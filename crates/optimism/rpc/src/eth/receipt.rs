@@ -73,22 +73,8 @@ pub struct OpReceiptFieldsBuilder {
     /// The base fee of the L1 origin block.
     pub l1_base_fee: Option<u128>,
     /* --------------------------------------- Regolith ---------------------------------------- */
-    /// Deposit nonce, if this is a deposit transaction.
-    pub deposit_nonce: Option<u64>,
-    /* ---------------------------------------- Canyon ----------------------------------------- */
-    /// Deposit receipt version, if this is a deposit transaction.
-    pub deposit_receipt_version: Option<u64>,
-    /* ---------------------------------------- Ecotone ---------------------------------------- */
-    /// The current L1 fee scalar.
-    pub l1_base_fee_scalar: Option<u128>,
-    /// The current L1 blob base fee.
-    pub l1_blob_base_fee: Option<u128>,
-    /// The current L1 blob base fee scalar.
-    pub l1_blob_base_fee_scalar: Option<u128>,
-    /// The current operator fee scalar.
-    pub operator_fee_scalar: Option<u128>,
-    /// The current L1 blob base fee scalar.
-    pub operator_fee_constant: Option<u128>,
+    /// The token ratio.
+    pub token_ratio: Option<u128>,
 }
 
 impl OpReceiptFieldsBuilder {
@@ -101,13 +87,7 @@ impl OpReceiptFieldsBuilder {
             l1_data_gas: None,
             l1_fee_scalar: None,
             l1_base_fee: None,
-            deposit_nonce: None,
-            deposit_receipt_version: None,
-            l1_base_fee_scalar: None,
-            l1_blob_base_fee: None,
-            l1_blob_base_fee_scalar: None,
-            operator_fee_scalar: None,
-            operator_fee_constant: None,
+            token_ratio: None,
         }
     }
 
@@ -141,28 +121,13 @@ impl OpReceiptFieldsBuilder {
             .then_some(f64::from(l1_block_info.l1_base_fee_scalar) / 1_000_000.0);
 
         self.l1_base_fee = Some(l1_block_info.l1_base_fee.saturating_to());
-        self.l1_base_fee_scalar = Some(l1_block_info.l1_base_fee_scalar.saturating_to());
-        self.l1_blob_base_fee = l1_block_info.l1_blob_base_fee.map(|fee| fee.saturating_to());
-        self.l1_blob_base_fee_scalar =
-            l1_block_info.l1_blob_base_fee_scalar.map(|scalar| scalar.saturating_to());
-        self.operator_fee_scalar =
-            l1_block_info.operator_fee_scalar.map(|scalar| scalar.saturating_to());
-        self.operator_fee_constant =
-            l1_block_info.operator_fee_constant.map(|constant| constant.saturating_to());
+        // self.l1_base_fee_scalar = Some(l1_block_info.l1_base_fee_scalar.saturating_to());
+        // self.l1_blob_base_fee = l1_block_info.l1_blob_base_fee.map(|fee| fee.saturating_to());
+        // self.l1_blob_base_fee_scalar =
+        //     l1_block_info.l1_blob_base_fee_scalar.map(|scalar| scalar.saturating_to());
+        self.token_ratio = l1_block_info.token_ratio.map(|ratio| ratio.saturating_to());
 
         Ok(self)
-    }
-
-    /// Applies deposit transaction metadata: deposit nonce.
-    pub const fn deposit_nonce(mut self, nonce: Option<u64>) -> Self {
-        self.deposit_nonce = nonce;
-        self
-    }
-
-    /// Applies deposit transaction metadata: deposit receipt version.
-    pub const fn deposit_version(mut self, version: Option<u64>) -> Self {
-        self.deposit_receipt_version = version;
-        self
     }
 
     /// Builds the [`OpTransactionReceiptFields`] object.
@@ -174,29 +139,24 @@ impl OpReceiptFieldsBuilder {
             l1_data_gas: l1_gas_used,
             l1_fee_scalar,
             l1_base_fee: l1_gas_price,
-            deposit_nonce,
-            deposit_receipt_version,
-            l1_base_fee_scalar,
-            l1_blob_base_fee,
-            l1_blob_base_fee_scalar,
-            operator_fee_scalar,
-            operator_fee_constant,
+            token_ratio,
         } = self;
 
+        // [TODO] modify op-alloy
         OpTransactionReceiptFields {
             l1_block_info: L1BlockInfo {
                 l1_gas_price,
                 l1_gas_used,
                 l1_fee,
                 l1_fee_scalar,
-                l1_base_fee_scalar,
-                l1_blob_base_fee,
-                l1_blob_base_fee_scalar,
-                operator_fee_scalar,
-                operator_fee_constant,
+                l1_base_fee_scalar: None,
+                l1_blob_base_fee: None,
+                l1_blob_base_fee_scalar: None,
+                operator_fee_scalar: None,
+                operator_fee_constant: None,
             },
-            deposit_nonce,
-            deposit_receipt_version,
+            deposit_nonce: None,
+            token_ratio,
         }
     }
 }
@@ -299,8 +259,7 @@ mod test {
                 operator_fee_scalar: None,
                 operator_fee_constant: None,
             },
-            deposit_nonce: None,
-            deposit_receipt_version: None,
+            token_ratio: None,
         };
 
     #[test]

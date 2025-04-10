@@ -101,6 +101,8 @@ impl<EXT, DB: Database> Evm for OpEvm<'_, EXT, DB> {
                 // The L1 fee is not charged for the EIP-4788 transaction, submit zero bytes for the
                 // enveloped tx size.
                 enveloped_tx: Some(Bytes::default()),
+                eth_tx_value: None,
+                eth_value: None,
             },
         };
 
