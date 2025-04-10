@@ -293,6 +293,8 @@ impl reth_primitives_traits::FillTxEnv for OpTransactionSigned {
                     mint: tx.mint,
                     is_system_transaction: Some(tx.is_system_transaction),
                     enveloped_tx: Some(envelope.into()),
+                    eth_tx_value: tx.eth_tx_value,
+                    eth_value: tx.eth_value,
                 };
                 return
             }
@@ -303,6 +305,8 @@ impl reth_primitives_traits::FillTxEnv for OpTransactionSigned {
             mint: None,
             is_system_transaction: Some(false),
             enveloped_tx: Some(envelope.into()),
+            eth_tx_value: None,
+            eth_value: None,
         }
     }
 }
