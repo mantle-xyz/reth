@@ -176,8 +176,8 @@ where
         let mut cumulative_gas_used = 0;
         let mut receipts = Vec::with_capacity(block.body().transaction_count());
         for (sender, transaction) in block.transactions_with_sender() {
-            // The sum of the transaction’s gas limit, Tg, and the gas utilized in this block prior,
-            // must be no greater than the block’s gasLimit.
+            // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
+            // must be no greater than the block's gasLimit.
             let block_available_gas = block.gas_limit() - cumulative_gas_used;
             if transaction.gas_limit() > block_available_gas &&
                 (is_regolith || !transaction.is_deposit())
@@ -245,15 +245,8 @@ where
                         self.receipt_builder.build_deposit_receipt(OpDepositReceipt {
                             inner: receipt,
                             deposit_nonce: depositor.map(|account| account.nonce),
-                            // The deposit receipt version was introduced in Canyon to indicate an
-                            // update to how receipt hashes should be computed
-                            // when set. The state transition process ensures
-                            // this is only set for post-Canyon deposit
-                            // transactions.
-                            deposit_receipt_version: (transaction.is_deposit() &&
-                                self.chain_spec
-                                    .is_canyon_active_at_timestamp(block.timestamp()))
-                            .then_some(1),
+                            // [TODO] Mantle does not support deposit receipt version in the mainnet
+                            deposit_receipt_version: None,
                         })
                     }
                 },
