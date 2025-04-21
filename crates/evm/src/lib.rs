@@ -22,7 +22,7 @@ use alloy_eips::eip2930::AccessList;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use core::fmt::Debug;
 use reth_primitives_traits::{BlockHeader, SignedTransaction};
-use revm::{DatabaseCommit, GetInspector};
+use revm::{DatabaseCommit, GetInspector, L1BlockInfo};
 use revm_primitives::{BlockEnv, ResultAndState, TxEnv, TxKind};
 
 pub mod batch;
@@ -90,6 +90,12 @@ pub trait Evm {
 
         Ok(result)
     }
+
+    /// Returns the L1 block info.
+    /// Note: This method is used by Mantle to obtain L1 block information which includes
+    /// [`L1BlockInfo::token_ratio`]. It should only be called after EVM execution, as the EVM
+    /// retrieves [`L1BlockInfo`] through stateDB. Otherwise, an error will be thrown.
+    fn get_l1_block_info(&self) -> Result<L1BlockInfo, Self::Error>;
 }
 /// Helper trait to bound [`revm::Database::Error`] with common requirements.
 pub trait Database: revm::Database<Error: core::error::Error + Send + Sync + 'static> {}

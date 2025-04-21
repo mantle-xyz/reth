@@ -1,7 +1,8 @@
 use alloy_consensus::{Eip658Value, Receipt};
 use core::fmt;
-use op_alloy_consensus::{OpDepositReceipt, OpTxType};
+use op_alloy_consensus::{MantleTxStoredReceipt, OpDepositReceipt, OpTxType};
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
+use revm::L1BlockInfo;
 use revm_primitives::ExecutionResult;
 
 /// Context for building a receipt.
@@ -13,6 +14,9 @@ pub struct ReceiptBuilderCtx<'a, T> {
     pub result: ExecutionResult,
     /// Cumulative gas used.
     pub cumulative_gas_used: u64,
+    /// L1 block information. Since Mantle's token ratio is updated in GasOracles, it's not
+    /// possible to retrieve the token ratio through extract_l1_info
+    pub l1_block_info: Option<L1BlockInfo>,
 }
 
 /// Type that knows how to build a receipt based on execution result.
@@ -48,12 +52,19 @@ impl OpReceiptBuilder<OpTransactionSigned> for BasicOpReceiptBuilder {
         match ctx.tx.tx_type() {
             OpTxType::Deposit => Err(ctx),
             ty => {
-                let receipt = Receipt {
-                    // Success flag was added in `EIP-658: Embedding transaction status code in
-                    // receipts`.
-                    status: Eip658Value::Eip658(ctx.result.is_success()),
-                    cumulative_gas_used: ctx.cumulative_gas_used,
-                    logs: ctx.result.into_logs(),
+                let l1_block_info = ctx.l1_block_info.unwrap();
+                let receipt = MantleTxStoredReceipt {
+                    inner: Receipt {
+                        // Success flag was added in `EIP-658: Embedding transaction status code in
+                        // receipts`.
+                        status: Eip658Value::Eip658(ctx.result.is_success()),
+                        cumulative_gas_used: ctx.cumulative_gas_used,
+                        logs: ctx.result.into_logs(),
+                    },
+                    l1_base_fee: l1_block_info.l1_base_fee.try_into().ok(),
+                    l1_fee_overhead: l1_block_info.l1_fee_overhead.map(|v| v.try_into().unwrap()),
+                    l1_base_fee_scalar: l1_block_info.l1_base_fee_scalar.try_into().ok(),
+                    token_ratio: l1_block_info.token_ratio.map(|v| v.try_into().unwrap()),
                 };
 
                 Ok(match ty {

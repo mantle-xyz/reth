@@ -19,6 +19,7 @@ pub use hardfork::OpHardfork;
 
 use reth_ethereum_forks::{EthereumHardforks, ForkCondition};
 
+// [TODO] need to implement the hardfork logic for MANTLE
 /// Extends [`EthereumHardforks`] with optimism helper methods.
 #[auto_impl::auto_impl(&, Arc)]
 pub trait OpHardforks: EthereumHardforks {

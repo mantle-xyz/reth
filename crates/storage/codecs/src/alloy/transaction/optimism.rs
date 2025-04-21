@@ -32,6 +32,8 @@ pub(crate) struct TxDeposit {
     value: U256,
     gas_limit: u64,
     is_system_transaction: bool,
+    eth_tx_value: Option<u128>,
+    eth_value: Option<u128>,
     input: Bytes,
 }
 
@@ -48,6 +50,8 @@ impl Compact for AlloyTxDeposit {
             value: self.value,
             gas_limit: self.gas_limit,
             is_system_transaction: self.is_system_transaction,
+            eth_tx_value: self.eth_tx_value,
+            eth_value: self.eth_value,
             input: self.input.clone(),
         };
         tx.to_compact(buf)
@@ -64,6 +68,8 @@ impl Compact for AlloyTxDeposit {
             gas_limit: tx.gas_limit,
             is_system_transaction: tx.is_system_transaction,
             input: tx.input,
+            eth_tx_value: tx.eth_tx_value,
+            eth_value: tx.eth_value,
         };
         (alloy_tx, buf)
     }

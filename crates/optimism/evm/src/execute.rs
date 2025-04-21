@@ -1,8 +1,8 @@
 //! Optimism block execution strategy.
 
 use crate::{
-    l1::ensure_create2_deployer, BasicOpReceiptBuilder, OpBlockExecutionError, OpEvmConfig,
-    OpReceiptBuilder, ReceiptBuilderCtx,
+    l1::ensure_create2_deployer, BasicOpReceiptBuilder, error::L1BlockInfoError, OpBlockExecutionError,
+    OpEvmConfig, OpReceiptBuilder, ReceiptBuilderCtx,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use alloy_consensus::{BlockHeader, Eip658Value, Receipt, Transaction as _};
@@ -176,8 +176,8 @@ where
         let mut cumulative_gas_used = 0;
         let mut receipts = Vec::with_capacity(block.body().transaction_count());
         for (sender, transaction) in block.transactions_with_sender() {
-            // The sum of the transaction’s gas limit, Tg, and the gas utilized in this block prior,
-            // must be no greater than the block’s gasLimit.
+            // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
+            // must be no greater than the block's gasLimit.
             let block_available_gas = block.gas_limit() - cumulative_gas_used;
             if transaction.gas_limit() > block_available_gas &&
                 (is_regolith || !transaction.is_deposit())
@@ -214,6 +214,10 @@ where
                 }
             })?;
 
+            let l1_block_info = evm.get_l1_block_info().map_err(|_| {
+                OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::InvalidL1BlockInfo)
+            })?;
+
             trace!(
                 target: "evm",
                 ?transaction,
@@ -231,6 +235,7 @@ where
                     tx: transaction,
                     result,
                     cumulative_gas_used,
+                    l1_block_info: Some(l1_block_info),
                 }) {
                     Ok(receipt) => receipt,
                     Err(ctx) => {
@@ -245,15 +250,8 @@ where
                         self.receipt_builder.build_deposit_receipt(OpDepositReceipt {
                             inner: receipt,
                             deposit_nonce: depositor.map(|account| account.nonce),
-                            // The deposit receipt version was introduced in Canyon to indicate an
-                            // update to how receipt hashes should be computed
-                            // when set. The state transition process ensures
-                            // this is only set for post-Canyon deposit
-                            // transactions.
-                            deposit_receipt_version: (transaction.is_deposit() &&
-                                self.chain_spec
-                                    .is_canyon_active_at_timestamp(block.timestamp()))
-                            .then_some(1),
+                            // [TODO] Mantle does not support deposit receipt version in the mainnet
+                            deposit_receipt_version: None,
                         })
                     }
                 },

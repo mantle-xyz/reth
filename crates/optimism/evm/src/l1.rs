@@ -161,6 +161,7 @@ pub fn parse_l1_info_tx_ecotone(data: &[u8]) -> Result<L1BlockInfo, OpBlockExecu
     Ok(l1block)
 }
 
+/// [TODO]
 /// Updates the L1 block values for an Isthmus upgraded chain.
 /// Params are packed and passed in as raw msg.data instead of ABI to reduce calldata size.
 /// Params are expected to be in the following order:
@@ -206,10 +207,10 @@ pub fn parse_l1_info_tx_isthmus(data: &[u8]) -> Result<L1BlockInfo, OpBlockExecu
         .ok_or(OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::BaseFeeConversion))?;
     let l1_blob_base_fee = U256::try_from_be_slice(&data[64..96])
         .ok_or(OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::BlobBaseFeeConversion))?;
-    let operator_fee_scalar = U256::try_from_be_slice(&data[160..164]).ok_or({
+    let _operator_fee_scalar = U256::try_from_be_slice(&data[160..164]).ok_or({
         OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::OperatorFeeScalarConversion)
     })?;
-    let operator_fee_constant = U256::try_from_be_slice(&data[164..172]).ok_or({
+    let _operator_fee_constant = U256::try_from_be_slice(&data[164..172]).ok_or({
         OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::OperatorFeeConstantConversion)
     })?;
 
@@ -218,8 +219,8 @@ pub fn parse_l1_info_tx_isthmus(data: &[u8]) -> Result<L1BlockInfo, OpBlockExecu
     l1block.l1_base_fee_scalar = l1_base_fee_scalar;
     l1block.l1_blob_base_fee = Some(l1_blob_base_fee);
     l1block.l1_blob_base_fee_scalar = Some(l1_blob_base_fee_scalar);
-    l1block.operator_fee_scalar = Some(operator_fee_scalar);
-    l1block.operator_fee_constant = Some(operator_fee_constant);
+    // l1block.operator_fee_scalar = Some(operator_fee_scalar);
+    // l1block.operator_fee_constant = Some(operator_fee_constant);
 
     Ok(l1block)
 }

@@ -3,6 +3,7 @@
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_rpc_types_eth::{Log, TransactionReceipt};
+use alloy_primitives::U256;
 use op_alloy_consensus::{OpDepositReceipt, OpDepositReceiptWithBloom, OpReceiptEnvelope};
 use op_alloy_rpc_types::{L1BlockInfo, OpTransactionReceipt, OpTransactionReceiptFields};
 use reth_node_api::{FullNodeComponents, NodeTypes};
@@ -75,20 +76,9 @@ pub struct OpReceiptFieldsBuilder {
     /* --------------------------------------- Regolith ---------------------------------------- */
     /// Deposit nonce, if this is a deposit transaction.
     pub deposit_nonce: Option<u64>,
-    /* ---------------------------------------- Canyon ----------------------------------------- */
-    /// Deposit receipt version, if this is a deposit transaction.
-    pub deposit_receipt_version: Option<u64>,
-    /* ---------------------------------------- Ecotone ---------------------------------------- */
-    /// The current L1 fee scalar.
-    pub l1_base_fee_scalar: Option<u128>,
-    /// The current L1 blob base fee.
-    pub l1_blob_base_fee: Option<u128>,
-    /// The current L1 blob base fee scalar.
-    pub l1_blob_base_fee_scalar: Option<u128>,
-    /// The current operator fee scalar.
-    pub operator_fee_scalar: Option<u128>,
-    /// The current L1 blob base fee scalar.
-    pub operator_fee_constant: Option<u128>,
+    /* --------------------------------------- Mantle ---------------------------------------- */
+    /// The token ratio.
+    pub token_ratio: Option<u128>,
 }
 
 impl OpReceiptFieldsBuilder {
@@ -102,12 +92,7 @@ impl OpReceiptFieldsBuilder {
             l1_fee_scalar: None,
             l1_base_fee: None,
             deposit_nonce: None,
-            deposit_receipt_version: None,
-            l1_base_fee_scalar: None,
-            l1_blob_base_fee: None,
-            l1_blob_base_fee_scalar: None,
-            operator_fee_scalar: None,
-            operator_fee_constant: None,
+            token_ratio: None,
         }
     }
 
@@ -141,14 +126,7 @@ impl OpReceiptFieldsBuilder {
             .then_some(f64::from(l1_block_info.l1_base_fee_scalar) / 1_000_000.0);
 
         self.l1_base_fee = Some(l1_block_info.l1_base_fee.saturating_to());
-        self.l1_base_fee_scalar = Some(l1_block_info.l1_base_fee_scalar.saturating_to());
-        self.l1_blob_base_fee = l1_block_info.l1_blob_base_fee.map(|fee| fee.saturating_to());
-        self.l1_blob_base_fee_scalar =
-            l1_block_info.l1_blob_base_fee_scalar.map(|scalar| scalar.saturating_to());
-        self.operator_fee_scalar =
-            l1_block_info.operator_fee_scalar.map(|scalar| scalar.saturating_to());
-        self.operator_fee_constant =
-            l1_block_info.operator_fee_constant.map(|constant| constant.saturating_to());
+        self.token_ratio = l1_block_info.token_ratio.map(|ratio| ratio.saturating_to());
 
         Ok(self)
     }
@@ -156,12 +134,6 @@ impl OpReceiptFieldsBuilder {
     /// Applies deposit transaction metadata: deposit nonce.
     pub const fn deposit_nonce(mut self, nonce: Option<u64>) -> Self {
         self.deposit_nonce = nonce;
-        self
-    }
-
-    /// Applies deposit transaction metadata: deposit receipt version.
-    pub const fn deposit_version(mut self, version: Option<u64>) -> Self {
-        self.deposit_receipt_version = version;
         self
     }
 
@@ -174,13 +146,8 @@ impl OpReceiptFieldsBuilder {
             l1_data_gas: l1_gas_used,
             l1_fee_scalar,
             l1_base_fee: l1_gas_price,
+            token_ratio,
             deposit_nonce,
-            deposit_receipt_version,
-            l1_base_fee_scalar,
-            l1_blob_base_fee,
-            l1_blob_base_fee_scalar,
-            operator_fee_scalar,
-            operator_fee_constant,
         } = self;
 
         OpTransactionReceiptFields {
@@ -189,14 +156,14 @@ impl OpReceiptFieldsBuilder {
                 l1_gas_used,
                 l1_fee,
                 l1_fee_scalar,
-                l1_base_fee_scalar,
-                l1_blob_base_fee,
-                l1_blob_base_fee_scalar,
-                operator_fee_scalar,
-                operator_fee_constant,
+                l1_base_fee_scalar: None,
+                l1_blob_base_fee: None,
+                l1_blob_base_fee_scalar: None,
+                operator_fee_scalar: None,
+                operator_fee_constant: None,
+                token_ratio,
             },
             deposit_nonce,
-            deposit_receipt_version,
         }
     }
 }
@@ -218,7 +185,7 @@ impl OpReceiptBuilder {
         meta: TransactionMeta,
         receipt: &OpReceipt,
         all_receipts: &[OpReceipt],
-        l1_block_info: &mut revm::L1BlockInfo,
+        _l1_block_info: &mut revm::L1BlockInfo,
     ) -> Result<Self, OpEthApiError> {
         let timestamp = meta.timestamp;
         let block_number = meta.block_number;
@@ -242,8 +209,13 @@ impl OpReceiptBuilder {
                 }
             })?;
 
+        let mut new_l1_block_info = revm::L1BlockInfo::default();
+        new_l1_block_info.token_ratio = Some(U256::from(receipt.token_ratio().unwrap_or(0)));
+        new_l1_block_info.l1_base_fee = U256::from(receipt.l1_base_fee().unwrap_or(0));
+        new_l1_block_info.l1_fee_overhead = Some(U256::from(receipt.l1_fee_overhead().unwrap_or(0)));
+        new_l1_block_info.l1_base_fee_scalar = U256::from(receipt.l1_base_fee_scalar().unwrap_or(0));
         let op_receipt_fields = OpReceiptFieldsBuilder::new(timestamp, block_number)
-            .l1_block_info(chain_spec, transaction, l1_block_info)?
+            .l1_block_info(chain_spec, transaction, &mut new_l1_block_info)?
             .build();
 
         Ok(Self { core_receipt, op_receipt_fields })
@@ -300,7 +272,7 @@ mod test {
                 operator_fee_constant: None,
             },
             deposit_nonce: None,
-            deposit_receipt_version: None,
+            token_ratio: None,
         };
 
     #[test]

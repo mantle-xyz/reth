@@ -41,6 +41,9 @@ pub enum L1BlockInfoError {
     /// Optimism hardforks not active
     #[error("Optimism hardforks are not active")]
     HardforksNotActive,
+    /// Invalid L1 block info
+    #[error("invalid l1 block info")]
+    InvalidL1BlockInfo,
 }
 
 /// Optimism Block Executor Errors

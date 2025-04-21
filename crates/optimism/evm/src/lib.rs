@@ -27,7 +27,7 @@ use reth_primitives_traits::FillTxEnv;
 use revm::{
     inspector_handle_register,
     primitives::{AnalysisKind, CfgEnvWithHandlerCfg, TxEnv},
-    EvmBuilder, GetInspector,
+    EvmBuilder, GetInspector, L1BlockInfo,
 };
 
 mod config;
@@ -101,6 +101,8 @@ impl<EXT, DB: Database> Evm for OpEvm<'_, EXT, DB> {
                 // The L1 fee is not charged for the EIP-4788 transaction, submit zero bytes for the
                 // enveloped tx size.
                 enveloped_tx: Some(Bytes::default()),
+                eth_tx_value: None,
+                eth_value: None,
             },
         };
 
@@ -124,6 +126,13 @@ impl<EXT, DB: Database> Evm for OpEvm<'_, EXT, DB> {
 
     fn db_mut(&mut self) -> &mut Self::DB {
         &mut self.context.evm.db
+    }
+
+    fn get_l1_block_info(&self) -> Result<L1BlockInfo, Self::Error> {
+        let Some(l1_block_info) = self.context.evm.l1_block_info.clone() else {
+            return Err(EVMError::Custom("[RETH] L1 block info not found".to_string()));
+        };
+        Ok(l1_block_info)
     }
 }
 
