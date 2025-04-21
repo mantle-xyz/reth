@@ -834,6 +834,7 @@ where
             tx,
             result,
             cumulative_gas_used: info.cumulative_gas_used,
+            l1_block_info: None,
         }) {
             Ok(receipt) => receipt,
             Err(ctx) => {

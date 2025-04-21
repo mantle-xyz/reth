@@ -1,8 +1,8 @@
 //! Optimism block execution strategy.
 
 use crate::{
-    l1::ensure_create2_deployer, BasicOpReceiptBuilder, OpBlockExecutionError, OpEvmConfig,
-    OpReceiptBuilder, ReceiptBuilderCtx,
+    l1::ensure_create2_deployer, BasicOpReceiptBuilder, error::L1BlockInfoError, OpBlockExecutionError,
+    OpEvmConfig, OpReceiptBuilder, ReceiptBuilderCtx,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use alloy_consensus::{BlockHeader, Eip658Value, Receipt, Transaction as _};
@@ -214,6 +214,10 @@ where
                 }
             })?;
 
+            let l1_block_info = evm.get_l1_block_info().map_err(|_| {
+                OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::InvalidL1BlockInfo)
+            })?;
+
             trace!(
                 target: "evm",
                 ?transaction,
@@ -231,6 +235,7 @@ where
                     tx: transaction,
                     result,
                     cumulative_gas_used,
+                    l1_block_info: Some(l1_block_info),
                 }) {
                     Ok(receipt) => receipt,
                     Err(ctx) => {

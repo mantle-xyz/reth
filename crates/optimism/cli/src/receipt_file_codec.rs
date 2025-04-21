@@ -5,7 +5,7 @@ use alloy_primitives::{
     Address, Bloom, Bytes, B256,
 };
 use alloy_rlp::{Decodable, RlpDecodable};
-use op_alloy_consensus::{OpDepositReceipt, OpTxType};
+use op_alloy_consensus::{MantleTxStoredReceipt, OpDepositReceipt, OpTxType};
 use reth_optimism_primitives::OpReceipt;
 use reth_primitives::{Log, Receipt};
 use tokio_util::codec::Decoder;
@@ -104,13 +104,20 @@ impl TryFrom<OpGethReceipt> for OpReceipt {
         let receipt =
             alloy_consensus::Receipt { status: (status != 0).into(), cumulative_gas_used, logs };
 
+        let mante_receipt = MantleTxStoredReceipt {
+            inner: receipt.clone(),
+            l1_base_fee: None,
+            l1_fee_overhead: None,
+            l1_base_fee_scalar: None,
+            token_ratio: None,
+        };
         match tx_type {
-            OpTxType::Legacy => Ok(Self::Legacy(receipt)),
-            OpTxType::Eip2930 => Ok(Self::Eip2930(receipt)),
-            OpTxType::Eip1559 => Ok(Self::Eip1559(receipt)),
-            OpTxType::Eip7702 => Ok(Self::Eip7702(receipt)),
+            OpTxType::Legacy => Ok(Self::Legacy(mante_receipt)),
+            OpTxType::Eip2930 => Ok(Self::Eip2930(mante_receipt)),
+            OpTxType::Eip1559 => Ok(Self::Eip1559(mante_receipt)),
+            OpTxType::Eip7702 => Ok(Self::Eip7702(mante_receipt)),
             OpTxType::Deposit => Ok(Self::Deposit(OpDepositReceipt {
-                inner: receipt,
+                inner: receipt.clone(),
                 deposit_nonce: None,
                 deposit_receipt_version: None,
             })),

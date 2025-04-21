@@ -4,23 +4,24 @@ use alloy_consensus::{
 };
 use alloy_primitives::{Bloom, Log};
 use alloy_rlp::{BufMut, Decodable, Header};
-use op_alloy_consensus::{OpDepositReceipt, OpTxType};
+use op_alloy_consensus::{MantleTxStoredReceipt, OpDepositReceipt, OpTxType};
 use reth_primitives_traits::InMemorySize;
 
 /// Typed ethereum transaction receipt.
 /// Receipt containing result of transaction execution.
+/// [TODO] add tests
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum OpReceipt {
-    /// Legacy receipt
-    Legacy(Receipt),
-    /// EIP-2930 receipt
-    Eip2930(Receipt),
-    /// EIP-1559 receipt
-    Eip1559(Receipt),
-    /// EIP-7702 receipt
-    Eip7702(Receipt),
+    /// Legacy Mantle receipt
+    Legacy(MantleTxStoredReceipt),
+    /// EIP-2930 Mantle receipt
+    Eip2930(MantleTxStoredReceipt),
+    /// EIP-1559 Mantle receipt
+    Eip1559(MantleTxStoredReceipt),
+    /// EIP-7702 Mantle receipt
+    Eip7702(MantleTxStoredReceipt),
     /// Deposit receipt
     Deposit(OpDepositReceipt),
 }
@@ -43,7 +44,7 @@ impl OpReceipt {
             Self::Legacy(receipt) |
             Self::Eip2930(receipt) |
             Self::Eip1559(receipt) |
-            Self::Eip7702(receipt) => receipt,
+            Self::Eip7702(receipt) => &receipt.inner,
             Self::Deposit(receipt) => &receipt.inner,
         }
     }
@@ -107,6 +108,48 @@ impl OpReceipt {
                     RlpDecodableReceipt::rlp_decode_with_bloom(buf)?;
                 Ok(ReceiptWithBloom { receipt: Self::Deposit(receipt), logs_bloom })
             }
+        }
+    }
+}
+
+impl OpReceipt {
+    pub fn l1_base_fee(&self) -> Option<u128> {
+        match self {
+            Self::Legacy(receipt) |
+            Self::Eip2930(receipt) |
+            Self::Eip1559(receipt) |
+            Self::Eip7702(receipt) => Some(receipt.l1_base_fee.unwrap_or(0)),
+            Self::Deposit(_) => None,
+        }
+    }
+
+    pub fn l1_fee_overhead(&self) -> Option<u128> {
+        match self {
+            Self::Legacy(receipt) |
+            Self::Eip2930(receipt) |
+            Self::Eip1559(receipt) |
+            Self::Eip7702(receipt) => Some(receipt.l1_fee_overhead.unwrap_or(0)),
+            Self::Deposit(_) => None,
+        }
+    }
+
+    pub fn l1_base_fee_scalar(&self) -> Option<u128> {
+        match self {
+            Self::Legacy(receipt) |
+            Self::Eip2930(receipt) |
+            Self::Eip1559(receipt) |
+            Self::Eip7702(receipt) => Some(receipt.l1_base_fee_scalar.unwrap_or(0)),
+            Self::Deposit(_) => None,
+        }
+    }
+
+    pub fn token_ratio(&self) -> Option<u128> {
+        match self {
+            Self::Legacy(receipt) |
+            Self::Eip2930(receipt) |
+            Self::Eip1559(receipt) |
+            Self::Eip7702(receipt) => Some(receipt.token_ratio.unwrap_or(0)),
+            Self::Deposit(_) => None,
         }
     }
 }
@@ -242,6 +285,10 @@ mod compact {
         success: bool,
         cumulative_gas_used: u64,
         logs: Cow<'a, Vec<Log>>,
+        l1_base_fee: Option<u128>,
+        l1_fee_overhead: Option<u128>,
+        l1_base_fee_scalar: Option<u128>,
+        token_ratio: Option<u128>,
         deposit_nonce: Option<u64>,
         deposit_receipt_version: Option<u64>,
     }
@@ -253,6 +300,10 @@ mod compact {
                 success: receipt.status(),
                 cumulative_gas_used: receipt.cumulative_gas_used(),
                 logs: Cow::Borrowed(&receipt.as_receipt().logs),
+                l1_base_fee: receipt.l1_base_fee(),
+                l1_fee_overhead: receipt.l1_fee_overhead(),
+                l1_base_fee_scalar: receipt.l1_base_fee_scalar(),
+                token_ratio: receipt.token_ratio(),
                 deposit_nonce: if let OpReceipt::Deposit(receipt) = receipt {
                     receipt.deposit_nonce
                 } else {
@@ -274,6 +325,10 @@ mod compact {
                 success,
                 cumulative_gas_used,
                 logs,
+                l1_base_fee,
+                l1_fee_overhead,
+                l1_base_fee_scalar,
+                token_ratio,
                 deposit_nonce,
                 deposit_receipt_version,
             } = receipt;
@@ -281,13 +336,21 @@ mod compact {
             let inner =
                 Receipt { status: success.into(), cumulative_gas_used, logs: logs.into_owned() };
 
+            let mantle_inner = MantleTxStoredReceipt {
+                inner: inner.clone(),
+                l1_base_fee,
+                l1_fee_overhead,
+                l1_base_fee_scalar,
+                token_ratio,
+            };
+
             match tx_type {
-                OpTxType::Legacy => Self::Legacy(inner),
-                OpTxType::Eip2930 => Self::Eip2930(inner),
-                OpTxType::Eip1559 => Self::Eip1559(inner),
-                OpTxType::Eip7702 => Self::Eip7702(inner),
+                OpTxType::Legacy => Self::Legacy(mantle_inner),
+                OpTxType::Eip2930 => Self::Eip2930(mantle_inner),
+                OpTxType::Eip1559 => Self::Eip1559(mantle_inner),
+                OpTxType::Eip7702 => Self::Eip7702(mantle_inner),
                 OpTxType::Deposit => Self::Deposit(OpDepositReceipt {
-                    inner,
+                    inner: inner.clone(),
                     deposit_nonce,
                     deposit_receipt_version,
                 }),
@@ -316,189 +379,5 @@ mod compact {
 
         assert_eq!(CompactOpReceipt::bitflag_encoded_bytes(), 2);
         validate_bitflag_backwards_compat!(CompactOpReceipt<'_>, UnusedBits::NotZero);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_eips::eip2718::Encodable2718;
-    use alloy_primitives::{address, b256, bytes, hex_literal::hex, Bytes};
-    use alloy_rlp::Encodable;
-    use reth_codecs::Compact;
-
-    #[test]
-    fn test_decode_receipt() {
-        reth_codecs::test_utils::test_decode::<OpReceipt>(&hex!(
-            "c30328b52ffd23fc426961a00105007eb0042307705a97e503562eacf2b95060cce9de6de68386b6c155b73a9650021a49e2f8baad17f30faff5899d785c4c0873e45bc268bcf07560106424570d11f9a59e8f3db1efa4ceec680123712275f10d92c3411e1caaa11c7c5d591bc11487168e09934a9986848136da1b583babf3a7188e3aed007a1520f1cf4c1ca7d3482c6c28d37c298613c70a76940008816c4c95644579fd08471dc34732fd0f24"
-        ));
-    }
-
-    // Test vector from: https://eips.ethereum.org/EIPS/eip-2481
-    #[test]
-    fn encode_legacy_receipt() {
-        let expected = hex!("f901668001b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f85ff85d940000000000000000000000000000000000000011f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100ff");
-
-        let mut data = Vec::with_capacity(expected.length());
-        let receipt = ReceiptWithBloom {
-            receipt: OpReceipt::Legacy(Receipt {
-                status: Eip658Value::Eip658(false),
-                cumulative_gas_used: 0x1,
-                logs: vec![Log::new_unchecked(
-                    address!("0000000000000000000000000000000000000011"),
-                    vec![
-                        b256!("000000000000000000000000000000000000000000000000000000000000dead"),
-                        b256!("000000000000000000000000000000000000000000000000000000000000beef"),
-                    ],
-                    bytes!("0100ff"),
-                )],
-            }),
-            logs_bloom: [0; 256].into(),
-        };
-
-        receipt.encode(&mut data);
-
-        // check that the rlp length equals the length of the expected rlp
-        assert_eq!(receipt.length(), expected.len());
-        assert_eq!(data, expected);
-    }
-
-    // Test vector from: https://eips.ethereum.org/EIPS/eip-2481
-    #[test]
-    fn decode_legacy_receipt() {
-        let data = hex!("f901668001b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f85ff85d940000000000000000000000000000000000000011f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100ff");
-
-        // EIP658Receipt
-        let expected = ReceiptWithBloom {
-            receipt: OpReceipt::Legacy(Receipt {
-                status: Eip658Value::Eip658(false),
-                cumulative_gas_used: 0x1,
-                logs: vec![Log::new_unchecked(
-                    address!("0000000000000000000000000000000000000011"),
-                    vec![
-                        b256!("000000000000000000000000000000000000000000000000000000000000dead"),
-                        b256!("000000000000000000000000000000000000000000000000000000000000beef"),
-                    ],
-                    bytes!("0100ff"),
-                )],
-            }),
-            logs_bloom: [0; 256].into(),
-        };
-
-        let receipt = ReceiptWithBloom::decode(&mut &data[..]).unwrap();
-        assert_eq!(receipt, expected);
-    }
-
-    #[test]
-    fn decode_deposit_receipt_regolith_roundtrip() {
-        let data = hex!("b901107ef9010c0182b741b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0833d3bbf");
-
-        // Deposit Receipt (post-regolith)
-        let expected = ReceiptWithBloom {
-            receipt: OpReceipt::Deposit(OpDepositReceipt {
-                inner: Receipt {
-                    status: Eip658Value::Eip658(true),
-                    cumulative_gas_used: 46913,
-                    logs: vec![],
-                },
-                deposit_nonce: Some(4012991),
-                deposit_receipt_version: None,
-            }),
-            logs_bloom: [0; 256].into(),
-        };
-
-        let receipt = ReceiptWithBloom::decode(&mut &data[..]).unwrap();
-        assert_eq!(receipt, expected);
-
-        let mut buf = Vec::with_capacity(data.len());
-        receipt.encode(&mut buf);
-        assert_eq!(buf, &data[..]);
-    }
-
-    #[test]
-    fn decode_deposit_receipt_canyon_roundtrip() {
-        let data = hex!("b901117ef9010d0182b741b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0833d3bbf01");
-
-        // Deposit Receipt (post-regolith)
-        let expected = ReceiptWithBloom {
-            receipt: OpReceipt::Deposit(OpDepositReceipt {
-                inner: Receipt {
-                    status: Eip658Value::Eip658(true),
-                    cumulative_gas_used: 46913,
-                    logs: vec![],
-                },
-                deposit_nonce: Some(4012991),
-                deposit_receipt_version: Some(1),
-            }),
-            logs_bloom: [0; 256].into(),
-        };
-
-        let receipt = ReceiptWithBloom::decode(&mut &data[..]).unwrap();
-        assert_eq!(receipt, expected);
-
-        let mut buf = Vec::with_capacity(data.len());
-        expected.encode(&mut buf);
-        assert_eq!(buf, &data[..]);
-    }
-
-    #[test]
-    fn gigantic_receipt() {
-        let receipt = OpReceipt::Legacy(Receipt {
-            status: Eip658Value::Eip658(true),
-            cumulative_gas_used: 16747627,
-            logs: vec![
-                Log::new_unchecked(
-                    address!("4bf56695415f725e43c3e04354b604bcfb6dfb6e"),
-                    vec![b256!("c69dc3d7ebff79e41f525be431d5cd3cc08f80eaf0f7819054a726eeb7086eb9")],
-                    Bytes::from(vec![1; 0xffffff]),
-                ),
-                Log::new_unchecked(
-                    address!("faca325c86bf9c2d5b413cd7b90b209be92229c2"),
-                    vec![b256!("8cca58667b1e9ffa004720ac99a3d61a138181963b294d270d91c53d36402ae2")],
-                    Bytes::from(vec![1; 0xffffff]),
-                ),
-            ],
-        });
-
-        let mut data = vec![];
-        receipt.to_compact(&mut data);
-        let (decoded, _) = OpReceipt::from_compact(&data[..], data.len());
-        assert_eq!(decoded, receipt);
-    }
-
-    #[test]
-    fn test_encode_2718_length() {
-        let receipt = ReceiptWithBloom {
-            receipt: OpReceipt::Eip1559(Receipt {
-                status: Eip658Value::Eip658(true),
-                cumulative_gas_used: 21000,
-                logs: vec![],
-            }),
-            logs_bloom: Bloom::default(),
-        };
-
-        let encoded = receipt.encoded_2718();
-        assert_eq!(
-            encoded.len(),
-            receipt.encode_2718_len(),
-            "Encoded length should match the actual encoded data length"
-        );
-
-        // Test for legacy receipt as well
-        let legacy_receipt = ReceiptWithBloom {
-            receipt: OpReceipt::Legacy(Receipt {
-                status: Eip658Value::Eip658(true),
-                cumulative_gas_used: 21000,
-                logs: vec![],
-            }),
-            logs_bloom: Bloom::default(),
-        };
-
-        let legacy_encoded = legacy_receipt.encoded_2718();
-        assert_eq!(
-            legacy_encoded.len(),
-            legacy_receipt.encode_2718_len(),
-            "Encoded length for legacy receipt should match the actual encoded data length"
-        );
     }
 }

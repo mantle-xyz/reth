@@ -7,7 +7,7 @@ use alloy_consensus::{
 };
 use alloy_eips::{eip7685::EMPTY_REQUESTS_HASH, merge::BEACON_NONCE, BlockNumberOrTag};
 use alloy_primitives::{B256, U256};
-use op_alloy_consensus::{OpDepositReceipt, OpTxType};
+use op_alloy_consensus::{MantleTxStoredReceipt, OpDepositReceipt, OpTxType};
 use op_alloy_network::Network;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::ConfigureEvm;
@@ -156,14 +156,21 @@ where
             cumulative_gas_used,
             logs: result.into_logs().into_iter().collect(),
         };
+        let mante_receipt = MantleTxStoredReceipt {
+            inner: receipt.clone(),
+            l1_base_fee: None,
+            l1_fee_overhead: None,
+            l1_base_fee_scalar: None,
+            token_ratio: None,
+        };
 
         match tx.tx_type() {
-            OpTxType::Legacy => OpReceipt::Legacy(receipt),
-            OpTxType::Eip2930 => OpReceipt::Eip2930(receipt),
-            OpTxType::Eip1559 => OpReceipt::Eip1559(receipt),
-            OpTxType::Eip7702 => OpReceipt::Eip7702(receipt),
+            OpTxType::Legacy => OpReceipt::Legacy(mante_receipt),
+            OpTxType::Eip2930 => OpReceipt::Eip2930(mante_receipt),
+            OpTxType::Eip1559 => OpReceipt::Eip1559(mante_receipt),
+            OpTxType::Eip7702 => OpReceipt::Eip7702(mante_receipt),
             OpTxType::Deposit => OpReceipt::Deposit(OpDepositReceipt {
-                inner: receipt,
+                inner: receipt.clone(),
                 deposit_nonce: None,
                 deposit_receipt_version: None,
             }),

@@ -207,10 +207,10 @@ pub fn parse_l1_info_tx_isthmus(data: &[u8]) -> Result<L1BlockInfo, OpBlockExecu
         .ok_or(OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::BaseFeeConversion))?;
     let l1_blob_base_fee = U256::try_from_be_slice(&data[64..96])
         .ok_or(OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::BlobBaseFeeConversion))?;
-    let operator_fee_scalar = U256::try_from_be_slice(&data[160..164]).ok_or({
+    let _operator_fee_scalar = U256::try_from_be_slice(&data[160..164]).ok_or({
         OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::OperatorFeeScalarConversion)
     })?;
-    let operator_fee_constant = U256::try_from_be_slice(&data[164..172]).ok_or({
+    let _operator_fee_constant = U256::try_from_be_slice(&data[164..172]).ok_or({
         OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::OperatorFeeConstantConversion)
     })?;
 

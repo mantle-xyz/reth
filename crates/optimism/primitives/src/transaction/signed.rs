@@ -202,11 +202,20 @@ impl From<Sealed<TxDeposit>> for OpTransactionSigned {
 pub trait OpTransaction {
     /// Whether or not the transaction is a dpeosit transaction.
     fn is_deposit(&self) -> bool;
+    /// Returns enveloped_tx if the transaction is a deposit transaction.
+    fn enveloped_tx(&self) -> Option<Bytes>;
 }
 
 impl OpTransaction for OpTransactionSigned {
     fn is_deposit(&self) -> bool {
         self.is_deposit()
+    }
+
+    fn enveloped_tx(&self) -> Option<Bytes> {
+        match &self.transaction {
+            OpTypedTransaction::Deposit(tx) => Some(tx.input.clone()),
+            _ => None,
+        }
     }
 }
 

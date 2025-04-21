@@ -3,6 +3,7 @@
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_rpc_types_eth::{Log, TransactionReceipt};
+use alloy_primitives::U256;
 use op_alloy_consensus::{OpDepositReceipt, OpDepositReceiptWithBloom, OpReceiptEnvelope};
 use op_alloy_rpc_types::{L1BlockInfo, OpTransactionReceipt, OpTransactionReceiptFields};
 use reth_node_api::{FullNodeComponents, NodeTypes};
@@ -160,9 +161,9 @@ impl OpReceiptFieldsBuilder {
                 l1_blob_base_fee_scalar: None,
                 operator_fee_scalar: None,
                 operator_fee_constant: None,
+                token_ratio,
             },
             deposit_nonce,
-            token_ratio,
         }
     }
 }
@@ -184,7 +185,7 @@ impl OpReceiptBuilder {
         meta: TransactionMeta,
         receipt: &OpReceipt,
         all_receipts: &[OpReceipt],
-        l1_block_info: &mut revm::L1BlockInfo,
+        _l1_block_info: &mut revm::L1BlockInfo,
     ) -> Result<Self, OpEthApiError> {
         let timestamp = meta.timestamp;
         let block_number = meta.block_number;
@@ -208,8 +209,13 @@ impl OpReceiptBuilder {
                 }
             })?;
 
+        let mut new_l1_block_info = revm::L1BlockInfo::default();
+        new_l1_block_info.token_ratio = Some(U256::from(receipt.token_ratio().unwrap_or(0)));
+        new_l1_block_info.l1_base_fee = U256::from(receipt.l1_base_fee().unwrap_or(0));
+        new_l1_block_info.l1_fee_overhead = Some(U256::from(receipt.l1_fee_overhead().unwrap_or(0)));
+        new_l1_block_info.l1_base_fee_scalar = U256::from(receipt.l1_base_fee_scalar().unwrap_or(0));
         let op_receipt_fields = OpReceiptFieldsBuilder::new(timestamp, block_number)
-            .l1_block_info(chain_spec, transaction, l1_block_info)?
+            .l1_block_info(chain_spec, transaction, &mut new_l1_block_info)?
             .build();
 
         Ok(Self { core_receipt, op_receipt_fields })

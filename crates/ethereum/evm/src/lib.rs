@@ -25,7 +25,7 @@ use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_evm::{env::EvmEnv, ConfigureEvm, ConfigureEvmEnv, Database, Evm, NextBlockEnvAttributes};
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::transaction::execute::FillTxEnv;
-use revm::{inspector_handle_register, EvmBuilder};
+use revm::{inspector_handle_register, EvmBuilder, L1BlockInfo};
 use revm_primitives::{
     AnalysisKind, BlobExcessGasAndPrice, BlockEnv, Bytes, CfgEnv, CfgEnvWithHandlerCfg, EVMError,
     HaltReason, HandlerCfg, ResultAndState, SpecId, TxEnv, TxKind,
@@ -115,6 +115,10 @@ impl<EXT, DB: Database> Evm for EthEvm<'_, EXT, DB> {
 
     fn db_mut(&mut self) -> &mut Self::DB {
         &mut self.context.evm.db
+    }
+
+    fn get_l1_block_info(&self) -> Result<L1BlockInfo, Self::Error> {
+        unimplemented!()
     }
 }
 
