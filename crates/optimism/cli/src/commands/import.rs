@@ -19,7 +19,7 @@ use reth_prune::PruneModes;
 use reth_stages::StageId;
 use reth_static_file::StaticFileProducer;
 use std::{path::PathBuf, sync::Arc};
-use tracing::{debug, error, info};
+use tracing::{debug, warn, info};
 
 /// Syncs RLP encoded blocks from a file.
 #[derive(Debug, Parser)]
@@ -80,7 +80,7 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> ImportOpCommand<C> {
             );
 
             let tip = file_client.tip().ok_or_else(|| eyre::eyre!("file client has no tip"))?;
-            info!(target: "reth::cli", "Chain file chunk read");
+            info!(target: "reth::cli", ?tip, "Chain file chunk read");
 
             total_decoded_blocks += file_client.headers_len();
             total_decoded_txns += file_client.total_transactions();
@@ -135,7 +135,7 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> ImportOpCommand<C> {
         if total_decoded_blocks != total_imported_blocks ||
             total_decoded_txns != total_imported_txns + total_filtered_out_dup_txns
         {
-            error!(target: "reth::cli",
+            warn!(target: "reth::cli",
                 total_decoded_blocks,
                 total_imported_blocks,
                 total_decoded_txns,

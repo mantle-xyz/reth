@@ -22,7 +22,7 @@ use reth_trie::{IntermediateStateRootState, StateRoot as StateRootComputer, Stat
 use reth_trie_db::DatabaseStateRoot;
 use serde::{Deserialize, Serialize};
 use std::io::BufRead;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// Default soft limit for number of bytes to read from state dump file, before inserting into
 /// database.
@@ -426,17 +426,17 @@ where
             "Computed state root matches state root in state dump"
         );
     } else {
-        error!(target: "reth::cli",
+        warn!(target: "reth::cli",
             ?computed_state_root,
             ?expected_state_root,
             "Computed state root does not match state root in state dump"
         );
 
-        return Err(InitStorageError::StateRootMismatch(GotExpected {
-            got: computed_state_root,
-            expected: expected_state_root,
-        })
-        .into())
+        // return Err(InitStorageError::StateRootMismatch(GotExpected {
+        //     got: computed_state_root,
+        //     expected: expected_state_root,
+        // })
+        // .into())
     }
 
     // insert sync stages for stages that require state

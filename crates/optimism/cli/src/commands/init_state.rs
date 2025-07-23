@@ -12,7 +12,7 @@ use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_primitives::OpPrimitives;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
-    BlockNumReader, DatabaseProviderFactory, StaticFileProviderFactory, StaticFileWriter,
+    BlockNumReader, ChainStateBlockWriter, DatabaseProviderFactory, StaticFileProviderFactory, StaticFileWriter,
 };
 use std::{io::BufReader, str::FromStr, sync::Arc};
 use tracing::info;
@@ -61,6 +61,7 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
             let header_hash = self
                 .init_state
                 .header_hash
+                .or_else(|| Some(header.hash_slow().to_string()))
                 .ok_or_else(|| eyre::eyre!("Header hash must be provided"))?;
             let header_hash = B256::from_str(&header_hash)?;
 
@@ -74,11 +75,8 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
 
             if last_block_number == 0 {
                 info!(target: "reth::cli", "header: {:?}, header_hash: {:?}, total_difficulty: {:?}", header, header_hash, total_difficulty);
-                without_evm::setup_without_evm(
-                    &provider_rw,
-                    SealedHeader::new(header, header_hash),
-                    total_difficulty,
-                )?;
+                let sealed_header = SealedHeader::new(header, header_hash);
+                without_evm::setup_without_evm(&provider_rw, sealed_header, total_difficulty)?;
 
                 // SAFETY: it's safe to commit static files, since in the event of a crash, they
                 // will be unwound according to database checkpoints.
@@ -93,11 +91,16 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
             }
         }
 
-        info!(target: "reth::cli", "Initiating state dump");
+        info!(target: "reth::cli", path=?self.init_state.state, "Initiating state dump");
 
         let reader = BufReader::new(reth_fs_util::open(self.init_state.state)?);
         let hash = init_from_state_dump(reader, &provider_rw, config.stages.etl)?;
 
+        // Set safe and finalized blocks to the same block as the latest block
+        let block = provider_rw.last_block_number()?;
+        info!(target: "reth::cli", "Setting safe and finalized blocks to latest block number {}", block);
+        provider_rw.save_safe_block_number(block)?;
+        provider_rw.save_finalized_block_number(block)?;
         provider_rw.commit()?;
 
         info!(target: "reth::cli", hash = ?hash, "Genesis block written");

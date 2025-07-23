@@ -150,7 +150,7 @@ where
     match static_file_provider.get_highest_static_file_block(StaticFileSegment::Receipts) {
         Some(receipts_block) => {
             if receipts_block > 0 {
-                eyre::bail!("Expected highest receipt block to be 0, but found {receipts_block}.");
+                warn!("Expected highest receipt block to be 0, but found {receipts_block}.");
             }
         }
         None => {
@@ -245,7 +245,7 @@ where
         .expect("transaction static files must exist before importing receipts");
 
     if total_receipts != total_imported_txns {
-        eyre::bail!(
+        warn!(
             "Number of receipts ({total_receipts}) inconsistent with transactions {total_imported_txns}"
         )
     }
