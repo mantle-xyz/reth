@@ -47,22 +47,17 @@ where
         }
 
         let buf_slice = &mut src.as_ref();
-        let receipt = OpGethReceiptContainer::decode(buf_slice)
-            .map_err(|err| Self::Error::Rlp(err, src.to_vec()))?
-            .0;
+        let receipt =
+            OpGethReceipt::decode(buf_slice).map_err(|err| Self::Error::Rlp(err, src.to_vec()))?;
         src.advance(src.len() - buf_slice.len());
 
-        Ok(Some(
-            receipt
-                .map(|receipt| {
-                    let number = receipt.block_number;
-                    receipt
-                        .try_into()
-                        .map_err(Into::into)
-                        .map(|receipt| ReceiptWithBlockNumber { receipt, number })
-                })
-                .transpose()?,
-        ))
+        let number = receipt.block_number;
+        let receipt = receipt
+            .try_into()
+            .map_err(Into::into)
+            .map(|receipt| ReceiptWithBlockNumber { receipt, number })?;
+
+        Ok(Some(Some(receipt)))
     }
 }
 

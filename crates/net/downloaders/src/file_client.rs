@@ -241,7 +241,7 @@ impl<B: FullBlock<Header: reth_primitives_traits::BlockHeader>> FromReader
                 let block = match block_res {
                     Ok(block) => block,
                     Err(FileClientError::Rlp(err, bytes)) => {
-                        trace!(target: "downloaders::file",
+                        warn!(target: "downloaders::file",
                             %err,
                             bytes_len=bytes.len(),
                             "partial block returned from decoding chunk"
