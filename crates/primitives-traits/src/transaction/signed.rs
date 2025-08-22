@@ -143,11 +143,26 @@ where
 {
     fn tx_hash(&self) -> &TxHash {
         match self {
-            Self::Legacy(tx) => tx.hash(),
-            Self::Eip2930(tx) => tx.hash(),
-            Self::Eip1559(tx) => tx.hash(),
-            Self::Eip7702(tx) => tx.hash(),
-            Self::Eip4844(tx) => tx.hash(),
+            Self::Legacy(tx) => {
+                tracing::info!(target: "evm::evm", tx=?tx, "legacy transaction");
+                tx.hash()
+            }
+            Self::Eip2930(tx) => {
+                tracing::info!(target: "evm::evm", tx=?tx, "eip2930 transaction");
+                tx.hash()
+            }
+            Self::Eip1559(tx) => {
+                tracing::info!(target: "evm::evm", tx=?tx, "eip1559 transaction");
+                tx.hash()
+            }
+            Self::Eip7702(tx) => {
+                tracing::info!(target: "evm::evm", tx=?tx, "eip7702 transaction");
+                tx.hash()
+            }
+            Self::Eip4844(tx) => {
+                tracing::info!(target: "evm::evm", tx=?tx, "eip4844 transaction");
+                tx.hash()
+            }
         }
     }
 
@@ -180,10 +195,22 @@ mod op {
     impl SignedTransaction for OpPooledTransaction {
         fn tx_hash(&self) -> &TxHash {
             match self {
-                Self::Legacy(tx) => tx.hash(),
-                Self::Eip2930(tx) => tx.hash(),
-                Self::Eip1559(tx) => tx.hash(),
-                Self::Eip7702(tx) => tx.hash(),
+                Self::Legacy(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "legacy oppooledtransaction transaction");
+                    tx.hash()
+                }
+                Self::Eip2930(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "eip2930 oppooledtransaction transaction");
+                    tx.hash()
+                }
+                Self::Eip1559(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "eip1559 oppooledtransaction transaction");
+                    tx.hash()
+                }
+                Self::Eip7702(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "eip7702 oppooledtransaction transaction");
+                    tx.hash()
+                }
             }
         }
 
@@ -209,11 +236,26 @@ mod op {
     impl SignedTransaction for OpTxEnvelope {
         fn tx_hash(&self) -> &TxHash {
             match self {
-                Self::Legacy(tx) => tx.hash(),
-                Self::Eip2930(tx) => tx.hash(),
-                Self::Eip1559(tx) => tx.hash(),
-                Self::Eip7702(tx) => tx.hash(),
-                Self::Deposit(tx) => tx.hash_ref(),
+                Self::Legacy(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "legacy optxenvelope transaction");
+                    tx.hash()
+                }
+                Self::Eip2930(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "eip2930 optxenvelope transaction");
+                    tx.hash()
+                }
+                Self::Eip1559(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "eip1559 optxenvelope transaction");
+                    tx.hash()
+                }
+                Self::Eip7702(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "eip7702 optxenvelope transaction");
+                    tx.hash()
+                }
+                Self::Deposit(tx) => {
+                    tracing::info!(target: "evm::evm", tx=?tx, "deposit optxenvelope transaction");
+                    tx.hash_ref()
+                }
             }
         }
 
