@@ -2,8 +2,8 @@
 //!
 //! Block processing related to syncing should take care to update the metrics by using either
 //! [`ExecutorMetrics::execute_metered`] or [`ExecutorMetrics::metered_one`].
-use crate::{Database, OnStateHook};
-use alloy_consensus::BlockHeader;
+use crate::{execute::ExecutorTx, Database, OnStateHook};
+use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::{
     block::{BlockExecutor, StateChangeSource},
     Evm,
@@ -13,7 +13,7 @@ use metrics::{Counter, Gauge, Histogram};
 use reth_execution_errors::BlockExecutionError;
 use reth_execution_types::BlockExecutionOutput;
 use reth_metrics::Metrics;
-use reth_primitives_traits::{Block, BlockBody, RecoveredBlock};
+use reth_primitives_traits::{Block, BlockBody, RecoveredBlock, SignedTransaction};
 use revm::{
     database::{states::bundle_state::BundleRetention, State},
     state::EvmState,
@@ -127,7 +127,11 @@ impl ExecutorMetrics {
         let (mut db, result) = self.metered(input, || {
             executor.apply_pre_execution_changes()?;
             for tx in input.transactions_recovered() {
-                executor.execute_transaction(tx)?;
+                // 打印交易的基本信息，避免使用 Debug trait
+                tracing::info!(target: "evm::evm", sender=?tx.signer(), "Executing transaction");
+                executor.execute_transaction_with_result_closure(tx, |result| {
+                    tracing::info!(target: "evm::evm", receipt=?result, "Transaction execute result");
+                })?;
             }
             executor.finish().map(|(evm, result)| (evm.into_db(), result))
         })?;
@@ -137,7 +141,7 @@ impl ExecutorMetrics {
         let output = BlockExecutionOutput { result, state: db.borrow_mut().take_bundle() };
 
         // Update the metrics for the number of accounts, storage slots and bytecodes updated
-        let accounts = output.state.state.len();
+        let accounts: usize = output.state.state.len();
         let storage_slots =
             output.state.state.values().map(|account| account.storage.len()).sum::<usize>();
         let bytecodes = output.state.contracts.len();
@@ -303,9 +307,9 @@ mod tests {
 
         for metric in snapshot {
             let metric_name = metric.0.key().name();
-            if metric_name == "sync.execution.accounts_loaded_histogram" ||
-                metric_name == "sync.execution.storage_slots_loaded_histogram" ||
-                metric_name == "sync.execution.bytecodes_loaded_histogram"
+            if metric_name == "sync.execution.accounts_loaded_histogram"
+                || metric_name == "sync.execution.storage_slots_loaded_histogram"
+                || metric_name == "sync.execution.bytecodes_loaded_histogram"
             {
                 if let DebugValue::Histogram(vs) = metric.3 {
                     assert!(

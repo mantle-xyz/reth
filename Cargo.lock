@@ -8355,6 +8355,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm",
+ "tracing",
 ]
 
 [[package]]
@@ -9556,6 +9557,7 @@ dependencies = [
  "serde_with",
  "test-fuzz",
  "thiserror 2.0.12",
+ "tracing",
 ]
 
 [[package]]
