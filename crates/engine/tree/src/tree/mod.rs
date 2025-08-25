@@ -2631,6 +2631,11 @@ where
                 contract_bytecode_hash=?account.bytecode_hash,
                 "Target contract state before execution"
             );
+            let storage_root = state_provider.storage_root(to, Default::default()).unwrap();
+            tracing::info!(target: "engine::tree",
+                storage_root=?storage_root,
+                "Storage root"
+            );
         } else {
             tracing::info!(target: "engine::tree",
                     target_contract=?to,
