@@ -17,6 +17,7 @@ reth-evm = { workspace = true, features = ["op"] }
 reth-primitives-traits.workspace = true
 reth-execution-errors.workspace = true
 reth-execution-types.workspace = true
+tracing.workspace = true
 
 # ethereum
 alloy-eips.workspace = true

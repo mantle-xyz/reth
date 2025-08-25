@@ -9188,6 +9188,7 @@ dependencies = [
  "reth-revm",
  "revm",
  "thiserror 2.0.12",
+ "tracing",
 ]
 
 [[package]]

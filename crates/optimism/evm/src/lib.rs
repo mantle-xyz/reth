@@ -153,6 +153,7 @@ where
                 BlobExcessGasAndPrice::new(excess_blob_gas, spec.into_eth_spec() >= SpecId::PRAGUE)
             }),
         };
+        tracing::info!(target: "optimism::evm", block_env=?block_env, cfg_env=?cfg_env, "Executing block");
 
         EvmEnv { cfg_env, block_env }
     }
