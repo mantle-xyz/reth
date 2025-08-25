@@ -2619,6 +2619,24 @@ where
             .with_bundle_update()
             .without_state_clear()
             .build();
+        use std::str::FromStr;
+        let to = revm_primitives::Address::from_str("0x4200000000000000000000000000000000000015")
+            .unwrap();
+        // 获取合约账户信息
+        if let Ok(Some(account)) = state_provider.basic_account(&to) {
+            tracing::info!(target: "engine::tree",
+                target_contract=?to,
+                contract_balance=?account.balance,
+                contract_nonce=?account.nonce,
+                contract_bytecode_hash=?account.bytecode_hash,
+                "Target contract state before execution"
+            );
+        } else {
+            tracing::info!(target: "engine::tree",
+                    target_contract=?to,
+                    "Target contract not found or error getting state"
+            );
+        }
         let executor = self.evm_config.executor_for_block(&mut db, block);
         let execution_start = Instant::now();
         let output = self.metrics.executor.execute_metered(
