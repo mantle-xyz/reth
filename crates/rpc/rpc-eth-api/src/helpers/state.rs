@@ -107,9 +107,9 @@ pub trait EthState: LoadState + SpawnBlocking {
                 .map_err(Self::Error::from_eth_err)?
                 .ok_or(EthApiError::HeaderNotFound(block_id))?;
             let max_window = self.max_proof_window();
-            if chain_info.best_number.saturating_sub(block_number) > max_window {
-                return Err(EthApiError::ExceedsMaxProofWindow.into())
-            }
+            // if chain_info.best_number.saturating_sub(block_number) > max_window {
+            //     return Err(EthApiError::ExceedsMaxProofWindow.into())
+            // }
 
             self.spawn_blocking_io(move |this| {
                 let state = this.state_at_block_id(block_id)?;
@@ -143,7 +143,7 @@ pub trait EthState: LoadState + SpawnBlocking {
                 .ok_or(EthApiError::HeaderNotFound(block_id))?;
             let max_window = this.max_proof_window();
             if chain_info.best_number.saturating_sub(block_number) > max_window {
-                return Err(EthApiError::ExceedsMaxProofWindow.into())
+                return Err(EthApiError::ExceedsMaxProofWindow.into());
             }
 
             let balance = account.balance;
