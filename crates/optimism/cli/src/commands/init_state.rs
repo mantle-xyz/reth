@@ -68,7 +68,7 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
             let total_difficulty = self
                 .init_state
                 .total_difficulty
-                .ok_or_else(|| eyre::eyre!("Total difficulty must be provided"))?;
+                .unwrap_or_else(|| "0".to_string());
             let total_difficulty = U256::from_str(&total_difficulty)?;
 
             let last_block_number = provider_rw.last_block_number()?;
