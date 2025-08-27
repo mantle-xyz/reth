@@ -127,7 +127,11 @@ impl ExecutorMetrics {
         let (mut db, result) = self.metered(input, || {
             executor.apply_pre_execution_changes()?;
             for tx in input.transactions_recovered() {
-                executor.execute_transaction(tx)?;
+                // 打印交易的基本信息，避免使用 Debug trait
+                tracing::info!(target: "evm::evm", sender=?tx.signer(), "Executing transaction");
+                executor.execute_transaction_with_result_closure(tx, |result| {
+                    tracing::info!(target: "evm::evm", receipt=?result, "Transaction execute result");
+                })?;
             }
             executor.finish().map(|(evm, result)| (evm.into_db(), result))
         })?;

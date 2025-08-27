@@ -337,11 +337,53 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
+        // 获取执行前的 state root
+        let pre_state_root = state.state_root_with_updates(HashedPostState::default())
+        .map_err(BlockExecutionError::other)?
+        .0;
+        
+        // 打印执行前的 state root
+        tracing::info!(target: "evm::execute", 
+            pre_state_root=?pre_state_root,
+            "State root before execution"
+        );
+
         // calculate the state root
         let hashed_state = state.hashed_post_state(&db.bundle_state);
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
+
+        // 打印执行后的 state root 和变化
+        tracing::info!(target: "evm::execute", 
+            post_state_root=?state_root,
+            pre_state_root=?pre_state_root,
+            state_root_changed=pre_state_root != state_root,
+            "State root after execution"
+        );
+
+        // 如果 state root 发生变化，打印详细信息
+        if pre_state_root != state_root {
+            tracing::info!(target: "evm::execute", 
+                pre_state_root=?pre_state_root,
+                post_state_root=?state_root,
+                "State root changed during execution"
+            );
+            
+            // 打印账户变化统计
+            let account_changes = hashed_state.accounts.len();
+            let storage_changes: usize = hashed_state.storages.values()
+                .map(|storage| storage.storage.len())
+                .sum();
+            let storages_changes = hashed_state.storages.len();
+            
+            tracing::info!(target: "evm::execute", 
+                account_changes=account_changes,
+                storage_changes=storage_changes,
+                storages_changes=storages_changes,
+                "State changes summary"
+            );
+        }
 
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();

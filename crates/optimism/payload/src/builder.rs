@@ -668,7 +668,9 @@ where
                 return Ok(Some(()))
             }
 
-            let gas_used = match builder.execute_transaction(tx.clone()) {
+            let gas_used = match builder.execute_transaction_with_result_closure(tx.clone(), |result| {
+                tracing::info!(target: "payload_builder", tx=?tx.tx_hash(), result=?result, "tx result");
+            }) {
                 Ok(gas_used) => gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
