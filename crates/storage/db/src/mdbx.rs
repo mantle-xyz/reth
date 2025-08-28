@@ -14,10 +14,12 @@ pub fn create_db<P: AsRef<Path>>(path: P, args: DatabaseArguments) -> eyre::Resu
 
     let rpath = path.as_ref();
     if is_database_empty(rpath) {
+        tracing::info!(target: "reth::cli", "Creating database directory {}", rpath.display());
         reth_fs_util::create_dir_all(rpath)
             .wrap_err_with(|| format!("Could not create database directory {}", rpath.display()))?;
         create_db_version_file(rpath)?;
     } else {
+        tracing::info!(target: "reth::cli", "Database directory already exists {}", rpath.display());
         match check_db_version_file(rpath) {
             Ok(_) => (),
             Err(DatabaseVersionError::MissingFile) => create_db_version_file(rpath)?,

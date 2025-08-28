@@ -2407,6 +2407,7 @@ where
         // See https://github.com/paradigmxyz/reth/issues/12688 for more details
         let persisting_kind = self.persisting_kind_for(block.header());
         let run_parallel_state_root = persisting_kind.can_run_parallel_state_root();
+        info!(target: "engine::tree", ?persisting_kind, ?run_parallel_state_root, use_state_root_task = ?self.config.use_state_root_task(), "Persisting kind and run parallel state root");
 
         // use prewarming background task
         let header = block.clone_sealed_header();

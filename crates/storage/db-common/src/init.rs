@@ -10,11 +10,7 @@ use reth_db_api::{tables, transaction::DbTxMut, DatabaseError};
 use reth_etl::Collector;
 use reth_primitives_traits::{Account, Bytecode, GotExpected, NodePrimitives, StorageEntry};
 use reth_provider::{
-    errors::provider::ProviderResult, providers::StaticFileWriter, writer::UnifiedStorageWriter,
-    BlockHashReader, BlockNumReader, BundleStateInit, ChainSpecProvider, DBProvider,
-    DatabaseProviderFactory, ExecutionOutcome, HashingWriter, HeaderProvider, HistoryWriter,
-    OriginalValuesKnown, ProviderError, RevertsInit, StageCheckpointReader, StageCheckpointWriter,
-    StateWriter, StaticFileProviderFactory, StorageLocation, TrieWriter,
+    errors::provider::ProviderResult, providers::StaticFileWriter, writer::UnifiedStorageWriter, BlockHashReader, BlockNumReader, BundleStateInit, ChainSpecProvider, DBProvider, DatabaseProviderFactory, ExecutionOutcome, HashingWriter, HeaderProvider, HistoryWriter, OriginalValuesKnown, ProviderError, RevertsInit, StageCheckpointReader, StageCheckpointWriter, StateRootProvider, StateWriter, StaticFileProviderFactory, StorageLocation, TrieWriter
 };
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
@@ -279,9 +275,12 @@ where
     trace!(target: "reth::cli", "Inserted account hashes");
 
     let alloc_storage = alloc.filter_map(|(addr, account)| {
+        info!(target: "reth::cli", "insert_genesis_hashes addr: {}", addr);
         // only return Some if there is storage
         account.storage.as_ref().map(|storage| {
-            (*addr, storage.iter().map(|(&key, &value)| StorageEntry { key, value: value.into() }))
+            (*addr, storage.iter().map(|(&key, &value)| {
+                info!(target: "reth::cli", "insert_genesis_hashes key: {}, value: {}", key, value);
+            StorageEntry { key, value: value.into() }}))
         })
     });
     provider.insert_storage_for_hashing(alloc_storage)?;
@@ -378,6 +377,7 @@ where
         + HashingWriter
         + TrieWriter
         + StateWriter
+        + StateRootProvider  // 添加这个约束
         + AsRef<Provider>,
 {
     if etl_config.file_size == 0 {
@@ -502,6 +502,7 @@ where
         + HashingWriter
         + HistoryWriter
         + StateWriter
+        + StateRootProvider
         + AsRef<Provider>,
 {
     let accounts_len = collector.len();
@@ -525,11 +526,17 @@ where
                 "Writing accounts to db"
             );
 
+            let pre_state_root = provider_rw.state_root(Default::default())?;
+            info!(target: "reth::cli", "Pre state root: {}", pre_state_root);
+
             // use transaction to insert genesis header
             insert_genesis_hashes(
                 provider_rw,
                 accounts.iter().map(|(address, account)| (address, account)),
             )?;
+
+            let post_state_root = provider_rw.state_root(Default::default())?;
+            info!(target: "reth::cli", "Post insert genesis hashes state root: {}", post_state_root);
 
             insert_history(
                 provider_rw,
@@ -537,12 +544,18 @@ where
                 block,
             )?;
 
+            let post_state_root = provider_rw.state_root(Default::default())?;
+            info!(target: "reth::cli", "Post insert history state root: {}", post_state_root);
+
             // block is already written to static files
             insert_state(
                 provider_rw,
                 accounts.iter().map(|(address, account)| (address, account)),
                 block,
             )?;
+
+            let post_state_root = provider_rw.state_root(Default::default())?;
+            info!(target: "reth::cli", "Post insert state state root: {}", post_state_root);
 
             accounts.clear();
         }
@@ -554,9 +567,12 @@ where
 /// database.
 fn compute_state_root<Provider>(provider: &Provider) -> eyre::Result<B256>
 where
-    Provider: DBProvider<Tx: DbTxMut> + TrieWriter,
+    Provider: DBProvider<Tx: DbTxMut> + TrieWriter + StateRootProvider,
 {
-    trace!(target: "reth::cli", "Computing state root");
+    info!(target: "reth::cli", "Computing state root");
+
+    let pre_state_root = provider.state_root(Default::default())?;
+    info!(target: "reth::cli", "Pre state root: {}", pre_state_root);
 
     let tx = provider.tx_ref();
     let mut intermediate_state: Option<IntermediateStateRootState> = None;
@@ -571,7 +587,7 @@ where
                 let updated_len = provider.write_trie_updates(&updates)?;
                 total_flushed_updates += updated_len;
 
-                trace!(target: "reth::cli",
+                info!(target: "reth::cli",
                     last_account_key = %state.last_account_key,
                     updated_len,
                     total_flushed_updates,
@@ -591,7 +607,7 @@ where
                 let updated_len = provider.write_trie_updates(&updates)?;
                 total_flushed_updates += updated_len;
 
-                trace!(target: "reth::cli",
+                info!(target: "reth::cli",
                     %root,
                     updated_len,
                     total_flushed_updates,

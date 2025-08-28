@@ -3,10 +3,9 @@ use alloy_primitives::{BlockNumber, B256, U256};
 use alloy_rlp::Decodable;
 use reth_codecs::Compact;
 use reth_node_builder::NodePrimitives;
-use reth_primitives_traits::{SealedBlock, SealedHeader, SealedHeaderFor};
+use reth_primitives_traits::{Block, SealedBlock, SealedHeader, SealedHeaderFor};
 use reth_provider::{
-    providers::StaticFileProvider, BlockWriter, ProviderResult, StageCheckpointWriter,
-    StaticFileProviderFactory, StaticFileWriter, StorageLocation,
+    providers::StaticFileProvider, BlockNumReader, BlockReader, BlockWriter, ProviderResult, StageCheckpointWriter, StaticFileProviderFactory, StaticFileWriter, StorageLocation, TransactionsProvider
 };
 use reth_stages::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
@@ -15,7 +14,7 @@ use tracing::info;
 
 /// Reads the header RLP from a file and returns the Header.
 pub fn read_header_from_file(path: PathBuf) -> Result<Header, eyre::Error> {
-    let mut file = File::open(path)?;
+    let mut file = File::open(path.clone()).map_err(|e| eyre::eyre!("Failed to open file: {}, error: {}", path.to_string_lossy(), e))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
 
@@ -33,13 +32,20 @@ pub fn setup_without_evm<Provider>(
 where
     Provider: StaticFileProviderFactory<Primitives: NodePrimitives<BlockHeader = Header>>
         + StageCheckpointWriter
-        + BlockWriter<Block = <Provider::Primitives as NodePrimitives>::Block>,
+        + BlockWriter<Block = <Provider::Primitives as NodePrimitives>::Block>
+        + BlockNumReader
+        + BlockReader<Block = <Provider::Primitives as NodePrimitives>::Block>,
 {
     info!(target: "reth::cli", new_tip = ?header.num_hash(), "Setting up dummy EVM chain before importing state.");
 
     let static_file_provider = provider_rw.static_file_provider();
-    // Write EVM dummy data up to `header - 1` block
-    append_dummy_chain(&static_file_provider, header.number() - 1)?;
+
+    let last_block_number = provider_rw.last_block_number()?;
+    if last_block_number == 0 {
+        // Write EVM dummy data up to `header - 1` block
+        append_dummy_chain(&static_file_provider, header.number() - 1)?;
+    }
+
 
     info!(target: "reth::cli", "Appending first valid block.");
 
@@ -65,12 +71,20 @@ fn append_first_block<Provider>(
 ) -> ProviderResult<()>
 where
     Provider: BlockWriter<Block = <Provider::Primitives as NodePrimitives>::Block>
-        + StaticFileProviderFactory<Primitives: NodePrimitives<BlockHeader: Compact>>,
+        + StaticFileProviderFactory<Primitives: NodePrimitives<BlockHeader: Compact>>
+        + BlockReader<Block = <Provider::Primitives as NodePrimitives>::Block>,
 {
+    // 尝试从 provider 中读取 block body，如果没有则使用默认值
+    let body = if let Some(block) = provider_rw.block_by_hash(header.hash())? {
+        block.into_body()
+    } else {
+        Default::default()
+    };
+
     provider_rw.insert_block(
         SealedBlock::<<Provider::Primitives as NodePrimitives>::Block>::from_sealed_parts(
             header.clone(),
-            Default::default(),
+            body,
         )
         .try_recover()
         .expect("no senders or txes"),

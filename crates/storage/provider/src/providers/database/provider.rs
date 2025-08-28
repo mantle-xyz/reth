@@ -54,13 +54,13 @@ use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
     BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider,
-    StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
+    StateProvider, StateRootProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
 };
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
     updates::{StorageTrieUpdates, TrieUpdates},
-    HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles,
+    HashedPostState, HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles, TrieInput,
 };
 use reth_trie_db::{DatabaseStateRoot, DatabaseStorageTrieCursor};
 use revm_database::states::{
@@ -2377,6 +2377,34 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
         let cursor = self.tx_ref().cursor_dup_write::<tables::StoragesTrie>()?;
         let mut trie_db_cursor = DatabaseStorageTrieCursor::new(cursor, hashed_address);
         Ok(trie_db_cursor.write_storage_trie_updates(updates)?)
+    }
+}
+
+impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StateRootProvider for DatabaseProvider<TX, N> {
+    fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
+        StateRoot::overlay_root(self.tx_ref(), hashed_state)
+            .map_err(|err| ProviderError::Database(err.into()))
+    }
+
+    fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
+        StateRoot::overlay_root_from_nodes(self.tx_ref(), input)
+            .map_err(|err| ProviderError::Database(err.into()))
+    }
+
+    fn state_root_with_updates(
+        &self,
+        hashed_state: HashedPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        StateRoot::overlay_root_with_updates(self.tx_ref(), hashed_state)
+            .map_err(|err| ProviderError::Database(err.into()))
+    }
+
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: TrieInput,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        StateRoot::overlay_root_from_nodes_with_updates(self.tx_ref(), input)
+            .map_err(|err| ProviderError::Database(err.into()))
     }
 }
 

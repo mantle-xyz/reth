@@ -19,8 +19,7 @@ use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
 };
 use reth_provider::{
-    providers::{BlockchainProvider, NodeTypesForProvider, StaticFileProvider},
-    ProviderFactory, StaticFileProviderFactory,
+    providers::{BlockchainProvider, NodeTypesForProvider, StaticFileProvider}, DatabaseProviderFactory, ProviderFactory, StateRootProvider, StaticFileProviderFactory
 };
 use reth_stages::{sets::DefaultStages, Pipeline, PipelineTarget};
 use reth_static_file::StaticFileProducer;
@@ -99,10 +98,14 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         };
 
         let provider_factory = self.create_provider_factory(&config, db, sfp)?;
+        let pre_state_root = provider_factory.database_provider_rw()?.state_root(Default::default())?;
+        info!(target: "reth::cli", "common init-state state root: {}", pre_state_root);
         if access.is_read_write() {
             debug!(target: "reth::cli", chain=%self.chain.chain(), genesis=?self.chain.genesis_hash(), "Initializing genesis");
             init_genesis(&provider_factory)?;
         }
+        let post_state_root = provider_factory.database_provider_rw()?.state_root(Default::default())?;
+        info!(target: "reth::cli", "common post init-state state root: {}", post_state_root);
 
         Ok(Environment { config, provider_factory, data_dir })
     }

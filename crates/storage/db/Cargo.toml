@@ -27,6 +27,8 @@ alloy-primitives.workspace = true
 reth-libmdbx = { workspace = true, optional = true, features = ["return-borrowed", "read-tx-timeouts"] }
 eyre = { workspace = true, optional = true }
 
+tracing.workspace = true
+
 # metrics
 reth-metrics = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }

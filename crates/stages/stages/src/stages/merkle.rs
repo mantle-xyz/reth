@@ -223,7 +223,8 @@ where
                 })?;
             match progress {
                 StateRootProgress::Progress(state, hashed_entries_walked, updates) => {
-                    provider.write_trie_updates(&updates)?;
+                    let updated_len = provider.write_trie_updates(&updates)?;
+                    tracing::info!(target: "sync::stages::merkle::exec", updated_len, "0 Updated trie");
 
                     let checkpoint = MerkleCheckpoint::new(
                         to_block,
@@ -243,7 +244,8 @@ where
                     })
                 }
                 StateRootProgress::Complete(root, hashed_entries_walked, updates) => {
-                    provider.write_trie_updates(&updates)?;
+                    let updated_len = provider.write_trie_updates(&updates)?;
+                    tracing::info!(target: "sync::stages::merkle::exec", updated_len, "1 Updated trie");
 
                     entities_checkpoint.processed += hashed_entries_walked as u64;
 
@@ -259,7 +261,8 @@ where
                         StageError::Fatal(Box::new(e))
                     })?;
 
-            provider.write_trie_updates(&updates)?;
+            let updated_len = provider.write_trie_updates(&updates)?;
+            tracing::info!(target: "sync::stages::merkle::exec", updated_len, "2 Updated trie");
 
             let total_hashed_entries = (provider.count_entries::<tables::HashedAccounts>()? +
                 provider.count_entries::<tables::HashedStorages>()?)
@@ -335,7 +338,8 @@ where
             validate_state_root(block_root, SealedHeader::seal_slow(target), input.unwind_to)?;
 
             // Validation passed, apply unwind changes to the database.
-            provider.write_trie_updates(&updates)?;
+            let updated_len = provider.write_trie_updates(&updates)?;
+            tracing::info!(target: "sync::stages::merkle::unwind", updated_len, "Updated trie");
 
             // TODO(alexey): update entities checkpoint
         }

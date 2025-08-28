@@ -13,6 +13,7 @@ use reth_optimism_primitives::OpPrimitives;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
     BlockNumReader, ChainStateBlockWriter, DatabaseProviderFactory, StaticFileProviderFactory, StaticFileWriter,
+    StateRootProvider,
 };
 use std::{io::BufReader, str::FromStr, sync::Arc};
 use tracing::info;
@@ -48,6 +49,8 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
 
         let static_file_provider = provider_factory.static_file_provider();
         let provider_rw = provider_factory.database_provider_rw()?;
+        let pre_state_root = provider_rw.state_root(Default::default())?;
+        info!(target: "reth::cli", "exec init-state state root: {}", pre_state_root);
 
         if self.init_state.without_evm {
             info!(target: "reth::cli", "Initializing state without EVM historical data");

@@ -7623,6 +7623,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 2.0.14",
+ "tracing",
 ]
 
 [[package]]

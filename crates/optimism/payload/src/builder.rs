@@ -307,6 +307,8 @@ impl<Txs> OpBuilder<'_, Txs> {
         // 2. execute sequencer transactions
         let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
 
+        tracing::info!(target: "optimism::payload_builder", "info: {:?}", info);
+        
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool {
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
