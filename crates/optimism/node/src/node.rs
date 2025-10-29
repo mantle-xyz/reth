@@ -36,7 +36,7 @@ use reth_optimism_payload_builder::{
 };
 use reth_optimism_primitives::{DepositReceipt, OpPrimitives, OpReceipt, OpTransactionSigned};
 use reth_optimism_rpc::{
-    eth::{ext::OpEthExtApi, OpEthApiBuilder},
+    eth::{ext::OpEthExtApi, mantle_ext::MantleEthExtApi, OpEthApiBuilder},
     miner::{MinerApiExtServer, OpMinerExtApi},
     witness::{DebugExecutionWitnessApiServer, OpDebugWitnessApi},
     OpEthApi, OpEthApiError, SequencerClient,
@@ -49,7 +49,7 @@ use reth_optimism_txpool::{
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions, EthStorage};
 use reth_rpc_api::DebugApiServer;
-use reth_rpc_eth_api::ext::L2EthApiExtServer;
+use reth_rpc_eth_api::{ext::L2EthApiExtServer, MantleEthApiServer};
 use reth_rpc_eth_types::error::FromEvmError;
 use reth_rpc_server_types::RethRpcModule;
 use reth_tracing::tracing::{debug, info};
@@ -328,6 +328,9 @@ where
             ctx.node.provider().clone(),
         );
 
+        let mantle_ext: MantleEthExtApi<N::Provider> =
+            MantleEthExtApi::new(ctx.node.provider().clone());
+
         rpc_add_ons
             .launch_add_ons_with(ctx, move |modules, auth_modules, registry| {
                 debug!(target: "reth::cli", "Installing debug payload witness rpc endpoint");
@@ -358,6 +361,10 @@ where
                         tx_conditional_ext.into_rpc(),
                     )?;
                 }
+
+                // extend the eth namespace with mantle methods
+                info!(target: "reth::cli", "Installing Mantle RPC extension endpoints");
+                modules.merge_if_module_configured(RethRpcModule::Eth, mantle_ext.into_rpc())?;
 
                 Ok(())
             })
