@@ -1,8 +1,8 @@
 //! `eth_` Extension traits.
 
+use alloy_json_rpc::RpcObject;
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_eth::erc4337::TransactionConditional;
-use alloy_rpc_types_eth::Block;
 use alloy_eips::BlockNumberOrTag;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 
@@ -78,7 +78,7 @@ pub struct PreconfLog {
 /// This trait provides Mantle-specific RPC methods that extend the standard Ethereum RPC API.
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "eth"))]
 #[cfg_attr(feature = "client", rpc(server, client, namespace = "eth"))]
-pub trait MantleEthApi {
+pub trait MantleEthApi<B: RpcObject> {
     /// Returns a list of blocks in the specified range.
     /// 
     /// # Parameters
@@ -100,7 +100,7 @@ pub trait MantleEthApi {
         start_number: BlockNumberOrTag,
         end_number: BlockNumberOrTag,
         full_transactions: bool,
-    ) -> RpcResult<Vec<Block>>;
+    ) -> RpcResult<Vec<B>>;
 
     /// Sends a raw transaction with preconfirmation support.
     /// 

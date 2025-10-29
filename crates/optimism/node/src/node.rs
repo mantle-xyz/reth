@@ -328,8 +328,9 @@ where
             ctx.node.provider().clone(),
         );
 
-        let mantle_ext: MantleEthExtApi<N::Provider> =
-            MantleEthExtApi::new(ctx.node.provider().clone());
+        // We need to create mantle_ext inside the closure since it requires access to registry.eth_api()
+        // Here we just define a placeholder; it will be actually created inside the closure.
+        let provider = ctx.node.provider().clone();
 
         rpc_add_ons
             .launch_add_ons_with(ctx, move |modules, auth_modules, registry| {
@@ -364,6 +365,8 @@ where
 
                 // extend the eth namespace with mantle methods
                 info!(target: "reth::cli", "Installing Mantle RPC extension endpoints");
+                let mantle_ext: MantleEthExtApi<N::Provider, OpEthApi<N>> =
+                    MantleEthExtApi::new(provider.clone(), Arc::new(registry.eth_api().clone()));
                 modules.merge_if_module_configured(RethRpcModule::Eth, mantle_ext.into_rpc())?;
 
                 Ok(())
