@@ -365,8 +365,10 @@ where
 
                 // extend the eth namespace with mantle methods
                 info!(target: "reth::cli", "Installing Mantle RPC extension endpoints");
+                let eth_api = registry.eth_api();
+                let sequencer_client = eth_api.sequencer_client().cloned();
                 let mantle_ext: MantleEthExtApi<N::Provider, OpEthApi<N>> =
-                    MantleEthExtApi::new(provider.clone(), Arc::new(registry.eth_api().clone()));
+                    MantleEthExtApi::new(provider.clone(), Arc::new(eth_api.clone()), sequencer_client);
                 modules.merge_if_module_configured(RethRpcModule::Eth, mantle_ext.into_rpc())?;
 
                 Ok(())

@@ -9,6 +9,8 @@ use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{BlockNumReader, BlockReaderIdExt, StateProviderFactory};
 use std::sync::Arc;
 
+use crate::SequencerClient;
+
 /// Mantle-specific `Eth` API extensions implementation.
 ///
 /// This provides Mantle-specific RPC methods such as `getBlockRange` and
@@ -19,6 +21,8 @@ pub struct MantleEthExtApi<Provider, EthApi> {
     provider: Provider,
     /// The Eth API used to fetch blocks.
     eth_api: Arc<EthApi>,
+    /// Optional sequencer client for forwarding transactions.
+    sequencer_client: Option<SequencerClient>,
 }
 
 impl<Provider, EthApi> MantleEthExtApi<Provider, EthApi>
@@ -27,8 +31,12 @@ where
 {
     /// Creates a new [`MantleEthExtApi`].
     #[allow(clippy::missing_const_for_fn)] // Provider type is generic and cannot be const
-    pub fn new(provider: Provider, eth_api: Arc<EthApi>) -> Self {
-        Self { provider, eth_api }
+    pub fn new(
+        provider: Provider,
+        eth_api: Arc<EthApi>,
+        sequencer_client: Option<SequencerClient>,
+    ) -> Self {
+        Self { provider, eth_api, sequencer_client }
     }
 
     #[inline]
@@ -130,12 +138,27 @@ where
         Ok(blocks)
     }
 
-    async fn send_raw_transaction_with_preconf(&self, _bytes: Bytes) -> RpcResult<PreconfTxEvent> {
-        // TODO: Implement sendRawTransactionWithPreconf for Mantle
-        Err(ErrorObject::owned(
-            -32000,
-            "sendRawTransactionWithPreconf is not yet implemented",
-            None::<()>,
-        ))
+    async fn send_raw_transaction_with_preconf(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
+        // If we have a sequencer client, forward the transaction to it
+        if let Some(sequencer) = self.sequencer_client.as_ref() {
+            tracing::debug!(target: "rpc::eth", "forwarding raw transaction with preconf to sequencer");
+            sequencer
+                .forward_raw_transaction_with_preconf(bytes.as_ref())
+                .await
+                .map_err(|err| {
+                    ErrorObject::owned(
+                        -32000,
+                        format!("failed to forward tx to sequencer, please try again. Error message: '{err}'"),
+                        None::<()>,
+                    )
+                })
+        } else {
+            // If no sequencer client is available, return an error
+            Err(ErrorObject::owned(
+                -32000,
+                "sendRawTransactionWithPreconf is not yet implemented: sequencer client not configured",
+                None::<()>,
+            ))
+        }
     }
 }
