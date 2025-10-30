@@ -31,6 +31,7 @@ pub struct PreconfTxEvent {
     /// Optional failure message
     pub reason: String,
     /// Predicted L2 block number
+    #[serde(with = "alloy_serde::quantity")]
     pub block_height: u64,
     /// Preconfirmation transaction receipt
     pub receipt: PreconfTxReceipt,
