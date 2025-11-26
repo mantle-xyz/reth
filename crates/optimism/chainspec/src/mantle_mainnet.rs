@@ -21,7 +21,7 @@ use reth_primitives_traits::SealedHeader;
 /// | jq -r '.result.hash'
 /// ```
 const MANTLE_MAINNET_GENESIS_HASH: alloy_primitives::B256 =
-    alloy_primitives::b256!("0x0a0eb32c4b024b28da5bf83356f7987c1b0612bbfbc9156186c59c834bfcd013");
+    alloy_primitives::b256!("0xcd3253817bbf6ae83c9839c362a0688a83d59d2fabeb9463b348cc98c4b056aa");
 
 /// The Mantle Mainnet spec with hardcoded Skadi timestamp
 pub static MANTLE_MAINNET: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
