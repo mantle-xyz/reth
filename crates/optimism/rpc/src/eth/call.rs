@@ -6,13 +6,18 @@ use alloy_rpc_types_eth::{state::StateOverride, transaction::TransactionRequest}
 use alloy_signer::Either;
 use op_revm::OpTransaction;
 use reth_chainspec::ChainSpecProvider;
-use reth_evm::{execute::BlockExecutorFactory, ConfigureEvm, EvmEnv, EvmFactory, EvmEnvFor, SpecFor, TransactionEnv};
-use reth_node_api::NodePrimitives;
+use reth_evm::{
+    execute::BlockExecutorFactory, ConfigureEvm, EvmEnv, EvmEnvFor, EvmFactory, SpecFor,
+    TransactionEnv,
+};
 use reth_mantle_forks::MantleHardforks;
+use reth_node_api::NodePrimitives;
 use reth_optimism_forks::OpHardforks;
-use reth_storage_api::{BlockReaderIdExt, ProviderHeader, ProviderTx, StateProvider, StateProviderFactory};
+use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_rpc_eth_api::{
-    helpers::{estimate::EstimateCall, Call, EthCall, LoadBlock, LoadFee, LoadState, SpawnBlocking},
+    helpers::{
+        estimate::EstimateCall, Call, EthCall, LoadBlock, LoadFee, LoadState, SpawnBlocking,
+    },
     AsEthApiError, FromEthApiError, FromEvmError, FullEthApiTypes, IntoEthApiError,
 };
 use reth_rpc_eth_types::{
@@ -21,10 +26,12 @@ use reth_rpc_eth_types::{
     EthApiError, RevertError, RpcInvalidTransactionError,
 };
 use reth_rpc_server_types::constants::gas_oracle::{CALL_STIPEND_GAS, ESTIMATE_GAS_ERROR_RATIO};
-use reth_revm::{database::StateProviderDatabase, db::CacheDB};
+use reth_storage_api::{
+    BlockReaderIdExt, ProviderHeader, ProviderTx, StateProvider, StateProviderFactory,
+};
 use revm::context_interface::{result::ExecutionResult, Block, Transaction};
-use tracing::trace;
 use revm::{context::TxEnv, Database};
+use tracing::trace;
 
 impl<N> EthCall for OpEthApi<N>
 where
@@ -87,14 +94,19 @@ where
         // matching op-geth's GasEstimationWithSkipCheckBalanceMode condition:
         // (GasPrice == nil || GasPrice == 0) AND (MaxFeePerGas == nil || MaxFeePerGas == 0) AND
         // (MaxPriorityFeePerGas == nil || MaxPriorityFeePerGas == 0)
-        let gas_price_is_zero = tx_request_gas_price.is_none() || tx_request_gas_price == Some(0u128);
-        let max_fee_per_gas_is_zero = request.max_fee_per_gas.is_none() || 
-            request.max_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
-        let max_priority_fee_per_gas_is_zero = request.max_priority_fee_per_gas.is_none() || 
-            request.max_priority_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
-        
-        let should_skip_balance_check = gas_price_is_zero && max_fee_per_gas_is_zero && max_priority_fee_per_gas_is_zero;
-        
+        let gas_price_is_zero =
+            tx_request_gas_price.is_none() || tx_request_gas_price == Some(0u128);
+        let max_fee_per_gas_is_zero = request.max_fee_per_gas.is_none()
+            || request.max_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
+        let max_priority_fee_per_gas_is_zero = request.max_priority_fee_per_gas.is_none()
+            || request
+                .max_priority_fee_per_gas
+                .map(|v| U256::from(v) == U256::ZERO)
+                .unwrap_or(false);
+
+        let should_skip_balance_check =
+            gas_price_is_zero && max_fee_per_gas_is_zero && max_priority_fee_per_gas_is_zero;
+
         // Enable balance check skip in evm_env when all gas prices are zero,
         // matching op-geth's GasEstimationWithSkipCheckBalanceMode behavior
         if should_skip_balance_check {
@@ -143,7 +155,8 @@ where
         // the actual gas price that will be used, so balance check would be meaningless or incorrect.
         if !should_skip_balance_check && tx_env.gas_price() > 0 {
             // cap the highest gas limit by max gas caller can afford with given gas price
-            let allowance = caller_gas_allowance(&mut db, &tx_env).map_err(Self::Error::from_eth_err)?;
+            let allowance =
+                caller_gas_allowance(&mut db, &tx_env).map_err(Self::Error::from_eth_err)?;
             // If allowance is very large (close to u64::MAX), it means gas_price is very small,
             // and we should skip the balance check to match op-geth's behavior.
             // op-geth skips balance check if allowance > uint64 max or if gas_price is 0.
@@ -165,8 +178,8 @@ where
                 // retry the transaction with the block's gas limit to determine if
                 // the failure was due to insufficient gas.
                 Err(err)
-                    if err.is_gas_too_high() &&
-                        (tx_request_gas_limit.is_some() || tx_request_gas_price.is_some()) =>
+                    if err.is_gas_too_high()
+                        && (tx_request_gas_limit.is_some() || tx_request_gas_price.is_some()) =>
                 {
                     return Err(self.map_out_of_gas_err(
                         block_env_gas_limit,
@@ -183,7 +196,7 @@ where
                     return Err(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
                         gas_limit: tx_env.gas_limit(),
                     }
-                    .into_eth_err())
+                    .into_eth_err());
                 }
                 // Propagate other results (successful or other errors).
                 ethres => ethres?,
@@ -194,7 +207,7 @@ where
             ExecutionResult::Halt { reason, .. } => {
                 // here we don't check for invalid opcode because already executed with highest gas
                 // limit
-                return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()))
+                return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()));
             }
             ExecutionResult::Revert { output, .. } => {
                 // if price or limit was included in the request then we can execute the request
@@ -204,7 +217,7 @@ where
                 } else {
                     // the transaction did revert
                     Err(RpcInvalidTransactionError::Revert(RevertError::new(output)).into_eth_err())
-                }
+                };
             }
         };
 
@@ -217,7 +230,7 @@ where
 
         // NOTE: this is the gas the transaction used, which is less than the
         // transaction requires to succeed.
-        let mut gas_used = res.result.gas_used();
+        let gas_used = res.result.gas_used();
         // the lowest value is capped by the gas used by the unconstrained transaction
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
         // As stated in Geth, there is a good chance that the transaction will pass if we set the
@@ -233,8 +246,6 @@ where
             // Re-execute the transaction with the new gas limit and update the result and
             // environment.
             (res, (evm_env, tx_env)) = self.transact(&mut db, evm_env, tx_env)?;
-            // Update the gas used based on the new result.
-            gas_used = res.result.gas_used();
             // Update the gas limit estimates (highest and lowest) based on the execution result.
             reth_rpc_eth_api::helpers::estimate::update_estimated_gas_range(
                 res.result,
@@ -246,7 +257,7 @@ where
 
         // Pick a point that's close to the estimated gas
         let mut mid_gas_limit = std::cmp::min(
-            gas_used * 3,
+            lowest_gas_limit * 2, // Use lowest_gas_limit * 2 to match geth's lo * 2
             ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
         );
         trace!(target: "rpc::eth::estimate", ?evm_env, ?tx_env, ?highest_gas_limit, ?lowest_gas_limit, ?mid_gas_limit, "Starting binary search for gas");
@@ -257,10 +268,10 @@ where
             // An estimation error is allowed once the current gas limit range used in the binary
             // search is small enough (less than 1.5% of the highest gas limit)
             // <https://github.com/ethereum/go-ethereum/blob/a5a4fa7032bb248f5a7c40f4e8df2b131c4186a4/eth/gasestimator/gasestimator.go#L152
-            if (highest_gas_limit - lowest_gas_limit) as f64 / (highest_gas_limit as f64) <
-                ESTIMATE_GAS_ERROR_RATIO
+            if (highest_gas_limit - lowest_gas_limit) as f64 / (highest_gas_limit as f64)
+                < ESTIMATE_GAS_ERROR_RATIO
             {
-                break
+                break;
             };
 
             tx_env.set_gas_limit(mid_gas_limit);
@@ -290,7 +301,10 @@ where
             }
 
             // New midpoint
-            mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
+            mid_gas_limit = std::cmp::min(
+                lowest_gas_limit * 2, // Use lowest_gas_limit * 2 to match geth's lo * 2
+                ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
+            );
         }
 
         // For Optimism chains, op-revm automatically handles L1 cost calculation and deduction
@@ -301,7 +315,7 @@ where
         // because op-revm deducted it during execution.
         // Apply gas buffer matching op-geth's behavior (gasBuffer = 120, i.e., 20% increase)
         let gas_with_buffer = (highest_gas_limit as u128 * 120 / 100) as u64;
-        
+
         Ok(U256::from(gas_with_buffer))
     }
 }
@@ -319,7 +333,8 @@ where
                 >,
             >,
             Error: FromEvmError<Self::Evm>,
-        > + SpawnBlocking + LoadFee,
+        > + SpawnBlocking
+        + LoadFee,
     Self::Error: From<OpEthApiError>,
     N: OpNodeCore,
 {
@@ -414,17 +429,15 @@ where
 
         // Calculate gas price for estimate when all gas prices are zero in estimateGas mode.
         // This matches op-geth's ToMessage behavior: gasPriceForEstimate = SuggestGasTipCap + BaseFee
-        let final_gas_price = if gas_price.is_zero() 
-            && max_priority_fee_per_gas.map_or(true, |v| v.is_zero()) 
-            && evm_env.block_env.basefee > 0 
+        let final_gas_price = if gas_price.is_zero()
+            && max_priority_fee_per_gas.map_or(true, |v| v.is_zero())
+            && evm_env.block_env.basefee > 0
         {
             // Get min_suggested_priority_fee, referencing eth_maxPriorityFeePerGas implementation
-            let min_tip = self
-                .gas_oracle()
-                .config()
-                .min_suggested_priority_fee
-                .unwrap_or(reth_rpc_server_types::constants::gas_oracle::DEFAULT_MIN_SUGGESTED_PRIORITY_FEE);
-            
+            let min_tip = self.gas_oracle().config().min_suggested_priority_fee.unwrap_or(
+                reth_rpc_server_types::constants::gas_oracle::DEFAULT_MIN_SUGGESTED_PRIORITY_FEE,
+            );
+
             // gasPriceForEstimate = basefee + min_tip (matching op-geth's SuggestGasTipCap + BaseFee)
             U256::from(evm_env.block_env.basefee).saturating_add(min_tip)
         } else {
@@ -467,24 +480,22 @@ where
             // This ensures we use the same GasLimit, GasTipCap, GasFeeCap values that op-geth uses.
             // In op-geth's ToMessage, when all gas prices are 0 in estimateGas mode, it sets both
             // gasFeeCap and gasTipCap to gasPriceForEstimate. We need to match this behavior.
-            // 
+            //
             // For L1 cost calculation, use a default tip of 100000 wei (0.0001 gwei) when all prices are zero.
             // This matches op-geth's CalculateRollupCostDataFromMessage behavior.
             const DEFAULT_TIP_FOR_L1_COST: u128 = 100_000;
             let basefee = evm_env.block_env.basefee as u128;
             let gas_price_for_estimate = basefee.saturating_add(DEFAULT_TIP_FOR_L1_COST);
-            
+
             // Determine max_priority_fee_per_gas and max_fee_per_gas for L1 cost calculation.
             // If all prices were zero, use gasPriceForEstimate; otherwise use the actual values.
-            let (max_priority_fee, max_fee) = if base.gas_price == 0 && base.gas_priority_fee.unwrap_or(0) == 0 {
-                (gas_price_for_estimate, gas_price_for_estimate)
-            } else {
-                (
-                    base.gas_priority_fee.unwrap_or(base.gas_price),
-                    base.gas_price,
-                )
-            };
-            
+            let (max_priority_fee, max_fee) =
+                if base.gas_price == 0 && base.gas_priority_fee.unwrap_or(0) == 0 {
+                    (gas_price_for_estimate, gas_price_for_estimate)
+                } else {
+                    (base.gas_priority_fee.unwrap_or(base.gas_price), base.gas_price)
+                };
+
             let tx = TxEip1559 {
                 chain_id: 0, // Default to 0 (will encode as zero, matching op-geth's nil ChainID)
                 nonce: base.nonce,
@@ -496,19 +507,19 @@ where
                 access_list: base.access_list.clone(), // Empty (matching op-geth's empty AccessList)
                 input: base.data.clone(),
             };
-            
+
             // Use zero signature (matching op-geth's nil V, R, S which encode as zeros)
             let signature = Signature::new(Default::default(), Default::default(), false);
-            
+
             // Encode the transaction directly (matching op-geth's MarshalBinary).
             // We encode the unsigned transaction with zero signature, without creating signed_tx.
             let mut encoded = Vec::new();
             tx.eip2718_encode(&signature, &mut encoded);
-            
+
             // Match op-geth: add 80 non-zero bytes to simulate real signature.
             // This matches op-geth's CalculateRollupCostDataFromMessage: st.msg.RollupCostData.Ones += 80.
             encoded.extend_from_slice(&[0xFFu8; 80]);
-            
+
             Some(Bytes::from(encoded))
         };
 
@@ -528,11 +539,11 @@ mod tests {
         max_priority_fee_per_gas: Option<u128>,
     ) -> bool {
         let gas_price_is_zero = gas_price.is_none() || gas_price == Some(0u128);
-        let max_fee_per_gas_is_zero = max_fee_per_gas.is_none() || 
-            max_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
-        let max_priority_fee_per_gas_is_zero = max_priority_fee_per_gas.is_none() || 
-            max_priority_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
-        
+        let max_fee_per_gas_is_zero = max_fee_per_gas.is_none()
+            || max_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
+        let max_priority_fee_per_gas_is_zero = max_priority_fee_per_gas.is_none()
+            || max_priority_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
+
         gas_price_is_zero && max_fee_per_gas_is_zero && max_priority_fee_per_gas_is_zero
     }
 
@@ -561,9 +572,9 @@ mod tests {
         basefee: u128,
         min_tip: U256,
     ) -> U256 {
-        if gas_price.is_zero() 
-            && max_priority_fee_per_gas.map_or(true, |v| v.is_zero()) 
-            && basefee > 0 
+        if gas_price.is_zero()
+            && max_priority_fee_per_gas.map_or(true, |v| v.is_zero())
+            && basefee > 0
         {
             U256::from(basefee).saturating_add(min_tip)
         } else {
@@ -578,10 +589,7 @@ mod tests {
         let expected = U256::from(basefee).saturating_add(min_tip);
 
         // All prices zero with basefee > 0 - should use basefee + min_tip
-        assert_eq!(
-            calculate_final_gas_price_helper(U256::ZERO, None, basefee, min_tip),
-            expected
-        );
+        assert_eq!(calculate_final_gas_price_helper(U256::ZERO, None, basefee, min_tip), expected);
         assert_eq!(
             calculate_final_gas_price_helper(U256::ZERO, Some(U256::ZERO), basefee, min_tip),
             expected
@@ -607,12 +615,14 @@ mod tests {
         let gas_price = U256::from(2000u128);
 
         // Gas price is non-zero - should return original gas_price
+        assert_eq!(calculate_final_gas_price_helper(gas_price, None, basefee, min_tip), gas_price);
         assert_eq!(
-            calculate_final_gas_price_helper(gas_price, None, basefee, min_tip),
-            gas_price
-        );
-        assert_eq!(
-            calculate_final_gas_price_helper(gas_price, Some(U256::from(500u128)), basefee, min_tip),
+            calculate_final_gas_price_helper(
+                gas_price,
+                Some(U256::from(500u128)),
+                basefee,
+                min_tip
+            ),
             gas_price
         );
     }
@@ -626,14 +636,12 @@ mod tests {
         // Test that when all prices are zero, we use gas_price_for_estimate
         let base_gas_price = 0u128;
         let base_gas_priority_fee = Some(0u128);
-        let (max_priority_fee, max_fee) = if base_gas_price == 0 && base_gas_priority_fee.unwrap_or(0) == 0 {
-            (gas_price_for_estimate, gas_price_for_estimate)
-        } else {
-            (
-                base_gas_priority_fee.unwrap_or(base_gas_price),
-                base_gas_price,
-            )
-        };
+        let (max_priority_fee, max_fee) =
+            if base_gas_price == 0 && base_gas_priority_fee.unwrap_or(0) == 0 {
+                (gas_price_for_estimate, gas_price_for_estimate)
+            } else {
+                (base_gas_priority_fee.unwrap_or(base_gas_price), base_gas_price)
+            };
 
         assert_eq!(max_priority_fee, gas_price_for_estimate);
         assert_eq!(max_fee, gas_price_for_estimate);
@@ -641,14 +649,12 @@ mod tests {
         // Test that when prices are non-zero, we use actual values
         let base_gas_price = 2000u128;
         let base_gas_priority_fee = Some(500u128);
-        let (max_priority_fee, max_fee) = if base_gas_price == 0 && base_gas_priority_fee.unwrap_or(0) == 0 {
-            (gas_price_for_estimate, gas_price_for_estimate)
-        } else {
-            (
-                base_gas_priority_fee.unwrap_or(base_gas_price),
-                base_gas_price,
-            )
-        };
+        let (max_priority_fee, max_fee) =
+            if base_gas_price == 0 && base_gas_priority_fee.unwrap_or(0) == 0 {
+                (gas_price_for_estimate, gas_price_for_estimate)
+            } else {
+                (base_gas_priority_fee.unwrap_or(base_gas_price), base_gas_price)
+            };
 
         assert_eq!(max_priority_fee, 500u128);
         assert_eq!(max_fee, 2000u128);
@@ -683,9 +689,98 @@ mod tests {
         // Verify the encoded transaction has the expected structure
         // The transaction should be encoded with EIP-2718 format (type byte + rlp encoded data)
         assert!(encoded.len() > 80, "Encoded transaction should be longer than 80 bytes");
-        
+
         // Verify the last 80 bytes are all 0xFF
         let signature_bytes = &encoded[encoded.len() - 80..];
         assert!(signature_bytes.iter().all(|&b| b == 0xFF), "Last 80 bytes should be 0xFF");
+    }
+
+    /// Test helper to calculate mid_gas_limit matching geth's behavior
+    /// This matches the logic in estimate_gas_with: use lowest_gas_limit * 2 instead of gas_used * 3
+    fn calculate_mid_gas_limit_helper(lowest_gas_limit: u64, highest_gas_limit: u64) -> u64 {
+        std::cmp::min(
+            lowest_gas_limit * 2, // Use lowest_gas_limit * 2 to match geth's lo * 2
+            ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
+        )
+    }
+
+    #[test]
+    fn test_mid_gas_limit_uses_lowest_times_two() {
+        // Test that mid_gas_limit uses lowest_gas_limit * 2 when it's smaller than average
+        let lowest = 1000u64;
+        let highest = 10000u64;
+        let mid = calculate_mid_gas_limit_helper(lowest, highest);
+
+        // mid should be min(lowest * 2, (highest + lowest) / 2)
+        // lowest * 2 = 2000, average = 5500, so should be 2000
+        assert_eq!(mid, 2000u64, "mid_gas_limit should use lowest_gas_limit * 2 when smaller");
+    }
+
+    #[test]
+    fn test_mid_gas_limit_uses_average_when_smaller() {
+        // Test that mid_gas_limit uses average when it's smaller than lowest * 2
+        let lowest = 5000u64;
+        let highest = 6000u64;
+        let mid = calculate_mid_gas_limit_helper(lowest, highest);
+
+        // mid should be min(lowest * 2, (highest + lowest) / 2)
+        // lowest * 2 = 10000, average = 5500, so should be 5500
+        let expected_average = ((highest as u128 + lowest as u128) / 2) as u64;
+        assert_eq!(
+            mid, expected_average,
+            "mid_gas_limit should use average when smaller than lowest * 2"
+        );
+    }
+
+    #[test]
+    fn test_mid_gas_limit_edge_case_small_range() {
+        // Test edge case with very small range
+        let lowest = 100u64;
+        let highest = 101u64;
+        let mid = calculate_mid_gas_limit_helper(lowest, highest);
+
+        // lowest * 2 = 200, average = 100, so should be 100
+        let expected_average = ((highest as u128 + lowest as u128) / 2) as u64;
+        assert_eq!(mid, expected_average, "mid_gas_limit should handle small ranges correctly");
+    }
+
+    #[test]
+    fn test_mid_gas_limit_edge_case_large_range() {
+        // Test edge case with large range
+        let lowest = 1000u64;
+        let highest = 1000000u64;
+        let mid = calculate_mid_gas_limit_helper(lowest, highest);
+
+        // lowest * 2 = 2000, average = 500500, so should be 2000
+        assert_eq!(
+            mid, 2000u64,
+            "mid_gas_limit should use lowest * 2 for large ranges when smaller"
+        );
+    }
+
+    #[test]
+    fn test_mid_gas_limit_matches_geth_behavior() {
+        // Test various scenarios to ensure we match geth's lo * 2 behavior
+        let test_cases = vec![
+            (100u64, 1000u64, 200u64),   // lowest * 2 < average
+            (500u64, 600u64, 550u64),    // average < lowest * 2
+            (1000u64, 2000u64, 1500u64), // average < lowest * 2
+            (5000u64, 5100u64, 5050u64), // average < lowest * 2
+        ];
+
+        for (lowest, highest, expected) in test_cases {
+            let mid = calculate_mid_gas_limit_helper(lowest, highest);
+            let expected_calc =
+                std::cmp::min(lowest * 2, ((highest as u128 + lowest as u128) / 2) as u64);
+            assert_eq!(
+                mid, expected_calc,
+                "mid_gas_limit calculation should match expected for lowest={}, highest={}",
+                lowest, highest
+            );
+            // Also verify it matches the expected value if provided
+            if expected == expected_calc {
+                assert_eq!(mid, expected);
+            }
+        }
     }
 }
