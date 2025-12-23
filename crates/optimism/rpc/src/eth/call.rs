@@ -31,7 +31,7 @@ use reth_storage_api::{
 };
 use revm::context_interface::{result::ExecutionResult, Block, Transaction};
 use revm::{context::TxEnv, Database};
-use tracing::trace;
+use tracing::{error, trace};
 
 impl<N> EthCall for OpEthApi<N>
 where
@@ -75,37 +75,26 @@ where
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
         let tx_request_gas_price = request.gas_price;
-        // the gas limit of the corresponding block
-        let block_env_gas_limit = evm_env.block_env.gas_limit;
+        let tx_request_max_fee_per_gas = request.max_fee_per_gas;
+        let tx_request_max_priority_fee_per_gas = request.max_priority_fee_per_gas;
 
-        // Determine the highest possible gas limit, considering both the request's specified limit
-        // and the block's limit.
-        let mut highest_gas_limit = tx_request_gas_limit
-            .map(|mut tx_gas_limit| {
-                if block_env_gas_limit < tx_gas_limit {
-                    // requested gas limit is higher than the allowed gas limit, capping
-                    tx_gas_limit = block_env_gas_limit;
-                }
-                tx_gas_limit
-            })
-            .unwrap_or(block_env_gas_limit);
+        // Apply CallDefaults (equivalent to geth's args.CallDefaults)
+        let global_gas_cap = self.call_gas_limit();
+        let chain_id = evm_env.cfg_env.chain_id;
+        Self::call_defaults(&mut request, global_gas_cap, chain_id)?;
 
         // Check if all gas price fields are nil or zero before create_txn_env
         // matching op-geth's GasEstimationWithSkipCheckBalanceMode condition:
         // (GasPrice == nil || GasPrice == 0) AND (MaxFeePerGas == nil || MaxFeePerGas == 0) AND
         // (MaxPriorityFeePerGas == nil || MaxPriorityFeePerGas == 0)
-        let gas_price_is_zero =
-            tx_request_gas_price.is_none() || tx_request_gas_price == Some(0u128);
-        let max_fee_per_gas_is_zero = request.max_fee_per_gas.is_none()
-            || request.max_fee_per_gas.map(|v| U256::from(v) == U256::ZERO).unwrap_or(false);
-        let max_priority_fee_per_gas_is_zero = request.max_priority_fee_per_gas.is_none()
-            || request
-                .max_priority_fee_per_gas
-                .map(|v| U256::from(v) == U256::ZERO)
-                .unwrap_or(false);
+        #[inline]
+        fn is_zero_or_none(opt: Option<impl Into<U256>>) -> bool {
+            opt.map(|v| U256::from(v) == U256::ZERO).unwrap_or(true)
+        }
 
-        let should_skip_balance_check =
-            gas_price_is_zero && max_fee_per_gas_is_zero && max_priority_fee_per_gas_is_zero;
+        let should_skip_balance_check = is_zero_or_none(tx_request_gas_price)
+            && is_zero_or_none(tx_request_max_fee_per_gas)
+            && is_zero_or_none(tx_request_max_priority_fee_per_gas);
 
         // Enable balance check skip in evm_env when all gas prices are zero,
         // matching op-geth's GasEstimationWithSkipCheckBalanceMode behavior
@@ -121,6 +110,64 @@ where
         if let Some(state_override) = state_override {
             apply_state_overrides(state_override, &mut db).map_err(Self::Error::from_eth_err)?;
         }
+
+        // Determine the highest possible gas limit, considering both the request's specified limit
+        // and the block's limit.
+        let mut highest_gas_limit = evm_env.block_env.gas_limit;
+        if let Some(call_gas_limit) = tx_request_gas_limit {
+            if call_gas_limit >= reth_chainspec::MIN_TRANSACTION_GAS {
+                highest_gas_limit = call_gas_limit;
+            }
+        }
+
+        // Check funds of the sender (only useful to check if transaction gas price is more than 0).
+        //
+        // The caller allowance is check by doing `(account.balance - tx.value) / tx.gas_price`
+        // In estimateGas mode, if all gas prices were 0 in the original request, we skip balance check
+        // to match op-geth's GasEstimationWithSkipCheckBalanceMode behavior.
+        // This is because in estimateGas, when user doesn't specify any gas prices, we don't know
+        // the actual gas price that will be used, so balance check would be meaningless or incorrect.
+        if !should_skip_balance_check {
+            // Calculate gasPriceForEstimate
+            // Get min_suggested_priority_fee, matching create_txn_env's approach
+            let min_tip = self.gas_oracle().config().min_suggested_priority_fee.unwrap_or(
+                reth_rpc_server_types::constants::gas_oracle::DEFAULT_MIN_SUGGESTED_PRIORITY_FEE,
+            );
+            // gasPriceForEstimate = basefee + min_tip (matching op-geth's SuggestGasTipCap + BaseFee)
+            let gas_price_for_estimate = U256::from(evm_env.block_env.basefee).saturating_add(min_tip);
+
+            // Check if this is an EIP-1559 transaction and user has set maxFeePerGas
+            // Match geth's ToMessage logic: args.GasPrice == nil and user has set maxFeePerGas
+            if tx_request_gas_price.is_none()
+                && (tx_request_max_fee_per_gas.is_some()
+                    || tx_request_max_priority_fee_per_gas.is_some())
+            {
+                // Rebuild OpTransaction, only modifying gas_price
+                // Get current base and other fields
+                let OpTransaction { base, enveloped_tx, deposit } = tx_env;
+                let mut new_base = base;
+                new_base.gas_price = gas_price_for_estimate.saturating_to();
+                // gas_priority_fee remains unchanged (user-set value)
+                tx_env = OpTransaction { base: new_base, enveloped_tx, deposit };
+            }
+
+            // cap the highest gas limit by max gas caller can afford with given gas price
+            let allowance =
+                caller_gas_allowance(&mut db, &tx_env).map_err(Self::Error::from_eth_err)?;
+            // todo: call.Value should be considered
+            // todo: cancun blob should be considered
+            // If allowance is very large (close to u64::MAX), it means gas_price is very small,
+            // and we should skip the balance check to match op-geth's behavior.
+            // op-geth skips balance check if allowance > uint64 max or if gas_price is 0.
+            if allowance < u64::MAX / 2 {
+                highest_gas_limit = highest_gas_limit.min(allowance);
+            }
+        }
+
+        // If the provided gas limit is less than computed cap, use that
+        tx_env.set_gas_limit(tx_env.gas_limit().min(highest_gas_limit));
+
+        trace!(target: "rpc::eth::estimate", ?evm_env, ?tx_env, "Starting gas estimation");
 
         // Optimize for simple transfer transactions, potentially reducing the gas estimate.
         if tx_env.input().is_empty() {
@@ -146,78 +193,36 @@ where
             }
         }
 
-        // Check funds of the sender (only useful to check if transaction gas price is more than 0).
-        //
-        // The caller allowance is check by doing `(account.balance - tx.value) / tx.gas_price`
-        // In estimateGas mode, if all gas prices were 0 in the original request, we skip balance check
-        // to match op-geth's GasEstimationWithSkipCheckBalanceMode behavior.
-        // This is because in estimateGas, when user doesn't specify any gas prices, we don't know
-        // the actual gas price that will be used, so balance check would be meaningless or incorrect.
-        if !should_skip_balance_check && tx_env.gas_price() > 0 {
-            // cap the highest gas limit by max gas caller can afford with given gas price
-            let allowance =
-                caller_gas_allowance(&mut db, &tx_env).map_err(Self::Error::from_eth_err)?;
-            // If allowance is very large (close to u64::MAX), it means gas_price is very small,
-            // and we should skip the balance check to match op-geth's behavior.
-            // op-geth skips balance check if allowance > uint64 max or if gas_price is 0.
-            if allowance < u64::MAX / 2 {
-                highest_gas_limit = highest_gas_limit.min(allowance);
-            }
-        }
-
-        // If the provided gas limit is less than computed cap, use that
-        tx_env.set_gas_limit(tx_env.gas_limit().min(highest_gas_limit));
-
-        trace!(target: "rpc::eth::estimate", ?evm_env, ?tx_env, "Starting gas estimation");
-
         // Execute the transaction with the highest possible gas limit.
         let (mut res, (mut evm_env, mut tx_env)) =
-            match self.transact(&mut db, evm_env.clone(), tx_env.clone()) {
-                // Handle the exceptional case where the transaction initialization uses too much
-                // gas. If the gas price or gas limit was specified in the request,
-                // retry the transaction with the block's gas limit to determine if
-                // the failure was due to insufficient gas.
-                Err(err)
-                    if err.is_gas_too_high()
-                        && (tx_request_gas_limit.is_some() || tx_request_gas_price.is_some()) =>
-                {
-                    return Err(self.map_out_of_gas_err(
-                        block_env_gas_limit,
-                        evm_env,
-                        tx_env,
-                        &mut db,
-                    ))
-                }
-                Err(err) if err.is_gas_too_low() => {
-                    // This failed because the configured gas cost of the tx was lower than what
-                    // actually consumed by the tx This can happen if the
-                    // request provided fee values manually and the resulting gas cost exceeds the
-                    // sender's allowance, so we return the appropriate error here
-                    return Err(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
-                        gas_limit: tx_env.gas_limit(),
-                    }
-                    .into_eth_err());
-                }
-                // Propagate other results (successful or other errors).
-                ethres => ethres?,
-            };
+            self.transact(&mut db, evm_env.clone(), tx_env.clone())?;
 
         let gas_refund = match res.result {
             ExecutionResult::Success { gas_refunded, .. } => gas_refunded,
             ExecutionResult::Halt { reason, .. } => {
-                // here we don't check for invalid opcode because already executed with highest gas
-                // limit
-                return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()));
+                match reason {
+                    HaltReason::OutOfGas(_) => {
+                        // Corresponds to geth: return 0, nil, fmt.Errorf("gas required exceeds allowance (%d)", hi)
+                        return Err(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
+                            gas_limit: tx_env.gas_limit(),
+                        }
+                        .into_eth_err());
+                    }
+                    _ => {
+                        // Corresponds to geth: if result != nil && !errors.Is(result.Err, vm.ErrOutOfGas) {
+                        //     return 0, result.Revert(), result.Err
+                        // }
+                        // here we don't check for invalid opcode because already executed with highest gas
+                        // limit
+                        return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()));
+                    }
+                }
             }
             ExecutionResult::Revert { output, .. } => {
-                // if price or limit was included in the request then we can execute the request
-                // again with the block's gas limit to check if revert is gas related or not
-                return if tx_request_gas_limit.is_some() || tx_request_gas_price.is_some() {
-                    Err(self.map_out_of_gas_err(block_env_gas_limit, evm_env, tx_env, &mut db))
-                } else {
-                    // the transaction did revert
-                    Err(RpcInvalidTransactionError::Revert(RevertError::new(output)).into_eth_err())
-                };
+                // Corresponds to geth: return 0, result.Revert(), result.Err
+                return Err(
+                    RpcInvalidTransactionError::Revert(RevertError::new(output)).into_eth_err()
+                );
             }
         };
 
@@ -245,7 +250,10 @@ where
             tx_env.set_gas_limit(optimistic_gas_limit);
             // Re-execute the transaction with the new gas limit and update the result and
             // environment.
-            (res, (evm_env, tx_env)) = self.transact(&mut db, evm_env, tx_env)?;
+            (res, (evm_env, tx_env)) = self.transact(&mut db, evm_env, tx_env).map_err(|err| {
+                error!(target: "rpc::eth::estimate", ?err, "Error executing transaction");
+                err
+            })?;
             // Update the gas limit estimates (highest and lowest) based on the execution result.
             reth_rpc_eth_api::helpers::estimate::update_estimated_gas_range(
                 res.result,
@@ -278,13 +286,9 @@ where
 
             // Execute transaction and handle potential gas errors, adjusting limits accordingly.
             match self.transact(&mut db, evm_env.clone(), tx_env.clone()) {
-                Err(err) if err.is_gas_too_high() => {
-                    // Decrease the highest gas limit if gas is too high
-                    highest_gas_limit = mid_gas_limit;
-                }
-                Err(err) if err.is_gas_too_low() => {
-                    // Increase the lowest gas limit if gas is too low
-                    lowest_gas_limit = mid_gas_limit;
+                Err(err) => {
+                    error!(target: "rpc::eth::estimate", ?err, "Execution error in estimate gas");
+                    return Err(err);
                 }
                 // Handle other cases, including successful transactions.
                 ethres => {
@@ -524,6 +528,117 @@ where
         };
 
         Ok(OpTransaction { base, enveloped_tx, deposit: Default::default() })
+    }
+}
+
+impl<N> OpEthApi<N>
+where
+    N: OpNodeCore,
+{
+    /// Equivalent to geth's CallDefaults function.
+    /// Sets default values for unspecified transaction fields and validates the request.
+    fn call_defaults(
+        request: &mut TransactionRequest,
+        global_gas_cap: u64,
+        chain_id: u64,
+    ) -> Result<(), EthApiError> {
+        // 1. Reject invalid combinations of pre- and post-1559 fee styles
+        if request.gas_price.is_some()
+            && (request.max_fee_per_gas.is_some() || request.max_priority_fee_per_gas.is_some())
+        {
+            return Err(EthApiError::InvalidTransaction(
+                reth_rpc_eth_types::error::RpcInvalidTransactionError::ConflictingFeeFields,
+            ));
+        }
+
+        // 2. Validate ChainID (if set, must match; if not set, will be set in create_txn_env)
+        if let Some(req_chain_id) = request.chain_id {
+            if req_chain_id != chain_id {
+                return Err(EthApiError::InvalidTransaction(
+                    reth_rpc_eth_types::error::RpcInvalidTransactionError::InvalidChainId,
+                ));
+            }
+        }
+
+        // 3. Set Gas (if nil, use globalGasCap; if exceeds globalGasCap, cap it)
+        match request.gas {
+            None => {
+                let gas = if global_gas_cap == 0 {
+                    u64::MAX / 2 // equivalent to math.MaxUint64 / 2
+                } else {
+                    global_gas_cap
+                };
+                request.gas = Some(gas);
+            }
+            Some(gas) => {
+                if global_gas_cap > 0 && global_gas_cap < gas {
+                    tracing::warn!(
+                        target: "rpc::eth::estimate",
+                        requested = gas,
+                        cap = global_gas_cap,
+                        "Caller gas above allowance, capping"
+                    );
+                    request.gas = Some(global_gas_cap);
+                }
+            }
+        }
+
+        // 4. Set Nonce (if nil, set to 0) - matching geth's CallDefaults 386-388
+        if request.nonce.is_none() {
+            request.nonce = Some(0);
+        }
+
+        // 5. Set Value (if nil, set to 0) - matching geth's CallDefaults 389-391
+        if request.value.is_none() {
+            request.value = Some(U256::ZERO);
+        }
+
+        // 6. Set gas price fields based on baseFee (matching geth's CallDefaults 392-405)
+        // Note: base_fee is not available in this context, so we default to EIP-1559 style
+        // when max_fee_per_gas or max_priority_fee_per_gas is set, otherwise use legacy
+        if request.max_fee_per_gas.is_some() || request.max_priority_fee_per_gas.is_some() {
+            // A basefee is provided, necessitating 1559-type execution
+            if request.max_fee_per_gas.is_none() {
+                request.max_fee_per_gas = Some(0u128);
+            }
+            if request.max_priority_fee_per_gas.is_none() {
+                request.max_priority_fee_per_gas = Some(0u128);
+            }
+        } else {
+            // If there's no basefee, then it must be a non-1559 execution
+            if request.gas_price.is_none() {
+                request.gas_price = Some(0u128);
+            }
+        }
+
+        // 7. Set BlobFeeCap (if BlobHashes is set but BlobFeeCap is nil)
+        // Matching geth's CallDefaults 406-408
+        if request.max_fee_per_blob_gas.is_none()
+            && request.blob_versioned_hashes.as_ref().is_some_and(|hashes| !hashes.is_empty())
+        {
+            request.max_fee_per_blob_gas = Some(0u128);
+        }
+
+        Ok(())
+    }
+
+    /// Calculate gasPriceForEstimate (matching geth's SuggestGasTipCap + BaseFee).
+    /// This value is used for:
+    /// 1. ToMessage's gasPriceForEstimate parameter (adjusting tx_env.gas_price)
+    /// 2. enveloped_tx's L1 cost calculation (when all prices are zero)
+    ///
+    /// Equivalent to geth's api.go:964-974:
+    ///
+    /// gasPriceForEstimate, err := b.SuggestGasTipCap(ctx)
+    /// if header.BaseFee != nil {
+    ///     gasPriceForEstimate.Add(gasPriceForEstimate, header.BaseFee)
+    /// }
+    async fn calculate_gas_price_for_estimate(&self, basefee: u128) -> Result<U256, Self::Error>
+    where
+        Self: LoadFee,
+    {
+        let gas_tip_cap = self.suggested_priority_fee().await?;
+        Ok(gas_tip_cap + U256::from(basefee))
     }
 }
 
