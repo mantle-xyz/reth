@@ -32,7 +32,7 @@ reth-mantle-forks = { workspace = true, optional = true }
 # op-reth
 reth-optimism-evm.workspace = true
 reth-optimism-forks.workspace = true
-reth-optimism-primitives.workspace = true
+reth-optimism-primitives = { workspace = true, features = ["serde", "reth-codec"] }
 reth-optimism-txpool.workspace = true
 
 # ethereum
