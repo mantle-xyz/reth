@@ -39,6 +39,7 @@ pub mod constants;
 mod dev;
 mod mantle;
 mod mantle_mainnet;
+mod mantle_sepolia;
 mod op;
 mod op_sepolia;
 
@@ -49,6 +50,7 @@ pub use superchain::*;
 
 pub use dev::OP_DEV;
 pub use mantle_mainnet::MANTLE_MAINNET;
+pub use mantle_sepolia::MANTLE_SEPOLIA;
 pub use op::OP_MAINNET;
 pub use op_sepolia::OP_SEPOLIA;
 
