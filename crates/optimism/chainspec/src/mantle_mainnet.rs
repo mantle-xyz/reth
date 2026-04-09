@@ -219,12 +219,17 @@ mod tests {
         // Verify that Osaka is mapped to Limb timestamp
         assert!(spec.is_osaka_active_at_timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP));
 
-        // Verify OP-layer forks are all aligned to Arsia timestamp
+        // Verify all 7 OP-layer forks are aligned to Arsia timestamp
         assert!(spec.is_canyon_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
         assert!(spec.is_ecotone_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
+        assert!(spec.is_fjord_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
+        assert!(spec.is_granite_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
         assert!(spec.is_holocene_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
+        assert!(spec.is_isthmus_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
         assert!(spec.is_jovian_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
         assert!(!spec.is_canyon_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP - 1));
+        assert!(!spec.is_holocene_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP - 1));
+        assert!(!spec.is_jovian_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP - 1));
     }
 
     #[test]
