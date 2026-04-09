@@ -20,16 +20,16 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2026-0067
     # tar: symlink-following allows writes outside extraction root (CVSS 5.1).
     # Only affects archive extraction paths; reth does not extract user-supplied
-    # tar archives. Fixed in tar >= 0.4.44.
+    # tar archives. Fixed in tar >= 0.4.45 (current: 0.4.44).
     "RUSTSEC-2026-0067",
     # https://rustsec.org/advisories/RUSTSEC-2026-0068
     # tar: PAX size header parsing inconsistency (CVSS 5.1).
-    # Same crate as above; same rationale.
+    # Same crate and rationale as above. Fixed in tar >= 0.4.45 (current: 0.4.44).
     "RUSTSEC-2026-0068",
     # https://rustsec.org/advisories/RUSTSEC-2026-0009
     # time: RFC 2822 parser stack overflow DoS (CVSS 6.8).
     # reth does not parse untrusted RFC 2822 dates; this is a dev/test
-    # dependency path. Fixed in time >= 0.3.37.
+    # dependency path. Fixed in time >= 0.3.47 (current: 0.3.44).
     "RUSTSEC-2026-0009",
 ]
 
