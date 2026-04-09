@@ -13,6 +13,10 @@ ignore = [
     # bincode (1.x) is unmaintained; no upstream replacement available that is
     # compatible with our current usage. Tracked for future migration.
     "RUSTSEC-2025-0141",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0049
+    # rustls-webpki: CRL matching logic flaw; fixed in 0.103.x >= 0.103.10.
+    # Current: 0.103.8. Blocked by transitive dep pin; fix when upstream allows.
+    "RUSTSEC-2026-0049",
     # https://rustsec.org/advisories/RUSTSEC-2026-0067
     # tar: symlink-following allows writes outside extraction root (CVSS 5.1).
     # Only affects archive extraction paths; reth does not extract user-supplied
