@@ -218,87 +218,46 @@ fn try_decode_v1(buf: &[u8], len: usize) -> Result<(AlloyTxDeposit, &[u8]), ()> 
 }
 
 // =====================================================================================
-//  AlloyTxDeposit Compact impl — write matches detected format, read auto-detect
+//  AlloyTxDeposit Compact impl — write V2 (canonical), read per-tx auto-detect
 // =====================================================================================
-
-/// Encode `AlloyTxDeposit` as V2 (2-byte bitfield) Compact format.
-fn encode_v2(tx: &AlloyTxDeposit, buf: &mut (impl bytes::BufMut + AsMut<[u8]>)) -> usize {
-    let inner = TxDeposit {
-        source_hash: tx.source_hash,
-        from: tx.from,
-        to: tx.to,
-        // 0 stored as None to save space: from_compact restores via unwrap_or_default()
-        mint: match tx.mint {
-            0 => None,
-            v => Some(v),
-        },
-        value: tx.value,
-        gas_limit: tx.gas_limit,
-        is_system_transaction: tx.is_system_transaction,
-        eth_value: match tx.eth_value {
-            0 => None,
-            v => Some(v),
-        },
-        eth_tx_value: tx.eth_tx_value,
-        input: tx.input.clone(),
-    };
-    inner.to_compact(buf)
-}
-
-/// Encode `AlloyTxDeposit` as V1 (3-byte bitfield) Compact format.
-fn encode_v1(tx: &AlloyTxDeposit, buf: &mut (impl bytes::BufMut + AsMut<[u8]>)) -> usize {
-    let inner = TxDepositV1 {
-        source_hash: tx.source_hash,
-        from: tx.from,
-        to: tx.to,
-        mint: match tx.mint {
-            0 => None,
-            v => Some(v),
-        },
-        value: tx.value,
-        gas_limit: tx.gas_limit,
-        is_system_transaction: tx.is_system_transaction,
-        eth_value: tx.eth_value,
-        eth_tx_value: tx.eth_tx_value,
-        input: tx.input.clone(),
-    };
-    inner.to_compact(buf)
-}
 
 impl Compact for AlloyTxDeposit {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
-        // Write the same format that was detected during reads, keeping the DB consistent.
-        // Before any format is detected (fresh start), default to V2 (canonical).
-        // Once detect_and_decode runs on the first L1 info deposit tx, the cache is set
-        // and all subsequent writes match the existing DB format.
-        let cached = DEPOSIT_COMPACT_FORMAT.load(Ordering::Relaxed);
-        if cached == FORMAT_V1 {
-            return encode_v1(self, buf);
-        }
-        // FORMAT_V2 or FORMAT_UNKNOWN → write V2 (canonical)
-        encode_v2(self, buf)
+        // Always write V2 (canonical 2-byte bitfield).
+        // Over time, DB contents converge to V2 as old V1 blocks are pruned.
+        let inner = TxDeposit {
+            source_hash: self.source_hash,
+            from: self.from,
+            to: self.to,
+            // 0 stored as None to save space: from_compact restores via unwrap_or_default()
+            mint: match self.mint {
+                0 => None,
+                v => Some(v),
+            },
+            value: self.value,
+            gas_limit: self.gas_limit,
+            is_system_transaction: self.is_system_transaction,
+            eth_value: match self.eth_value {
+                0 => None,
+                v => Some(v),
+            },
+            eth_tx_value: self.eth_tx_value,
+            input: self.input.clone(),
+        };
+        inner.to_compact(buf)
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        // In test builds, skip the cache to avoid cross-test interference
-        // (tests run in parallel in the same process, sharing the global AtomicU8).
-        // In production, the cache is set once on the first L1 info deposit tx
-        // and never changes — safe for the process lifetime.
-        #[cfg(not(test))]
-        {
-            let cached = DEPOSIT_COMPACT_FORMAT.load(Ordering::Relaxed);
-            if cached == FORMAT_V2 {
-                return decode_v2(buf, len);
-            }
-            if cached == FORMAT_V1 {
-                return decode_v1(buf, len);
-            }
-        }
-
-        // Detection path: try both formats, pick by selector match.
+        // Always run per-tx detection. This handles mixed-format DBs correctly:
+        // - L1 info deposit txs: definitive selector match, updates the cache
+        // - User deposit txs: uses the cache as fallback (set by the preceding L1 info tx)
+        //
+        // We intentionally do NOT skip detection via a cached fast path, because the DB
+        // can contain both V1 (old) and V2 (new) data after an upgrade. Each block's
+        // L1 info tx re-detects the correct format for that block's era.
         detect_and_decode(buf, len)
     }
 }
