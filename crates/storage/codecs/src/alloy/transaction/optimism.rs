@@ -31,8 +31,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 // =====================================================================================
 
 /// Re-export from `op_alloy_consensus::L1_BLOCK_SELECTORS` once op-alloy v2.2.1+ is released.
-/// Until then, kept in sync manually. Canonical source: `op-alloy/crates/consensus/src/predeploys.rs`.
-/// See also: `reth/crates/optimism/evm/src/l1.rs` which uses the same selectors.
+/// Until then, kept in sync manually. Canonical source:
+/// `op-alloy/crates/consensus/src/predeploys.rs`. See also: `reth/crates/optimism/evm/src/l1.rs`
+/// which uses the same selectors.
 const L1_BLOCK_SELECTORS: [[u8; 4]; 5] = [
     [0x01, 0x5d, 0x8e, 0xb9], // Bedrock   setL1BlockValues
     [0x44, 0x0a, 0x5e, 0x20], // Ecotone   setL1BlockValuesEcotone
@@ -217,34 +218,68 @@ fn try_decode_v1(buf: &[u8], len: usize) -> Result<(AlloyTxDeposit, &[u8]), ()> 
 }
 
 // =====================================================================================
-//  AlloyTxDeposit Compact impl — write V2, read auto-detect
+//  AlloyTxDeposit Compact impl — write matches detected format, read auto-detect
 // =====================================================================================
+
+/// Encode `AlloyTxDeposit` as V2 (2-byte bitfield) Compact format.
+fn encode_v2(tx: &AlloyTxDeposit, buf: &mut (impl bytes::BufMut + AsMut<[u8]>)) -> usize {
+    let inner = TxDeposit {
+        source_hash: tx.source_hash,
+        from: tx.from,
+        to: tx.to,
+        // 0 stored as None to save space: from_compact restores via unwrap_or_default()
+        mint: match tx.mint {
+            0 => None,
+            v => Some(v),
+        },
+        value: tx.value,
+        gas_limit: tx.gas_limit,
+        is_system_transaction: tx.is_system_transaction,
+        eth_value: match tx.eth_value {
+            0 => None,
+            v => Some(v),
+        },
+        eth_tx_value: tx.eth_tx_value,
+        input: tx.input.clone(),
+    };
+    inner.to_compact(buf)
+}
+
+/// Encode `AlloyTxDeposit` as V1 (3-byte bitfield) Compact format.
+fn encode_v1(tx: &AlloyTxDeposit, buf: &mut (impl bytes::BufMut + AsMut<[u8]>)) -> usize {
+    let inner = TxDepositV1 {
+        source_hash: tx.source_hash,
+        from: tx.from,
+        to: tx.to,
+        mint: match tx.mint {
+            0 => None,
+            v => Some(v),
+        },
+        value: tx.value,
+        gas_limit: tx.gas_limit,
+        is_system_transaction: tx.is_system_transaction,
+        eth_value: tx.eth_value,
+        eth_tx_value: tx.eth_tx_value,
+        input: tx.input.clone(),
+    };
+    inner.to_compact(buf)
+}
 
 impl Compact for AlloyTxDeposit {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
-        // Always write V2 (canonical 2-byte bitfield).
-        let tx = TxDeposit {
-            source_hash: self.source_hash,
-            from: self.from,
-            to: self.to,
-            mint: match self.mint {
-                0 => None,
-                v => Some(v),
-            },
-            value: self.value,
-            gas_limit: self.gas_limit,
-            is_system_transaction: self.is_system_transaction,
-            eth_value: match self.eth_value {
-                0 => None,
-                v => Some(v),
-            },
-            eth_tx_value: self.eth_tx_value,
-            input: self.input.clone(),
-        };
-        tx.to_compact(buf)
+        // Write the same format that was detected during reads, keeping the DB consistent.
+        // Before any format is detected (fresh start), default to V2 (canonical).
+        // Once detect_and_decode runs on the first L1 info deposit tx, the cache is set
+        // and all subsequent writes match the existing DB format.
+        let cached = DEPOSIT_COMPACT_FORMAT.load(Ordering::Relaxed);
+        if cached == FORMAT_V1 {
+            return encode_v1(self, buf);
+        }
+        // FORMAT_V2 or FORMAT_UNKNOWN → write V2 (canonical)
+        encode_v2(self, buf)
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
