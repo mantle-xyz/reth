@@ -1,4 +1,12 @@
 //! Compact implementation for [`AlloyTxDeposit`]
+//!
+//! Supports two on-disk formats via auto-detection:
+//! - V2 (2-byte bitfield): `eth_value: Option<u128>` — canonical format (v2.0.5 / v2.2.1+)
+//! - V1 (3-byte bitfield): `eth_value: u128` — legacy format (v2.1.x / v2.2.0-beta)
+//!
+//! Detection: decode with V2, check if `input[0..4]` matches a known L1 info deposit
+//! selector. If not, try V1. Result is cached in an `AtomicU8` — detection runs at most
+//! once (on the first L1 info deposit tx read). Writes always use V2 (canonical).
 
 use crate::{
     alloy::transaction::ethereum::{CompactEnvelope, Envelope, FromTxCompact, ToTxCompact},
@@ -16,29 +24,43 @@ use alloy_primitives::{Address, Bytes, Sealed, Signature, TxKind, B256, U256};
 use bytes::BufMut;
 use op_alloy_consensus::{OpTxEnvelope, OpTxType, OpTypedTransaction, TxDeposit as AlloyTxDeposit};
 use reth_codecs_derive::add_arbitrary_tests;
+use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Compact storage helper for Mantle deposit transactions.
+// =====================================================================================
+//  Format auto-detection via L1 info deposit tx selectors
+// =====================================================================================
+
+/// Re-export from `op_alloy_consensus::L1_BLOCK_SELECTORS` once op-alloy v2.2.1+ is released.
+/// Until then, kept in sync manually. Canonical source: `op-alloy/crates/consensus/src/predeploys.rs`.
+/// See also: `reth/crates/optimism/evm/src/l1.rs` which uses the same selectors.
+const L1_BLOCK_SELECTORS: [[u8; 4]; 5] = [
+    [0x01, 0x5d, 0x8e, 0xb9], // Bedrock   setL1BlockValues
+    [0x44, 0x0a, 0x5e, 0x20], // Ecotone   setL1BlockValuesEcotone
+    [0x09, 0x89, 0x99, 0xbe], // Isthmus   setL1BlockValuesIsthmus
+    [0x3d, 0xb6, 0xbe, 0x2b], // Jovian    setL1BlockValuesJovian
+    [0x49, 0xe7, 0x23, 0x83], // Arsia     setL1BlockValuesArsia
+];
+
+fn has_known_l1_info_selector(input: &[u8]) -> bool {
+    input.len() >= 4 && L1_BLOCK_SELECTORS.iter().any(|s| input[..4] == *s)
+}
+
+const FORMAT_UNKNOWN: u8 = 0;
+const FORMAT_V2: u8 = 1;
+const FORMAT_V1: u8 = 2;
+
+/// Cached per-process format detection. Set on the first successful selector-based detection.
+/// Uses AtomicU8 instead of OnceLock so it can be reset in tests.
+static DEPOSIT_COMPACT_FORMAT: AtomicU8 = AtomicU8::new(FORMAT_UNKNOWN);
+
+// =====================================================================================
+//  V2 struct (canonical, 2-byte bitfield) — used for ALL writes
+// =====================================================================================
+
+/// V2 Compact format for Mantle deposit transactions.
 ///
-/// By deriving `Compact` here, any future changes or enhancements to the `Compact` derive
-/// will automatically apply to this type.
-///
-/// # ⚠️ CRITICAL: On-disk binary compatibility — DO NOT change field types!
-///
-/// This struct's field types directly determine the Compact bitfield size (see
-/// [`TxDeposit::bitflag_encoded_bytes()`]). Changing a field type changes the bitfield
-/// layout, which makes ALL existing on-disk data **unreadable** (every field shifts by
-/// N bytes). This was the root cause of the op-reth-rpc41 sync failure: `eth_value` was
-/// accidentally changed from `Option<u128>` (1 bit) to `u128` (5 bits), growing the
-/// bitfield from 2 to 3 bytes. See `TROUBLESHOOTING-OP-RETH-RPC41.md` §5.4 for details.
-///
-/// Specifically:
-/// - `Option<T>` uses **1 bit** in the bitfield (None/Some flag only).
-/// - `u128` uses **5 bits**, `u64` uses **4 bits**, `U256` uses **6 bits**.
-/// - **Adding/removing `Option` wrapping changes the bit count and breaks the format.**
-///
-/// The field types here do NOT need to match `op_alloy_consensus::TxDeposit` exactly.
-/// The `to_compact`/`from_compact` impl handles type conversion (e.g., `u128 ↔ Option<u128>`).
-/// `mint` already uses this pattern: op-alloy has `u128`, Compact has `Option<u128>`.
+/// `eth_value: Option<u128>` → 1 bit → total 15 bits → 2-byte bitfield.
+/// This is the canonical format. All new writes use this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Compact)]
 #[cfg_attr(
     any(test, feature = "test-utils"),
@@ -55,21 +77,155 @@ pub(crate) struct TxDeposit {
     value: U256,
     gas_limit: u64,
     is_system_transaction: bool,
-    /// DO NOT change to `u128` — see struct-level doc for why.
-    /// Stored as `Option<u128>` (1 bit in bitfield) to preserve the 2-byte bitfield layout
-    /// that all existing on-disk data uses. The op-alloy struct uses `u128`; the
-    /// `to_compact`/`from_compact` impl converts via `0 → None` / `None → 0`.
-    /// Guarded by `test_bitfield_size_must_be_2_bytes` test below.
     eth_value: Option<u128>,
     eth_tx_value: Option<u128>,
     input: Bytes,
 }
+
+// =====================================================================================
+//  V1 struct (legacy, 3-byte bitfield) — used to decode old DB data
+// =====================================================================================
+
+/// V1 Compact format: `eth_value: u128` → 5 bits → total 19 bits → 3-byte bitfield.
+/// Only used by `from_compact` when auto-detection finds V1-formatted data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Compact)]
+#[reth_codecs(crate = "crate")]
+struct TxDepositV1 {
+    source_hash: B256,
+    from: Address,
+    to: TxKind,
+    mint: Option<u128>,
+    value: U256,
+    gas_limit: u64,
+    is_system_transaction: bool,
+    eth_value: u128,
+    eth_tx_value: Option<u128>,
+    input: Bytes,
+}
+
+// =====================================================================================
+//  Decode helpers
+// =====================================================================================
+
+fn decode_v2(buf: &[u8], len: usize) -> (AlloyTxDeposit, &[u8]) {
+    let (tx, remaining) = TxDeposit::from_compact(buf, len);
+    let alloy_tx = AlloyTxDeposit {
+        source_hash: tx.source_hash,
+        from: tx.from,
+        to: tx.to,
+        mint: tx.mint.unwrap_or_default(),
+        value: tx.value,
+        gas_limit: tx.gas_limit,
+        is_system_transaction: tx.is_system_transaction,
+        input: tx.input,
+        eth_value: tx.eth_value.unwrap_or_default(),
+        eth_tx_value: tx.eth_tx_value,
+    };
+    (alloy_tx, remaining)
+}
+
+fn decode_v1(buf: &[u8], len: usize) -> (AlloyTxDeposit, &[u8]) {
+    let (tx, remaining) = TxDepositV1::from_compact(buf, len);
+    let alloy_tx = AlloyTxDeposit {
+        source_hash: tx.source_hash,
+        from: tx.from,
+        to: tx.to,
+        mint: tx.mint.unwrap_or_default(),
+        value: tx.value,
+        gas_limit: tx.gas_limit,
+        is_system_transaction: tx.is_system_transaction,
+        input: tx.input,
+        eth_value: tx.eth_value,
+        eth_tx_value: tx.eth_tx_value,
+    };
+    (alloy_tx, remaining)
+}
+
+/// Try both decoders, pick the one whose decoded `input` starts with a known selector.
+///
+/// # Why `catch_unwind`
+///
+/// Decoding with the wrong format produces a corrupted bitfield, which can pass an invalid
+/// length (e.g. > 16) to `u128::from_compact`, causing a subtraction overflow panic inside
+/// the compact codec. Since there is no fallible `from_compact` API, we use `catch_unwind`
+/// to treat the panic as "wrong format, try the other one".
+///
+/// # `panic = "unwind"` requirement
+///
+/// `catch_unwind` only works when the panic strategy is `unwind` (the default).
+/// If the binary is compiled with `panic = "abort"`, the process will terminate on the
+/// first wrong-format attempt instead of falling through to the other decoder.
+/// The workspace `Cargo.toml` sets `panic = "unwind"` in `[profile.release]`, so this
+/// is safe for production builds. If the panic strategy ever changes to `abort`, this
+/// detection logic must be replaced with a fallible decode path.
+///
+/// # Performance
+///
+/// This function runs at most once per process in production (`#[cfg(not(test))]` fast path
+/// caches the result in `DEPOSIT_COMPACT_FORMAT`). `catch_unwind` overhead on the happy path
+/// (no panic) is negligible — a single function pointer check.
+fn detect_and_decode(buf: &[u8], len: usize) -> (AlloyTxDeposit, &[u8]) {
+    // Try V2 (canonical) first — may panic if buf is actually V1 with certain field values.
+    let v2_result = try_decode_v2(buf, len);
+    if let Ok((ref tx_v2, _)) = v2_result {
+        if has_known_l1_info_selector(&tx_v2.input) {
+            DEPOSIT_COMPACT_FORMAT
+                .compare_exchange(FORMAT_UNKNOWN, FORMAT_V2, Ordering::Relaxed, Ordering::Relaxed)
+                .ok();
+            return v2_result.unwrap();
+        }
+    }
+
+    // Try V1 (legacy) — may panic if buf is actually V2 with certain field values.
+    if let Ok((tx_v1, rem_v1)) = try_decode_v1(buf, len) {
+        if has_known_l1_info_selector(&tx_v1.input) {
+            DEPOSIT_COMPACT_FORMAT
+                .compare_exchange(FORMAT_UNKNOWN, FORMAT_V1, Ordering::Relaxed, Ordering::Relaxed)
+                .ok();
+            return (tx_v1, rem_v1);
+        }
+    }
+
+    // Neither matched a known selector (user deposit tx, random data in tests, etc.).
+    // Do NOT cache — wait for a definitive selector match from the next L1 info tx.
+    // Reuse the saved V2 result if available; otherwise try V1 (guarded).
+    if let Ok(v2) = v2_result {
+        return v2;
+    }
+    if let Ok(v1) = try_decode_v1(buf, len) {
+        return v1;
+    }
+    panic!(
+        "Failed to decode TxDeposit: both V1 and V2 Compact decoders panicked ({} bytes)",
+        buf.len()
+    );
+}
+
+/// Attempt V2 decode, catching panics from malformed bitfield lengths.
+///
+/// `&[u8]` is `UnwindSafe` (via `RefUnwindSafe`), so no unsafe is needed.
+/// `decode_v2` is purely functional — no global state mutation before the potential panic
+/// point — so catching the panic leaves no inconsistent state.
+fn try_decode_v2(buf: &[u8], len: usize) -> Result<(AlloyTxDeposit, &[u8]), ()> {
+    std::panic::catch_unwind(|| decode_v2(buf, len)).map_err(|_| ())
+}
+
+/// Attempt V1 decode, catching panics from malformed bitfield lengths.
+/// Same safety rationale as [`try_decode_v2`].
+fn try_decode_v1(buf: &[u8], len: usize) -> Result<(AlloyTxDeposit, &[u8]), ()> {
+    std::panic::catch_unwind(|| decode_v1(buf, len)).map_err(|_| ())
+}
+
+// =====================================================================================
+//  AlloyTxDeposit Compact impl — write V2, read auto-detect
+// =====================================================================================
 
 impl Compact for AlloyTxDeposit {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
+        // Always write V2 (canonical 2-byte bitfield).
         let tx = TxDeposit {
             source_hash: self.source_hash,
             from: self.from,
@@ -81,34 +237,40 @@ impl Compact for AlloyTxDeposit {
             value: self.value,
             gas_limit: self.gas_limit,
             is_system_transaction: self.is_system_transaction,
-            input: self.input.clone(),
             eth_value: match self.eth_value {
                 0 => None,
                 v => Some(v),
             },
             eth_tx_value: self.eth_tx_value,
+            input: self.input.clone(),
         };
         tx.to_compact(buf)
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        // Return the remaining slice from the inner from_compact to advance the cursor correctly.
-        let (tx, remaining) = TxDeposit::from_compact(buf, len);
-        let alloy_tx = Self {
-            source_hash: tx.source_hash,
-            from: tx.from,
-            to: tx.to,
-            mint: tx.mint.unwrap_or_default(),
-            value: tx.value,
-            gas_limit: tx.gas_limit,
-            is_system_transaction: tx.is_system_transaction,
-            input: tx.input,
-            eth_value: tx.eth_value.unwrap_or_default(),
-            eth_tx_value: tx.eth_tx_value,
-        };
-        (alloy_tx, remaining)
+        // In test builds, skip the cache to avoid cross-test interference
+        // (tests run in parallel in the same process, sharing the global AtomicU8).
+        // In production, the cache is set once on the first L1 info deposit tx
+        // and never changes — safe for the process lifetime.
+        #[cfg(not(test))]
+        {
+            let cached = DEPOSIT_COMPACT_FORMAT.load(Ordering::Relaxed);
+            if cached == FORMAT_V2 {
+                return decode_v2(buf, len);
+            }
+            if cached == FORMAT_V1 {
+                return decode_v1(buf, len);
+            }
+        }
+
+        // Detection path: try both formats, pick by selector match.
+        detect_and_decode(buf, len)
     }
 }
+
+// =====================================================================================
+//  OpTxType, OpTypedTransaction, OpTxEnvelope — unchanged
+// =====================================================================================
 
 impl crate::Compact for OpTxType {
     fn to_compact<B>(&self, buf: &mut B) -> usize
@@ -132,9 +294,6 @@ impl crate::Compact for OpTxType {
         }
     }
 
-    // For backwards compatibility purposes only 2 bits of the type are encoded in the identifier
-    // parameter. In the case of a [`COMPACT_EXTENDED_IDENTIFIER_FLAG`], the full transaction type
-    // is read from the buffer as a single byte.
     fn from_compact(mut buf: &[u8], identifier: usize) -> (Self, &[u8]) {
         use bytes::Buf;
         (
@@ -279,250 +438,55 @@ impl Compact for OpTxEnvelope {
 
 generate_tests!(#[crate, compact] OpTypedTransaction, OpTypedTransactionTests);
 
+// =====================================================================================
+//  Tests
+// =====================================================================================
+
 #[cfg(test)]
-mod mantle_compact_roundtrip_tests {
+mod mantle_compact_tests {
     use super::*;
     use alloy_primitives::{address, hex, Bytes, TxKind, B256, U256};
     use op_alloy_consensus::TxDeposit as AlloyTxDeposit;
 
-    /// Simulate a typical Mantle mainnet deposit tx (Limb era):
-    /// `eth_value=0`, `eth_tx_value=None`, input=260 bytes (Bedrock `setL1BlockValues`)
-    ///
-    /// This is the exact scenario that causes the 243-byte bug on op-reth-rpc41.
-    #[test]
-    fn test_compact_roundtrip_mantle_deposit_tx_bedrock_260b() {
-        // Bedrock setL1BlockValues calldata (260 bytes): selector 015d8eb9 + 8 * 32-byte args
-        let mut input_data = vec![0x01, 0x5d, 0x8e, 0xb9]; // selector
-                                                           // 8 ABI-encoded uint256 args (8 * 32 = 256 bytes)
-        for i in 0u8..8 {
-            let mut arg = [0u8; 32];
-            arg[31] = i + 1; // non-zero last byte for each arg
-            input_data.extend_from_slice(&arg);
-        }
-        assert_eq!(input_data.len(), 260, "Bedrock calldata must be 260 bytes");
-
-        let original = AlloyTxDeposit {
-            source_hash: B256::from(hex!(
-                "520df4f6f1f883397e640e1f837e3d29b119241a4fb50ff483256d850562f903"
-            )),
-            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
-            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
-            mint: 0,
-            value: U256::ZERO,
-            gas_limit: 1_000_000,
-            is_system_transaction: false,
-            eth_value: 0,
-            input: Bytes::from(input_data),
-            eth_tx_value: None,
-        };
-
-        // Compact roundtrip — use Vec::new() so buffer grows to exact encoded size.
-        // Using a pre-allocated buffer (e.g., vec![0u8; 4096]) would cause the Bytes
-        // field to read trailing zeros, since it consumes the remaining buffer.
-        let mut compact_buf = Vec::new();
-        let _len = original.to_compact(&mut compact_buf);
-        let (restored, _remaining) = AlloyTxDeposit::from_compact(&compact_buf, compact_buf.len());
-
-        // Field-level comparison
-        assert_eq!(original.source_hash, restored.source_hash, "source_hash mismatch");
-        assert_eq!(original.from, restored.from, "from mismatch");
-        assert_eq!(original.to, restored.to, "to mismatch");
-        assert_eq!(original.mint, restored.mint, "mint mismatch");
-        assert_eq!(original.value, restored.value, "value mismatch");
-        assert_eq!(original.gas_limit, restored.gas_limit, "gas_limit mismatch");
-        assert_eq!(
-            original.is_system_transaction, restored.is_system_transaction,
-            "is_system_transaction mismatch"
-        );
-        assert_eq!(original.eth_value, restored.eth_value, "eth_value mismatch");
-        assert_eq!(original.eth_tx_value, restored.eth_tx_value, "eth_tx_value mismatch");
-        assert_eq!(
-            original.input.len(),
-            restored.input.len(),
-            "input LENGTH mismatch: expected {} got {}",
-            original.input.len(),
-            restored.input.len()
-        );
-        assert_eq!(original.input, restored.input, "input CONTENT mismatch");
+    /// Reset the global format cache so tests don't interfere with each other.
+    fn reset_format_cache() {
+        DEPOSIT_COMPACT_FORMAT.store(FORMAT_UNKNOWN, Ordering::Relaxed);
     }
 
-    /// Test with `eth_value=200`, `eth_tx_value=Some(300)` — non-zero Mantle extension fields
+    // ==================================================================================
+    //  Bitfield guard tests
+    // ==================================================================================
+
     #[test]
-    fn test_compact_roundtrip_mantle_deposit_tx_nonzero_fields() {
-        let original = AlloyTxDeposit {
-            source_hash: B256::with_last_byte(42),
-            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
-            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
-            mint: 1000,
-            value: U256::from(5000),
-            gas_limit: 1_000_000,
-            is_system_transaction: false,
-            eth_value: 200,
-            input: Bytes::from_static(&[0x01, 0x5d, 0x8e, 0xb9, 0xaa, 0xbb, 0xcc]),
-            eth_tx_value: Some(300),
-        };
-
-        let mut compact_buf = Vec::new();
-        let _len = original.to_compact(&mut compact_buf);
-        let (restored, _) = AlloyTxDeposit::from_compact(&compact_buf, compact_buf.len());
-
-        assert_eq!(original.eth_value, restored.eth_value, "eth_value mismatch");
-        assert_eq!(original.eth_tx_value, restored.eth_tx_value, "eth_tx_value mismatch");
-        assert_eq!(original.input, restored.input, "input mismatch");
-        assert_eq!(original, restored, "full tx mismatch");
+    fn test_v2_bitfield_size_must_be_2_bytes() {
+        assert_eq!(TxDeposit::bitflag_encoded_bytes(), 2, "V2 bitfield must be 2 bytes");
     }
 
-    /// Test `eth_tx_value=Some(0)` — edge case where Option is Some but value is zero
     #[test]
-    fn test_compact_roundtrip_eth_tx_value_some_zero() {
-        let original = AlloyTxDeposit {
-            source_hash: B256::with_last_byte(1),
-            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
-            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
-            mint: 0,
-            value: U256::ZERO,
-            gas_limit: 1_000_000,
-            is_system_transaction: false,
-            eth_value: 0,
-            input: Bytes::from_static(&[0x01, 0x02, 0x03]),
-            eth_tx_value: Some(0),
-        };
-
-        let mut compact_buf = Vec::new();
-        let _len = original.to_compact(&mut compact_buf);
-        let (restored, _) = AlloyTxDeposit::from_compact(&compact_buf, compact_buf.len());
-
-        assert_eq!(original.eth_value, restored.eth_value, "eth_value mismatch");
-        assert_eq!(
-            original.eth_tx_value, restored.eth_tx_value,
-            "eth_tx_value mismatch: expected {:?} got {:?}",
-            original.eth_tx_value, restored.eth_tx_value
-        );
-        assert_eq!(
-            original.input,
-            restored.input,
-            "input mismatch: expected {} bytes got {} bytes",
-            original.input.len(),
-            restored.input.len()
-        );
+    fn test_v1_bitfield_size_must_be_3_bytes() {
+        assert_eq!(TxDepositV1::bitflag_encoded_bytes(), 3, "V1 bitfield must be 3 bytes");
     }
 
-    /// CRITICAL GUARD TEST: The Compact bitfield for `TxDeposit` MUST be exactly 2 bytes.
-    ///
-    /// If this test fails, you have changed a field type in the `TxDeposit` struct in a way
-    /// that changes the bitfield size. This WILL break all existing on-disk data for every
-    /// Mantle node that upgrades. DO NOT simply update the expected value — read the
-    /// struct-level doc comment on `TxDeposit` and `TROUBLESHOOTING-OP-RETH-RPC41.md` §5.4.
-    ///
-    /// Background: Commit `563f0492b2` changed `eth_value: Option<u128>` (1 bit) to
-    /// `eth_value: u128` (5 bits), growing the bitfield from 2→3 bytes. This caused every
-    /// deposit tx read from DB to have all fields shifted by 1 byte, producing corrupt data
-    /// (e.g., input truncated from 260→243 bytes). The fix was to revert to `Option<u128>`.
+    // ==================================================================================
+    //  Selector detection
+    // ==================================================================================
+
     #[test]
-    fn test_bitfield_size_must_be_2_bytes() {
-        assert_eq!(
-            TxDeposit::bitflag_encoded_bytes(),
-            2,
-            "TxDeposit bitfield size changed! This breaks ALL existing on-disk data. \
-             See struct-level doc on TxDeposit and TROUBLESHOOTING-OP-RETH-RPC41.md §5.4. \
-             Current field bit counts: B256=0, Address=0, TxKind=1, Option<u128>=1, \
-             U256=6, u64=4, bool=1, Option<u128>=1, Option<u128>=1, Bytes=0 → 15 bits → 2 bytes."
-        );
+    fn test_known_selectors() {
+        assert!(has_known_l1_info_selector(&[0x01, 0x5d, 0x8e, 0xb9, 0x00]));
+        assert!(has_known_l1_info_selector(&[0x49, 0xe7, 0x23, 0x83]));
+        assert!(!has_known_l1_info_selector(&[0x00, 0x00, 0x00, 0x00]));
+        assert!(!has_known_l1_info_selector(&[0x01, 0x5d, 0x8e]));
+        assert!(!has_known_l1_info_selector(&[]));
     }
 
-    /// Roundtrip test using real Mantle mainnet deposit tx bytes from block 87,910,504.
-    ///
-    /// These bytes were fetched from geth via `debug_getRawTransaction` and represent a
-    /// typical Limb-era L1 attributes deposit tx with 260-byte input calldata. This is the
-    /// exact tx pattern that triggered the op-reth-rpc41 "data is unexpected length: 243" bug.
-    ///
-    /// The test decodes the real RLP bytes → Compact encode → Compact decode → RLP re-encode,
-    /// and asserts the output is byte-identical to the original.
+    // ==================================================================================
+    //  V2 roundtrip (write V2, read V2 directly)
+    // ==================================================================================
+
     #[test]
-    fn test_compact_roundtrip_real_mainnet_block_87910504() {
-        use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-
-        // Real deposit tx from Mantle mainnet block 87,910,504 (353 bytes EIP-2718 envelope).
-        // Fetched via: cast rpc debug_getRawTransaction <txhash> --rpc-url <geth>
-        // Type 0x7e (126) = deposit tx.
-        let raw_bytes = hex!(
-            "7ef9015aa0f129853cf1f38fe1fbcf264f82d80e8fd4532bba9213ff0b0846890cbd2f1656"
-            "94deaddeaddeaddeaddeaddeaddeaddeaddead0001944200000000000000000000000000000000"
-            "000015808083"
-            "0f42408080b90104015d8eb900000000000000000000000000000000000000000000000000"
-            "000000000f424000000000000000000000000000000000000000000000000000000000676f0775"
-            "000000000000000000000000000000000000000000000000000000003b9aca0000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000027100000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc00000000000000000000000000000000000000000000000000000000000000012710"
-        );
-        assert_eq!(raw_bytes.len(), 353, "Real mainnet tx must be 353 bytes (EIP-2718 envelope)");
-
-        // Step 1: Decode RLP (simulates what reth does when receiving from Engine API)
-        let tx = AlloyTxDeposit::decode_2718(&mut &raw_bytes[..])
-            .expect("Failed to decode real mainnet deposit tx RLP");
-
-        // Verify key fields from the real tx
-        assert_eq!(tx.from, address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"));
-        assert_eq!(tx.to, TxKind::Call(address!("4200000000000000000000000000000000000015")));
-        assert_eq!(tx.gas_limit, 1_000_000);
-        assert_eq!(tx.eth_value, 0);
-        assert_eq!(tx.input.len(), 260, "Bedrock setL1BlockValues calldata = 260 bytes");
-
-        // Step 2: Compact encode (simulates DB write)
-        let mut compact_buf = Vec::new();
-        let _len = tx.to_compact(&mut compact_buf);
-
-        // Step 3: Compact decode (simulates DB read)
-        let (restored, _) = AlloyTxDeposit::from_compact(&compact_buf, compact_buf.len());
-
-        // Step 4: Verify field-level correctness (catches 1-byte shift bugs)
-        assert_eq!(tx.source_hash, restored.source_hash, "source_hash mismatch");
-        assert_eq!(tx.from, restored.from, "from mismatch");
-        assert_eq!(tx.to, restored.to, "to mismatch");
-        assert_eq!(tx.mint, restored.mint, "mint mismatch");
-        assert_eq!(tx.value, restored.value, "value mismatch");
-        assert_eq!(tx.gas_limit, restored.gas_limit, "gas_limit mismatch");
-        assert_eq!(
-            tx.is_system_transaction, restored.is_system_transaction,
-            "is_system_transaction mismatch"
-        );
-        assert_eq!(tx.eth_value, restored.eth_value, "eth_value mismatch");
-        assert_eq!(tx.eth_tx_value, restored.eth_tx_value, "eth_tx_value mismatch");
-        assert_eq!(
-            tx.input.len(),
-            restored.input.len(),
-            "input LENGTH mismatch: expected {} got {} (this is the exact rpc41 bug symptom!)",
-            tx.input.len(),
-            restored.input.len()
-        );
-        assert_eq!(tx.input, restored.input, "input CONTENT mismatch");
-
-        // Step 5: RLP re-encode and compare against the decoded tx's own RLP encoding.
-        // We compare against tx.encoded_2718() (not raw_bytes) to isolate the Compact
-        // roundtrip from any RLP decode/re-encode differences.
-        let rlp_original = tx.encoded_2718();
-        let rlp_restored = restored.encoded_2718();
-        assert_eq!(
-            rlp_original.len(),
-            rlp_restored.len(),
-            "RLP length mismatch: original {}B vs restored {}B",
-            rlp_original.len(),
-            rlp_restored.len()
-        );
-        assert_eq!(
-            rlp_original,
-            rlp_restored,
-            "RLP bytes differ after Compact roundtrip! This means the Compact codec is corrupting data."
-        );
-    }
-
-    /// Full RLP → Compact → RLP roundtrip test.
-    /// This simulates the exact reth pipeline: Engine API receive → DB store → DB read → serve.
-    #[test]
-    fn test_full_rlp_compact_rlp_roundtrip() {
-        use alloy_eips::eip2718::Encodable2718;
-
-        // Build a realistic Mantle deposit tx
-        let mut input_data = vec![0x01, 0x5d, 0x8e, 0xb9]; // Bedrock selector
+    fn test_v2_roundtrip_bedrock_260b() {
+        let mut input_data = vec![0x01, 0x5d, 0x8e, 0xb9];
         for i in 0u8..8 {
             let mut arg = [0u8; 32];
             arg[31] = i + 1;
@@ -544,33 +508,288 @@ mod mantle_compact_roundtrip_tests {
             eth_tx_value: None,
         };
 
-        // Step 1: RLP encode (simulate what geth/sequencer produces)
-        let rlp_original = original.encoded_2718();
+        let mut buf = Vec::new();
+        original.to_compact(&mut buf);
+        let (restored, rem) = decode_v2(&buf, buf.len());
+        assert!(rem.is_empty());
+        assert_eq!(original, restored);
+    }
 
-        // Step 2: Compact encode (simulate DB write)
+    #[test]
+    fn test_v2_roundtrip_nonzero_fields() {
+        let original = AlloyTxDeposit {
+            source_hash: B256::with_last_byte(42),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: 1000,
+            value: U256::from(5000),
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 200,
+            input: Bytes::from_static(&[0x49, 0xe7, 0x23, 0x83, 0xaa, 0xbb]),
+            eth_tx_value: Some(300),
+        };
+
+        let mut buf = Vec::new();
+        original.to_compact(&mut buf);
+        let (restored, rem) = decode_v2(&buf, buf.len());
+        assert!(rem.is_empty());
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn test_v2_roundtrip_eth_tx_value_some_zero() {
+        let original = AlloyTxDeposit {
+            source_hash: B256::with_last_byte(1),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            input: Bytes::from_static(&[0x01, 0x02, 0x03]),
+            eth_tx_value: Some(0),
+        };
+
+        let mut buf = Vec::new();
+        original.to_compact(&mut buf);
+        let (restored, _) = decode_v2(&buf, buf.len());
+        assert_eq!(original.eth_tx_value, restored.eth_tx_value);
+        assert_eq!(original.input, restored.input);
+    }
+
+    // ==================================================================================
+    //  Auto-detection: V1 encoded → detect_and_decode picks V1
+    // ==================================================================================
+
+    #[test]
+    fn test_detect_v1_bedrock_selector() {
+        reset_format_cache();
+        let v1_tx = TxDepositV1 {
+            source_hash: B256::from(hex!(
+                "520df4f6f1f883397e640e1f837e3d29b119241a4fb50ff483256d850562f903"
+            )),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: None,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            eth_tx_value: None,
+            input: Bytes::from_static(&[0x01, 0x5d, 0x8e, 0xb9, 0x00, 0x01]),
+        };
+
+        let mut v1_buf = Vec::new();
+        v1_tx.to_compact(&mut v1_buf);
+
+        let (restored, rem) = detect_and_decode(&v1_buf, v1_buf.len());
+        assert!(rem.is_empty());
+        assert_eq!(restored.source_hash, v1_tx.source_hash);
+        assert_eq!(restored.from, v1_tx.from);
+        assert_eq!(restored.gas_limit, v1_tx.gas_limit);
+        assert_eq!(restored.eth_value, v1_tx.eth_value);
+        assert_eq!(restored.input, v1_tx.input);
+    }
+
+    #[test]
+    fn test_detect_v1_arsia_selector() {
+        reset_format_cache();
+        let v1_tx = TxDepositV1 {
+            source_hash: B256::with_last_byte(99),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: None,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            eth_tx_value: None,
+            input: Bytes::from_static(&[0x49, 0xe7, 0x23, 0x83, 0x01, 0x02]),
+        };
+
+        let mut v1_buf = Vec::new();
+        v1_tx.to_compact(&mut v1_buf);
+
+        let (restored, rem) = detect_and_decode(&v1_buf, v1_buf.len());
+        assert!(rem.is_empty());
+        assert_eq!(restored.input, v1_tx.input);
+        assert_eq!(restored.from, v1_tx.from);
+    }
+
+    #[test]
+    fn test_detect_v1_nonzero_eth_value() {
+        reset_format_cache();
+        let v1_tx = TxDepositV1 {
+            source_hash: B256::with_last_byte(42),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: Some(1000),
+            value: U256::from(5000),
+            gas_limit: 2_000_000,
+            is_system_transaction: false,
+            eth_value: 200,
+            eth_tx_value: Some(300),
+            input: Bytes::from_static(&[0x01, 0x5d, 0x8e, 0xb9, 0xaa, 0xbb, 0xcc]),
+        };
+
+        let mut v1_buf = Vec::new();
+        v1_tx.to_compact(&mut v1_buf);
+
+        let (restored, rem) = detect_and_decode(&v1_buf, v1_buf.len());
+        assert!(rem.is_empty());
+        assert_eq!(restored.eth_value, 200);
+        assert_eq!(restored.eth_tx_value, Some(300));
+        assert_eq!(restored.mint, 1000);
+        assert_eq!(restored.input, v1_tx.input);
+    }
+
+    #[test]
+    fn test_detect_v1_bedrock_260b_input() {
+        reset_format_cache();
+        let mut input_data = vec![0x01, 0x5d, 0x8e, 0xb9];
+        for i in 0u8..8 {
+            let mut arg = [0u8; 32];
+            arg[31] = i + 1;
+            input_data.extend_from_slice(&arg);
+        }
+        assert_eq!(input_data.len(), 260);
+
+        let v1_tx = TxDepositV1 {
+            source_hash: B256::from(hex!(
+                "f129853cf1f38fe1fbcf264f82d80e8fd4532bba9213ff0b0846890cbd2f1656"
+            )),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: None,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            eth_tx_value: None,
+            input: Bytes::from(input_data.clone()),
+        };
+
+        let mut v1_buf = Vec::new();
+        v1_tx.to_compact(&mut v1_buf);
+
+        let (restored, rem) = detect_and_decode(&v1_buf, v1_buf.len());
+        assert!(rem.is_empty());
+        assert_eq!(restored.input.len(), 260, "Bedrock input must be 260 bytes");
+        assert_eq!(restored.input, Bytes::from(input_data));
+        assert_eq!(restored.source_hash, v1_tx.source_hash);
+    }
+
+    // ==================================================================================
+    //  Auto-detection: V2 encoded → detect_and_decode picks V2
+    // ==================================================================================
+
+    #[test]
+    fn test_detect_v2_bedrock_selector() {
+        reset_format_cache();
+        let original = AlloyTxDeposit {
+            source_hash: B256::from(hex!(
+                "520df4f6f1f883397e640e1f837e3d29b119241a4fb50ff483256d850562f903"
+            )),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            input: Bytes::from_static(&[0x01, 0x5d, 0x8e, 0xb9, 0x00, 0x01]),
+            eth_tx_value: None,
+        };
+
+        let mut buf = Vec::new();
+        original.to_compact(&mut buf);
+
+        let (restored, rem) = detect_and_decode(&buf, buf.len());
+        assert!(rem.is_empty());
+        assert_eq!(restored, original);
+    }
+
+    // ==================================================================================
+    //  Mixed-format test: both V1 and V2 data readable by detect_and_decode
+    // ==================================================================================
+
+    #[test]
+    fn test_mixed_format_both_readable() {
+        reset_format_cache();
+        let tx = AlloyTxDeposit {
+            source_hash: B256::with_last_byte(1),
+            from: address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001"),
+            to: TxKind::Call(address!("4200000000000000000000000000000000000015")),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            input: Bytes::from_static(&[0x01, 0x5d, 0x8e, 0xb9, 0xaa, 0xbb]),
+            eth_tx_value: None,
+        };
+
+        // V1 encoded
+        let v1_inner = TxDepositV1 {
+            source_hash: tx.source_hash,
+            from: tx.from,
+            to: tx.to,
+            mint: None,
+            value: tx.value,
+            gas_limit: tx.gas_limit,
+            is_system_transaction: tx.is_system_transaction,
+            eth_value: tx.eth_value,
+            eth_tx_value: tx.eth_tx_value,
+            input: tx.input.clone(),
+        };
+        let mut v1_buf = Vec::new();
+        v1_inner.to_compact(&mut v1_buf);
+
+        // V2 encoded
+        let mut v2_buf = Vec::new();
+        tx.to_compact(&mut v2_buf);
+
+        // Both readable via detect_and_decode
+        let (from_v1, rem1) = detect_and_decode(&v1_buf, v1_buf.len());
+        assert!(rem1.is_empty());
+        assert_eq!(from_v1.source_hash, tx.source_hash);
+        assert_eq!(from_v1.input, tx.input);
+
+        let (from_v2, rem2) = detect_and_decode(&v2_buf, v2_buf.len());
+        assert!(rem2.is_empty());
+        assert_eq!(from_v2, tx);
+    }
+
+    // ==================================================================================
+    //  Real mainnet tx RLP → Compact → RLP roundtrip
+    // ==================================================================================
+
+    #[test]
+    fn test_real_mainnet_block_87910504() {
+        use alloy_eips::eip2718::{Decodable2718, Encodable2718};
+
+        let raw_bytes = hex!(
+            "7ef9015aa0f129853cf1f38fe1fbcf264f82d80e8fd4532bba9213ff0b0846890cbd2f1656"
+            "94deaddeaddeaddeaddeaddeaddeaddeaddead0001944200000000000000000000000000000000"
+            "000015808083"
+            "0f42408080b90104015d8eb900000000000000000000000000000000000000000000000000"
+            "000000000f424000000000000000000000000000000000000000000000000000000000676f0775"
+            "000000000000000000000000000000000000000000000000000000003b9aca0000000000000000"
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000027100000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc00000000000000000000000000000000000000000000000000000000000000012710"
+        );
+
+        let tx = AlloyTxDeposit::decode_2718(&mut &raw_bytes[..]).unwrap();
+        assert_eq!(tx.input.len(), 260);
+
         let mut compact_buf = Vec::new();
-        let _len = original.to_compact(&mut compact_buf);
+        tx.to_compact(&mut compact_buf);
+        let (restored, _) = decode_v2(&compact_buf, compact_buf.len());
+        assert_eq!(tx, restored);
 
-        // Step 3: Compact decode (simulate DB read)
-        let (restored, _) = AlloyTxDeposit::from_compact(&compact_buf, compact_buf.len());
-
-        // Step 4: RLP re-encode (simulate serving via Engine API / RPC)
+        let rlp_original = tx.encoded_2718();
         let rlp_restored = restored.encoded_2718();
-
-        // Compare: the full pipeline must produce identical bytes
-        assert_eq!(
-            rlp_original.len(),
-            rlp_restored.len(),
-            "RLP length mismatch after Compact roundtrip: original {}B vs restored {}B",
-            rlp_original.len(),
-            rlp_restored.len()
-        );
-        assert_eq!(
-            rlp_original,
-            rlp_restored,
-            "RLP bytes differ after Compact roundtrip!\noriginal: {}\nrestored: {}",
-            hex::encode(&rlp_original),
-            hex::encode(&rlp_restored)
-        );
+        assert_eq!(rlp_original, rlp_restored);
     }
 }
