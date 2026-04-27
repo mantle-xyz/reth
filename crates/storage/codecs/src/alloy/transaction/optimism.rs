@@ -4,9 +4,10 @@
 //! - V2 (2-byte bitfield): `eth_value: Option<u128>` — canonical format (v2.0.5 / v2.2.1+)
 //! - V1 (3-byte bitfield): `eth_value: u128` — legacy format (v2.1.x / v2.2.0-beta)
 //!
-//! Detection: decode with V2, check if `input[0..4]` matches a known L1 info deposit
-//! selector. If not, try V1. Result is cached in an `AtomicU8` — detection runs at most
-//! once (on the first L1 info deposit tx read). Writes always use V2 (canonical).
+//! Detection: on each `from_compact` call, try V2 decode first, check if `input[0..4]`
+//! matches a known L1 info deposit selector. If not, try V1. The last successful detection
+//! is cached in an `AtomicU8` as a fallback hint for user deposit txs (which lack known
+//! selectors). Writes always use V2 (canonical).
 
 use crate::{
     alloy::transaction::ethereum::{CompactEnvelope, Envelope, FromTxCompact, ToTxCompact},
@@ -46,12 +47,12 @@ fn has_known_l1_info_selector(input: &[u8]) -> bool {
     input.len() >= 4 && L1_BLOCK_SELECTORS.iter().any(|s| input[..4] == *s)
 }
 
+/// Last detected format, used as a fallback hint for user deposit txs (no known selector).
+/// Updated by every successful selector-based detection.
+/// Uses AtomicU8 instead of OnceLock so it can be reset in tests.
 const FORMAT_UNKNOWN: u8 = 0;
 const FORMAT_V2: u8 = 1;
 const FORMAT_V1: u8 = 2;
-
-/// Cached per-process format detection. Set on the first successful selector-based detection.
-/// Uses AtomicU8 instead of OnceLock so it can be reset in tests.
 static DEPOSIT_COMPACT_FORMAT: AtomicU8 = AtomicU8::new(FORMAT_UNKNOWN);
 
 // =====================================================================================
@@ -162,44 +163,47 @@ fn decode_v1(buf: &[u8], len: usize) -> (AlloyTxDeposit, &[u8]) {
 ///
 /// # Performance
 ///
-/// This function runs at most once per process in production (`#[cfg(not(test))]` fast path
-/// caches the result in `DEPOSIT_COMPACT_FORMAT`). `catch_unwind` overhead on the happy path
-/// (no panic) is negligible — a single function pointer check.
+/// Called on every `from_compact` (no cached fast path), but the work is lightweight:
+/// `try_decode_v2` succeeds without panic for most data, then a 4-byte selector comparison
+/// against 5 known values. `catch_unwind` overhead on the no-panic path is negligible.
 fn detect_and_decode(buf: &[u8], len: usize) -> (AlloyTxDeposit, &[u8]) {
     // Try V2 (canonical) first — may panic if buf is actually V1 with certain field values.
     let v2_result = try_decode_v2(buf, len);
     if let Ok((ref tx_v2, _)) = v2_result {
         if has_known_l1_info_selector(&tx_v2.input) {
-            DEPOSIT_COMPACT_FORMAT
-                .compare_exchange(FORMAT_UNKNOWN, FORMAT_V2, Ordering::Relaxed, Ordering::Relaxed)
-                .ok();
+            DEPOSIT_COMPACT_FORMAT.store(FORMAT_V2, Ordering::Relaxed);
             return v2_result.unwrap();
         }
     }
 
     // Try V1 (legacy) — may panic if buf is actually V2 with certain field values.
-    if let Ok((tx_v1, rem_v1)) = try_decode_v1(buf, len) {
+    let v1_result = try_decode_v1(buf, len);
+    if let Ok((ref tx_v1, _)) = v1_result {
         if has_known_l1_info_selector(&tx_v1.input) {
-            DEPOSIT_COMPACT_FORMAT
-                .compare_exchange(FORMAT_UNKNOWN, FORMAT_V1, Ordering::Relaxed, Ordering::Relaxed)
-                .ok();
-            return (tx_v1, rem_v1);
+            DEPOSIT_COMPACT_FORMAT.store(FORMAT_V1, Ordering::Relaxed);
+            return v1_result.unwrap();
         }
     }
 
-    // Neither matched a known selector (user deposit tx, random data in tests, etc.).
-    // Do NOT cache — wait for a definitive selector match from the next L1 info tx.
-    // Reuse the saved V2 result if available; otherwise try V1 (guarded).
+    // Neither selector matched — user deposit tx or unknown calldata.
+    // Use the cached hint from the last L1 info tx detection (same block's first tx).
+    let hint = DEPOSIT_COMPACT_FORMAT.load(Ordering::Relaxed);
+    if hint == FORMAT_V1 {
+        if let Ok(v1) = v1_result {
+            return v1;
+        }
+    }
+    // Default to V2 (canonical / most common going forward).
     if let Ok(v2) = v2_result {
         return v2;
     }
-    if let Ok(v1) = try_decode_v1(buf, len) {
-        return v1;
-    }
-    panic!(
-        "Failed to decode TxDeposit: both V1 and V2 Compact decoders panicked ({} bytes)",
-        buf.len()
-    );
+    // Both panicked — data is truly corrupt.
+    v1_result.unwrap_or_else(|_| {
+        panic!(
+            "Failed to decode TxDeposit: both V1 and V2 Compact decoders panicked ({} bytes)",
+            buf.len()
+        )
+    })
 }
 
 /// Attempt V2 decode, catching panics from malformed bitfield lengths.
