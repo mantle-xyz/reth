@@ -1,0 +1,6 @@
+[build]
+rustflags = []
+
+# Disable incremental compilation for CI
+# [profile.dev]
+# incremental = false

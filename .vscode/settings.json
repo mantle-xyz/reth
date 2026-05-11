@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.server.extraEnv": {
+    "PATH": "/Users/sh001/Documents/codes/rde-v3/local/rust/cargo/bin:${env:PATH}"
+  }
+}
+

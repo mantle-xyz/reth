@@ -1,0 +1,21 @@
+{
+    "EmptyTransaction" :
+    {
+	    "expectException" : 
+        {
+            ">=Frontier": "TransactionException.INVALID_SIGNATURE_VRS"
+        },
+        "transaction" :
+        {
+            "data" : "",
+            "gasLimit" : "",
+            "gasPrice" : "",
+            "nonce" : "",
+            "to" : "",
+            "value" : "",
+            "v" : "",
+            "r" : "",
+            "s" : ""
+        }
+    }
+}
