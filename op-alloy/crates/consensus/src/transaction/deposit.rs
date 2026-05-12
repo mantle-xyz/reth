@@ -44,9 +44,26 @@ pub struct TxDeposit {
         )
     )]
     pub is_system_transaction: bool,
+    /// Mantle BVM_ETH: ETH value to mint on L2 (0 = no mint).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "alloy_serde::quantity", rename = "ethValue")
+    )]
+    pub eth_value: u128,
     /// Input has two uses depending if transaction is Create or Call (if `to` field is None or
     /// Some).
     pub input: Bytes,
+    /// Mantle BVM_ETH: ETH value to transfer to recipient (None = no transfer).
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            with = "alloy_serde::quantity::opt",
+            rename = "ethTxValue",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
+    pub eth_tx_value: Option<u128>,
 }
 
 impl TxDeposit {
@@ -62,7 +79,9 @@ impl TxDeposit {
     /// - `value`
     /// - `gas_limit`
     /// - `is_system_transaction`
+    /// - `eth_value`        (Mantle BVM_ETH mint amount)
     /// - `input`
+    /// - `eth_tx_value`     (Mantle BVM_ETH tx value, optional / trailing)
     pub fn rlp_decode_fields(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         Ok(Self {
             source_hash: Decodable::decode(buf)?,
@@ -72,8 +91,19 @@ impl TxDeposit {
             value: Decodable::decode(buf)?,
             gas_limit: Decodable::decode(buf)?,
             is_system_transaction: Decodable::decode(buf)?,
+            eth_value: Decodable::decode(buf)?,
             input: Decodable::decode(buf)?,
+            eth_tx_value: Self::decode_optional_u128_from_rlp(buf)?,
         })
+    }
+
+    /// Mantle BVM_ETH: decode optional trailing u128 field. Returns `None` when the buffer is
+    /// empty (legacy deposit without `eth_tx_value`); otherwise decodes a u128.
+    fn decode_optional_u128_from_rlp(buf: &mut &[u8]) -> alloy_rlp::Result<Option<u128>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Decodable::decode(buf)?))
     }
 
     /// Decodes the transaction from RLP bytes.
@@ -82,17 +112,22 @@ impl TxDeposit {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        let remaining = buf.len();
-
-        if header.payload_length > remaining {
+        if header.payload_length > buf.len() {
             return Err(alloy_rlp::Error::InputTooShort);
         }
 
-        let this = Self::rlp_decode_fields(buf)?;
+        // [MANTLE] Decode fields strictly within this RLP payload so trailing bytes (e.g. the
+        // next tx in a stream) are never interpreted as the optional `eth_tx_value` field of
+        // the current tx. Equivalent to mantle-xyz/op-alloy commit 6637567 — supports
+        // stream-style decoding without rejecting trailing data.
+        let (payload, rest) = buf.split_at(header.payload_length);
+        let mut payload_buf = payload;
+        let this = Self::rlp_decode_fields(&mut payload_buf)?;
 
-        if buf.len() + header.payload_length != remaining {
+        if !payload_buf.is_empty() {
             return Err(alloy_rlp::Error::UnexpectedLength);
         }
+        *buf = rest;
 
         Ok(this)
     }
@@ -107,7 +142,9 @@ impl TxDeposit {
             self.value.length() +
             self.gas_limit.length() +
             self.is_system_transaction.length() +
-            self.input.0.length()
+            self.eth_value.length() +
+            self.input.0.length() +
+            self.eth_tx_value.map_or(0, |eth_tx_value| eth_tx_value.length())
     }
 
     /// Encodes only the transaction's fields into the desired buffer, without a RLP header.
@@ -120,7 +157,11 @@ impl TxDeposit {
         self.value.encode(out);
         self.gas_limit.encode(out);
         self.is_system_transaction.encode(out);
+        self.eth_value.encode(out);
         self.input.encode(out);
+        if let Some(eth_tx_value) = self.eth_tx_value {
+            eth_tx_value.encode(out);
+        }
     }
 
     /// Calculates a heuristic for the in-memory size of the [`TxDeposit`] transaction.
@@ -133,7 +174,9 @@ impl TxDeposit {
         mem::size_of::<U256>() + // value
         mem::size_of::<u128>() + // gas_limit
         mem::size_of::<bool>() + // is_system_transaction
-        self.input.len() // input
+        mem::size_of::<u128>() + // eth_value (Mantle BVM_ETH)
+        self.input.len() + // input
+        mem::size_of::<Option<u128>>() // eth_tx_value (Mantle BVM_ETH)
     }
 
     /// Get the transaction type
@@ -342,6 +385,10 @@ impl From<TxDeposit> for alloy_rpc_types_eth::TransactionRequest {
             gas_limit,
             is_system_transaction: _,
             input,
+            // Mantle BVM_ETH fields: target is alloy_rpc_types_eth::TransactionRequest,
+            // a standard Ethereum type with no BVM_ETH concept — ignore.
+            eth_value: _,
+            eth_tx_value: _,
         } = tx;
 
         Self {
@@ -433,6 +480,8 @@ mod tests {
             gas_limit: 50000,
             is_system_transaction: true,
             input: Bytes::default(),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         assert_eq!(tx.source_hash(), Some(B256::with_last_byte(42)));
@@ -451,6 +500,8 @@ mod tests {
             gas_limit: 50000,
             is_system_transaction: false,
             input: Bytes::default(),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         assert_eq!(tx.source_hash(), Some(B256::default()));
@@ -470,6 +521,8 @@ mod tests {
             gas_limit: 100000,
             is_system_transaction: false,
             input: Bytes::from_static(&[1, 2, 3]),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         assert_eq!(tx.source_hash(), Some(B256::default()));
@@ -500,6 +553,8 @@ mod tests {
             gas_limit: 50000,
             is_system_transaction: true,
             input: Bytes::default(),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         let mut buffer = BytesMut::new();
@@ -520,6 +575,8 @@ mod tests {
             gas_limit: 50000,
             is_system_transaction: true,
             input: Bytes::default(),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         let mut buffer_with_header = BytesMut::new();
@@ -542,6 +599,8 @@ mod tests {
             gas_limit: 50000,
             is_system_transaction: true,
             input: Bytes::default(),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         assert!(tx_deposit.size() > tx_deposit.rlp_encoded_fields_length());
@@ -558,6 +617,8 @@ mod tests {
             gas_limit: 50000,
             is_system_transaction: true,
             input: Bytes::default(),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         let mut buffer_with_header = BytesMut::new();
@@ -580,6 +641,8 @@ mod tests {
             gas_limit: 50000,
             is_system_transaction: true,
             input: Bytes::default(),
+            eth_value: 0,
+            eth_tx_value: None,
         };
 
         let total_len = tx_deposit.network_encoded_length();
@@ -667,6 +730,9 @@ pub(super) mod serde_bincode_compat {
 
     impl<'a> From<TxDeposit<'a>> for super::TxDeposit {
         fn from(value: TxDeposit<'a>) -> Self {
+            // TODO(mantle): bincode_compat::TxDeposit itself needs eth_value/eth_tx_value
+            // fields to preserve Mantle BVM_ETH data across a bincode round-trip. Defaulting
+            // to 0/None here means bincode-decoded deposits lose BVM_ETH information.
             Self {
                 source_hash: value.source_hash,
                 from: value.from,
@@ -675,7 +741,9 @@ pub(super) mod serde_bincode_compat {
                 value: value.value,
                 gas_limit: value.gas_limit,
                 is_system_transaction: value.is_system_transaction,
+                eth_value: 0,
                 input: value.input.into_owned(),
+                eth_tx_value: None,
             }
         }
     }

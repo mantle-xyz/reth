@@ -108,6 +108,11 @@ impl From<&TxDeposit> for CompactTxDeposit {
 
 impl From<CompactTxDeposit> for TxDeposit {
     fn from(tx: CompactTxDeposit) -> Self {
+        // TODO(mantle): CompactTxDeposit itself needs eth_value / eth_tx_value fields
+        // to preserve Mantle BVM_ETH data in reth's Compact storage. Defaulting to 0/None
+        // here means deposits decoded from Compact lose BVM_ETH information. Production
+        // Mantle reth typically uses its own fork — confirm with the team whether this
+        // codec is actually exercised before relying on lossless round-trips.
         Self {
             source_hash: tx.source_hash,
             from: tx.from,
@@ -116,7 +121,9 @@ impl From<CompactTxDeposit> for TxDeposit {
             value: tx.value,
             gas_limit: tx.gas_limit,
             is_system_transaction: tx.is_system_transaction,
+            eth_value: 0,
             input: tx.input,
+            eth_tx_value: None,
         }
     }
 }

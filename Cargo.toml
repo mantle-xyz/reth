@@ -61,7 +61,6 @@ members = [
   "op-alloy/crates/*",
   "alloy-op-evm/",
   "alloy-op-hardforks/",
-  "op-revm/",
 ]
 default-members = [
   "op-reth/bin/",
@@ -236,22 +235,21 @@ revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branc
 # TODO: Switch to mantle-xyz/evm once upgraded
 alloy-evm = { version = "0.34.0", default-features = false }
 
-# ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (local path, from optimism monorepo) ====================
-alloy-op-evm = { version = "0.31.0", path = "alloy-op-evm/", default-features = false }
-alloy-op-hardforks = { version = "0.4.7", path = "alloy-op-hardforks/", default-features = false }
+# ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantlenetworkio/mantle-v2 rust/upgrade-develop-20260511) ====================
+alloy-op-evm = { version = "0.32.0", path = "alloy-op-evm/", default-features = false }
+alloy-op-hardforks = { version = "0.5.0", path = "alloy-op-hardforks/", default-features = false }
 
-# ==================== OP-REVM (local path, from optimism monorepo) ====================
-# NOTE: This is the UPSTREAM op-revm. Later switch to mantle-xyz/revm's op-revm with Mantle fee patches
-op-revm = { version = "19.0.0", path = "op-revm/", default-features = false }
+# ==================== OP-REVM (Mantle fork: mantle-elysium branch, same repo as revm) ====================
+op-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
 
-# ==================== OP-ALLOY (local path, from optimism monorepo) ====================
-op-alloy = { version = "0.24.0", path = "op-alloy/crates/op-alloy", default-features = false }
-op-alloy-consensus = { version = "0.24.0", path = "op-alloy/crates/consensus", default-features = false }
-op-alloy-network = { version = "0.24.0", path = "op-alloy/crates/network", default-features = false }
-op-alloy-provider = { version = "0.24.0", path = "op-alloy/crates/provider", default-features = false }
-op-alloy-rpc-types = { version = "0.24.0", path = "op-alloy/crates/rpc-types", default-features = false }
-op-alloy-rpc-types-engine = { version = "0.24.0", path = "op-alloy/crates/rpc-types-engine", default-features = false }
-op-alloy-rpc-jsonrpsee = { version = "0.24.0", path = "op-alloy/crates/rpc-jsonrpsee", default-features = false }
+# ==================== OP-ALLOY (Mantle: mantlenetworkio/mantle-v2 rust/upgrade-develop-20260511) ====================
+op-alloy = { version = "2.0.0", path = "op-alloy/crates/op-alloy", default-features = false }
+op-alloy-consensus = { version = "2.0.0", path = "op-alloy/crates/consensus", default-features = false }
+op-alloy-network = { version = "2.0.0", path = "op-alloy/crates/network", default-features = false }
+op-alloy-provider = { version = "2.0.0", path = "op-alloy/crates/provider", default-features = false }
+op-alloy-rpc-types = { version = "2.0.0", path = "op-alloy/crates/rpc-types", default-features = false }
+op-alloy-rpc-types-engine = { version = "2.0.0", path = "op-alloy/crates/rpc-types-engine", default-features = false }
+op-alloy-rpc-jsonrpsee = { version = "2.0.0", path = "op-alloy/crates/rpc-jsonrpsee", default-features = false }
 op-alloy-flz = { version = "0.13.1", default-features = false }
 
 # ==================== ALLOY ====================
@@ -421,12 +419,12 @@ revm-context = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-el
 revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
 # revm-inspectors: mantle-xyz/revm-inspectors mantle-elysium branch
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "mantle-elysium" }
-# op-revm: local path (from optimism monorepo)
-op-revm = { path = "op-revm/" }
-# alloy-op-evm / alloy-op-hardforks: local path
+# op-revm: mantle-xyz/revm (same as workspace dep)
+op-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
+# alloy-op-evm / alloy-op-hardforks: local path (Mantle version)
 alloy-op-evm = { path = "alloy-op-evm/" }
 alloy-op-hardforks = { path = "alloy-op-hardforks/" }
-# op-alloy: local path
+# op-alloy: local path (Mantle version)
 op-alloy-consensus = { path = "op-alloy/crates/consensus" }
 op-alloy-network = { path = "op-alloy/crates/network" }
 op-alloy-rpc-types = { path = "op-alloy/crates/rpc-types" }

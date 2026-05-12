@@ -144,6 +144,14 @@ impl op_revm::transaction::OpTxTr for OpTx {
     fn is_system_transaction(&self) -> bool {
         self.0.is_system_transaction()
     }
+
+    fn eth_value(&self) -> Option<u128> {
+        self.0.eth_value()
+    }
+
+    fn eth_tx_value(&self) -> Option<u128> {
+        self.0.eth_tx_value()
+    }
 }
 
 impl FromRecoveredTx<OpTxEnvelope> for OpTx {
@@ -240,6 +248,10 @@ impl FromTxWithEncoded<TxDeposit> for OpTx {
             source_hash: tx.source_hash,
             mint: Some(tx.mint),
             is_system_transaction: tx.is_system_transaction,
+            // Mantle BVM_ETH: TxDeposit.eth_value (u128) -> DepositTransactionParts.eth_value (Option<u128>)
+            // Treat 0 as "no mint" -> None; otherwise Some(...).
+            eth_value: if tx.eth_value == 0 { None } else { Some(tx.eth_value) },
+            eth_tx_value: tx.eth_tx_value,
         };
         Self(OpTransaction { base, enveloped_tx: Some(encoded), deposit })
     }

@@ -18,7 +18,8 @@ use alloy_evm::{
 };
 use alloy_op_hardforks::{OpChainHardforks, OpHardforks};
 use alloy_primitives::{Address, B256, Bytes, U256};
-use canyon::ensure_create2_deployer;
+// [MANTLE] Disabled — see comment near the (commented-out) call site below
+// use canyon::ensure_create2_deployer;
 use op_alloy::consensus::{
     OpDepositReceipt, OpTransaction as OpConsensusTransaction, POST_EXEC_TX_TYPE_ID,
     PostExecPayload, SDMGasEntry,
@@ -618,12 +619,14 @@ where
         let canonical_gas_used = evm_gas_used.saturating_sub(post_exec_refund);
         let l1_block_info = self.l1_block_info(spec_id)?;
         let encoded = tx.tx().encoded_2718();
+        // mantle-elysium's operator_fee_charge takes (input, gas_limit) — two args.
+        // develop's op-revm v20 added a third spec_id parameter. Drop it here to match
+        // mantle-elysium's signature.
         let raw_fee =
-            l1_block_info.operator_fee_charge(encoded.as_ref(), U256::from(evm_gas_used), spec_id);
+            l1_block_info.operator_fee_charge(encoded.as_ref(), U256::from(evm_gas_used));
         let canonical_fee = l1_block_info.operator_fee_charge(
             encoded.as_ref(),
             U256::from(canonical_gas_used),
-            spec_id,
         );
         let operator_fee_balance_delta = raw_fee.saturating_sub(canonical_fee);
 
@@ -706,12 +709,16 @@ where
         // blocks will always have at least a single transaction in them (the L1 info transaction),
         // so we can safely assume that this will always be triggered upon the transition and that
         // the above check for empty blocks will never be hit on OP chains.
-        ensure_create2_deployer(
-            &self.spec,
-            self.evm.block().timestamp().saturating_to(),
-            self.evm.db_mut(),
-        )
-        .map_err(BlockExecutionError::other)?;
+        //
+        // [MANTLE] DISABLED: Mantle does not use OP Canyon's force-deploy of the create2
+        // deployer (Mantle handles create2 deployer deployment via a separate path).
+        // Original upstream code retained below as a comment for reference.
+        // ensure_create2_deployer(
+        //     &self.spec,
+        //     self.evm.block().timestamp().saturating_to(),
+        //     self.evm.db_mut(),
+        // )
+        // .map_err(BlockExecutionError::other)?;
 
         Ok(())
     }
@@ -937,11 +944,10 @@ where
                         // when set. The state transition process ensures
                         // this is only set for post-Canyon deposit
                         // transactions.
-                        deposit_receipt_version: (is_deposit &&
-                            self.spec.is_canyon_active_at_timestamp(
-                                self.evm.block().timestamp().saturating_to(),
-                            ))
-                        .then_some(1),
+                        // [MANTLE] Always None: Mantle uses MNT as the native gas token
+                        // and represents ETH as an ERC-20 (BVM_ETH). The deposit receipt
+                        // does not follow OP Canyon's `deposit_receipt_version` semantics.
+                        deposit_receipt_version: None,
                     })
                 }
             },

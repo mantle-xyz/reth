@@ -35,7 +35,10 @@ pub fn spec_by_timestamp_after_bedrock(chain_spec: impl OpHardforks, timestamp: 
         };
     }
     check_forks! {
-        is_karst_active_at_timestamp => KARST,
+        // mantle-elysium's OpSpecId has no KARST variant (KARST was introduced in op-revm
+        // v20; mantle-elysium is still on v19). Mantle uses OSAKA/ARSIA, neither of which
+        // is driven through this chain_spec hook — comment the line out.
+        // is_karst_active_at_timestamp => KARST,
         is_interop_active_at_timestamp => INTEROP,
         is_jovian_active_at_timestamp => JOVIAN,
         is_isthmus_active_at_timestamp => ISTHMUS,
@@ -230,7 +233,8 @@ mod tests {
         }
     }
 
-    #[test_case::test_case(FakeHardfork::karst(), OpSpecId::KARST; "Karst")]
+    // [MANTLE] OpSpecId::KARST does not exist on mantle-elysium — test case removed.
+    // #[test_case::test_case(FakeHardfork::karst(), OpSpecId::KARST; "Karst")]
     #[test_case::test_case(FakeHardfork::interop(), OpSpecId::INTEROP; "Interop")]
     #[test_case::test_case(FakeHardfork::jovian(), OpSpecId::JOVIAN; "Jovian")]
     #[test_case::test_case(FakeHardfork::isthmus(), OpSpecId::ISTHMUS; "Isthmus")]

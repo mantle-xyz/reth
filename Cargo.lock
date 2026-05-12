@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "alloy-op-evm"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "alloy-op-hardforks"
-version = "0.4.7"
+version = "0.5.0"
 dependencies = [
  "alloy-chains",
  "alloy-hardforks",
@@ -3561,8 +3561,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -4070,7 +4070,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -4831,9 +4831,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-dependencies = [
- "spin",
-]
 
 [[package]]
 name = "leb128fmt"
@@ -5619,7 +5616,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "op-alloy"
-version = "0.24.0"
+version = "2.0.0"
 dependencies = [
  "op-alloy-consensus",
  "op-alloy-network",
@@ -5631,7 +5628,7 @@ dependencies = [
 
 [[package]]
 name = "op-alloy-consensus"
-version = "0.24.0"
+version = "2.0.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -5664,7 +5661,7 @@ checksum = "a79f352fc3893dcd670172e615afef993a41798a1d3fc0db88a3e60ef2e70ecc"
 
 [[package]]
 name = "op-alloy-network"
-version = "0.24.0"
+version = "2.0.0"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -5676,7 +5673,7 @@ dependencies = [
 
 [[package]]
 name = "op-alloy-provider"
-version = "0.24.0"
+version = "2.0.0"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -5689,7 +5686,7 @@ dependencies = [
 
 [[package]]
 name = "op-alloy-rpc-jsonrpsee"
-version = "0.24.0"
+version = "2.0.0"
 dependencies = [
  "alloy-primitives",
  "jsonrpsee",
@@ -5697,7 +5694,7 @@ dependencies = [
 
 [[package]]
 name = "op-alloy-rpc-types"
-version = "0.24.0"
+version = "2.0.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -5721,7 +5718,7 @@ dependencies = [
 
 [[package]]
 name = "op-alloy-rpc-types-engine"
-version = "0.24.0"
+version = "2.0.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -5765,15 +5762,12 @@ dependencies = [
 [[package]]
 name = "op-revm"
 version = "19.0.0"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#e637f61eb2b9d7ec67a12eceb7218d06bd2eff3e"
 dependencies = [
- "alloy-primitives",
  "alloy-sol-types",
  "auto_impl",
  "revm",
- "rstest",
  "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -10250,7 +10244,6 @@ dependencies = [
  "ripemd",
  "secp256k1 0.31.1",
  "sha2",
- "substrate-bn",
 ]
 
 [[package]]
@@ -11235,12 +11228,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spin"
-version = "0.9.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
-
-[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11287,19 +11274,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "substrate-bn"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b5bbfa79abbae15dd642ea8176a21a635ff3c00059961d1ea27ad04e5b441c"
-dependencies = [
- "byteorder",
- "crunchy",
- "lazy_static",
- "rand 0.8.6",
- "rustc-hex",
 ]
 
 [[package]]

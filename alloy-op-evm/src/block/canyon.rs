@@ -1,3 +1,8 @@
+// [MANTLE] ensure_create2_deployer is never called (see the [MANTLE] comment in
+// block/mod.rs). The whole module is therefore unused; allow dead_code so it does
+// not spam compile warnings.
+#![allow(dead_code)]
+
 use alloy_evm::Database;
 use alloy_op_hardforks::OpHardforks;
 use alloy_primitives::{Address, B256, Bytes, address, b256, hex};
