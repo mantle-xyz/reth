@@ -86,6 +86,24 @@ impl Metadata {
 /// throughout block construction. This includes fundamental block properties like
 /// parent hash, block number, and other header fields that are determined at
 /// block creation and cannot be modified.
+///
+/// # Mantle compatibility
+///
+/// This struct intentionally keeps `extra_data` as opaque `Bytes` rather than a
+/// decoded structure. The reason: `extra_data` has three valid layouts depending
+/// on the active hardfork:
+/// - **Pre-Holocene**: empty (0 bytes).
+/// - **Holocene** (OP / Mantle pre-Jovian): 9 bytes — `[version=0x00,
+///   eip_1559_params(8)]`.
+/// - **Jovian / Mantle**: 17 bytes — Holocene layout followed by an additional
+///   `min_base_fee(8 BE bytes)`.
+///
+/// The decoder of `extra_data` lives in [`OpNextBlockEnvAttributes`] consumers (the
+/// EVM env builder), not here. Keeping the field opaque lets this type stay
+/// hardfork-agnostic and avoids tying the wire format to any specific fork.
+///
+/// Use [`Self::mantle_min_base_fee`] for a typed accessor when consumer code
+/// only needs the Mantle-specific value.
 #[derive(Clone, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 pub struct ExecutionPayloadBaseV1 {
     /// Ecotone parent beacon block root
@@ -106,9 +124,57 @@ pub struct ExecutionPayloadBaseV1 {
     #[serde(with = "alloy_serde::quantity")]
     pub timestamp: u64,
     /// The extra data of the block.
+    ///
+    /// Shape depends on the active hardfork — see [`Self::extra_data_shape`] and
+    /// [`Self::mantle_min_base_fee`] for typed views.
     pub extra_data: Bytes,
     /// The base fee per gas of the block.
     pub base_fee_per_gas: U256,
+}
+
+/// Layout of the `extra_data` field as understood by the Mantle / OP hardfork
+/// timeline. Returned by [`ExecutionPayloadBaseV1::extra_data_shape`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExtraDataShape {
+    /// Pre-Holocene: 0 bytes.
+    Empty,
+    /// Holocene: 9 bytes — `[version=0x00, eip_1559_params(8)]`.
+    Holocene,
+    /// Jovian (incl. Mantle): 17 bytes — Holocene layout + `min_base_fee(8 BE)`.
+    Jovian,
+    /// Unknown / malformed length.
+    Unknown(usize),
+}
+
+impl ExecutionPayloadBaseV1 {
+    /// Classify the `extra_data` field by length per the OP / Mantle hardfork timeline.
+    pub fn extra_data_shape(&self) -> ExtraDataShape {
+        match self.extra_data.len() {
+            0 => ExtraDataShape::Empty,
+            9 => ExtraDataShape::Holocene,
+            17 => ExtraDataShape::Jovian,
+            n => ExtraDataShape::Unknown(n),
+        }
+    }
+
+    /// Mantle Jovian+: decode the `min_base_fee` (in wei) embedded in the trailing
+    /// 8 big-endian bytes of `extra_data`. Returns `None` for Holocene / pre-Holocene
+    /// shapes or any unrecognized length.
+    ///
+    /// Wire layout for Jovian (17 bytes):
+    /// ```text
+    /// [0]   version=0x00
+    /// [1..9]  eip_1559_params (8 bytes)
+    /// [9..17] min_base_fee (u64, big-endian)
+    /// ```
+    pub fn mantle_min_base_fee(&self) -> Option<u64> {
+        if matches!(self.extra_data_shape(), ExtraDataShape::Jovian) {
+            let bytes: [u8; 8] = self.extra_data[9..17].try_into().ok()?;
+            Some(u64::from_be_bytes(bytes))
+        } else {
+            None
+        }
+    }
 }
 
 /// Represents the modified portions of an execution payload within a flashblock.
@@ -139,6 +205,10 @@ pub struct ExecutionPayloadFlashblockDeltaV1 {
 
 impl From<ExecutionPayloadBaseV1> for OpNextBlockEnvAttributes {
     fn from(value: ExecutionPayloadBaseV1) -> Self {
+        // Note (Mantle): the Jovian `min_base_fee` field is *not* a top-level
+        // field of [`OpNextBlockEnvAttributes`]; it travels with the
+        // `extra_data` bytes (17-byte Jovian layout). Downstream EVM env
+        // builders are responsible for decoding it from `extra_data`.
         Self {
             timestamp: value.timestamp,
             suggested_fee_recipient: value.fee_recipient,
@@ -382,5 +452,39 @@ mod tests {
         let roundtrip: FlashBlock = serde_json::from_str(&serialized).expect("roundtrip");
 
         assert_eq!(flashblock, roundtrip);
+    }
+
+    #[test]
+    fn extra_data_shape_classifies_lengths() {
+        let mk = |bytes: Vec<u8>| ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
+        assert_eq!(mk(vec![]).extra_data_shape(), ExtraDataShape::Empty);
+        assert_eq!(mk(vec![0u8; 9]).extra_data_shape(), ExtraDataShape::Holocene);
+        assert_eq!(mk(vec![0u8; 17]).extra_data_shape(), ExtraDataShape::Jovian);
+        assert_eq!(mk(vec![0u8; 5]).extra_data_shape(), ExtraDataShape::Unknown(5));
+    }
+
+    #[test]
+    fn mantle_min_base_fee_returns_none_for_non_jovian() {
+        let mk = |bytes: Vec<u8>| ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
+        assert_eq!(mk(vec![]).mantle_min_base_fee(), None);
+        assert_eq!(mk(vec![0u8; 9]).mantle_min_base_fee(), None);
+        assert_eq!(mk(vec![0u8; 12]).mantle_min_base_fee(), None);
+    }
+
+    #[test]
+    fn mantle_min_base_fee_decodes_jovian_layout() {
+        // version(1) + eip_1559_params(8) + min_base_fee(8) BE = 1_500_000_000 wei (1.5 Gwei)
+        let mut bytes = vec![0u8; 17];
+        bytes[9..17].copy_from_slice(&1_500_000_000_u64.to_be_bytes());
+        let base = ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
+        assert_eq!(base.mantle_min_base_fee(), Some(1_500_000_000));
+    }
+
+    #[test]
+    fn mantle_min_base_fee_decodes_zero() {
+        // Jovian shape but min_base_fee=0 still returns Some(0), not None.
+        let bytes = vec![0u8; 17];
+        let base = ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
+        assert_eq!(base.mantle_min_base_fee(), Some(0));
     }
 }

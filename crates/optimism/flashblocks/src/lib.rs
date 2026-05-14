@@ -12,8 +12,8 @@ use reth_primitives_traits::NodePrimitives;
 use std::sync::Arc;
 
 pub use payload::{
-    ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashBlock, FlashBlockDecoder,
-    Metadata,
+    ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, ExtraDataShape, FlashBlock,
+    FlashBlockDecoder, Metadata,
 };
 pub use service::{FlashBlockBuildInfo, FlashBlockService};
 pub use ws::{WsConnect, WsFlashBlockStream};
