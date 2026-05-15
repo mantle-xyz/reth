@@ -3,6 +3,7 @@ use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{bytes, Address, Bloom, Bytes, B256, U256};
 use alloy_rpc_types_engine::PayloadId;
 use derive_more::Deref;
+use op_alloy_consensus::{decode_holocene_extra_data, decode_jovian_extra_data};
 use reth_optimism_evm::OpNextBlockEnvAttributes;
 use reth_optimism_primitives::OpReceipt;
 use reth_primitives_traits::NodePrimitives;
@@ -132,48 +133,72 @@ pub struct ExecutionPayloadBaseV1 {
     pub base_fee_per_gas: U256,
 }
 
-/// Layout of the `extra_data` field as understood by the Mantle / OP hardfork
-/// timeline. Returned by [`ExecutionPayloadBaseV1::extra_data_shape`].
+/// Layout of the `extra_data` field as classified by the canonical op-alloy
+/// decoders. Returned by [`ExecutionPayloadBaseV1::extra_data_shape`].
+///
+/// Length alone is *not* sufficient — a 17-byte buffer with an invalid version
+/// byte is rejected by `decode_jovian_extra_data` and reported as
+/// `Unknown(17)` here, even though earlier (length-only) implementations would
+/// have mis-classified it as `Jovian`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExtraDataShape {
     /// Pre-Holocene: 0 bytes.
     Empty,
-    /// Holocene: 9 bytes — `[version=0x00, eip_1559_params(8)]`.
+    /// Holocene: 9 bytes — `[version=0x00, eip_1559_params(8)]`, accepted by
+    /// `op_alloy_consensus::decode_holocene_extra_data`.
     Holocene,
-    /// Jovian (incl. Mantle): 17 bytes — Holocene layout + `min_base_fee(8 BE)`.
+    /// Jovian (incl. Mantle Arsia): 17 bytes — Holocene layout +
+    /// `min_base_fee(8 BE)`, accepted by
+    /// `op_alloy_consensus::decode_jovian_extra_data`.
     Jovian,
-    /// Unknown / malformed length.
+    /// Anything else — including correctly-sized but malformed bytes that the
+    /// op-alloy decoder rejected. Carries the observed length for diagnostics.
     Unknown(usize),
 }
 
-impl ExecutionPayloadBaseV1 {
-    /// Classify the `extra_data` field by length per the OP / Mantle hardfork timeline.
-    pub fn extra_data_shape(&self) -> ExtraDataShape {
-        match self.extra_data.len() {
-            0 => ExtraDataShape::Empty,
-            9 => ExtraDataShape::Holocene,
-            17 => ExtraDataShape::Jovian,
-            n => ExtraDataShape::Unknown(n),
+impl ExtraDataShape {
+    /// The shape that the active fork *should* produce for a freshly-built
+    /// block's `extra_data`.
+    ///
+    /// Use this to compare against [`ExecutionPayloadBaseV1::extra_data_shape`]
+    /// for sanity checks. On Mantle, Arsia is the equivalent of OP's Jovian
+    /// and uses the same 17-byte wire layout.
+    pub const fn expected_for_mantle(arsia_active: bool, holocene_active: bool) -> Self {
+        match (arsia_active, holocene_active) {
+            (true, _) => Self::Jovian,
+            (false, true) => Self::Holocene,
+            _ => Self::Empty,
         }
     }
+}
 
-    /// Mantle Jovian+: decode the `min_base_fee` (in wei) embedded in the trailing
-    /// 8 big-endian bytes of `extra_data`. Returns `None` for Holocene / pre-Holocene
-    /// shapes or any unrecognized length.
+impl ExecutionPayloadBaseV1 {
+    /// Classify the `extra_data` field against the canonical op-alloy decoders.
     ///
-    /// Wire layout for Jovian (17 bytes):
-    /// ```text
-    /// [0]   version=0x00
-    /// [1..9]  eip_1559_params (8 bytes)
-    /// [9..17] min_base_fee (u64, big-endian)
-    /// ```
-    pub fn mantle_min_base_fee(&self) -> Option<u64> {
-        if matches!(self.extra_data_shape(), ExtraDataShape::Jovian) {
-            let bytes: [u8; 8] = self.extra_data[9..17].try_into().ok()?;
-            Some(u64::from_be_bytes(bytes))
-        } else {
-            None
+    /// Tries the Jovian (17-byte) decoder first, then the Holocene (9-byte)
+    /// decoder. A buffer that has the right length but fails decoding (e.g.
+    /// wrong version byte) is reported as `Unknown(len)`.
+    pub fn extra_data_shape(&self) -> ExtraDataShape {
+        let len = self.extra_data.len();
+        if len == 0 {
+            return ExtraDataShape::Empty;
         }
+        if decode_jovian_extra_data(&self.extra_data).is_ok() {
+            return ExtraDataShape::Jovian;
+        }
+        if decode_holocene_extra_data(&self.extra_data).is_ok() {
+            return ExtraDataShape::Holocene;
+        }
+        ExtraDataShape::Unknown(len)
+    }
+
+    /// Decode the Mantle Arsia / OP Jovian `min_base_fee` (wei) from
+    /// `extra_data`.
+    ///
+    /// Returns `None` if `extra_data` is not a valid Jovian layout (length
+    /// mismatch *or* version byte mismatch).
+    pub fn mantle_min_base_fee(&self) -> Option<u64> {
+        decode_jovian_extra_data(&self.extra_data).ok().map(|(_, _, min_base_fee)| min_base_fee)
     }
 }
 
@@ -455,36 +480,66 @@ mod tests {
     }
 
     #[test]
-    fn extra_data_shape_classifies_lengths() {
-        let mk = |bytes: Vec<u8>| ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
-        assert_eq!(mk(vec![]).extra_data_shape(), ExtraDataShape::Empty);
-        assert_eq!(mk(vec![0u8; 9]).extra_data_shape(), ExtraDataShape::Holocene);
-        assert_eq!(mk(vec![0u8; 17]).extra_data_shape(), ExtraDataShape::Jovian);
-        assert_eq!(mk(vec![0u8; 5]).extra_data_shape(), ExtraDataShape::Unknown(5));
+    fn extra_data_shape_classifies_jovian() {
+        let bytes = op_alloy_consensus::encode_jovian_extra_data(
+            [0u8; 8].into(),
+            alloy_eips::eip1559::BaseFeeParams::new(250, 6),
+            1_000_000u64,
+        )
+        .unwrap();
+        let base =
+            ExecutionPayloadBaseV1 { extra_data: bytes, ..Default::default() };
+
+        assert_eq!(base.extra_data_shape(), ExtraDataShape::Jovian);
+        assert_eq!(base.mantle_min_base_fee(), Some(1_000_000u64));
     }
 
     #[test]
-    fn mantle_min_base_fee_returns_none_for_non_jovian() {
-        let mk = |bytes: Vec<u8>| ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
-        assert_eq!(mk(vec![]).mantle_min_base_fee(), None);
-        assert_eq!(mk(vec![0u8; 9]).mantle_min_base_fee(), None);
-        assert_eq!(mk(vec![0u8; 12]).mantle_min_base_fee(), None);
+    fn extra_data_shape_classifies_holocene() {
+        let bytes = op_alloy_consensus::encode_holocene_extra_data(
+            [0u8; 8].into(),
+            alloy_eips::eip1559::BaseFeeParams::new(250, 6),
+        )
+        .unwrap();
+        let base =
+            ExecutionPayloadBaseV1 { extra_data: bytes, ..Default::default() };
+
+        assert_eq!(base.extra_data_shape(), ExtraDataShape::Holocene);
+        assert_eq!(base.mantle_min_base_fee(), None);
     }
 
     #[test]
-    fn mantle_min_base_fee_decodes_jovian_layout() {
-        // version(1) + eip_1559_params(8) + min_base_fee(8) BE = 1_500_000_000 wei (1.5 Gwei)
-        let mut bytes = vec![0u8; 17];
-        bytes[9..17].copy_from_slice(&1_500_000_000_u64.to_be_bytes());
-        let base = ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
-        assert_eq!(base.mantle_min_base_fee(), Some(1_500_000_000));
+    fn extra_data_shape_empty_and_unknown() {
+        let empty = ExecutionPayloadBaseV1 { extra_data: Bytes::new(), ..Default::default() };
+        assert_eq!(empty.extra_data_shape(), ExtraDataShape::Empty);
+        assert_eq!(empty.mantle_min_base_fee(), None);
+
+        let weird =
+            ExecutionPayloadBaseV1 { extra_data: Bytes::from(vec![0u8; 5]), ..Default::default() };
+        assert!(matches!(weird.extra_data_shape(), ExtraDataShape::Unknown(5)));
+        assert_eq!(weird.mantle_min_base_fee(), None);
     }
 
     #[test]
-    fn mantle_min_base_fee_decodes_zero() {
-        // Jovian shape but min_base_fee=0 still returns Some(0), not None.
-        let bytes = vec![0u8; 17];
-        let base = ExecutionPayloadBaseV1 { extra_data: bytes.into(), ..Default::default() };
-        assert_eq!(base.mantle_min_base_fee(), Some(0));
+    fn malformed_jovian_bytes_classified_unknown() {
+        // 17 bytes but version byte is invalid — op-alloy decoder must reject,
+        // shape must fall back to Unknown(17), min_base_fee must be None.
+        // (PR 38's length-only classifier wrongly accepted this.)
+        let mut bad = vec![0xFFu8; 17];
+        bad[0] = 0xEE; // not 1 (Jovian) and not 0 (Holocene)
+        let base = ExecutionPayloadBaseV1 { extra_data: Bytes::from(bad), ..Default::default() };
+        assert!(matches!(base.extra_data_shape(), ExtraDataShape::Unknown(17)));
+        assert_eq!(base.mantle_min_base_fee(), None);
+    }
+
+    #[test]
+    fn expected_for_mantle_matches_active_fork() {
+        // Arsia active (regardless of Holocene) → expect Jovian layout.
+        assert_eq!(ExtraDataShape::expected_for_mantle(true, true), ExtraDataShape::Jovian);
+        assert_eq!(ExtraDataShape::expected_for_mantle(true, false), ExtraDataShape::Jovian);
+        // Only Holocene active → 9-byte layout.
+        assert_eq!(ExtraDataShape::expected_for_mantle(false, true), ExtraDataShape::Holocene);
+        // Pre-Holocene → empty.
+        assert_eq!(ExtraDataShape::expected_for_mantle(false, false), ExtraDataShape::Empty);
     }
 }

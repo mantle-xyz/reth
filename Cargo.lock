@@ -9522,6 +9522,7 @@ dependencies = [
  "eyre",
  "futures-util",
  "metrics",
+ "op-alloy-consensus",
  "reth-chain-state",
  "reth-engine-primitives",
  "reth-errors",
