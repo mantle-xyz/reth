@@ -349,7 +349,9 @@ mod tests {
             value: U256::ZERO,
             gas_limit: 0,
             is_system_transaction: false,
+            eth_value: 0,
             input: Default::default(),
+            eth_tx_value: None,
         };
         let signed_tx: OpTransactionSigned = deposit_tx.into();
         let signed_recovered = Recovered::new_unchecked(signed_tx, signer);

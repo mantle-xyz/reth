@@ -94,9 +94,9 @@ check:
 fmt:
   cargo +nightly fmt --all
 
-# Run clippy lints
+# Run clippy lints (stable, matching upstream)
 clippy:
-  cargo +nightly clippy \
+  cargo clippy \
     --workspace \
     --lib --examples --tests --benches \
     --all-features \
