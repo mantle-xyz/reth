@@ -196,11 +196,19 @@ where
             validate_against_parent_timestamp(header.header(), parent.header())?;
         }
 
-        validate_against_parent_eip1559_base_fee(
-            header.header(),
-            parent.header(),
-            &self.chain_spec,
-        )?;
+        // [MANTLE] Skip EIP-1559 basefee validation for pre-Arsia Mantle chains.
+        // Mantle's Skadi/Limb hardforks use a custom basefee model that does not follow
+        // EIP-1559 constraints. Standard validation is re-enabled from Arsia onward.
+        let is_pre_arsia_mantle = self.chain_spec.is_mantle() &&
+            !self.chain_spec.is_mantle_arsia_active_at_timestamp(parent.timestamp());
+
+        if !is_pre_arsia_mantle {
+            validate_against_parent_eip1559_base_fee(
+                header.header(),
+                parent.header(),
+                &self.chain_spec,
+            )?;
+        }
 
         // Ensure that the blob gas fields for this block are correctly set.
         // In the op-stack, the excess blob gas is always 0 for all blocks after ecotone.

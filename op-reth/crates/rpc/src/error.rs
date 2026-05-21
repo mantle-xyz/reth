@@ -110,8 +110,9 @@ impl TryFrom<OpTxError> for OpInvalidTransactionError {
             OpTransactionError::HaltedDepositPostRegolith => Ok(Self::HaltedDepositPostRegolith),
             OpTransactionError::MissingEnvelopedTx => Ok(Self::MissingEnvelopedTx),
             OpTransactionError::Base(err) => Err(err),
-            // Mantle-specific error variants from op-revm
-            // TODO(mantle): add proper OpInvalidTransactionError variants in Phase 2
+            // [MANTLE] BvmEth fee model errors and L1 cost overflow from op-revm.
+            // These map to HaltedDepositPostRegolith as a catch-all invalid tx error
+            // since they don't have direct upstream equivalents.
             OpTransactionError::BvmEth(_) | OpTransactionError::TxL1CostOutOfRange => {
                 Ok(Self::HaltedDepositPostRegolith)
             }

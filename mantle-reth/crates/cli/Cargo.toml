@@ -1,0 +1,61 @@
+[package]
+name = "mantle-reth-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Mantle node CLI: chain spec parser and node entry point"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-cli.workspace = true
+reth-cli-util.workspace = true
+reth-chainspec.workspace = true
+reth-evm.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-transaction-pool.workspace = true
+
+# op-reth
+reth-optimism-chainspec.workspace = true
+reth-optimism-cli.workspace = true
+reth-optimism-forks.workspace = true
+reth-optimism-node.workspace = true
+reth-optimism-payload-builder.workspace = true
+reth-optimism-primitives.workspace = true
+reth-optimism-rpc.workspace = true
+reth-optimism-storage.workspace = true
+reth-optimism-txpool.workspace = true
+
+# mantle-reth
+mantle-reth-chainspec = { path = "../chainspec" }
+mantle-reth-rpc-ext = { path = "../rpc-ext" }
+
+# ethereum
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-op-hardforks.workspace = true
+op-alloy-consensus.workspace = true
+
+# async / misc
+eyre.workspace = true
+clap.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+
+[features]
+default = ["std"]
+std = [
+    "reth-optimism-chainspec/std",
+    "mantle-reth-chainspec/std",
+]

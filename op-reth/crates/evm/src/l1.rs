@@ -1,6 +1,6 @@
 //! Optimism-specific implementation and utilities for the executor
 
-use crate::{OpBlockExecutionError, error::L1BlockInfoError, revm_spec_by_timestamp_after_bedrock};
+use crate::{OpBlockExecutionError, error::L1BlockInfoError};
 use alloy_consensus::Transaction;
 use alloy_primitives::{U16, U256, hex};
 use op_revm::L1BlockInfo;
@@ -17,6 +17,10 @@ const L1_BLOCK_ISTHMUS_SELECTOR: [u8; 4] = hex!("098999be");
 /// The function selector of the "setL1BlockValuesJovian" function in the `L1Block` contract.
 /// This is the first 4 bytes of `keccak256("setL1BlockValuesJovian()")`.
 const L1_BLOCK_JOVIAN_SELECTOR: [u8; 4] = hex!("3db6be2b");
+
+/// [MANTLE] The function selector of the `setL1BlockValuesArsia()` function.
+/// Same calldata layout as Jovian, different selector.
+const L1_BLOCK_ARSIA_SELECTOR: [u8; 4] = hex!("49e72383");
 
 /// Extracts the [`L1BlockInfo`] from the L2 block. The L1 info transaction is always the first
 /// transaction in the L2 block.
@@ -61,7 +65,7 @@ pub fn parse_l1_info(input: &[u8]) -> Result<L1BlockInfo, OpBlockExecutionError>
     // - Isthmus
     // - Ecotone
     // - Bedrock
-    if input[0..4] == L1_BLOCK_JOVIAN_SELECTOR {
+    if input[0..4] == L1_BLOCK_JOVIAN_SELECTOR || input[0..4] == L1_BLOCK_ARSIA_SELECTOR {
         parse_l1_info_tx_jovian(input[4..].as_ref())
     } else if input[0..4] == L1_BLOCK_ISTHMUS_SELECTOR {
         parse_l1_info_tx_isthmus(input[4..].as_ref())
@@ -322,6 +326,28 @@ pub trait RethL1BlockInfo {
     ) -> Result<U256, BlockExecutionError>;
 }
 
+/// Computes the [`op_revm::OpSpecId`] for the given chain spec and timestamp.
+///
+/// Handles Mantle-specific spec routing (Arsia/Osaka/Isthmus) and falls back to
+/// the standard OP spec computed from the activated hardforks.
+pub(crate) fn resolve_op_spec_id(
+    chain_spec: &impl OpHardforks,
+    timestamp: u64,
+) -> op_revm::OpSpecId {
+    if chain_spec.is_mantle() {
+        if chain_spec.is_mantle_arsia_active_at_timestamp(timestamp) {
+            return op_revm::OpSpecId::ARSIA;
+        }
+        if chain_spec.is_mantle_limb_active_at_timestamp(timestamp) {
+            return op_revm::OpSpecId::OSAKA;
+        }
+        if chain_spec.is_mantle_skadi_active_at_timestamp(timestamp) {
+            return op_revm::OpSpecId::ISTHMUS;
+        }
+    }
+    alloy_op_evm::spec_by_timestamp_after_bedrock(chain_spec, timestamp)
+}
+
 impl RethL1BlockInfo for L1BlockInfo {
     fn l1_tx_data_fee(
         &mut self,
@@ -334,7 +360,7 @@ impl RethL1BlockInfo for L1BlockInfo {
             return Ok(U256::ZERO);
         }
 
-        let spec_id = revm_spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
+        let spec_id = resolve_op_spec_id(&chain_spec, timestamp);
         Ok(self.calculate_tx_l1_cost(input, spec_id))
     }
 
@@ -344,7 +370,7 @@ impl RethL1BlockInfo for L1BlockInfo {
         timestamp: u64,
         input: &[u8],
     ) -> Result<U256, BlockExecutionError> {
-        let spec_id = revm_spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
+        let spec_id = resolve_op_spec_id(&chain_spec, timestamp);
         Ok(self.data_gas(input, spec_id))
     }
 }
@@ -385,6 +411,12 @@ mod tests {
     fn test_verify_set_jovian() {
         let hash = &keccak256("setL1BlockValuesJovian()")[..4];
         assert_eq!(hash, L1_BLOCK_JOVIAN_SELECTOR)
+    }
+
+    #[test]
+    fn test_verify_set_arsia() {
+        let hash = &keccak256("setL1BlockValuesArsia()")[..4];
+        assert_eq!(hash, L1_BLOCK_ARSIA_SELECTOR)
     }
 
     #[test]

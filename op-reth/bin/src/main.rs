@@ -1,8 +1,8 @@
 #![allow(missing_docs, rustdoc::missing_crate_level_docs)]
 
 use clap::Parser;
-use reth_optimism_cli::{Cli, chainspec::OpChainSpecParser};
-use reth_optimism_node::{args::RollupArgs, proof_history};
+use mantle_reth_cli::{MantleChainSpecParser, MantleNode};
+use reth_optimism_node::args::RollupArgs;
 use tracing::info;
 
 #[global_allocator]
@@ -22,12 +22,13 @@ fn main() {
         }
     }
 
-    if let Err(err) =
-        Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, args| {
-            info!(target: "reth::cli", "Launching node");
-            proof_history::launch_node(builder, args).await
-        })
-    {
+    if let Err(err) = reth_optimism_cli::Cli::<MantleChainSpecParser, RollupArgs>::parse().run(
+        async move |builder, args| {
+            info!(target: "reth::cli", "Launching Mantle node");
+            let handle = builder.node(MantleNode::new(args)).launch().await?;
+            handle.node_exit_future.await
+        },
+    ) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }

@@ -1,0 +1,41 @@
+[package]
+name = "mantle-reth-rpc-ext"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Mantle-specific RPC extensions (eth_getBlockRange, eth_sendRawTransactionWithPreconf)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# op-reth
+reth-optimism-rpc.workspace = true
+reth-optimism-evm.workspace = true
+reth-optimism-forks.workspace = true
+
+# reth
+reth-chainspec.workspace = true
+reth-primitives-traits.workspace = true
+reth-storage-api.workspace = true
+reth-rpc-eth-api.workspace = true
+reth-rpc-server-types.workspace = true
+
+# alloy / op-alloy
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-serde.workspace = true
+op-revm.workspace = true
+
+# rpc
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+async-trait.workspace = true
+
+# misc
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
