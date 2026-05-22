@@ -52,6 +52,7 @@ members = [
   "mantle-reth/crates/chainspec/",
   "mantle-reth/crates/rpc-ext/",
   "mantle-reth/crates/eth-api/",
+  "mantle-reth/crates/integration-tests/",
 
   # Optimism ecosystem crates (from mantlenetworkio/mantle-v2, git dependency)
   # (no longer workspace members — referenced via git dep)

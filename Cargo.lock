@@ -5158,6 +5158,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-reth-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "alloy-genesis",
+ "alloy-network",
+ "alloy-op-hardforks",
+ "alloy-primitives",
+ "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
+ "eyre",
+ "jsonrpsee",
+ "mantle-reth-chainspec",
+ "mantle-reth-cli",
+ "mantle-reth-eth-api",
+ "mantle-reth-rpc-ext",
+ "op-alloy-rpc-types-engine",
+ "reth-chainspec",
+ "reth-db",
+ "reth-e2e-test-utils",
+ "reth-node-builder",
+ "reth-node-core",
+ "reth-optimism-chainspec",
+ "reth-optimism-node",
+ "reth-optimism-rpc",
+ "reth-provider",
+ "reth-rpc-api",
+ "reth-tasks",
+ "reth-tracing",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mantle-reth-rpc-ext"
 version = "0.1.0"
 dependencies = [
