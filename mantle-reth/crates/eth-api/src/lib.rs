@@ -1,8 +1,9 @@
 //! Mantle-specific Eth API helpers.
 //!
-//! Provides [`mantle_arsia_check_funds`] which validates that the caller has sufficient balance
-//! to cover L2 gas + L1 data fee + operator fee + value transfer, matching op-geth v1.5.5's
-//! `mantleArsiaCheckFunds` in `eth/gasestimator/gasestimator.go`.
+//! - [`mantle_arsia_check_funds`]: Arsia balance check for gas estimation
+//! - [`debug`]: State export hook (compiled but not active by default — see module docs)
+
+pub mod debug;
 
 use alloy_primitives::U256;
 use op_revm::L1BlockInfo;

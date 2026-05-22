@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Mantle-specific Eth API helpers (Arsia gas estimation balance check)"
+description = "Mantle-specific Eth API helpers (Arsia gas estimation balance check, state export hook)"
 
 [lints]
 workspace = true
@@ -14,15 +14,29 @@ workspace = true
 [dependencies]
 # op-reth
 reth-optimism-forks.workspace = true
-reth-optimism-evm.workspace = true
+
+# reth
+reth-db.workspace = true
+reth-db-api.workspace = true
+reth-engine-primitives.workspace = true
+reth-execution-types.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-trie.workspace = true
+reth-trie-common.workspace = true
+reth-trie-db.workspace = true
 
 # alloy / op
 alloy-primitives.workspace = true
+alloy-consensus.workspace = true
 alloy-op-evm.workspace = true
 op-revm.workspace = true
+revm.workspace = true
 
 # misc
+eyre.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 reth-optimism-chainspec.workspace = true
