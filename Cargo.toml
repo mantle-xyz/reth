@@ -51,6 +51,7 @@ members = [
   "mantle-reth/crates/cli/",
   "mantle-reth/crates/chainspec/",
   "mantle-reth/crates/rpc-ext/",
+  "mantle-reth/crates/eth-api/",
 
   # Optimism ecosystem crates (from mantlenetworkio/mantle-v2, git dependency)
   # (no longer workspace members — referenced via git dep)
@@ -132,6 +133,7 @@ reth-optimism-txpool = { path = "op-reth/crates/txpool/" }
 mantle-reth-chainspec = { path = "mantle-reth/crates/chainspec/", default-features = false }
 mantle-reth-rpc-ext = { path = "mantle-reth/crates/rpc-ext/" }
 mantle-reth-cli = { path = "mantle-reth/crates/cli/" }
+mantle-reth-eth-api = { path = "mantle-reth/crates/eth-api/" }
 
 # ==================== RETH CRATES (crates.io published) ====================
 reth-codecs = { version = "0.3.1", default-features = false, features = ["alloy"] }

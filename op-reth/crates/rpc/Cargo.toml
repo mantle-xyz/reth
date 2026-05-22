@@ -43,6 +43,9 @@ reth-optimism-primitives = { workspace = true, features = ["reth-codec", "serde-
 reth-optimism-forks.workspace = true
 reth-optimism-trie.workspace = true
 
+# mantle-reth
+mantle-reth-eth-api.workspace = true
+
 # ethereum
 alloy-eips.workspace = true
 alloy-json-rpc.workspace = true

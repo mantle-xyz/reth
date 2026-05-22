@@ -5144,6 +5144,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-reth-eth-api"
+version = "0.1.0"
+dependencies = [
+ "alloy-op-evm",
+ "alloy-primitives",
+ "mantle-reth-chainspec",
+ "op-revm",
+ "reth-optimism-chainspec",
+ "reth-optimism-evm",
+ "reth-optimism-forks",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mantle-reth-rpc-ext"
 version = "0.1.0"
 dependencies = [
@@ -9019,6 +9033,7 @@ dependencies = [
  "jsonrpsee-core",
  "jsonrpsee-types",
  "mantle-reth-chainspec",
+ "mantle-reth-eth-api",
  "metrics",
  "op-alloy-consensus",
  "op-alloy-network",

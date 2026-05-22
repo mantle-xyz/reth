@@ -44,14 +44,12 @@ fn token_ratio_after_logs(mut current: U256, logs: &[alloy_primitives::Log]) -> 
         let topics = log.topics();
         let is_token_ratio_updated = topics
             .first()
-            .is_some_and(|t| U256::from_be_bytes(t.0) == TOKEN_RATIO_UPDATED_TOPIC)
-            || (topics.len() == 2);
-        if is_token_ratio_updated {
-            if let Some(new_ratio) = topics.last() {
-                let new_ratio_val = U256::from_be_bytes(new_ratio.0);
-                if new_ratio_val <= U256::from(MAX_REASONABLE_TOKEN_RATIO) {
-                    current = new_ratio_val;
-                }
+            .is_some_and(|t| U256::from_be_bytes(t.0) == TOKEN_RATIO_UPDATED_TOPIC) ||
+            (topics.len() == 2);
+        if is_token_ratio_updated && let Some(new_ratio) = topics.last() {
+            let new_ratio_val = U256::from_be_bytes(new_ratio.0);
+            if new_ratio_val <= U256::from(MAX_REASONABLE_TOKEN_RATIO) {
+                current = new_ratio_val;
             }
         }
     }
@@ -62,8 +60,8 @@ fn has_full_block_indices(
     block_tx_count: usize,
     indices: impl ExactSizeIterator<Item = u64>,
 ) -> bool {
-    indices.len() == block_tx_count
-        && indices.enumerate().all(|(idx, input_index)| input_index == idx as u64)
+    indices.len() == block_tx_count &&
+        indices.enumerate().all(|(idx, input_index)| input_index == idx as u64)
 }
 
 fn build_token_ratio_prefixes_from_logs<'a>(
@@ -105,7 +103,7 @@ pub struct OpReceiptConverter<Provider> {
     provider: Provider,
     /// Whether SDM is explicitly enabled for integration tests.
     sdm_enabled: bool,
-    /// [MANTLE] LRU cache of per-tx token_ratio prefix arrays, keyed by block hash.
+    /// [MANTLE] LRU cache of per-tx `token_ratio` prefix arrays, keyed by block hash.
     token_ratio_prefix_cache: TokenRatioPrefixCache,
 }
 
@@ -179,16 +177,13 @@ where
         // at the parent block state (= start of this block, before any tx runs).
         let is_mantle = self.provider.chain_spec().is_mantle();
         let mut token_ratio = U256::ZERO;
-        if is_mantle {
-            if let Ok(state) = self.provider.state_by_block_hash(block.header().parent_hash()) {
-                if let Ok(Some(ratio)) = state.storage(
-                    GAS_ORACLE_CONTRACT,
-                    op_revm::constants::TOKEN_RATIO_SLOT.into(),
-                ) {
-                    token_ratio = ratio;
-                    l1_block_info.token_ratio = ratio;
-                }
-            }
+        if is_mantle &&
+            let Ok(state) = self.provider.state_by_block_hash(block.header().parent_hash()) &&
+            let Ok(Some(ratio)) =
+                state.storage(GAS_ORACLE_CONTRACT, op_revm::constants::TOKEN_RATIO_SLOT.into())
+        {
+            token_ratio = ratio;
+            l1_block_info.token_ratio = ratio;
         }
 
         // [MANTLE] For single-receipt requests (eth_getTransactionReceipt), precompute
@@ -202,23 +197,19 @@ where
         let token_ratio_before_tx: Option<Arc<Vec<U256>>> = if !is_mantle || has_full_block_inputs {
             None
         } else {
-            get_or_insert_token_ratio_prefix(
-                &self.token_ratio_prefix_cache,
-                block_hash,
-                || {
-                    self.provider
-                        .receipts_by_block(BlockHashOrNumber::Hash(block_hash))
-                        .ok()
-                        .flatten()
-                        .filter(|all_receipts| all_receipts.len() == block_tx_count)
-                        .map(|all_receipts| {
-                            Arc::new(build_token_ratio_prefixes_from_logs(
-                                token_ratio,
-                                all_receipts.iter().map(|receipt| receipt.logs()),
-                            ))
-                        })
-                },
-            )
+            get_or_insert_token_ratio_prefix(&self.token_ratio_prefix_cache, block_hash, || {
+                self.provider
+                    .receipts_by_block(BlockHashOrNumber::Hash(block_hash))
+                    .ok()
+                    .flatten()
+                    .filter(|all_receipts| all_receipts.len() == block_tx_count)
+                    .map(|all_receipts| {
+                        Arc::new(build_token_ratio_prefixes_from_logs(
+                            token_ratio,
+                            all_receipts.iter().map(|receipt| receipt.logs()),
+                        ))
+                    })
+            })
         };
 
         let mut receipts = Vec::with_capacity(inputs.len());
@@ -621,8 +612,7 @@ mod test {
     #[test]
     fn op_receipt_fields_from_block_and_tx() {
         // rig
-        let tx_0 =
-            deposit_tx_with_calldata(&TX_SET_L1_BLOCK_OP_MAINNET_BLOCK_124665056_INPUT);
+        let tx_0 = deposit_tx_with_calldata(&TX_SET_L1_BLOCK_OP_MAINNET_BLOCK_124665056_INPUT);
 
         let tx_1 =
             OpTransactionSigned::decode_2718(&mut TX_1_OP_MAINNET_BLOCK_124665056.as_slice())

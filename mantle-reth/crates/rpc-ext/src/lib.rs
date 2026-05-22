@@ -30,7 +30,10 @@ use reth_optimism_evm::{RethL1BlockInfo, extract_l1_info};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_rpc::SequencerClient;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
-use reth_rpc_eth_api::{FullEthApiTypes, helpers::EthBlocks};
+use reth_rpc_eth_api::{
+    FullEthApiTypes,
+    helpers::{EthBlocks, EthCall, EthFees},
+};
 use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{BlockIdReader, BlockReaderIdExt, StateProviderFactory};
 use std::sync::Arc;
@@ -167,9 +170,6 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
 /// Maximum number of blocks that may be requested in a single `eth_getBlockRange` call.
 const MAX_BLOCK_RANGE: u64 = 1000;
 
-/// geth's RPC gas cap for Mantle `estimateTotalFee`.
-const GETH_MANTLE_RPC_GAS_CAP: u64 = 0x4000000000000;
-
 fn estimate_total_fee_gas_price(
     request_gas_price: Option<u128>,
     request_max_fee_per_gas: Option<u128>,
@@ -187,10 +187,6 @@ fn estimate_total_fee_gas_price(
     }
 }
 
-fn capped_l1_gas_limit(request_gas: Option<u64>) -> u64 {
-    request_gas.map(|gas| gas.min(GETH_MANTLE_RPC_GAS_CAP)).unwrap_or(GETH_MANTLE_RPC_GAS_CAP)
-}
-
 #[async_trait]
 impl<Provider, EthApi> MantleEthApiExtServer for MantleRpcExt<Provider, EthApi>
 where
@@ -202,7 +198,7 @@ where
         + Send
         + Sync
         + 'static,
-    EthApi: EthBlocks + FullEthApiTypes + Send + Sync + 'static,
+    EthApi: EthBlocks + EthCall + EthFees + FullEthApiTypes + Send + Sync + 'static,
 {
     async fn get_block_range(
         &self,
@@ -367,20 +363,35 @@ where
             ));
         }
 
-        // Estimate L2 gas
-        let gas_limit = capped_l1_gas_limit(request.gas);
+        // Estimate L2 gas via the standard gas estimator (matches op-geth DoEstimateGas)
+        let gas_estimate: U256 = EthCall::estimate_gas_at(
+            self.eth_api(),
+            serde_json::from_value(serde_json::to_value(&request).map_err(|e| {
+                ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
+            })?)
+            .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?,
+            block_id,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            ErrorObject::owned(-32000, format!("failed to estimate gas: {e}"), None::<()>)
+        })?;
+
         let base_fee = U256::from(header.base_fee_per_gas().unwrap_or(0));
 
-        // Use gas_price from request or derive from basefee + suggested tip
+        // Get real suggested tip (matches op-geth SuggestGasTipCap)
+        let suggested_tip =
+            EthFees::suggested_priority_fee(self.eth_api()).await.unwrap_or(U256::ZERO);
+
         let gas_price = estimate_total_fee_gas_price(
             request.gas_price,
             request.max_fee_per_gas,
             request.max_priority_fee_per_gas,
             base_fee,
-            U256::ZERO, /* suggested tip (would need max_priority_fee_per_gas RPC call for full
-                         * accuracy) */
+            suggested_tip,
         );
-        let l2_fee = U256::from(gas_limit).saturating_mul(gas_price);
+        let l2_fee = gas_estimate.saturating_mul(gas_price);
 
         // Calculate L1 data fee + operator fee from L1BlockInfo
         let (l1_data_fee, operator_fee) = match extract_l1_info(block.body()) {
@@ -406,7 +417,7 @@ where
                     if scalar.is_zero() && constant.is_zero() {
                         U256::ZERO
                     } else {
-                        U256::from(gas_limit)
+                        gas_estimate
                             .saturating_mul(scalar)
                             .saturating_mul(U256::from(100))
                             .saturating_add(constant)
@@ -449,12 +460,5 @@ mod tests {
     fn gas_price_fallback_base_plus_tip() {
         let p = estimate_total_fee_gas_price(None, None, None, U256::from(10), U256::from(3));
         assert_eq!(p, U256::from(13));
-    }
-
-    #[test]
-    fn capped_gas_limit() {
-        assert_eq!(capped_l1_gas_limit(None), GETH_MANTLE_RPC_GAS_CAP);
-        assert_eq!(capped_l1_gas_limit(Some(21_000)), 21_000);
-        assert_eq!(capped_l1_gas_limit(Some(GETH_MANTLE_RPC_GAS_CAP + 1)), GETH_MANTLE_RPC_GAS_CAP);
     }
 }

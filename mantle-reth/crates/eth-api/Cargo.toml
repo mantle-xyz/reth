@@ -1,0 +1,29 @@
+[package]
+name = "mantle-reth-eth-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Mantle-specific Eth API helpers (Arsia gas estimation balance check)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# op-reth
+reth-optimism-forks.workspace = true
+reth-optimism-evm.workspace = true
+
+# alloy / op
+alloy-primitives.workspace = true
+alloy-op-evm.workspace = true
+op-revm.workspace = true
+
+# misc
+thiserror.workspace = true
+
+[dev-dependencies]
+reth-optimism-chainspec.workspace = true
+mantle-reth-chainspec.workspace = true

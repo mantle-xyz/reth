@@ -379,23 +379,36 @@ impl RethL1BlockInfo for L1BlockInfo {
 mod tests {
     use super::*;
     use alloy_consensus::{Block, BlockBody};
-    use alloy_eips::eip2718::Decodable2718;
-    use alloy_primitives::keccak256;
+    use alloy_primitives::{Address, B256, Bytes, hex, keccak256};
+    use op_alloy_consensus::TxDeposit;
     use reth_optimism_chainspec::OP_MAINNET;
     use reth_optimism_forks::OpHardforks;
     use reth_optimism_primitives::OpTransactionSigned;
 
+    fn deposit_tx_with_calldata(calldata: Bytes) -> OpTransactionSigned {
+        TxDeposit {
+            source_hash: B256::ZERO,
+            from: Address::ZERO,
+            to: Address::ZERO.into(),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            input: calldata,
+            eth_tx_value: None,
+        }
+        .into()
+    }
+
     #[test]
     fn sanity_l1_block() {
-        use alloy_consensus::Header;
-        use alloy_primitives::{Bytes, hex_literal::hex};
-
-        let bytes = Bytes::from_static(&hex!(
-            "7ef9015aa044bae9d41b8380d781187b426c6fe43df5fb2fb57bd4466ef6a701e1f01e015694deaddeaddeaddeaddeaddeaddeaddeaddead000194420000000000000000000000000000000000001580808408f0d18001b90104015d8eb900000000000000000000000000000000000000000000000000000000008057650000000000000000000000000000000000000000000000000000000063d96d10000000000000000000000000000000000000000000000000000000000009f35273d89754a1e0387b89520d989d3be9c37c1f32495a88faf1ea05c61121ab0d1900000000000000000000000000000000000000000000000000000000000000010000000000000000000000002d679b567db6187c0c8323fa982cfb88b74dbcc7000000000000000000000000000000000000000000000000000000000000083400000000000000000000000000000000000000000000000000000000000f4240"
+        let calldata = Bytes::from_static(&hex!(
+            "015d8eb900000000000000000000000000000000000000000000000000000000008057650000000000000000000000000000000000000000000000000000000063d96d10000000000000000000000000000000000000000000000000000000000009f35273d89754a1e0387b89520d989d3be9c37c1f32495a88faf1ea05c61121ab0d1900000000000000000000000000000000000000000000000000000000000000010000000000000000000000002d679b567db6187c0c8323fa982cfb88b74dbcc7000000000000000000000000000000000000000000000000000000000000083400000000000000000000000000000000000000000000000000000000000f4240"
         ));
-        let l1_info_tx = OpTransactionSigned::decode_2718(&mut bytes.as_ref()).unwrap();
+        let l1_info_tx = deposit_tx_with_calldata(calldata);
         let mock_block = Block {
-            header: Header::default(),
+            header: alloy_consensus::Header::default(),
             body: BlockBody { transactions: vec![l1_info_tx], ..Default::default() },
         };
 
@@ -421,21 +434,14 @@ mod tests {
 
     #[test]
     fn sanity_l1_block_ecotone() {
-        // rig
-
-        // OP mainnet ecotone block 118024092
-        // <https://optimistic.etherscan.io/block/118024092>
         const TIMESTAMP: u64 = 1711603765;
         assert!(OP_MAINNET.is_ecotone_active_at_timestamp(TIMESTAMP));
 
-        // First transaction in OP mainnet block 118024092
-        //
-        // https://optimistic.etherscan.io/getRawTx?tx=0x88501da5d5ca990347c2193be90a07037af1e3820bb40774c8154871c7669150
-        const TX: [u8; 251] = hex!(
-            "7ef8f8a0a539eb753df3b13b7e386e147d45822b67cb908c9ddc5618e3dbaa22ed00850b94deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e2000000558000c5fc50000000000000000000000006605a89f00000000012a10d90000000000000000000000000000000000000000000000000000000af39ac3270000000000000000000000000000000000000000000000000000000d5ea528d24e582fa68786f080069bdbfe06a43f8e67bfd31b8e4d8a8837ba41da9a82a54a0000000000000000000000006887246668a3b87f54deb3b94ba47a6f63f32985"
-        );
-
-        let tx = OpTransactionSigned::decode_2718(&mut TX.as_slice()).unwrap();
+        // Ecotone L1 info calldata (setL1BlockValuesEcotone, 164 bytes total)
+        let calldata = Bytes::from_static(&hex!(
+            "440a5e2000000558000c5fc50000000000000000000000006605a89f00000000012a10d90000000000000000000000000000000000000000000000000000000af39ac3270000000000000000000000000000000000000000000000000000000d5ea528d24e582fa68786f080069bdbfe06a43f8e67bfd31b8e4d8a8837ba41da9a82a54a0000000000000000000000006887246668a3b87f54deb3b94ba47a6f63f32985"
+        ));
+        let tx = deposit_tx_with_calldata(calldata);
         let block: Block<OpTransactionSigned> = Block {
             body: BlockBody { transactions: vec![tx], ..Default::default() },
             ..Default::default()
