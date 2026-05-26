@@ -81,6 +81,12 @@ where
         result: &BlockExecutionResult<N::Receipt>,
         receipt_root_bloom: Option<ReceiptRootBloom>,
     ) -> Result<(), ConsensusError> {
+        // [MANTLE] The streaming receipt root task does not strip deposit_nonce /
+        // deposit_receipt_version, so its pre-computed root is wrong for Mantle.
+        // Force the fallback path through verify_receipts_optimism which applies
+        // the Mantle-specific strip logic.
+        let receipt_root_bloom =
+            if self.chain_spec.is_mantle() { None } else { receipt_root_bloom };
         validate_block_post_execution(block.header(), &self.chain_spec, result, receipt_root_bloom)
     }
 }
@@ -793,5 +799,101 @@ mod tests {
             ConsensusError::BlobGasUsedDiff(diff)
                 if diff.got == DA_FOOTPRINT && diff.expected == 0
         ));
+    }
+
+    /// Verifies that on Mantle chains, `validate_block_post_execution` ignores a
+    /// pre-computed receipt root (which lacks the Mantle deposit-field strip) and
+    /// re-computes the correct root via `verify_receipts_optimism`.
+    #[test]
+    fn mantle_ignores_precomputed_receipt_root() {
+        use crate::proof::calculate_receipt_root_no_memo_optimism;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+        use op_alloy_consensus::OpDepositReceipt;
+
+        let transaction = mock_tx(0);
+
+        // Build a deposit receipt WITH deposit_nonce and deposit_receipt_version set.
+        let deposit_receipt = OpReceipt::Deposit(OpDepositReceipt {
+            inner: Receipt {
+                status: Eip658Value::success(),
+                cumulative_gas_used: 21000,
+                logs: vec![],
+            },
+            deposit_nonce: Some(42),
+            deposit_receipt_version: Some(1),
+        });
+
+        // Root WITHOUT strip (what the streaming task computes)
+        let unstripped_root =
+            proofs::calculate_receipt_root(std::slice::from_ref(&deposit_receipt.with_bloom_ref()));
+        let bloom = deposit_receipt.bloom();
+
+        // Root WITH Mantle strip (correct canonical root)
+        let mantle_root = calculate_receipt_root_no_memo_optimism(
+            std::slice::from_ref(&deposit_receipt),
+            MANTLE_MAINNET.as_ref(),
+            u64::MAX,
+        );
+
+        // Sanity: the two roots must differ (strip changes the encoding)
+        assert_ne!(unstripped_root, mantle_root, "strip should produce a different root");
+
+        // Build block header with the CORRECT (stripped) receipt root
+        let header = Header {
+            base_fee_per_gas: Some(1337),
+            gas_used: 21000,
+            transactions_root: proofs::calculate_transaction_root(std::slice::from_ref(
+                &transaction,
+            )),
+            receipts_root: mantle_root,
+            logs_bloom: bloom,
+            timestamp: u64::MAX,
+            withdrawals_root: Some(proofs::calculate_withdrawals_root(&[])),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            ..Default::default()
+        };
+        let body = BlockBody {
+            transactions: vec![transaction],
+            ommers: vec![],
+            withdrawals: Some(Withdrawals::default()),
+        };
+        let block = SealedBlock::seal_slow(alloy_consensus::Block { header, body });
+        let block = RecoveredBlock::new_sealed(block, vec![Address::default()]);
+
+        let result = BlockExecutionResult::<OpReceipt> {
+            receipts: vec![deposit_receipt],
+            gas_used: 21000,
+            blob_gas_used: 0,
+            requests: Requests::default(),
+        };
+
+        let mantle_consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+
+        // Pass the WRONG (unstripped) pre-computed root — Mantle should ignore it
+        // and re-compute with strip, matching the header.
+        let post_exec =
+            <OpBeaconConsensus<OpChainSpec> as FullConsensus<OpPrimitives>>::validate_block_post_execution(
+                &mantle_consensus,
+                &block,
+                &result,
+                Some((unstripped_root, bloom)),
+            );
+        assert!(post_exec.is_ok(), "Mantle should ignore pre-computed receipt root: {post_exec:?}");
+
+        // Sanity: on non-Mantle (OP_MAINNET), the same wrong pre-computed root IS
+        // used, so validation should FAIL with receipt root mismatch.
+        let op_consensus = OpBeaconConsensus::new(OP_MAINNET.clone());
+        let post_exec_op =
+            <OpBeaconConsensus<OpChainSpec> as FullConsensus<OpPrimitives>>::validate_block_post_execution(
+                &op_consensus,
+                &block,
+                &result,
+                Some((unstripped_root, bloom)),
+            );
+        assert!(
+            post_exec_op.is_err(),
+            "Non-Mantle should use pre-computed root and detect mismatch"
+        );
     }
 }

@@ -48,6 +48,7 @@ reth-optimism-node.workspace = true
 alloy-chains.workspace = true
 
 op-alloy-consensus.workspace = true
+mantle-reth-chainspec.workspace = true
 
 [features]
 default = ["std"]

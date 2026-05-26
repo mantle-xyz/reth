@@ -8784,6 +8784,7 @@ dependencies = [
  "alloy-eips 2.0.5",
  "alloy-primitives",
  "alloy-trie",
+ "mantle-reth-chainspec",
  "op-alloy-consensus",
  "reth-chainspec",
  "reth-consensus",
