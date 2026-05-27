@@ -63,7 +63,7 @@ pub fn mantle_arsia_check_funds(
         return Ok(());
     }
 
-    let spec_id = resolve_mantle_spec_id(check.chain_spec, check.timestamp);
+    let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(check.chain_spec, check.timestamp);
 
     // L1 data fee with +80 bytes geth signature overhead
     let l1_cost =
@@ -90,19 +90,6 @@ pub fn mantle_arsia_check_funds(
         return Err(MantleInsufficientFunds { total, balance: check.from_balance });
     }
     Ok(())
-}
-
-/// Resolve the Mantle-specific `OpSpecId` for a given timestamp.
-pub fn resolve_mantle_spec_id(chain_spec: &impl OpHardforks, timestamp: u64) -> op_revm::OpSpecId {
-    if chain_spec.is_mantle_arsia_active_at_timestamp(timestamp) {
-        op_revm::OpSpecId::ARSIA
-    } else if chain_spec.is_mantle_limb_active_at_timestamp(timestamp) {
-        op_revm::OpSpecId::OSAKA
-    } else if chain_spec.is_mantle_skadi_active_at_timestamp(timestamp) {
-        op_revm::OpSpecId::ISTHMUS
-    } else {
-        alloy_op_evm::spec_by_timestamp_after_bedrock(chain_spec, timestamp)
-    }
 }
 
 #[cfg(test)]

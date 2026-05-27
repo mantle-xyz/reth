@@ -326,28 +326,6 @@ pub trait RethL1BlockInfo {
     ) -> Result<U256, BlockExecutionError>;
 }
 
-/// Computes the [`op_revm::OpSpecId`] for the given chain spec and timestamp.
-///
-/// Handles Mantle-specific spec routing (Arsia/Osaka/Isthmus) and falls back to
-/// the standard OP spec computed from the activated hardforks.
-pub(crate) fn resolve_op_spec_id(
-    chain_spec: &impl OpHardforks,
-    timestamp: u64,
-) -> op_revm::OpSpecId {
-    if chain_spec.is_mantle() {
-        if chain_spec.is_mantle_arsia_active_at_timestamp(timestamp) {
-            return op_revm::OpSpecId::ARSIA;
-        }
-        if chain_spec.is_mantle_limb_active_at_timestamp(timestamp) {
-            return op_revm::OpSpecId::OSAKA;
-        }
-        if chain_spec.is_mantle_skadi_active_at_timestamp(timestamp) {
-            return op_revm::OpSpecId::ISTHMUS;
-        }
-    }
-    alloy_op_evm::spec_by_timestamp_after_bedrock(chain_spec, timestamp)
-}
-
 impl RethL1BlockInfo for L1BlockInfo {
     fn l1_tx_data_fee(
         &mut self,
@@ -360,7 +338,7 @@ impl RethL1BlockInfo for L1BlockInfo {
             return Ok(U256::ZERO);
         }
 
-        let spec_id = resolve_op_spec_id(&chain_spec, timestamp);
+        let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
         Ok(self.calculate_tx_l1_cost(input, spec_id))
     }
 
@@ -370,7 +348,7 @@ impl RethL1BlockInfo for L1BlockInfo {
         timestamp: u64,
         input: &[u8],
     ) -> Result<U256, BlockExecutionError> {
-        let spec_id = resolve_op_spec_id(&chain_spec, timestamp);
+        let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
         Ok(self.data_gas(input, spec_id))
     }
 }
