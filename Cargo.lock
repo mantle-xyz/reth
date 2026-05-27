@@ -5206,7 +5206,10 @@ dependencies = [
 name = "mantle-reth-rpc-ext"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-op-evm",
  "alloy-primitives",
  "alloy-rpc-types-eth",
  "alloy-serde 2.0.5",

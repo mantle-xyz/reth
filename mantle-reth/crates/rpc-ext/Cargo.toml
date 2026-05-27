@@ -25,7 +25,10 @@ reth-rpc-eth-api.workspace = true
 reth-rpc-server-types.workspace = true
 
 # alloy / op-alloy
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
+alloy-network.workspace = true
+alloy-op-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-serde.workspace = true
