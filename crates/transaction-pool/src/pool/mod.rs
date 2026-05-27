@@ -395,14 +395,39 @@ where
         } = update;
         self.validator.on_new_head_block(new_tip);
 
+        // TEMP instrumentation: measure per-block pool maintenance cost.
+        let block_number = block_info.last_seen_block_number;
+        let mined_count = mined_transactions.len();
+        let changed_count = changed_accounts.len();
+
         let changed_senders = self.changed_senders(changed_accounts.into_iter());
 
         // update the pool
+        let maintain_start = std::time::Instant::now();
         let outcome = self.pool.write().on_canonical_state_change(
             block_info,
             mined_transactions,
             changed_senders,
             update_kind,
+        );
+        let maintain_elapsed = maintain_start.elapsed();
+
+        // TEMP instrumentation: emit at warn level so it surfaces at -vv (WARN); one line per block.
+        let promoted_count = outcome.promoted.len();
+        let discarded_count = outcome.discarded.len();
+        let pool_size = self.pool.read().size();
+        warn!(
+            target: "txpool::timing",
+            block = block_number,
+            mined = mined_count,
+            changed_accts = changed_count,
+            promoted = promoted_count,
+            discarded = discarded_count,
+            pending = pool_size.pending,
+            queued = pool_size.queued,
+            total = pool_size.total,
+            elapsed_ms = maintain_elapsed.as_secs_f64() * 1e3,
+            "on_canonical_state_change pool maintenance timing",
         );
 
         // This will discard outdated transactions based on the account's nonce
