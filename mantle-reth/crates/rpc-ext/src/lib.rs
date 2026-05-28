@@ -170,6 +170,16 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
 /// Maximum number of blocks that may be requested in a single `eth_getBlockRange` call.
 const MAX_BLOCK_RANGE: u64 = 1000;
 
+/// geth `DefaultMantleBlockGasLimit` — used as `RPCGasCap` default in op-geth.
+/// `estimateTotalFee` uses this to build a proxy tx envelope matching geth's `CallDefaults`,
+/// which fills `args.Gas` with `RPCGasCap` before `ToTransaction` for L1 cost estimation.
+const GETH_MANTLE_RPC_GAS_CAP: u64 = 0x4000000000000;
+
+/// Caps gas for the L1 cost envelope, matching geth's `CallDefaults` behavior.
+fn capped_gas_for_l1_envelope(request_gas: Option<u64>) -> u64 {
+    request_gas.map(|gas| gas.min(GETH_MANTLE_RPC_GAS_CAP)).unwrap_or(GETH_MANTLE_RPC_GAS_CAP)
+}
+
 fn estimate_total_fee_gas_price(
     request_gas_price: Option<u128>,
     request_max_fee_per_gas: Option<u128>,
@@ -352,6 +362,11 @@ where
             })?
             .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
 
+        // Pin symbolic block tags (safe, finalized, latest) to the resolved block number.
+        // This ensures estimate_gas_at uses the same block even if a new block arrives.
+        // Matches geth: `bNrOrHash = rpc.BlockNumberOrHashWithNumber(header.Number.Int64())`
+        let block_id = BlockId::Number(BlockNumberOrTag::Number(block.header().number()));
+
         let header = block.header();
         let chain_spec = self.provider().chain_spec();
 
@@ -404,17 +419,18 @@ where
                     l1_block_info.token_ratio = ratio;
                 }
 
-                // Build a proxy envelope from the request to approximate the full signed tx
-                // size. geth's CallDefaults + ToTransaction constructs the full tx for
-                // RollupCostData + FastLzSize += 80. When baseFee > 0 and no gasPrice is
-                // specified, geth produces an EIP-1559 tx; otherwise legacy.
-                let envelope_gas = U256::from(request.gas.unwrap_or(
-                    gas_estimate.try_into().unwrap_or(u64::MAX),
-                ));
+                // Build a proxy envelope matching geth's CallDefaults + ToTransaction:
+                // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with RPCGasCap,
+                //   which defaults to DefaultMantleBlockGasLimit = 0x4000000000000)
+                // - ChainID = chain config chain ID
+                // - When baseFee > 0 and no gasPrice → EIP-1559 tx; otherwise legacy
+                let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
+                let chain_id = chain_spec.chain().id();
                 let tx_envelope = build_unsigned_tx_envelope(
                     &request,
                     envelope_gas,
                     header.base_fee_per_gas().unwrap_or(0),
+                    chain_id,
                 );
                 let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(
                     chain_spec.as_ref(),
@@ -446,18 +462,22 @@ where
     }
 }
 
-/// Builds an unsigned tx envelope from a [`TransactionRequest`], replicating geth's
-/// `CallDefaults` + `ToTransaction(LegacyTxType)` for L1 cost estimation.
+/// Builds an unsigned tx byte representation matching geth's `MarshalBinary` on an unsigned tx
+/// created by `CallDefaults` + `ToTransaction(LegacyTxType)`.
 ///
-/// When `base_fee > 0` and the user did not specify `gas_price`, geth fills
-/// `MaxFeePerGas`/`MaxPriorityFeePerGas` and `ToTransaction` produces an EIP-1559
-/// (`DynamicFeeTx`) envelope. Otherwise it produces a legacy envelope.
+/// geth's `ToTransaction` creates an unsigned tx (V/R/S = nil) and `MarshalBinary` encodes
+/// Builds an unsigned transaction envelope matching geth's `eth_fillTransaction` output.
+///
+/// geth returns a signed envelope with a zero signature. We replicate this using
+/// `into_signed(zero_sig)` + `encoded_2718()`.
 fn build_unsigned_tx_envelope(
     request: &TransactionRequest,
     gas_estimate: U256,
     base_fee: u64,
+    chain_id: u64,
 ) -> Vec<u8> {
-    use alloy_consensus::SignableTransaction;
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxLegacy};
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::Signature;
 
     let gas_limit: u64 = gas_estimate.try_into().unwrap_or(u64::MAX);
@@ -465,14 +485,10 @@ fn build_unsigned_tx_envelope(
     let value = request.value.unwrap_or(U256::ZERO);
     let input = request.input.input().cloned().unwrap_or_default();
     let nonce = request.nonce.unwrap_or(0);
-    let chain_id = request.chain_id.unwrap_or(0);
-    let sig = Signature::new(U256::ZERO, U256::ZERO, false);
+    let zero_sig = Signature::new(U256::ZERO, U256::ZERO, false);
 
-    let use_eip1559 = base_fee > 0 && request.gas_price.is_none();
-
-    if use_eip1559 {
-        use alloy_consensus::TxEip1559;
-        let tx = TxEip1559 {
+    if base_fee > 0 && request.gas_price.is_none() {
+        TxEip1559 {
             chain_id,
             nonce,
             max_fee_per_gas: request.max_fee_per_gas.unwrap_or(0),
@@ -482,20 +498,21 @@ fn build_unsigned_tx_envelope(
             value,
             input,
             access_list: Default::default(),
-        };
-        alloy_network::eip2718::Encodable2718::encoded_2718(&tx.into_signed(sig))
+        }
+        .into_signed(zero_sig)
+        .encoded_2718()
     } else {
-        use alloy_consensus::TxLegacy;
-        let tx = TxLegacy {
-            chain_id: Some(chain_id),
+        TxLegacy {
+            chain_id: None,
             nonce,
             gas_price: request.gas_price.unwrap_or(0),
             gas_limit,
             to,
             value,
             input,
-        };
-        alloy_network::eip2718::Encodable2718::encoded_2718(&tx.into_signed(sig))
+        }
+        .into_signed(zero_sig)
+        .encoded_2718()
     }
 }
 
@@ -534,11 +551,9 @@ mod tests {
 
     #[test]
     fn envelope_eip1559_when_basefee_nonzero_and_no_gas_price() {
-        let request = TransactionRequest {
-            to: Some(TxKind::Call(Default::default())),
-            ..Default::default()
-        };
-        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000);
+        let request =
+            TransactionRequest { to: Some(TxKind::Call(Default::default())), ..Default::default() };
+        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
         // EIP-1559 envelope starts with type byte 0x02
         assert_eq!(envelope[0], 0x02, "should be EIP-1559 (type 0x02)");
     }
@@ -550,35 +565,32 @@ mod tests {
             gas_price: Some(10_000_000_000),
             ..Default::default()
         };
-        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000);
+        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
         // Legacy envelope starts with RLP list prefix (>= 0xc0)
         assert!(envelope[0] >= 0xc0, "should be legacy RLP, got 0x{:02x}", envelope[0]);
     }
 
     #[test]
     fn envelope_legacy_when_basefee_zero() {
-        let request = TransactionRequest {
-            to: Some(TxKind::Call(Default::default())),
-            ..Default::default()
-        };
-        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 0);
+        let request =
+            TransactionRequest { to: Some(TxKind::Call(Default::default())), ..Default::default() };
+        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 0, 1337);
         assert!(envelope[0] >= 0xc0, "baseFee=0 should produce legacy RLP");
     }
 
     #[test]
     fn envelope_includes_calldata() {
-        let request_empty = TransactionRequest {
-            to: Some(TxKind::Call(Default::default())),
-            ..Default::default()
-        };
+        let request_empty =
+            TransactionRequest { to: Some(TxKind::Call(Default::default())), ..Default::default() };
         let calldata = vec![0xffu8; 256];
         let request_data = TransactionRequest {
             to: Some(TxKind::Call(Default::default())),
             input: alloy_rpc_types_eth::TransactionInput::new(calldata.into()),
             ..Default::default()
         };
-        let empty = build_unsigned_tx_envelope(&request_empty, U256::from(21_000), 1_000_000);
-        let with_data = build_unsigned_tx_envelope(&request_data, U256::from(100_000), 1_000_000);
+        let empty = build_unsigned_tx_envelope(&request_empty, U256::from(21_000), 1_000_000, 1337);
+        let with_data =
+            build_unsigned_tx_envelope(&request_data, U256::from(100_000), 1_000_000, 1337);
         assert!(
             with_data.len() > empty.len() + 200,
             "256-byte calldata should add >200 bytes to envelope (empty={}, with_data={})",
@@ -587,78 +599,79 @@ mod tests {
         );
     }
 
-    // ─── L1 data fee: envelope vs calldata-only ─────────────────────────
+    // ─── L1 data fee: deterministic tests with exact expected values ────
 
-    #[test]
-    fn l1_cost_uses_full_envelope_not_just_calldata() {
-        use op_revm::L1BlockInfo;
-
-        let make_l1_info = || L1BlockInfo {
+    fn test_l1_block_info() -> op_revm::L1BlockInfo {
+        op_revm::L1BlockInfo {
             l1_base_fee: U256::from(30_000_000_000u64),
             l1_base_fee_scalar: U256::from(5000u64),
             l1_blob_base_fee: Some(U256::from(1_000_000u64)),
             l1_blob_base_fee_scalar: Some(U256::from(100u64)),
             token_ratio: U256::from(3000u64),
             ..Default::default()
-        };
-        let spec_id = op_revm::OpSpecId::ARSIA;
+        }
+    }
 
-        // Empty calldata — but the envelope still has ~40 bytes of tx structure
+    #[test]
+    fn l1_cost_empty_calldata_hits_min_tx_size_floor() {
+        let spec_id = op_revm::OpSpecId::ARSIA;
         let request = TransactionRequest {
             to: Some(TxKind::Call(Default::default())),
             value: Some(U256::from(1)),
             ..Default::default()
         };
-        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000);
+        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
+        let cost = test_l1_block_info().calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
 
-        // L1 cost from full envelope (what we do now)
-        let cost_envelope =
-            make_l1_info().calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
-        // L1 cost from empty calldata (what we did before — the bug)
-        let cost_empty =
-            make_l1_info().calculate_tx_l1_cost_for_estimate(&[], spec_id, 80);
-
-        assert!(
-            cost_envelope > cost_empty,
-            "full envelope should produce higher L1 cost than empty bytes \
-             (envelope={cost_envelope}, empty={cost_empty})"
-        );
-        assert!(
-            !cost_envelope.is_zero(),
-            "L1 cost from full envelope should be non-zero"
-        );
+        // Arsia formula: cost = max(MinTxSizeScaled, fastlz*COEF - INTERCEPT) * l1FeeScaled / 1e12
+        // * tokenRatio l1FeeScaled = 30e9*16*5000 + 1e6*100 = 2_400_000_100_000_000
+        // Small tx → MinTxSizeScaled = 100_000_000
+        // cost = 100_000_000 * 2_400_000_100_000_000 / 1_000_000_000_000 * 3000 =
+        // 720_000_030_000_000
+        assert_eq!(cost, U256::from(720_000_030_000_000u64));
     }
 
     #[test]
-    fn l1_cost_grows_with_large_calldata() {
-        use op_revm::L1BlockInfo;
+    fn l1_cost_empty_input_returns_zero() {
+        let cost = test_l1_block_info().calculate_tx_l1_cost_for_estimate(
+            &[],
+            op_revm::OpSpecId::ARSIA,
+            80,
+        );
+        assert_eq!(cost, U256::ZERO);
+    }
 
+    #[test]
+    fn l1_cost_large_calldata_exceeds_min_tx_size() {
         let spec_id = op_revm::OpSpecId::ARSIA;
-
-        let make_l1_info = || L1BlockInfo {
-            l1_base_fee: U256::from(30_000_000_000u64),
-            l1_base_fee_scalar: U256::from(5000u64),
-            l1_blob_base_fee: Some(U256::from(1_000_000u64)),
-            l1_blob_base_fee_scalar: Some(U256::from(100u64)),
-            token_ratio: U256::from(3000u64),
+        // High-entropy data defeats FastLZ compression → exceeds MinTxSizeScaled
+        let data: Vec<u8> =
+            (0u16..4096).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+        let request = TransactionRequest {
+            to: Some(TxKind::Call(Default::default())),
+            input: alloy_rpc_types_eth::TransactionInput::new(data.into()),
             ..Default::default()
         };
+        let envelope = build_unsigned_tx_envelope(&request, U256::from(100_000), 1_000_000, 1337);
+        let cost = test_l1_block_info().calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
 
-        // Test calculate_tx_l1_cost_for_estimate directly with raw bytes
-        let small_bytes = vec![0x02u8; 50]; // small tx-like bytes
-        // Use pseudo-random bytes to prevent FastLZ compression from collapsing the input
-        let large_bytes: Vec<u8> = (0u16..4096).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+        assert_eq!(cost, U256::from(2_222_959_772_622_000u64));
+    }
 
-        let cost_small =
-            make_l1_info().calculate_tx_l1_cost_for_estimate(&small_bytes, spec_id, 80);
-        let cost_large =
-            make_l1_info().calculate_tx_l1_cost_for_estimate(&large_bytes, spec_id, 80);
+    #[test]
+    fn l1_cost_regression_full_envelope_vs_calldata_only() {
+        let spec_id = op_revm::OpSpecId::ARSIA;
+        let request =
+            TransactionRequest { to: Some(TxKind::Call(Default::default())), ..Default::default() };
+        let envelope = build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
 
-        eprintln!("cost_small={cost_small}, cost_large={cost_large}");
+        // Correct: full envelope → MinTxSizeScaled floor
+        let cost_correct =
+            test_l1_block_info().calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
+        // Bug: empty bytes → zero
+        let cost_buggy = test_l1_block_info().calculate_tx_l1_cost_for_estimate(&[], spec_id, 80);
 
-        assert!(
-            cost_large > cost_small,
-            "4KB input should cost more than 50-byte input (small={cost_small}, large={cost_large})"
-        );
+        assert_eq!(cost_correct, U256::from(720_000_030_000_000u64));
+        assert_eq!(cost_buggy, U256::ZERO);
     }
 }

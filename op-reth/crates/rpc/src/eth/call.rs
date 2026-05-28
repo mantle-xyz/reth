@@ -31,6 +31,27 @@ where
         state_override: Option<StateOverride>,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
+            // [MANTLE] Pre-check: value transfer (geth state_transition.go clause 6).
+            // geth checks `!value.IsZero() && !CanTransfer(from, value)` BEFORE EVM execution
+            // and returns a specific error. Without this, reth returns generic "OutOfFunds".
+            if let Some(from) = request.as_ref().from {
+                let value = request.as_ref().value.unwrap_or(U256::ZERO);
+                if !value.is_zero() &&
+                    let Ok(Some(block)) = self.provider().block_by_id(at) &&
+                    let Ok(state) =
+                        self.provider().state_by_block_hash(block.header().parent_hash())
+                {
+                    let balance = state.account_balance(&from).ok().flatten().unwrap_or(U256::ZERO);
+                    if value > balance {
+                        let hi = request.as_ref().gas.unwrap_or(block.header().gas_limit());
+                        return Err(reth_rpc_eth_types::EthApiError::InvalidParams(format!(
+                            "failed with {hi} gas: insufficient funds for transfer: address {from}"
+                        ))
+                        .into());
+                    }
+                }
+            }
+
             let estimate =
                 EstimateCall::estimate_gas_at(self, request.clone(), at, state_override).await?;
 
