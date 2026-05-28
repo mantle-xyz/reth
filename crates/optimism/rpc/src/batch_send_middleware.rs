@@ -18,8 +18,11 @@ use jsonrpsee::{
 use jsonrpsee_core::server::{BatchResponseBuilder, ResponsePayload};
 use reth_rpc_eth_api::SendRawTxBatchItem;
 use serde_json::value::RawValue;
-use std::future::Future;
+use std::{future::Future, time::Instant};
 use tower::Layer;
+use tracing::{debug, info};
+
+const LOG_TARGET: &str = "rpc::eth::batch_mw";
 
 const TARGET_METHOD: &str = "eth_sendRawTransaction";
 const REWRITE_METHOD: &str = "eth_sendRawTransactions";
@@ -77,6 +80,15 @@ where
     type NotificationResponse = MethodResponse;
 
     fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
+        // Count single-call eth_sendRawTransaction arrivals so we can tell
+        // whether clients are batching at the JSON-RPC level (visits batch())
+        // or just firing N independent HTTP requests (visits call() N times).
+        if req.method_name() == TARGET_METHOD {
+            debug!(
+                target: LOG_TARGET,
+                "single eth_sendRawTransaction arrived via call() (not batched at JSON-RPC level)"
+            );
+        }
         self.inner.call(req)
     }
 
@@ -84,11 +96,22 @@ where
         let inner = self.inner.clone();
         let max_response_size = self.max_response_size;
         async move {
+            let t_start = Instant::now();
+            let batch_len = batch.len();
+
             // Inspect the batch first; if it's not a homogenous bundle of
             // single-arg eth_sendRawTransaction calls, pass through.
+            let t_parse = Instant::now();
             let Some(parsed) = parse_homogenous_batch(&batch) else {
+                debug!(
+                    target: LOG_TARGET,
+                    batch_len,
+                    parse_us = t_parse.elapsed().as_micros() as u64,
+                    "batch passes through (not homogenous eth_sendRawTransaction)"
+                );
                 return inner.batch(batch).await;
             };
+            let parse_us = t_parse.elapsed().as_micros() as u64;
             let HomogenousBatch { ids, txs } = parsed;
             debug_assert_eq!(ids.len(), txs.len());
 
@@ -96,13 +119,28 @@ where
             let synthetic = match build_synthetic_request(&txs) {
                 Ok(req) => req,
                 Err(_) => {
-                    // Should not happen for valid Bytes; fall back to pass-through.
                     return inner.batch(batch).await;
                 }
             };
 
+            let t_call = Instant::now();
             let synthetic_resp = inner.call(synthetic).await;
-            split_batch_response(synthetic_resp, ids, max_response_size)
+            let call_us = t_call.elapsed().as_micros() as u64;
+
+            let t_split = Instant::now();
+            let out = split_batch_response(synthetic_resp, ids, max_response_size);
+            let split_us = t_split.elapsed().as_micros() as u64;
+
+            info!(
+                target: LOG_TARGET,
+                batch_len,
+                parse_us,
+                call_us,
+                split_us,
+                total_us = t_start.elapsed().as_micros() as u64,
+                "rewrote eth_sendRawTransaction batch into single eth_sendRawTransactions"
+            );
+            out
         }
         .boxed()
     }

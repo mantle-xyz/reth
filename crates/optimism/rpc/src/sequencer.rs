@@ -10,7 +10,9 @@ use alloy_transport_http::Http;
 use futures::future::join_all;
 use std::{str::FromStr, sync::Arc, time::Instant};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
+
+const BATCH_LOG_TARGET: &str = "rpc::sequencer::batch";
 
 /// Sequencer client error
 #[derive(Error, Debug)]
@@ -189,10 +191,21 @@ impl SequencerClient {
             return Ok(Vec::new());
         }
         if txs.len() == 1 {
-            return Ok(vec![self.forward_raw_transaction(&txs[0]).await]);
+            let t = Instant::now();
+            let res = self.forward_raw_transaction(&txs[0]).await;
+            info!(
+                target: BATCH_LOG_TARGET,
+                n = 1,
+                ok = res.is_ok(),
+                total_us = t.elapsed().as_micros() as u64,
+                "forward_raw_transactions: single-tx fast path"
+            );
+            return Ok(vec![res]);
         }
 
+        let n = txs.len();
         let start = Instant::now();
+        let t_build = Instant::now();
         let mut batch = self.client().new_batch();
         let mut waiters: Vec<Option<_>> = Vec::with_capacity(txs.len());
         for tx in txs {
@@ -202,11 +215,13 @@ impl SequencerClient {
                 Err(_) => waiters.push(None),
             }
         }
+        let build_us = t_build.elapsed().as_micros() as u64;
 
         // Drive the batch send and the per-entry waiters concurrently. The send
         // future populates the oneshot channels the waiters resolve on; if the
         // send itself fails, the channels are dropped and the waiters resolve
         // with a transport error.
+        let t_send = Instant::now();
         let send_fut = batch.send();
         let waiter_futs = waiters.into_iter().map(|w| async move {
             match w {
@@ -215,11 +230,12 @@ impl SequencerClient {
             }
         });
         let (_send_res, results) = tokio::join!(send_fut, join_all(waiter_futs));
+        let send_us = t_send.elapsed().as_micros() as u64;
 
         let elapsed = start.elapsed();
         self.metrics().record_forward_latency(elapsed);
 
-        let mapped = results
+        let mapped: Vec<Result<B256, SequencerClientError>> = results
             .into_iter()
             .map(|waiter_res| match waiter_res {
                 Some(Ok(hash)) => Ok(hash),
@@ -234,6 +250,16 @@ impl SequencerClient {
                 }
             })
             .collect();
+        let ok_count = mapped.iter().filter(|r| r.is_ok()).count();
+        info!(
+            target: BATCH_LOG_TARGET,
+            n,
+            ok = ok_count,
+            build_us,
+            send_us,
+            total_us = elapsed.as_micros() as u64,
+            "forward_raw_transactions: batch sent to sequencer"
+        );
         Ok(mapped)
     }
 

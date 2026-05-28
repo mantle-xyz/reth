@@ -19,8 +19,10 @@ use reth_storage_api::ReceiptProvider;
 use reth_transaction_pool::{
     AddedTransactionOutcome, PoolTransaction, TransactionOrigin, TransactionPool,
 };
-use std::sync::Arc;
-use tracing::warn;
+use std::{sync::Arc, time::Instant};
+use tracing::{info, warn};
+
+const LOG_TARGET: &str = "rpc::eth::batch_send";
 
 /// Capability surface required by [`OpEthBatchSendApi`].
 ///
@@ -151,6 +153,9 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
         return Vec::new();
     }
 
+    let t_total = Instant::now();
+    let total_in = txs.len();
+
     struct Prepared<T> {
         raw: Bytes,
         pool_tx: T,
@@ -158,6 +163,7 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
 
     // Per-tx local prep: decode + sender recovery. Failed items skip the rest
     // of the pipeline and are reported as per-item errors.
+    let t_recover = Instant::now();
     let prepared: Vec<Result<Prepared<E::PoolTx>, ErrorObjectOwned>> = txs
         .into_iter()
         .map(|tx| match eth_api.recover_pool_tx(&tx) {
@@ -168,6 +174,8 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
             Err(err) => Err(err),
         })
         .collect();
+    let recover_us = t_recover.elapsed().as_micros() as u64;
+    let recover_ok = prepared.iter().filter(|p| p.is_ok()).count();
 
     if let Some(client) = eth_api.sequencer_client() {
         let (forward_indices, forward_raws): (Vec<usize>, Vec<Bytes>) = prepared
@@ -178,6 +186,7 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
 
         // Normalize to a single shape so per-item assembly is uniform whether
         // the batch envelope failed or only some entries did.
+        let t_forward = Instant::now();
         let forward_results: Vec<Result<B256, ErrorObjectOwned>> = if forward_raws.is_empty() {
             Vec::new()
         } else {
@@ -206,9 +215,15 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
             }
         };
 
+        let forward_us = t_forward.elapsed().as_micros() as u64;
+        let forward_n = forward_indices.len();
+
+        let t_pool = Instant::now();
         let mut forward_iter = forward_indices.into_iter().zip(forward_results);
         let mut next_forwarded = forward_iter.next();
         let mut out: Vec<SendRawTxBatchItem> = Vec::with_capacity(prepared.len());
+        let mut forward_ok = 0usize;
+        let mut pool_failed = 0usize;
 
         for (i, prep) in prepared.into_iter().enumerate() {
             match prep {
@@ -219,8 +234,10 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
                     next_forwarded = forward_iter.next();
                     match fwd_res {
                         Ok(hash) => {
+                            forward_ok += 1;
                             if let Err(pool_err) = eth_api.add_pool_transaction(prep.pool_tx).await
                             {
+                                pool_failed += 1;
                                 warn!(
                                     target: "rpc::eth",
                                     %pool_err,
@@ -235,10 +252,25 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
                 }
             }
         }
+        let pool_us = t_pool.elapsed().as_micros() as u64;
+        info!(
+            target: LOG_TARGET,
+            total_in,
+            recover_ok,
+            forward_n,
+            forward_ok,
+            pool_failed,
+            recover_us,
+            forward_us,
+            pool_us,
+            total_us = t_total.elapsed().as_micros() as u64,
+            "sendRawTransactions handler (forwarder path) finished"
+        );
         return out;
     }
 
     // No sequencer forwarder: per-tx local pool insertion only.
+    let t_local = Instant::now();
     let adds = prepared.into_iter().map(|prep| async move {
         match prep {
             Err(err) => SendRawTxBatchItem::err(err),
@@ -253,5 +285,15 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
             }
         }
     });
-    join_all(adds).await
+    let out = join_all(adds).await;
+    info!(
+        target: LOG_TARGET,
+        total_in,
+        recover_ok,
+        recover_us,
+        local_pool_us = t_local.elapsed().as_micros() as u64,
+        total_us = t_total.elapsed().as_micros() as u64,
+        "sendRawTransactions handler (no-forwarder path) finished"
+    );
+    out
 }
