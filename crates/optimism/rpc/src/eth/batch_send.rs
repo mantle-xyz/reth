@@ -219,15 +219,20 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
         let forward_n = forward_indices.len();
 
         let t_pool = Instant::now();
+        // Two-phase assembly so pool inserts can run concurrently via join_all,
+        // letting the txpool BatchTxProcessor coalesce them under one write lock
+        // instead of paying per-tx lock acquisition in a serial await loop.
+        let mut out: Vec<Option<SendRawTxBatchItem>> =
+            (0..prepared.len()).map(|_| None).collect();
+        let mut pool_inserts: Vec<(usize, E::PoolTx, B256)> =
+            Vec::with_capacity(prepared.len());
         let mut forward_iter = forward_indices.into_iter().zip(forward_results);
         let mut next_forwarded = forward_iter.next();
-        let mut out: Vec<SendRawTxBatchItem> = Vec::with_capacity(prepared.len());
         let mut forward_ok = 0usize;
-        let mut pool_failed = 0usize;
 
         for (i, prep) in prepared.into_iter().enumerate() {
             match prep {
-                Err(err) => out.push(SendRawTxBatchItem::err(err)),
+                Err(err) => out[i] = Some(SendRawTxBatchItem::err(err)),
                 Ok(prep) => {
                     debug_assert_eq!(next_forwarded.as_ref().map(|(j, _)| *j), Some(i));
                     let (_, fwd_res) = next_forwarded.take().expect("forward result aligned");
@@ -235,23 +240,37 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
                     match fwd_res {
                         Ok(hash) => {
                             forward_ok += 1;
-                            if let Err(pool_err) = eth_api.add_pool_transaction(prep.pool_tx).await
-                            {
-                                pool_failed += 1;
-                                warn!(
-                                    target: "rpc::eth",
-                                    %pool_err,
-                                    %hash,
-                                    "sent tx to sequencer but failed to persist locally",
-                                );
-                            }
-                            out.push(SendRawTxBatchItem::ok(hash));
+                            pool_inserts.push((i, prep.pool_tx, hash));
                         }
-                        Err(err) => out.push(SendRawTxBatchItem::err(err)),
+                        Err(err) => out[i] = Some(SendRawTxBatchItem::err(err)),
                     }
                 }
             }
         }
+
+        let insert_results =
+            join_all(pool_inserts.into_iter().map(|(i, pool_tx, hash)| async move {
+                let pool_err = eth_api.add_pool_transaction(pool_tx).await.err();
+                (i, hash, pool_err)
+            }))
+            .await;
+
+        let mut pool_failed = 0usize;
+        for (i, hash, pool_err) in insert_results {
+            if let Some(pool_err) = pool_err {
+                pool_failed += 1;
+                warn!(
+                    target: "rpc::eth",
+                    %pool_err,
+                    %hash,
+                    "sent tx to sequencer but failed to persist locally",
+                );
+            }
+            out[i] = Some(SendRawTxBatchItem::ok(hash));
+        }
+
+        let out: Vec<SendRawTxBatchItem> =
+            out.into_iter().map(|o| o.expect("every slot filled")).collect();
         let pool_us = t_pool.elapsed().as_micros() as u64;
         info!(
             target: LOG_TARGET,
