@@ -2,10 +2,12 @@
 
 use crate::{SequencerClientError, SequencerMetrics};
 use alloy_json_rpc::{RpcRecv, RpcSend};
-use alloy_primitives::{hex, B256};
+use alloy_primitives::{hex, Bytes, B256};
 use alloy_rpc_client::{BuiltInConnectionString, ClientBuilder, RpcClient as Client};
 use alloy_rpc_types_eth::erc4337::TransactionConditional;
+use alloy_transport::TransportErrorKind;
 use alloy_transport_http::Http;
+use futures::future::join_all;
 use std::{str::FromStr, sync::Arc, time::Instant};
 use thiserror::Error;
 use tracing::warn;
@@ -169,6 +171,72 @@ impl SequencerClient {
         Ok(tx_hash)
     }
 
+    /// Forwards multiple raw transactions to the sequencer in a single outbound
+    /// JSON-RPC batch.
+    ///
+    /// Returns one result per input transaction, preserving order. The outer `Result`
+    /// is an error only if the batch envelope itself cannot be sent (transport
+    /// failure); per-transaction failures from the sequencer are reported via the
+    /// inner `Result`s.
+    ///
+    /// For a single input this falls back to [`Self::forward_raw_transaction`] to
+    /// avoid the batch wrapper overhead.
+    pub async fn forward_raw_transactions(
+        &self,
+        txs: &[Bytes],
+    ) -> Result<Vec<Result<B256, SequencerClientError>>, SequencerClientError> {
+        if txs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if txs.len() == 1 {
+            return Ok(vec![self.forward_raw_transaction(&txs[0]).await]);
+        }
+
+        let start = Instant::now();
+        let mut batch = self.client().new_batch();
+        let mut waiters: Vec<Option<_>> = Vec::with_capacity(txs.len());
+        for tx in txs {
+            let params = (hex::encode_prefixed(tx),);
+            match batch.add_call::<_, B256>("eth_sendRawTransaction", &params) {
+                Ok(waiter) => waiters.push(Some(waiter)),
+                Err(_) => waiters.push(None),
+            }
+        }
+
+        // Drive the batch send and the per-entry waiters concurrently. The send
+        // future populates the oneshot channels the waiters resolve on; if the
+        // send itself fails, the channels are dropped and the waiters resolve
+        // with a transport error.
+        let send_fut = batch.send();
+        let waiter_futs = waiters.into_iter().map(|w| async move {
+            match w {
+                Some(waiter) => Some(waiter.await),
+                None => None,
+            }
+        });
+        let (_send_res, results) = tokio::join!(send_fut, join_all(waiter_futs));
+
+        let elapsed = start.elapsed();
+        self.metrics().record_forward_latency(elapsed);
+
+        let mapped = results
+            .into_iter()
+            .map(|waiter_res| match waiter_res {
+                Some(Ok(hash)) => Ok(hash),
+                Some(Err(err)) => Err(SequencerClientError::HttpError(err)),
+                None => Err(SequencerClientError::HttpError(TransportErrorKind::custom_str(
+                    "failed to serialize batched eth_sendRawTransaction",
+                ))),
+            })
+            .inspect(|res| {
+                if let Err(err) = res {
+                    warn!(target: "rpc::eth", %err, "Failed to forward batched transaction to sequencer");
+                }
+            })
+            .collect();
+        Ok(mapped)
+    }
+
     /// Forwards a transaction conditional to the sequencer endpoint.
     pub async fn forward_raw_transaction_conditional(
         &self,
@@ -262,6 +330,144 @@ mod tests {
             body,
             r#"{"method":"eth_sendRawTransactionConditional","params":["0x61626364",{"knownAccounts":{}}],"id":1,"jsonrpc":"2.0"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn forward_raw_transactions_empty_returns_empty() {
+        let client = SequencerClient::new("http://localhost:8545").await.unwrap();
+        let results = client.forward_raw_transactions(&[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// Minimal HTTP/1.1 single-shot server. Accepts one POST, returns the
+    /// caller-supplied body, and hands back the captured request body so the
+    /// test can assert on its shape.
+    async fn one_shot_http_server(
+        response_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read until we have the full body. HTTP/1.1 with Content-Length.
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut total = 0usize;
+            let body = loop {
+                let n = sock.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break String::from_utf8_lossy(&buf[..total]).to_string();
+                }
+                total += n;
+                let text = std::str::from_utf8(&buf[..total]).unwrap_or("");
+                if let Some(hdr_end) = text.find("\r\n\r\n") {
+                    let content_length: usize = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    let body_start = hdr_end + 4;
+                    if total >= body_start + content_length {
+                        break text[body_start..body_start + content_length].to_string();
+                    }
+                }
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            body
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn forward_raw_transactions_sends_single_batch_post_for_multiple_txs() {
+        // Two raw txs → exactly one HTTP POST with a JSON-RPC batch body
+        // containing two eth_sendRawTransaction entries, in order.
+        let canned_response = r#"[{"jsonrpc":"2.0","id":0,"result":"0x1111111111111111111111111111111111111111111111111111111111111111"},{"jsonrpc":"2.0","id":1,"result":"0x2222222222222222222222222222222222222222222222222222222222222222"}]"#;
+        let (url, srv) = one_shot_http_server(canned_response).await;
+        let client = SequencerClient::new(url).await.unwrap();
+
+        let txs = vec![Bytes::from(vec![0xaa, 0xbb]), Bytes::from(vec![0xcc, 0xdd])];
+        let results = client.forward_raw_transactions(&txs).await.unwrap();
+
+        let body = srv.await.unwrap();
+        assert!(
+            body.starts_with('[') && body.trim_end().ends_with(']'),
+            "expected JSON-RPC batch array, got: {body}"
+        );
+        assert_eq!(
+            body.matches("\"method\":\"eth_sendRawTransaction\"").count(),
+            2,
+            "expected two eth_sendRawTransaction entries, got: {body}"
+        );
+        assert!(body.contains("0xaabb"), "missing first tx in body: {body}");
+        assert!(body.contains("0xccdd"), "missing second tx in body: {body}");
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert_eq!(
+            results[0].as_ref().unwrap().to_string(),
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            results[1].as_ref().unwrap().to_string(),
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_raw_transactions_single_tx_uses_single_call_not_batch() {
+        // N=1 short-circuits to forward_raw_transaction → body is a JSON
+        // object, not an array.
+        let canned_response = r#"{"jsonrpc":"2.0","id":0,"result":"0x3333333333333333333333333333333333333333333333333333333333333333"}"#;
+        let (url, srv) = one_shot_http_server(canned_response).await;
+        let client = SequencerClient::new(url).await.unwrap();
+
+        let results =
+            client.forward_raw_transactions(&[Bytes::from(vec![0x11, 0x22])]).await.unwrap();
+        let body = srv.await.unwrap();
+
+        assert!(body.starts_with('{'), "expected single JSON-RPC object (not batch), got: {body}");
+        assert!(body.contains("\"method\":\"eth_sendRawTransaction\""));
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn forward_raw_transactions_propagates_per_item_errors() {
+        // Sequencer returns error for one entry, success for the other —
+        // the wrapper must report per-item Err/Ok without failing overall.
+        let canned_response = r#"[{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"already known"}},{"jsonrpc":"2.0","id":1,"result":"0x4444444444444444444444444444444444444444444444444444444444444444"}]"#;
+        let (url, srv) = one_shot_http_server(canned_response).await;
+        let client = SequencerClient::new(url).await.unwrap();
+
+        let results = client
+            .forward_raw_transactions(&[Bytes::from(vec![0xaa]), Bytes::from(vec![0xbb])])
+            .await
+            .unwrap();
+        let _body = srv.await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_err(), "first entry should be error, got {:?}", results[0]);
+        let err_str = results[0].as_ref().err().unwrap().to_string();
+        assert!(
+            err_str.contains("already known"),
+            "error should preserve sequencer message: {err_str}"
+        );
+        assert!(results[1].is_ok(), "second entry should be ok, got {:?}", results[1]);
     }
 
     #[tokio::test]

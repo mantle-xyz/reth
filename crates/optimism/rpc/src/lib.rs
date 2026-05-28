@@ -8,6 +8,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod batch_send_middleware;
 pub mod engine;
 pub mod error;
 pub mod eth;

@@ -5,6 +5,7 @@ use alloy_json_rpc::RpcObject;
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rpc_types_eth::{erc4337::TransactionConditional, TransactionRequest};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use jsonrpsee_types::ErrorObjectOwned;
 
 /// Extension trait for `eth_` namespace for L2s.
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "eth"))]
@@ -71,6 +72,31 @@ pub struct PreconfLog {
     pub topics: Vec<B256>,
     /// Log data
     pub data: Bytes,
+}
+
+/// Per-item response of `eth_sendRawTransactions`. Exactly one of `hash` and
+/// `error` is set.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendRawTxBatchItem {
+    /// Tx hash on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<B256>,
+    /// JSON-RPC error object on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorObjectOwned>,
+}
+
+impl SendRawTxBatchItem {
+    /// Constructs a success item.
+    pub const fn ok(hash: B256) -> Self {
+        Self { hash: Some(hash), error: None }
+    }
+
+    /// Constructs a failure item.
+    pub const fn err(error: ErrorObjectOwned) -> Self {
+        Self { hash: None, error: Some(error) }
+    }
 }
 
 /// Extension trait for `eth_` namespace for Mantle networks.

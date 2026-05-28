@@ -45,7 +45,12 @@ use reth_optimism_payload_builder::{
 };
 use reth_optimism_primitives::{DepositReceipt, OpPrimitives};
 use reth_optimism_rpc::{
-    eth::{ext::OpEthExtApi, mantle_ext::MantleEthApiExt, OpEthApiBuilder},
+    eth::{
+        batch_send::{OpEthBatchApiServer, OpEthBatchSendApi},
+        ext::OpEthExtApi,
+        mantle_ext::MantleEthApiExt,
+        OpEthApiBuilder,
+    },
     historical::{HistoricalRpc, HistoricalRpcClient},
     miner::{MinerApiExtServer, OpMinerExtApi},
     witness::{DebugExecutionWitnessApiServer, OpDebugWitnessApi},
@@ -514,6 +519,7 @@ where
         Pool: TransactionPool<Transaction: OpPooledTx>,
     >,
     EthB: EthApiBuilder<N>,
+    EthB::EthApi: reth_optimism_rpc::eth::batch_send::OpBatchEthApi,
     reth_rpc_eth_api::RpcTxReq<<EthB::EthApi as reth_rpc_eth_api::EthApiTypes>::NetworkTypes>:
         reth_rpc_convert::TryIntoSimTx<op_alloy_consensus::OpTxEnvelope> + Clone,
     PVB: Send,
@@ -560,6 +566,13 @@ where
             ;
 
         let rpc_add_ons = rpc_add_ons.option_layer_rpc_middleware(maybe_pre_bedrock_historical_rpc);
+
+        // Coalesce inbound `eth_sendRawTransaction` JSON-RPC batches into one
+        // `eth_sendRawTransactions` call so the sequencer forward step is a
+        // single outbound batch.
+        let rpc_add_ons = rpc_add_ons.layer_rpc_middleware(
+            reth_optimism_rpc::batch_send_middleware::BatchSendRawTxLayer::new(),
+        );
 
         let builder = reth_optimism_payload_builder::OpPayloadBuilder::new(
             ctx.node.pool().clone(),
@@ -623,6 +636,12 @@ where
                         .merge(L2EthApiExtServer::into_rpc(op_eth_ext))
                         .expect("L2 and Mantle eth ext methods do not conflict");
                 }
+                // Batched eth_sendRawTransactions: per-tx local processing,
+                // single outbound forward to the sequencer.
+                let batch_send_ext = OpEthBatchSendApi::new(Arc::new(registry.eth_api().clone()));
+                mantle_ext_module
+                    .merge(OpEthBatchApiServer::into_rpc(batch_send_ext))
+                    .expect("eth_sendRawTransactions does not collide with existing eth ext");
                 info!(
                     target: "reth::cli",
                     "Installing Mantle RPC extension{}",
@@ -655,6 +674,7 @@ where
     >,
     <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction: OpPooledTx,
     EthB: EthApiBuilder<N>,
+    EthB::EthApi: reth_optimism_rpc::eth::batch_send::OpBatchEthApi,
     reth_rpc_eth_api::RpcTxReq<<EthB::EthApi as reth_rpc_eth_api::EthApiTypes>::NetworkTypes>:
         reth_rpc_convert::TryIntoSimTx<op_alloy_consensus::OpTxEnvelope> + Clone,
     PVB: PayloadValidatorBuilder<N>,

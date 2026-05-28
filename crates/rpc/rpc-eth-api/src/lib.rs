@@ -25,7 +25,7 @@ pub use bundle::{EthBundleApiServer, EthCallBundleApiServer};
 pub use core::{EthApiServer, FullEthApiServer};
 pub use ext::{
     L2EthApiExtServer, MantleEthApiExtServer, PreconfLog, PreconfStatus, PreconfTxEvent,
-    PreconfTxReceipt,
+    PreconfTxReceipt, SendRawTxBatchItem,
 };
 pub use filter::{EngineEthFilter, EthFilterApiServer, QueryLimits};
 pub use node::{RpcNodeCore, RpcNodeCoreExt};

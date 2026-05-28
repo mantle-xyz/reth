@@ -1,5 +1,6 @@
 //! OP-Reth `eth_` endpoint implementation.
 
+pub mod batch_send;
 pub mod ext;
 pub mod mantle_ext;
 pub mod receipt;
