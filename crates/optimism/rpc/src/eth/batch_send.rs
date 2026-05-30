@@ -248,26 +248,16 @@ async fn send_raw_transactions_impl<E: OpBatchEthApi>(
             }
         }
 
-        let insert_results =
-            join_all(pool_inserts.into_iter().map(|(i, pool_tx, hash)| async move {
-                let pool_err = eth_api.add_pool_transaction(pool_tx).await.err();
-                (i, hash, pool_err)
-            }))
-            .await;
-
-        let mut pool_failed = 0usize;
-        for (i, hash, pool_err) in insert_results {
-            if let Some(pool_err) = pool_err {
-                pool_failed += 1;
-                warn!(
-                    target: "rpc::eth",
-                    %pool_err,
-                    %hash,
-                    "sent tx to sequencer but failed to persist locally",
-                );
-            }
+        // EXPERIMENT: skip local pool insert entirely on the forwarder path
+        // to measure how much of the observed BTPS ceiling is attributable to
+        // local-pool admission cost vs everything else. The trade-off is real
+        // (broken `eth_getTransactionByHash` for pending, broken pending-nonce
+        // queries, broken pending-tx subscriptions) and is NOT acceptable for a
+        // user-facing RPC node; this branch exists only for offline benchmarks.
+        for (i, _pool_tx, hash) in pool_inserts {
             out[i] = Some(SendRawTxBatchItem::ok(hash));
         }
+        let pool_failed = 0usize;
 
         let out: Vec<SendRawTxBatchItem> =
             out.into_iter().map(|o| o.expect("every slot filled")).collect();
