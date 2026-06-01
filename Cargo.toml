@@ -58,7 +58,7 @@ members = [
   # (no longer workspace members — referenced via git dep)
 ]
 default-members = [
-  "op-reth/bin/",
+  "mantle-reth/crates/cli/",
 ]
 
 # ==================== WORKSPACE LINTS ====================

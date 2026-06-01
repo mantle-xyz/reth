@@ -12,4 +12,6 @@ pub use txpool::{MantleTransactionValidator, MetaTxDisabled, UnprotectedTxDisabl
 pub mod node;
 pub use node::{MantleNode, MantleNodeComponentBuilder, MantlePoolBuilder, MantleTransactionPool};
 
+pub mod version;
+
 pub use reth_optimism_node::OpNode;
