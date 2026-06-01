@@ -58,10 +58,12 @@ where
                     tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
                 })?;
 
-            // Retain tx in local tx pool after forwarding, for local RPC usage.
-            let _ = self.inner.eth_api.add_pool_transaction(pool_transaction).await.inspect_err(|err| {
-                tracing::warn!(target: "rpc::eth", %err, %hash, "successfully sent tx to sequencer, but failed to persist in local tx pool");
-            });
+            // EXPERIMENT: skip local pool insert when forwarder is configured.
+            // Diagnostic-only branch to measure the cost of the local pool admission
+            // path. Trade-off: eth_getTransactionByHash returns null for txs not yet
+            // mined; eth_getTransactionCount(pending) returns stale nonce; txpool_*
+            // queries see an empty pool. NOT for user-facing production.
+            let _ = pool_transaction;
 
             return Ok(hash);
         }
