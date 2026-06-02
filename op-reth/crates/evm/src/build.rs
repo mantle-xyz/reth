@@ -73,7 +73,7 @@ impl<ChainSpec: OpHardforks> OpBlockAssembler<ChainSpec> {
                 isthmus::withdrawals_root(bundle_state, state_provider)
                     .map_err(BlockExecutionError::other)?,
             )
-        } else if self.chain_spec.is_canyon_active_at_timestamp(timestamp) {
+        } else if self.chain_spec.is_shanghai_active_at_timestamp(timestamp) {
             Some(EMPTY_WITHDRAWALS)
         } else {
             None
@@ -123,7 +123,7 @@ impl<ChainSpec: OpHardforks> OpBlockAssembler<ChainSpec> {
                 ommers: Default::default(),
                 withdrawals: self
                     .chain_spec
-                    .is_canyon_active_at_timestamp(timestamp)
+                    .is_shanghai_active_at_timestamp(timestamp)
                     .then(Default::default),
             },
         ))

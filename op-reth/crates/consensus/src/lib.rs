@@ -123,7 +123,7 @@ where
         }
 
         // Check empty shanghai-withdrawals
-        if self.chain_spec.is_canyon_active_at_timestamp(block.timestamp()) {
+        if self.chain_spec.is_shanghai_active_at_timestamp(block.timestamp()) {
             canyon::ensure_empty_shanghai_withdrawals(block.body()).map_err(|err| {
                 ConsensusError::msg(format!("failed to verify block {}: {err}", block.number()))
             })?
