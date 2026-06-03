@@ -42,10 +42,8 @@ fn token_ratio_after_logs(mut current: U256, logs: &[alloy_primitives::Log]) -> 
             continue;
         }
         let topics = log.topics();
-        let is_token_ratio_updated = topics
-            .first()
-            .is_some_and(|t| U256::from_be_bytes(t.0) == TOKEN_RATIO_UPDATED_TOPIC) ||
-            (topics.len() == 2);
+        let is_token_ratio_updated =
+            topics.first().is_some_and(|t| U256::from_be_bytes(t.0) == TOKEN_RATIO_UPDATED_TOPIC);
         if is_token_ratio_updated && let Some(new_ratio) = topics.last() {
             let new_ratio_val = U256::from_be_bytes(new_ratio.0);
             if new_ratio_val <= U256::from(MAX_REASONABLE_TOKEN_RATIO) {
@@ -529,13 +527,56 @@ mod test {
     };
     use alloy_op_hardforks::{OP_MAINNET_ISTHMUS_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP};
     use alloy_primitives::{Address, B256, Bytes, Signature, U256, hex};
-    use mantle_reth_chainspec::MANTLE_MAINNET;
     use op_alloy_consensus::{OpTypedTransaction, SDMGasEntry, TxDeposit, build_post_exec_tx};
     use op_alloy_network::eip2718::Decodable2718;
     use reth_optimism_chainspec::OP_MAINNET;
     use reth_optimism_forks::OpHardforks;
     use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
     use reth_primitives_traits::{Recovered, SealedBlock};
+
+    /// Build a Mantle-compatible `OpChainSpec` for tests without importing `mantle-reth-chainspec`.
+    ///
+    /// All Mantle hardforks (Skadi, Limb, Arsia) and their bundled OP hardforks are activated
+    /// at timestamp 0, so every test block is post-Arsia.
+    fn mantle_test_chain_spec() -> std::sync::Arc<reth_optimism_chainspec::OpChainSpec> {
+        use alloy_hardforks::{ForkCondition, Hardfork};
+        use alloy_op_hardforks::{MantleHardfork, OpHardfork};
+        use reth_chainspec::{
+            BaseFeeParams, BaseFeeParamsKind, ChainHardforks, ChainSpec, EthereumHardfork,
+        };
+        use reth_optimism_chainspec::OpChainSpec;
+
+        let hardforks = ChainHardforks::new(vec![
+            (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Paris.boxed(), ForkCondition::Timestamp(0)),
+            (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(0)),
+            (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
+            (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Bedrock.boxed(), ForkCondition::Block(0)),
+            (OpHardfork::Regolith.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Ecotone.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Isthmus.boxed(), ForkCondition::Timestamp(0)),
+            (MantleHardfork::Skadi.boxed(), ForkCondition::Timestamp(0)),
+            (MantleHardfork::Limb.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Canyon.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Fjord.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Granite.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Holocene.boxed(), ForkCondition::Timestamp(0)),
+            (OpHardfork::Jovian.boxed(), ForkCondition::Timestamp(0)),
+            (MantleHardfork::Arsia.boxed(), ForkCondition::Timestamp(0)),
+        ]);
+
+        std::sync::Arc::new(OpChainSpec {
+            inner: ChainSpec {
+                chain: 5000u64.into(),
+                hardforks,
+                base_fee_params: BaseFeeParamsKind::Variable(
+                    vec![(MantleHardfork::Arsia.boxed(), BaseFeeParams::new(8, 2))].into(),
+                ),
+                ..Default::default()
+            },
+        })
+    }
 
     /// Construct an [`OpTransactionSigned`] deposit transaction with the given calldata.
     ///
@@ -759,10 +800,11 @@ mod test {
             reth_optimism_evm::extract_l1_info(&block.body).expect("should extract l1 info");
         l1_block_info.token_ratio = U256::from(MANTLE_BLOCK_95483648_TOKEN_RATIO);
 
-        assert!(MANTLE_MAINNET.is_mantle_arsia_active_at_timestamp(BLOCK_95483648_TIMESTAMP));
+        let mantle_spec = mantle_test_chain_spec();
+        assert!(mantle_spec.is_mantle_arsia_active_at_timestamp(BLOCK_95483648_TIMESTAMP));
 
         let receipt_meta = OpReceiptFieldsBuilder::new(BLOCK_95483648_TIMESTAMP, 95483648)
-            .l1_block_info(&*MANTLE_MAINNET, &tx_1, &mut l1_block_info)
+            .l1_block_info(&*mantle_spec, &tx_1, &mut l1_block_info)
             .expect("should parse revm l1 info")
             .build();
 
@@ -826,7 +868,7 @@ mod test {
         let converter = OpReceiptConverter::new(reth_storage_api::noop::NoopProvider::<
             _,
             OpPrimitives,
-        >::new(MANTLE_MAINNET.clone()))
+        >::new(mantle_test_chain_spec()))
         .with_sdm_enabled(true);
         let receipts =
             <OpReceiptConverter<_> as ReceiptConverter<OpPrimitives>>::convert_receipts_with_block(
@@ -867,8 +909,9 @@ mod test {
             ..Default::default()
         };
 
+        let mantle_spec = mantle_test_chain_spec();
         let receipt_meta = OpReceiptFieldsBuilder::new(BLOCK_95483648_TIMESTAMP, 95483648)
-            .l1_block_info(&*MANTLE_MAINNET, &tx_1, &mut l1_block_info)
+            .l1_block_info(&*mantle_spec, &tx_1, &mut l1_block_info)
             .expect("should parse revm l1 info")
             .build();
 
@@ -891,8 +934,9 @@ mod test {
             ..Default::default()
         };
 
+        let mantle_spec = mantle_test_chain_spec();
         let receipt_meta = OpReceiptFieldsBuilder::new(BLOCK_95483648_TIMESTAMP, 95483648)
-            .l1_block_info(&*MANTLE_MAINNET, &tx_1, &mut l1_block_info)
+            .l1_block_info(&*mantle_spec, &tx_1, &mut l1_block_info)
             .expect("should parse revm l1 info")
             .build();
 
@@ -1043,5 +1087,67 @@ mod test {
         .unwrap();
 
         assert_eq!(op_receipt.core_receipt.blob_gas_used, None);
+    }
+
+    #[test]
+    fn token_ratio_after_logs_ignores_non_token_ratio_2topic_event() {
+        let fake_event_sig = B256::from(U256::from(0xdeadbeefu64).to_be_bytes::<32>());
+        let fake_value = B256::from(U256::from(42u64).to_be_bytes::<32>());
+        let log = alloy_primitives::Log::new_unchecked(
+            GAS_ORACLE_CONTRACT,
+            vec![fake_event_sig, fake_value],
+            Bytes::new(),
+        );
+
+        let initial = U256::from(1_000_000);
+        let result = token_ratio_after_logs(initial, &[log]);
+        assert_eq!(result, initial, "non-TokenRatioUpdated 2-topic log must not change ratio");
+    }
+
+    #[test]
+    fn token_ratio_after_logs_accepts_real_event() {
+        let topic0 = B256::from(TOKEN_RATIO_UPDATED_TOPIC.to_be_bytes::<32>());
+        let prev = B256::from(U256::from(1_000_000u64).to_be_bytes::<32>());
+        let new_val = B256::from(U256::from(500_000u64).to_be_bytes::<32>());
+        let log = alloy_primitives::Log::new_unchecked(
+            GAS_ORACLE_CONTRACT,
+            vec![topic0, prev, new_val],
+            Bytes::new(),
+        );
+
+        let result = token_ratio_after_logs(U256::from(1_000_000), &[log]);
+        assert_eq!(result, U256::from(500_000));
+    }
+
+    #[test]
+    fn token_ratio_after_logs_ignores_unreasonable_ratio() {
+        let topic0 = B256::from(TOKEN_RATIO_UPDATED_TOPIC.to_be_bytes::<32>());
+        let prev = B256::ZERO;
+        let huge = B256::from(U256::from(MAX_REASONABLE_TOKEN_RATIO + 1).to_be_bytes::<32>());
+        let log = alloy_primitives::Log::new_unchecked(
+            GAS_ORACLE_CONTRACT,
+            vec![topic0, prev, huge],
+            Bytes::new(),
+        );
+
+        let initial = U256::from(1_000_000);
+        let result = token_ratio_after_logs(initial, &[log]);
+        assert_eq!(result, initial, "unreasonable ratio should be ignored");
+    }
+
+    #[test]
+    fn token_ratio_after_logs_ignores_other_contract() {
+        let topic0 = B256::from(TOKEN_RATIO_UPDATED_TOPIC.to_be_bytes::<32>());
+        let prev = B256::ZERO;
+        let new_val = B256::from(U256::from(500_000u64).to_be_bytes::<32>());
+        let log = alloy_primitives::Log::new_unchecked(
+            Address::ZERO,
+            vec![topic0, prev, new_val],
+            Bytes::new(),
+        );
+
+        let initial = U256::from(1_000_000);
+        let result = token_ratio_after_logs(initial, &[log]);
+        assert_eq!(result, initial, "events from other contracts should be ignored");
     }
 }

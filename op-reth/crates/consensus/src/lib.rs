@@ -896,4 +896,58 @@ mod tests {
             "Non-Mantle should use pre-computed root and detect mismatch"
         );
     }
+
+    #[test]
+    fn mantle_skadi_without_arsia_strips_deposit_fields() {
+        use crate::proof::calculate_receipt_root_no_memo_optimism;
+        use alloy_hardforks::ForkCondition;
+        use alloy_op_hardforks::{MantleHardfork, OpHardfork};
+        use op_alloy_consensus::OpDepositReceipt;
+        use reth_chainspec::{ChainHardforks, ChainSpec, EthereumHardfork, Hardfork as _};
+        use reth_optimism_chainspec::OpChainSpec;
+        use reth_optimism_forks::OpHardforks;
+
+        let skadi_only_spec = std::sync::Arc::new(OpChainSpec {
+            inner: ChainSpec {
+                chain: 5000u64.into(),
+                hardforks: ChainHardforks::new(vec![
+                    (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
+                    (OpHardfork::Bedrock.boxed(), ForkCondition::Block(0)),
+                    (OpHardfork::Regolith.boxed(), ForkCondition::Timestamp(0)),
+                    (OpHardfork::Ecotone.boxed(), ForkCondition::Timestamp(0)),
+                    (MantleHardfork::Skadi.boxed(), ForkCondition::Timestamp(0)),
+                    // Canyon and Arsia NOT activated
+                ]),
+                ..Default::default()
+            },
+        });
+
+        assert!(skadi_only_spec.is_mantle());
+        assert!(!skadi_only_spec.is_canyon_active_at_timestamp(1));
+        assert!(!skadi_only_spec.is_mantle_arsia_active_at_timestamp(1));
+
+        let deposit_receipt = OpReceipt::Deposit(OpDepositReceipt {
+            inner: Receipt {
+                status: Eip658Value::success(),
+                cumulative_gas_used: 21000,
+                logs: vec![],
+            },
+            deposit_nonce: Some(42),
+            deposit_receipt_version: Some(1),
+        });
+
+        let unstripped_root =
+            proofs::calculate_receipt_root(std::slice::from_ref(&deposit_receipt.with_bloom_ref()));
+
+        let mantle_root = calculate_receipt_root_no_memo_optimism(
+            std::slice::from_ref(&deposit_receipt),
+            skadi_only_spec.as_ref(),
+            1,
+        );
+
+        assert_ne!(
+            unstripped_root, mantle_root,
+            "Skadi-only (no Canyon/Arsia) should still strip deposit fields"
+        );
+    }
 }

@@ -255,8 +255,17 @@ impl EthChainSpec for OpChainSpec {
         self.inner.base_fee_params_at_timestamp(timestamp)
     }
 
-    fn blob_params_at_timestamp(&self, timestamp: u64) -> Option<BlobParams> {
-        self.inner.blob_params_at_timestamp(timestamp)
+    fn blob_params_at_timestamp(&self, _timestamp: u64) -> Option<BlobParams> {
+        // [MANTLE] Upstream op-reth inherits BlobParams::cancun() from the inner ChainSpec
+        // when Cancun is active, but geth enforces BlobScheduleConfig=nil for all OP-Stack
+        // chains (MaxBlobGasPerBlock=0). Post-Jovian the header `blob_gas_used` field is
+        // repurposed for DA footprint, so a non-zero max_blob_gas produces incorrect
+        // blobGasUsedRatio in eth_feeHistory. Override to max_blob_count=0 to match geth.
+        Some(BlobParams {
+            max_blob_count: 0,
+            target_blob_count: 0,
+            ..BlobParams::cancun()
+        })
     }
 
     fn deposit_contract(&self) -> Option<&DepositContract> {
@@ -310,6 +319,11 @@ impl EthChainSpec for OpChainSpec {
     }
 
     fn next_block_base_fee(&self, parent: &Header, target_timestamp: u64) -> Option<u64> {
+        // [MANTLE] Pre-Arsia: basefee is frozen (inherited from parent, no EIP-1559 adjustment).
+        // Mirrors geth CalcBaseFee: `IsMantleBaseFee && !IsMantleArsia => return parent.BaseFee`.
+        if self.is_mantle() && !self.is_mantle_arsia_active_at_timestamp(parent.timestamp()) {
+            return parent.base_fee_per_gas();
+        }
         if self.is_jovian_active_at_timestamp(parent.timestamp()) {
             compute_jovian_base_fee(self, parent, target_timestamp).ok()
         } else if self.is_holocene_active_at_timestamp(parent.timestamp()) {

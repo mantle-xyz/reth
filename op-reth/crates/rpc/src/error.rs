@@ -80,6 +80,16 @@ pub enum OpInvalidTransactionError {
     /// The encoded transaction was missing during evm execution.
     #[error("missing enveloped transaction bytes")]
     MissingEnvelopedTx,
+    /// [MANTLE] BVM ETH transfer value exceeds sender's `BVM_ETH` balance.
+    /// Aligned with op-geth `ErrEthTxValueTooLarge`.
+    #[error("eth tx value is too large")]
+    BvmEthValueTooLarge,
+    /// [MANTLE] BVM ETH operation error (nonce overflow, DB error, etc.).
+    #[error("BVM ETH error: {0}")]
+    BvmEthError(String),
+    /// [MANTLE] L1 cost cannot be represented in u64 gas arithmetic.
+    #[error("tx l1 cost is out of range for u64 gas arithmetic")]
+    TxL1CostOutOfRange,
     /// Transaction conditional errors.
     #[error(transparent)]
     TxConditionalErr(#[from] TxConditionalErr),
@@ -90,7 +100,10 @@ impl From<OpInvalidTransactionError> for jsonrpsee_types::error::ErrorObject<'st
         match err {
             OpInvalidTransactionError::DepositSystemTxPostRegolith |
             OpInvalidTransactionError::HaltedDepositPostRegolith |
-            OpInvalidTransactionError::MissingEnvelopedTx => {
+            OpInvalidTransactionError::MissingEnvelopedTx |
+            OpInvalidTransactionError::BvmEthValueTooLarge |
+            OpInvalidTransactionError::BvmEthError(_) |
+            OpInvalidTransactionError::TxL1CostOutOfRange => {
                 rpc_err(EthRpcErrorCode::TransactionRejected.code(), err.to_string(), None)
             }
             OpInvalidTransactionError::TxConditionalErr(_) => err.into(),
@@ -110,12 +123,17 @@ impl TryFrom<OpTxError> for OpInvalidTransactionError {
             OpTransactionError::HaltedDepositPostRegolith => Ok(Self::HaltedDepositPostRegolith),
             OpTransactionError::MissingEnvelopedTx => Ok(Self::MissingEnvelopedTx),
             OpTransactionError::Base(err) => Err(err),
-            // [MANTLE] BvmEth fee model errors and L1 cost overflow from op-revm.
-            // These map to HaltedDepositPostRegolith as a catch-all invalid tx error
-            // since they don't have direct upstream equivalents.
-            OpTransactionError::BvmEth(_) | OpTransactionError::TxL1CostOutOfRange => {
-                Ok(Self::HaltedDepositPostRegolith)
+            // [MANTLE] Map BvmEth variants to specific error types aligned with op-geth.
+            OpTransactionError::BvmEth(bvm_err) => {
+                use op_revm::transaction::error::BvmEthError;
+                match bvm_err {
+                    BvmEthError::InsufficientFunds | BvmEthError::EthTxValueTooLarge => {
+                        Ok(Self::BvmEthValueTooLarge)
+                    }
+                    other => Ok(Self::BvmEthError(other.to_string())),
+                }
             }
+            OpTransactionError::TxL1CostOutOfRange => Ok(Self::TxL1CostOutOfRange),
         }
     }
 }

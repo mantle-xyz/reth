@@ -100,7 +100,8 @@ strum.workspace = true
 
 [dev-dependencies]
 reth-optimism-chainspec.workspace = true
-mantle-reth-chainspec.workspace = true
+reth-chainspec.workspace = true
+alloy-hardforks.workspace = true
 alloy-op-hardforks.workspace = true
 
 [features]

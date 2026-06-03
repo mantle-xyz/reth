@@ -32,14 +32,12 @@ where
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
             // [MANTLE] Pre-check: value transfer (geth state_transition.go clause 6).
-            // geth checks `!value.IsZero() && !CanTransfer(from, value)` BEFORE EVM execution
-            // and returns a specific error. Without this, reth returns generic "OutOfFunds".
+            // geth uses target block state (StateAndHeaderByNumberOrHash), not parent state.
             if let Some(from) = request.as_ref().from {
                 let value = request.as_ref().value.unwrap_or(U256::ZERO);
                 if !value.is_zero() &&
                     let Ok(Some(block)) = self.provider().block_by_id(at) &&
-                    let Ok(state) =
-                        self.provider().state_by_block_hash(block.header().parent_hash())
+                    let Ok(state) = self.provider().state_by_block_id(at)
                 {
                     let balance = state.account_balance(&from).ok().flatten().unwrap_or(U256::ZERO);
                     if value > balance {
@@ -56,6 +54,7 @@ where
                 EstimateCall::estimate_gas_at(self, request.clone(), at, state_override).await?;
 
             // [MANTLE] Post-estimation Arsia balance check (op-geth v1.5.5 mantleArsiaCheckFunds)
+            // geth uses target block state (opts.State from StateAndHeaderByNumberOrHash).
             let chain_spec = self.provider().chain_spec();
             if chain_spec.is_mantle() &&
                 let Ok(Some(block)) = self.provider().block_by_id(at) &&
@@ -69,8 +68,7 @@ where
                 );
                 if !fee_cap.is_zero() &&
                     let Ok(mut l1_block_info) = extract_l1_info(block.body()) &&
-                    let Ok(state) =
-                        self.provider().state_by_block_hash(block.header().parent_hash()) &&
+                    let Ok(state) = self.provider().state_by_block_id(at) &&
                     let Some(from) = request.as_ref().from
                 {
                     if let Ok(Some(ratio)) = state.storage(

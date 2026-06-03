@@ -65,6 +65,8 @@ pub fn parse_l1_info(input: &[u8]) -> Result<L1BlockInfo, OpBlockExecutionError>
     // - Isthmus
     // - Ecotone
     // - Bedrock
+    // Arsia shares the same calldata layout as Jovian (174 bytes after the 4-byte selector).
+    // Only the function selector differs: Jovian=0x3db6be2b, Arsia=0x49e72383.
     if input[0..4] == L1_BLOCK_JOVIAN_SELECTOR || input[0..4] == L1_BLOCK_ARSIA_SELECTOR {
         parse_l1_info_tx_jovian(input[4..].as_ref())
     } else if input[0..4] == L1_BLOCK_ISTHMUS_SELECTOR {

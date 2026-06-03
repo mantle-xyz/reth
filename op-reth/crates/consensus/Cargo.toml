@@ -40,12 +40,15 @@ reth-optimism-chainspec.workspace = true
 
 [dev-dependencies]
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-chainspec.workspace = true
 reth-db-common.workspace = true
 reth-revm.workspace = true
 reth-trie.workspace = true
 reth-optimism-node.workspace = true
 
 alloy-chains.workspace = true
+alloy-hardforks.workspace = true
+alloy-op-hardforks.workspace = true
 
 op-alloy-consensus.workspace = true
 mantle-reth-chainspec.workspace = true

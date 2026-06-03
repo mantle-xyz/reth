@@ -208,10 +208,15 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
         },
     ));
 
-    // Mantle time-based hardfork layout:
-    // - L1 forks (Shanghai, Cancun, Prague) + Ecotone + Isthmus → Skadi timestamp
-    // - Limb → Limb timestamp
-    // - OP forks (Canyon, Fjord, Granite, Holocene, Jovian) → Arsia timestamp
+    // Mantle time-based hardfork layout (differs from standard OP Stack ordering):
+    //
+    // Standard OP: Regolith → Canyon → Ecotone → Fjord → Granite → Holocene → Jovian
+    // Mantle:      Regolith → Skadi (Ecotone+Isthmus+L1 forks) → Limb → Arsia
+    // (Canyon+Fjord+...+Jovian)
+    //
+    // Canyon is delayed to the Arsia timestamp rather than activated with Ecotone at Skadi.
+    // This is a Mantle contract-layer design decision: Skadi activates Ecotone-level L1 data
+    // cost model, while Canyon's corrections ship together with Arsia.
     let time_hardfork_opts: Vec<(alloc::boxed::Box<dyn Hardfork>, Option<u64>)> = vec![
         (OpHardfork::Regolith.boxed(), op_genesis_info.regolith_time),
         // Mantle Skadi

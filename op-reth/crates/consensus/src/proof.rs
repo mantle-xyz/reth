@@ -22,6 +22,11 @@ pub(crate) fn calculate_receipt_root_optimism<R: DepositReceipt>(
     //
     // [MANTLE] Mantle always strips deposit_nonce and deposit_receipt_version from deposit
     // receipts before computing the trie root, regardless of hardfork stage.
+    // This is necessary because Mantle delays Canyon activation to the Arsia timestamp
+    // (while Ecotone is already active at Skadi). After Arsia, the upstream condition
+    // `is_regolith && !is_canyon` becomes false and would stop stripping — but Mantle's
+    // receipt encoding still requires it. Unconditional strip is safe: for pre-Regolith
+    // blocks the fields are already None (no-op).
     let is_mantle = chain_spec.is_mantle();
     let should_strip = if is_mantle {
         true

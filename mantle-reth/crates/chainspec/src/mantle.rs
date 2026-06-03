@@ -91,6 +91,9 @@ pub(crate) fn configure_mantle_genesis(
     genesis.config.terminal_total_difficulty = Some(U256::ZERO);
     genesis.config.terminal_total_difficulty_passed = true;
 
+    // These EIP-1559 params are used as defaults by the Arsia payload builder when
+    // PayloadAttributes does not specify overrides. Pre-Arsia, basefee is inherited from
+    // the parent block directly (see CalcBaseFee in op-geth eip1559.go:67-68).
     let mut extra_fields = serde_json::Map::from_iter([
         ("bedrockBlock".to_owned(), serde_json::json!(0)),
         ("regolithTime".to_owned(), serde_json::json!(0)),
