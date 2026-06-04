@@ -22,6 +22,11 @@ name = "replay"
 path = "tests/replay.rs"
 harness = true
 
+[[test]]
+name = "token_ratio_midblock"
+path = "tests/token_ratio_midblock.rs"
+harness = true
+
 [dependencies]
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }

@@ -19,7 +19,7 @@ use std::any::Any;
 
 /// Legacy Mantle `MetaTx` transactions are permanently disabled since `MantleEverest`.
 #[derive(thiserror::Error, Debug)]
-#[error("Mantle MetaTx transactions are permanently disabled")]
+#[error("meta tx is disabled")]
 pub struct MetaTxDisabled;
 
 impl reth_transaction_pool::error::PoolTransactionError for MetaTxDisabled {
@@ -34,7 +34,7 @@ impl reth_transaction_pool::error::PoolTransactionError for MetaTxDisabled {
 
 /// EIP-155 unprotected transactions (missing `chain_id`) are rejected on Mantle.
 #[derive(thiserror::Error, Debug)]
-#[error("EIP-155 unprotected transactions are not allowed on Mantle")]
+#[error("only replay-protected (EIP-155) transactions allowed over RPC")]
 pub struct UnprotectedTxDisabled;
 
 impl reth_transaction_pool::error::PoolTransactionError for UnprotectedTxDisabled {
