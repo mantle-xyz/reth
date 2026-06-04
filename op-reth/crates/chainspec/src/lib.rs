@@ -261,11 +261,7 @@ impl EthChainSpec for OpChainSpec {
         // chains (MaxBlobGasPerBlock=0). Post-Jovian the header `blob_gas_used` field is
         // repurposed for DA footprint, so a non-zero max_blob_gas produces incorrect
         // blobGasUsedRatio in eth_feeHistory. Override to max_blob_count=0 to match geth.
-        Some(BlobParams {
-            max_blob_count: 0,
-            target_blob_count: 0,
-            ..BlobParams::cancun()
-        })
+        Some(BlobParams { max_blob_count: 0, target_blob_count: 0, ..BlobParams::cancun() })
     }
 
     fn deposit_contract(&self) -> Option<&DepositContract> {

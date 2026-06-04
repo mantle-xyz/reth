@@ -17,6 +17,11 @@ name = "it"
 path = "tests/main.rs"
 harness = true
 
+[[test]]
+name = "replay"
+path = "tests/replay.rs"
+harness = true
+
 [dependencies]
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }
@@ -48,6 +53,10 @@ alloy-rpc-types-engine = { workspace = true }
 alloy-network = { workspace = true }
 alloy-op-hardforks = { workspace = true }
 op-alloy-rpc-types-engine = { workspace = true }
+
+# revm / op-revm (for replay tests)
+revm = { workspace = true, features = ["std"] }
+op-revm = { workspace = true, features = ["std"] }
 
 # misc
 tokio = { workspace = true, features = ["full"] }

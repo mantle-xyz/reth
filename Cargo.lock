@@ -5189,6 +5189,7 @@ dependencies = [
  "mantle-reth-eth-api",
  "mantle-reth-rpc-ext",
  "op-alloy-rpc-types-engine",
+ "op-revm",
  "reth-chainspec",
  "reth-db",
  "reth-e2e-test-utils",
@@ -5201,6 +5202,7 @@ dependencies = [
  "reth-rpc-api",
  "reth-tasks",
  "reth-tracing",
+ "revm",
  "serde_json",
  "tokio",
 ]
