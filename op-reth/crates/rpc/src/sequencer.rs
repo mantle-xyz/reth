@@ -169,6 +169,31 @@ impl SequencerClient {
         Ok(tx_hash)
     }
 
+    /// Forwards a raw transaction to the sequencer and returns a preconfirmation event as a raw
+    /// JSON value.
+    ///
+    /// The caller is responsible for deserializing the returned value into the appropriate type
+    /// (e.g. `mantle_reth_rpc_ext::PreconfTxEvent`).
+    pub async fn forward_raw_transaction_with_preconf(
+        &self,
+        tx: &[u8],
+    ) -> Result<serde_json::Value, SequencerClientError> {
+        let start = Instant::now();
+        let rlp_hex = hex::encode_prefixed(tx);
+        let preconf_event: serde_json::Value = self
+            .request("eth_sendRawTransactionWithPreconf", (rlp_hex,))
+            .await
+            .inspect_err(|err| {
+                warn!(
+                    target: "rpc::eth",
+                    %err,
+                    "Failed to forward transaction with preconf to sequencer",
+                );
+            })?;
+        self.metrics().record_forward_latency(start.elapsed());
+        Ok(preconf_event)
+    }
+
     /// Forwards a transaction conditional to the sequencer endpoint.
     pub async fn forward_raw_transaction_conditional(
         &self,

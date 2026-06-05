@@ -319,7 +319,8 @@ where
         let timestamp = payload.payload.timestamp();
         let block_number = payload.payload.block_number();
 
-        let spec = revm_spec_by_timestamp_after_bedrock(self.chain_spec(), timestamp);
+        let spec =
+            alloy_op_evm::spec_by_timestamp_after_bedrock(self.chain_spec().as_ref(), timestamp);
 
         let cfg_env = CfgEnv::new()
             .with_chain_id(self.chain_spec().chain().id())

@@ -252,11 +252,11 @@ where
 
 /// Validates the presence of the `withdrawals` field according to the payload timestamp.
 ///
-/// After Canyon, withdrawals field must be [Some].
-/// Before Canyon, withdrawals field must be [None];
+/// After Shanghai, withdrawals field must be [Some].
+/// Before Shanghai, withdrawals field must be [None].
 ///
-/// Canyon activates the Shanghai EIPs, see the Canyon specs for more details:
-/// <https://github.com/ethereum-optimism/optimism/blob/ab926c5fd1e55b5c864341c44842d6d1ca679d99/specs/superchain-upgrades.md#canyon>
+/// On standard OP Stack chains, Shanghai activates with Canyon.
+/// On Mantle, Shanghai activates with Skadi (before Canyon/Arsia).
 pub fn validate_withdrawals_presence(
     chain_spec: impl OpHardforks,
     version: EngineApiMessageVersion,
@@ -264,7 +264,7 @@ pub fn validate_withdrawals_presence(
     timestamp: u64,
     has_withdrawals: bool,
 ) -> Result<(), EngineObjectValidationError> {
-    let is_shanghai = chain_spec.is_canyon_active_at_timestamp(timestamp);
+    let is_shanghai = chain_spec.is_shanghai_active_at_timestamp(timestamp);
 
     match version {
         EngineApiMessageVersion::V1 => {

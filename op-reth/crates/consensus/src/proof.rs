@@ -19,15 +19,32 @@ pub(crate) fn calculate_receipt_root_optimism<R: DepositReceipt>(
     // encoding. In the Regolith Hardfork, we must strip the deposit nonce from the
     // receipts before calculating the receipt root. This was corrected in the Canyon
     // hardfork.
-    if chain_spec.is_regolith_active_at_timestamp(timestamp) &&
-        !chain_spec.is_canyon_active_at_timestamp(timestamp)
-    {
+    //
+    // [MANTLE] Mantle always strips deposit_nonce and deposit_receipt_version from deposit
+    // receipts before computing the trie root, regardless of hardfork stage.
+    // This is necessary because Mantle delays Canyon activation to the Arsia timestamp
+    // (while Ecotone is already active at Skadi). After Arsia, the upstream condition
+    // `is_regolith && !is_canyon` becomes false and would stop stripping — but Mantle's
+    // receipt encoding still requires it. Unconditional strip is safe: for pre-Regolith
+    // blocks the fields are already None (no-op).
+    let is_mantle = chain_spec.is_mantle();
+    let should_strip = if is_mantle {
+        true
+    } else {
+        chain_spec.is_regolith_active_at_timestamp(timestamp) &&
+            !chain_spec.is_canyon_active_at_timestamp(timestamp)
+    };
+
+    if should_strip {
         let receipts = receipts
             .iter()
             .map(|receipt| {
                 let mut receipt = receipt.clone().map_receipt(|r| r.clone());
                 if let Some(receipt) = receipt.receipt.as_deposit_receipt_mut() {
                     receipt.deposit_nonce = None;
+                    if is_mantle {
+                        receipt.deposit_receipt_version = None;
+                    }
                 }
                 receipt
             })
@@ -47,20 +64,24 @@ pub fn calculate_receipt_root_no_memo_optimism<R: DepositReceipt>(
     chain_spec: impl OpHardforks,
     timestamp: u64,
 ) -> B256 {
-    // There is a minor bug in op-geth and op-erigon where in the Regolith hardfork,
-    // the receipt root calculation does not include the deposit nonce in the receipt
-    // encoding. In the Regolith Hardfork, we must strip the deposit nonce from the
-    // receipts before calculating the receipt root. This was corrected in the Canyon
-    // hardfork.
-    if chain_spec.is_regolith_active_at_timestamp(timestamp) &&
-        !chain_spec.is_canyon_active_at_timestamp(timestamp)
-    {
+    let is_mantle = chain_spec.is_mantle();
+    let should_strip = if is_mantle {
+        true
+    } else {
+        chain_spec.is_regolith_active_at_timestamp(timestamp) &&
+            !chain_spec.is_canyon_active_at_timestamp(timestamp)
+    };
+
+    if should_strip {
         let receipts = receipts
             .iter()
             .map(|r| {
                 let mut r = (*r).clone();
                 if let Some(receipt) = r.as_deposit_receipt_mut() {
                     receipt.deposit_nonce = None;
+                    if is_mantle {
+                        receipt.deposit_receipt_version = None;
+                    }
                 }
                 r
             })

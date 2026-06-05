@@ -147,6 +147,17 @@ where
             *self.block_info.l1_block_info.write() = l1_block_info;
         }
 
+        // [MANTLE] token_ratio is not in L1 info calldata; read from GAS_ORACLE_CONTRACT state.
+        if self.chain_spec().is_mantle() &&
+            let Ok(state) = self.client().latest() &&
+            let Ok(Some(ratio)) = state.storage(
+                op_revm::constants::GAS_ORACLE_CONTRACT,
+                op_revm::constants::TOKEN_RATIO_SLOT.into(),
+            )
+        {
+            self.block_info.l1_block_info.write().token_ratio = ratio;
+        }
+
         if self.chain_spec().is_interop_active_at_timestamp(header.timestamp()) {
             self.fork_tracker.interop.store(true, Ordering::Relaxed);
         }

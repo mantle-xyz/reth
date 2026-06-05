@@ -47,22 +47,18 @@ members = [
   "op-reth/crates/trie/",
   "op-reth/crates/txpool/",
 
-  # Mantle-Reth (trait override layer, new)
-  # Uncomment as crates are created:
-  # "mantle-reth/crates/eth-api/",
-  # "mantle-reth/crates/chainspec/",
-  # "mantle-reth/crates/consensus/",
-  # "mantle-reth/crates/validator/",
-  # "mantle-reth/crates/rpc-ext/",
-  # "mantle-reth/crates/cli/",
-  # "mantle-reth/crates/exex/",
-  # "mantle-reth/crates/hardforks/",
+  # Mantle-Reth
+  "mantle-reth/crates/cli/",
+  "mantle-reth/crates/chainspec/",
+  "mantle-reth/crates/rpc-ext/",
+  "mantle-reth/crates/eth-api/",
+  "mantle-reth/crates/integration-tests/",
 
   # Optimism ecosystem crates (from mantlenetworkio/mantle-v2, git dependency)
   # (no longer workspace members — referenced via git dep)
 ]
 default-members = [
-  "op-reth/bin/",
+  "mantle-reth/crates/cli/",
 ]
 
 # ==================== WORKSPACE LINTS ====================
@@ -133,6 +129,12 @@ reth-optimism-storage = { path = "op-reth/crates/storage/" }
 reth-optimism-exex = { path = "op-reth/crates/exex/" }
 reth-optimism-trie = { path = "op-reth/crates/trie/" }
 reth-optimism-txpool = { path = "op-reth/crates/txpool/" }
+
+# ==================== MANTLE-RETH INTERNAL CRATES ====================
+mantle-reth-chainspec = { path = "mantle-reth/crates/chainspec/", default-features = false }
+mantle-reth-rpc-ext = { path = "mantle-reth/crates/rpc-ext/" }
+mantle-reth-cli = { path = "mantle-reth/crates/cli/" }
+mantle-reth-eth-api = { path = "mantle-reth/crates/eth-api/" }
 
 # ==================== RETH CRATES (crates.io published) ====================
 reth-codecs = { version = "0.3.1", default-features = false, features = ["alloy"] }
@@ -397,8 +399,8 @@ url = "2.5"
 
 # ==================== [patch] — reth core minimal patches ====================
 # Uncomment when patches/ crates are populated:
-# [patch."https://github.com/paradigmxyz/reth"]
-# reth-trie-common = { path = "patches/reth-trie-common" }
+[patch."https://github.com/paradigmxyz/reth"]
+reth-trie-common = { path = "patches/reth-trie-common" }
 # reth-rpc = { path = "patches/reth-rpc" }
 # reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 

@@ -43,6 +43,9 @@ reth-optimism-primitives = { workspace = true, features = ["reth-codec", "serde-
 reth-optimism-forks.workspace = true
 reth-optimism-trie.workspace = true
 
+# mantle-reth
+mantle-reth-eth-api.workspace = true
+
 # ethereum
 alloy-eips.workspace = true
 alloy-json-rpc.workspace = true
@@ -85,6 +88,8 @@ eyre.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 derive_more = { workspace = true, features = ["constructor"] }
+parking_lot.workspace = true
+schnellru.workspace = true
 
 # metrics
 reth-metrics.workspace = true
@@ -95,6 +100,8 @@ strum.workspace = true
 
 [dev-dependencies]
 reth-optimism-chainspec.workspace = true
+reth-chainspec.workspace = true
+alloy-hardforks.workspace = true
 alloy-op-hardforks.workspace = true
 
 [features]

@@ -24,23 +24,23 @@ default:
 
 # Build op-reth binary (release)
 build:
-  cargo build --bin op-reth --features "{{FEATURES}}" --profile "{{PROFILE}}"
+  cargo build -p mantle-reth-cli --bin op-reth --features "{{FEATURES}}" --profile "{{PROFILE}}"
 
 # Build op-reth binary (debug, with Mantle state-export feature)
 build-debug:
-  cargo build --bin op-reth --features "{{MANTLE_DEBUG_FEATURES}}"
+  cargo build -p mantle-reth-cli --bin op-reth --features "{{MANTLE_DEBUG_FEATURES}}"
 
 # Build op-reth with maximum performance optimisations
 build-maxperf:
-  RUSTFLAGS="-C target-cpu=native" cargo build --profile maxperf --features "jemalloc asm-keccak" --bin op-reth
+  RUSTFLAGS="-C target-cpu=native" cargo build -p mantle-reth-cli --profile maxperf --features "jemalloc asm-keccak" --bin op-reth
 
 # Build op-reth with profiling symbols
 build-profiling:
-  RUSTFLAGS="-C target-cpu=native" cargo build --profile profiling --features "jemalloc asm-keccak" --bin op-reth
+  RUSTFLAGS="-C target-cpu=native" cargo build -p mantle-reth-cli --profile profiling --features "jemalloc asm-keccak" --bin op-reth
 
 # Build and install op-reth to $CARGO_HOME/bin
 install:
-  cargo install --path op-reth/bin --bin op-reth --force --locked \
+  cargo install --path mantle-reth/crates/cli --bin op-reth --force --locked \
     --features "{{FEATURES}}" \
     --profile "{{PROFILE}}"
 
@@ -48,7 +48,7 @@ install:
 
 # Build op-reth natively for a specific target
 build-native target:
-  cargo build --bin op-reth --target {{target}} --features "{{FEATURES}}" --profile "{{PROFILE}}"
+  cargo build -p mantle-reth-cli --bin op-reth --target {{target}} --features "{{FEATURES}}" --profile "{{PROFILE}}"
 
 # Cross-compile op-reth for a specific target (requires `cross` and Docker)
 build-cross target:
@@ -64,7 +64,7 @@ build-cross target:
   fi
   env "${env_args[@]}" \
     RUSTFLAGS="-C link-arg=-lgcc -Clink-arg=-static-libgcc" \
-    cross build --bin op-reth --target {{target}} --features "$features" --profile "{{PROFILE}}"
+    cross build -p mantle-reth-cli --bin op-reth --target {{target}} --features "$features" --profile "{{PROFILE}}"
 
 # Shorthand targets
 build-x86_64-unknown-linux-gnu: (build-cross "x86_64-unknown-linux-gnu")

@@ -1,0 +1,70 @@
+[package]
+name = "mantle-reth-integration-tests"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Integration tests for Mantle op-reth node"
+autobenches = false
+autotests = false
+
+[lints]
+workspace = true
+
+[[test]]
+name = "it"
+path = "tests/main.rs"
+harness = true
+
+[[test]]
+name = "replay"
+path = "tests/replay.rs"
+harness = true
+
+[[test]]
+name = "token_ratio_midblock"
+path = "tests/token_ratio_midblock.rs"
+harness = true
+
+[dependencies]
+# mantle-reth
+mantle-reth-chainspec = { workspace = true }
+mantle-reth-cli = { workspace = true }
+mantle-reth-eth-api = { workspace = true }
+mantle-reth-rpc-ext = { workspace = true }
+
+# op-reth
+reth-optimism-chainspec = { workspace = true }
+reth-optimism-node = { workspace = true, features = ["test-utils"] }
+reth-optimism-rpc = { workspace = true }
+
+# reth
+reth-e2e-test-utils = { workspace = true }
+reth-node-builder = { workspace = true, features = ["test-utils"] }
+reth-node-core = { workspace = true }
+reth-db = { workspace = true, features = ["test-utils"] }
+reth-provider = { workspace = true }
+reth-tasks = { workspace = true }
+reth-rpc-api = { workspace = true }
+reth-chainspec = { workspace = true }
+reth-tracing = { workspace = true }
+
+# alloy
+alloy-genesis = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-rpc-types-engine = { workspace = true }
+alloy-network = { workspace = true }
+alloy-op-hardforks = { workspace = true }
+op-alloy-rpc-types-engine = { workspace = true }
+
+# revm / op-revm (for replay tests)
+revm = { workspace = true, features = ["std"] }
+op-revm = { workspace = true, features = ["std"] }
+
+# misc
+tokio = { workspace = true, features = ["full"] }
+eyre = { workspace = true }
+serde_json = { workspace = true }
+jsonrpsee = { workspace = true, features = ["http-client"] }

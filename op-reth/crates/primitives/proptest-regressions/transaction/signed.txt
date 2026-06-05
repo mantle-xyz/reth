@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0eeac56c2c85d6e824e9baddb53d1b3c765a8ee22ae3f53f4badc24b7c7d5c59 # shrinks to reth_tx = OpTransactionSigned { hash: OnceLock(<uninit>), signature: Signature { y_parity: false, r: 0, s: 0 }, transaction: Deposit(TxDeposit { source_hash: 0xca653845f1b0129954ec71e8c6aac79c34a6e65584e7ee52c04a21b09599f270, from: 0xa9c1898402ad3fa82c2becfcb8381ceee96af836, to: Call(0x619bc9dbfd984249f2450d1fe5fbbae1360211b7), mint: 270440229635327186803334504024887806222, value: 44674486719888755959121519743347180425047679417413344221912732119720700097083, gas_limit: 11062921570479345672, is_system_transaction: false, eth_value: 113, input: 0x, eth_tx_value: None }) }
+cc 912fc6bc8eb959ae2ff91575fec4d735254f4520bcf156c0ed29659e4e251e75 # shrinks to mut reth_tx = OpTransactionSigned { hash: OnceLock(<uninit>), signature: Signature { y_parity: false, r: 0, s: 0 }, transaction: Deposit(TxDeposit { source_hash: 0x645a7d2c97590ee637d0ade5732eceab1160985b22e4680b2049fe1c967cc414, from: 0xe9ed62a114d5621218b000f78ba76ade1609eaee, to: Create, mint: 105398686497389160419725666442599380812, value: 82672993716421821746463066704751164973209286283944600310357774501845898920624, gas_limit: 11391793447515273603, is_system_transaction: true, eth_value: 211, input: 0x, eth_tx_value: None }) }
