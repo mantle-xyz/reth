@@ -65,6 +65,9 @@ build-cross target:
   if [[ "{{target}}" == "x86_64-pc-windows-gnu" ]]; then
     features=$(echo "$features" | sed 's/jemalloc-prof//g; s/jemalloc//g' | xargs)
   fi
+  # Ubuntu 24.04 clang lacks stdarg.h in resource-dir; point bindgen at gcc's copy.
+  # BINDGEN_EXTRA_CLANG_ARGS is passed through to the cross container via Cross.toml.
+  export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:--I/usr/lib/gcc/x86_64-linux-gnu/13/include}"
   env "${env_args[@]}" \
     RUSTFLAGS="-C link-arg=-lgcc -Clink-arg=-static-libgcc" \
     cross build -p mantle-reth-cli --bin op-reth --target {{target}} --features "$features" --profile "{{PROFILE}}"

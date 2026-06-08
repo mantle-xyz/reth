@@ -32,10 +32,6 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build ${{ matrix.target }}
-        env:
-          # Ubuntu 24.04 clang doesn't install stdarg.h in its resource-dir.
-          # Point bindgen at gcc's copy so libmdbx-sys build.rs succeeds.
-          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/lib/gcc/x86_64-linux-gnu/13/include"
         run: just build-cross ${{ matrix.target }}
 
       - name: Package tarball
