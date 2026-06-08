@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: extractions/setup-just@v2
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build ${{ matrix.target }}
+        run: just build-cross ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          BIN_DIR="dist/bin"
+          mkdir -p "$BIN_DIR"
+          cp target/${{ matrix.target }}/release/op-reth "$BIN_DIR/op-reth"
+          cd "$BIN_DIR"
+          TAG="${GITHUB_REF_NAME}"
+          TARBALL="op-reth-${TAG}-${{ matrix.target }}.tar.gz"
+          tar -czf "$TARBALL" op-reth
+          sha256sum "$TARBALL" > "$TARBALL.sha256"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          echo "SHA256=${TARBALL}.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: op-reth-${{ matrix.target }}
+          path: |
+            dist/bin/op-reth-*.tar.gz
+            dist/bin/op-reth-*.sha256
+
+  release:
+    name: create release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'test') }}
