@@ -26,6 +26,9 @@ default:
 build:
   cargo build -p mantle-reth-cli --bin op-reth --features "{{FEATURES}}" --profile "{{PROFILE}}"
 
+# Alias: backward-compatible with old Makefile `make build-op`
+build-op: build
+
 # Build op-reth binary (debug, with Mantle state-export feature)
 build-debug:
   cargo build -p mantle-reth-cli --bin op-reth --features "{{MANTLE_DEBUG_FEATURES}}"
