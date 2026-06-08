@@ -37,10 +37,7 @@ pre-build = [
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
 
     # Native build toolchain (bare ubuntu image has none) + rust-bindgen deps
-    # gcc-multilib provides stdarg.h in a location clang/bindgen can find
     "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang",
-    # symlink clang resource-dir stdarg.h so bindgen finds it (ubuntu:24.04 clang-18)
-    "CLANG_RES=$(clang -print-resource-dir) && test -f \"${CLANG_RES}/include/stdarg.h\" || (mkdir -p \"${CLANG_RES}/include\" && cp /usr/lib/gcc/x86_64-linux-gnu/*/include/stdarg.h \"${CLANG_RES}/include/\")",
 ]
 
 [target.aarch64-unknown-linux-gnu]
@@ -67,8 +64,6 @@ pre-build = [
 
     # Native host toolchain + rust-bindgen deps + aarch64 cross toolchain
     "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
-    # symlink clang resource-dir stdarg.h so bindgen finds it (ubuntu:24.04 clang-18)
-    "CLANG_RES=$(clang -print-resource-dir) && test -f \"${CLANG_RES}/include/stdarg.h\" || (mkdir -p \"${CLANG_RES}/include\" && cp /usr/lib/gcc/x86_64-linux-gnu/*/include/stdarg.h \"${CLANG_RES}/include/\")",
 ]
 env.passthrough = [
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
@@ -96,4 +91,4 @@ env.passthrough = [
 ]
 
 [build.env]
-passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE"]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS"]

@@ -32,6 +32,8 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build ${{ matrix.target }}
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS: "--sysroot=/usr"
         run: just build-cross ${{ matrix.target }}
 
       - name: Package tarball
