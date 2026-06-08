@@ -37,9 +37,6 @@ pre-build = [
     "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake",
-    "ls /usr/lib/clang/*/include/ || true",
-    "find /usr/lib/gcc -name stdarg.h || true",
-    "GCC_INC=$(dirname $(find /usr/lib/gcc -name stdarg.h | head -1)) && CLANG_INC=$(ls -d /usr/lib/clang/*/include | head -1) && echo copying $GCC_INC/stdarg.h to $CLANG_INC/ && cp $GCC_INC/stdarg.h $CLANG_INC/ && cp $GCC_INC/stddef.h $CLANG_INC/ 2>/dev/null || true",
 ]
 
 [target.aarch64-unknown-linux-gnu]
@@ -51,7 +48,7 @@ pre-build = [
     "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
-    "GCC_INC=$(dirname $(find /usr/lib/gcc -name stdarg.h | head -1)) && CLANG_INC=$(ls -d /usr/lib/clang/*/include | head -1) && cp $GCC_INC/stdarg.h $CLANG_INC/ && cp $GCC_INC/stddef.h $CLANG_INC/ 2>/dev/null || true",
+]
 ]
 env.passthrough = [
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
@@ -73,4 +70,4 @@ env.passthrough = [
 ]
 
 [build.env]
-passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS"]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS", "LIBCLANG_PATH"]
