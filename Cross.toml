@@ -49,7 +49,6 @@ pre-build = [
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
 ]
-]
 env.passthrough = [
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
     "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc",
