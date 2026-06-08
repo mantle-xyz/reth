@@ -10,9 +10,9 @@
 #   revm/op-revm   → mantle-xyz/revm branch mantle-elysium (Mantle fee model patches)
 #   revm-inspectors → mantle-xyz/revm-inspectors branch mantle-elysium
 #   alloy-evm      → mantle-xyz/evm branch mantle-v0.34.0 (Mantle token_ratio trait method)
-#   alloy-op-evm   → mantlenetworkio/mantle-v2 branch rust/upgrade-develop-20260511 (TODO: switch to tag)
-#   alloy-op-hardforks → mantlenetworkio/mantle-v2 branch rust/upgrade-develop-20260511 (TODO: switch to tag)
-#   op-alloy       → mantlenetworkio/mantle-v2 branch rust/upgrade-develop-20260511 (TODO: switch to tag)
+#   alloy-op-evm   → mantle-xyz/mantle-v2 branch mantle-elysium
+#   alloy-op-hardforks → mantle-xyz/mantle-v2 branch mantle-elysium
+#   op-alloy       → mantle-xyz/mantle-v2 branch mantle-elysium
 #   alloy base     → crates.io 2.0.4
 
 [workspace.package]
@@ -54,7 +54,7 @@ members = [
   "mantle-reth/crates/eth-api/",
   "mantle-reth/crates/integration-tests/",
 
-  # Optimism ecosystem crates (from mantlenetworkio/mantle-v2, git dependency)
+  # Optimism ecosystem crates (from mantle-xyz/mantle-v2, git dependency)
   # (no longer workspace members — referenced via git dep)
 ]
 default-members = [
@@ -235,23 +235,23 @@ revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branc
 # ==================== ALLOY-EVM (Mantle fork: mantle-xyz/evm, has token_ratio trait method) ====================
 alloy-evm = { git = "https://github.com/mantle-xyz/evm", branch = "mantle-v0.34.0", default-features = false }
 
-# ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantlenetworkio/mantle-v2) ====================
+# ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
-alloy-op-evm = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
-alloy-op-hardforks = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
 
 # ==================== OP-REVM (Mantle fork: mantle-elysium branch, same repo as revm) ====================
 op-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
 
-# ==================== OP-ALLOY (Mantle: mantlenetworkio/mantle-v2) ====================
+# ==================== OP-ALLOY (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
-op-alloy = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
-op-alloy-consensus = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
-op-alloy-network = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
-op-alloy-provider = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
-op-alloy-rpc-types = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511", default-features = false }
+op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
 op-alloy-flz = { version = "0.13.1", default-features = false }
 
 # ==================== ALLOY ====================
@@ -425,12 +425,12 @@ revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branc
 op-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
 # alloy-evm: mantle-xyz/evm (Mantle version with token_ratio trait method)
 alloy-evm = { git = "https://github.com/mantle-xyz/evm", branch = "mantle-v0.34.0" }
-# alloy-op-evm / alloy-op-hardforks: mantlenetworkio/mantle-v2 (Mantle version)
-alloy-op-evm = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511" }
-alloy-op-hardforks = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511" }
-# op-alloy: mantlenetworkio/mantle-v2 (Mantle version)
-op-alloy-consensus = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511" }
-op-alloy-network = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511" }
-op-alloy-rpc-types = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511" }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511" }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantlenetworkio/mantle-v2", branch = "rust/upgrade-develop-20260511" }
+# alloy-op-evm / alloy-op-hardforks: mantle-xyz/mantle-v2 (Mantle version)
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+# op-alloy: mantle-xyz/mantle-v2 (Mantle version)
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
