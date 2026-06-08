@@ -67,9 +67,10 @@ build-cross target:
   fi
   # Ubuntu 24.04 containers need:
   # - LIBCLANG_PATH: use system clang-18, not cross's bundled libclang 3.8
+  #   libclang-dev installs libclang-18.so in /usr/lib/x86_64-linux-gnu/
   # - BINDGEN_EXTRA_CLANG_ARGS: gcc-13 stdarg.h path (clang-18 package misses it)
-  # CROSS_CONTAINER_OPTS injects -e flags into docker run (passthrough doesn't work reliably)
-  export CROSS_CONTAINER_OPTS="${CROSS_CONTAINER_OPTS:--e LIBCLANG_PATH=/usr/lib/llvm-18/lib -e BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/13/include}"
+  # CROSS_CONTAINER_OPTS injects -e flags into docker run
+  export CROSS_CONTAINER_OPTS="${CROSS_CONTAINER_OPTS:--e LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu -e BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/13/include}"
   env "${env_args[@]}" \
     RUSTFLAGS="-C link-arg=-lgcc -Clink-arg=-static-libgcc" \
     cross build -p mantle-reth-cli --bin op-reth --target {{target}} --features "$features" --profile "{{PROFILE}}"
