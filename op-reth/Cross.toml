@@ -15,61 +15,10 @@ pre-build = [
     "apt-get update && apt-get install --assume-yes --no-install-recommends llvm-dev libclang-dev clang",
 ]
 
-[target.x86_64-unknown-linux-gnu]
-# Pin a glibc 2.39 base image (Ubuntu 24.04) for the native Linux target.
-# cross's default x86_64-unknown-linux-gnu image ships an older glibc; build
-# scripts compiled against the host's glibc 2.39 then fail at runtime with
-# `version GLIBC_2.39 not found`. Ubuntu 24.04 provides glibc 2.39, matching
-# the toolchain used by the release runners. Mirrors the riscv64 entry below.
-#
-# NOTE: a target-level pre-build OVERRIDES the global [build] pre-build, so the
-# HTTPS/retry setup and rust-bindgen deps are repeated here, plus the native
-# C/C++ toolchain that the bare ubuntu image lacks.
-image = "ubuntu:24.04"
-pre-build = [
-    # Use HTTPS for package sources
-    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
-    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
-
-    # Configure APT retries and timeouts to handle network issues
-    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
-    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
-    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
-
-    # Native build toolchain (bare ubuntu image has none) + rust-bindgen deps
-    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang",
-]
-
-[target.aarch64-unknown-linux-gnu]
-# Same glibc 2.39 pin as x86_64 above. aarch64 is a cross-compile: the build
-# scripts run on the x86_64 build host (inside this container), so the
-# container's glibc — not the target's — is what must satisfy the
-# `GLIBC_2.39 not found` requirement. Ubuntu 24.04 provides it.
-#
-# A target-level pre-build OVERRIDES the global [build] pre-build, so the
-# HTTPS/retry setup and rust-bindgen deps are repeated here, plus the native
-# host toolchain AND the aarch64 cross toolchain that the bare ubuntu image
-# lacks. CC/CXX/LINKER are pinned so the cc crate compiles target C deps
-# (e.g. reth-libmdbx) with the aarch64 cross compiler.
-image = "ubuntu:24.04"
-pre-build = [
-    # Use HTTPS for package sources
-    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
-    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
-
-    # Configure APT retries and timeouts to handle network issues
-    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
-    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
-    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
-
-    # Native host toolchain + rust-bindgen deps + aarch64 cross toolchain
-    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
-]
-env.passthrough = [
-    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
-    "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc",
-    "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
-]
+# x86_64 and aarch64 use cross's DEFAULT images (which bundle clang + stdarg.h
+# and a glibc recent enough for the pinned cross rev). Do NOT override with
+# bare ubuntu:24.04 — that image lacks clang's resource-dir stdarg.h and
+# requires extensive manual fixup.
 
 [target.x86_64-pc-windows-gnu]
 # Why do we need a custom Dockerfile on Windows:
@@ -91,4 +40,4 @@ env.passthrough = [
 ]
 
 [build.env]
-passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS"]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE"]
