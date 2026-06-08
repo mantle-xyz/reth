@@ -1,0 +1,73 @@
+[build]
+pre-build = [
+    # Use HTTPS for package sources
+    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
+    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
+
+    # Configure APT retries and timeouts to handle network issues
+    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+
+    # rust-bindgen dependencies: llvm-dev libclang-dev (>= 10) clang (>= 10)
+    "apt-get update && apt-get install --assume-yes --no-install-recommends llvm-dev libclang-dev clang",
+]
+
+# == Why ubuntu:24.04 for x86_64 and aarch64? ==
+#
+# Three requirements conflict:
+#   1. glibc >= 2.39 (matching GitHub Actions ubuntu-latest runners)
+#   2. gcc >= 10 (aws-lc-sys detects gcc memcmp bug gcc#95189 in older gcc)
+#   3. clang stdarg.h reachable by bindgen (libmdbx-sys build.rs)
+#
+# cross's default images satisfy (3) but fail (1) and (2).
+# bare ubuntu:24.04 satisfies (1) and (2) but fails (3) — its clang package
+# doesn't install stdarg.h in the resource-dir, and pre-build `cp` doesn't
+# help because bindgen may use the Rust-toolchain's bundled libclang.
+#
+# Fix: ubuntu:24.04 + pass BINDGEN_EXTRA_CLANG_ARGS with gcc's include path
+# so bindgen finds stdarg.h regardless of which libclang it uses.
+
+[target.x86_64-unknown-linux-gnu]
+image = "ubuntu:24.04"
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
+    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
+    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake",
+]
+
+[target.aarch64-unknown-linux-gnu]
+image = "ubuntu:24.04"
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
+    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
+    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
+]
+]
+env.passthrough = [
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+    "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc",
+    "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
+]
+
+[target.x86_64-pc-windows-gnu]
+dockerfile = "./Dockerfile.x86_64-pc-windows-gnu"
+
+[target.riscv64gc-unknown-linux-gnu]
+image = "ubuntu:24.04"
+pre-build = [
+    "apt update",
+    "apt install --yes gcc gcc-riscv64-linux-gnu libclang-dev make",
+]
+env.passthrough = [
+    "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc",
+]
+
+[build.env]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS", "LIBCLANG_PATH"]
