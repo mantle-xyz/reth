@@ -28,11 +28,8 @@ jobs:
           cache-on-failure: true
       - uses: extractions/setup-just@v2
 
-      - name: Install cross (pinned to upstream reth rev)
-        run: |
-          cargo install cross --locked \
-            --git https://github.com/cross-rs/cross \
-            --rev 65fe72b0cdb1e7e0cc0652517498d4389cc8f5cf
+      - name: Install cross
+        run: cargo install cross --locked
 
       - name: Build ${{ matrix.target }}
         run: just build-cross ${{ matrix.target }}

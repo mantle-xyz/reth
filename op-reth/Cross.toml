@@ -15,18 +15,44 @@ pre-build = [
     "apt-get update && apt-get install --assume-yes --no-install-recommends llvm-dev libclang-dev clang",
 ]
 
-# x86_64 and aarch64 use cross's DEFAULT images (which bundle clang + stdarg.h
-# and a glibc recent enough for the pinned cross rev). Do NOT override with
-# bare ubuntu:24.04 — that image lacks clang's resource-dir stdarg.h and
-# requires extensive manual fixup.
+[target.x86_64-unknown-linux-gnu]
+# Ubuntu 24.04 for glibc 2.39 (matching GitHub Actions runners) AND gcc 13+
+# (avoiding aws-lc-sys gcc memcmp bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95189).
+# cross's default image has old gcc that triggers the bug.
+#
+# stdarg.h fix: copy from gcc include dir into clang resource-dir, since bare
+# ubuntu:24.04 clang package doesn't install it there.
+image = "ubuntu:24.04"
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
+    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
+    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake",
+    "CLANG_RES=$(clang -print-resource-dir) && GCC_STDARG=$(find /usr/lib/gcc -name stdarg.h | head -1) && mkdir -p ${CLANG_RES}/include && cp ${GCC_STDARG} ${CLANG_RES}/include/",
+]
+
+[target.aarch64-unknown-linux-gnu]
+# Same ubuntu:24.04 pin as x86_64. aarch64 is cross-compiled; build scripts
+# run on the x86_64 host inside this container.
+image = "ubuntu:24.04"
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
+    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
+    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
+    "CLANG_RES=$(clang -print-resource-dir) && GCC_STDARG=$(find /usr/lib/gcc -name stdarg.h | head -1) && mkdir -p ${CLANG_RES}/include && cp ${GCC_STDARG} ${CLANG_RES}/include/",
+]
+env.passthrough = [
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+    "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc",
+    "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
+]
 
 [target.x86_64-pc-windows-gnu]
-# Why do we need a custom Dockerfile on Windows:
-# 1. `reth-libmdbx` stopped working with MinGW 9.3 that cross image comes with.
-# 2. To be able to update the version of MinGW, we need to also update the Ubuntu that the image is based on.
-#
-# Also see https://github.com/cross-rs/cross/issues/1667
-# Inspired by https://github.com/cross-rs/cross/blob/9e2298e17170655342d3248a9c8ac37ef92ba38f/docker/Dockerfile.x86_64-pc-windows-gnu#L51
 dockerfile = "./Dockerfile.x86_64-pc-windows-gnu"
 
 [target.riscv64gc-unknown-linux-gnu]
