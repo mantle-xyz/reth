@@ -10,18 +10,25 @@ pre-build = [
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
 
     # rust-bindgen dependencies: llvm-dev libclang-dev (>= 10) clang (>= 10)
-    # See: https://github.com/cross-rs/cross/wiki/FAQ#using-clang--bindgen for
-    # recommended clang versions for the given cross and bindgen version.
     "apt-get update && apt-get install --assume-yes --no-install-recommends llvm-dev libclang-dev clang",
 ]
 
-[target.x86_64-unknown-linux-gnu]
-# Ubuntu 24.04 for glibc 2.39 (matching GitHub Actions runners) AND gcc 13+
-# (avoiding aws-lc-sys gcc memcmp bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95189).
-# cross's default image has old gcc that triggers the bug.
+# == Why ubuntu:24.04 for x86_64 and aarch64? ==
 #
-# stdarg.h fix: copy from gcc include dir into clang resource-dir, since bare
-# ubuntu:24.04 clang package doesn't install it there.
+# Three requirements conflict:
+#   1. glibc >= 2.39 (matching GitHub Actions ubuntu-latest runners)
+#   2. gcc >= 10 (aws-lc-sys detects gcc memcmp bug gcc#95189 in older gcc)
+#   3. clang stdarg.h reachable by bindgen (libmdbx-sys build.rs)
+#
+# cross's default images satisfy (3) but fail (1) and (2).
+# bare ubuntu:24.04 satisfies (1) and (2) but fails (3) — its clang package
+# doesn't install stdarg.h in the resource-dir, and pre-build `cp` doesn't
+# help because bindgen may use the Rust-toolchain's bundled libclang.
+#
+# Fix: ubuntu:24.04 + pass BINDGEN_EXTRA_CLANG_ARGS with gcc's include path
+# so bindgen finds stdarg.h regardless of which libclang it uses.
+
+[target.x86_64-unknown-linux-gnu]
 image = "ubuntu:24.04"
 pre-build = [
     "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
@@ -30,12 +37,9 @@ pre-build = [
     "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake",
-    "CLANG_RES=$(clang -print-resource-dir) && GCC_STDARG=$(find /usr/lib/gcc -name stdarg.h | head -1) && mkdir -p ${CLANG_RES}/include && cp ${GCC_STDARG} ${CLANG_RES}/include/",
 ]
 
 [target.aarch64-unknown-linux-gnu]
-# Same ubuntu:24.04 pin as x86_64. aarch64 is cross-compiled; build scripts
-# run on the x86_64 host inside this container.
 image = "ubuntu:24.04"
 pre-build = [
     "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
@@ -44,7 +48,6 @@ pre-build = [
     "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
     "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
-    "CLANG_RES=$(clang -print-resource-dir) && GCC_STDARG=$(find /usr/lib/gcc -name stdarg.h | head -1) && mkdir -p ${CLANG_RES}/include && cp ${GCC_STDARG} ${CLANG_RES}/include/",
 ]
 env.passthrough = [
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
@@ -66,4 +69,4 @@ env.passthrough = [
 ]
 
 [build.env]
-passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE"]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS"]
