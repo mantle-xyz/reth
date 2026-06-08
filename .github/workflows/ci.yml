@@ -11,30 +11,8 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: cargo check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-
-  clippy:
-    name: clippy
+  pr:
+    name: just pr (fmt + clippy + test + test-doc)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,15 +20,9 @@ jobs:
         with:
           toolchain: "1.94"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-features -- -D warnings
-
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      - run: cargo +nightly fmt --all --check
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - run: just pr
