@@ -37,7 +37,8 @@ pre-build = [
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
 
     # Native build toolchain (bare ubuntu image has none) + rust-bindgen deps
-    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang",
+    # libclang-rt-dev provides stdarg.h required by libmdbx bindgen
+    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang libclang-rt-dev",
 ]
 
 [target.aarch64-unknown-linux-gnu]
@@ -63,7 +64,8 @@ pre-build = [
     "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
 
     # Native host toolchain + rust-bindgen deps + aarch64 cross toolchain
-    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
+    # libclang-rt-dev provides stdarg.h required by libmdbx bindgen
+    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang libclang-rt-dev gcc-aarch64-linux-gnu g++-aarch64-linux-gnu",
 ]
 env.passthrough = [
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
