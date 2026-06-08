@@ -15,6 +15,31 @@ pre-build = [
     "apt-get update && apt-get install --assume-yes --no-install-recommends llvm-dev libclang-dev clang",
 ]
 
+[target.x86_64-unknown-linux-gnu]
+# Pin a glibc 2.39 base image (Ubuntu 24.04) for the native Linux target.
+# cross's default x86_64-unknown-linux-gnu image ships an older glibc; build
+# scripts compiled against the host's glibc 2.39 then fail at runtime with
+# `version GLIBC_2.39 not found`. Ubuntu 24.04 provides glibc 2.39, matching
+# the toolchain used by the release runners. Mirrors the riscv64 entry below.
+#
+# NOTE: a target-level pre-build OVERRIDES the global [build] pre-build, so the
+# HTTPS/retry setup and rust-bindgen deps are repeated here, plus the native
+# C/C++ toolchain that the bare ubuntu image lacks.
+image = "ubuntu:24.04"
+pre-build = [
+    # Use HTTPS for package sources
+    "apt-get update && apt-get install --assume-yes --no-install-recommends ca-certificates",
+    "find /etc/apt/ -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sed -i 's|http://|https://|g' {} +",
+
+    # Configure APT retries and timeouts to handle network issues
+    "echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::http::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+    "echo 'Acquire::ftp::Timeout \"60\";' >> /etc/apt/apt.conf.d/80-retries",
+
+    # Native build toolchain (bare ubuntu image has none) + rust-bindgen deps
+    "apt-get update && apt-get install --assume-yes --no-install-recommends gcc g++ make pkg-config llvm-dev libclang-dev clang",
+]
+
 [target.x86_64-pc-windows-gnu]
 # Why do we need a custom Dockerfile on Windows:
 # 1. `reth-libmdbx` stopped working with MinGW 9.3 that cross image comes with.
