@@ -406,7 +406,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-evm"
 version = "0.32.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -423,7 +423,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-hardforks"
 version = "0.5.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-chains",
  "alloy-hardforks",
@@ -1029,7 +1029,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1040,7 +1040,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3131,7 +3131,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3550,8 +3550,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -4061,7 +4061,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -5575,7 +5575,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5762,7 +5762,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "op-alloy"
 version = "2.0.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "op-alloy-consensus",
  "op-alloy-network",
@@ -5774,7 +5774,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-consensus"
 version = "2.0.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -5804,7 +5804,7 @@ checksum = "a79f352fc3893dcd670172e615afef993a41798a1d3fc0db88a3e60ef2e70ecc"
 [[package]]
 name = "op-alloy-network"
 version = "2.0.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -5817,7 +5817,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-provider"
 version = "2.0.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -5831,7 +5831,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-jsonrpsee"
 version = "2.0.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-primitives",
  "jsonrpsee",
@@ -5840,7 +5840,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types"
 version = "2.0.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -5861,7 +5861,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types-engine"
 version = "2.0.0"
-source = "git+https://github.com/mantlenetworkio/mantle-v2?branch=rust%2Fupgrade-develop-20260511#3c9024be0ad753aa1c6cc012d7ec1d345352defd"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#465207a6831a22a291e974858eea95cd7c6aa120"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -5902,7 +5902,7 @@ dependencies = [
 [[package]]
 name = "op-revm"
 version = "19.0.0"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "alloy-sol-types",
  "auto_impl",
@@ -10228,7 +10228,7 @@ dependencies = [
 [[package]]
 name = "revm"
 version = "38.0.0"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "revm-bytecode",
  "revm-context",
@@ -10246,7 +10246,7 @@ dependencies = [
 [[package]]
 name = "revm-bytecode"
 version = "10.0.0"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "bitvec",
  "phf",
@@ -10257,7 +10257,7 @@ dependencies = [
 [[package]]
 name = "revm-context"
 version = "16.0.1"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "bitvec",
  "cfg-if",
@@ -10273,7 +10273,7 @@ dependencies = [
 [[package]]
 name = "revm-context-interface"
 version = "17.0.1"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "alloy-eip2930",
  "alloy-eip7702",
@@ -10288,7 +10288,7 @@ dependencies = [
 [[package]]
 name = "revm-database"
 version = "13.0.1"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "alloy-eips 1.8.3",
  "revm-bytecode",
@@ -10301,7 +10301,7 @@ dependencies = [
 [[package]]
 name = "revm-database-interface"
 version = "11.0.1"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "auto_impl",
  "either",
@@ -10314,7 +10314,7 @@ dependencies = [
 [[package]]
 name = "revm-handler"
 version = "18.1.0"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "auto_impl",
  "derive-where",
@@ -10332,7 +10332,7 @@ dependencies = [
 [[package]]
 name = "revm-inspector"
 version = "19.0.0"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "auto_impl",
  "either",
@@ -10368,7 +10368,7 @@ dependencies = [
 [[package]]
 name = "revm-interpreter"
 version = "35.0.1"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",
@@ -10380,7 +10380,7 @@ dependencies = [
 [[package]]
 name = "revm-precompile"
 version = "34.0.0"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -10405,7 +10405,7 @@ dependencies = [
 [[package]]
 name = "revm-primitives"
 version = "23.0.0"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "alloy-primitives",
  "num_enum",
@@ -10416,7 +10416,7 @@ dependencies = [
 [[package]]
 name = "revm-state"
 version = "11.0.1"
-source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#2b42441dbda9c3efba0d9d1cf698f16f28720d74"
+source = "git+https://github.com/mantle-xyz/revm?branch=mantle-elysium#b4f618225ddf5cc808080a47fe9065339704fcb7"
 dependencies = [
  "alloy-eip7928",
  "bitflags",
@@ -10665,7 +10665,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10745,7 +10745,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.7",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11353,7 +11353,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11551,7 +11551,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12767,7 +12767,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
