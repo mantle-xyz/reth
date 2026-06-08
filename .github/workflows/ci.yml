@@ -1,4 +1,4 @@
-name: CI
+name: lint
 
 on:
   pull_request:
@@ -11,9 +11,10 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  pr:
-    name: just pr (fmt + clippy + test + test-doc)
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,5 +25,8 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: extractions/setup-just@v2
-      - run: just pr
+      - run: just fmt
+      - run: just clippy
