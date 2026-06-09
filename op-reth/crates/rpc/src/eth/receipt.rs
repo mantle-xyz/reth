@@ -494,6 +494,25 @@ impl OpReceiptBuilder {
             core_receipt.blob_gas_used = Some(da_size);
         });
 
+        // op-geth parity: `build_receipt` derives `contract_address` from `tx.nonce()`,
+        // which is hard-coded to `0` for deposit transactions. For a deposit
+        // contract-creation tx (`to == nil`, `isCreation == true`), op-geth instead derives
+        // the address from the sender's *actual* L2 nonce, persisted on the receipt as the
+        // deposit nonce (see go-ethereum `core/types/receipt.go` `DeriveFields`:
+        // `if tx.IsDepositTx() && r.DepositNonce != nil { nonce = *r.DepositNonce }`).
+        //
+        // Without this override `eth_getTransactionReceipt` returns `CREATE(from, 0)` while the
+        // contract is actually deployed at `CREATE(from, depositNonce)`, so any client that
+        // calls `eth_getCode(receipt.contractAddress)` fails whenever the deposit sender's L2
+        // nonce > 0. The contract itself (and chain state) is correct; only this derived RPC
+        // field was wrong. The `contract_address.is_some()` guard limits this to creation txs.
+        if core_receipt.contract_address.is_some() &&
+            let OpReceipt::Deposit(deposit_receipt) = &core_receipt.inner.receipt &&
+            let Some(deposit_nonce) = deposit_receipt.deposit_nonce
+        {
+            core_receipt.contract_address = Some(core_receipt.from.create(deposit_nonce));
+        }
+
         let op_receipt_fields = OpReceiptFieldsBuilder::new(timestamp, block_number)
             .l1_block_info(chain_spec, tx_signed, l1_block_info)?
             .op_gas_refund(op_gas_refund)
@@ -1087,6 +1106,184 @@ mod test {
         .unwrap();
 
         assert_eq!(op_receipt.core_receipt.blob_gas_used, None);
+    }
+
+    /// A deposit contract-creation receipt must derive `contractAddress` from the sender's
+    /// real L2 nonce (the deposit nonce), not from the deposit tx nonce which is always 0.
+    ///
+    /// Regression test for the rpc-moon `eth_getTransactionReceipt` mismatch where
+    /// `CREATE(from, 0)` was returned instead of `CREATE(from, depositNonce)`.
+    #[test]
+    fn deposit_contract_creation_uses_deposit_nonce_for_contract_address() {
+        use op_alloy_consensus::OpDepositReceipt;
+
+        const DEPOSIT_NONCE: u64 = 35_964;
+        let from = Address::with_last_byte(0x42);
+
+        // Deposit contract creation: `to == TxKind::Create`. Its `nonce()` is hard-coded to 0.
+        let tx: OpTransactionSigned = TxDeposit {
+            source_hash: B256::ZERO,
+            from,
+            to: alloy_primitives::TxKind::Create,
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            // init code: PUSH1 0x42, MSTORE, RETURN 32 bytes
+            input: Bytes::from_static(&hex!("604260005260206000f3")),
+            eth_tx_value: None,
+        }
+        .into();
+
+        let mut l1_block_info = op_revm::L1BlockInfo::default();
+        let op_hardforks = OP_MAINNET.as_ref();
+
+        let op_receipt = OpReceiptBuilder::new(
+            &op_hardforks,
+            ConvertReceiptInput::<OpPrimitives> {
+                tx: Recovered::new_unchecked(&tx, from),
+                receipt: OpReceipt::Deposit(OpDepositReceipt {
+                    inner: Receipt {
+                        status: Eip658Value::Eip658(true),
+                        cumulative_gas_used: 100,
+                        logs: vec![],
+                    },
+                    deposit_nonce: Some(DEPOSIT_NONCE),
+                    deposit_receipt_version: Some(1),
+                }),
+                gas_used: 100,
+                next_log_index: 0,
+                meta: TransactionMeta {
+                    timestamp: OP_MAINNET_ISTHMUS_TIMESTAMP,
+                    ..Default::default()
+                },
+            },
+            &mut l1_block_info,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            op_receipt.core_receipt.contract_address,
+            Some(from.create(DEPOSIT_NONCE)),
+            "deposit contract creation must derive the address from the deposit nonce"
+        );
+        assert_ne!(
+            op_receipt.core_receipt.contract_address,
+            Some(from.create(0)),
+            "must not derive the address from the deposit tx nonce (0)"
+        );
+    }
+
+    /// A deposit *call* tx (`to == Call`, not creation) must have no `contractAddress`;
+    /// the deposit-nonce override must not fabricate one.
+    #[test]
+    fn deposit_call_tx_has_no_contract_address() {
+        use op_alloy_consensus::OpDepositReceipt;
+
+        let from = Address::with_last_byte(0x11);
+        let tx: OpTransactionSigned = TxDeposit {
+            source_hash: B256::ZERO,
+            from,
+            to: Address::with_last_byte(0x99).into(), // TxKind::Call
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            input: Bytes::new(),
+            eth_tx_value: None,
+        }
+        .into();
+
+        let mut l1_block_info = op_revm::L1BlockInfo::default();
+        let op_hardforks = OP_MAINNET.as_ref();
+
+        let op_receipt = OpReceiptBuilder::new(
+            &op_hardforks,
+            ConvertReceiptInput::<OpPrimitives> {
+                tx: Recovered::new_unchecked(&tx, from),
+                receipt: OpReceipt::Deposit(OpDepositReceipt {
+                    inner: Receipt {
+                        status: Eip658Value::Eip658(true),
+                        cumulative_gas_used: 100,
+                        logs: vec![],
+                    },
+                    deposit_nonce: Some(35_964),
+                    deposit_receipt_version: Some(1),
+                }),
+                gas_used: 100,
+                next_log_index: 0,
+                meta: TransactionMeta {
+                    timestamp: OP_MAINNET_ISTHMUS_TIMESTAMP,
+                    ..Default::default()
+                },
+            },
+            &mut l1_block_info,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            op_receipt.core_receipt.contract_address, None,
+            "a deposit call tx must not have a contract address"
+        );
+    }
+
+    /// A non-deposit contract creation must keep deriving its address from `tx.nonce()`;
+    /// the deposit override must not touch it.
+    #[test]
+    fn non_deposit_contract_creation_uses_tx_nonce() {
+        use alloy_consensus::TxEip1559;
+
+        const NONCE: u64 = 7;
+        let from = Address::with_last_byte(0x22);
+
+        let tx_inner = TxEip1559 {
+            chain_id: 1,
+            nonce: NONCE,
+            gas_limit: 1_000_000,
+            max_fee_per_gas: 0x28f000fff,
+            max_priority_fee_per_gas: 0x28f000fff,
+            to: alloy_primitives::TxKind::Create,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::from_static(&hex!("604260005260206000f3")),
+        };
+        let signature = Signature::new(U256::default(), U256::default(), true);
+        let tx: OpTransactionSigned =
+            OpTypedTransaction::Eip1559(tx_inner).into_signed(signature).into();
+
+        let mut l1_block_info = op_revm::L1BlockInfo::default();
+        let op_hardforks = OP_MAINNET.as_ref();
+
+        let op_receipt = OpReceiptBuilder::new(
+            &op_hardforks,
+            ConvertReceiptInput::<OpPrimitives> {
+                tx: Recovered::new_unchecked(&tx, from),
+                receipt: OpReceipt::Eip1559(Receipt {
+                    status: Eip658Value::Eip658(true),
+                    cumulative_gas_used: 100,
+                    logs: vec![],
+                }),
+                gas_used: 100,
+                next_log_index: 0,
+                meta: TransactionMeta {
+                    timestamp: OP_MAINNET_ISTHMUS_TIMESTAMP,
+                    ..Default::default()
+                },
+            },
+            &mut l1_block_info,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            op_receipt.core_receipt.contract_address,
+            Some(from.create(NONCE)),
+            "non-deposit contract creation must keep using the tx nonce"
+        );
     }
 
     #[test]
