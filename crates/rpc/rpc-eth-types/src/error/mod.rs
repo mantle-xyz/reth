@@ -1084,7 +1084,7 @@ pub fn ensure_success<Halt, Error: FromEvmHalt<Halt> + FromEthApiError>(
         ExecutionResult::Revert { output, .. } => {
             Err(Error::from_eth_err(RpcInvalidTransactionError::Revert(RevertError::new(output))))
         }
-        ExecutionResult::Halt { reason, gas_used } => Err(Error::from_evm_halt(reason, gas_used)),
+        ExecutionResult::Halt { reason, gas_used, .. } => Err(Error::from_evm_halt(reason, gas_used)),
     }
 }
 
