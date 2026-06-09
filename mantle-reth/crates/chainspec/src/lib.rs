@@ -84,7 +84,9 @@ static MANTLE_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ),
         (OpHardfork::Isthmus.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_SKADI_TIMESTAMP)),
         (MantleHardfork::Skadi.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_SKADI_TIMESTAMP)),
+        // Limb activates Osaka (engine_getPayloadV5)
         (MantleHardfork::Limb.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP)),
+        (EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP)),
         // Arsia activates remaining OP forks: Canyon + Fjord + Granite + Holocene + Jovian
         (OpHardfork::Canyon.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP)),
         (OpHardfork::Fjord.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP)),
@@ -226,8 +228,9 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
         (OpHardfork::Ecotone.boxed(), skadi_ts),
         (OpHardfork::Isthmus.boxed(), skadi_ts),
         (MantleHardfork::Skadi.boxed(), skadi_ts),
-        // Mantle Limb
+        // Mantle Limb — activates Osaka (engine_getPayloadV5)
         (MantleHardfork::Limb.boxed(), limb_ts),
+        (EthereumHardfork::Osaka.boxed(), limb_ts),
         // Mantle Arsia
         (OpHardfork::Canyon.boxed(), arsia_ts),
         (OpHardfork::Fjord.boxed(), arsia_ts),
