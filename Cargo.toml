@@ -9,7 +9,7 @@
 #   reth crates    → paradigmxyz/reth rev 88505c7f (= v2.2.0, same as upstream op-reth pins)
 #   revm/op-revm   → mantle-xyz/revm branch mantle-elysium (Mantle fee model patches)
 #   revm-inspectors → mantle-xyz/revm-inspectors branch mantle-elysium
-#   alloy-evm      → mantle-xyz/evm branch mantle-v0.34.0 (Mantle token_ratio trait method)
+#   alloy-evm      → crates.io 0.34.0 (upstream, no Mantle patches; see mantle-v2#359)
 #   alloy-op-evm   → mantle-xyz/mantle-v2 branch mantle-elysium
 #   alloy-op-hardforks → mantle-xyz/mantle-v2 branch mantle-elysium
 #   op-alloy       → mantle-xyz/mantle-v2 branch mantle-elysium
@@ -232,8 +232,8 @@ revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = 
 # TODO: Switch to tag once mantle-elysium is tagged
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "mantle-elysium" }
 
-# ==================== ALLOY-EVM (Mantle fork: mantle-xyz/evm, has token_ratio trait method) ====================
-alloy-evm = { git = "https://github.com/mantle-xyz/evm", branch = "mantle-v0.34.0", default-features = false }
+# ==================== ALLOY-EVM (upstream crates.io, no Mantle patches; see mantle-v2#359) ====================
+alloy-evm = { version = "0.34.0", default-features = false }
 
 # ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
@@ -423,8 +423,6 @@ revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = 
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "mantle-elysium" }
 # op-revm: mantle-xyz/revm (same as workspace dep)
 op-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-# alloy-evm: mantle-xyz/evm (Mantle version with token_ratio trait method)
-alloy-evm = { git = "https://github.com/mantle-xyz/evm", branch = "mantle-v0.34.0" }
 # alloy-op-evm / alloy-op-hardforks: mantle-xyz/mantle-v2 (Mantle version)
 alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
 alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
