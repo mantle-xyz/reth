@@ -84,6 +84,8 @@ static MANTLE_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ),
         (OpHardfork::Isthmus.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_SKADI_TIMESTAMP)),
         (MantleHardfork::Skadi.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_SKADI_TIMESTAMP)),
+        // Limb activates the L1 fork: Osaka
+        (EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP)),
         (MantleHardfork::Limb.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP)),
         // Arsia activates remaining OP forks: Canyon + Fjord + Granite + Holocene + Jovian
         (OpHardfork::Canyon.boxed(), ForkCondition::Timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP)),
@@ -138,6 +140,8 @@ static MANTLE_SEPOLIA_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ),
         (OpHardfork::Isthmus.boxed(), ForkCondition::Timestamp(MANTLE_SEPOLIA_SKADI_TIMESTAMP)),
         (MantleHardfork::Skadi.boxed(), ForkCondition::Timestamp(MANTLE_SEPOLIA_SKADI_TIMESTAMP)),
+        // Limb activates the L1 Osaka fork (required for op-node's engine_getPayloadV5).
+        (EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(MANTLE_SEPOLIA_LIMB_TIMESTAMP)),
         (MantleHardfork::Limb.boxed(), ForkCondition::Timestamp(MANTLE_SEPOLIA_LIMB_TIMESTAMP)),
         // Arsia activates remaining OP forks: Canyon + Fjord + Granite + Holocene + Jovian
         (OpHardfork::Canyon.boxed(), ForkCondition::Timestamp(MANTLE_SEPOLIA_ARSIA_TIMESTAMP)),
@@ -227,6 +231,7 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
         (OpHardfork::Isthmus.boxed(), skadi_ts),
         (MantleHardfork::Skadi.boxed(), skadi_ts),
         // Mantle Limb
+        (EthereumHardfork::Osaka.boxed(), limb_ts),
         (MantleHardfork::Limb.boxed(), limb_ts),
         // Mantle Arsia
         (OpHardfork::Canyon.boxed(), arsia_ts),
