@@ -1,6 +1,6 @@
 //! State provider factory for OP Proofs ExEx.
 
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use derive_more::Constructor;
 use jsonrpsee_types::error::ErrorObject;
 use reth_optimism_trie::{
@@ -29,6 +29,14 @@ where
         block_id: Option<BlockId>,
     ) -> ProviderResult<Box<dyn StateProvider + 'a>> {
         let block_id = block_id.unwrap_or_default();
+
+        let historical_provider =
+            self.eth_api.state_at_block_id(block_id).await.map_err(ProviderError::other)?;
+
+        if matches!(block_id, BlockId::Number(BlockNumberOrTag::Latest)) {
+            return Ok(Box::new(historical_provider));
+        }
+
         // Check whether the distance to the block exceeds the maximum configured window.
         let block_number = self
             .eth_api
@@ -37,20 +45,21 @@ where
             .ok_or(EthApiError::HeaderNotFound(block_id))
             .map_err(ProviderError::other)?;
 
-        let historical_provider =
-            self.eth_api.state_at_block_id(block_id).await.map_err(ProviderError::other)?;
-
         let provider_ro = self.preimage_store.provider_ro().map_err(ProviderError::from)?;
 
         let (Some((latest_block_number, _)), Some((earliest_block_number, _))) = (
             provider_ro.get_latest_block_number().map_err(ProviderError::from)?,
             provider_ro.get_earliest_block_number().map_err(ProviderError::from)?,
         ) else {
-            // if no earliest block, db is empty, return error
-            return Err(ProviderError::StateForNumberNotFound(block_number));
+            // if no earliest block, db is empty, fall to historical provider
+            return Ok(Box::new(historical_provider));
         };
 
-        if block_number < earliest_block_number || block_number > latest_block_number {
+        if block_number > latest_block_number {
+            return Ok(Box::new(historical_provider));
+        }
+
+        if block_number < earliest_block_number {
             return Err(ProviderError::StateForNumberNotFound(block_number));
         }
 

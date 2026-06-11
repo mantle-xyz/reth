@@ -198,6 +198,7 @@ reth-revm = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdeb
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
@@ -376,6 +377,7 @@ bytes = { version = "1.11.1", default-features = false }
 cfg-if = "1.0.4"
 clap = { version = "4", features = ["derive"] }
 derive_more = { version = "2.0", default-features = false }
+dyn-clone = "1.0"
 either = "1"
 eyre = "0.6"
 humantime = "2"
@@ -401,6 +403,7 @@ url = "2.5"
 # Uncomment when patches/ crates are populated:
 [patch."https://github.com/paradigmxyz/reth"]
 reth-trie-common = { path = "patches/reth-trie-common" }
+reth-rpc-eth-api = { path = "patches/reth-rpc-eth-api" }
 # reth-rpc = { path = "patches/reth-rpc" }
 # reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 

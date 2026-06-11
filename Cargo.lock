@@ -9657,7 +9657,6 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-api"
 version = "2.2.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=88505c7fcbfdebfd3b56d88c86b62e950043c6c4#88505c7fcbfdebfd3b56d88c86b62e950043c6c4"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -9685,6 +9684,7 @@ dependencies = [
  "reth-network-api",
  "reth-node-api",
  "reth-primitives-traits",
+ "reth-prune-types",
  "reth-revm",
  "reth-rpc-convert",
  "reth-rpc-eth-types",
