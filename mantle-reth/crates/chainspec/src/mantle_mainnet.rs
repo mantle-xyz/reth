@@ -84,6 +84,13 @@ mod tests {
     }
 
     #[test]
+    fn verify_mantle_mainnet_limb_activates_osaka() {
+        let spec = &*MANTLE_MAINNET;
+        assert!(spec.is_osaka_active_at_timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP));
+        assert!(!spec.is_osaka_active_at_timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP - 1));
+    }
+
+    #[test]
     fn verify_mantle_mainnet_mantle_hardforks() {
         let spec = &*MANTLE_MAINNET;
         assert!(
