@@ -53,6 +53,15 @@ mod tests {
     }
 
     #[test]
+    fn verify_mantle_sepolia_limb_activates_osaka() {
+        let spec = &*MANTLE_SEPOLIA;
+        assert!(spec.is_osaka_active_at_timestamp(MANTLE_SEPOLIA_LIMB_TIMESTAMP));
+        assert!(!spec.is_osaka_active_at_timestamp(MANTLE_SEPOLIA_LIMB_TIMESTAMP - 1));
+        // Osaka is gated on Limb, not Skadi: Prague (Skadi) is already active while Osaka is not.
+        assert!(!spec.is_osaka_active_at_timestamp(MANTLE_SEPOLIA_SKADI_TIMESTAMP));
+    }
+
+    #[test]
     fn verify_mantle_sepolia_arsia_activates_op_forks() {
         let spec = &*MANTLE_SEPOLIA;
         assert!(spec.is_canyon_active_at_timestamp(MANTLE_SEPOLIA_ARSIA_TIMESTAMP));

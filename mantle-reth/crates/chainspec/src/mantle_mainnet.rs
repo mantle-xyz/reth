@@ -72,6 +72,15 @@ mod tests {
     }
 
     #[test]
+    fn verify_mantle_mainnet_limb_activates_osaka() {
+        let spec = &*MANTLE_MAINNET;
+        assert!(spec.is_osaka_active_at_timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP));
+        assert!(!spec.is_osaka_active_at_timestamp(MANTLE_MAINNET_LIMB_TIMESTAMP - 1));
+        // Osaka is gated on Limb, not Skadi: Prague (Skadi) is already active while Osaka is not.
+        assert!(!spec.is_osaka_active_at_timestamp(MANTLE_MAINNET_SKADI_TIMESTAMP));
+    }
+
+    #[test]
     fn verify_mantle_mainnet_arsia_activates_op_forks() {
         let spec = &*MANTLE_MAINNET;
         assert!(spec.is_canyon_active_at_timestamp(MANTLE_MAINNET_ARSIA_TIMESTAMP));
