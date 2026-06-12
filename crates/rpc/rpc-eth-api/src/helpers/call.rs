@@ -434,7 +434,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let access_list = inspector.into_access_list();
             tx_env.set_access_list(access_list.clone());
             match result.result {
-                ExecutionResult::Halt { reason, gas_used } => {
+                ExecutionResult::Halt { reason, gas_used, .. } => {
                     let error =
                         Some(Self::Error::from_evm_halt(reason, tx_env.gas_limit()).to_string());
                     return Ok(AccessListResult {
@@ -458,7 +458,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let gas_limit = tx_env.gas_limit();
             let result = this.transact(&mut db, evm_env, tx_env)?;
             let res = match result.result {
-                ExecutionResult::Halt { reason, gas_used } => {
+                ExecutionResult::Halt { reason, gas_used, .. } => {
                     let error = Some(Self::Error::from_evm_halt(reason, gas_limit).to_string());
                     AccessListResult { access_list, gas_used: U256::from(gas_used), error }
                 }
