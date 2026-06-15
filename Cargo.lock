@@ -5120,6 +5120,7 @@ dependencies = [
  "eyre",
  "mantle-reth-chainspec",
  "mantle-reth-rpc-ext",
+ "metrics",
  "op-alloy-consensus",
  "reth-chainspec",
  "reth-cli",
