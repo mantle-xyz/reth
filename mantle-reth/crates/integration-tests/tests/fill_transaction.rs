@@ -6,7 +6,6 @@
 //! response is structurally complete and internally consistent.
 
 use crate::helpers::{mantle_payload_attributes, mantle_test_chain_spec};
-use alloy_primitives::U256;
 use jsonrpsee::core::client::ClientT;
 use mantle_reth_cli::node::MantleNode;
 use reth_chainspec::EthChainSpec;
@@ -82,6 +81,24 @@ fn hex_u128(v: &Value, key: &str) -> u128 {
         .unwrap_or_else(|_| panic!("field `{key}` is not hex: {s}"))
 }
 
+/// Reads `baseFeePerGas` of the latest block.
+///
+/// `fill_transaction` derives `maxFeePerGas` from `latest_header()` (see
+/// `transaction.rs`), so the latest block — not `pending` — is the value to compare
+/// against. With London active at genesis and no `baseFeePerGas` in the genesis JSON,
+/// the genesis block (the latest, since these tests don't mine) carries the non-zero
+/// `INITIAL_BASE_FEE`, which makes the `* 2` factor observable.
+async fn latest_base_fee(client: &jsonrpsee::http_client::HttpClient) -> u128 {
+    let block: Value = client
+        .request(
+            "eth_getBlockByNumber",
+            vec![serde_json::json!("latest"), serde_json::json!(false)],
+        )
+        .await
+        .expect("eth_getBlockByNumber latest should succeed");
+    hex_u128(&block, "baseFeePerGas")
+}
+
 /// A minimal request (only `from`/`to`) gets every default populated, and `raw` is non-empty.
 #[tokio::test]
 async fn fill_transaction_populates_all_defaults() {
@@ -110,12 +127,15 @@ async fn fill_transaction_populates_all_defaults() {
         // gas estimated to at least the intrinsic cost of a transfer.
         assert!(hex_u128(tx, "gas") >= 21_000, "gas estimated >= 21000");
 
-        // EIP-1559 fee fields are filled and consistent: maxFee >= priorityFee * 2.
-        let max_fee = hex_u128(tx, "maxFeePerGas");
-        let max_prio = hex_u128(tx, "maxPriorityFeePerGas");
-        assert!(
-            max_fee >= max_prio * 2,
-            "maxFeePerGas ({max_fee}) >= maxPriorityFeePerGas ({max_prio})"
+        // EIP-1559 fees: maxPriorityFeePerGas defaults to the suggested tip, and
+        // maxFeePerGas must be exactly base_fee * 2 + tip (the formula under test).
+        let base_fee = latest_base_fee(&client).await;
+        assert_ne!(base_fee, 0, "base_fee must be non-zero so the *2 factor is observable");
+        let tip = hex_u128(tx, "maxPriorityFeePerGas");
+        assert_eq!(
+            hex_u128(tx, "maxFeePerGas"),
+            base_fee * 2 + tip,
+            "maxFeePerGas should equal base_fee*2 + tip (base_fee={base_fee}, tip={tip})"
         );
     })
     .await;
@@ -139,8 +159,8 @@ async fn fill_transaction_respects_supplied_nonce() {
     .await;
 }
 
-/// When only the priority fee is given, `maxFeePerGas` is derived (`base_fee` * 2 + tip)
-/// and must be >= the supplied tip.
+/// When only the priority fee is given, `maxFeePerGas` is derived as exactly
+/// `base_fee` * 2 + tip.
 #[tokio::test]
 async fn fill_transaction_derives_max_fee_from_priority_fee() {
     with_rpc_client(|client| async move {
@@ -159,11 +179,19 @@ async fn fill_transaction_derives_max_fee_from_priority_fee() {
 
         let tx = resp.get("tx").expect("tx present");
         assert_eq!(hex_u128(tx, "maxPriorityFeePerGas"), tip, "supplied tip preserved");
-        assert!(hex_u128(tx, "maxFeePerGas") >= tip, "maxFeePerGas derived to cover the tip");
+
+        // maxFeePerGas must be exactly base_fee * 2 + tip. The old `base_fee + tip`
+        // behavior would fail this assertion because base_fee is non-zero.
+        let base_fee = latest_base_fee(&client).await;
+        assert_ne!(base_fee, 0, "base_fee must be non-zero so the *2 factor is observable");
+        assert_eq!(
+            hex_u128(tx, "maxFeePerGas"),
+            base_fee * 2 + tip,
+            "maxFeePerGas should equal base_fee*2 + tip (base_fee={base_fee}, tip={tip})"
+        );
 
         // Sanity: the value default still applies alongside fee filling.
         assert_eq!(hex_u128(tx, "value"), 0, "value defaults to 0");
-        let _ = U256::ZERO; // keep U256 import meaningful if assertions change
     })
     .await;
 }
