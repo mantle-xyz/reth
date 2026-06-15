@@ -14,4 +14,7 @@ pub use node::{MantleNode, MantleNodeComponentBuilder, MantlePoolBuilder, Mantle
 
 pub mod version;
 
+pub mod metrics_seed;
+pub use metrics_seed::seed_blockchain_tree_metrics;
+
 pub use reth_optimism_node::OpNode;
