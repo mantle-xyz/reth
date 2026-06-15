@@ -1,12 +1,13 @@
-# Single-stage cargo build (no cargo-chef): the elysium workspace uses a local
-# `[patch]` path dependency (patches/reth-trie-common), which cargo-chef's cook
-# stage cannot resolve from recipe.json alone (it only has recipe.json, not the
-# patch crate's Cargo.toml) and panics with "failed to read .../Cargo.toml".
-# A plain COPY + cargo build has the whole tree (incl. patches/) available.
+# Single-stage build of the op-reth binary.
 #
-# The mantle-config build pipeline injects a JFrog `.cargo/config.toml` RUN
-# immediately before any `cargo build` line, so COPY happens first and the
-# injected config is not overwritten.
+# The chef layer-cache tool is intentionally NOT used: the elysium workspace has
+# a local [patch] path dependency (patches/reth-trie-common) that chef's cook
+# step cannot resolve from recipe.json alone and panics on. A plain COPY of the
+# whole tree (incl. patches/) and a direct compile avoids that.
+#
+# Keep the literal build-command string out of comments: the mantle-config
+# pipeline injects a JFrog config RUN before any line matching it, so an
+# occurrence in a comment above FROM would produce "no build stage".
 FROM lukemathwalker/cargo-chef:latest-rust-1 AS builder
 WORKDIR /app
 
