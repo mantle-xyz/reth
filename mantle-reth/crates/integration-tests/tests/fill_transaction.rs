@@ -114,7 +114,7 @@ async fn fill_transaction_populates_all_defaults() {
         let max_fee = hex_u128(tx, "maxFeePerGas");
         let max_prio = hex_u128(tx, "maxPriorityFeePerGas");
         assert!(
-            max_fee >= max_prio,
+            max_fee >= max_prio * 2,
             "maxFeePerGas ({max_fee}) >= maxPriorityFeePerGas ({max_prio})"
         );
     })
