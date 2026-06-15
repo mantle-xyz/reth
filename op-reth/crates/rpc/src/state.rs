@@ -1,6 +1,6 @@
 //! State provider factory for OP Proofs ExEx.
 
-use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_eips::BlockId;
 use derive_more::Constructor;
 use jsonrpsee_types::error::ErrorObject;
 use reth_optimism_trie::{
