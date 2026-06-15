@@ -1,4 +1,13 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+# Single-stage cargo build (no cargo-chef): the elysium workspace uses a local
+# `[patch]` path dependency (patches/reth-trie-common), which cargo-chef's cook
+# stage cannot resolve from recipe.json alone (it only has recipe.json, not the
+# patch crate's Cargo.toml) and panics with "failed to read .../Cargo.toml".
+# A plain COPY + cargo build has the whole tree (incl. patches/) available.
+#
+# The mantle-config build pipeline injects a JFrog `.cargo/config.toml` RUN
+# immediately before any `cargo build` line, so COPY happens first and the
+# injected config is not overwritten.
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS builder
 WORKDIR /app
 
 LABEL org.opencontainers.image.source=https://github.com/mantle-xyz/reth
@@ -6,27 +15,18 @@ LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
 
-# Builds a cargo-chef plan
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
-
 ARG BUILD_PROFILE=release
 ENV BUILD_PROFILE=$BUILD_PROFILE
 
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS="$RUSTFLAGS"
 
-# Mantle op-reth is the `mantle-reth-cli` package (new elysium workspace layout).
+# Mantle op-reth is the `mantle-reth-cli` package (elysium workspace layout).
 ARG FEATURES="jemalloc asm-keccak min-debug-logs"
 ENV FEATURES=$FEATURES
 
-RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json --manifest-path /app/mantle-reth/crates/cli/Cargo.toml
-
 COPY . .
+
 RUN cargo build --profile $BUILD_PROFILE --features "$FEATURES" --bin op-reth --manifest-path /app/mantle-reth/crates/cli/Cargo.toml
 
 RUN ls -la /app/target/$BUILD_PROFILE/op-reth
