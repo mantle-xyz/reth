@@ -110,7 +110,7 @@ async fn fill_transaction_populates_all_defaults() {
         // gas estimated to at least the intrinsic cost of a transfer.
         assert!(hex_u128(tx, "gas") >= 21_000, "gas estimated >= 21000");
 
-        // EIP-1559 fee fields are filled and consistent: maxFee >= priorityFee.
+        // EIP-1559 fee fields are filled and consistent: maxFee >= priorityFee * 2.
         let max_fee = hex_u128(tx, "maxFeePerGas");
         let max_prio = hex_u128(tx, "maxPriorityFeePerGas");
         assert!(
@@ -139,7 +139,7 @@ async fn fill_transaction_respects_supplied_nonce() {
     .await;
 }
 
-/// When only the priority fee is given, `maxFeePerGas` is derived (base_fee * 2 + tip)
+/// When only the priority fee is given, `maxFeePerGas` is derived (`base_fee` * 2 + tip)
 /// and must be >= the supplied tip.
 #[tokio::test]
 async fn fill_transaction_derives_max_fee_from_priority_fee() {

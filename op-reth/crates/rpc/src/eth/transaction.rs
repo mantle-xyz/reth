@@ -1,7 +1,10 @@
 //! Loads and formats OP transaction RPC response.
 
 use crate::{OpEthApi, OpEthApiError, SequencerClient};
-use alloy_primitives::{B256, U256, Bytes};
+use alloy_consensus::BlockHeader;
+use alloy_eips::{BlockId, Encodable2718};
+use alloy_network::{TransactionBuilder, TransactionBuilder4844};
+use alloy_primitives::{B256, Bytes, U256};
 use alloy_rpc_types_eth::TransactionInfo;
 use futures::StreamExt;
 use op_alloy_consensus::{
@@ -10,21 +13,24 @@ use op_alloy_consensus::{
 };
 use reth_chain_state::CanonStateSubscriptions;
 use reth_optimism_primitives::DepositReceipt;
-use reth_primitives_traits::{Recovered, SignedTransaction, SignerRecoverable, WithEncoded, TxTy};
+use reth_primitives_traits::{Recovered, SignedTransaction, SignerRecoverable, TxTy, WithEncoded};
+use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
-    EthApiTypes, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore, RpcReceipt,
-    TxInfoMapper,
-    helpers::{EthApiSpec, EthTransactions, LoadBlock, LoadFee, LoadReceipt,LoadState, LoadTransaction, SpawnBlocking, estimate::EstimateCall, spec::SignersForRpc},
+    EthApiTypes, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore, RpcReceipt, TxInfoMapper,
+    helpers::{
+        EthApiSpec, EthTransactions, LoadBlock, LoadFee, LoadReceipt, LoadState, LoadTransaction,
+        SpawnBlocking, estimate::EstimateCall, spec::SignersForRpc,
+    },
 };
-use reth_rpc_eth_types::{EthApiError, TransactionSource, block::convert_transaction_receipt, FillTransaction};
-use reth_storage_api::{ProviderTx, ReceiptProvider, TransactionsProvider, errors::ProviderError, BlockReaderIdExt};
+use reth_rpc_eth_types::{
+    EthApiError, FillTransaction, TransactionSource, block::convert_transaction_receipt,
+};
+use reth_storage_api::{
+    BlockReaderIdExt, ProviderTx, ReceiptProvider, TransactionsProvider, errors::ProviderError,
+};
 use reth_transaction_pool::{
     AddedTransactionOutcome, PoolPooledTx, PoolTransaction, TransactionOrigin, TransactionPool,
 };
-use reth_rpc_convert::RpcTxReq;
-use alloy_eips::{BlockId, Encodable2718};
-use alloy_network::{TransactionBuilder, TransactionBuilder4844};
-use alloy_consensus::BlockHeader;
 use std::{
     fmt::{Debug, Formatter},
     future::Future,
@@ -37,8 +43,7 @@ where
     N: RpcNodeCore,
     OpEthApiError: FromEvmError<N::Evm>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
-    <Self as EthApiTypes>::RpcConvert:
-        RpcConvert<Primitives = <Self as RpcNodeCore>::Primitives>,
+    <Self as EthApiTypes>::RpcConvert: RpcConvert<Primitives = <Self as RpcNodeCore>::Primitives>,
 {
     fn signers(&self) -> &SignersForRpc<Self::Provider, Self::NetworkTypes> {
         self.inner.eth_api.signers()
@@ -190,69 +195,64 @@ where
     }
 
     /// Fills the defaults on a given unsigned transaction.
-    fn fill_transaction(
+    async fn fill_transaction(
         &self,
         mut request: RpcTxReq<Self::NetworkTypes>,
-    ) -> impl Future<Output = Result<FillTransaction<TxTy<Self::Primitives>>, Self::Error>> + Send
+    ) -> Result<FillTransaction<TxTy<Self::Primitives>>, Self::Error>
     where
         Self: EthApiSpec + LoadBlock + EstimateCall + LoadFee,
     {
-        async move {
-            if request.as_ref().value().is_none() {
-                request.as_mut().set_value(U256::ZERO);
-            }
-
-            if request.as_ref().nonce().is_none() {
-                let nonce = self.next_available_nonce_for(&request).await?;
-                request.as_mut().set_nonce(nonce);
-            }
-
-            let chain_id = self.chain_id();
-            request.as_mut().set_chain_id(chain_id.to());
-
-            if request.as_ref().has_eip4844_fields() &&
-                request.as_ref().max_fee_per_blob_gas().is_none()
-            {
-                let blob_fee = self.blob_base_fee().await?;
-                request.as_mut().set_max_fee_per_blob_gas(blob_fee.to());
-            }
-
-            // Use `sidecar.is_some()` instead of `blob_sidecar().is_some()` to handle
-            // both EIP-4844 (v0) and EIP-7594 (v1) sidecar formats
-            if request.as_ref().sidecar.is_some() &&
-                request.as_ref().blob_versioned_hashes.is_none()
-            {
-                request.as_mut().populate_blob_hashes();
-            }
-
-            if request.as_ref().gas_limit().is_none() {
-                let estimated_gas =
-                    self.estimate_gas_at(request.clone(), BlockId::pending(), None).await?;
-                request.as_mut().set_gas_limit(estimated_gas.to());
-            }
-
-            if request.as_ref().gas_price().is_none() {
-                let tip = if let Some(tip) = request.as_ref().max_priority_fee_per_gas() {
-                    tip
-                } else {
-                    let tip = self.suggested_priority_fee().await?.to::<u128>();
-                    request.as_mut().set_max_priority_fee_per_gas(tip);
-                    tip
-                };
-                if request.as_ref().max_fee_per_gas().is_none() {
-                    let header =
-                        self.provider().latest_header().map_err(Self::Error::from_eth_err)?;
-                    let base_fee = header.and_then(|h| h.base_fee_per_gas()).unwrap_or_default();
-                    request.as_mut().set_max_fee_per_gas(base_fee as u128 * 2 + tip);
-                }
-            }
-
-            let tx = self.converter().build_simulate_v1_transaction(request)?;
-
-            let raw = tx.encoded_2718().into();
-
-            Ok(FillTransaction { raw, tx })
+        if request.as_ref().value().is_none() {
+            request.as_mut().set_value(U256::ZERO);
         }
+
+        if request.as_ref().nonce().is_none() {
+            let nonce = self.next_available_nonce_for(&request).await?;
+            request.as_mut().set_nonce(nonce);
+        }
+
+        let chain_id = self.chain_id();
+        request.as_mut().set_chain_id(chain_id.to());
+
+        if request.as_ref().has_eip4844_fields() &&
+            request.as_ref().max_fee_per_blob_gas().is_none()
+        {
+            let blob_fee = self.blob_base_fee().await?;
+            request.as_mut().set_max_fee_per_blob_gas(blob_fee.to());
+        }
+
+        // Use `sidecar.is_some()` instead of `blob_sidecar().is_some()` to handle
+        // both EIP-4844 (v0) and EIP-7594 (v1) sidecar formats
+        if request.as_ref().sidecar.is_some() && request.as_ref().blob_versioned_hashes.is_none() {
+            request.as_mut().populate_blob_hashes();
+        }
+
+        if request.as_ref().gas_limit().is_none() {
+            let estimated_gas =
+                self.estimate_gas_at(request.clone(), BlockId::pending(), None).await?;
+            request.as_mut().set_gas_limit(estimated_gas.to());
+        }
+
+        if request.as_ref().gas_price().is_none() {
+            let tip = if let Some(tip) = request.as_ref().max_priority_fee_per_gas() {
+                tip
+            } else {
+                let tip = self.suggested_priority_fee().await?.to::<u128>();
+                request.as_mut().set_max_priority_fee_per_gas(tip);
+                tip
+            };
+            if request.as_ref().max_fee_per_gas().is_none() {
+                let header = self.provider().latest_header().map_err(Self::Error::from_eth_err)?;
+                let base_fee = header.and_then(|h| h.base_fee_per_gas()).unwrap_or_default();
+                request.as_mut().set_max_fee_per_gas(base_fee as u128 * 2 + tip);
+            }
+        }
+
+        let tx = self.converter().build_simulate_v1_transaction(request)?;
+
+        let raw = tx.encoded_2718().into();
+
+        Ok(FillTransaction { raw, tx })
     }
 }
 
