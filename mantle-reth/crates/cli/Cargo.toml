@@ -54,6 +54,7 @@ op-alloy-consensus.workspace = true
 # async / misc
 eyre.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+metrics.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -1,7 +1,7 @@
 #![allow(missing_docs, rustdoc::missing_crate_level_docs)]
 
 use clap::Parser;
-use mantle_reth_cli::{MantleChainSpecParser, MantleNode};
+use mantle_reth_cli::{seed_blockchain_tree_metrics, MantleChainSpecParser, MantleNode};
 use reth_optimism_node::args::RollupArgs;
 use tracing::info;
 
@@ -25,7 +25,14 @@ fn main() {
     if let Err(err) = reth_optimism_cli::Cli::<MantleChainSpecParser, RollupArgs>::parse().run(
         async move |builder, args| {
             info!(target: "reth::cli", "Launching Mantle node");
-            let handle = builder.node(MantleNode::new(args)).launch().await?;
+            let handle = builder
+                .node(MantleNode::new(args))
+                .on_node_started(|full_node| {
+                    seed_blockchain_tree_metrics(&full_node.provider);
+                    Ok(())
+                })
+                .launch()
+                .await?;
             handle.node_exit_future.await
         },
     ) {
