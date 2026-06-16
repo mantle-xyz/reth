@@ -22,6 +22,9 @@ tokio = { workspace = true, features = ["sync", "macros", "time"] }
 # Error handling
 thiserror.workspace = true
 
+# Tracing
+tracing.workspace = true
+
 # Serde
 serde = { workspace = true, features = ["derive", "std"] }
 

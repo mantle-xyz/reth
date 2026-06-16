@@ -158,9 +158,7 @@ pub enum PreconfConfigError {
     InvalidPreconfMaxGasPerBlock,
     /// `preconf_max_gas_per_block < preconf_max_gas_per_tx` — a single tx
     /// could never fit the block budget.
-    #[error(
-        "preconf_max_gas_per_block ({block}) must be >= preconf_max_gas_per_tx ({per_tx})"
-    )]
+    #[error("preconf_max_gas_per_block ({block}) must be >= preconf_max_gas_per_tx ({per_tx})")]
     BlockBudgetSmallerThanPerTx {
         /// Configured per-block budget.
         block: u64,

@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed by
 /// `mantle-reth-rpc-ext` and op-geth `core/preconf_status.go` semantics.
 ///
-/// State machine (`mark_terminal` / `recover_from_timeout`):
+/// State machine (`mark_succeeded` / `mark_failed` / `mark_timeout`
+/// / `recover_from_timeout`):
 ///
 /// ```text
 ///                  ┌──→ Success    (terminal)
@@ -80,7 +81,8 @@ pub enum AttachError {
     AlreadyAttached,
 }
 
-/// Errors returned by [`crate::preconf_tx_set::PreconfTxSet::mark_terminal`].
+/// Errors returned by `PreconfTxSet::mark_succeeded` / `mark_failed`
+/// / `mark_timeout` — all share the same `Waiting → target` CAS body.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarkError {
     /// Entry no longer present — safe to ignore (terminal signal is best-effort).
