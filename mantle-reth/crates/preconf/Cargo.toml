@@ -1,0 +1,29 @@
+[package]
+name = "mantle-reth-preconf"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Mantle preconfirmation core types for op-reth"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Alloy
+alloy-primitives = { workspace = true, features = ["std", "serde"] }
+alloy-consensus = { workspace = true, features = ["std"] }
+
+# Async runtime + sync primitives
+tokio = { workspace = true, features = ["sync", "macros", "time"] }
+
+# Error handling
+thiserror.workspace = true
+
+# Serde
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "test-util"] }

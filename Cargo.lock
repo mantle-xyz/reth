@@ -5210,6 +5210,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-reth-preconf"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "mantle-reth-rpc-ext"
 version = "0.1.0"
 dependencies = [
