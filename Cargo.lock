@@ -5214,7 +5214,10 @@ name = "mantle-reth-preconf"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-evm",
  "alloy-primitives",
+ "reth-evm",
+ "reth-revm",
  "serde",
  "thiserror 2.0.18",
  "tokio",

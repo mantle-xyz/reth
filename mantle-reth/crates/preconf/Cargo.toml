@@ -16,6 +16,17 @@ workspace = true
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
 alloy-consensus = { workspace = true, features = ["std"] }
 
+# revm — for the builder's State / CacheState / TransitionState carry-forward
+# helpers in `builder::state_carry`. Re-exports from reth-revm so we stay
+# version-aligned with the rest of the reth payload-building stack.
+reth-revm = { workspace = true, features = ["std"] }
+
+# reth-evm — for the BlockBuilder / ExecutorTx traits used by apply_preconf_tx
+reth-evm.workspace = true
+
+# alloy-evm — for the TxResult trait + ExecutionResult re-exports
+alloy-evm.workspace = true
+
 # Async runtime + sync primitives
 tokio = { workspace = true, features = ["sync", "macros", "time"] }
 
