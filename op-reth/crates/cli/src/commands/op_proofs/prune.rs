@@ -64,8 +64,10 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> PruneCommand<C> {
         info!(target: "reth::cli", "reth {} starting", version_metadata().short_version);
         info!(target: "reth::cli", "Pruning OP proofs storage at: {:?}", self.storage_path);
 
-        // Initialize the environment with read-only access
-        let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO, runtime)?;
+        // Initialize the environment with read-only access. We use `RoInconsistent` to skip the
+        // static-file/database consistency check.
+        let Environment { provider_factory, .. } =
+            self.env.init::<N>(AccessRights::RoInconsistent, runtime)?;
 
         match self.storage_version {
             ProofsStorageVersion::V1 => {
@@ -104,23 +106,16 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> PruneCommand<C> {
         proofs_history_window: u64,
         prune_batch_size: u64,
     ) -> eyre::Result<()> {
-        let provider_ro = storage.provider_ro()?;
-        let earliest_block = provider_ro.get_earliest_block_number()?;
-        let latest_block = provider_ro.get_latest_block_number()?;
+        let window = storage.provider_ro()?.get_proof_window()?;
         info!(
             target: "reth::cli",
-            ?earliest_block,
-            ?latest_block,
+            earliest_block = ?window.earliest,
+            latest_block = ?window.latest,
             "Current proofs storage block range"
         );
-        drop(provider_ro);
 
-        let pruner = OpProofStoragePruner::new(
-            storage,
-            block_hash_reader,
-            proofs_history_window,
-            prune_batch_size,
-        );
+        let pruner = OpProofStoragePruner::new(storage, block_hash_reader, proofs_history_window)
+            .with_batch_size(prune_batch_size);
         pruner.run();
         Ok(())
     }
