@@ -2,8 +2,8 @@
 
 use crate::{
     InvalidCrossTx,
-    supervisor::{
-        ExecutingDescriptor, InteropTxValidatorError, metrics::SupervisorMetrics,
+    interop_filter::{
+        ExecutingDescriptor, InteropTxValidatorError, metrics::InteropMetrics,
         parse_access_list_items_to_inbox_entries,
     },
 };
@@ -29,27 +29,23 @@ use std::{
 };
 use tracing::trace;
 
-/// Supervisor hosted by op-labs
-// TODO: This should be changed to actual supervisor url
-pub const DEFAULT_SUPERVISOR_URL: &str = "http://localhost:1337/";
-
 /// The default request timeout to use
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Implementation of the supervisor trait for the interop.
+/// Client for interop filter RPC requests.
 #[derive(Debug, Clone)]
-pub struct SupervisorClient {
+pub struct InteropFilterClient {
     /// Stores type's data.
-    inner: Arc<SupervisorClientInner>,
+    inner: Arc<InteropFilterClientInner>,
 }
 
-impl SupervisorClient {
-    /// Returns a new [`SupervisorClientBuilder`].
+impl InteropFilterClient {
+    /// Returns a new [`InteropFilterClientBuilder`].
     pub fn builder(
-        supervisor_endpoint: impl Into<String>,
+        interop_endpoint: impl Into<String>,
         chain_id: u64,
-    ) -> SupervisorClientBuilder {
-        SupervisorClientBuilder::new(supervisor_endpoint, chain_id)
+    ) -> InteropFilterClientBuilder {
+        InteropFilterClientBuilder::new(interop_endpoint, chain_id)
     }
 
     /// Returns the configured request timeout.
@@ -57,12 +53,12 @@ impl SupervisorClient {
         self.inner.timeout
     }
 
-    /// Returns configured minimum safety level. See [`SupervisorClient`].
+    /// Returns configured minimum safety level. See [`InteropFilterClient`].
     pub fn safety(&self) -> SafetyLevel {
         self.inner.safety
     }
 
-    /// Executes a `supervisor_checkAccessList` with the configured safety level.
+    /// Executes an `interop_checkAccessList` with the configured safety level.
     pub fn check_access_list<'a>(
         &self,
         inbox_entries: &'a [B256],
@@ -78,8 +74,8 @@ impl SupervisorClient {
         }
     }
 
-    /// Extracts commitment from access list entries, pointing to 0x420..022 and validates them
-    /// against supervisor.
+    /// Extracts commitments from access list entries pointing to the cross-L2 inbox and validates
+    /// them against the interop filter.
     ///
     /// If commitment present pre-interop tx rejected.
     ///
@@ -135,6 +131,14 @@ impl SupervisorClient {
         self.inner.failsafe_enabled.load(Ordering::Acquire)
     }
 
+    /// Applies a freshly polled failsafe state to the cached flag (read live by the admission
+    /// fast-path and the block-event handler) and the gauge. Split out of [`Self::query_failsafe`]
+    /// so the live, restart-free state transition can be exercised in tests without an RPC.
+    pub(crate) fn apply_failsafe_state(&self, enabled: bool) {
+        self.inner.failsafe_enabled.store(enabled, Ordering::Release);
+        self.inner.metrics.set_failsafe_enabled(enabled);
+    }
+
     /// Queries the interop filter for failsafe state and caches the result.
     /// Calls `admin_getFailsafeEnabled` RPC.
     pub async fn query_failsafe(&self) -> Result<bool, InteropTxValidatorError> {
@@ -146,19 +150,19 @@ impl SupervisorClient {
         .map_err(|_| InteropTxValidatorError::Timeout(self.inner.timeout.as_secs()))?
         .map_err(InteropTxValidatorError::from_json_rpc)?;
 
-        self.inner.failsafe_enabled.store(result, Ordering::Release);
+        self.apply_failsafe_state(result);
         Ok(result)
     }
 
-    /// Creates a stream that revalidates interop transactions against the supervisor.
+    /// Creates a stream that revalidates interop transactions against the interop filter.
     /// Returns
     /// An implementation of `Stream` that is `Send`-able and tied to the lifetime `'a` of `self`.
     /// Each item yielded by the stream is a tuple `(TItem, Option<Result<(), InvalidCrossTx>>)`.
     ///   - The first element is the original `TItem` that was revalidated.
     ///   - The second element is the `Option<Result<(), InvalidCrossTx>>` describes the outcome
     ///     - `None`: Transaction was not identified as a cross-chain candidate by initial checks.
-    ///     - `Some(Ok(()))`: Supervisor confirmed the transaction is valid.
-    ///     - `Some(Err(InvalidCrossTx))`: Supervisor indicated the transaction is invalid.
+    ///     - `Some(Ok(()))`: Interop filter confirmed the transaction is valid.
+    ///     - `Some(Err(InvalidCrossTx))`: Interop filter indicated the transaction is invalid.
     pub fn revalidate_interop_txs_stream<'a, TItem, InputIter>(
         &'a self,
         txs_to_revalidate: InputIter,
@@ -193,9 +197,9 @@ impl SupervisorClient {
     }
 }
 
-/// Holds supervisor data. Inner type of [`SupervisorClient`].
+/// Holds interop RPC data. Inner type of [`InteropFilterClient`].
 #[derive(Debug)]
-pub(crate) struct SupervisorClientInner {
+pub(crate) struct InteropFilterClientInner {
     client: ReqwestClient,
     /// The chain ID of the executing chain
     chain_id: u64,
@@ -203,16 +207,16 @@ pub(crate) struct SupervisorClientInner {
     safety: SafetyLevel,
     /// The default request timeout
     timeout: Duration,
-    /// Metrics for tracking supervisor operations
-    metrics: SupervisorMetrics,
+    /// Metrics for tracking interop RPC operations.
+    metrics: InteropMetrics,
     /// Cached failsafe state, polled by the background failsafe task.
     failsafe_enabled: AtomicBool,
 }
 
-/// Builds [`SupervisorClient`].
+/// Builds [`InteropFilterClient`].
 #[derive(Debug)]
-pub struct SupervisorClientBuilder {
-    /// Supervisor server's socket.
+pub struct InteropFilterClientBuilder {
+    /// Interop filter RPC endpoint.
     endpoint: String,
     /// The chain ID of the executing chain.
     chain_id: u64,
@@ -225,11 +229,11 @@ pub struct SupervisorClientBuilder {
     safety: SafetyLevel,
 }
 
-impl SupervisorClientBuilder {
+impl InteropFilterClientBuilder {
     /// Creates a new builder.
-    pub fn new(supervisor_endpoint: impl Into<String>, chain_id: u64) -> Self {
+    pub fn new(interop_endpoint: impl Into<String>, chain_id: u64) -> Self {
         Self {
-            endpoint: supervisor_endpoint.into(),
+            endpoint: interop_endpoint.into(),
             chain_id,
             timeout: DEFAULT_REQUEST_TIMEOUT,
             safety: SafetyLevel::CrossUnsafe,
@@ -248,29 +252,29 @@ impl SupervisorClientBuilder {
         self
     }
 
-    /// Creates a new supervisor validator.
-    pub async fn build(self) -> SupervisorClient {
+    /// Creates a new interop RPC client.
+    pub async fn build(self) -> InteropFilterClient {
         let Self { endpoint, chain_id, timeout, safety } = self;
 
         let client = ReqwestClient::builder()
             .connect(endpoint.as_str())
             .await
-            .expect("building supervisor client");
+            .expect("building interop filter client");
 
-        SupervisorClient {
-            inner: Arc::new(SupervisorClientInner {
+        InteropFilterClient {
+            inner: Arc::new(InteropFilterClientInner {
                 client,
                 chain_id,
                 safety,
                 timeout,
-                metrics: SupervisorMetrics::default(),
+                metrics: InteropMetrics::default(),
                 failsafe_enabled: AtomicBool::new(false),
             }),
         }
     }
 }
 
-/// A Request future that issues a `supervisor_checkAccessList` request.
+/// A Request future that issues an `interop_checkAccessList` request.
 #[derive(Debug, Clone)]
 pub struct CheckAccessListRequest<'a> {
     client: ReqwestClient,
@@ -278,7 +282,7 @@ pub struct CheckAccessListRequest<'a> {
     executing_descriptor: ExecutingDescriptor,
     timeout: Duration,
     safety: SafetyLevel,
-    metrics: SupervisorMetrics,
+    metrics: InteropMetrics,
 }
 
 impl<'a> CheckAccessListRequest<'a> {
@@ -307,16 +311,59 @@ impl<'a> IntoFuture for CheckAccessListRequest<'a> {
             let result = tokio::time::timeout(
                 timeout,
                 client.request(
-                    "supervisor_checkAccessList",
+                    "interop_checkAccessList",
                     (inbox_entries, safety, executing_descriptor),
                 ),
             )
             .await;
-            metrics.record_supervisor_query(start.elapsed());
+            metrics.record_interop_query(start.elapsed());
 
             result
                 .map_err(|_| InteropTxValidatorError::Timeout(timeout.as_secs()))?
                 .map_err(InteropTxValidatorError::from_json_rpc)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interop_filter::CROSS_L2_INBOX_ADDRESS;
+    use alloy_eips::eip2930::AccessListItem;
+
+    async fn test_client() -> InteropFilterClient {
+        InteropFilterClient::builder("http://localhost:8545", 1).build().await
+    }
+
+    /// An access list that marks the tx as cross-chain (one entry targeting the cross-L2 inbox).
+    fn interop_access_list() -> AccessList {
+        AccessList(vec![AccessListItem {
+            address: CROSS_L2_INBOX_ADDRESS,
+            storage_keys: vec![B256::ZERO],
+        }])
+    }
+
+    /// The failsafe gate is a live, runtime-mutable flag: enabling it rejects interop txs on the
+    /// fast-path (no RPC), and clearing it flips the gate back in-process — so admission resumes
+    /// without restarting reth. This is the property the `poll_failsafe` loop relies on.
+    #[tokio::test]
+    async fn failsafe_gate_is_live_and_resumes_without_restart() {
+        let client = test_client().await;
+        let access_list = interop_access_list();
+        let hash = TxHash::ZERO;
+
+        // Filter signals failsafe enabled -> admission fast-path rejects immediately, no RPC.
+        client.apply_failsafe_state(true);
+        assert!(client.is_failsafe_enabled());
+        let outcome = client.is_valid_cross_tx(Some(&access_list), &hash, 0, None, true).await;
+        assert!(
+            matches!(outcome, Some(Err(InvalidCrossTx::FailsafeEnabled))),
+            "failsafe-enabled interop tx should be rejected on the fast-path, got {outcome:?}"
+        );
+
+        // Filter clears failsafe -> the cached gate flips back in-process on the next poll, so
+        // interop admission resumes without restarting the execution layer.
+        client.apply_failsafe_state(false);
+        assert!(!client.is_failsafe_enabled(), "failsafe gate must clear at runtime, no restart");
     }
 }

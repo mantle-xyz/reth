@@ -9,12 +9,13 @@ use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_node::args::ProofsStorageVersion;
 use reth_optimism_primitives::OpPrimitives;
 use reth_optimism_trie::{
-    InitializationJob, OpProofsProviderRO, OpProofsStore, RethTrieStorageLayout,
+    InitializationJob, OpProofsProviderRO, OpProofsStorageError, OpProofsStore,
+    RethTrieStorageLayout,
     db::{MdbxProofsStorage, MdbxProofsStorageV2},
 };
 use reth_provider::{BlockNumReader, DBProvider, DatabaseProviderFactory, StorageSettingsCache};
 use std::{path::PathBuf, sync::Arc};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Initializes the proofs storage with the current state of the chain.
 ///
@@ -54,8 +55,10 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitCommand<C> {
         info!(target: "reth::cli", "reth {} starting", version_metadata().short_version);
         info!(target: "reth::cli", "Initializing OP proofs storage at: {:?}", self.storage_path);
 
-        // Initialize the environment with read-only access
-        let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO, runtime)?;
+        // Initialize the environment with read-only access. We use `RoInconsistent` to skip the
+        // static-file/database consistency check.
+        let Environment { provider_factory, .. } =
+            self.env.init::<N>(AccessRights::RoInconsistent, runtime)?;
 
         // Create the proofs storage without the metrics wrapper.
         // During initialization we write billions of entries; the metrics layer's
@@ -90,16 +93,20 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitCommand<C> {
         F::Provider: DBProvider,
     {
         // Check if already initialized
-        if let Some((block_number, block_hash)) =
-            storage.provider_ro()?.get_earliest_block_number()?
-        {
-            info!(
-                target: "reth::cli",
-                block_number = block_number,
-                block_hash = ?block_hash,
-                "Proofs storage already initialized"
-            );
-            return Ok(());
+        match storage.provider_ro()?.get_earliest_block() {
+            Ok(anchor) => {
+                info!(
+                    target: "reth::cli",
+                    block_number = anchor.number,
+                    block_hash = ?anchor.hash,
+                    "Proofs storage already initialized"
+                );
+                return Ok(());
+            }
+            Err(OpProofsStorageError::NoBlocksFound) => {
+                debug!(target: "reth::cli", "Proofs storage is empty; starting initialization");
+            }
+            Err(err) => return Err(err.into()),
         }
 
         // Get the current chain state
