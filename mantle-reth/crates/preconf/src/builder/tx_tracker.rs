@@ -6,7 +6,8 @@
 //! - the preconf fifo broadcast (event-driven, may also fire from
 //!   `broadcast::Receiver::Lagged` reconcile-via-snapshot)
 //! - the pool sweep arm (normal-path `best_transactions`)
-//! - Phase 1 replay of journaled / forwarded entries on job startup
+//! - the start-of-job replay of any commitments that accumulated in the
+//!   fifo while no payload job was active
 //!
 //! `BuilderTxTracker` records the set of hashes that have already been
 //! committed to the block-under-construction or deliberately excluded from

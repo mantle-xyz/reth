@@ -47,6 +47,27 @@ reth-primitives-traits.workspace = true
 # `TxEnvelope` and drops Deposit / PostExec variants
 op-alloy-consensus.workspace = true
 
+# reth storage — RPC handler reads on-chain account nonce via
+# `StateProviderFactory::latest()` + `StateProvider::account_nonce` to compute
+# the pending nonce floor for the nonce-gap pre-check.
+reth-storage-api.workspace = true
+
+# reth-chain-state — `CanonStateSubscriptions` + `CanonStateNotification`
+# stream consumed by the canonical-state handler.
+reth-chain-state.workspace = true
+
+# reth-execution-types — `Chain` type referenced by the canon handler's
+# reorg observation helper.
+reth-execution-types.workspace = true
+
+# reth rpc / jsonrpsee — RPC handler returns `RpcResult<PreconfTxEvent>`.
+mantle-reth-rpc-ext.workspace = true
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+async-trait.workspace = true
+
+# raw-tx decoding helper used by the RPC handler
+reth-rpc-eth-types.workspace = true
+
 # Async runtime + sync primitives
 tokio = { workspace = true, features = ["sync", "macros", "time"] }
 

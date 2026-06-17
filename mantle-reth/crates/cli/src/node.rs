@@ -91,8 +91,8 @@ pub struct MantlePoolBuilder<T = OpPooledTransaction> {
 }
 
 /// Preconf wiring bundle held by [`MantlePoolBuilder`]. Constructed and
-/// owned by the higher-level service builder (P5); the pool builder only
-/// needs the shared handles.
+/// owned by the preconf service builder; the pool builder only needs the
+/// shared handles.
 #[derive(Debug, Clone)]
 pub struct PreconfWiring {
     /// Runtime preconf configuration; cloned into the validator.
@@ -363,6 +363,12 @@ where
                 ctx.node().provider().clone(),
                 Arc::new(ctx.registry.eth_api().clone()),
                 sequencer_client,
+                // Preconf handler is injected by the preconf ServiceBuilder
+                // when this node is configured as a sequencer with preconf
+                // enabled; otherwise the field stays `None` and
+                // `send_raw_transaction_with_preconf` falls back to the
+                // sequencer-forward / not-implemented branches.
+                None,
             );
             ctx.modules.merge_configured(mantle_ext.into_rpc())?;
             info!(target: "reth::cli", "Mantle RPC extensions registered");

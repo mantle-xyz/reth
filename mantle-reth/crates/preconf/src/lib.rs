@@ -12,17 +12,21 @@
 
 pub mod apply;
 pub mod builder;
+pub mod canon_handler;
 pub mod config;
 pub mod pool_ext;
 pub mod preconf_tx_set;
+pub mod rpc;
 pub mod types;
 
 pub use builder::{BuilderTxTracker, CarriedState};
+pub use canon_handler::PreconfCanonHandler;
 pub use config::PreconfConfig;
 pub use pool_ext::{
     PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,
 };
 pub use preconf_tx_set::{PreconfTxSet, TxEntry};
+pub use rpc::PreconfRpcHandler;
 pub use types::{
     AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult, RecoverError,
 };

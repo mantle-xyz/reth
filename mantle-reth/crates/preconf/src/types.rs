@@ -3,8 +3,8 @@
 use alloy_primitives::{B256, Bytes, Log, TxHash};
 use serde::{Deserialize, Serialize};
 
-/// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed by
-/// `mantle-reth-rpc-ext` and op-geth `core/preconf_status.go` semantics.
+/// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
+/// by `mantle-reth-rpc-ext`.
 ///
 /// State machine (`mark_succeeded` / `mark_failed` / `mark_timeout`
 /// / `recover_from_timeout`):
@@ -117,7 +117,20 @@ pub enum PreconfError {
     #[error("transaction is not preconf eligible (whitelist miss)")]
     NotPreconfEligible,
     /// Nonce gap — tx nonce > pool's pending nonce for sender.
-    /// Differs from op-geth's behavior, which queues out-of-order nonces.
+    ///
+    /// **Client-visible behavioral choice**: when a client submits a tx
+    /// whose nonce skips ahead of the pool's pending nonce, the RPC
+    /// handler rejects synchronously with this error rather than
+    /// admitting the tx into the pool's queued sub-pool. Clients are
+    /// expected to resend in nonce order after observing this code.
+    ///
+    /// Rationale: admitting the tx and letting later promotions silently
+    /// lift it into a preconf commitment hides the failure from the
+    /// client — they would see a generic timeout while the tx still
+    /// lands on chain, defeating the preconf contract. Surfacing the
+    /// gap immediately keeps the client's view and the chain's view in
+    /// sync, at the cost of requiring SDKs to handle this error code
+    /// explicitly.
     #[error("nonce gap: tx nonce {tx_nonce} > pending nonce {pending_nonce}")]
     NonceGap {
         /// Sender's tx nonce.

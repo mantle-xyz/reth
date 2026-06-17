@@ -215,9 +215,10 @@ mod tests {
     }
 
     // Listener loop tests (with a real `MockTransactionPool`) are deferred
-    // to P5/P6 — they need either a noop pool or a fully-faked pool that
-    // emits `NewTransactionEvent`s for OP-typed transactions, which is
-    // heavyweight setup. The conversion helper above is the testable
-    // nucleus; the loop is a straight-line drain over an mpsc receiver
-    // with branch coverage already exercised through code review.
+    // to end-to-end coverage — they need either a noop pool or a fully-
+    // faked pool that emits `NewTransactionEvent`s for OP-typed
+    // transactions, which is heavyweight setup. The conversion helper
+    // above is the testable nucleus; the loop is a straight-line drain
+    // over an mpsc receiver with branch coverage already exercised
+    // through code review.
 }

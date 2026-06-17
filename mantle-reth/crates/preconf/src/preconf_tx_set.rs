@@ -267,7 +267,9 @@ impl PreconfTxSet {
         self.inner.lock().await.entries.contains_key(hash)
     }
 
-    /// Snapshot of hashes in FIFO order. Used by Phase 1 replay.
+    /// Snapshot of hashes in FIFO order. Used by the payload builder when
+    /// it starts a new job to replay any pending commitments accumulated
+    /// since the previous block.
     pub async fn snapshot(&self) -> Vec<TxHash> {
         self.inner.lock().await.order.iter().copied().collect()
     }

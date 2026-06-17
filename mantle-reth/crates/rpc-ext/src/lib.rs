@@ -93,6 +93,25 @@ pub struct PreconfLog {
     pub data: Bytes,
 }
 
+// ─── Preconf handler indirection ─────────────────────────────────────────────
+
+/// Dyn-safe entry point for the local preconf handler.
+///
+/// The concrete implementation in `mantle-reth-preconf::rpc::PreconfRpcHandler`
+/// is generic over the pool and the state provider; this trait erases those
+/// generics so `MantleRpcExt` can hold an `Option<Arc<dyn DynPreconfHandler>>`
+/// without becoming generic itself.
+///
+/// Returning a `PreconfTxEvent` (the existing wire type) keeps the RPC trait
+/// signature unchanged — clients see the same response shape regardless of
+/// whether the node is acting as a sequencer (local handler) or a follower
+/// (forwarding to an upstream sequencer).
+#[async_trait]
+pub trait DynPreconfHandler: Send + Sync + std::fmt::Debug {
+    /// Process a raw transaction submission and return the preconf event.
+    async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent>;
+}
+
 // ─── RPC trait ───────────────────────────────────────────────────────────────
 
 /// Extension trait for the `eth_` namespace providing Mantle-specific RPC methods.
@@ -144,6 +163,11 @@ pub struct MantleRpcExt<Provider, EthApi> {
     provider: Provider,
     eth_api: Arc<EthApi>,
     sequencer_client: Option<SequencerClient>,
+    /// Local preconf handler. `Some` only when this node is acting as the
+    /// sequencer with preconf enabled (wired by the preconf `ServiceBuilder`).
+    /// `None` ⇒ fall back to `sequencer_client` forward / "not implemented"
+    /// stub.
+    preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
 }
 
 impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
@@ -152,8 +176,9 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         provider: Provider,
         eth_api: Arc<EthApi>,
         sequencer_client: Option<SequencerClient>,
+        preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
     ) -> Self {
-        Self { provider, eth_api, sequencer_client }
+        Self { provider, eth_api, sequencer_client, preconf_handler }
     }
 
     #[inline]
@@ -317,6 +342,11 @@ where
     }
 
     async fn send_raw_transaction_with_preconf(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
+        // Path 1: local sequencer + preconf enabled → handle in-process.
+        if let Some(handler) = self.preconf_handler.as_ref() {
+            return handler.handle(bytes).await;
+        }
+        // Path 2: follower node → forward to upstream sequencer (existing behavior).
         if let Some(sequencer) = self.sequencer_client.as_ref() {
             debug!(target: "rpc::eth::mantle", "forwarding raw transaction with preconf to sequencer");
             let raw: serde_json::Value = sequencer

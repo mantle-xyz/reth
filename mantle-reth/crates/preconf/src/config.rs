@@ -77,7 +77,9 @@ pub struct PreconfConfig {
     /// Client-side oneshot wait — default 200ms (see [`DEFAULT_PRECONF_TIMEOUT`]).
     pub preconf_timeout: Duration,
 
-    /// Phase 2 sweep ticker interval — default 50ms.
+    /// Interval at which the payload builder yields to drain pending
+    /// preconf work before resuming the normal-path tx sweep — default
+    /// 50ms.
     pub sweep_interval: Duration,
 
     // ===== Operator hardening =====

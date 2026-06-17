@@ -6,8 +6,7 @@
 //! 1. **Replacement guard**: a tx whose `(sender, nonce)` collides with a
 //!    non-`Timeout` `PreconfTxSet` entry of a different hash is rejected.
 //!    `Timeout` entries release the slot — the existing fifo record is
-//!    actively removed so the new tx can proceed cleanly. Mirrors op-geth
-//!    `legacypool.go:815` semantics.
+//!    actively removed so the new tx can proceed cleanly.
 //!
 //! 2. **Per-tx gas ceiling (operator hardening)**: preconf-eligible txs
 //!    whose `gas_limit` exceeds `cfg.preconf_max_gas_per_tx` are rejected.
@@ -204,5 +203,5 @@ mod tests {
     // the decorator's branching logic is otherwise a straight read against
     // the `PreconfTxSet` state machine (already covered by 40 tests in
     // `preconf_tx_set::tests`). End-to-end tests of the validator are
-    // deferred to P5/P6 when a real pool is spun up.
+    // deferred to an integration suite that spins up a real pool.
 }
