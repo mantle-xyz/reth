@@ -27,6 +27,26 @@ reth-evm.workspace = true
 # alloy-evm — for the TxResult trait + ExecutionResult re-exports
 alloy-evm.workspace = true
 
+# reth-transaction-pool — for the TransactionValidator trait wrapped by
+# `PreconfAwareValidator` and the TransactionPool trait consumed by
+# `PreconfPoolListener`
+reth-transaction-pool.workspace = true
+
+# futures — `StreamExt::next` used to drive
+# `TransactionPool::new_pending_pool_transactions_listener` (returns a
+# Stream rather than an mpsc::Receiver)
+futures.workspace = true
+
+# reth-optimism-txpool — for `OpPooledTx` trait bound on the wrapped tx type
+reth-optimism-txpool.workspace = true
+
+# reth-primitives-traits — for SealedBlock used in `on_new_head_block`
+reth-primitives-traits.workspace = true
+
+# OP-stack consensus types — listener bridges `OpTxEnvelope` to alloy
+# `TxEnvelope` and drops Deposit / PostExec variants
+op-alloy-consensus.workspace = true
+
 # Async runtime + sync primitives
 tokio = { workspace = true, features = ["sync", "macros", "time"] }
 

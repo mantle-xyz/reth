@@ -13,11 +13,15 @@
 pub mod apply;
 pub mod builder;
 pub mod config;
+pub mod pool_ext;
 pub mod preconf_tx_set;
 pub mod types;
 
 pub use builder::{BuilderTxTracker, CarriedState};
 pub use config::PreconfConfig;
+pub use pool_ext::{
+    PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,
+};
 pub use preconf_tx_set::{PreconfTxSet, TxEntry};
 pub use types::{
     AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult, RecoverError,

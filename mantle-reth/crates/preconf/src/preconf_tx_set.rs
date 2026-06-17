@@ -350,8 +350,9 @@ impl PreconfTxSet {
 
     /// `Waiting → Timeout`. **Soft terminal** — unlike `Success` / `Failed`,
     /// a `Timeout` entry can be revived via [`Self::recover_from_timeout`]
-    /// (used by the H4 client-retry path). Called by RPC handler when the
-    /// client-side `preconf_timeout` fires before a receipt is delivered.
+    /// (used by the same-hash client-retry path). Called by RPC handler
+    /// when the client-side `preconf_timeout` fires before a receipt is
+    /// delivered.
     pub async fn mark_timeout(&self, hash: &TxHash) -> Result<(), MarkError> {
         self.transition_from_waiting(hash, PreconfStatus::Timeout).await
     }

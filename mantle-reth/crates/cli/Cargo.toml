@@ -43,6 +43,7 @@ reth-optimism-txpool.workspace = true
 
 # mantle-reth
 mantle-reth-chainspec = { path = "../chainspec" }
+mantle-reth-preconf = { path = "../preconf" }
 mantle-reth-rpc-ext = { path = "../rpc-ext" }
 
 # ethereum

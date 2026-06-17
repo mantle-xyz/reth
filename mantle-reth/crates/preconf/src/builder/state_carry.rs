@@ -18,12 +18,11 @@
 //! ## What this is not
 //!
 //! This module does **not** implement per-tx speculative rollback. The
-//! preconf design uses a **single source state** (`docs/design/preconf.md`
-//! §3.3) — once a tx is applied to the cache it is part of the in-flight
-//! block. A separate concern is the flashblock seal boundary used by
-//! op-rbuilder (`transition_state` snapshot/restore around
-//! `merge_transitions`), which lives in a different code path and is added
-//! only when flashblocks support lands.
+//! preconf design uses a single source state — once a tx is applied to the
+//! cache it is part of the in-flight block. A separate concern is the
+//! flashblock seal boundary used by op-rbuilder (`transition_state`
+//! snapshot/restore around `merge_transitions`), which lives in a different
+//! code path and is added only when flashblocks support lands.
 //!
 //! ## Reference
 //!

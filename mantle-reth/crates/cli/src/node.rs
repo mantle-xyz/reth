@@ -5,7 +5,11 @@
 //! validation on top of the OP stack checks.
 
 use crate::txpool::MantleTransactionValidator;
+use mantle_reth_preconf::{
+    PreconfAwareValidator, PreconfConfig, PreconfPoolListener, PreconfTxSet,
+};
 use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+use op_alloy_consensus::OpTxEnvelope;
 use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, PrimitivesTy, TxTy};
 use reth_node_builder::{
@@ -41,13 +45,24 @@ use reth_optimism_node::{OpEngineApiBuilder, OpEngineValidatorBuilder};
 
 /// Type alias for the Mantle transaction pool.
 ///
-/// Same structure as `OpTransactionPool` but the inner validator is wrapped in
-/// [`MantleTransactionValidator`].
+/// Same structure as `OpTransactionPool` but the inner validator chain is:
+///
+/// ```text
+/// PreconfAwareValidator<MantleTransactionValidator<OpTransactionValidator<...>>>
+/// ```
+///
+/// The outermost [`PreconfAwareValidator`] is always present in the type;
+/// when preconf is not wired up via [`MantlePoolBuilder::with_preconf`], it
+/// holds a default-disabled `PreconfConfig` and an empty `PreconfTxSet` —
+/// effectively a no-op layer (both replacement guard and gas-ceiling check
+/// short-circuit on the empty / disabled state).
 pub type MantleTransactionPool<Client, S, Evm, T = OpPooledTransaction> = OpPool<
     Pool<
         TransactionValidationTaskExecutor<
-            MantleTransactionValidator<
-                reth_optimism_txpool::OpTransactionValidator<Client, T, Evm>,
+            PreconfAwareValidator<
+                MantleTransactionValidator<
+                    reth_optimism_txpool::OpTransactionValidator<Client, T, Evm>,
+                >,
             >,
         >,
         CoinbaseTipOrdering<T>,
@@ -66,7 +81,24 @@ pub type MantleTransactionPool<Client, S, Evm, T = OpPooledTransaction> = OpPool
 pub struct MantlePoolBuilder<T = OpPooledTransaction> {
     pool_config_overrides: PoolBuilderConfigOverrides,
     enable_tx_conditional: bool,
+    /// Optional preconfirmation wiring. `None` ⇒ preconf disabled; the
+    /// validator chain still includes a `PreconfAwareValidator`, but it
+    /// receives a default-disabled config and an empty fifo so its checks
+    /// short-circuit. `Some(_)` ⇒ both validator and pool listener are
+    /// driven by the provided `cfg` / `fifo`.
+    preconf: Option<PreconfWiring>,
     _pd: core::marker::PhantomData<T>,
+}
+
+/// Preconf wiring bundle held by [`MantlePoolBuilder`]. Constructed and
+/// owned by the higher-level service builder (P5); the pool builder only
+/// needs the shared handles.
+#[derive(Debug, Clone)]
+pub struct PreconfWiring {
+    /// Runtime preconf configuration; cloned into the validator.
+    pub cfg: Arc<PreconfConfig>,
+    /// Commitment fifo shared between validator, RPC handler, and builder.
+    pub fifo: Arc<PreconfTxSet>,
 }
 
 impl<T> Default for MantlePoolBuilder<T> {
@@ -74,6 +106,7 @@ impl<T> Default for MantlePoolBuilder<T> {
         Self {
             pool_config_overrides: Default::default(),
             enable_tx_conditional: false,
+            preconf: None,
             _pd: core::marker::PhantomData,
         }
     }
@@ -94,6 +127,14 @@ impl<T> MantlePoolBuilder<T> {
         self.pool_config_overrides = pool_config_overrides;
         self
     }
+
+    /// Enable preconfirmation: thread `cfg` and `fifo` into the validator
+    /// decoration chain and spawn the pool listener that pushes
+    /// whitelisted txs into `fifo`.
+    pub fn with_preconf(mut self, cfg: Arc<PreconfConfig>, fifo: Arc<PreconfTxSet>) -> Self {
+        self.preconf = Some(PreconfWiring { cfg, fifo });
+        self
+    }
 }
 
 impl<N, T, Evm> PoolBuilder<N, Evm> for MantlePoolBuilder<T>
@@ -101,6 +142,12 @@ where
     N: FullNodeTypes<Types: NodeTypes<ChainSpec: OpHardforks>>,
     T: EthPoolTransaction<Consensus = TxTy<N::Types>> + OpPooledTx,
     Evm: ConfigureEvm<Primitives = PrimitivesTy<N::Types>> + Clone + 'static,
+    // PreconfPoolListener bridges the pool's consensus tx into `OpTxEnvelope`
+    // (and drops Deposit / PostExec). This bound makes the conversion path
+    // discoverable to the compiler; for any OP-stack `NodePrimitives` it is
+    // satisfied by `impl From<OpTransactionSigned> for OpTxEnvelope` in
+    // `op-reth/crates/primitives/src/transaction/signed.rs`.
+    OpTxEnvelope: From<TxTy<N::Types>>,
 {
     type Pool = MantleTransactionPool<N::Provider, DiskFileBlobStore, Evm, T>;
 
@@ -110,6 +157,25 @@ where
         evm_config: Evm,
     ) -> eyre::Result<Self::Pool> {
         let blob_store = reth_node_builder::components::create_blob_store(ctx)?;
+
+        // Resolve preconf wiring once for both the validator decoration
+        // and the optional listener spawn below. When no caller has wired
+        // up preconf (`with_preconf` not invoked), supply default-disabled
+        // handles so the `PreconfAwareValidator` layer becomes a cheap
+        // pass-through (empty fifo + disabled cfg).
+        let (preconf_cfg, preconf_fifo) = match self.preconf.clone() {
+            Some(p) => (p.cfg, p.fifo),
+            None => {
+                let cfg = Arc::new(PreconfConfig::default());
+                let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
+                (cfg, fifo)
+            }
+        };
+        // Clones moved into the validator-build closure. The listener
+        // (spawned later) takes a separate clone of the same Arcs.
+        let validator_cfg = preconf_cfg.clone();
+        let validator_fifo = preconf_fifo.clone();
+
         let validator =
             TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
                 .no_eip4844()
@@ -124,10 +190,16 @@ where
                         .unwrap_or_else(|| ctx.config().txpool.additional_validation_tasks),
                 )
                 .build_with_tasks(ctx.task_executor().clone(), blob_store.clone())
-                .map(|validator| {
+                .map(move |validator| {
                     let op_validator = reth_optimism_txpool::OpTransactionValidator::new(validator)
                         .require_l1_data_gas_fee(!ctx.config().dev.dev);
-                    MantleTransactionValidator::new(op_validator)
+                    let mantle_validator = MantleTransactionValidator::new(op_validator);
+                    // `.map` takes `FnMut`; clone the Arcs on every call.
+                    PreconfAwareValidator::new(
+                        mantle_validator,
+                        validator_cfg.clone(),
+                        validator_fifo.clone(),
+                    )
                 });
 
         let final_pool_config = self.pool_config_overrides.apply(ctx.pool_config());
@@ -144,6 +216,20 @@ where
             transaction_pool.clone(),
             &final_pool_config,
         )?;
+
+        // Spawn the pool listener only when preconf is actually enabled —
+        // when `with_preconf` was not called, `preconf_cfg.enabled` is
+        // false and the listener would just sit idle filtering every tx
+        // against empty whitelists. Skipping the spawn saves a task.
+        if preconf_cfg.enabled {
+            let listener = PreconfPoolListener::new(
+                transaction_pool.clone(),
+                preconf_cfg.clone(),
+                preconf_fifo.clone(),
+            );
+            ctx.task_executor().spawn_critical_task("mantle-preconf-pool-listener", listener.run());
+            info!(target: "reth::cli", "Mantle preconf pool listener spawned");
+        }
 
         if self.enable_tx_conditional {
             let chain_events = ctx.provider().canonical_state_stream();
