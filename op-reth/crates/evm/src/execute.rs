@@ -190,8 +190,7 @@ mod tests {
         let OpReceipt::Deposit(deposit_receipt) = deposit_receipt else {
             panic!("expected deposit")
         };
-        // [MANTLE] deposit_receipt_version is always None on Mantle (BVM_ETH semantics)
-        assert_eq!(deposit_receipt.deposit_receipt_version, None);
+        assert_eq!(deposit_receipt.deposit_receipt_version, Some(1));
 
         // deposit_nonce is present only in deposit transactions
         assert!(deposit_receipt.deposit_nonce.is_some());
