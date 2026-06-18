@@ -167,7 +167,6 @@ fn block_env() -> BlockEnv {
 }
 
 #[test]
-#[ignore = "requires op-revm fix (remove stale try_fetch guard in validate_against_state_and_deduct_caller)"]
 fn token_ratio_midblock_l1_fee_vault_no_overcredit() {
     let caller: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
     let eoa: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
@@ -236,7 +235,6 @@ fn token_ratio_midblock_l1_fee_vault_no_overcredit() {
 /// ratio (the deduct-caller refetch guard undoes `reset_l2_block` before the
 /// oracle's own SSTORE), so this fails at tx3 by +384.
 #[test]
-#[ignore = "requires op-revm fix (remove stale try_fetch guard in validate_against_state_and_deduct_caller)"]
 fn token_ratio_multi_oracle_per_tx_l1_fee_correct() {
     let caller: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
     let eoa: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
