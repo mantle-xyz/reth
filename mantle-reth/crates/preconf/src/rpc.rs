@@ -46,7 +46,8 @@ use tokio::{sync::oneshot, time::timeout};
 use tracing::{debug, trace, warn};
 
 use crate::{
-    PreconfConfig, PreconfTxSet,
+    PreconfConfig, PreconfJournal, PreconfTxSet,
+    journal::JournalEntry,
     types::{AttachError, PreconfError, PreconfReceipt, RecoverError},
 };
 
@@ -57,6 +58,13 @@ pub struct PreconfRpcHandler<P, Pr> {
     provider: Pr,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
+    /// Optional persistence sink — when `Some`, every successful
+    /// preconf commitment is appended to the journal before the
+    /// `PreconfTxEvent` is returned to the client. Append failures
+    /// are logged but do not block the response (best-effort
+    /// durability; a crash before the next disk flush loses at most
+    /// the most recent commitment).
+    journal: Option<Arc<PreconfJournal>>,
 }
 
 // Manual Debug — `P` (TransactionPool) and `Pr` (StateProviderFactory) do
@@ -74,13 +82,16 @@ impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
 
 impl<P, Pr> PreconfRpcHandler<P, Pr> {
     /// Construct a handler bound to the given pool + provider + fifo.
+    /// `journal` is optional; when `None`, the handler runs without
+    /// persistence and successful commitments are lost on crash.
     pub const fn new(
         pool: P,
         provider: Pr,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
+        journal: Option<Arc<PreconfJournal>>,
     ) -> Self {
-        Self { pool, provider, fifo, cfg }
+        Self { pool, provider, fifo, cfg, journal }
     }
 }
 
@@ -203,8 +214,33 @@ where
         // Step 5 — await receipt with timeout.
         let preconf_timeout = self.cfg.preconf_timeout;
         match timeout(preconf_timeout, resp_rx).await {
-            // Receipt arrived.
-            Ok(Ok(Ok(receipt))) => Ok(PreconfTxEvent::from(receipt)),
+            // Receipt arrived. On `Success`, persist the commitment so
+            // it survives a crash. Failures of the append are logged
+            // and do not block the client response — best-effort
+            // durability; a power loss before fsync loses at most this
+            // single record.
+            Ok(Ok(Ok(receipt))) => {
+                let event = PreconfTxEvent::from(receipt);
+                if matches!(event.status, WireStatus::Success)
+                    && let Some(journal) = self.journal.as_ref()
+                {
+                    let entry = JournalEntry {
+                        hash,
+                        tx_rlp: bytes.clone(),
+                        block_height: event.block_height,
+                        committed_at_ms: now_unix_ms(),
+                    };
+                    if let Err(e) = journal.append_promised(&entry).await {
+                        warn!(
+                            target: "mantle::preconf::rpc",
+                            ?hash,
+                            ?e,
+                            "journal append failed; commitment may be lost on restart"
+                        );
+                    }
+                }
+                Ok(event)
+            }
 
             // Builder signalled an error through the responder.
             Ok(Ok(Err(err))) => Err(preconf_error_to_rpc(&err)),
@@ -318,6 +354,15 @@ fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Address> {
         TxKind::Call(addr) => Some(addr),
         TxKind::Create => None,
     }
+}
+
+/// Current wall-clock milliseconds since the Unix epoch. Used to
+/// stamp [`JournalEntry::committed_at_ms`]. Falls back to `0` if the
+/// system clock is set before 1970, which is best treated as
+/// "unset" rather than crashing the RPC path.
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]

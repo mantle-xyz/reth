@@ -66,6 +66,9 @@ reth-payload-builder.workspace = true
 reth-payload-builder-primitives.workspace = true
 reth-payload-primitives.workspace = true
 
+# Journal serialisation — one JSON Lines record per appended commitment.
+serde_json = { workspace = true, features = ["std"] }
+
 # reth rpc / jsonrpsee — RPC handler returns `RpcResult<PreconfTxEvent>`.
 mantle-reth-rpc-ext.workspace = true
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
@@ -74,8 +77,8 @@ async-trait.workspace = true
 # raw-tx decoding helper used by the RPC handler
 reth-rpc-eth-types.workspace = true
 
-# Async runtime + sync primitives
-tokio = { workspace = true, features = ["sync", "macros", "time"] }
+# Async runtime + sync primitives + async fs for the journal
+tokio = { workspace = true, features = ["sync", "macros", "time", "fs", "io-util", "rt"] }
 
 # Error handling
 thiserror.workspace = true
@@ -87,4 +90,5 @@ tracing.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "test-util"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "test-util", "fs"] }
+tempfile.workspace = true

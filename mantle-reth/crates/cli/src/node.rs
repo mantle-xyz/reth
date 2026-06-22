@@ -398,6 +398,30 @@ where
                         .spawn_critical_task("mantle-preconf-canon-handler", canon.run());
                     info!(target: "reth::cli", "Mantle preconf canonical-state handler spawned");
 
+                    // If persistence is on, drive the periodic rotation
+                    // loop. The shutdown sender is intentionally leaked
+                    // via `mem::forget` — there is no clean teardown
+                    // hook in the `extend_rpc_modules` closure to land
+                    // it on, and process exit reclaims everything
+                    // regardless. The loop itself is registered as a
+                    // critical task so the reth TaskManager owns its
+                    // lifecycle.
+                    if let Some(journal) = svc.journal() {
+                        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                        let loop_fut = mantle_reth_preconf::spawn_rejournal_loop(
+                            journal.clone(),
+                            svc.cfg().rejournal_interval,
+                            shutdown_rx,
+                        );
+                        // `spawn_rejournal_loop` already calls `tokio::spawn`
+                        // internally; we ignore the returned handle and
+                        // rely on the reth runtime drop to cancel the
+                        // task on node shutdown.
+                        std::mem::drop(loop_fut);
+                        std::mem::forget(shutdown_tx);
+                        info!(target: "reth::cli", "Mantle preconf journal rotation loop spawned");
+                    }
+
                     let handler =
                         svc.rpc_handler(ctx.node().pool().clone(), ctx.node().provider().clone());
                     Arc::new(handler) as Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>

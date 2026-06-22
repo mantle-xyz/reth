@@ -33,7 +33,7 @@ use reth_execution_types::Chain;
 use reth_primitives_traits::NodePrimitives;
 use tracing::{debug, trace, warn};
 
-use crate::preconf_tx_set::PreconfTxSet;
+use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
 
 /// Long-running async task bridging `CanonStateNotification` events to
 /// [`PreconfTxSet`] cleanup.
@@ -45,6 +45,14 @@ use crate::preconf_tx_set::PreconfTxSet;
 pub struct PreconfCanonHandler<Pr, N> {
     provider: Pr,
     fifo: Arc<PreconfTxSet>,
+    /// Optional commitment journal. When `Some`, every sealed tx is
+    /// marked via [`PreconfJournal::mark_sealed`] so periodic rotation
+    /// can drop the entry; the reverted-chain observer also keys the
+    /// `reorg_drift` warning off [`PreconfJournal::contains`] instead
+    /// of the noisier fifo-membership proxy. `None` ⇒ persistence
+    /// disabled; reverted-chain observation falls back to the fifo
+    /// proxy as before.
+    journal: Option<Arc<PreconfJournal>>,
     _n: PhantomData<fn() -> N>,
 }
 
@@ -63,8 +71,15 @@ where
     N::SignedTx: Transaction + TxHashRef,
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
-    pub const fn new(provider: Pr, fifo: Arc<PreconfTxSet>) -> Self {
-        Self { provider, fifo, _n: PhantomData }
+    /// `journal` is optional; when `None`, the handler degrades to
+    /// the pre-journal behaviour (fifo-membership proxy for reorg
+    /// signal, no sealed-set bookkeeping).
+    pub const fn new(
+        provider: Pr,
+        fifo: Arc<PreconfTxSet>,
+        journal: Option<Arc<PreconfJournal>>,
+    ) -> Self {
+        Self { provider, fifo, journal, _n: PhantomData }
     }
 
     /// Run the listener loop. Returns when the underlying broadcast
@@ -88,12 +103,31 @@ where
             // low-frequency (block cadence) and small (consensus tx with
             // no sidecars).
             let committed = notif.committed();
-            let pairs: Vec<(Address, u64)> = committed
-                .blocks_iter()
-                .flat_map(|block| block.clone_transactions_recovered())
-                .map(|r| (r.signer(), r.inner().nonce()))
-                .collect();
+            // Walk the recovered txs once; capture both the per-tx
+            // hash (for journal sealing) and the (sender, nonce) pair
+            // (for fifo forwarding). Two-pass would re-clone the same
+            // recovered iterator; one pass + two accumulators is
+            // cheaper at the cost of two `Vec`s of trivial size per
+            // sealed block.
+            let mut pairs: Vec<(Address, u64)> = Vec::new();
+            let mut sealed_hashes: Vec<alloy_primitives::TxHash> = Vec::new();
+            for recovered in
+                committed.blocks_iter().flat_map(|block| block.clone_transactions_recovered())
+            {
+                pairs.push((recovered.signer(), recovered.inner().nonce()));
+                sealed_hashes.push(*recovered.inner().tx_hash());
+            }
             drop(committed);
+
+            // Mark sealed hashes in the journal so the rotation loop
+            // can drop them on its next tick. No-op when persistence
+            // is disabled.
+            if let Some(journal) = self.journal.as_ref() {
+                for hash in &sealed_hashes {
+                    journal.mark_sealed(*hash).await;
+                }
+            }
+
             let frontier = aggregate_nonce_frontier(pairs);
             for (sender, next_nonce) in frontier {
                 trace!(
@@ -113,13 +147,19 @@ where
         let block_number = old.tip().number();
         for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
             let hash = *recovered.inner().tx_hash();
-            // Once the preconf journal is wired in, this membership test
-            // becomes `journal.contains(&hash)`. Until then the fifo
-            // membership check is the only signal available; it
-            // undercounts (entries already forward-cleaned) but never
-            // overcounts, so the resulting reorg-drift signal is safe to
-            // act on operationally.
-            if self.fifo.contains(&hash).await {
+            // When the journal is enabled, query it — every preconf
+            // commitment that survived to a sealed block is tracked
+            // there, so `contains` is a precise reorg-drift signal.
+            // When persistence is disabled, fall back to fifo
+            // membership; that proxy undercounts (entries already
+            // forward-cleaned drop out) but never overcounts, so the
+            // resulting signal remains operationally safe.
+            let tracked = if let Some(journal) = self.journal.as_ref() {
+                journal.contains(&hash).await
+            } else {
+                self.fifo.contains(&hash).await
+            };
+            if tracked {
                 warn!(
                     target: "mantle::preconf::canon",
                     ?hash,

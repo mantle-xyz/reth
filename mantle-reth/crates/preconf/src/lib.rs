@@ -14,6 +14,7 @@ pub mod apply;
 pub mod builder;
 pub mod canon_handler;
 pub mod config;
+pub mod journal;
 pub mod pool_ext;
 pub mod preconf_tx_set;
 pub mod rpc;
@@ -26,12 +27,16 @@ pub use builder::{
 };
 pub use canon_handler::PreconfCanonHandler;
 pub use config::PreconfConfig;
+pub use journal::{
+    EventPublisher, JournalEntry, JournalError, PreconfJournal, RestorePool, RestoredEnvelope,
+    RestoredSet, RotateStats, restore_preconf_state, spawn_rejournal_loop,
+};
 pub use pool_ext::{
     PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,
 };
 pub use preconf_tx_set::{PreconfTxSet, TxEntry};
 pub use rpc::PreconfRpcHandler;
-pub use service_builder::PreconfServiceBuilder;
+pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
 pub use types::{
     AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult, RecoverError,
 };
