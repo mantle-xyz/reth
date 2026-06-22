@@ -6,7 +6,7 @@
 
 use crate::txpool::MantleTransactionValidator;
 use mantle_reth_preconf::{
-    PreconfAwareValidator, PreconfConfig, PreconfPoolListener, PreconfTxSet,
+    PreconfAwareValidator, PreconfConfig, PreconfPoolListener, PreconfServiceBuilder, PreconfTxSet,
 };
 use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
 use op_alloy_consensus::OpTxEnvelope;
@@ -268,12 +268,18 @@ pub type MantleNodeComponentBuilder<N, Payload = OpNodePayloadBuilder> = Compone
 pub struct MantleNode {
     /// Underlying OP node configuration.
     pub op_node: reth_optimism_node::OpNode,
+    /// Optional preconfirmation subsystem handle. `None` ⇒ preconf
+    /// disabled (default); the node behaves exactly like the
+    /// underlying OP node. `Some` ⇒ the validator chain, pool listener,
+    /// canonical-state cleaner, and RPC handler all get wired up to
+    /// the shared `cfg` / `fifo` held by the builder.
+    pub preconf: Option<Arc<PreconfServiceBuilder>>,
 }
 
 impl MantleNode {
     /// Creates a new [`MantleNode`] with the given rollup arguments.
     pub fn new(args: RollupArgs) -> Self {
-        Self { op_node: reth_optimism_node::OpNode::new(args) }
+        Self { op_node: reth_optimism_node::OpNode::new(args), preconf: None }
     }
 
     /// Configure the data availability configuration for the Mantle builder.
@@ -288,18 +294,38 @@ impl MantleNode {
         self
     }
 
+    /// Enable the preconfirmation subsystem on this node. The provided
+    /// builder owns the shared `cfg` / `fifo` handles; the same handles
+    /// thread into the validator chain, the pool listener (spawned by
+    /// [`MantlePoolBuilder::build_pool`]), the canonical-state handler
+    /// (spawned in [`MantleNode::add_ons`]), and the RPC handler
+    /// (injected into [`MantleRpcExt`]).
+    pub fn with_preconf(mut self, builder: PreconfServiceBuilder) -> Self {
+        self.preconf = Some(Arc::new(builder));
+        self
+    }
+
     /// Returns the component builder for this Mantle node.
     pub fn components<N>(&self) -> MantleNodeComponentBuilder<N>
     where
         N: FullNodeTypes<Types: OpNodeTypes>,
     {
         let args = &self.op_node.args;
+
+        // Activate pool-side preconf wiring (validator decoration + spawned
+        // pool listener inside `build_pool`) if the node was configured
+        // for preconf. Otherwise the pool builder stays in its default
+        // pass-through state.
+        let mut pool_builder =
+            MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional);
+        if let Some(p) = &self.preconf {
+            pool_builder = pool_builder.with_preconf(p.cfg().clone(), p.fifo().clone());
+        }
+
         ComponentsBuilder::default()
             .node_types::<N>()
             .executor(OpExecutorBuilder::default().with_sdm_enabled(args.sdm_enabled))
-            .pool(
-                MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional),
-            )
+            .pool(pool_builder)
             .payload(BasicPayloadServiceBuilder::new(
                 OpNodePayloadBuilder::new(args.compute_pending_block)
                     .with_da_config(self.op_node.da_config.clone())
@@ -345,6 +371,7 @@ where
 
     fn add_ons(&self) -> Self::AddOns {
         let sequencer_url = self.op_node.args.sequencer.clone();
+        let preconf = self.preconf.clone();
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |ctx| {
             // Build SequencerClient if a sequencer URL is configured.
@@ -359,16 +386,28 @@ where
                 .transpose()
                 .map_err(|e| eyre::eyre!("failed to create SequencerClient: {e}"))?;
 
+            // If preconf is enabled, spin up the canonical-state handler and
+            // build the RPC handler. The pool listener is already spawned
+            // by `MantlePoolBuilder::build_pool` when its `with_preconf`
+            // was called during `components()`.
+            let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
+                preconf.as_ref().map(|svc| {
+                    let canon = svc.canon_handler(ctx.node().provider().clone());
+                    ctx.node()
+                        .task_executor()
+                        .spawn_critical_task("mantle-preconf-canon-handler", canon.run());
+                    info!(target: "reth::cli", "Mantle preconf canonical-state handler spawned");
+
+                    let handler =
+                        svc.rpc_handler(ctx.node().pool().clone(), ctx.node().provider().clone());
+                    Arc::new(handler) as Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>
+                });
+
             let mantle_ext = MantleRpcExt::new(
                 ctx.node().provider().clone(),
                 Arc::new(ctx.registry.eth_api().clone()),
                 sequencer_client,
-                // Preconf handler is injected by the preconf ServiceBuilder
-                // when this node is configured as a sequencer with preconf
-                // enabled; otherwise the field stays `None` and
-                // `send_raw_transaction_with_preconf` falls back to the
-                // sequencer-forward / not-implemented branches.
-                None,
+                preconf_handler,
             );
             ctx.modules.merge_configured(mantle_ext.into_rpc())?;
             info!(target: "reth::cli", "Mantle RPC extensions registered");

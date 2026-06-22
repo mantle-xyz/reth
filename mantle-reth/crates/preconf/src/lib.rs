@@ -17,9 +17,13 @@ pub mod config;
 pub mod pool_ext;
 pub mod preconf_tx_set;
 pub mod rpc;
+pub mod service_builder;
 pub mod types;
 
-pub use builder::{BuilderTxTracker, CarriedState};
+pub use builder::{
+    BuilderEvent, BuilderTxTracker, CarriedState, JobCancel, PreconfPayloadJob,
+    PreconfPayloadJobGenerator,
+};
 pub use canon_handler::PreconfCanonHandler;
 pub use config::PreconfConfig;
 pub use pool_ext::{
@@ -27,6 +31,7 @@ pub use pool_ext::{
 };
 pub use preconf_tx_set::{PreconfTxSet, TxEntry};
 pub use rpc::PreconfRpcHandler;
+pub use service_builder::PreconfServiceBuilder;
 pub use types::{
     AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult, RecoverError,
 };

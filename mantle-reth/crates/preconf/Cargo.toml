@@ -60,6 +60,12 @@ reth-chain-state.workspace = true
 # reorg observation helper.
 reth-execution-types.workspace = true
 
+# reth payload traits — `PayloadJob` + `PayloadJobGenerator` impls for the
+# preconf payload-builder skeleton.
+reth-payload-builder.workspace = true
+reth-payload-builder-primitives.workspace = true
+reth-payload-primitives.workspace = true
+
 # reth rpc / jsonrpsee — RPC handler returns `RpcResult<PreconfTxEvent>`.
 mantle-reth-rpc-ext.workspace = true
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
