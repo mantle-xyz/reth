@@ -331,4 +331,128 @@ mod tests {
         // This should now fail (insufficient funds)
         assert!(result.is_err(), "with non-zero L1 base fee, calldata should add L1 cost");
     }
+
+    #[test]
+    fn check_funds_value_equals_balance_is_ok() {
+        // The check uses a strict `total > balance` comparison (op-geth's funds
+        // preflight rejects only when the *total* exceeds balance). With zero gas
+        // fee + zero operator/L1 cost, total == value, so value == balance must pass.
+        let info = L1BlockInfo::default();
+        let value = U256::from(1_000_000u64);
+        assert!(
+            mantle_arsia_check_funds(&ArsiaFundsCheck {
+                gas_limit: 21_000,
+                // fee_cap must be non-zero or the whole check is skipped; keep L2 cost
+                // negligible by pairing a tiny fee with a value-dominated balance.
+                fee_cap: U256::from(1u64),
+                value,
+                // balance exactly covers value + the 1 wei/gas L2 cost (21000 * 1)
+                from_balance: value + U256::from(21_000u64),
+                l1_block_info: &info,
+                tx_input: &[],
+                chain_spec: MANTLE_MAINNET.as_ref(),
+                timestamp: arsia_ts(),
+            })
+            .is_ok(),
+            "total == balance must pass (strict > comparison)"
+        );
+    }
+
+    #[test]
+    fn check_funds_operator_constant_only() {
+        // scalar = 0, constant > 0 => operator_cost == constant (independent of gas_limit).
+        let constant = 1_000_000u64;
+        let info = l1_info_with_operator_fee(0, constant);
+        let fee_cap = U256::from(10_000_000_000u64);
+        let l2_cost = U256::from(21_000u64) * fee_cap;
+
+        // Balance covers L2 but is 1 wei short of the operator constant.
+        let result = mantle_arsia_check_funds(&ArsiaFundsCheck {
+            gas_limit: 21_000,
+            fee_cap,
+            value: U256::ZERO,
+            from_balance: l2_cost + U256::from(constant) - U256::from(1),
+            l1_block_info: &info,
+            tx_input: &[],
+            chain_spec: MANTLE_MAINNET.as_ref(),
+            timestamp: arsia_ts(),
+        });
+        assert!(result.is_err(), "1 wei short of L2 + operator constant must fail");
+
+        // Exactly L2 + constant passes.
+        assert!(
+            mantle_arsia_check_funds(&ArsiaFundsCheck {
+                gas_limit: 21_000,
+                fee_cap,
+                value: U256::ZERO,
+                from_balance: l2_cost + U256::from(constant),
+                l1_block_info: &info,
+                tx_input: &[],
+                chain_spec: MANTLE_MAINNET.as_ref(),
+                timestamp: arsia_ts(),
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_funds_all_components_combined() {
+        // Exercise every additive term at once: L2 + operator(scalar+constant) + value.
+        // L1 cost stays 0 (default l1_base_fee), so `total` is exactly computable here.
+        let info = l1_info_with_operator_fee(2, 50_000);
+        let fee_cap = U256::from(10_000_000_000u64);
+        let value = U256::from(500_000u64);
+        let l2_cost = U256::from(21_000u64) * fee_cap;
+        let operator_cost =
+            U256::from(21_000u64) * U256::from(2u64) * U256::from(100u64) + U256::from(50_000u64);
+        let total = l2_cost + operator_cost + value;
+
+        // 1 wei short of the full total must fail.
+        let result = mantle_arsia_check_funds(&ArsiaFundsCheck {
+            gas_limit: 21_000,
+            fee_cap,
+            value,
+            from_balance: total - U256::from(1),
+            l1_block_info: &info,
+            tx_input: &[],
+            chain_spec: MANTLE_MAINNET.as_ref(),
+            timestamp: arsia_ts(),
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.total, total, "reported total must equal L2 + operator + value");
+
+        // Exactly the total passes.
+        assert!(
+            mantle_arsia_check_funds(&ArsiaFundsCheck {
+                gas_limit: 21_000,
+                fee_cap,
+                value,
+                from_balance: total,
+                l1_block_info: &info,
+                tx_input: &[],
+                chain_spec: MANTLE_MAINNET.as_ref(),
+                timestamp: arsia_ts(),
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_funds_saturates_without_panic() {
+        // gas_limit * fee_cap and operator math use saturating ops; extreme inputs
+        // must not panic on overflow and must report insufficient funds.
+        let info = l1_info_with_operator_fee(u64::MAX, u64::MAX);
+        let result = mantle_arsia_check_funds(&ArsiaFundsCheck {
+            gas_limit: u64::MAX,
+            fee_cap: U256::MAX,
+            value: U256::MAX,
+            from_balance: U256::from(1u64),
+            l1_block_info: &info,
+            tx_input: &[0xff; 64],
+            chain_spec: MANTLE_MAINNET.as_ref(),
+            timestamp: arsia_ts(),
+        });
+        assert!(result.is_err(), "saturated total must exceed a 1 wei balance");
+    }
 }
