@@ -218,16 +218,16 @@ reth-trie-db = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbf
 
 # ==================== REVM (Mantle fork: mantle-elysium branch) ====================
 # TODO: Switch to tag once mantle-elysium is tagged (e.g., v107-mantle-elysium.1)
-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
-revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
+revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
+revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
 
 # ==================== REVM-INSPECTORS (Mantle fork: mantle-elysium branch) ====================
 # TODO: Switch to tag once mantle-elysium is tagged
@@ -242,7 +242,7 @@ alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mant
 alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
 
 # ==================== OP-REVM (Mantle fork: mantle-elysium branch, same repo as revm) ====================
-op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e", default-features = false }
+op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749", default-features = false }
 
 # ==================== OP-ALLOY (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
@@ -410,20 +410,20 @@ reth-trie-common = { path = "patches/reth-trie-common" }
 # creating incompatible duplicate types in the dependency graph.
 [patch.crates-io]
 # revm family: mantle-xyz/revm mantle-elysium branch
-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
+revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
 # revm-inspectors: mantle-xyz/revm-inspectors mantle-elysium branch
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "mantle-elysium" }
 # op-revm: mantle-xyz/revm (same as workspace dep)
-op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
+op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
 # alloy-op-evm / alloy-op-hardforks: mantle-xyz/mantle-v2 (Mantle version)
 alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
 alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
@@ -436,16 +436,16 @@ op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", bran
 
 # pin transitive revm refs to the same revm source as the workspace deps above
 [patch."https://github.com/mantle-xyz/revm"]
-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-handler = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-revm-precompile = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
-op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "12bfc01e" }
+revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-handler = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+revm-precompile = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
+op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "87fbc749" }
