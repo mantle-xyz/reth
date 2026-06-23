@@ -41,20 +41,23 @@ async fn estimate_gas_simple_transfer_via_rpc() {
 }
 
 /// A value transfer the caller cannot afford is rejected up front with an
-/// "insufficient funds for transfer" error — this is the `value > balance` pre-check
-/// in the Mantle `estimate_gas_at` override (op-geth `state_transition.go` clause 6),
-/// and it does not require a mined L1-info block.
+/// "insufficient funds for transfer" error — this is the `value >= balance` pre-check
+/// in the Mantle `estimate_gas_at` override (op-geth `gasestimator.go` clause 6). Like
+/// geth, the check only runs when a fee cap is set, so the request specifies
+/// `maxFeePerGas`; it does not require a mined L1-info block.
 #[tokio::test]
 async fn estimate_gas_value_exceeds_balance_rejected_via_rpc() {
     with_mantle_rpc_client(|client| async move {
-        // UNFUNDED has zero balance; any non-zero value exceeds it.
+        // UNFUNDED has zero balance; any non-zero value exceeds it. A fee cap is set so
+        // the geth-gated value pre-check (feeCap != 0) actually runs.
         let res: Result<U256, _> = client
             .request(
                 "eth_estimateGas",
                 vec![serde_json::json!({
                     "from": UNFUNDED,
                     "to": FUNDED,
-                    "value": "0xde0b6b3a7640000" // 1 ETH
+                    "value": "0xde0b6b3a7640000", // 1 ETH
+                    "maxFeePerGas": "0x3b9aca00"   // 1 gwei → fee gate is open
                 })],
             )
             .await;
