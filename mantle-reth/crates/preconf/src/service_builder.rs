@@ -31,7 +31,9 @@ use reth_transaction_pool::TransactionPool;
 
 use crate::{
     PreconfCanonHandler, PreconfConfig, PreconfJournal, PreconfRpcHandler, PreconfTxSet,
-    config::PreconfConfigError, journal::JournalError,
+    builder::builder::{PreconfApplierFactory, default_applier_factory},
+    config::PreconfConfigError,
+    journal::JournalError,
 };
 use thiserror::Error;
 
@@ -50,7 +52,7 @@ pub enum PreconfServiceError {
 /// Owns and hands out the shared preconf handles for a single node
 /// instance. Construct once at startup; clone the `Arc` returned by the
 /// accessors freely.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
     fifo: Arc<PreconfTxSet>,
@@ -59,6 +61,26 @@ pub struct PreconfServiceBuilder {
     /// via [`PreconfServiceBuilder::with_journal`] before installing
     /// the service builder in the node.
     journal: Option<Arc<PreconfJournal>>,
+    /// Applier factory the service builder hands to every produced
+    /// [`PreconfPayloadJobGenerator`]. Defaults to
+    /// [`default_applier_factory`] (which yields a fresh
+    /// [`PromiseApplier`](crate::builder::PromiseApplier) per slot).
+    /// Operators replace this via
+    /// [`PreconfServiceBuilder::with_applier_factory`] when an
+    /// EVM-backed applier is available.
+    applier_factory: PreconfApplierFactory,
+}
+
+// Manual Debug — `applier_factory` wraps a trait object without
+// `Debug`. The cfg / fifo / journal fields keep the dump informative.
+impl std::fmt::Debug for PreconfServiceBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreconfServiceBuilder")
+            .field("cfg", &self.cfg)
+            .field("fifo", &self.fifo)
+            .field("journal", &self.journal)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PreconfServiceBuilder {
@@ -95,7 +117,25 @@ impl PreconfServiceBuilder {
         let broadcast_cap = cfg.broadcast_cap;
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
-        Ok(Self { cfg, fifo, journal: None })
+        Ok(Self { cfg, fifo, journal: None, applier_factory: default_applier_factory() })
+    }
+
+    /// Replace the applier factory. Any
+    /// [`PreconfPayloadJobGenerator`](crate::builder::PreconfPayloadJobGenerator)
+    /// constructed via [`Self::generator`] after this call will use
+    /// the new factory; existing generators keep the one they
+    /// captured.
+    pub fn with_applier_factory(mut self, factory: PreconfApplierFactory) -> Self {
+        self.applier_factory = factory;
+        self
+    }
+
+    /// Borrow the configured applier factory. Used by callers that
+    /// build a payload-job generator themselves (e.g. the cli crate
+    /// when it wraps the OP basic payload job generator) and need to
+    /// thread the factory through.
+    pub fn applier_factory(&self) -> &PreconfApplierFactory {
+        &self.applier_factory
     }
 
     /// Open or create the on-disk commitment journal at `path` and

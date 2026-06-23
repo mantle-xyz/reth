@@ -65,15 +65,33 @@ use crate::{
 /// Minimal interface the builder loop needs from "something that can
 /// execute one preconf transaction and produce a receipt".
 ///
-/// Production impl wraps a reth `BlockBuilder` and delegates to
-/// [`apply_preconf_tx`](crate::apply::apply_preconf_tx). The loop's
-/// tests pass a stub that records each call without standing up an EVM.
+/// Production impls of this trait fall into two families:
+///
+/// - **Promise-only** ([`PromiseApplier`]): fabricates a synthetic
+///   success receipt without running the EVM. Cheap; lets clients
+///   observe the commitment immediately. The real execution outcome
+///   surfaces later via `eth_getTransactionReceipt` against the
+///   canonical chain.
+/// - **EVM-backed** (future work): runs the tx against the latest
+///   committed state (or, ideally, the in-flight block builder's
+///   state) and produces a receipt that includes real revert
+///   reasons, gas usage, and logs. Outline:
+///   1. Hold `evm_config: E where E: reth_evm::ConfigureEvm` and a
+///      [`reth_storage_api::StateProviderFactory`].
+///   2. On each `apply` call: fetch latest state, construct a
+///      `State<CacheDB<StateProviderBox>>`, call
+///      `evm_config.builder_for_next_block(db, parent, attrs)?` to
+///      get a [`reth_evm::execute::BlockBuilder`].
+///   3. Pass the resulting builder + tx + `block_height` to
+///      [`apply_preconf_tx`](crate::apply::apply_preconf_tx).
+///   4. Discard the builder (we don't seal it — the inner OP payload
+///      builder owns block assembly).
 ///
 /// The trait is sync to match the underlying `apply_preconf_tx`
 /// function — the EVM call itself is CPU-bound and does not yield. The
 /// loop awaits I/O (fifo mutex, responder channel) around the apply
 /// itself, not within it.
-pub trait PreconfTxApplier {
+pub trait PreconfTxApplier: Send {
     /// Execute `tx` against the in-flight block, reporting its receipt
     /// or the EVM rejection reason.
     fn apply(
@@ -81,6 +99,39 @@ pub trait PreconfTxApplier {
         tx: Arc<TxEnvelope>,
         block_height: u64,
     ) -> Result<PreconfReceipt, PreconfError>;
+}
+
+// Blanket impl so a boxed dyn applier still satisfies the trait. This
+// is what lets [`PreconfApplierFactory`] (alias around `dyn Fn ->
+// Box<dyn PreconfTxApplier + Send>`) hand the result straight into
+// [`BuilderLoop::new`] without an extra wrapping layer.
+impl<T: PreconfTxApplier + ?Sized> PreconfTxApplier for Box<T> {
+    fn apply(
+        &mut self,
+        tx: Arc<TxEnvelope>,
+        block_height: u64,
+    ) -> Result<PreconfReceipt, PreconfError> {
+        (**self).apply(tx, block_height)
+    }
+}
+
+/// Type-erased applier suitable for boxing into a factory.
+pub type BoxedPreconfTxApplier = Box<dyn PreconfTxApplier + Send + 'static>;
+
+/// Factory that produces one fresh [`PreconfTxApplier`] per payload
+/// job. Each preconf payload job spawns its own [`BuilderLoop`] task
+/// holding one applier instance; the factory is invoked once per
+/// `PreconfPayloadJob::new` call.
+///
+/// Cloning the `Arc` is cheap; the closure itself must be `Send + Sync`
+/// because the generator clones it into every produced job.
+pub type PreconfApplierFactory = Arc<dyn Fn() -> BoxedPreconfTxApplier + Send + Sync>;
+
+/// Default applier factory — produces a [`PromiseApplier`] per slot.
+/// Returned by [`default_applier_factory`] so callers don't need to
+/// know the type-erased boxing syntax.
+pub fn default_applier_factory() -> PreconfApplierFactory {
+    Arc::new(|| Box::new(PromiseApplier))
 }
 
 // ─── Promise Applier ────────────────────────────────────────────────────────

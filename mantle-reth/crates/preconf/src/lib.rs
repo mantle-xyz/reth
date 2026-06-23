@@ -22,8 +22,9 @@ pub mod service_builder;
 pub mod types;
 
 pub use builder::{
-    BuilderEvent, BuilderTxTracker, CarriedState, JobCancel, PreconfPayloadJob,
-    PreconfPayloadJobGenerator,
+    BoxedPreconfTxApplier, BuilderEvent, BuilderTxTracker, CarriedState, JobCancel,
+    PreconfApplierFactory, PreconfPayloadJob, PreconfPayloadJobGenerator, PreconfTxApplier,
+    PromiseApplier, default_applier_factory,
 };
 pub use canon_handler::PreconfCanonHandler;
 pub use config::PreconfConfig;

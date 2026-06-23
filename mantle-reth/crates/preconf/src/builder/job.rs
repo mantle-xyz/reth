@@ -41,7 +41,10 @@ use tracing::debug;
 
 use crate::{
     PreconfConfig, PreconfTxSet,
-    builder::{builder::BuilderLoop, builder::PromiseApplier, cancel::JobCancel},
+    builder::{
+        builder::{BuilderLoop, PreconfApplierFactory, default_applier_factory},
+        cancel::JobCancel,
+    },
 };
 
 /// A [`PayloadJob`] that delegates block construction to `Inner` while
@@ -77,10 +80,15 @@ impl<Inner> PreconfPayloadJob<Inner> {
     /// Wrap an existing inner [`PayloadJob`] with the preconf-specific
     /// surface, spawning the builder loop on the ambient tokio runtime.
     ///
-    /// The applier today is [`PromiseApplier`] — it synthesises always-
-    /// success receipts without running the EVM. Replacing it with an
-    /// EVM-backed applier is the next integration step (deferred so
-    /// the rest of the structural wiring can land first).
+    /// `applier_factory` produces one fresh [`PreconfTxApplier`] for
+    /// the spawned loop. Defaults to [`default_applier_factory`]
+    /// (which yields [`PromiseApplier`]); production callers wire in
+    /// an EVM-backed factory via
+    /// [`PreconfPayloadJobGenerator::with_applier_factory`] or
+    /// [`crate::PreconfServiceBuilder::with_applier_factory`].
+    ///
+    /// [`PreconfTxApplier`]: crate::builder::PreconfTxApplier
+    /// [`PromiseApplier`]: crate::builder::PromiseApplier
     ///
     /// # Panics
     ///
@@ -91,6 +99,17 @@ impl<Inner> PreconfPayloadJob<Inner> {
     ///
     /// [`PayloadJobGenerator::new_payload_job`]: reth_payload_builder::PayloadJobGenerator::new_payload_job
     pub fn new(inner: Inner, fifo: Arc<PreconfTxSet>, cfg: Arc<PreconfConfig>) -> Self {
+        Self::with_applier_factory(inner, fifo, cfg, default_applier_factory())
+    }
+
+    /// Construct with a caller-supplied applier factory. Same panic
+    /// requirements as [`Self::new`].
+    pub fn with_applier_factory(
+        inner: Inner,
+        fifo: Arc<PreconfTxSet>,
+        cfg: Arc<PreconfConfig>,
+        applier_factory: PreconfApplierFactory,
+    ) -> Self {
         let cancel = JobCancel::new();
         // `block_height = 0` is a placeholder: the receipt's block_height
         // is a "predicted L2 block number" promised to the client. We
@@ -98,8 +117,8 @@ impl<Inner> PreconfPayloadJob<Inner> {
         // until that lands, clients should treat `block_height` as
         // informational only and use `eth_getTransactionReceipt` for
         // the authoritative slot.
-        let loop_state =
-            BuilderLoop::new(PromiseApplier, fifo.clone(), cfg.clone(), cancel.clone(), 0);
+        let applier = applier_factory();
+        let loop_state = BuilderLoop::new(applier, fifo.clone(), cfg.clone(), cancel.clone(), 0);
         let loop_handle = tokio::spawn(loop_state.run());
         Self { inner, cancel, loop_handle: Some(loop_handle) }
     }
@@ -322,5 +341,52 @@ mod tests {
             // `job` dropped at end of scope.
         };
         assert!(cancel.is_cancelled(), "Drop impl must flip the cancel signal");
+    }
+
+    #[tokio::test]
+    async fn custom_applier_factory_takes_effect_on_loop() {
+        // Wire a custom applier that always returns Err, prove the
+        // loop actually consults the factory (rather than the default
+        // PromiseApplier) by checking the responder gets an Err.
+        use crate::PreconfError;
+        use crate::builder::builder::{BoxedPreconfTxApplier, PreconfTxApplier};
+
+        struct AlwaysErr;
+        impl PreconfTxApplier for AlwaysErr {
+            fn apply(
+                &mut self,
+                _tx: Arc<TxEnvelope>,
+                _block_height: u64,
+            ) -> Result<crate::PreconfReceipt, PreconfError> {
+                Err(PreconfError::BuilderRejected("custom applier".into()))
+            }
+        }
+
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        let cfg = Arc::new(PreconfConfig {
+            sweep_interval: Duration::from_millis(5),
+            ..PreconfConfig::default()
+        });
+        let factory: PreconfApplierFactory =
+            Arc::new(|| Box::new(AlwaysErr) as BoxedPreconfTxApplier);
+
+        let tx = make_tx(0xcd);
+        let hash = *tx.tx_hash();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        fifo.attach_responder(hash, resp_tx).await.unwrap();
+
+        let job = PreconfPayloadJob::with_applier_factory((), fifo.clone(), cfg, factory);
+
+        let push = fifo.push_if_absent(tx, Address::ZERO).await;
+        assert!(matches!(push, PushResult::Inserted));
+
+        let err = timeout(Duration::from_millis(500), resp_rx)
+            .await
+            .expect("responder timed out")
+            .expect("oneshot closed")
+            .expect_err("custom applier should produce Err");
+        assert!(matches!(err, PreconfError::BuilderRejected(_)));
+
+        drop(job);
     }
 }

@@ -15,7 +15,10 @@ pub mod job;
 pub mod state_carry;
 pub mod tx_tracker;
 
-pub use builder::{BuilderLoop, PreconfTxApplier, PromiseApplier};
+pub use builder::{
+    BoxedPreconfTxApplier, BuilderLoop, PreconfApplierFactory, PreconfTxApplier, PromiseApplier,
+    default_applier_factory,
+};
 pub use cancel::JobCancel;
 pub use event::BuilderEvent;
 pub use generator::PreconfPayloadJobGenerator;

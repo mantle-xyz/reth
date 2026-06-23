@@ -20,7 +20,13 @@ use reth_payload_builder::{BuildNewPayload, PayloadId, PayloadJob, PayloadJobGen
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_primitives_traits::NodePrimitives;
 
-use crate::{PreconfConfig, PreconfTxSet, builder::job::PreconfPayloadJob};
+use crate::{
+    PreconfConfig, PreconfTxSet,
+    builder::{
+        builder::{PreconfApplierFactory, default_applier_factory},
+        job::PreconfPayloadJob,
+    },
+};
 
 /// Wraps an inner [`PayloadJobGenerator`] so every produced job carries
 /// the shared preconf fifo + config handles.
@@ -29,21 +35,47 @@ use crate::{PreconfConfig, PreconfTxSet, builder::job::PreconfPayloadJob};
 /// — the standard OP block-builder generator. Any other generator that
 /// satisfies the trait will work too, which keeps this layer free of
 /// OP-specific type bounds.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreconfPayloadJobGenerator<Inner> {
     inner: Inner,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
+    /// Applier factory consulted on every [`PayloadJobGenerator::new_payload_job`]
+    /// call. Defaults to [`default_applier_factory`] which produces a
+    /// [`PromiseApplier`](crate::builder::PromiseApplier) per slot;
+    /// override via [`Self::with_applier_factory`].
+    applier_factory: PreconfApplierFactory,
+}
+
+// Manual Debug — `PreconfApplierFactory` is `dyn Fn`, which has no
+// Debug impl, but the rest of the struct is informative.
+impl<Inner: std::fmt::Debug> std::fmt::Debug for PreconfPayloadJobGenerator<Inner> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreconfPayloadJobGenerator")
+            .field("inner", &self.inner)
+            .field("fifo", &self.fifo)
+            .field("cfg", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Inner> PreconfPayloadJobGenerator<Inner> {
-    /// Construct a generator bound to a shared `fifo` and `cfg`. The
+    /// Construct a generator bound to a shared `fifo` and `cfg` with
+    /// the default applier factory ([`default_applier_factory`]). The
     /// service builder is the typical caller — it constructs the fifo
     /// once and hands the same `Arc` clones to the validator, the pool
     /// listener, the RPC handler, the canonical-state handler, and this
     /// generator.
-    pub const fn new(inner: Inner, fifo: Arc<PreconfTxSet>, cfg: Arc<PreconfConfig>) -> Self {
-        Self { inner, fifo, cfg }
+    pub fn new(inner: Inner, fifo: Arc<PreconfTxSet>, cfg: Arc<PreconfConfig>) -> Self {
+        Self { inner, fifo, cfg, applier_factory: default_applier_factory() }
+    }
+
+    /// Replace the applier factory. Future jobs produced by this
+    /// generator will call `factory()` once each to obtain their loop's
+    /// applier. Returns `self` for builder-style chaining.
+    pub fn with_applier_factory(mut self, factory: PreconfApplierFactory) -> Self {
+        self.applier_factory = factory;
+        self
     }
 
     /// Borrow the inner generator. Useful for tests that need to assert
@@ -70,7 +102,12 @@ where
         id: PayloadId,
     ) -> Result<Self::Job, PayloadBuilderError> {
         let inner_job = self.inner.new_payload_job(input, id)?;
-        Ok(PreconfPayloadJob::new(inner_job, self.fifo.clone(), self.cfg.clone()))
+        Ok(PreconfPayloadJob::with_applier_factory(
+            inner_job,
+            self.fifo.clone(),
+            self.cfg.clone(),
+            self.applier_factory.clone(),
+        ))
     }
 
     fn on_new_state<N: NodePrimitives>(&mut self, new_state: CanonStateNotification<N>) {
