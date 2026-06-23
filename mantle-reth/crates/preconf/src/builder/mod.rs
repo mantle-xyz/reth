@@ -12,6 +12,7 @@ pub mod cancel;
 pub mod event;
 pub mod generator;
 pub mod job;
+pub mod payload_builder;
 pub mod state_carry;
 pub mod tx_tracker;
 

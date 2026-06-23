@@ -66,6 +66,19 @@ reth-payload-builder.workspace = true
 reth-payload-builder-primitives.workspace = true
 reth-payload-primitives.workspace = true
 
+# P5f fork dependencies — mantle's preconf payload builder is a fork of
+# `OpPayloadBuilder` (see `docs/design/preconf-dev-plan.md` §P5f).
+# We import upstream's `OpPayloadBuilderCtx` / `ExecutionInfo` /
+# `OpBuiltPayload` / `OpPayloadBuilderAttributes` directly, only the
+# build-loop body is forked.
+reth-optimism-payload-builder.workspace = true
+reth-optimism-evm.workspace = true
+reth-optimism-node.workspace = true
+reth-optimism-primitives.workspace = true
+reth-optimism-forks.workspace = true
+reth-basic-payload-builder.workspace = true
+reth-chainspec.workspace = true
+
 # Journal serialisation — one JSON Lines record per appended commitment.
 serde_json = { workspace = true, features = ["std"] }
 
