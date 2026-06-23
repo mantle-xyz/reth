@@ -754,17 +754,17 @@ vergen-git2 = "1.0.5"
 
 # pin revm to the workspace revm source
 [patch."https://github.com/mantle-xyz/revm"]
-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
-op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "096d0f0e" }
+revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-bytecode = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-state = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-primitives = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-interpreter = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-inspector = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-context = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-context-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-database = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+revm-database-interface = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
+op-revm = { git = "https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf", rev = "3d0fc154" }
 
 # [patch."https://github.com/mantle-xyz/revm-inspectors"]
 # revm-inspectors = { path = "../revm-inspectors" }

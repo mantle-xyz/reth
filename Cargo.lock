@@ -6298,7 +6298,7 @@ dependencies = [
 [[package]]
 name = "op-revm"
 version = "12.0.2"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "alloy-sol-types",
  "auto_impl",
@@ -11038,7 +11038,7 @@ dependencies = [
 [[package]]
 name = "revm"
 version = "31.0.2"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "revm-bytecode",
  "revm-context",
@@ -11056,7 +11056,7 @@ dependencies = [
 [[package]]
 name = "revm-bytecode"
 version = "7.1.1"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "bitvec",
  "phf",
@@ -11067,7 +11067,7 @@ dependencies = [
 [[package]]
 name = "revm-context"
 version = "11.0.2"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "bitvec",
  "cfg-if",
@@ -11083,7 +11083,7 @@ dependencies = [
 [[package]]
 name = "revm-context-interface"
 version = "12.0.1"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "alloy-eip2930",
  "alloy-eip7702",
@@ -11098,7 +11098,7 @@ dependencies = [
 [[package]]
 name = "revm-database"
 version = "9.0.5"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "alloy-eips",
  "revm-bytecode",
@@ -11111,7 +11111,7 @@ dependencies = [
 [[package]]
 name = "revm-database-interface"
 version = "8.0.5"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "auto_impl",
  "either",
@@ -11123,7 +11123,7 @@ dependencies = [
 [[package]]
 name = "revm-handler"
 version = "12.0.2"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "auto_impl",
  "derive-where",
@@ -11141,7 +11141,7 @@ dependencies = [
 [[package]]
 name = "revm-inspector"
 version = "12.0.2"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "auto_impl",
  "either",
@@ -11175,7 +11175,7 @@ dependencies = [
 [[package]]
 name = "revm-interpreter"
 version = "29.0.1"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",
@@ -11187,7 +11187,7 @@ dependencies = [
 [[package]]
 name = "revm-precompile"
 version = "29.0.1"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -11211,7 +11211,7 @@ dependencies = [
 [[package]]
 name = "revm-primitives"
 version = "21.0.2"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "alloy-primitives",
  "num_enum",
@@ -11222,7 +11222,7 @@ dependencies = [
 [[package]]
 name = "revm-state"
 version = "8.1.1"
-source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=096d0f0e#096d0f0e194d06a56c4c65c01d9a0143922677ee"
+source = "git+https://github.com/mantle-xyz/revm-ghsa-5vfr-x84h-hmvf?rev=3d0fc154#3d0fc1543d86bf61c091f68dace45e104de9686f"
 dependencies = [
  "bitflags 2.10.0",
  "revm-bytecode",
