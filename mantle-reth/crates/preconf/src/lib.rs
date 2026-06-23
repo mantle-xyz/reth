@@ -6,7 +6,7 @@
 //! - [`types`] — common enums and error types
 //! - [`preconf_tx_set::PreconfTxSet`] — the commitment truth source
 //! - [`apply`] — builder apply path interface
-//! - [`builder`] — payload-builder helpers (cross-iteration dedup, ...)
+//! - [`builder`] — forked OP payload-builder (async build loop + preconf dispatch)
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -15,6 +15,7 @@ pub mod builder;
 pub mod canon_handler;
 pub mod config;
 pub mod journal;
+pub mod payload_service_builder;
 pub mod pool_ext;
 pub mod preconf_tx_set;
 pub mod rpc;
@@ -22,10 +23,10 @@ pub mod service_builder;
 pub mod types;
 
 pub use builder::{
-    BoxedPreconfTxApplier, BuilderEvent, BuilderTxTracker, CarriedState, JobCancel,
-    PreconfApplierFactory, PreconfPayloadJob, PreconfPayloadJobGenerator, PreconfTxApplier,
-    PromiseApplier, default_applier_factory,
+    JobCancel, PreconfPayloadBuilder, PreconfPayloadJob, PreconfPayloadJobGenerator,
+    ResolvePayloadFuture,
 };
+pub use payload_service_builder::MantlePreconfServiceBuilder;
 pub use canon_handler::PreconfCanonHandler;
 pub use config::PreconfConfig;
 pub use journal::{

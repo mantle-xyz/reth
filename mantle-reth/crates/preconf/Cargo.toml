@@ -74,10 +74,21 @@ reth-payload-primitives.workspace = true
 reth-optimism-payload-builder.workspace = true
 reth-optimism-evm.workspace = true
 reth-optimism-node.workspace = true
-reth-optimism-primitives.workspace = true
+# reth-optimism-primitives: re-added in Step 6 (payload_job_generator wires
+# OP node primitives directly into the PayloadJobGenerator type signature).
 reth-optimism-forks.workspace = true
 reth-basic-payload-builder.workspace = true
 reth-chainspec.workspace = true
+reth-payload-util.workspace = true
+op-revm.workspace = true
+either.workspace = true
+
+# Step 7b: payload-service builder integration — implements reth's
+# `PayloadServiceBuilder` trait so the mantle cli can swap our
+# preconf-aware service in for the default `BasicPayloadServiceBuilder`.
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+eyre.workspace = true
 
 # Journal serialisation — one JSON Lines record per appended commitment.
 serde_json = { workspace = true, features = ["std"] }

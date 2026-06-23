@@ -6,8 +6,10 @@
 
 use crate::txpool::MantleTransactionValidator;
 use mantle_reth_preconf::{
-    PreconfAwareValidator, PreconfConfig, PreconfPoolListener, PreconfServiceBuilder, PreconfTxSet,
+    MantlePreconfServiceBuilder, PreconfAwareValidator, PreconfConfig, PreconfPoolListener,
+    PreconfServiceBuilder, PreconfTxSet,
 };
+use reth_optimism_payload_builder::config::OpBuilderConfig;
 use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_evm::ConfigureEvm;
@@ -15,8 +17,7 @@ use reth_node_api::{FullNodeComponents, PrimitivesTy, TxTy};
 use reth_node_builder::{
     BuilderContext, Node, NodeAdapter, NodeComponentsBuilder,
     components::{
-        BasicPayloadServiceBuilder, ComponentsBuilder, PoolBuilder, PoolBuilderConfigOverrides,
-        TxPoolBuilder,
+        ComponentsBuilder, PoolBuilder, PoolBuilderConfigOverrides, TxPoolBuilder,
     },
     node::{FullNodeTypes, NodeTypes},
     rpc::BasicEngineValidatorBuilder,
@@ -25,8 +26,7 @@ use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::{
     OpAddOns, OpConsensusBuilder, OpExecutorBuilder, OpFullNodeTypes, OpNetworkBuilder,
-    OpNodeTypes, args::RollupArgs, engine::OpEngineTypes,
-    node::OpPayloadBuilder as OpNodePayloadBuilder, rpc::OpEthApiBuilder,
+    OpNodeTypes, args::RollupArgs, engine::OpEngineTypes, rpc::OpEthApiBuilder,
 };
 use reth_optimism_payload_builder::config::{OpDAConfig, OpGasLimitConfig};
 use reth_optimism_primitives::OpPrimitives;
@@ -249,10 +249,19 @@ where
 }
 
 /// Type alias for the Mantle node component builder.
-pub type MantleNodeComponentBuilder<N, Payload = OpNodePayloadBuilder> = ComponentsBuilder<
+///
+/// Always uses [`MantlePreconfServiceBuilder`] as the payload service —
+/// when `MantleNode.preconf == None`, the cli supplies a default-empty
+/// `(cfg, fifo)` pair, so no preconf-eligible tx is ever applied. The
+/// fork's `build_payload` then sits in its `select!` loop until cancel,
+/// and the block seals at CL `getPayload` time. This trades a small
+/// timing diff vs. upstream `BasicPayloadServiceBuilder` (which returns
+/// the payload as-soon-as-built) for a single static `ComponentsBuilder`
+/// type across both modes.
+pub type MantleNodeComponentBuilder<N> = ComponentsBuilder<
     N,
     MantlePoolBuilder,
-    BasicPayloadServiceBuilder<Payload>,
+    MantlePreconfServiceBuilder<OpPrimitives>,
     OpNetworkBuilder,
     OpExecutorBuilder,
     OpConsensusBuilder,
@@ -322,16 +331,31 @@ impl MantleNode {
             pool_builder = pool_builder.with_preconf(p.cfg().clone(), p.fifo().clone());
         }
 
+        // Construct the preconf-aware payload service. When
+        // `self.preconf == None` we still supply a default-empty
+        // `(cfg, fifo)` — no whitelist, no broadcast events. The fork's
+        // select! loop then sits idle waiting for cancel, and the
+        // block seals at CL `getPayload` time.
+        let builder_config = OpBuilderConfig::new_with_sdm(
+            self.op_node.da_config.clone(),
+            self.op_node.gas_limit_config.clone(),
+            args.sdm_enabled,
+        );
+        let (cfg, fifo) = if let Some(p) = &self.preconf {
+            (p.cfg().clone(), p.fifo().clone())
+        } else {
+            let default_svc = PreconfServiceBuilder::new(PreconfConfig::default())
+                .expect("default PreconfConfig validates");
+            (default_svc.cfg().clone(), default_svc.fifo().clone())
+        };
+        let payload_service =
+            MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, fifo, builder_config);
+
         ComponentsBuilder::default()
             .node_types::<N>()
             .executor(OpExecutorBuilder::default().with_sdm_enabled(args.sdm_enabled))
             .pool(pool_builder)
-            .payload(BasicPayloadServiceBuilder::new(
-                OpNodePayloadBuilder::new(args.compute_pending_block)
-                    .with_da_config(self.op_node.da_config.clone())
-                    .with_gas_limit_config(self.op_node.gas_limit_config.clone())
-                    .with_sdm_enabled(args.sdm_enabled),
-            ))
+            .payload(payload_service)
             .network(OpNetworkBuilder::new(args.disable_txpool_gossip, !args.discovery_v4))
             .consensus(OpConsensusBuilder::default())
     }
@@ -351,7 +375,7 @@ where
     type ComponentsBuilder = ComponentsBuilder<
         N,
         MantlePoolBuilder,
-        BasicPayloadServiceBuilder<OpNodePayloadBuilder>,
+        MantlePreconfServiceBuilder<OpPrimitives>,
         OpNetworkBuilder,
         OpExecutorBuilder,
         OpConsensusBuilder,

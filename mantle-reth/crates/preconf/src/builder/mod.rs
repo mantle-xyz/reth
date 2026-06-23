@@ -1,28 +1,30 @@
-//! Payload builder helpers — primitives used by the preconf-aware payload
-//! job's main loop.
+//! Mantle preconf-aware OP payload builder — forked from upstream's
+//! `OpPayloadBuilder` (see `docs/design/preconf-dev-plan.md` §P5f for
+//! the rationale).
 //!
-//! This module is intentionally narrow: it houses small, side-effect-free
-//! data structures (`BuilderTxTracker`, future state-carry helpers, ...) so
-//! they can be unit-tested in isolation without spinning up a full reth
-//! payload-building stack. The `PreconfPayloadJob` itself lives elsewhere
-//! and consumes these primitives.
+//! Module layout:
+//!
+//! - [`payload_builder`] — the fork itself: struct + `async
+//!   build_payload` (deposits → sequencer txs → preconf select! loop
+//!   → SDM post-exec → finalize).
+//! - [`dispatch`] — the select! loop's per-event helpers
+//!   (`apply_one_preconf` + `reconcile_lagged`), separated so the
+//!   state-machine invariants are unit-testable without standing up
+//!   the full EVM stack.
+//! - [`payload_job`] — `PreconfPayloadJob` implementing reth's
+//!   [`PayloadJob`](reth_payload_builder::PayloadJob) trait.
+//! - [`payload_job_generator`] — `PreconfPayloadJobGenerator`
+//!   implementing reth's [`PayloadJobGenerator`](reth_payload_builder::PayloadJobGenerator) trait.
+//! - [`cancel`] — `JobCancel`, the async-aware cancel signal shared
+//!   between the job and the spawned build task.
 
-pub mod builder;
 pub mod cancel;
-pub mod event;
-pub mod generator;
-pub mod job;
+pub(crate) mod dispatch;
 pub mod payload_builder;
-pub mod state_carry;
-pub mod tx_tracker;
+pub mod payload_job;
+pub mod payload_job_generator;
 
-pub use builder::{
-    BoxedPreconfTxApplier, BuilderLoop, PreconfApplierFactory, PreconfTxApplier, PromiseApplier,
-    default_applier_factory,
-};
 pub use cancel::JobCancel;
-pub use event::BuilderEvent;
-pub use generator::PreconfPayloadJobGenerator;
-pub use job::PreconfPayloadJob;
-pub use state_carry::CarriedState;
-pub use tx_tracker::BuilderTxTracker;
+pub use payload_builder::PreconfPayloadBuilder;
+pub use payload_job::{PreconfPayloadJob, ResolvePayloadFuture};
+pub use payload_job_generator::PreconfPayloadJobGenerator;
