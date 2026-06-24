@@ -148,7 +148,7 @@ pub fn validate_block_pre_execution<B, ChainSpec>(
 ) -> Result<(), ConsensusError>
 where
     B: Block,
-    ChainSpec: EthereumHardforks,
+    ChainSpec: EthChainSpec + EthereumHardforks,
 {
     post_merge_hardfork_fields(block, chain_spec)?;
 
@@ -156,8 +156,14 @@ where
     if let Err(error) = block.ensure_transaction_root_valid() {
         return Err(ConsensusError::BodyTransactionRootDiff(error.into()))
     }
-    // EIP-7825 validation
-    if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) {
+    // EIP-7825 validation.
+    //
+    // Disabled on OP-stack chains, matching op-geth (`!IsOptimism()` in
+    // `core/txpool/validation.go`) and the per-tx-pool check: L2 block gas limits far exceed
+    // the 16,777,216 per-tx cap. Defense-in-depth — op-reth's `OpBeaconConsensus` reimplements
+    // pre-execution validation and never calls this function, but gating here ensures the cap
+    // stays disabled for Optimism even if this path is ever wired up.
+    if !chain_spec.is_optimism() && chain_spec.is_osaka_active_at_timestamp(block.timestamp()) {
         for tx in block.body().transactions() {
             if tx.gas_limit() > MAX_TX_GAS_LIMIT_OSAKA {
                 return Err(TxGasLimitTooHighErr {
