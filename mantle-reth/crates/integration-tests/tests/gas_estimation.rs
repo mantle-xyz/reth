@@ -1,82 +1,126 @@
-//! Smoke tests for Mantle-specific RPC endpoints and gas estimation.
+//! Smoke + behavioural tests for Mantle-specific gas estimation RPCs.
 //!
-//! These tests verify the RPC methods are reachable and return structurally
-//! valid responses. Numerical accuracy is verified by `tests/rpc_compat`.
+//! These exercise the live `eth_estimateGas` / `eth_estimateTotalFee` paths through a
+//! booted `MantleNode`, covering the Arsia funds-preflight wiring added in
+//! `op-reth/crates/rpc/src/eth/call.rs` (port of op-geth `mantleArsiaCheckFunds` +
+//! the `value > balance` pre-check). Numerical accuracy is cross-checked against geth
+//! by `tests/rpc_compat`; the pure formula is unit-tested in `mantle-reth-eth-api`.
 
-use crate::helpers::{mantle_payload_attributes, mantle_test_chain_spec};
+use crate::helpers::with_mantle_rpc_client;
 use alloy_primitives::U256;
-use mantle_reth_cli::node::MantleNode;
-use reth_chainspec::EthChainSpec;
-use reth_db::test_utils::create_test_rw_db_with_path;
-use reth_e2e_test_utils::node::NodeTestContext;
-use reth_node_builder::{EngineNodeLauncher, Node, NodeBuilder, NodeConfig};
-use reth_node_core::args::{DatadirArgs, RpcServerArgs};
-use reth_provider::providers::BlockchainProvider;
-use reth_tasks::Runtime;
+use jsonrpsee::core::client::ClientT;
+
+/// Pre-funded Hardhat account from `assets/genesis.json` (holds ~1M ETH).
+const FUNDED: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+/// Second pre-funded Hardhat account.
+const FUNDED_2: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+/// An address with no genesis allocation — balance is zero.
+const UNFUNDED: &str = "0x000000000000000000000000000000000000dEaD";
 
 /// `eth_estimateGas` for a simple transfer returns >= 21000 via RPC.
 ///
 /// No block mining needed — estimateGas works against genesis state.
 #[tokio::test]
 async fn estimate_gas_simple_transfer_via_rpc() {
-    reth_tracing::init_test_tracing();
+    with_mantle_rpc_client(|client| async move {
+        let gas: U256 = client
+            .request(
+                "eth_estimateGas",
+                vec![serde_json::json!({
+                    "from": FUNDED,
+                    "to": FUNDED_2,
+                    "value": "0x1"
+                })],
+            )
+            .await
+            .expect("eth_estimateGas should succeed");
 
-    let chain_spec = mantle_test_chain_spec();
+        assert!(gas >= U256::from(21_000u64), "expected >= 21000, got {gas}");
+    })
+    .await;
+}
 
-    let mut config: NodeConfig<reth_optimism_chainspec::OpChainSpec> = NodeConfig::new(chain_spec)
-        .with_unused_ports()
-        .with_datadir_args(DatadirArgs {
-            datadir: reth_db::test_utils::tempdir_path().into(),
-            ..Default::default()
-        })
-        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    config.network.discovery.discv5_port = 0;
-    config.network.discovery.discv5_port_ipv6 = 0;
+/// A value transfer the caller cannot afford is rejected up front with an
+/// "insufficient funds for transfer" error — this is the `value >= balance` pre-check
+/// in the Mantle `estimate_gas_at` override (op-geth `gasestimator.go` clause 6). Like
+/// geth, the check only runs when a fee cap is set, so the request specifies
+/// `maxFeePerGas`; it does not require a mined L1-info block.
+#[tokio::test]
+async fn estimate_gas_value_exceeds_balance_rejected_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        // UNFUNDED has zero balance; any non-zero value exceeds it. A fee cap is set so
+        // the geth-gated value pre-check (feeCap != 0) actually runs.
+        let res: Result<U256, _> = client
+            .request(
+                "eth_estimateGas",
+                vec![serde_json::json!({
+                    "from": UNFUNDED,
+                    "to": FUNDED,
+                    "value": "0xde0b6b3a7640000", // 1 ETH
+                    "maxFeePerGas": "0x3b9aca00"   // 1 gwei → fee gate is open
+                })],
+            )
+            .await;
 
-    let db = create_test_rw_db_with_path(
-        config
-            .datadir
-            .datadir
-            .unwrap_or_chain_default(config.chain.chain(), config.datadir.clone())
-            .db(),
-    );
-    let runtime = Runtime::test();
-    let node_handle = NodeBuilder::new(config)
-        .with_database(db)
-        .with_types_and_provider::<MantleNode, BlockchainProvider<_>>()
-        .with_components(MantleNode::default().components())
-        .with_add_ons(MantleNode::default().add_ons())
-        .launch_with_fn(|builder| {
-            let launcher = EngineNodeLauncher::new(
-                runtime.clone(),
-                builder.config.datadir(),
-                Default::default(),
-            );
-            builder.launch_with(launcher)
-        })
-        .await
-        .expect("MantleNode failed to launch");
+        let err =
+            res.expect_err("estimateGas must reject a value transfer from a zero-balance account");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("insufficient funds for transfer"),
+            "expected 'insufficient funds for transfer', got: {msg}"
+        );
+    })
+    .await;
+}
 
-    // Don't mine — estimateGas works on genesis state directly.
-    let _node = NodeTestContext::new(node_handle.node, mantle_payload_attributes).await.unwrap();
+/// With no value and no fee specified, an unfunded account still gets an estimate:
+/// the `value > balance` pre-check is skipped (value == 0) and the Arsia funds
+/// preflight is skipped (no fee → `fee_cap == 0`, mirroring op-geth's
+/// `GasEstimationWithSkipCheckBalanceMode`). Documents the skip gates.
+#[tokio::test]
+async fn estimate_gas_zero_value_unfunded_skips_funds_check_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        let gas: U256 = client
+            .request(
+                "eth_estimateGas",
+                vec![serde_json::json!({
+                    "from": UNFUNDED,
+                    "to": FUNDED
+                })],
+            )
+            .await
+            .expect("estimateGas with no value/fee should skip the funds check and succeed");
 
-    let client = _node.inner.rpc_server_handle().http_client().expect("HTTP RPC enabled");
+        assert!(gas >= U256::from(21_000u64), "expected >= 21000, got {gas}");
+    })
+    .await;
+}
 
-    // Pre-funded Hardhat account from genesis.json
-    let from = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+/// `eth_estimateTotalFee` is reachable on an Arsia chain and returns a structurally
+/// valid total (L2 gas + L1 data + operator fee). Shares the estimateGas path with
+/// `eth_estimateGas` (op-geth `DoEstimateGas`), so the funds-preflight wiring is
+/// exercised transitively.
+#[tokio::test]
+async fn estimate_total_fee_simple_transfer_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        let total: U256 = client
+            .request(
+                "eth_estimateTotalFee",
+                // positional params: [request, block?] — block defaults to latest.
+                vec![serde_json::json!({
+                    "from": FUNDED,
+                    "to": FUNDED_2,
+                    "value": "0x1"
+                })],
+            )
+            .await
+            .expect("eth_estimateTotalFee should succeed on an Arsia chain");
 
-    use jsonrpsee::core::client::ClientT;
-    let gas: U256 = client
-        .request(
-            "eth_estimateGas",
-            vec![serde_json::json!({
-                "from": from,
-                "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-                "value": "0x1"
-            })],
-        )
-        .await
-        .expect("eth_estimateGas should succeed");
-
-    assert!(gas >= U256::from(21_000u64), "expected >= 21000, got {gas}");
+        // L2 gas estimate is always >= 21000; the total fee is gas * price + L1 + operator,
+        // so it must be representable (no panic / overflow). On the zero-base-fee genesis
+        // state the numeric value may be small, so we only assert the call shape here —
+        // numerical parity with geth lives in tests/rpc_compat.
+        let _ = total;
+    })
+    .await;
 }

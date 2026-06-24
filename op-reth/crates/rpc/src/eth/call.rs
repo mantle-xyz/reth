@@ -31,16 +31,29 @@ where
         state_override: Option<StateOverride>,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
-            // [MANTLE] Pre-check: value transfer (geth state_transition.go clause 6).
-            // geth uses target block state (StateAndHeaderByNumberOrHash), not parent state.
+            // [MANTLE] Pre-check: value transfer (op-geth `gasestimator.go` clause 6,
+            // lines 98-105). geth only runs this when a fee cap is set
+            // (`feeCap.BitLen() != 0`, i.e. not `GasEstimationWithSkipCheckBalanceMode`)
+            // and rejects when `value >= balance`. We mirror both the fee gate and the
+            // `>=` comparison, evaluated against the target block state (matching geth's
+            // `StateAndHeaderByNumberOrHash`). Without a fee, upstream `estimate_gas_at`
+            // skips its own `caller_gas_allowance` check too, so this stays gated to avoid
+            // diverging from geth (which returns an estimate rather than erroring).
             if let Some(from) = request.as_ref().from {
                 let value = request.as_ref().value.unwrap_or(U256::ZERO);
+                let fee_cap = U256::from(
+                    request
+                        .as_ref()
+                        .max_fee_per_gas
+                        .unwrap_or(request.as_ref().gas_price.unwrap_or(0)),
+                );
                 if !value.is_zero() &&
+                    !fee_cap.is_zero() &&
                     let Ok(Some(block)) = self.provider().block_by_id(at) &&
                     let Ok(state) = self.provider().state_by_block_id(at)
                 {
                     let balance = state.account_balance(&from).ok().flatten().unwrap_or(U256::ZERO);
-                    if value > balance {
+                    if value >= balance {
                         let hi = request.as_ref().gas.unwrap_or(block.header().gas_limit());
                         return Err(reth_rpc_eth_types::EthApiError::InvalidParams(format!(
                             "failed with {hi} gas: insufficient funds for transfer: address {from}"
