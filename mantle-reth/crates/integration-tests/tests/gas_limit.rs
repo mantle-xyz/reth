@@ -1,4 +1,4 @@
-//! TxPool gas-limit reservation: a non-deposit transaction may use at most
+//! Tx-pool gas-limit reservation: a non-deposit transaction may use at most
 //! `block_gas_limit - MANTLE_L1_INFO_GAS_OVERHEAD` gas, matching op-geth's `EffectiveGasLimit`.
 //!
 //! Every L2 block carries an L1-info deposit that consumes part of the block gas, so a tx asking
