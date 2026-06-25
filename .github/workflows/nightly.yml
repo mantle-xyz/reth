@@ -1,0 +1,37 @@
+name: nightly
+
+on:
+  schedule:
+    # Daily at 03:17 UTC. Off-zero minute to avoid the top-of-hour scheduling spike.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  full-test:
+    name: full test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Exhaustive suite incl. the node-spawning `it` integration harness, benches,
+    # and all features — too heavy for per-PR CI, so it runs here on a schedule.
+    # Warnings are gated by the PR clippy job; do not fail the build on them here.
+    env:
+      RUSTFLAGS: ""
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: extractions/setup-just@v2
+      - run: just test
+      - run: just test-doc
