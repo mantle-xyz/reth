@@ -35,7 +35,9 @@ use reth_rpc_eth_api::{
     helpers::{EthBlocks, EthCall, EthFees},
 };
 use reth_rpc_server_types::result::invalid_params_rpc_err;
-use reth_storage_api::{BlockIdReader, BlockReaderIdExt, StateProviderFactory};
+use reth_storage_api::{
+    BlockIdReader, BlockReaderIdExt, StateProviderBox, StateProviderFactory, errors::ProviderResult,
+};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -178,6 +180,41 @@ const GETH_MANTLE_RPC_GAS_CAP: u64 = 0x4000000000000;
 /// Caps gas for the L1 cost envelope, matching geth's `CallDefaults` behavior.
 fn capped_gas_for_l1_envelope(request_gas: Option<u64>) -> u64 {
     request_gas.map(|gas| gas.min(GETH_MANTLE_RPC_GAS_CAP)).unwrap_or(GETH_MANTLE_RPC_GAS_CAP)
+}
+
+/// Minimal state-source seam for [`read_token_ratio`].
+///
+/// A blanket impl covers every [`StateProviderFactory`], so production passes the real
+/// provider unchanged; tests implement just this one method to inject provider failures
+/// without standing up a full provider stack.
+trait BlockState {
+    fn state_at(&self, block_id: BlockId) -> ProviderResult<StateProviderBox>;
+}
+
+impl<P: StateProviderFactory> BlockState for P {
+    fn state_at(&self, block_id: BlockId) -> ProviderResult<StateProviderBox> {
+        self.state_by_block_id(block_id)
+    }
+}
+
+/// Reads the Mantle `token_ratio` (`GasPriceOracle` slot 0) from `block_id`'s post-state.
+///
+/// `token_ratio` is not carried in the L1-attributes calldata, so it must be read from
+/// state. It is the last (multiplicative) factor of the Arsia L1 data fee, so a silently
+/// swallowed provider error would leave it at the default `0` and drop the entire L1 data
+/// fee component — a large, silent under-estimate. We therefore propagate provider errors,
+/// and treat a missing slot (`Ok(None)`) as the on-chain zero value (matching geth, which
+/// reads the same slot from the same target-block state).
+fn read_token_ratio<S: BlockState>(source: &S, block_id: BlockId) -> RpcResult<U256> {
+    let state = source.state_at(block_id).map_err(|e| {
+        ErrorObject::owned(-32000, format!("failed to load state for token_ratio: {e}"), None::<()>)
+    })?;
+    Ok(state
+        .storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
+        .map_err(|e| {
+            ErrorObject::owned(-32000, format!("failed to read token_ratio: {e}"), None::<()>)
+        })?
+        .unwrap_or(U256::ZERO))
 }
 
 fn estimate_total_fee_gas_price(
@@ -411,13 +448,12 @@ where
         // Calculate L1 data fee + operator fee from L1BlockInfo
         let (l1_data_fee, operator_fee) = match extract_l1_info(block.body()) {
             Ok(mut l1_block_info) => {
-                // Geth uses target block state (StateAndHeaderByNumberOrHash), not parent state.
-                if let Ok(state) = self.provider().state_by_block_id(block_id) &&
-                    let Ok(Some(ratio)) =
-                        state.storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
-                {
-                    l1_block_info.token_ratio = ratio;
-                }
+                // `token_ratio` (GasPriceOracle slot 0) is not in the L1-attributes calldata;
+                // read it from the target block's post-state (matches geth's
+                // `StateAndHeaderByNumberOrHash`). Propagate provider errors rather than
+                // silently keeping the default 0 — `token_ratio` is the multiplicative factor
+                // of the L1 data fee, so swallowing an error would drop the whole L1 component.
+                l1_block_info.token_ratio = read_token_ratio(self.provider(), block_id)?;
 
                 // Build a proxy envelope matching geth's CallDefaults + ToTransaction:
                 // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with RPCGasCap,
@@ -732,6 +768,33 @@ mod tests {
             U256::from(2_242_484_739_278u64),
             "must reproduce the on-chain 597707 divergence \
              (reth 0x82759e66553fe - geth 0x8254fc7e3b730)"
+        );
+    }
+
+    // ─── token_ratio state-read error propagation ───────────────────────
+
+    use reth_storage_api::errors::ProviderError;
+
+    /// A [`BlockState`] whose state lookup always fails, so we can assert that
+    /// [`read_token_ratio`] surfaces provider errors instead of silently falling back to
+    /// `token_ratio = 0` (which would drop the entire L1 data fee).
+    struct FailingState;
+
+    impl BlockState for FailingState {
+        fn state_at(&self, _: BlockId) -> ProviderResult<StateProviderBox> {
+            Err(ProviderError::StateForNumberNotFound(0))
+        }
+    }
+
+    #[test]
+    fn read_token_ratio_propagates_state_error() {
+        // Pre-hardening, the read used `if let Ok(state) = state_by_block_id(..)` and silently
+        // left `token_ratio = 0` on error, zeroing the L1 data fee. The hardened helper must
+        // surface the provider error instead.
+        let result = read_token_ratio(&FailingState, BlockId::Number(1u64.into()));
+        assert!(
+            result.is_err(),
+            "a provider error while reading token_ratio must propagate, not silently yield 0"
         );
     }
 }
