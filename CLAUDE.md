@@ -8,15 +8,30 @@ Run the full pre-PR check locally and make sure it is green:
 just pr
 ```
 
-`just pr` runs the same gates CI enforces, in order:
+`just pr` runs the same gates CI enforces on every PR, in order:
 
 1. `just lint` — `cargo +nightly fmt --all` + `cargo clippy --workspace --all-features -D warnings`
-2. `just test-ci` — hermetic unit + integration + replay tests (`cargo test --workspace --lib --tests`)
+2. `just test-ci` — workspace unit tests + offline integration targets (`replay`, `token_ratio_midblock`)
 3. `just test-doc` — documentation tests
 
 CI (`.github/workflows/ci.yml`) runs `lint` and `test` (`just test-ci`) in
 parallel on every PR to `mantle-elysium` and `main`. Running `just pr` first
 avoids round-trips waiting on CI.
+
+## Test tiers
+
+To keep per-PR CI fast, the test suite is split into two tiers:
+
+- **PR tier** (`just test-ci`, every PR): workspace unit tests + the offline
+  integration targets (`replay`, `token_ratio_midblock`). No node spawning.
+- **Nightly tier** (`just test`, `.github/workflows/nightly.yml`, daily +
+  manual `workflow_dispatch`): the exhaustive suite, including the
+  node-spawning `it` integration harness (`fill_transaction`, `gas_estimation`,
+  `gas_limit`, `txpool`), benches, and `--all-features`.
+
+Before a release — or whenever you touch node/RPC/txpool behavior — run the
+full suite locally with `just test`, since those paths are only covered by the
+nightly tier in CI.
 
 ## Useful recipes
 

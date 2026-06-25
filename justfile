@@ -114,9 +114,12 @@ clippy:
 # Run all linters (fmt + clippy)
 lint: fmt clippy
 
-# CI-required hermetic tests: unit + integration + replay (no benches/all-features)
+# Excludes the node-spawning `it` harness (the heavy target to compile/link/run),
+# which runs in the nightly workflow instead.
+# PR-tier tests: workspace unit tests + offline integration targets
 test-ci:
-  cargo test --workspace --lib --tests
+  cargo test --workspace --lib
+  cargo test -p mantle-reth-integration-tests --test replay --test token_ratio_midblock
 
 # Mainnet transaction replay fixtures only (offline, sub-second)
 test-replay:
