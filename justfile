@@ -116,10 +116,12 @@ lint: fmt clippy
 
 # Excludes the node-spawning `it` harness (the heavy target to compile/link/run),
 # which runs in the nightly workflow instead.
-# PR-tier tests: workspace unit tests + offline integration targets
+# PR-tier tests: workspace unit tests + offline integration targets.
+# Kept as a single cargo invocation so feature resolution happens once; splitting
+# into a separate `-p` run narrows the resolver scope and forces a large recompile
+# of the op-reth/revm/alloy subgraph between invocations.
 test-ci:
-  cargo test --workspace --lib
-  cargo test -p mantle-reth-integration-tests --test replay --test token_ratio_midblock
+  cargo test --workspace --lib --test replay --test token_ratio_midblock
 
 # Mainnet transaction replay fixtures only (offline, sub-second)
 test-replay:
