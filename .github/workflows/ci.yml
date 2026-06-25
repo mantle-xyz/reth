@@ -1,4 +1,4 @@
-name: lint
+name: ci
 
 on:
   pull_request:
@@ -34,3 +34,25 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just fmt
       - run: just clippy
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Tests compile a lot of code; do not fail the build on warnings here
+    # (warnings are already gated by the clippy job above).
+    # Disable incremental compilation: it gives little benefit on CI's mostly
+    # cold builds and avoids stale-cache rustc ICEs on large trait graphs.
+    env:
+      RUSTFLAGS: ""
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: extractions/setup-just@v2
+      - run: just test-ci

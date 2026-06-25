@@ -114,7 +114,15 @@ clippy:
 # Run all linters (fmt + clippy)
 lint: fmt clippy
 
-# Run workspace unit tests
+# CI-required hermetic tests: unit + integration + replay (no benches/all-features)
+test-ci:
+  cargo test --workspace --lib --tests
+
+# Mainnet transaction replay fixtures only (offline, sub-second)
+test-replay:
+  cargo test -p mantle-reth-integration-tests --test replay
+
+# Run the full local test suite (examples + benches + all features)
 test:
   cargo test --workspace --lib --examples --tests --benches --all-features
 
@@ -122,8 +130,8 @@ test:
 test-doc:
   cargo test --doc --workspace --all-features
 
-# Full pre-PR check: lint + test
-pr: lint test test-doc
+# Full pre-PR check: lint + CI tests + doc tests (use `just test` for the exhaustive suite)
+pr: lint test-ci test-doc
 
 # ==================== Docker ====================
 
