@@ -411,8 +411,8 @@ where
         // Calculate L1 data fee + operator fee from L1BlockInfo
         let (l1_data_fee, operator_fee) = match extract_l1_info(block.body()) {
             Ok(mut l1_block_info) => {
-                // Read token_ratio from GasOracle contract state
-                if let Ok(state) = self.provider().state_by_block_hash(header.parent_hash()) &&
+                // Geth uses target block state (StateAndHeaderByNumberOrHash), not parent state.
+                if let Ok(state) = self.provider().state_by_block_id(block_id) &&
                     let Ok(Some(ratio)) =
                         state.storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
                 {
