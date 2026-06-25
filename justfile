@@ -114,7 +114,20 @@ clippy:
 # Run all linters (fmt + clippy)
 lint: fmt clippy
 
-# Run workspace unit tests
+# Excludes the node-spawning `it` harness (the heavy target to compile/link/run),
+# which runs in the nightly workflow instead.
+# PR-tier tests: workspace unit tests + offline integration targets.
+# Kept as a single cargo invocation so feature resolution happens once; splitting
+# into a separate `-p` run narrows the resolver scope and forces a large recompile
+# of the op-reth/revm/alloy subgraph between invocations.
+test-ci:
+  cargo test --workspace --lib --test replay --test token_ratio_midblock
+
+# Mainnet transaction replay fixtures only (offline, sub-second)
+test-replay:
+  cargo test -p mantle-reth-integration-tests --test replay
+
+# Run the full local test suite (examples + benches + all features)
 test:
   cargo test --workspace --lib --examples --tests --benches --all-features
 
@@ -122,8 +135,8 @@ test:
 test-doc:
   cargo test --doc --workspace --all-features
 
-# Full pre-PR check: lint + test
-pr: lint test test-doc
+# Full pre-PR check: lint + CI tests + doc tests (use `just test` for the exhaustive suite)
+pr: lint test-ci test-doc
 
 # ==================== Docker ====================
 
