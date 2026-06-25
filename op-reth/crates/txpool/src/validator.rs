@@ -23,6 +23,23 @@ use std::sync::{
 /// The timeout for cross-chain transaction validation against the supervisor/interop-filter.
 pub(crate) const CHECK_ACCESS_LIST_TIMEOUT_SECS: u64 = 7200;
 
+/// Gas reserved on every L2 block for the always-present L1-info deposit transaction.
+///
+/// Mirrors op-geth `l1InfoGasOverhead` (`core/txpool/validation.go`): the L1-info deposit is
+/// injected into every L2 block, so a non-deposit transaction can never consume the full block
+/// gas limit. Upstream reth caps the tx-pool gas limit at the full block limit, so without this
+/// reservation a transaction with gas in `(block_gas_limit - overhead, block_gas_limit]` would be
+/// admitted to the pool yet could never be included — it would sit there until it expires. We
+/// reserve the overhead so such transactions are rejected up front, as geth does.
+pub(crate) const MANTLE_L1_INFO_GAS_OVERHEAD: u64 = 1_000_000;
+
+/// Effective per-transaction gas limit for the Mantle tx-pool: the block gas limit minus the
+/// L1-info deposit reservation. Port of the Optimism branch of op-geth's `EffectiveGasLimit`
+/// (`core/txpool/validation.go`). Saturates to `0` when the block limit is below the reservation.
+pub(crate) fn mantle_effective_gas_limit(block_gas_limit: u64) -> u64 {
+    block_gas_limit.saturating_sub(MANTLE_L1_INFO_GAS_OVERHEAD)
+}
+
 /// Tracks additional infos for the current block.
 #[derive(Debug, Default)]
 pub struct OpL1BlockInfo {
@@ -220,6 +237,22 @@ where
             _ => {}
         }
 
+        // [MANTLE] Reserve gas for the L1-info deposit present in every L2 block, matching
+        // op-geth `EffectiveGasLimit` (`core/txpool/validation.go`). Upstream reth caps at the
+        // full block gas limit, so without this a tx with gas_limit in
+        // `(block_gas_limit - overhead, block_gas_limit]` would be admitted but could never be
+        // included (the L1-info deposit always consumes part of the block), leaving it stuck.
+        if self.chain_spec().is_mantle() {
+            let gas_limit = transaction.gas_limit();
+            let effective_limit = mantle_effective_gas_limit(self.inner.block_gas_limit());
+            if gas_limit > effective_limit {
+                return TransactionValidationOutcome::Invalid(
+                    transaction,
+                    InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, effective_limit),
+                );
+            }
+        }
+
         let outcome = self.inner.validate_one_with_state(origin, transaction, state);
 
         self.apply_op_checks(outcome)
@@ -339,5 +372,28 @@ impl OpForkTracker {
     /// Returns `true` if Interop fork is activated.
     pub(crate) fn is_interop_activated(&self) -> bool {
         self.interop.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MANTLE_L1_INFO_GAS_OVERHEAD, mantle_effective_gas_limit};
+
+    #[test]
+    fn effective_gas_limit_subtracts_l1_info_overhead() {
+        // 30M block → 29M effective; 60M block → 59M (matches op-geth EffectiveGasLimit).
+        assert_eq!(
+            mantle_effective_gas_limit(30_000_000),
+            30_000_000 - MANTLE_L1_INFO_GAS_OVERHEAD
+        );
+        assert_eq!(mantle_effective_gas_limit(60_000_000), 59_000_000);
+    }
+
+    #[test]
+    fn effective_gas_limit_saturates_below_overhead() {
+        // A block limit at or below the reservation leaves no room for user txs.
+        assert_eq!(mantle_effective_gas_limit(MANTLE_L1_INFO_GAS_OVERHEAD), 0);
+        assert_eq!(mantle_effective_gas_limit(500_000), 0);
+        assert_eq!(mantle_effective_gas_limit(0), 0);
     }
 }
