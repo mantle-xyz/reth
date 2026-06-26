@@ -48,29 +48,24 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo test -p mantle-reth-integration-tests --test estimate_total_fee_token_ratio -- --nocapture
+//! cargo test -p mantle-reth-integration-tests --test it \
+//!     estimate_total_fee_uses_target_block_token_ratio -- --nocapture
 //! ```
 
+use crate::helpers::with_mantle_node;
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B64, B256, Bytes, TxKind, U256, address, hex};
 use alloy_rpc_types_engine::PayloadAttributes;
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use jsonrpsee::core::client::ClientT;
+use jsonrpsee::{core::client::ClientT, http_client::HttpClient};
 use mantle_reth_cli::node::MantleNode;
 use op_alloy_consensus::TxDeposit;
 use op_alloy_rpc_types_engine::OpPayloadAttributes;
 use reth_chainspec::EthChainSpec;
-use reth_db::test_utils::create_test_rw_db_with_path;
-use reth_e2e_test_utils::{
-    node::NodeTestContext, transaction::TransactionTestContext, wallet::Wallet,
-};
+use reth_e2e_test_utils::{NodeHelperType, transaction::TransactionTestContext, wallet::Wallet};
 use reth_node_api::TreeConfig;
-use reth_node_builder::{EngineNodeLauncher, Node, NodeBuilder, NodeConfig};
-use reth_node_core::args::{DatadirArgs, RpcServerArgs};
 use reth_optimism_node::payload::OpPayloadAttrs;
-use reth_provider::providers::BlockchainProvider;
-use reth_tasks::Runtime;
 use std::sync::Arc;
 
 /// `GasPriceOracle` predeploy — `token_ratio` lives at slot 0.
@@ -157,69 +152,38 @@ fn chain_spec_with_oracle() -> Arc<reth_optimism_chainspec::OpChainSpec> {
     Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
 }
 
-// Previously flaky under the engine-only e2e harness: it builds the engine but not the staged-sync
-// pipeline, so the `AccountsHistory`/`StoragesHistory` indices are never populated and a *by-number
-// historical* read for a freshly mined block intermittently errors (`HeaderNotFound`, the number→
-// hash index lags the canonical commit) or silently returns the head state. Reading a *past* block
-// (e.g. block 1 after block 3 exists) was therefore unreliable, and `sync_to`/waiting did not help
-// because the per-block historical reconstruction itself is unavailable in this configuration.
-//
-// Fix: take every read while its block is the canonical head (the `latest` tag) and cache it,
-// after `sync_to` confirms the head has settled. Head state is always present and consistent, so
-// the reads are reliable; the bug under test is still exercised (`estimate_total_fee` resolves
-// `latest` to the concrete head number and prices `token_ratio` from that block's post-state).
 #[tokio::test]
 async fn estimate_total_fee_uses_target_block_token_ratio() {
-    reth_tracing::init_test_tracing();
-
     let chain_spec = chain_spec_with_oracle();
     let chain_id = chain_spec.chain().id();
     let wallet = Wallet::default().with_chain_id(chain_id);
 
-    let mut config: NodeConfig<reth_optimism_chainspec::OpChainSpec> = NodeConfig::new(chain_spec)
-        .with_unused_ports()
-        .with_datadir_args(DatadirArgs {
-            datadir: reth_db::test_utils::tempdir_path().into(),
-            ..Default::default()
-        })
-        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    config.network.discovery.discv5_port = 0;
-    config.network.discovery.discv5_port_ipv6 = 0;
+    // Keep the test's few blocks in the in-memory canonical chain (never persist/evict them within
+    // the test): a high persistence threshold means historical state is always served via the
+    // `MemoryOverlayStateProvider` (forward in-memory diffs), which does NOT depend on the
+    // `StoragesHistory` index. The engine-only e2e harness does not populate that index, so once a
+    // block is evicted to the DB-historical path its by-number historical read falls back to the
+    // head state (the stale-ratio flakiness). Keeping blocks in memory sidesteps that path.
+    // Threshold 8 is > the 3 blocks we mine and < the default backpressure threshold of 16, so
+    // the engine never persists/evicts within the test.
+    let tree_config = TreeConfig::default().with_persistence_threshold(8);
 
-    let db = create_test_rw_db_with_path(
-        config
-            .datadir
-            .datadir
-            .unwrap_or_chain_default(config.chain.chain(), config.datadir.clone())
-            .db(),
-    );
-    let runtime = Runtime::test();
-    let node_handle = NodeBuilder::new(config)
-        .with_database(db)
-        .with_types_and_provider::<MantleNode, BlockchainProvider<_>>()
-        .with_components(MantleNode::default().components())
-        .with_add_ons(MantleNode::default().add_ons())
-        .launch_with_fn(|builder| {
-            // Keep the test's few blocks in the in-memory canonical chain (never persist/evict
-            // them within the test): a high persistence threshold means historical state is always
-            // served via the `MemoryOverlayStateProvider` (forward in-memory diffs), which does NOT
-            // depend on the `StoragesHistory` index. The engine-only harness does not populate that
-            // index, so once a block is evicted to the DB-historical path its by-number historical
-            // read falls back to the head state (the stale-ratio flakiness). Keeping blocks in
-            // memory sidesteps that path entirely.
-            // threshold 8 (> the 3 blocks we mine, < the default backpressure threshold of 16):
-            // the engine never persists/evicts within the test, so all blocks stay in memory.
-            let tree_config = TreeConfig::default().with_persistence_threshold(8);
-            let launcher =
-                EngineNodeLauncher::new(runtime.clone(), builder.config.datadir(), tree_config);
-            builder.launch_with(launcher)
-        })
-        .await
-        .expect("MantleNode failed to launch");
+    with_mantle_node(chain_spec, attrs_with_l1_deposit, tree_config, move |node, client| {
+        run_token_ratio_assertions(node, client, chain_id, wallet)
+    })
+    .await;
+}
 
-    let mut node = NodeTestContext::new(node_handle.node, attrs_with_l1_deposit).await.unwrap();
-    let client = node.inner.rpc_server_handle().http_client().expect("HTTP RPC enabled");
-
+/// Mines a `token_ratio` transition (block 1 stable → block 2 transition → block 3 stable) and
+/// asserts, via the live `eth_estimateTotalFee` RPC, that the L1 data fee tracks the on-chain
+/// ratio at the target block. Split out from the `#[tokio::test]` so the node-launch closure
+/// stays a trivial one-liner.
+async fn run_token_ratio_assertions(
+    mut node: NodeHelperType<MantleNode>,
+    client: HttpClient,
+    chain_id: u64,
+    wallet: Wallet,
+) {
     // Blocks are mined deterministically from genesis (block 0): each `advance_block()` produces
     // exactly one block, so the numbers are 1 (pre), 2 (transition), 3 (stable). They remain in
     // the in-memory canonical chain and are queryable by number for the assertions below.
