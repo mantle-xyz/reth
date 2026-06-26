@@ -249,7 +249,8 @@ where
             if request.as_ref().max_fee_per_gas().is_none() {
                 let header = self.provider().latest_header().map_err(Self::Error::from_eth_err)?;
                 let base_fee = header.and_then(|h| h.base_fee_per_gas()).unwrap_or_default();
-                // MANTLE PATCH: go-ethereum parity — `base_fee * 2 + tip` (upstream: `base_fee + tip`).
+                // MANTLE PATCH: go-ethereum parity — `base_fee * 2 + tip` (upstream: `base_fee +
+                // tip`).
                 request.as_mut().set_max_fee_per_gas(base_fee as u128 * 2 + tip);
             }
         }

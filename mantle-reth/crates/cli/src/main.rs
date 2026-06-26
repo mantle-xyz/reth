@@ -1,7 +1,7 @@
 #![allow(missing_docs, rustdoc::missing_crate_level_docs)]
 
 use clap::Parser;
-use mantle_reth_cli::{seed_blockchain_tree_metrics, MantleChainSpecParser, MantleNode};
+use mantle_reth_cli::{MantleChainSpecParser, MantleNode, seed_blockchain_tree_metrics};
 use reth_optimism_node::args::RollupArgs;
 use tracing::info;
 
