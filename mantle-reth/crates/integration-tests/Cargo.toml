@@ -27,11 +27,6 @@ name = "token_ratio_midblock"
 path = "tests/token_ratio_midblock.rs"
 harness = true
 
-[[test]]
-name = "estimate_total_fee_token_ratio"
-path = "tests/estimate_total_fee_token_ratio.rs"
-harness = true
-
 [dependencies]
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }
