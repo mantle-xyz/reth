@@ -42,7 +42,9 @@ reth-optimism-rpc = { workspace = true }
 # reth
 reth-e2e-test-utils = { workspace = true }
 reth-node-builder = { workspace = true, features = ["test-utils"] }
+reth-node-api = { workspace = true }
 reth-node-core = { workspace = true }
+reth-payload-primitives = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true }
 reth-tasks = { workspace = true }
@@ -57,6 +59,7 @@ alloy-rpc-types-eth = { workspace = true }
 alloy-rpc-types-engine = { workspace = true }
 alloy-network = { workspace = true }
 alloy-op-hardforks = { workspace = true }
+op-alloy-consensus = { workspace = true }
 op-alloy-rpc-types-engine = { workspace = true }
 
 # revm / op-revm (for replay tests)
