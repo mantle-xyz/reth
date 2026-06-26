@@ -120,7 +120,14 @@ where
         mantle_test_chain_spec(),
         mantle_payload_attributes,
         TreeConfig::default(),
-        move |_node, client| test(client),
+        move |node, client| async move {
+            // Keep `node` (and its RPC server) alive until the test future completes; binding it
+            // here moves it into this future. Returning `test(client)` directly would drop the
+            // node the instant the closure returns — before the await — so the RPC client would
+            // get connection-refused.
+            let _node = node;
+            test(client).await;
+        },
     )
     .await;
 }
