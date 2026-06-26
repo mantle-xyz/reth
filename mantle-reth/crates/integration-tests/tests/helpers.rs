@@ -8,7 +8,8 @@ use mantle_reth_cli::node::MantleNode;
 use op_alloy_rpc_types_engine::OpPayloadAttributes;
 use reth_chainspec::EthChainSpec;
 use reth_db::test_utils::create_test_rw_db_with_path;
-use reth_e2e_test_utils::node::NodeTestContext;
+use reth_e2e_test_utils::{NodeHelperType, node::NodeTestContext};
+use reth_node_api::TreeConfig;
 use reth_node_builder::{EngineNodeLauncher, Node, NodeBuilder, NodeConfig};
 use reth_node_core::args::{DatadirArgs, RpcServerArgs};
 use reth_optimism_chainspec::OpChainSpec;
@@ -52,20 +53,23 @@ pub(crate) fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
     })
 }
 
-/// Boot a Mantle test node (all hardforks active at genesis) with HTTP-RPC enabled and
-/// run `test` against its RPC client.
+/// Boot a Mantle test node (all hardforks active at genesis) with HTTP-RPC enabled, then run
+/// `test` against the live node context and its RPC client.
 ///
-/// The node is kept alive for the duration of the closure and torn down afterwards, so
-/// callers don't have to repeat the (verbose) node-launch boilerplate. estimateGas /
-/// estimateTotalFee work against genesis state, so no block needs to be mined.
-pub(crate) async fn with_mantle_rpc_client<F, Fut>(test: F)
-where
-    F: FnOnce(HttpClient) -> Fut,
+/// Centralises the verbose, upstream-fragile node-launch boilerplate (`NodeConfig`, the temp DB,
+/// and the `NodeBuilder`/`EngineNodeLauncher` chain) so callers only supply what actually differs
+/// between tests: the chain spec, the per-block payload-attributes generator, and the `TreeConfig`.
+/// The node is kept alive for the duration of `test` and torn down afterwards.
+pub(crate) async fn with_mantle_node<F, Fut>(
+    chain_spec: Arc<OpChainSpec>,
+    attributes_generator: fn(u64) -> OpPayloadAttrs,
+    tree_config: TreeConfig,
+    test: F,
+) where
+    F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     reth_tracing::init_test_tracing();
-
-    let chain_spec = mantle_test_chain_spec();
 
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
         .with_unused_ports()
@@ -91,18 +95,32 @@ where
         .with_components(MantleNode::default().components())
         .with_add_ons(MantleNode::default().add_ons())
         .launch_with_fn(|builder| {
-            let launcher = EngineNodeLauncher::new(
-                runtime.clone(),
-                builder.config.datadir(),
-                Default::default(),
-            );
+            let launcher =
+                EngineNodeLauncher::new(runtime.clone(), builder.config.datadir(), tree_config);
             builder.launch_with(launcher)
         })
         .await
         .expect("MantleNode failed to launch");
 
-    let node = NodeTestContext::new(node_handle.node, mantle_payload_attributes).await.unwrap();
+    let node = NodeTestContext::new(node_handle.node, attributes_generator).await.unwrap();
     let client = node.inner.rpc_server_handle().http_client().expect("HTTP RPC enabled");
 
-    test(client).await;
+    test(node, client).await;
+}
+
+/// Boot a default Mantle test node (genesis state only, no blocks mined) and run `test` against
+/// its RPC client. Thin wrapper over [`with_mantle_node`] for the common case where a test only
+/// needs the RPC client (e.g. estimateGas / estimateTotalFee against genesis state).
+pub(crate) async fn with_mantle_rpc_client<F, Fut>(test: F)
+where
+    F: FnOnce(HttpClient) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    with_mantle_node(
+        mantle_test_chain_spec(),
+        mantle_payload_attributes,
+        TreeConfig::default(),
+        move |_node, client| test(client),
+    )
+    .await;
 }
