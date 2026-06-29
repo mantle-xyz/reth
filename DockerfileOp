@@ -29,7 +29,7 @@ ARG RUSTFLAGS=""
 ENV RUSTFLAGS="$RUSTFLAGS"
 
 # Mantle op-reth is the `mantle-reth-cli` package (elysium workspace layout).
-ARG FEATURES="jemalloc asm-keccak min-debug-logs"
+ARG FEATURES="jemalloc-symbols asm-keccak min-debug-logs"
 ENV FEATURES=$FEATURES
 
 COPY . .
