@@ -32,6 +32,11 @@ ENV RUSTFLAGS="$RUSTFLAGS"
 ARG FEATURES="jemalloc-symbols asm-keccak min-debug-logs"
 ENV FEATURES=$FEATURES
 
+# Keep symbols + line tables so jemalloc heap profiles (jeprof) symbolize.
+# Overrides [profile.release] debug="none"/strip="symbols" for this profiling image only.
+ENV CARGO_PROFILE_RELEASE_DEBUG=1
+ENV CARGO_PROFILE_RELEASE_STRIP=false
+
 COPY . .
 
 # NOTE: this must stay a SINGLE physical line — the pipeline injects a RUN before
