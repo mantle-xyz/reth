@@ -402,6 +402,7 @@ url = "2.5"
 # Uncomment when patches/ crates are populated:
 [patch."https://github.com/paradigmxyz/reth"]
 reth-trie-common = { path = "patches/reth-trie-common" }
+reth-trie-db = { path = "patches/reth-trie-db" }
 # reth-rpc = { path = "patches/reth-rpc" }
 # reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 
