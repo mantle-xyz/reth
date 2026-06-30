@@ -116,3 +116,11 @@ serde = { workspace = true, features = ["derive", "std"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "test-util", "fs"] }
 tempfile.workspace = true
+
+# P6 e2e harness — in-process EVM tests for build_payload (see
+# `docs/design/preconf-dev-plan.md` §P6).
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-optimism-chainspec.workspace = true
+reth-optimism-primitives.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
