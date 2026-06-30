@@ -398,10 +398,27 @@ thiserror = { version = "2", default-features = false }
 tokio-tungstenite = "0.28.0"
 url = "2.5"
 
+# ==================== [MANTLE PATCH] extra deps for vendored reth-engine-tree (patches/reth-engine-tree) ====================
+# These are direct deps of reth-engine-tree that the mantle workspace did not previously declare
+# (they were only pulled transitively via the reth git crates). Required so the vendored patch
+# crate's `.workspace = true` references resolve. Remove together with the patch once upstream lands.
+reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-stages-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-exex-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-testing-utils = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+moka = "0.12"
+indexmap = "2"
+crossbeam-channel = "0.5.13"
+
 # ==================== [patch] — reth core minimal patches ====================
 # Uncomment when patches/ crates are populated:
 [patch."https://github.com/paradigmxyz/reth"]
 reth-trie-common = { path = "patches/reth-trie-common" }
+reth-engine-tree = { path = "patches/reth-engine-tree" }
 # reth-rpc = { path = "patches/reth-rpc" }
 # reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 
