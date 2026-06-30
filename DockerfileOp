@@ -29,8 +29,13 @@ ARG RUSTFLAGS=""
 ENV RUSTFLAGS="$RUSTFLAGS"
 
 # Mantle op-reth is the `mantle-reth-cli` package (elysium workspace layout).
-ARG FEATURES="jemalloc asm-keccak min-debug-logs"
+ARG FEATURES="jemalloc-symbols asm-keccak min-debug-logs"
 ENV FEATURES=$FEATURES
+
+# Keep symbols + line tables so jemalloc heap profiles (jeprof) symbolize.
+# Overrides [profile.release] debug="none"/strip="symbols" for this profiling image only.
+ENV CARGO_PROFILE_RELEASE_DEBUG=1
+ENV CARGO_PROFILE_RELEASE_STRIP=false
 
 COPY . .
 
