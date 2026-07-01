@@ -124,3 +124,79 @@ async fn estimate_total_fee_simple_transfer_via_rpc() {
     })
     .await;
 }
+
+/// [MANTLE] Balance-gating divisor: a low-balance caller passing a `maxFeePerGas` far
+/// above the base fee must be rejected with `gas required exceeds allowance`, matching
+/// op-geth `gasestimator.go` (`allowance = (balance - value) / feeCap`). Upstream reth
+/// divides by the *effective* gas price `min(maxFee, base + tip)`, which over-estimates
+/// the allowance and would let the estimate through. `stateOverride` pins the caller
+/// balance so the check is deterministic. With `data` present this is not a basic
+/// transfer, so it exercises the divisor directly (not the short-circuit).
+#[tokio::test]
+async fn estimate_gas_low_balance_high_maxfee_data_exceeds_allowance_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        // balance 1e14 wei (0.0001 ETH), maxFeePerGas 1e12 (1000 gwei)
+        // → allowance = 1e14 / 1e12 = 100 < intrinsic gas, so estimation must reject.
+        let res: Result<U256, _> = client
+            .request(
+                "eth_estimateGas",
+                vec![
+                    serde_json::json!({
+                        "from": FUNDED,
+                        "to": FUNDED_2,
+                        "data": "0xa9059cbb0000000000000000000000003333333333333333333333333333333333333333000000000000000000000000000000000000000000000000000000000000000a",
+                        "maxFeePerGas": "0xe8d4a51000",
+                        "maxPriorityFeePerGas": "0x3b9aca00"
+                    }),
+                    serde_json::json!("latest"),
+                    serde_json::json!({ FUNDED: { "balance": "0x5af3107a4000" } }),
+                ],
+            )
+            .await;
+
+        let err = res
+            .expect_err("estimateGas must reject when balance / maxFeePerGas is below intrinsic gas");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gas required exceeds allowance"),
+            "expected 'gas required exceeds allowance', got: {msg}"
+        );
+    })
+    .await;
+}
+
+/// [MANTLE] Balance-gating short-circuit guard: the same low-balance / high-`maxFeePerGas`
+/// scenario for a *basic transfer* (no calldata) must also be rejected with `gas required
+/// exceeds allowance`. Upstream reth would return `21000` via the basic-transfer
+/// short-circuit (estimation disables fee charging, so that path never checks the maxFee
+/// balance); the Mantle guard skips the short-circuit when the allowance is below 21000.
+#[tokio::test]
+async fn estimate_gas_low_balance_high_maxfee_transfer_exceeds_allowance_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        let res: Result<U256, _> = client
+            .request(
+                "eth_estimateGas",
+                vec![
+                    serde_json::json!({
+                        "from": FUNDED,
+                        "to": FUNDED_2,
+                        "maxFeePerGas": "0xe8d4a51000",
+                        "maxPriorityFeePerGas": "0x3b9aca00"
+                    }),
+                    serde_json::json!("latest"),
+                    serde_json::json!({ FUNDED: { "balance": "0x5af3107a4000" } }),
+                ],
+            )
+            .await;
+
+        let err = res.expect_err(
+            "basic-transfer estimateGas must not short-circuit to 21000 when it is unaffordable",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gas required exceeds allowance"),
+            "expected 'gas required exceeds allowance', got: {msg}"
+        );
+    })
+    .await;
+}
