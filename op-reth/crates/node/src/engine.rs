@@ -30,7 +30,10 @@ pub struct OpEngineTypes<T: PayloadTypes = OpPayloadTypes> {
     _marker: PhantomData<T>,
 }
 
-impl<T: PayloadTypes<ExecutionData = OpExecData>> PayloadTypes for OpEngineTypes<T> {
+impl<T: PayloadTypes<ExecutionData = OpExecData>> PayloadTypes for OpEngineTypes<T>
+where
+    OpExecData: From<<T as PayloadTypes>::BuiltPayload>,
+{
     type ExecutionData = T::ExecutionData;
     type BuiltPayload = T::BuiltPayload;
     type PayloadAttributes = T::PayloadAttributes;
@@ -39,8 +42,9 @@ impl<T: PayloadTypes<ExecutionData = OpExecData>> PayloadTypes for OpEngineTypes
         block: SealedBlock<
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
+        _bal: Option<alloy_primitives::Bytes>,
     ) -> <T as PayloadTypes>::ExecutionData {
-        OpExecData::from(op_alloy_rpc_types_engine::OpExecutionData::from_block_unchecked(
+        OpExecData(op_alloy_rpc_types_engine::OpExecutionData::from_block_unchecked(
             block.hash(),
             &block.into_block().into_ethereum_block(),
         ))
@@ -49,6 +53,7 @@ impl<T: PayloadTypes<ExecutionData = OpExecData>> PayloadTypes for OpEngineTypes
 
 impl<T: PayloadTypes<ExecutionData = OpExecData>> EngineTypes for OpEngineTypes<T>
 where
+    OpExecData: From<<T as PayloadTypes>::BuiltPayload>,
     T::BuiltPayload: BuiltPayload<Primitives: NodePrimitives<Block = OpBlock>>
         + TryInto<ExecutionPayloadV1>
         + TryInto<ExecutionPayloadEnvelopeV2>
@@ -252,11 +257,11 @@ where
 
 /// Validates the presence of the `withdrawals` field according to the payload timestamp.
 ///
-/// After Shanghai, withdrawals field must be [Some].
-/// Before Shanghai, withdrawals field must be [None].
+/// After Canyon, withdrawals field must be [Some].
+/// Before Canyon, withdrawals field must be [None];
 ///
-/// On standard OP Stack chains, Shanghai activates with Canyon.
-/// On Mantle, Shanghai activates with Skadi (before Canyon/Arsia).
+/// Canyon activates the Shanghai EIPs, see the Canyon specs for more details:
+/// <https://github.com/ethereum-optimism/optimism/blob/ab926c5fd1e55b5c864341c44842d6d1ca679d99/specs/superchain-upgrades.md#canyon>
 pub fn validate_withdrawals_presence(
     chain_spec: impl OpHardforks,
     version: EngineApiMessageVersion,
@@ -264,7 +269,7 @@ pub fn validate_withdrawals_presence(
     timestamp: u64,
     has_withdrawals: bool,
 ) -> Result<(), EngineObjectValidationError> {
-    let is_shanghai = chain_spec.is_shanghai_active_at_timestamp(timestamp);
+    let is_shanghai = chain_spec.is_canyon_active_at_timestamp(timestamp);
 
     match version {
         EngineApiMessageVersion::V1 => {
@@ -301,11 +306,11 @@ mod test {
     use super::*;
 
     use crate::engine;
-    use alloy_op_hardforks::BASE_SEPOLIA_JOVIAN_TIMESTAMP;
+    use alloy_op_hardforks::OP_SEPOLIA_JOVIAN_TIMESTAMP;
     use alloy_primitives::{Address, B64, B256, b64};
     use alloy_rpc_types_engine::PayloadAttributes;
     use op_alloy_rpc_types_engine::OpPayloadAttributes;
-    use reth_optimism_chainspec::BASE_SEPOLIA;
+    use reth_optimism_chainspec::OP_SEPOLIA;
     use reth_provider::noop::NoopProvider;
     use reth_trie_common::KeccakKeyHasher;
 
@@ -345,10 +350,8 @@ mod test {
 
     #[test]
     fn test_well_formed_attributes_pre_holocene() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes = get_attributes(None, None, 1732633199);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -361,10 +364,8 @@ mod test {
 
     #[test]
     fn test_well_formed_attributes_holocene_no_eip1559_params() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes = get_attributes(None, None, 1732633200);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -377,10 +378,8 @@ mod test {
 
     #[test]
     fn test_well_formed_attributes_holocene_eip1559_params_zero_denominator() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes = get_attributes(Some(b64!("0000000000000008")), None, 1732633200);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -393,10 +392,8 @@ mod test {
 
     #[test]
     fn test_well_formed_attributes_holocene_eip1559_params_zero_elasticity() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes = get_attributes(Some(b64!("0000000800000000")), None, 1732633200);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -409,10 +406,8 @@ mod test {
 
     #[test]
     fn test_well_formed_attributes_holocene_valid() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes = get_attributes(Some(b64!("0000000800000008")), None, 1732633200);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -425,10 +420,8 @@ mod test {
 
     #[test]
     fn test_well_formed_attributes_holocene_valid_all_zero() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes = get_attributes(Some(b64!("0000000000000000")), None, 1732633200);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -441,12 +434,10 @@ mod test {
 
     #[test]
     fn test_well_formed_attributes_jovian_valid() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes =
-            get_attributes(Some(b64!("0000000000000000")), Some(1), BASE_SEPOLIA_JOVIAN_TIMESTAMP);
+            get_attributes(Some(b64!("0000000000000000")), Some(1), OP_SEPOLIA_JOVIAN_TIMESTAMP);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
             OpEngineTypes,
@@ -459,11 +450,9 @@ mod test {
     /// After Jovian (and holocene), eip1559 params must be Some
     #[test]
     fn test_malformed_attributes_jovian_with_eip_1559_params_none() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
-        let attributes = get_attributes(None, Some(1), BASE_SEPOLIA_JOVIAN_TIMESTAMP);
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
+        let attributes = get_attributes(None, Some(1), OP_SEPOLIA_JOVIAN_TIMESTAMP);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
             OpEngineTypes,
@@ -476,10 +465,8 @@ mod test {
     /// Before Jovian, min base fee must be None
     #[test]
     fn test_malformed_attributes_pre_jovian_with_min_base_fee() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes = get_attributes(Some(b64!("0000000000000000")), Some(1), 1732633200);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
@@ -493,12 +480,10 @@ mod test {
     /// After Jovian, min base fee must be Some
     #[test]
     fn test_malformed_attributes_post_jovian_with_min_base_fee_none() {
-        let validator = OpEngineValidator::new::<KeccakKeyHasher>(
-            BASE_SEPOLIA.clone(),
-            NoopProvider::default(),
-        );
+        let validator =
+            OpEngineValidator::new::<KeccakKeyHasher>(OP_SEPOLIA.clone(), NoopProvider::default());
         let attributes =
-            get_attributes(Some(b64!("0000000000000000")), None, BASE_SEPOLIA_JOVIAN_TIMESTAMP);
+            get_attributes(Some(b64!("0000000000000000")), None, OP_SEPOLIA_JOVIAN_TIMESTAMP);
 
         let result = <engine::OpEngineValidator<_, _, _> as EngineApiValidator<
             OpEngineTypes,
