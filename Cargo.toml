@@ -1,18 +1,18 @@
 # Mantle op-reth Workspace
 #
 # Structure:
-#   op-reth/       — OP Stack execution layer (from ethereum-optimism/optimism, op-reth/v2.2.1)
+#   op-reth/       — OP Stack execution layer (from ethereum-optimism/optimism, op-reth/v2.3.3)
 #   mantle-reth/   — Mantle trait override layer (custom)
 #   patches/       — Minimal reth core patches (via [patch])
 #
 # Dependency strategy:
-#   reth crates    → paradigmxyz/reth rev 88505c7f (= v2.2.0, same as upstream op-reth pins)
-#   revm/op-revm   → mantle-xyz/revm branch mantle-elysium (Mantle fee model patches)
-#   revm-inspectors → mantle-xyz/revm-inspectors branch mantle-elysium
-#   alloy-evm      → crates.io 0.34.0 (upstream, no Mantle patches; see mantle-v2#359)
-#   alloy-op-evm   → mantle-xyz/mantle-v2 branch mantle-elysium
-#   alloy-op-hardforks → mantle-xyz/mantle-v2 branch mantle-elysium
-#   op-alloy       → mantle-xyz/mantle-v2 branch mantle-elysium
+#   reth crates    → paradigmxyz/reth tag v2.3.0 (same as upstream op-reth v2.3.3 pins)
+#   revm/op-revm   → mantle-xyz/revm rev 04ba823b (revm 40 / op-revm 20 re-apply)
+#   revm-inspectors → crates.io 0.40.1 (transitive revm patched above)
+#   alloy-evm      → crates.io 0.36.0
+#   alloy-op-evm   → mantle-xyz/mantle-v2 rev fdd1ddbc (rust fork crates)
+#   alloy-op-hardforks → mantle-xyz/mantle-v2 rev fdd1ddbc
+#   op-alloy       → mantle-xyz/mantle-v2 rev fdd1ddbc
 #   alloy base     → crates.io 2.0.4
 
 [workspace.package]
@@ -29,7 +29,7 @@ categories = ["cryptography", "cryptography::cryptocurrencies"]
 [workspace]
 resolver = "2"
 members = [
-  # Op-Reth (from upstream ethereum-optimism/optimism, op-reth/v2.2.1)
+  # Op-Reth (from upstream ethereum-optimism/optimism, op-reth/v2.3.3)
   "op-reth/bin/",
   "op-reth/crates/chainspec/",
   "op-reth/crates/cli/",
@@ -46,6 +46,7 @@ members = [
   "op-reth/crates/exex/",
   "op-reth/crates/trie/",
   "op-reth/crates/txpool/",
+  "op-reth/crates/post-exec-replay/",
 
   # Mantle-Reth
   "mantle-reth/crates/cli/",
@@ -129,6 +130,7 @@ reth-optimism-storage = { path = "op-reth/crates/storage/" }
 reth-optimism-exex = { path = "op-reth/crates/exex/" }
 reth-optimism-trie = { path = "op-reth/crates/trie/" }
 reth-optimism-txpool = { path = "op-reth/crates/txpool/" }
+reth-optimism-post-exec-replay = { path = "op-reth/crates/post-exec-replay/" }
 
 # ==================== MANTLE-RETH INTERNAL CRATES ====================
 mantle-reth-chainspec = { path = "mantle-reth/crates/chainspec/", default-features = false }
@@ -137,122 +139,119 @@ mantle-reth-cli = { path = "mantle-reth/crates/cli/" }
 mantle-reth-eth-api = { path = "mantle-reth/crates/eth-api/" }
 
 # ==================== RETH CRATES (crates.io published) ====================
-reth-codecs = { version = "0.3.1", default-features = false, features = ["alloy"] }
-reth-codecs-derive = "0.3.1"
-reth-primitives-traits = { version = "0.3.1", default-features = false }
-reth-rpc-traits = { version = "0.3.1", default-features = false }
-reth-zstd-compressors = { version = "0.3.1", default-features = false }
+reth-codecs = { version = "0.4.1", default-features = false, features = ["alloy"] }
+reth-codecs-derive = "0.4.1"
+reth-primitives-traits = { version = "0.4.1", default-features = false }
+reth-rpc-traits = { version = "0.4.1", default-features = false }
+reth-zstd-compressors = { version = "0.4.1", default-features = false }
 
-# ==================== RETH CRATES (git @ v2.2.0, pinned by upstream op-reth) ====================
-reth = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-chain-state = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-cli = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-cli-runner = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-db = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-db-common = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-downloaders = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-engine-local = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-errors = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-evm = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-execution-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-fs-util = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-metrics = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-network-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-node-builder = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-node-core = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-node-events = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-node-metrics = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-payload-util = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-payload-validator = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-prune = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-prune-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-revm = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-rpc = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-stages = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-stages-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-static-file = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-tasks = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-trie = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
-reth-trie-db = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+# ==================== RETH CRATES (git @ v2.3.1, pinned by upstream op-reth) ====================
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-cli-runner = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-downloaders = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-engine-local = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-fs-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-node-events = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-node-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-payload-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-payload-validator = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-prune = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-static-file = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
 
-# ==================== REVM (Mantle fork: mantle-elysium branch) ====================
-# TODO: Switch to tag once mantle-elysium is tagged (e.g., v107-mantle-elysium.1)
-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-bytecode = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-database = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-state = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-primitives = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-interpreter = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-database-interface = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-inspector = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-context = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
-revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
+# ==================== REVM (Mantle fork: mantle-xyz/revm rev 04ba823b, revm-40 re-apply) ====================
+# TODO: Switch to tag once the revm-40 re-apply lands on mantle-elysium and is tagged
+revm = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-bytecode = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-database = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-state = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-primitives = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-interpreter = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-database-interface = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-inspector = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-context = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
+revm-context-interface = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
 
-# ==================== REVM-INSPECTORS (Mantle fork: mantle-elysium branch) ====================
-# TODO: Switch to tag once mantle-elysium is tagged
-revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "mantle-elysium" }
+# ==================== REVM-INSPECTORS (upstream crates.io 0.40.1 for revm-40; Mantle fork is only a cosmetic clippy patch over v0.39.0) ====================
+revm-inspectors = "0.40.1"
 
 # ==================== ALLOY-EVM (upstream crates.io, no Mantle patches; see mantle-v2#359) ====================
-alloy-evm = { version = "0.34.0", default-features = false }
+alloy-evm = { version = "0.36.0", default-features = false }
 
-# ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantle-xyz/mantle-v2) ====================
-# TODO: Switch to tag once mantle-v2 Rust crates are tagged
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+# ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle fork: mantle-xyz/mantle-v2 rev fdd1ddbc) ====================
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
 
-# ==================== OP-REVM (Mantle fork: mantle-elysium branch, same repo as revm) ====================
-op-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium", default-features = false }
+# ==================== OP-REVM (Mantle fork: mantle-xyz/revm rev 04ba823b, same repo as revm) ====================
+op-revm = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf", default-features = false }
 
-# ==================== OP-ALLOY (Mantle: mantle-xyz/mantle-v2) ====================
-# TODO: Switch to tag once mantle-v2 Rust crates are tagged
-op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+# ==================== OP-ALLOY (Mantle fork: mantle-xyz/mantle-v2 rev fdd1ddbc) ====================
+op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
 op-alloy-flz = { version = "0.13.1", default-features = false }
 
 # ==================== ALLOY ====================
@@ -299,6 +298,7 @@ alloy-transport-ws = { version = "2.0.4", default-features = false }
 async-channel = "2.5"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
+crossbeam-channel = "0.5.13"
 futures = "0.3.31"
 futures-core = "0.3"
 futures-util = { version = "0.3.31", default-features = false }
@@ -384,6 +384,7 @@ itertools = "0.15"
 mockall = "0.14.0"
 modular-bitfield = "0.13"
 once_cell = "1.21"
+page_size = "0.6.0"
 parking_lot = "0.12"
 paste = "1"
 rand = "0.9.1"
@@ -410,26 +411,25 @@ reth-trie-common = { path = "patches/reth-trie-common" }
 # creating incompatible duplicate types in the dependency graph.
 [patch.crates-io]
 # revm family: mantle-xyz/revm mantle-elysium branch
-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-bytecode = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-database = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-state = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-primitives = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-interpreter = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-database-interface = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-inspector = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-context = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-# revm-inspectors: mantle-xyz/revm-inspectors mantle-elysium branch
-revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "mantle-elysium" }
+revm = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-bytecode = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-database = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-state = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-primitives = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-interpreter = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-database-interface = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-inspector = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-context = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+revm-context-interface = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+# revm-inspectors: upstream crates.io 0.40.1 (no patch; its transitive revm is patched above)
 # op-revm: mantle-xyz/revm (same as workspace dep)
-op-revm = { git = "https://github.com/mantle-xyz/revm", branch = "mantle-elysium" }
-# alloy-op-evm / alloy-op-hardforks: mantle-xyz/mantle-v2 (Mantle version)
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-# op-alloy: mantle-xyz/mantle-v2 (Mantle version)
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+op-revm = { git = "https://github.com/mantle-xyz/revm", rev = "04ba823b57a4ec055c28a062ad07abc2d18a85bf" }
+# alloy-op-evm / alloy-op-hardforks: mantle-v2 local path (Mantle version)
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+# op-alloy: mantle-v2 local path (Mantle version)
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "fdd1ddbcf7c650849a4adfeaf837548ed1c89da2", default-features = false }

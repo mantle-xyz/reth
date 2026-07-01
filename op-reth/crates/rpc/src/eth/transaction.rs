@@ -5,7 +5,7 @@ use alloy_consensus::BlockHeader;
 use alloy_eips::{BlockId, Encodable2718};
 use alloy_network::{TransactionBuilder, TransactionBuilder4844};
 use alloy_primitives::{B256, Bytes, U256};
-use alloy_rpc_types_eth::TransactionInfo;
+use alloy_rpc_types_eth::{TransactionInfo, state::EvmOverrides};
 use futures::StreamExt;
 use op_alloy_consensus::{
     OpTransaction,
@@ -16,9 +16,10 @@ use reth_optimism_primitives::DepositReceipt;
 use reth_primitives_traits::{Recovered, SignedTransaction, SignerRecoverable, TxTy, WithEncoded};
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
-    EthApiTypes, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore, RpcReceipt, TxInfoMapper,
+    EthApiTypes as _, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore, RpcReceipt,
+    TxInfoMapper,
     helpers::{
-        EthApiSpec, EthTransactions, LoadBlock, LoadFee, LoadReceipt, LoadState, LoadTransaction,
+        EthApiSpec, EthTransactions, LoadBlock, LoadFee, LoadReceipt, LoadTransaction,
         SpawnBlocking, estimate::EstimateCall, spec::SignersForRpc,
     },
 };
@@ -43,7 +44,6 @@ where
     N: RpcNodeCore,
     OpEthApiError: FromEvmError<N::Evm>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
-    <Self as EthApiTypes>::RpcConvert: RpcConvert<Primitives = <Self as RpcNodeCore>::Primitives>,
 {
     fn signers(&self) -> &SignersForRpc<Self::Provider, Self::NetworkTypes> {
         self.inner.eth_api.signers()
@@ -196,71 +196,89 @@ where
 
     /// Fills the defaults on a given unsigned transaction.
     ///
-    /// MANTLE PATCH: verbatim copy of upstream `EthTransactions::fill_transaction`, with one
-    /// change — the default `maxFeePerGas` uses `base_fee * 2 + tip` (go-ethereum parity) instead
-    /// of `base_fee + tip`. Upstreamed as paradigmxyz/reth#25258; once that merges and the pinned
-    /// reth rev is bumped past it, delete this override and fall back to the default.
+    /// MANTLE PATCH: delegates to [`fill_transaction_with_mantle_fee`], which is a verbatim copy
+    /// of upstream `EthTransactions::fill_transaction` with one change — the default
+    /// `maxFeePerGas` uses `base_fee * 2 + tip` (go-ethereum parity) instead of `base_fee + tip`.
+    /// Upstreamed as paradigmxyz/reth#25258; once that merges and the pinned reth rev is bumped
+    /// past it, delete this override and the helper and fall back to the default.
     async fn fill_transaction(
         &self,
-        mut request: RpcTxReq<Self::NetworkTypes>,
+        request: RpcTxReq<Self::NetworkTypes>,
     ) -> Result<FillTransaction<TxTy<Self::Primitives>>, Self::Error>
     where
         Self: EthApiSpec + LoadBlock + EstimateCall + LoadFee,
     {
-        if request.as_ref().value().is_none() {
-            request.as_mut().set_value(U256::ZERO);
-        }
-
-        if request.as_ref().nonce().is_none() {
-            let nonce = self.next_available_nonce_for(&request).await?;
-            request.as_mut().set_nonce(nonce);
-        }
-
-        let chain_id = self.chain_id();
-        request.as_mut().set_chain_id(chain_id.to());
-
-        if request.as_ref().has_eip4844_fields() &&
-            request.as_ref().max_fee_per_blob_gas().is_none()
-        {
-            let blob_fee = self.blob_base_fee().await?;
-            request.as_mut().set_max_fee_per_blob_gas(blob_fee.to());
-        }
-
-        // Use `sidecar.is_some()` instead of `blob_sidecar().is_some()` to handle
-        // both EIP-4844 (v0) and EIP-7594 (v1) sidecar formats
-        if request.as_ref().sidecar.is_some() && request.as_ref().blob_versioned_hashes.is_none() {
-            request.as_mut().populate_blob_hashes();
-        }
-
-        if request.as_ref().gas_limit().is_none() {
-            let estimated_gas =
-                self.estimate_gas_at(request.clone(), BlockId::pending(), None).await?;
-            request.as_mut().set_gas_limit(estimated_gas.to());
-        }
-
-        if request.as_ref().gas_price().is_none() {
-            let tip = if let Some(tip) = request.as_ref().max_priority_fee_per_gas() {
-                tip
-            } else {
-                let tip = self.suggested_priority_fee().await?.to::<u128>();
-                request.as_mut().set_max_priority_fee_per_gas(tip);
-                tip
-            };
-            if request.as_ref().max_fee_per_gas().is_none() {
-                let header = self.provider().latest_header().map_err(Self::Error::from_eth_err)?;
-                let base_fee = header.and_then(|h| h.base_fee_per_gas()).unwrap_or_default();
-                // MANTLE PATCH: go-ethereum parity — `base_fee * 2 + tip` (upstream: `base_fee +
-                // tip`).
-                request.as_mut().set_max_fee_per_gas(base_fee as u128 * 2 + tip);
-            }
-        }
-
-        let tx = self.converter().build_simulate_v1_transaction(request)?;
-
-        let raw = tx.encoded_2718().into();
-
-        Ok(FillTransaction { raw, tx })
+        fill_transaction_with_mantle_fee(self, request).await
     }
+}
+
+/// MANTLE PATCH: verbatim copy of upstream `EthTransactions::fill_transaction`, with one change —
+/// the default `maxFeePerGas` uses `base_fee * 2 + tip` (go-ethereum parity) instead of
+/// `base_fee + tip`.
+///
+/// Written as a generic free function so the `FullEthApiTypes` super-bound
+/// (`RpcConvert::Primitives = Self::Primitives`) is usable by the solver, which lets
+/// `build_simulate_v1_transaction`'s `TxTy<RpcConvert::Primitives>` unify with the return's
+/// `TxTy<E::Primitives>`. The concrete `OpEthApi` impl can't normalize this equality itself
+/// because of the blanket `RpcNodeCore` impl in reth core.
+async fn fill_transaction_with_mantle_fee<E>(
+    this: &E,
+    mut request: RpcTxReq<E::NetworkTypes>,
+) -> Result<FillTransaction<TxTy<E::Primitives>>, E::Error>
+where
+    E: EthTransactions + EthApiSpec + LoadBlock + EstimateCall + LoadFee,
+{
+    if request.as_ref().value().is_none() {
+        request.as_mut().set_value(U256::ZERO);
+    }
+
+    if request.as_ref().nonce().is_none() {
+        let nonce = this.next_available_nonce_for(&request).await?;
+        request.as_mut().set_nonce(nonce);
+    }
+
+    let chain_id = this.chain_id();
+    request.as_mut().set_chain_id(chain_id.to());
+
+    if request.as_ref().has_eip4844_fields() && request.as_ref().max_fee_per_blob_gas().is_none() {
+        let blob_fee = this.blob_base_fee().await?;
+        request.as_mut().set_max_fee_per_blob_gas(blob_fee.to());
+    }
+
+    // Use `sidecar.is_some()` instead of `blob_sidecar().is_some()` to handle
+    // both EIP-4844 (v0) and EIP-7594 (v1) sidecar formats
+    if request.as_ref().sidecar.is_some() && request.as_ref().blob_versioned_hashes.is_none() {
+        request.as_mut().populate_blob_hashes();
+    }
+
+    if request.as_ref().gas_limit().is_none() {
+        let estimated_gas = this
+            .estimate_gas_at(request.clone(), BlockId::pending(), EvmOverrides::default())
+            .await?;
+        request.as_mut().set_gas_limit(estimated_gas.to());
+    }
+
+    if request.as_ref().gas_price().is_none() {
+        let tip = if let Some(tip) = request.as_ref().max_priority_fee_per_gas() {
+            tip
+        } else {
+            let tip = this.suggested_priority_fee().await?.to::<u128>();
+            request.as_mut().set_max_priority_fee_per_gas(tip);
+            tip
+        };
+        if request.as_ref().max_fee_per_gas().is_none() {
+            let header = this.provider().latest_header().map_err(E::Error::from_eth_err)?;
+            let base_fee = header.and_then(|h| h.base_fee_per_gas()).unwrap_or_default();
+            // MANTLE PATCH: go-ethereum parity — `base_fee * 2 + tip` (upstream: `base_fee + tip`).
+            request.as_mut().set_max_fee_per_gas(base_fee as u128 * 2 + tip);
+        }
+    }
+
+    let tx = this.converter().build_simulate_v1_transaction(request)?;
+
+    let raw = tx.encoded_2718().into();
+
+    Ok(FillTransaction { raw, tx })
 }
 
 impl<N, Rpc> LoadTransaction for OpEthApi<N, Rpc>

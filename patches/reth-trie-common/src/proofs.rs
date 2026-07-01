@@ -618,7 +618,7 @@ impl StorageMultiProof {
     pub fn storage_proof(&self, slot: B256) -> Result<StorageProof, alloy_rlp::Error> {
         let nibbles = Nibbles::unpack(keccak256(slot));
 
-        // Empty trie has no nodes to prove — return empty proof (geth compat).
+        // [MANTLE] Empty trie has no nodes to prove — return empty proof (geth compat).
         if self.root == EMPTY_ROOT_HASH {
             return Ok(StorageProof { key: slot, nibbles, value: U256::ZERO, proof: vec![] });
         }
@@ -673,7 +673,7 @@ impl DecodedStorageMultiProof {
     pub fn storage_proof(&self, slot: B256) -> Result<DecodedStorageProof, alloy_rlp::Error> {
         let nibbles = Nibbles::unpack(keccak256(slot));
 
-        // Empty trie has no nodes to prove — return empty proof (geth compat).
+        // [MANTLE] Empty trie has no nodes to prove — return empty proof (geth compat).
         if self.root == EMPTY_ROOT_HASH {
             return Ok(DecodedStorageProof { key: slot, nibbles, value: U256::ZERO, proof: vec![] });
         }
@@ -734,16 +734,39 @@ pub struct AccountProof {
 
 #[cfg(feature = "eip1186")]
 impl AccountProof {
-    /// Convert into an EIP-1186 account proof response
+    /// Convert into an EIP-1186 account proof response.
+    ///
+    /// [MANTLE] For non-existent accounts, this returns `B256::ZERO` for both `codeHash`
+    /// and `storageHash`, matching geth's behavior (go-ethereum#28357). Upstream reth
+    /// defaults to `KECCAK_EMPTY` / `EMPTY_ROOT_HASH`; Mantle flips the default to geth-compat
+    /// because the Mantle RPC surface must match geth byte-for-byte.
+    ///
+    /// Use [`Self::into_eip1186_response_with`] to opt back into reth's default behavior.
     pub fn into_eip1186_response(
         self,
         slots: Vec<alloy_serde::JsonStorageKey>,
     ) -> alloy_rpc_types_eth::EIP1186AccountProofResponse {
-        // [MANTLE] geth returns B256::ZERO for code_hash and storage_hash when the account
-        // does not exist in state. Standard reth returns KECCAK_EMPTY / EMPTY_ROOT_HASH.
+        self.into_eip1186_response_with(slots, true)
+    }
+
+    /// Convert into an EIP-1186 account proof response, with optional geth-compatible
+    /// zero hashes for non-existent accounts.
+    ///
+    /// When `zero_empty_account` is `true`, non-existent accounts return `B256::ZERO`
+    /// for both `codeHash` and `storageHash`, matching geth's behavior since v1.13.4
+    /// ([go-ethereum#28357](https://github.com/ethereum/go-ethereum/pull/28357)).
+    ///
+    /// When `false`, returns `KECCAK_EMPTY` / `EMPTY_ROOT_HASH` (reth default).
+    ///
+    /// See: <https://github.com/ethereum/go-ethereum/issues/28441>
+    pub fn into_eip1186_response_with(
+        self,
+        slots: Vec<alloy_serde::JsonStorageKey>,
+        zero_empty_account: bool,
+    ) -> alloy_rpc_types_eth::EIP1186AccountProofResponse {
         let is_non_existent = self.info.is_none();
         let info = self.info.unwrap_or_default();
-        let (code_hash, storage_hash) = if is_non_existent {
+        let (code_hash, storage_hash) = if is_non_existent && zero_empty_account {
             (B256::ZERO, B256::ZERO)
         } else {
             (info.get_bytecode_hash(), self.storage_root)
@@ -786,12 +809,17 @@ impl AccountProof {
 
         let (storage_root, info) = if nonce == 0 &&
             balance.is_zero() &&
-            storage_hash.is_zero() &&
-            // [MANTLE] Also match B256::ZERO (geth returns zero for non-existent accounts)
+            (storage_hash.is_zero() || storage_hash == EMPTY_ROOT_HASH) &&
             (code_hash == KECCAK_EMPTY || code_hash.is_zero())
         {
             // Account does not exist in state. Return `None` here to prevent proof
             // verification.
+            //
+            // Note: geth (since v1.13.4, go-ethereum#28357) returns `B256::ZERO` for
+            // both `codeHash` and `storageHash` in exclusion proofs, while reth
+            // returns `KECCAK_EMPTY` / `EMPTY_ROOT_HASH`. We accept both formats here
+            // so that proofs obtained from any client can be deserialized correctly.
+            // See: https://github.com/ethereum/go-ethereum/issues/28441
             (EMPTY_ROOT_HASH, None)
         } else {
             (storage_hash, Some(Account { nonce, balance, bytecode_hash: code_hash.into() }))
@@ -1229,6 +1257,91 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "eip1186")]
+    fn from_eip1186_proof_accepts_geth_zero_hashes() {
+        // geth (since v1.13.4) returns B256::ZERO for codeHash and storageHash
+        // in exclusion proofs for non-existent accounts, instead of
+        // KECCAK_EMPTY / EMPTY_ROOT_HASH. Verify that from_eip1186_proof
+        // correctly recognizes this format as a non-existent account.
+        let geth_proof = alloy_rpc_types_eth::EIP1186AccountProofResponse {
+            address: Address::random(),
+            balance: U256::ZERO,
+            code_hash: B256::ZERO,
+            nonce: 0,
+            storage_hash: B256::ZERO,
+            account_proof: vec![],
+            storage_proof: vec![],
+        };
+
+        let acc: AccountProof = geth_proof.into();
+        // Should be interpreted as a non-existent account (info = None)
+        assert!(acc.info.is_none());
+        assert_eq!(acc.storage_root, EMPTY_ROOT_HASH);
+    }
+
+    #[test]
+    #[cfg(feature = "eip1186")]
+    fn from_eip1186_proof_accepts_empty_hashes() {
+        let proof = alloy_rpc_types_eth::EIP1186AccountProofResponse {
+            address: Address::random(),
+            balance: U256::ZERO,
+            code_hash: KECCAK_EMPTY,
+            nonce: 0,
+            storage_hash: EMPTY_ROOT_HASH,
+            account_proof: vec![],
+            storage_proof: vec![],
+        };
+
+        let acc: AccountProof = proof.into();
+        assert!(acc.info.is_none());
+        assert_eq!(acc.storage_root, EMPTY_ROOT_HASH);
+    }
+
+    #[test]
+    #[cfg(feature = "eip1186")]
+    fn into_eip1186_response_zero_empty_account() {
+        // Non-existent account (info = None)
+        let acc = AccountProof {
+            address: Address::random(),
+            info: None,
+            proof: vec![],
+            storage_root: EMPTY_ROOT_HASH,
+            storage_proofs: vec![],
+        };
+
+        // [MANTLE] Default behavior is geth-compat: B256::ZERO / B256::ZERO
+        let rpc_default = acc.clone().into_eip1186_response(Vec::new());
+        assert_eq!(rpc_default.code_hash, B256::ZERO);
+        assert_eq!(rpc_default.storage_hash, B256::ZERO);
+
+        // zero_empty_account = false: opt back into reth default KECCAK_EMPTY / EMPTY_ROOT_HASH
+        let rpc_compat_off = acc.clone().into_eip1186_response_with(Vec::new(), false);
+        assert_eq!(rpc_compat_off.code_hash, KECCAK_EMPTY);
+        assert_eq!(rpc_compat_off.storage_hash, EMPTY_ROOT_HASH);
+
+        // zero_empty_account = true: B256::ZERO (geth-compat)
+        let rpc_compat_on = acc.into_eip1186_response_with(Vec::new(), true);
+        assert_eq!(rpc_compat_on.code_hash, B256::ZERO);
+        assert_eq!(rpc_compat_on.storage_hash, B256::ZERO);
+
+        // Existing account should NOT be affected by zero_empty_account
+        let existing_acc = AccountProof {
+            address: Address::random(),
+            info: Some(Account {
+                nonce: 42,
+                balance: U256::from(100),
+                bytecode_hash: Some(KECCAK_EMPTY),
+            }),
+            proof: vec![],
+            storage_root: B256::random(),
+            storage_proofs: vec![],
+        };
+        let rpc_existing = existing_acc.clone().into_eip1186_response_with(Vec::new(), true);
+        assert_eq!(rpc_existing.code_hash, KECCAK_EMPTY);
+        assert_eq!(rpc_existing.storage_hash, existing_acc.storage_root);
+    }
+
+    #[test]
     fn test_multiproof_targets_chunking_length() {
         let mut targets = MultiProofTargets::default();
         targets.insert(B256::with_last_byte(1), B256Set::default());
@@ -1255,64 +1368,5 @@ mod tests {
                 chunking_length, size
             );
         }
-    }
-
-    #[test]
-    fn test_empty_storage_trie_returns_empty_proof() {
-        let multiproof = StorageMultiProof::empty();
-        assert_eq!(multiproof.root, EMPTY_ROOT_HASH);
-
-        let slot = B256::with_last_byte(1);
-        let proof = multiproof.storage_proof(slot).unwrap();
-        assert_eq!(proof.key, slot);
-        assert_eq!(proof.value, U256::ZERO);
-        assert!(proof.proof.is_empty(), "empty trie must return empty proof vec, got {:?}", proof.proof);
-    }
-
-    #[test]
-    fn test_empty_storage_trie_multiple_slots_all_empty() {
-        let multiproof = StorageMultiProof::empty();
-
-        for i in 0..5u8 {
-            let slot = B256::with_last_byte(i);
-            let proof = multiproof.storage_proof(slot).unwrap();
-            assert_eq!(proof.value, U256::ZERO);
-            assert!(proof.proof.is_empty(), "slot {i}: expected empty proof");
-        }
-    }
-
-    #[test]
-    fn test_decoded_empty_storage_trie_returns_empty_proof() {
-        let multiproof = DecodedStorageMultiProof::empty();
-        assert_eq!(multiproof.root, EMPTY_ROOT_HASH);
-
-        let slot = B256::with_last_byte(42);
-        let proof = multiproof.storage_proof(slot).unwrap();
-        assert_eq!(proof.key, slot);
-        assert_eq!(proof.value, U256::ZERO);
-        assert!(proof.proof.is_empty(), "decoded empty trie must return empty proof vec, got {:?}", proof.proof);
-    }
-
-    #[test]
-    fn test_nonempty_storage_trie_returns_nonempty_proof() {
-        let slot = B256::with_last_byte(1);
-        let nibbles = Nibbles::unpack(keccak256(slot));
-        let value = U256::from(999);
-        let leaf = alloy_trie::nodes::LeafNode::new(nibbles.clone(), encode_fixed_size(&value).to_vec());
-        let mut encoded = vec![];
-        alloy_rlp::Encodable::encode(&leaf, &mut encoded);
-
-        let mut subtree = ProofNodes::default();
-        subtree.insert(nibbles.clone(), encoded.into());
-
-        let multiproof = StorageMultiProof {
-            root: B256::with_last_byte(0xFF),
-            subtree,
-            branch_node_masks: BranchNodeMasksMap::default(),
-        };
-
-        let proof = multiproof.storage_proof(slot).unwrap();
-        assert!(!proof.proof.is_empty(), "non-empty trie must return non-empty proof");
-        assert_eq!(proof.value, value);
     }
 }

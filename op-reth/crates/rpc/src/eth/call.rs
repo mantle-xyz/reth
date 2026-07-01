@@ -2,7 +2,7 @@ use crate::{OpEthApi, OpEthApiError, eth::RpcNodeCore};
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
 use alloy_primitives::U256;
-use alloy_rpc_types_eth::state::StateOverride;
+use alloy_rpc_types_eth::state::EvmOverrides;
 use reth_chainspec::ChainSpecProvider;
 use reth_optimism_evm::extract_l1_info;
 use reth_optimism_forks::OpHardforks;
@@ -28,7 +28,7 @@ where
         &self,
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         at: BlockId,
-        state_override: Option<StateOverride>,
+        overrides: EvmOverrides,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
             // [MANTLE] Pre-check: value transfer (op-geth `gasestimator.go` clause 6,
@@ -64,7 +64,7 @@ where
             }
 
             let estimate =
-                EstimateCall::estimate_gas_at(self, request.clone(), at, state_override).await?;
+                EstimateCall::estimate_gas_at(self, request.clone(), at, overrides).await?;
 
             // [MANTLE] Post-estimation Arsia balance check (op-geth v1.5.5 mantleArsiaCheckFunds)
             // geth uses target block state (opts.State from StateAndHeaderByNumberOrHash).
@@ -139,6 +139,11 @@ where
     #[inline]
     fn max_simulate_blocks(&self) -> u64 {
         self.inner.eth_api.max_simulate_blocks()
+    }
+
+    #[inline]
+    fn compute_state_root_for_eth_simulate(&self) -> bool {
+        self.inner.eth_api.compute_state_root_for_eth_simulate()
     }
 
     #[inline]

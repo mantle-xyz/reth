@@ -423,7 +423,7 @@ where
             })?)
             .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?,
             block_id,
-            None,
+            Default::default(),
         )
         .await
         .map_err(|e| {

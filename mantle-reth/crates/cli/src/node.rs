@@ -210,15 +210,14 @@ impl MantleNode {
         let args = &self.op_node.args;
         ComponentsBuilder::default()
             .node_types::<N>()
-            .executor(OpExecutorBuilder::default().with_sdm_enabled(args.sdm_enabled))
+            .executor(OpExecutorBuilder::default())
             .pool(
                 MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional),
             )
             .payload(BasicPayloadServiceBuilder::new(
                 OpNodePayloadBuilder::new(args.compute_pending_block)
                     .with_da_config(self.op_node.da_config.clone())
-                    .with_gas_limit_config(self.op_node.gas_limit_config.clone())
-                    .with_sdm_enabled(args.sdm_enabled),
+                    .with_gas_limit_config(self.op_node.gas_limit_config.clone()),
             ))
             .network(OpNetworkBuilder::new(args.disable_txpool_gossip, !args.discovery_v4))
             .consensus(OpConsensusBuilder::default())

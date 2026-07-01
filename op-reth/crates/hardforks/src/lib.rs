@@ -23,7 +23,7 @@ use alloy_op_hardforks::{
     OP_SEPOLIA_JOVIAN_TIMESTAMP,
 };
 // Re-export alloy-op-hardforks types.
-pub use alloy_op_hardforks::{OpHardfork, OpHardforks};
+pub use alloy_op_hardforks::{MantleHardfork, OpHardfork, OpHardforks};
 
 use alloc::vec;
 use alloy_primitives::U256;

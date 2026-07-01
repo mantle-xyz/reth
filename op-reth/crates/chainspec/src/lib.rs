@@ -208,10 +208,10 @@ impl OpChainSpecBuilder {
         self
     }
 
-    /// Enable Interop at genesis
+    /// Enable Lagoon at genesis
     pub fn interop_activated(mut self) -> Self {
         self = self.karst_activated();
-        self.inner = self.inner.with_fork(OpHardfork::Interop, ForkCondition::Timestamp(0));
+        self.inner = self.inner.with_fork(OpHardfork::Lagoon, ForkCondition::Timestamp(0));
         self
     }
 
@@ -364,19 +364,19 @@ impl OpHardforks for OpChainSpec {
     }
 
     fn is_mantle(&self) -> bool {
-        self.inner.hardforks.get(alloy_op_hardforks::MantleHardfork::Skadi).is_some()
+        self.inner.hardforks.get(MantleHardfork::Skadi).is_some()
     }
 
     fn is_mantle_skadi_active_at_timestamp(&self, timestamp: u64) -> bool {
-        self.fork(alloy_op_hardforks::MantleHardfork::Skadi).active_at_timestamp(timestamp)
+        self.fork(MantleHardfork::Skadi).active_at_timestamp(timestamp)
     }
 
     fn is_mantle_limb_active_at_timestamp(&self, timestamp: u64) -> bool {
-        self.fork(alloy_op_hardforks::MantleHardfork::Limb).active_at_timestamp(timestamp)
+        self.fork(MantleHardfork::Limb).active_at_timestamp(timestamp)
     }
 
     fn is_mantle_arsia_active_at_timestamp(&self, timestamp: u64) -> bool {
-        self.fork(alloy_op_hardforks::MantleHardfork::Arsia).active_at_timestamp(timestamp)
+        self.fork(MantleHardfork::Arsia).active_at_timestamp(timestamp)
     }
 }
 
@@ -437,7 +437,7 @@ impl From<Genesis> for OpChainSpec {
             (OpHardfork::Isthmus.boxed(), genesis_info.isthmus_time),
             (OpHardfork::Jovian.boxed(), genesis_info.jovian_time),
             (OpHardfork::Karst.boxed(), genesis_info.karst_time),
-            (OpHardfork::Interop.boxed(), genesis_info.interop_time),
+            (OpHardfork::Lagoon.boxed(), genesis_info.lagoon_time),
         ];
 
         let mut time_hardforks = time_hardfork_opts
@@ -559,7 +559,7 @@ pub fn make_op_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> 
 mod tests {
     use alloc::string::{String, ToString};
     use alloy_genesis::{ChainConfig, Genesis};
-    use alloy_op_hardforks::{
+    use reth_optimism_forks::{
         BASE_MAINNET_JOVIAN_TIMESTAMP, BASE_SEPOLIA_JOVIAN_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP,
         OP_SEPOLIA_JOVIAN_TIMESTAMP,
     };
@@ -1243,7 +1243,7 @@ mod tests {
             EthereumHardfork::Prague.boxed(),
             OpHardfork::Isthmus.boxed(),
             OpHardfork::Jovian.boxed(),
-            // OpHardfork::Interop.boxed(),
+            // OpHardfork::Lagoon.boxed(),
         ];
 
         for (expected, actual) in expected_hardforks.iter().zip(hardforks.iter()) {

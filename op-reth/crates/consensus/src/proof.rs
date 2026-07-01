@@ -64,6 +64,15 @@ pub fn calculate_receipt_root_no_memo_optimism<R: DepositReceipt>(
     chain_spec: impl OpHardforks,
     timestamp: u64,
 ) -> B256 {
+    // There is a minor bug in op-geth and op-erigon where in the Regolith hardfork,
+    // the receipt root calculation does not include the deposit nonce in the receipt
+    // encoding. In the Regolith Hardfork, we must strip the deposit nonce from the
+    // receipts before calculating the receipt root. This was corrected in the Canyon
+    // hardfork.
+    //
+    // [MANTLE] Mantle always strips deposit_nonce and deposit_receipt_version from deposit
+    // receipts before computing the trie root, regardless of hardfork stage (see the memoized
+    // variant above for the full rationale).
     let is_mantle = chain_spec.is_mantle();
     let should_strip = if is_mantle {
         true

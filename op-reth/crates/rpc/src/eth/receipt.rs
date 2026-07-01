@@ -99,8 +99,6 @@ where
 #[derive(Debug, Clone)]
 pub struct OpReceiptConverter<Provider> {
     provider: Provider,
-    /// Whether SDM is explicitly enabled for integration tests.
-    sdm_enabled: bool,
     /// [MANTLE] LRU cache of per-tx `token_ratio` prefix arrays, keyed by block hash.
     token_ratio_prefix_cache: TokenRatioPrefixCache,
 }
@@ -110,18 +108,10 @@ impl<Provider> OpReceiptConverter<Provider> {
     pub fn new(provider: Provider) -> Self {
         Self {
             provider,
-            sdm_enabled: false,
             token_ratio_prefix_cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(
                 TOKEN_RATIO_PREFIX_CACHE_MAX_BLOCKS,
             )))),
         }
-    }
-
-    /// Configures the temporary SDM integration-test override.
-    #[must_use]
-    pub const fn with_sdm_enabled(mut self, sdm_enabled: bool) -> Self {
-        self.sdm_enabled = sdm_enabled;
-        self
     }
 }
 
@@ -159,11 +149,13 @@ where
         inputs: Vec<ConvertReceiptInput<'_, N>>,
         block: &SealedBlock<N::Block>,
     ) -> Result<Vec<Self::RpcReceipt>, Self::Error> {
+        let chain_spec = self.provider.chain_spec();
         let mut l1_block_info = match reth_optimism_evm::extract_l1_info(block.body()) {
             Ok(l1_block_info) => l1_block_info,
             Err(err) => {
-                let genesis_number =
-                    self.provider.chain_spec().genesis().number.unwrap_or_default();
+                let genesis_number = chain_spec.genesis().number.unwrap_or_default();
+                // If it is the genesis block (i.e. block number is 0), there is no L1 info, so
+                // we return an empty l1_block_info.
                 if block.header().number() == genesis_number {
                     return Ok(vec![]);
                 }
@@ -173,7 +165,7 @@ where
 
         // [MANTLE] token_ratio is not in the L1 info calldata; read from GAS_ORACLE_CONTRACT
         // at the parent block state (= start of this block, before any tx runs).
-        let is_mantle = self.provider.chain_spec().is_mantle();
+        let is_mantle = chain_spec.is_mantle();
         let mut token_ratio = U256::ZERO;
         if is_mantle &&
             let Ok(state) = self.provider.state_by_block_hash(block.header().parent_hash()) &&
@@ -211,10 +203,12 @@ where
         };
 
         let mut receipts = Vec::with_capacity(inputs.len());
+        let sdm_active =
+            reth_optimism_evm::is_sdm_active_at_timestamp(&chain_spec, block.header().timestamp());
         let post_exec_payload = parse_post_exec_payload_from_transactions(
             block.body().transactions(),
             block.header().number(),
-            self.sdm_enabled,
+            sdm_active,
         )?
         .map(|parsed| parsed.payload);
 
@@ -232,6 +226,9 @@ where
                 }
             }
 
+            // We must clear this cache as different L2 transactions can have different
+            // L1 costs. A potential improvement here is to only clear the cache if the
+            // new transaction input has changed, since otherwise the L1 cost wouldn't.
             l1_block_info.clear_tx_l1_cost();
 
             let op_gas_refund = post_exec_payload
@@ -239,13 +236,8 @@ where
                 .and_then(|payload| payload.gas_refund_for_idx(input.meta.index));
 
             receipts.push(
-                OpReceiptBuilder::new(
-                    &self.provider.chain_spec(),
-                    input,
-                    &mut l1_block_info,
-                    op_gas_refund,
-                )?
-                .build(),
+                OpReceiptBuilder::new(&chain_spec, input, &mut l1_block_info, op_gas_refund)?
+                    .build(),
             );
         }
 
@@ -356,13 +348,10 @@ impl OpReceiptFieldsBuilder {
             l1_block_info.l1_blob_base_fee_scalar.map(|scalar| scalar.saturating_to());
 
         // If the operator fee params are both set to 0, we don't add them to the receipt.
-        let operator_fee_scalar_has_non_zero_value: bool =
-            l1_block_info.operator_fee_scalar.is_some_and(|scalar| !scalar.is_zero());
+        let has_operator_fee = l1_block_info.operator_fee_scalar.is_some_and(|s| !s.is_zero()) ||
+            l1_block_info.operator_fee_constant.is_some_and(|c| !c.is_zero());
 
-        let operator_fee_constant_has_non_zero_value =
-            l1_block_info.operator_fee_constant.is_some_and(|constant| !constant.is_zero());
-
-        if operator_fee_scalar_has_non_zero_value || operator_fee_constant_has_non_zero_value {
+        if has_operator_fee {
             self.operator_fee_scalar =
                 l1_block_info.operator_fee_scalar.map(|scalar| scalar.saturating_to());
             self.operator_fee_constant =
@@ -483,7 +472,7 @@ impl OpReceiptBuilder {
         // footprint's value.
         // We're computing the jovian blob gas used before building the receipt since the inputs get
         // consumed by the `build_receipt` function.
-        chain_spec.is_jovian_active_at_timestamp(timestamp).then(|| {
+        if chain_spec.is_jovian_active_at_timestamp(timestamp) {
             // Estimate the size of the transaction in bytes and multiply by the DA
             // footprint gas scalar.
             // Jovian specs: `https://github.com/ethereum-optimism/specs/blob/main/specs/protocol/jovian/exec-engine.md#da-footprint-block-limit`
@@ -492,7 +481,7 @@ impl OpReceiptBuilder {
                 .saturating_mul(l1_block_info.da_footprint_gas_scalar.unwrap_or_default().into());
 
             core_receipt.blob_gas_used = Some(da_size);
-        });
+        }
 
         // op-geth parity: `build_receipt` derives `contract_address` from `tx.nonce()`,
         // which is hard-coded to `0` for deposit transactions. For a deposit
@@ -887,8 +876,7 @@ mod test {
         let converter = OpReceiptConverter::new(reth_storage_api::noop::NoopProvider::<
             _,
             OpPrimitives,
-        >::new(mantle_test_chain_spec()))
-        .with_sdm_enabled(true);
+        >::new(mantle_test_chain_spec()));
         let receipts =
             <OpReceiptConverter<_> as ReceiptConverter<OpPrimitives>>::convert_receipts_with_block(
                 &converter,
@@ -964,6 +952,60 @@ mod test {
 
         assert_eq!(operator_fee_scalar, None, "incorrect operator fee scalar");
         assert_eq!(operator_fee_constant, None, "incorrect operator fee constant");
+    }
+
+    // <https://github.com/paradigmxyz/reth/issues/12177>
+    #[test]
+    fn base_receipt_gas_fields() {
+        // https://basescan.org/tx/0x510fd4c47d78ba9f97c91b0f2ace954d5384c169c9545a77a373cf3ef8254e6e
+        let system = hex!(
+            "7ef8f8a0389e292420bcbf9330741f72074e39562a09ff5a00fd22e4e9eee7e34b81bca494deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000008dd00101c120000000000000004000000006721035b00000000014189960000000000000000000000000000000000000000000000000000000349b4dcdc000000000000000000000000000000000000000000000000000000004ef9325cc5991ce750960f636ca2ffbb6e209bb3ba91412f21dd78c14ff154d1930f1f9a0000000000000000000000005050f69a9786f081509234f1a7f4684b5e5b76c9"
+        );
+        let tx_0 = OpTransactionSigned::decode_2718(&mut &system[..]).unwrap();
+
+        let block: alloy_consensus::Block<OpTransactionSigned> = Block {
+            body: BlockBody { transactions: vec![tx_0], ..Default::default() },
+            ..Default::default()
+        };
+        let mut l1_block_info =
+            reth_optimism_evm::extract_l1_info(&block.body).expect("should extract l1 info");
+
+        // https://basescan.org/tx/0xf9420cbaf66a2dda75a015488d37262cbfd4abd0aad7bb2be8a63e14b1fa7a94
+        let tx = hex!(
+            "02f86c8221058034839a4ae283021528942f16386bb37709016023232523ff6d9daf444be380841249c58bc080a001b927eda2af9b00b52a57be0885e0303c39dd2831732e14051c2336470fd468a0681bf120baf562915841a48601c2b54a6742511e535cf8f71c95115af7ff63bd"
+        );
+        let tx_1 = OpTransactionSigned::decode_2718(&mut &tx[..]).unwrap();
+
+        use reth_optimism_chainspec::BASE_MAINNET;
+        let receipt_meta = OpReceiptFieldsBuilder::new(1730216981, 21713817)
+            .l1_block_info(&*BASE_MAINNET, &tx_1, &mut l1_block_info)
+            .expect("should parse revm l1 info")
+            .build();
+
+        let L1BlockInfo {
+            l1_gas_price,
+            l1_gas_used,
+            l1_fee,
+            l1_fee_scalar,
+            l1_base_fee_scalar,
+            l1_blob_base_fee,
+            l1_blob_base_fee_scalar,
+            operator_fee_scalar,
+            operator_fee_constant,
+            da_footprint_gas_scalar,
+            token_ratio: _,
+        } = receipt_meta.l1_block_info;
+
+        assert_eq!(l1_gas_price, Some(14121491676), "incorrect l1 base fee (former gas price)");
+        assert_eq!(l1_gas_used, Some(1600), "incorrect l1 gas used");
+        assert_eq!(l1_fee, Some(191150293412), "incorrect l1 fee");
+        assert!(l1_fee_scalar.is_none(), "incorrect l1 fee scalar");
+        assert_eq!(l1_base_fee_scalar, Some(2269), "incorrect l1 base fee scalar");
+        assert_eq!(l1_blob_base_fee, Some(1324954204), "incorrect l1 blob base fee");
+        assert_eq!(l1_blob_base_fee_scalar, Some(1055762), "incorrect l1 blob base fee scalar");
+        assert_eq!(operator_fee_scalar, None, "incorrect operator fee scalar");
+        assert_eq!(operator_fee_constant, None, "incorrect operator fee constant");
+        assert_eq!(da_footprint_gas_scalar, None, "incorrect da footprint gas scalar");
     }
 
     #[test]
@@ -1143,7 +1185,7 @@ mod test {
             &op_hardforks,
             ConvertReceiptInput::<OpPrimitives> {
                 tx: Recovered::new_unchecked(&tx, from),
-                receipt: OpReceipt::Deposit(OpDepositReceipt {
+                receipt: OpReceipt::Deposit(op_alloy_consensus::OpDepositReceipt {
                     inner: Receipt {
                         status: Eip658Value::Eip658(true),
                         cumulative_gas_used: 100,
