@@ -479,20 +479,30 @@ impl OpReceiptBuilder {
             mapped_receipt.into_with_bloom()
         });
 
+        // op-geth only populates L1/DA fee fields for non-deposit transactions. Compute this
+        // once and use it to gate both `blobGasUsed` (jovian DA footprint) and the L1 fee
+        // fields below, matching op-geth's `eth_getTransactionReceipt` output for deposits.
+        let is_deposit = tx_signed.is_deposit();
+
         // In jovian, we're using the blob gas used field to store the current da
         // footprint's value.
         // We're computing the jovian blob gas used before building the receipt since the inputs get
         // consumed by the `build_receipt` function.
-        chain_spec.is_jovian_active_at_timestamp(timestamp).then(|| {
-            // Estimate the size of the transaction in bytes and multiply by the DA
-            // footprint gas scalar.
-            // Jovian specs: `https://github.com/ethereum-optimism/specs/blob/main/specs/protocol/jovian/exec-engine.md#da-footprint-block-limit`
-            let da_size = estimate_tx_compressed_size(tx_signed.encoded_2718().as_slice())
-                .saturating_div(1_000_000)
-                .saturating_mul(l1_block_info.da_footprint_gas_scalar.unwrap_or_default().into());
+        // Only for non-deposit txs: op-geth omits blobGasUsed on deposit receipts.
+        if !is_deposit {
+            chain_spec.is_jovian_active_at_timestamp(timestamp).then(|| {
+                // Estimate the size of the transaction in bytes and multiply by the DA
+                // footprint gas scalar.
+                // Jovian specs: `https://github.com/ethereum-optimism/specs/blob/main/specs/protocol/jovian/exec-engine.md#da-footprint-block-limit`
+                let da_size = estimate_tx_compressed_size(tx_signed.encoded_2718().as_slice())
+                    .saturating_div(1_000_000)
+                    .saturating_mul(
+                        l1_block_info.da_footprint_gas_scalar.unwrap_or_default().into(),
+                    );
 
-            core_receipt.blob_gas_used = Some(da_size);
-        });
+                core_receipt.blob_gas_used = Some(da_size);
+            });
+        }
 
         // op-geth parity: `build_receipt` derives `contract_address` from `tx.nonce()`,
         // which is hard-coded to `0` for deposit transactions. For a deposit
@@ -513,10 +523,21 @@ impl OpReceiptBuilder {
             core_receipt.contract_address = Some(core_receipt.from.create(deposit_nonce));
         }
 
-        let op_receipt_fields = OpReceiptFieldsBuilder::new(timestamp, block_number)
-            .l1_block_info(chain_spec, tx_signed, l1_block_info)?
-            .op_gas_refund(op_gas_refund)
-            .build();
+        // L1 fee fields are only added for non-deposit transactions, matching op-geth.
+        // Deposits pay no L1 fee, so op-geth omits l1Fee / l1GasPrice / l1GasUsed / scalars on
+        // deposit receipts; emitting the block's L1 base-fee data on a deposit receipt is
+        // meaningless and diverges from op-geth's `eth_getTransactionReceipt` output.
+        // `op_gas_refund` (Mantle SDM) is unrelated to L1 fees and is kept for all txs.
+        let op_receipt_fields = if is_deposit {
+            OpReceiptFieldsBuilder::new(timestamp, block_number)
+                .op_gas_refund(op_gas_refund)
+                .build()
+        } else {
+            OpReceiptFieldsBuilder::new(timestamp, block_number)
+                .l1_block_info(chain_spec, tx_signed, l1_block_info)?
+                .op_gas_refund(op_gas_refund)
+                .build()
+        };
 
         Ok(Self { core_receipt, op_receipt_fields })
     }
@@ -1283,6 +1304,71 @@ mod test {
             op_receipt.core_receipt.contract_address,
             Some(from.create(NONCE)),
             "non-deposit contract creation must keep using the tx nonce"
+        );
+    }
+
+    /// op-geth omits L1 fee / DA fields on deposit receipts (deposits pay no L1 fee). Verify a
+    /// deposit receipt carries no L1 fee fields even when the block's L1 info is non-zero (a
+    /// non-deposit tx would populate them as `Some(..)`).
+    #[test]
+    fn deposit_receipt_omits_l1_fee_fields() {
+        use op_alloy_consensus::OpDepositReceipt;
+
+        let from = Address::with_last_byte(0x11);
+        let tx: OpTransactionSigned = TxDeposit {
+            source_hash: B256::ZERO,
+            from,
+            to: Address::with_last_byte(0x99).into(),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: 0,
+            input: Bytes::new(),
+            eth_tx_value: None,
+        }
+        .into();
+
+        // Non-zero L1 info: without the deposit gate these would populate the receipt.
+        let mut l1_block_info = op_revm::L1BlockInfo {
+            l1_base_fee: U256::from(1_000_000_000u64),
+            ..Default::default()
+        };
+        let op_hardforks = OP_MAINNET.as_ref();
+
+        let op_receipt = OpReceiptBuilder::new(
+            &op_hardforks,
+            ConvertReceiptInput::<OpPrimitives> {
+                tx: Recovered::new_unchecked(&tx, from),
+                receipt: OpReceipt::Deposit(OpDepositReceipt {
+                    inner: Receipt {
+                        status: Eip658Value::Eip658(true),
+                        cumulative_gas_used: 100,
+                        logs: vec![],
+                    },
+                    deposit_nonce: Some(7),
+                    deposit_receipt_version: Some(1),
+                }),
+                gas_used: 100,
+                next_log_index: 0,
+                meta: TransactionMeta {
+                    timestamp: OP_MAINNET_ISTHMUS_TIMESTAMP,
+                    ..Default::default()
+                },
+            },
+            &mut l1_block_info,
+            None,
+        )
+        .unwrap();
+
+        let l1 = &op_receipt.op_receipt_fields.l1_block_info;
+        assert!(l1.l1_gas_price.is_none(), "deposit receipt must omit l1GasPrice");
+        assert!(l1.l1_fee.is_none(), "deposit receipt must omit l1Fee");
+        assert!(l1.l1_gas_used.is_none(), "deposit receipt must omit l1GasUsed");
+        assert!(l1.l1_base_fee_scalar.is_none(), "deposit receipt must omit l1BaseFeeScalar");
+        assert!(
+            op_receipt.core_receipt.blob_gas_used.is_none(),
+            "deposit receipt must omit blobGasUsed"
         );
     }
 
