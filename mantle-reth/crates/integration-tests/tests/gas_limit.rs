@@ -1,5 +1,5 @@
 //! Tx-pool gas-limit reservation: a non-deposit transaction may use at most
-//! `block_gas_limit - MANTLE_L1_INFO_GAS_OVERHEAD` gas, matching op-geth's `EffectiveGasLimit`.
+//! `block_gas_limit - L1_INFO_GAS_OVERHEAD` gas, matching op-geth's `EffectiveGasLimit`.
 //!
 //! Every L2 block carries an L1-info deposit that consumes part of the block gas, so a tx asking
 //! for the full block gas limit could never be included. op-geth rejects such a tx at admission;
@@ -22,7 +22,7 @@ use reth_tasks::Runtime;
 
 /// Test genesis `gasLimit` (`assets/genesis.json` → `0x1c9c380`).
 const BLOCK_GAS_LIMIT: u64 = 30_000_000;
-/// Must match `op-reth/crates/txpool/src/validator.rs::MANTLE_L1_INFO_GAS_OVERHEAD`.
+/// Must match `op-reth/crates/txpool/src/validator.rs::L1_INFO_GAS_OVERHEAD`.
 const L1_INFO_GAS_OVERHEAD: u64 = 1_000_000;
 /// Largest gas a normal tx may request and still be admitted: 29M on a 30M block.
 const EFFECTIVE_CAP: u64 = BLOCK_GAS_LIMIT - L1_INFO_GAS_OVERHEAD;
