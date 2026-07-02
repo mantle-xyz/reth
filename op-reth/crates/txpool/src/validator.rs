@@ -1,10 +1,11 @@
 use crate::{InvalidCrossTx, OpPooledTx, supervisor::SupervisorClient};
 use alloy_consensus::{BlockHeader, Transaction};
-use op_revm::L1BlockInfo;
+use alloy_primitives::U256;
+use op_revm::{L1BlockInfo, OpSpecId};
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpecProvider;
 use reth_evm::ConfigureEvm;
-use reth_optimism_evm::RethL1BlockInfo;
+use reth_optimism_evm::{RethL1BlockInfo, revm_spec_by_timestamp_after_bedrock};
 use reth_optimism_forks::OpHardforks;
 use reth_primitives_traits::{
     Block, BlockBody, BlockTy, GotExpected, SealedBlock,
@@ -31,13 +32,46 @@ pub(crate) const CHECK_ACCESS_LIST_TIMEOUT_SECS: u64 = 7200;
 /// reservation a transaction with gas in `(block_gas_limit - overhead, block_gas_limit]` would be
 /// admitted to the pool yet could never be included — it would sit there until it expires. We
 /// reserve the overhead so such transactions are rejected up front, as geth does.
-pub(crate) const MANTLE_L1_INFO_GAS_OVERHEAD: u64 = 1_000_000;
+///
+/// Named to match upstream op-reth (#21548); the Mantle-specific part is only the value
+/// (op-geth's Mantle `l1InfoGasOverhead` is `1_000_000`, vs `70_000` upstream).
+pub(crate) const L1_INFO_GAS_OVERHEAD: u64 = 1_000_000;
 
-/// Effective per-transaction gas limit for the Mantle tx-pool: the block gas limit minus the
+/// Effective per-transaction gas limit for the tx-pool: the block gas limit minus the
 /// L1-info deposit reservation. Port of the Optimism branch of op-geth's `EffectiveGasLimit`
 /// (`core/txpool/validation.go`). Saturates to `0` when the block limit is below the reservation.
-pub(crate) fn mantle_effective_gas_limit(block_gas_limit: u64) -> u64 {
-    block_gas_limit.saturating_sub(MANTLE_L1_INFO_GAS_OVERHEAD)
+pub(crate) fn effective_gas_limit(block_gas_limit: u64) -> u64 {
+    block_gas_limit.saturating_sub(L1_INFO_GAS_OVERHEAD)
+}
+
+/// Operator fee to reserve for a non-deposit transaction in the tx-pool balance check.
+///
+/// Mirrors op-geth's operator cost function (`core/types/rollup_cost.go`). Upstream op-reth
+/// reserves only the L1 data fee, so without this a sender covering L2 gas + value + L1 data fee —
+/// but not the operator fee — would be admitted to the pool and then fail at execution.
+///
+/// Structurally matches upstream op-reth's `operator_fee_addition` (#21609); the Mantle difference
+/// is only the activation fork — op-geth gates the Mantle operator fee on `IsMantleArsia`, so this
+/// guards on [`OpSpecId::ARSIA`] rather than `ISTHMUS`.
+///
+/// Returns `0` before Arsia or when the operator fee params are unset:
+/// [`L1BlockInfo::operator_fee_charge`] panics on a missing scalar/constant, so both must be
+/// present before the charge is computed. Uses the transaction's `gas_limit` (worst-case spend),
+/// matching op-geth's use of `tx.Gas()`.
+pub(crate) fn operator_fee_addition(
+    l1_block_info: &L1BlockInfo,
+    spec_id: OpSpecId,
+    encoded: &[u8],
+    gas_limit: u64,
+) -> U256 {
+    if spec_id.is_enabled_in(OpSpecId::ARSIA) &&
+        l1_block_info.operator_fee_scalar.is_some() &&
+        l1_block_info.operator_fee_constant.is_some()
+    {
+        l1_block_info.operator_fee_charge(encoded, U256::from(gas_limit))
+    } else {
+        U256::ZERO
+    }
 }
 
 /// Tracks additional infos for the current block.
@@ -244,7 +278,7 @@ where
         // included (the L1-info deposit always consumes part of the block), leaving it stuck.
         if self.chain_spec().is_mantle() {
             let gas_limit = transaction.gas_limit();
-            let effective_limit = mantle_effective_gas_limit(self.inner.block_gas_limit());
+            let effective_limit = effective_gas_limit(self.inner.block_gas_limit());
             if gas_limit > effective_limit {
                 return TransactionValidationOutcome::Invalid(
                     transaction,
@@ -281,7 +315,7 @@ where
 
             let encoded = valid_tx.transaction().encoded_2718();
 
-            let cost_addition = match l1_block_info.l1_tx_data_fee(
+            let mut cost_addition = match l1_block_info.l1_tx_data_fee(
                 self.chain_spec(),
                 self.block_timestamp(),
                 &encoded,
@@ -292,6 +326,21 @@ where
                     return TransactionValidationOutcome::Error(*valid_tx.hash(), Box::new(err));
                 }
             };
+
+            // [MANTLE] Also reserve the Isthmus/Arsia operator fee in the pool balance check,
+            // matching op-geth's operator cost function (guarded by `IsMantleArsia`,
+            // `core/types/rollup_cost.go`). Upstream op-reth reserves only the L1 data fee above,
+            // so a sender covering L2 gas + value + L1 data fee — but not the operator fee — would
+            // be admitted here and then fail at execution.
+            let spec_id =
+                revm_spec_by_timestamp_after_bedrock(self.chain_spec(), self.block_timestamp());
+            cost_addition = cost_addition.saturating_add(operator_fee_addition(
+                &l1_block_info,
+                spec_id,
+                &encoded,
+                valid_tx.transaction().gas_limit(),
+            ));
+
             let cost = valid_tx.transaction().cost().saturating_add(cost_addition);
 
             // Checks for max cost
@@ -377,23 +426,77 @@ impl OpForkTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::{MANTLE_L1_INFO_GAS_OVERHEAD, mantle_effective_gas_limit};
+    use super::{L1_INFO_GAS_OVERHEAD, effective_gas_limit, operator_fee_addition};
+    use alloy_primitives::U256;
+    use op_revm::{L1BlockInfo, OpSpecId};
+
+    /// A non-deposit EIP-2718 encoding: first byte is a tx-type (0x02 = EIP-1559), not the
+    /// `0x7E` deposit marker, and non-empty — so `operator_fee_charge` does not short-circuit.
+    const NON_DEPOSIT_ENCODED: &[u8] = &[0x02, 0xAB, 0xCD];
+
+    fn l1_info_with_operator_fee(scalar: u64, constant: u64) -> L1BlockInfo {
+        L1BlockInfo {
+            operator_fee_scalar: Some(U256::from(scalar)),
+            operator_fee_constant: Some(U256::from(constant)),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn effective_gas_limit_subtracts_l1_info_overhead() {
         // 30M block → 29M effective; 60M block → 59M (matches op-geth EffectiveGasLimit).
-        assert_eq!(
-            mantle_effective_gas_limit(30_000_000),
-            30_000_000 - MANTLE_L1_INFO_GAS_OVERHEAD
-        );
-        assert_eq!(mantle_effective_gas_limit(60_000_000), 59_000_000);
+        assert_eq!(effective_gas_limit(30_000_000), 30_000_000 - L1_INFO_GAS_OVERHEAD);
+        assert_eq!(effective_gas_limit(60_000_000), 59_000_000);
     }
 
     #[test]
     fn effective_gas_limit_saturates_below_overhead() {
         // A block limit at or below the reservation leaves no room for user txs.
-        assert_eq!(mantle_effective_gas_limit(MANTLE_L1_INFO_GAS_OVERHEAD), 0);
-        assert_eq!(mantle_effective_gas_limit(500_000), 0);
-        assert_eq!(mantle_effective_gas_limit(0), 0);
+        assert_eq!(effective_gas_limit(L1_INFO_GAS_OVERHEAD), 0);
+        assert_eq!(effective_gas_limit(500_000), 0);
+        assert_eq!(effective_gas_limit(0), 0);
+    }
+
+    #[test]
+    fn operator_fee_added_when_arsia_active_and_params_present() {
+        let l1 = l1_info_with_operator_fee(1, 2);
+        let gas_limit = 21_000u64;
+        // Delegates to L1BlockInfo::operator_fee_charge (gas*scalar*100 + constant), which is
+        // non-zero here.
+        let expected = l1.operator_fee_charge(NON_DEPOSIT_ENCODED, U256::from(gas_limit));
+        assert!(expected > U256::ZERO);
+        assert_eq!(
+            operator_fee_addition(&l1, OpSpecId::ARSIA, NON_DEPOSIT_ENCODED, gas_limit),
+            expected
+        );
+    }
+
+    #[test]
+    fn operator_fee_zero_before_arsia() {
+        // Params present but the spec is pre-Arsia → op-geth charges no operator fee.
+        let l1 = l1_info_with_operator_fee(1, 2);
+        assert_eq!(
+            operator_fee_addition(&l1, OpSpecId::BEDROCK, NON_DEPOSIT_ENCODED, 21_000),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn operator_fee_zero_and_no_panic_when_params_unset() {
+        // Pre-Isthmus L1 info has no operator fee params; operator_fee_charge would panic on the
+        // missing scalar/constant, so the guard must return zero without calling it.
+        let l1 = L1BlockInfo::default();
+        assert!(l1.operator_fee_scalar.is_none() && l1.operator_fee_constant.is_none());
+        assert_eq!(
+            operator_fee_addition(&l1, OpSpecId::ARSIA, NON_DEPOSIT_ENCODED, 21_000),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn operator_fee_zero_for_deposit_input() {
+        // A deposit-typed (0x7E) encoding is exempt from the operator fee.
+        let l1 = l1_info_with_operator_fee(1, 2);
+        assert_eq!(operator_fee_addition(&l1, OpSpecId::ARSIA, &[0x7E, 0x00], 21_000), U256::ZERO);
     }
 }
