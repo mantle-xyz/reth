@@ -52,6 +52,16 @@ where
         state_override: Option<StateOverride>,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
+            // [MANTLE] Apply the request's `stateOverride` balance for `from` to the Mantle
+            // pre/post fund checks below — geth applies overrides to its estimation
+            // state before reading balances, but these checks read the raw provider
+            // state (`state_by_block_id`), which ignored `stateOverride` and spuriously
+            // rejected overridden-balance estimates. Extracted once here because
+            // `state_override` is moved into the inner call below.
+            let from_override_balance = request.as_ref().from.and_then(|from| {
+                state_override.as_ref().and_then(|ov| ov.get(&from)).and_then(|acc| acc.balance)
+            });
+
             // [MANTLE] Pre-check: value transfer (op-geth `gasestimator.go` clause 6,
             // lines 98-105). geth only runs this when a fee cap is set
             // (`feeCap.BitLen() != 0`, i.e. not `GasEstimationWithSkipCheckBalanceMode`)
@@ -73,7 +83,9 @@ where
                     let Ok(Some(block)) = self.provider().block_by_id(at) &&
                     let Ok(state) = self.provider().state_by_block_id(at)
                 {
-                    let balance = state.account_balance(&from).ok().flatten().unwrap_or(U256::ZERO);
+                    let balance = from_override_balance
+                        .or_else(|| state.account_balance(&from).ok().flatten())
+                        .unwrap_or(U256::ZERO);
                     if value >= balance {
                         let hi = request.as_ref().gas.unwrap_or(block.header().gas_limit());
                         return Err(reth_rpc_eth_types::EthApiError::InvalidParams(format!(
@@ -111,7 +123,9 @@ where
                     ) {
                         l1_block_info.token_ratio = ratio;
                     }
-                    let balance = state.account_balance(&from).ok().flatten().unwrap_or(U256::ZERO);
+                    let balance = from_override_balance
+                        .or_else(|| state.account_balance(&from).ok().flatten())
+                        .unwrap_or(U256::ZERO);
                     let input = request.as_ref().input.input().cloned().unwrap_or_default();
 
                     if let Err(e) = mantle_reth_eth_api::mantle_arsia_check_funds(
