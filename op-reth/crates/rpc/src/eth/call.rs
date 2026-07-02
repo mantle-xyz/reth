@@ -146,9 +146,10 @@ where
 {
     /// [MANTLE] Overrides upstream `estimate_gas_with` to match op-geth `gasestimator.go`:
     /// gate the caller balance allowance by the fee cap (`maxFeePerGas`) instead of the effective
-    /// gas price (`geth_style_gas_allowance`, with checked value + blob-fee subtraction), ignore a
-    /// request gas limit below the intrinsic minimum, and only take the basic-transfer short-circuit
-    /// when the allowance permits it.
+    /// gas price (`geth_style_gas_allowance`, rejecting on `value >= balance` / blob-exposure like
+    /// op-geth), ignore a
+    /// request gas limit below the intrinsic minimum, and only take the basic-transfer
+    /// short-circuit when the allowance permits it.
     ///
     /// Everything else is a verbatim copy of
     /// `reth_rpc_eth_api::helpers::estimate::EstimateCall::estimate_gas_with` (reth rev
@@ -434,23 +435,32 @@ where
 ///
 /// Dividing by the fee cap rather than the effective execution price keeps the estimate
 /// submittable: reth's own transaction validation requires `balance >= gas_limit * maxFee + value`.
-/// Returns [`RpcInvalidTransactionError::InsufficientFunds`] when the value or blob exposure alone
-/// exceeds the balance. `fee_cap` is expected to be non-zero — callers use an unbounded allowance
-/// otherwise, matching op-geth's skip-balance estimation mode.
+/// Rejects (like op-geth) when the transfer value alone meets-or-exceeds the balance
+/// ([`RpcInvalidTransactionError::InsufficientFundsForTransfer`], the `value >= available` check),
+/// or when the blob exposure meets-or-exceeds the remainder
+/// ([`RpcInvalidTransactionError::InsufficientFunds`]). `fee_cap` is expected to be non-zero —
+/// callers use an unbounded allowance otherwise, matching op-geth's skip-balance estimation mode.
 fn geth_style_gas_allowance(
     balance: U256,
     value: U256,
     max_blob_fee: U256,
     fee_cap: u128,
 ) -> Result<u64, RpcInvalidTransactionError> {
-    // Subtract the transfer value, then the max blob-fee exposure, erroring if either exceeds the
-    // remaining balance (checked subtraction, matching upstream `caller_gas_allowance`).
-    let available = balance
-        .checked_sub(value)
-        .ok_or(RpcInvalidTransactionError::InsufficientFunds { cost: value, balance })?;
-    let available = available.checked_sub(max_blob_fee).ok_or(
-        RpcInvalidTransactionError::InsufficientFunds { cost: max_blob_fee, balance: available },
-    )?;
+    // op-geth `gasestimator.go`: reject when `value >= available` (available == balance here);
+    // the `>=` also matches the Mantle value pre-check in `estimate_gas_at`.
+    if value >= balance {
+        return Err(RpcInvalidTransactionError::InsufficientFundsForTransfer);
+    }
+    let available = balance - value;
+    // op-geth: for 4844 calls, reject when the max blob-fee exposure `>= available`, then subtract
+    // it. `available >= 1` here (value < balance), so a zero `max_blob_fee` never false-positives.
+    if max_blob_fee >= available {
+        return Err(RpcInvalidTransactionError::InsufficientFunds {
+            cost: max_blob_fee,
+            balance: available,
+        });
+    }
+    let available = available - max_blob_fee;
     Ok(available.checked_div(U256::from(fee_cap)).unwrap_or_default().saturating_to())
 }
 
@@ -486,18 +496,26 @@ mod allowance_tests {
     }
 
     #[test]
-    fn value_exceeding_balance_is_insufficient_funds() {
+    fn value_exceeding_balance_is_insufficient_funds_for_transfer() {
         let err = geth_style_gas_allowance(U256::from(1u64), U256::from(2u64), U256::ZERO, 1)
             .unwrap_err();
-        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFunds { .. }));
+        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFundsForTransfer));
     }
 
     #[test]
-    fn value_equal_balance_yields_zero_allowance() {
-        assert_eq!(
-            geth_style_gas_allowance(U256::from(5u64), U256::from(5u64), U256::ZERO, 1).unwrap(),
-            0
-        );
+    fn value_equal_balance_is_insufficient_funds_for_transfer() {
+        // op-geth uses `value >= available`, so value == balance rejects (0 gas budget left).
+        let err = geth_style_gas_allowance(U256::from(5u64), U256::from(5u64), U256::ZERO, 1)
+            .unwrap_err();
+        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFundsForTransfer));
+    }
+
+    #[test]
+    fn value_zero_balance_zero_is_insufficient_funds_for_transfer() {
+        // The estimateGas_13 edge: value == 0, balance == 0, fee set -> `0 >= 0` -> reject,
+        // matching op-geth's `insufficient funds for transfer` exactly.
+        let err = geth_style_gas_allowance(U256::ZERO, U256::ZERO, U256::ZERO, 1).unwrap_err();
+        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFundsForTransfer));
     }
 
     #[test]
