@@ -14,7 +14,7 @@ use reth_primitives_traits::{
 use reth_storage_api::{AccountInfoReader, BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::{
     EthPoolTransaction, EthTransactionValidator, TransactionOrigin, TransactionValidationOutcome,
-    TransactionValidator, error::InvalidPoolTransactionError,
+    TransactionValidator, error::InvalidPoolTransactionError, validate::ValidTransaction,
 };
 use std::sync::{
     Arc,
@@ -354,10 +354,15 @@ where
                 );
             }
 
+            // [MANTLE] Stash the overlay so the pool's cumulative accounting reserves it too. OP
+            // txs are never EIP-4844, so the sidecar-less `Valid` variant is correct.
+            let mut tx = valid_tx.into_transaction();
+            tx.set_extra_balance_cost(cost_addition);
+
             return TransactionValidationOutcome::Valid {
                 balance,
                 state_nonce,
-                transaction: valid_tx,
+                transaction: ValidTransaction::Valid(tx),
                 propagate,
                 bytecode_hash,
                 authorities,
