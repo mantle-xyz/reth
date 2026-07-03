@@ -51,8 +51,8 @@ impl reth_transaction_pool::error::PoolTransactionError for UnprotectedTxDisable
 ///
 /// - EIP-155 unprotected legacy transactions (type 0 without `chain_id`)
 /// - Legacy `MetaTx` transactions (disabled since `MantleEverest`)
-/// - Transactions whose max fee (`gas_limit * max_fee_per_gas`) exceeds the configured
-///   RPC tx fee cap (`--rpc.txfeecap`), matching op-geth's `RPCTxFeeCap` behavior
+/// - Transactions whose max fee (`gas_limit * max_fee_per_gas`) exceeds the configured RPC tx fee
+///   cap (`--rpc.txfeecap`), matching op-geth's `RPCTxFeeCap` behavior
 ///
 /// All other transactions are forwarded to the inner validator unchanged.
 ///
