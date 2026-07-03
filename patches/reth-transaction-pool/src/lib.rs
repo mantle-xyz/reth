@@ -275,6 +275,14 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
+// This crate is a near-verbatim vendored copy of upstream `reth-transaction-pool`, which
+// keeps the `unnameable-types` lint disabled (see reth's root Cargo.toml:
+// `# rust.unnameable-types = "warn"`). Upstream ships several `pub` types in private
+// modules that are reachable through the public API but not nameable (e.g.
+// `pool::update::UpdateOutcome`, `validate::task::ValidationJobSender`). The Mantle
+// workspace enables that lint fork-wide, so allow it here to stay aligned with upstream
+// rather than diverging the vendored source.
+#![allow(unnameable_types)]
 
 pub use imbl::OrdMap;
 
