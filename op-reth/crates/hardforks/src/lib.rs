@@ -18,7 +18,7 @@
 
 extern crate alloc;
 
-use alloy_op_hardforks::{
+pub use alloy_op_hardforks::{
     BASE_MAINNET_JOVIAN_TIMESTAMP, BASE_SEPOLIA_JOVIAN_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP,
     OP_SEPOLIA_JOVIAN_TIMESTAMP,
 };
