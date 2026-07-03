@@ -54,6 +54,9 @@ pub struct OpPooledTransaction<
 
     /// Cached EIP-2718 encoded bytes of the transaction, lazily computed.
     encoded_2718: OnceLock<Bytes>,
+
+    /// L1 data fee + operator fee overlay, stashed by the validator (see `extra_balance_cost`).
+    extra_balance_cost: U256,
 }
 
 impl<Cons: SignedTransaction, Pooled> OpPooledTransaction<Cons, Pooled> {
@@ -66,6 +69,7 @@ impl<Cons: SignedTransaction, Pooled> OpPooledTransaction<Cons, Pooled> {
             interop: Arc::new(AtomicU64::new(NO_INTEROP_TX)),
             _pd: core::marker::PhantomData,
             encoded_2718: Default::default(),
+            extra_balance_cost: U256::ZERO,
         }
     }
 
@@ -166,6 +170,10 @@ where
 
     fn cost(&self) -> &U256 {
         &self.inner.cost
+    }
+
+    fn extra_balance_cost(&self) -> U256 {
+        self.extra_balance_cost
     }
 
     fn encoded_length(&self) -> usize {
@@ -299,6 +307,9 @@ pub trait OpPooledTx:
 {
     /// Returns the EIP-2718 encoded bytes of the transaction.
     fn encoded_2718(&self) -> Cow<'_, Bytes>;
+
+    /// Stashes the L1 + operator fee overlay (surfaced via `PoolTransaction::extra_balance_cost`).
+    fn set_extra_balance_cost(&mut self, cost: U256);
 }
 
 impl<Cons, Pooled> OpPooledTx for OpPooledTransaction<Cons, Pooled>
@@ -309,6 +320,10 @@ where
 {
     fn encoded_2718(&self) -> Cow<'_, Bytes> {
         Cow::Borrowed(self.encoded_2718())
+    }
+
+    fn set_extra_balance_cost(&mut self, cost: U256) {
+        self.extra_balance_cost = cost;
     }
 }
 
@@ -364,5 +379,38 @@ mod tests {
             _ => panic!("Expected invalid transaction"),
         };
         assert_eq!(err.to_string(), "transaction type not supported");
+    }
+
+    #[test]
+    fn extra_balance_cost_roundtrip() {
+        use crate::OpPooledTx;
+        use reth_transaction_pool::PoolTransaction;
+
+        let signer = Default::default();
+        let deposit_tx = TxDeposit {
+            source_hash: Default::default(),
+            from: signer,
+            to: TxKind::Create,
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 0,
+            is_system_transaction: false,
+            eth_value: 0,
+            input: Default::default(),
+            eth_tx_value: None,
+        };
+        let signed_tx: OpTransactionSigned = deposit_tx.into();
+        let signed_recovered = Recovered::new_unchecked(signed_tx, signer);
+        let len = signed_recovered.encode_2718_len();
+        let mut tx: OpPooledTransaction = OpPooledTransaction::new(signed_recovered, len);
+
+        // Default: no overlay.
+        assert_eq!(tx.extra_balance_cost(), U256::ZERO);
+        let intrinsic = *tx.cost();
+
+        // Stashing the overlay is reflected by extra_balance_cost() and leaves cost() intrinsic.
+        tx.set_extra_balance_cost(U256::from(12_345u64));
+        assert_eq!(tx.extra_balance_cost(), U256::from(12_345u64));
+        assert_eq!(*tx.cost(), intrinsic, "cost() must stay intrinsic");
     }
 }
