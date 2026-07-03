@@ -52,6 +52,16 @@ where
         state_override: Option<StateOverride>,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
+            // [MANTLE] Apply the request's `stateOverride` balance for `from` to the Mantle
+            // pre/post fund checks below — geth applies overrides to its estimation
+            // state before reading balances, but these checks read the raw provider
+            // state (`state_by_block_id`), which ignored `stateOverride` and spuriously
+            // rejected overridden-balance estimates. Extracted once here because
+            // `state_override` is moved into the inner call below.
+            let from_override_balance = request.as_ref().from.and_then(|from| {
+                state_override.as_ref().and_then(|ov| ov.get(&from)).and_then(|acc| acc.balance)
+            });
+
             // [MANTLE] Pre-check: value transfer (op-geth `gasestimator.go` clause 6,
             // lines 98-105). geth only runs this when a fee cap is set
             // (`feeCap.BitLen() != 0`, i.e. not `GasEstimationWithSkipCheckBalanceMode`)
@@ -73,7 +83,9 @@ where
                     let Ok(Some(block)) = self.provider().block_by_id(at) &&
                     let Ok(state) = self.provider().state_by_block_id(at)
                 {
-                    let balance = state.account_balance(&from).ok().flatten().unwrap_or(U256::ZERO);
+                    let balance = from_override_balance
+                        .or_else(|| state.account_balance(&from).ok().flatten())
+                        .unwrap_or(U256::ZERO);
                     if value >= balance {
                         let hi = request.as_ref().gas.unwrap_or(block.header().gas_limit());
                         return Err(reth_rpc_eth_types::EthApiError::InvalidParams(format!(
@@ -111,7 +123,9 @@ where
                     ) {
                         l1_block_info.token_ratio = ratio;
                     }
-                    let balance = state.account_balance(&from).ok().flatten().unwrap_or(U256::ZERO);
+                    let balance = from_override_balance
+                        .or_else(|| state.account_balance(&from).ok().flatten())
+                        .unwrap_or(U256::ZERO);
                     let input = request.as_ref().input.input().cloned().unwrap_or_default();
 
                     if let Err(e) = mantle_reth_eth_api::mantle_arsia_check_funds(
@@ -144,14 +158,16 @@ where
     OpEthApiError: FromEvmError<N::Evm>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError, Evm = N::Evm>,
 {
-    /// [MANTLE] Overrides upstream `estimate_gas_with` to gate the caller balance
-    /// allowance by `maxFeePerGas` (matching op-geth `gasestimator.go`) instead of the
-    /// effective gas price used by upstream reth, and to only take the basic-transfer
-    /// short-circuit when that allowance permits it.
+    /// [MANTLE] Overrides upstream `estimate_gas_with` to match op-geth `gasestimator.go`:
+    /// gate the caller balance allowance by the fee cap (`maxFeePerGas`) instead of the effective
+    /// gas price (`geth_style_gas_allowance`, rejecting on `value >= balance` / blob-exposure like
+    /// op-geth), ignore a
+    /// request gas limit below the intrinsic minimum, and only take the basic-transfer
+    /// short-circuit when the allowance permits it.
     ///
     /// Everything else is a verbatim copy of
     /// `reth_rpc_eth_api::helpers::estimate::EstimateCall::estimate_gas_with` (reth rev
-    /// 88505c7). The two `[MANTLE]` blocks below are the only deviations. See
+    /// 88505c7). The `[MANTLE]` blocks below are the only deviations. See
     /// `docs/op-reth-estimategas-fix-and-upstream.md` for the rationale.
     fn estimate_gas_with<S>(
         &self,
@@ -193,14 +209,11 @@ where
             );
 
         // Determine the highest possible gas limit, considering both the request's specified
-        // limit and the block's limit.
+        // limit and the block's limit. Like op-geth, a user-supplied gas limit below the intrinsic
+        // minimum is ignored (the block limit is used) rather than taken as the search ceiling.
         let mut highest_gas_limit = tx_request_gas_limit
-            .map(|mut tx_gas_limit| {
-                if max_gas_limit < tx_gas_limit {
-                    tx_gas_limit = max_gas_limit;
-                }
-                tx_gas_limit
-            })
+            .filter(|&tx_gas_limit| tx_gas_limit >= MIN_TRANSACTION_GAS)
+            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
             .unwrap_or(max_gas_limit);
 
         // Configure the evm env
@@ -227,33 +240,26 @@ where
             false
         };
 
-        // [MANTLE] Compute the caller's balance allowance using the *maxFeePerGas*
-        // (`fee_cap`), matching op-geth `gasestimator.go:109`
-        // (`allowance = (balance - value) / feeCap`). Upstream reth calls
-        // `caller_gas_allowance`, which divides by `tx_env.gas_price()` — the effective
-        // gas price `min(maxFee, base + tip)` on the RPC path — over-estimating the
-        // allowance when `maxFee >> effective`. The execution `tx_env` keeps its effective
-        // `gas_price`, so the GASPRICE opcode value is unchanged.
-        //
-        // `balance_allowance` is tracked separately from `highest_gas_limit` (which may also
-        // be lowered by a user-supplied `gas`) so the basic-transfer short-circuit below can
-        // gate purely on affordability, mirroring geth's `execute(21000)` buyGas check. When
-        // no fee is set (`fee_cap == 0`), geth estimates in skip-balance mode
-        // (`GasEstimationWithSkipCheckBalanceMode`), so the allowance is unbounded.
+        // [MANTLE] Cap the search by the caller's affordable gas, gated by the fee cap
+        // (`geth_style_gas_allowance`): op-geth `gasestimator.go` divides
+        // `(balance - value - blobFee) / feeCap`, whereas upstream reth's `caller_gas_allowance`
+        // divides by the effective `tx_env.gas_price()` (`min(maxFee, base + tip)` on the RPC
+        // path), over-estimating the allowance and returning an estimate the caller cannot submit
+        // at `maxFee`. The execution `tx_env` keeps its effective `gas_price`, so the GASPRICE
+        // opcode value is unchanged. Tracked separately from `highest_gas_limit` (which a request
+        // gas limit can also lower) so the basic-transfer short-circuit below can gate purely on
+        // affordability. No fee (`fee_cap == 0`) => unbounded, matching op-geth's skip-balance
+        // mode.
         let balance_allowance: u64 = if fee_cap > 0 {
-            // Read the balance through the `State` overlay (`db.basic`, as
-            // `caller_gas_allowance` does), NOT `db.database` — the latter is the raw
-            // provider and bypasses `stateOverride` balances applied above.
+            // Read the balance through the `State` overlay (`db.basic`), NOT `db.database` — the
+            // latter is the raw provider and bypasses `stateOverride` balances applied above.
             let balance = db
                 .basic(tx_env.caller())
                 .map_err(Self::Error::from_eth_err)?
                 .map(|acc| acc.balance)
                 .unwrap_or_default();
-            balance
-                .saturating_sub(tx_env.value())
-                .checked_div(U256::from(fee_cap))
-                .unwrap_or_default()
-                .saturating_to()
+            geth_style_gas_allowance(balance, tx_env.value(), tx_env.calc_max_data_fee(), fee_cap)
+                .map_err(Self::Error::from_eth_err)?
         } else {
             u64::MAX
         };
@@ -267,8 +273,9 @@ where
                 highest_gas_limit.min(self.caller_gas_allowance(&mut db, &evm_env, &tx_env)?);
         }
 
-        // If the provided gas limit is less than computed cap, use that
-        tx_env.set_gas_limit(tx_env.gas_limit().min(highest_gas_limit));
+        // [MANTLE] Search from the affordable/block ceiling. A valid request gas limit is already
+        // folded into `highest_gas_limit`; a sub-intrinsic one was ignored above (like op-geth).
+        tx_env.set_gas_limit(highest_gas_limit);
 
         // Create EVM instance once and reuse it throughout the entire estimation process
         let mut evm = self.evm_config().evm_with_env(&mut db, evm_env);
@@ -432,5 +439,122 @@ where
     #[inline]
     fn evm_memory_limit(&self) -> u64 {
         self.inner.eth_api.evm_memory_limit()
+    }
+}
+
+/// Computes the caller's affordable gas limit the way op-geth's estimator does
+/// (`eth/gasestimator`): from `balance`, subtract the transfer `value` and — for EIP-4844 calls —
+/// the max blob-fee exposure `max_blob_fee`, then divide the remainder by the transaction
+/// `fee_cap` (`maxFeePerGas`, or legacy `gasPrice`).
+///
+/// Dividing by the fee cap rather than the effective execution price keeps the estimate
+/// submittable: reth's own transaction validation requires `balance >= gas_limit * maxFee + value`.
+/// Rejects (like op-geth) when the transfer value alone meets-or-exceeds the balance
+/// ([`RpcInvalidTransactionError::InsufficientFundsForTransfer`], the `value >= available` check),
+/// or when the blob exposure meets-or-exceeds the remainder
+/// ([`RpcInvalidTransactionError::InsufficientFunds`]). `fee_cap` is expected to be non-zero —
+/// callers use an unbounded allowance otherwise, matching op-geth's skip-balance estimation mode.
+fn geth_style_gas_allowance(
+    balance: U256,
+    value: U256,
+    max_blob_fee: U256,
+    fee_cap: u128,
+) -> Result<u64, RpcInvalidTransactionError> {
+    // op-geth `gasestimator.go`: reject when `value >= available` (available == balance here);
+    // the `>=` also matches the Mantle value pre-check in `estimate_gas_at`.
+    if value >= balance {
+        return Err(RpcInvalidTransactionError::InsufficientFundsForTransfer);
+    }
+    let available = balance - value;
+    // op-geth: for 4844 calls, reject when the max blob-fee exposure `>= available`, then subtract
+    // it. `available >= 1` here (value < balance), so a zero `max_blob_fee` never false-positives.
+    if max_blob_fee >= available {
+        return Err(RpcInvalidTransactionError::InsufficientFunds {
+            cost: max_blob_fee,
+            balance: available,
+        });
+    }
+    let available = available - max_blob_fee;
+    Ok(available.checked_div(U256::from(fee_cap)).unwrap_or_default().saturating_to())
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::geth_style_gas_allowance;
+    use alloy_primitives::U256;
+    use reth_rpc_eth_types::RpcInvalidTransactionError;
+
+    #[test]
+    fn high_fee_cap_low_balance() {
+        // 1e14 balance, 1e12 fee cap -> allowance 100.
+        assert_eq!(
+            geth_style_gas_allowance(
+                U256::from(100_000_000_000_000u128),
+                U256::ZERO,
+                U256::ZERO,
+                1_000_000_000_000u128,
+            )
+            .unwrap(),
+            100
+        );
+    }
+
+    #[test]
+    fn legacy_gas_price_divisor() {
+        let gas_price = 50_000_000_000u128;
+        let balance = U256::from(gas_price) * U256::from(21_000u64);
+        assert_eq!(
+            geth_style_gas_allowance(balance, U256::ZERO, U256::ZERO, gas_price).unwrap(),
+            21_000
+        );
+    }
+
+    #[test]
+    fn value_exceeding_balance_is_insufficient_funds_for_transfer() {
+        let err = geth_style_gas_allowance(U256::from(1u64), U256::from(2u64), U256::ZERO, 1)
+            .unwrap_err();
+        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFundsForTransfer));
+    }
+
+    #[test]
+    fn value_equal_balance_is_insufficient_funds_for_transfer() {
+        // op-geth uses `value >= available`, so value == balance rejects (0 gas budget left).
+        let err = geth_style_gas_allowance(U256::from(5u64), U256::from(5u64), U256::ZERO, 1)
+            .unwrap_err();
+        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFundsForTransfer));
+    }
+
+    #[test]
+    fn value_zero_balance_zero_is_insufficient_funds_for_transfer() {
+        // The estimateGas_13 edge: value == 0, balance == 0, fee set -> `0 >= 0` -> reject,
+        // matching op-geth's `insufficient funds for transfer` exactly.
+        let err = geth_style_gas_allowance(U256::ZERO, U256::ZERO, U256::ZERO, 1).unwrap_err();
+        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFundsForTransfer));
+    }
+
+    #[test]
+    fn blob_fee_is_subtracted() {
+        let fee_cap = 1_000u128;
+        let blob_fee = U256::from(500_000u64);
+        let balance = blob_fee + U256::from(1_000u64) * U256::from(fee_cap);
+        assert_eq!(
+            geth_style_gas_allowance(balance, U256::ZERO, blob_fee, fee_cap).unwrap(),
+            1_000
+        );
+    }
+
+    #[test]
+    fn blob_fee_exceeding_balance_is_insufficient_funds() {
+        let err = geth_style_gas_allowance(U256::from(10u64), U256::ZERO, U256::from(11u64), 1)
+            .unwrap_err();
+        assert!(matches!(err, RpcInvalidTransactionError::InsufficientFunds { .. }));
+    }
+
+    #[test]
+    fn saturates_to_u64_max() {
+        assert_eq!(
+            geth_style_gas_allowance(U256::MAX, U256::ZERO, U256::ZERO, 1).unwrap(),
+            u64::MAX
+        );
     }
 }
