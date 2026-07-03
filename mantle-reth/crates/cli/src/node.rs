@@ -127,7 +127,10 @@ where
                 .map(|validator| {
                     let op_validator = reth_optimism_txpool::OpTransactionValidator::new(validator)
                         .require_l1_data_gas_fee(!ctx.config().dev.dev);
-                    MantleTransactionValidator::new(op_validator)
+                    // Enforce `--rpc.txfeecap` for all RPC-submitted txs (op-geth parity);
+                    // see MantleTransactionValidator docs for why this can't live in the
+                    // inner (upstream) validator. Same config source as `set_tx_fee_cap` above.
+                    MantleTransactionValidator::new(op_validator, ctx.config().rpc.rpc_tx_fee_cap)
                 });
 
         let final_pool_config = self.pool_config_overrides.apply(ctx.pool_config());
