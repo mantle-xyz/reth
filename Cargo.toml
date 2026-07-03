@@ -112,6 +112,14 @@ lto = "thin"
 # ==================== WORKSPACE DEPENDENCIES ====================
 [workspace.dependencies]
 
+# Transitive deps pulled in by the vendored `patches/reth-transaction-pool` (versions match
+# paradigmxyz/reth rev 88505c7). Remove once the extra_balance_cost hook lands upstream and the
+# patch is dropped.
+bitflags = "2.4"
+imbl = "7"
+rustc-hash = { version = "2.0", default-features = false }
+smallvec = "1"
+
 # ==================== OP-RETH INTERNAL CRATES ====================
 op-reth = { path = "op-reth/bin/" }
 reth-optimism-chainspec = { path = "op-reth/crates/chainspec/", default-features = false }
@@ -403,7 +411,7 @@ url = "2.5"
 [patch."https://github.com/paradigmxyz/reth"]
 reth-trie-common = { path = "patches/reth-trie-common" }
 # reth-rpc = { path = "patches/reth-rpc" }
-# reth-transaction-pool = { path = "patches/reth-transaction-pool" }
+reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,
