@@ -69,6 +69,33 @@ pub(crate) async fn with_mantle_node<F, Fut>(
     F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    with_configured_mantle_node(
+        MantleNode::default(),
+        chain_spec,
+        attributes_generator,
+        tree_config,
+        test,
+    )
+    .await;
+}
+
+/// Same as [`with_mantle_node`], but launches an explicitly-configured [`MantleNode`] instead of
+/// `MantleNode::default()`.
+///
+/// This is the seam tests use to exercise node configuration that only takes effect through the
+/// node's `RollupArgs` / add-ons — most notably a configured sequencer URL, which is what wires up
+/// `MantleRpcExt`'s `SequencerClient` and therefore the `eth_sendRawTransactionWithPreconf`
+/// forwarding path.
+pub(crate) async fn with_configured_mantle_node<F, Fut>(
+    node: MantleNode,
+    chain_spec: Arc<OpChainSpec>,
+    attributes_generator: fn(u64) -> OpPayloadAttrs,
+    tree_config: TreeConfig,
+    test: F,
+) where
+    F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     reth_tracing::init_test_tracing();
 
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
@@ -92,8 +119,8 @@ pub(crate) async fn with_mantle_node<F, Fut>(
     let node_handle = NodeBuilder::new(config)
         .with_database(db)
         .with_types_and_provider::<MantleNode, BlockchainProvider<_>>()
-        .with_components(MantleNode::default().components())
-        .with_add_ons(MantleNode::default().add_ons())
+        .with_components(node.components())
+        .with_add_ons(node.add_ons())
         .launch_with_fn(|builder| {
             let launcher =
                 EngineNodeLauncher::new(runtime.clone(), builder.config.datadir(), tree_config);
