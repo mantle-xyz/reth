@@ -78,9 +78,16 @@ pub enum PreconfStatus {
 /// Preconfirmation transaction receipt
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PreconfTxReceipt {
-    /// Event logs
+    /// Event logs, echoed verbatim from the sequencer.
+    ///
+    /// Modeled as `Option` so the sequencer's exact JSON shape round-trips. An op-geth sequencer
+    /// emits `"logs": null` for a reverted tx (Go nil slice) and `"logs": []` / `[..]` otherwise.
+    /// A plain `Vec<PreconfLog>` with `#[serde(default)]` both rejected an explicit `null` on the
+    /// wire (`invalid type: null, expected a sequence`) *and* would re-serialize an empty result
+    /// as `[]`, diverging from geth. `Option<Vec<_>>` deserializes null→None and re-serializes
+    /// None→null, so a forwarding reth node returns byte-identical shape to the geth sequencer.
     #[serde(default)]
-    pub logs: Vec<PreconfLog>,
+    pub logs: Option<Vec<PreconfLog>>,
 }
 
 /// Preconfirmation log entry
@@ -796,5 +803,56 @@ mod tests {
             result.is_err(),
             "a provider error while reading token_ratio must propagate, not silently yield 0"
         );
+    }
+
+    // ─── preconf event deserialization ──────────────────────────────────
+
+    #[test]
+    fn preconf_receipt_accepts_null_logs() {
+        // The sequencer sends `"logs": null` (not `[]`) for reverted transactions. Before the
+        // `Option<Vec<_>>` change this failed with "invalid type: null, expected a sequence".
+        let json = r#"{
+            "txHash": "0x66199f44ede67884fa62012bde48a4e7823c2ce6a827f4c33e28d001a9c37cf3",
+            "status": "failed",
+            "reason": "execution reverted: ERC20: insufficient balance",
+            "blockHeight": "0xe9be5",
+            "receipt": { "logs": null }
+        }"#;
+        let event: PreconfTxEvent = serde_json::from_str(json).expect("null logs must deserialize");
+        assert_eq!(event.status, PreconfStatus::Failed);
+        assert_eq!(event.receipt.logs, None);
+        // Byte-parity with geth: null must round-trip back to null (not []).
+        let reser = serde_json::to_value(&event).unwrap();
+        assert!(reser["receipt"]["logs"].is_null(), "null logs must re-serialize as null");
+    }
+
+    #[test]
+    fn preconf_receipt_accepts_missing_logs() {
+        let json = r#"{
+            "txHash": "0x66199f44ede67884fa62012bde48a4e7823c2ce6a827f4c33e28d001a9c37cf3",
+            "status": "success",
+            "reason": "",
+            "blockHeight": "0xe9be5",
+            "receipt": {}
+        }"#;
+        let event: PreconfTxEvent = serde_json::from_str(json).expect("missing logs must default");
+        assert_eq!(event.receipt.logs, None);
+    }
+
+    #[test]
+    fn preconf_receipt_roundtrips_empty_and_populated_logs() {
+        // Empty array stays an empty array (a successful, log-less tx), and a populated array is
+        // preserved — reth echoes the sequencer's exact shape in every case.
+        let empty: PreconfTxReceipt = serde_json::from_str(r#"{ "logs": [] }"#).unwrap();
+        assert_eq!(empty.logs, Some(vec![]));
+        assert_eq!(serde_json::to_value(&empty).unwrap()["logs"].to_string(), "[]");
+
+        let json = r#"{ "logs": [{
+            "address": "0x5bec7df4940345b717361664c4847bb3b794eaca",
+            "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
+            "data": "0x000000000000000000000000000000000000000000000000000000000000000a"
+        }] }"#;
+        let populated: PreconfTxReceipt = serde_json::from_str(json).unwrap();
+        assert_eq!(populated.logs.as_ref().map(Vec::len), Some(1));
     }
 }
