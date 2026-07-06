@@ -434,7 +434,16 @@ where
         )
         .await
         .map_err(|e| {
-            ErrorObject::owned(-32000, format!("failed to estimate gas: {e}"), None::<()>)
+            // Surface the gas estimator's RPC error message (e.g. "insufficient funds for
+            // transfer") rather than revm's raw Display ("EVM error: OutOfFunds"), matching
+            // op-geth and reth's own eth_estimateGas. `estimate_gas_at` returns the eth-api
+            // error before RPC conversion, so convert it the same way the endpoint does.
+            let rpc_err: ErrorObject<'static> = e.into();
+            ErrorObject::owned(
+                -32000,
+                format!("failed to estimate gas: {}", rpc_err.message()),
+                None::<()>,
+            )
         })?;
 
         let base_fee = U256::from(header.base_fee_per_gas().unwrap_or(0));
