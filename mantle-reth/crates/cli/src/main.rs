@@ -1,9 +1,8 @@
 #![allow(missing_docs, rustdoc::missing_crate_level_docs)]
 
 use clap::Parser;
-use mantle_reth_cli::{MantleChainSpecParser, MantleNode, seed_blockchain_tree_metrics};
-use mantle_reth_preconf::{PreconfConfig, PreconfServiceBuilder};
-use reth_optimism_node::args::RollupArgs;
+use mantle_reth_cli::{MantleArgs, MantleChainSpecParser, MantleNode, seed_blockchain_tree_metrics};
+use mantle_reth_preconf::PreconfServiceBuilder;
 use tracing::info;
 
 #[global_allocator]
@@ -23,27 +22,29 @@ fn main() {
         }
     }
 
-    if let Err(err) = reth_optimism_cli::Cli::<MantleChainSpecParser, RollupArgs>::parse().run(
+    if let Err(err) = reth_optimism_cli::Cli::<MantleChainSpecParser, MantleArgs>::parse().run(
         async move |builder, args| {
             info!(target: "reth::cli", "Launching Mantle node");
-            let mut node = MantleNode::new(args);
-            if std::env::var_os("MANTLE_PRECONF_ENABLE").is_some() {
-                let cfg = PreconfConfig {
-                    enabled: true,
-                    all_preconfs: true,
-                    journal_path: std::env::var_os("MANTLE_PRECONF_JOURNAL")
-                        .map(std::path::PathBuf::from),
-                    ..PreconfConfig::default()
-                };
-                let svc = PreconfServiceBuilder::from_config(cfg)
-                    .await
-                    .map_err(|e| eyre::eyre!("preconf service init: {e}"))?;
-                node = node.with_preconf(svc);
-                info!(
-                    target: "reth::cli",
-                    "Mantle preconf ENABLED (all_preconfs=true, journal={:?})",
-                    std::env::var_os("MANTLE_PRECONF_JOURNAL"),
-                );
+            let mut node = MantleNode::new(args.rollup);
+            match args.preconf.into_config() {
+                Some(cfg) => {
+                    let all = cfg.all_preconfs;
+                    let journal = cfg.journal_path.clone();
+                    let svc = PreconfServiceBuilder::from_config(cfg)
+                        .await
+                        .map_err(|e| eyre::eyre!("preconf service init: {e}"))?;
+                    node = node.with_preconf(svc);
+                    info!(
+                        target: "reth::cli",
+                        "Mantle preconf ENABLED (all_preconfs={all}, journal={journal:?})",
+                    );
+                }
+                None => {
+                    info!(
+                        target: "reth::cli",
+                        "Mantle preconf DISABLED (pass --preconf.enable to opt in)",
+                    );
+                }
             }
             let handle = builder
                 .node(node)

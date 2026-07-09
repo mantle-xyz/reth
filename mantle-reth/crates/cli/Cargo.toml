@@ -50,6 +50,7 @@ mantle-reth-rpc-ext = { path = "../rpc-ext" }
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-op-hardforks.workspace = true
+alloy-primitives = { workspace = true, features = ["std", "map-foldhash"] }
 op-alloy-consensus.workspace = true
 
 # async / misc

@@ -130,29 +130,32 @@ where
         let to = Transaction::to(&transaction);
         let is_preconf_eligible = self.cfg.is_preconf_tx(&sender, to.as_ref());
 
-        // Replacement guard: only a `Timeout` commitment releases the
-        // (sender, nonce) slot; Waiting / Success / Failed all block
-        // replacement attempts.
+        // Replacement guard: only server pre-apply reclaimable states
+        // release the (sender, nonce) slot — `Timeout` (client deadline)
+        // and `Canceled` (server pre-apply reject). Waiting / Success /
+        // Failed all block replacement attempts.
         if let Some(existing) = self.fifo.find_by_sender_nonce(&sender, nonce).await
             && existing.hash != tx_hash
         {
-            if existing.status != PreconfStatus::Timeout {
+            if existing.status != PreconfStatus::Timeout
+                && existing.status != PreconfStatus::Canceled
+            {
                 return TransactionValidationOutcome::Invalid(
                     transaction,
                     InvalidPoolTransactionError::Other(Box::new(ReplaceActivePreconf)),
                 );
             }
-            // Slot is in `Timeout` — drop the stale fifo entry so the new
-            // tx can occupy the slot cleanly. The replacement only proceeds
-            // via the rest of the validator chain; we do not re-push here —
-            // the pool listener will pick up the new tx once it lands in
-            // the pool.
+            // Slot is Timeout or Canceled — drop the stale fifo entry so
+            // the new tx can occupy the slot cleanly. The replacement
+            // only proceeds via the rest of the validator chain; we do
+            // not re-push here — the pool listener will pick up the new
+            // tx once it lands in the pool.
             self.fifo.remove(&existing.hash).await;
         }
 
         // Per-tx gas ceiling: applies only to preconf-eligible txs.
-        // Non-preconf txs travel the normal pool path with the upstream
-        // gas-limit semantics unchanged.
+        // Non-preconf txs are intentionally left to the upstream (reth /
+        // OP) validator's own gas-limit checks
         if is_preconf_eligible && transaction.gas_limit() > self.cfg.preconf_max_gas_per_tx {
             return TransactionValidationOutcome::Invalid(
                 transaction,

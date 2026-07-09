@@ -5116,6 +5116,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
  "alloy-op-hardforks",
+ "alloy-primitives",
  "clap",
  "eyre",
  "mantle-reth-chainspec",

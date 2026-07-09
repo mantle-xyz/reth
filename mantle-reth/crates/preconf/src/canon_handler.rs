@@ -7,16 +7,24 @@
 //!   per-sender nonce frontier. For every distinct sender we compute
 //!   `max_nonce_in_chain + 1` and call [`PreconfTxSet::forward`], which
 //!   drops fifo entries whose nonce sits strictly below the new frontier.
-//!   Without this, preconf entries that have already landed on chain
-//!   would leak into subsequent slots until `clean_timeout` ages them
-//!   out.
-//! - **Reverted chain**: a reorg currently produces a warn log for every
-//!   reverted tx whose hash still lives in the fifo. The intended
-//!   `reorg_drift_total` metric keys off the preconf journal's
-//!   `contains(&hash)` (a persistent record of what was actually
-//!   promised). The journal subsystem is not yet wired in, so the fifo
-//!   membership check serves as a temporary undercounting proxy —
-//!   logged through the same code path so the swap is a one-line change.
+//!   Immediately after, [`PreconfTxSet::clean_reclaimable`] runs once
+//!   to evict `Timeout` and `Canceled` entries — this generalises
+//!   op-geth's tail-of-block-build `cleanTimeoutPreconfTxs` and prevents
+//!   both states from accumulating on senders that never post another
+//!   tx. The same evicted hashes are then `remove_transactions`-ed
+//!   from the pool so a preconf tx that already surfaced a `Timeout`
+//!   or `Canceled` to the client cannot silently land on chain later
+//!   (which would corrupt off-chain reconciliation).
+//! - **Reverted chain**: a reorg produces a warn log for every reverted
+//!   tx whose hash is tracked (journal `sealed` set when persistence is
+//!   enabled, fifo membership as fallback). This handler performs no
+//!   recovery action — reorg reinject is delegated to the reth pool's
+//!   own reset flow (`transaction-pool/src/maintain.rs` re-admits
+//!   pruned txs via `add_external_transactions`), which the preconf
+//!   pool listener picks up on the next new-pending event and pushes
+//!   into the fifo with `PreconfSource::Replay` (see the listener's
+//!   `journal.contains` check). The client-observed `block_height` may
+//!   drift for reorged commitments; op-geth has the same behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
 //! then spawned as a `spawn_critical_task` on the reth task executor.
@@ -31,9 +39,10 @@ use futures::StreamExt;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_execution_types::Chain;
 use reth_primitives_traits::NodePrimitives;
+use reth_transaction_pool::TransactionPool;
 use tracing::{debug, trace, warn};
 
-use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
+use crate::{PreconfJournal, journal::RestoredSet, preconf_tx_set::PreconfTxSet};
 
 /// Long-running async task bridging `CanonStateNotification` events to
 /// [`PreconfTxSet`] cleanup.
@@ -42,8 +51,14 @@ use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
 /// parameter is `Pr::Primitives` — kept as a separate type parameter so
 /// trait bounds on the transaction type (`Transaction`, recovery) can
 /// be expressed without re-projecting `<Pr::Primitives as ...>` everywhere.
-pub struct PreconfCanonHandler<Pr, N> {
+pub struct PreconfCanonHandler<Pr, P, N> {
     provider: Pr,
+    /// Transaction pool. Used to `remove_transactions` the hashes evicted
+    /// by [`PreconfTxSet::clean_reclaimable`] so a Timeout or Canceled
+    /// preconf tx does NOT quietly land on chain later (which would
+    /// violate the client's bookkeeping — see design note in the run
+    /// loop).
+    pool: P,
     fifo: Arc<PreconfTxSet>,
     /// Optional commitment journal. When `Some`, every sealed tx is
     /// marked via [`PreconfJournal::mark_sealed`] so periodic rotation
@@ -53,37 +68,52 @@ pub struct PreconfCanonHandler<Pr, N> {
     /// disabled; reverted-chain observation falls back to the fifo
     /// proxy as before.
     journal: Option<Arc<PreconfJournal>>,
+    /// Startup-restore hash set. On every canon commit the handler
+    /// calls `restored.take(&hash)` for each sealed hash: once a
+    /// restored commitment actually lands on chain, the wire
+    /// `EventPublisher` no longer needs to suppress duplicate events
+    /// for it (see [`crate::journal::EventPublisher::publish`]).
+    /// [`RestoredSet::empty`] is used when the journal is disabled —
+    /// `take` on an empty set is a cheap no-op.
+    restored: Arc<RestoredSet>,
     _n: PhantomData<fn() -> N>,
 }
 
-// Manual `Debug` impl: skip the provider (which would force `Pr: Debug`
-// on every call site) and the phantom marker.
-impl<Pr, N> std::fmt::Debug for PreconfCanonHandler<Pr, N> {
+// Manual `Debug` impl: skip the provider / pool (which would force
+// `Pr: Debug` / `P: Debug` on every call site) and the phantom marker.
+impl<Pr, P, N> std::fmt::Debug for PreconfCanonHandler<Pr, P, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfCanonHandler").field("fifo", &self.fifo).finish_non_exhaustive()
     }
 }
 
-impl<Pr, N> PreconfCanonHandler<Pr, N>
+impl<Pr, P, N> PreconfCanonHandler<Pr, P, N>
 where
     Pr: CanonStateSubscriptions<Primitives = N> + 'static,
+    P: TransactionPool + 'static,
     N: NodePrimitives,
     N::SignedTx: Transaction + TxHashRef,
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
     /// `journal` is optional; when `None`, the handler degrades to
     /// the pre-journal behaviour (fifo-membership proxy for reorg
-    /// signal, no sealed-set bookkeeping).
+    /// signal, no sealed-set bookkeeping). `restored` should be the
+    /// same `Arc<RestoredSet>` the [`crate::journal::EventPublisher`]
+    /// consults — use [`RestoredSet::empty`] when journal is disabled
+    /// or [`crate::PreconfServiceBuilder::restored_set`] otherwise.
     pub const fn new(
         provider: Pr,
+        pool: P,
         fifo: Arc<PreconfTxSet>,
         journal: Option<Arc<PreconfJournal>>,
+        restored: Arc<RestoredSet>,
     ) -> Self {
-        Self { provider, fifo, journal, _n: PhantomData }
+        Self { provider, pool, fifo, journal, restored, _n: PhantomData }
     }
 
-    /// Run the listener loop. Returns when the underlying broadcast
-    /// subscription closes (node shutdown).
+    /// Run the listener loop. Returns when the canonical-state stream
+    /// terminates (typically at node shutdown, when the provider's
+    /// broadcast sender is dropped).
     pub async fn run(self) {
         let mut stream = self.provider.canonical_state_stream();
         while let Some(notif) = stream.next().await {
@@ -128,6 +158,13 @@ where
                 }
             }
 
+            // Drop restored hashes from the wire-event suppression set
+            // once they actually land on chain. `RestoredSet::empty` +
+            // no-op `take` covers the journal-disabled case.
+            for hash in &sealed_hashes {
+                self.restored.take(hash);
+            }
+
             let frontier = aggregate_nonce_frontier(pairs);
             for (sender, next_nonce) in frontier {
                 trace!(
@@ -137,6 +174,43 @@ where
                 );
                 self.fifo.forward(&sender, next_nonce).await;
             }
+
+            // Housekeeping: evict `Timeout` + `Canceled` entries in one
+            // pass — both are "server-side pre-apply reclaimable" and
+            // must NOT linger, or the (sender, nonce) slot they hold
+            // would block future preconf submissions from the same
+            // sender. `forward` above only drops entries whose nonce
+            // trails the sealed frontier; reclaimable entries whose
+            // sender never posts another nonce would otherwise stay
+            // indefinitely. Running per-notification (~ per sealed
+            // block, so ~2s on OP L2) matches op-geth's cadence without
+            // requiring a separate background task.
+            //
+            // Pool-side removal mirrors op-geth: after fifo eviction we
+            // `remove_transactions` the same hashes from the pool so a
+            // preconf tx that already surfaced Timeout or Canceled to
+            // the client CANNOT quietly land on chain later. That silent
+            // late-inclusion would break off-chain reconciliation
+            // (client accounts it as "failed", chain shows "success").
+            //
+            // The two calls are not atomic: between fifo eviction and
+            // pool removal a concurrent build_payload could theoretically
+            // pick up an evicted tx from the pool iterator. The window
+            // is µs-scale (both are same-task sequential calls, no await
+            // between them beyond mutex acquisition) and has not been
+            // observed in devnet — see R7/C1 for the followup.
+            let evicted = self.fifo.clean_reclaimable().await;
+            if !evicted.is_empty() {
+                let pool_removed = self.pool.remove_transactions(evicted.clone());
+                debug!(
+                    target: "mantle::preconf::canon",
+                    fifo_count = evicted.len(),
+                    pool_count = pool_removed.len(),
+                    "clean_reclaimable evicted {} fifo entries; removed {} from pool",
+                    evicted.len(),
+                    pool_removed.len(),
+                );
+            }
         }
         debug!(target: "mantle::preconf::canon", "canonical state stream closed");
     }
@@ -144,6 +218,12 @@ where
     async fn observe_reorg(&self, old: &Chain<N>) {
         // `clone_transactions_recovered` for the same `Transaction: 'static`
         // reason as the committed-side iteration above.
+        //
+        // `block_number` records the tip of the reverted chain, not the
+        // per-tx block. When a reorg spans multiple blocks every warn
+        // log tag under this tip — precise enough for reorg-drift
+        // metric aggregation; a per-tx block resolution would require
+        // walking `old.blocks_iter()` with an outer loop over blocks.
         let block_number = old.tip().number();
         for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
             let hash = *recovered.inner().tx_hash();

@@ -65,6 +65,12 @@ pub struct PreconfRpcHandler<P, Pr> {
     /// durability; a crash before the next disk flush loses at most
     /// the most recent commitment).
     journal: Option<Arc<PreconfJournal>>,
+    /// Optional wire-event publisher. Only used to emit `Timeout`
+    /// events for the BaseFee/Queued orphan path (see the `Err(_elapsed)`
+    /// arm of `handle_inner`) — every other terminal transition is
+    /// published by the dispatch loop directly on the fifo entry it
+    /// owns. Threaded through from `PreconfServiceBuilder::start`.
+    publisher: Option<Arc<crate::journal::EventPublisher>>,
 }
 
 // Manual Debug — `P` (TransactionPool) and `Pr` (StateProviderFactory) do
@@ -82,16 +88,18 @@ impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
 
 impl<P, Pr> PreconfRpcHandler<P, Pr> {
     /// Construct a handler bound to the given pool + provider + fifo.
-    /// `journal` is optional; when `None`, the handler runs without
-    /// persistence and successful commitments are lost on crash.
+    /// `journal` and `publisher` are optional; either / both may be
+    /// `None`, in which case the corresponding side-effect (persistence
+    /// / wire broadcast) is silently skipped.
     pub const fn new(
         pool: P,
         provider: Pr,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
         journal: Option<Arc<PreconfJournal>>,
+        publisher: Option<Arc<crate::journal::EventPublisher>>,
     ) -> Self {
-        Self { pool, provider, fifo, cfg, journal }
+        Self { pool, provider, fifo, cfg, journal, publisher }
     }
 }
 
@@ -104,6 +112,13 @@ where
     ///
     /// See module-level documentation for the step-by-step semantics.
     pub async fn handle_inner(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
+        // Anchor the SLA clock to the moment the request landed in the
+        // handler, before any decode / pool-validator latency. `TxEntry`
+        // eventually carries this instant as `inserted_at`, so the
+        // dispatch deadline gate measures against the client-visible
+        // budget rather than the pool-listener drain time.
+        let origin_instant = std::time::Instant::now();
+
         // Step 0 — decode + recover, then convert to the pool's `Transaction`
         // type. Reading sender/nonce/hash/kind from the pool tx goes through
         // its `PoolTransaction` + `Transaction` impls and avoids importing
@@ -167,7 +182,9 @@ where
 
         // Step 3 — attach responder BEFORE pool.add. See module-level docs.
         let (resp_tx, resp_rx) = oneshot::channel();
-        if let Err(AttachError::AlreadyAttached) = self.fifo.attach_responder(hash, resp_tx).await {
+        if let Err(AttachError::AlreadyAttached) =
+            self.fifo.attach_responder(hash, origin_instant, resp_tx).await
+        {
             return Err(preconf_error_to_rpc(&PreconfError::AlreadyInProgress));
         }
 
@@ -175,24 +192,26 @@ where
         match self.pool.add_transaction(TransactionOrigin::External, pool_tx).await {
             Ok(_) => { /* normal — fall through to await responder */ }
 
-            // Same-hash retry. If the fifo entry is `Timeout`, atomically
-            // revive it (Timeout → Waiting + broadcast). The responder
-            // attached at step 3 is reused.
+            // Same-hash retry. If the fifo entry is in a reclaimable state
+            // (Timeout or Canceled), atomically revive it (→ Waiting +
+            // broadcast) so the responder attached at step 3 can be
+            // reused. The unified `recover_from_reclaimable` handles both
+            // states — RPC layer doesn't need to distinguish.
             Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {
-                match self.fifo.recover_from_timeout(&hash).await {
+                match self.fifo.recover_from_reclaimable(&hash).await {
                     Ok(()) => {
-                        debug!(target: "mantle::preconf::rpc", ?hash, "recovered Timeout entry on AlreadyImported retry");
+                        debug!(target: "mantle::preconf::rpc", ?hash, "recovered reclaimable entry on AlreadyImported retry");
                     }
-                    Err(RecoverError::NotTimeout(status)) => {
-                        // Active commitment for this hash — refuse silently
-                        // overlapping requests.
-                        warn!(target: "mantle::preconf::rpc", ?hash, ?status, "AlreadyImported but entry is not Timeout");
+                    Err(RecoverError::UnexpectedStatus(status)) => {
+                        // Active commitment for this hash (Waiting / Success /
+                        // Failed) — refuse silently overlapping requests.
+                        warn!(target: "mantle::preconf::rpc", ?hash, ?status, "AlreadyImported but entry is not reclaimable");
                         self.fifo.cancel_responder(&hash, PreconfError::AlreadyInProgress).await;
                         return Err(preconf_error_to_rpc(&PreconfError::AlreadyInProgress));
                     }
                     Err(RecoverError::NotFound) => {
                         // Entry vanished between the pool add and our
-                        // recover call (clean_timeout race). Treat as
+                        // recover call (clean_reclaimable race). Treat as
                         // transient and ask the client to retry.
                         let err = PreconfError::Internal(
                             "transient: fifo entry cleaned between pool add and recover"
@@ -246,10 +265,15 @@ where
             Ok(Ok(Err(err))) => Err(preconf_error_to_rpc(&err)),
 
             // Builder dropped the responder without sending — should not
-            // happen on healthy paths. Clean fifo state defensively.
+            // happen on healthy paths. Semantically this is a server-side
+            // failure with the tx never applied, so mark the entry
+            // `Canceled` (revivable + swept by `clean_reclaimable`) rather
+            // than `Timeout` (client-deadline semantic) or `Failed` (tx
+            // permanently dead, blocks the (sender, nonce) slot). Symmetric
+            // with the F1 block-gas-budget gate in `dispatch`.
             Ok(Err(_recv_err)) => {
                 warn!(target: "mantle::preconf::rpc", ?hash, "responder dropped before send");
-                let _ = self.fifo.mark_timeout(&hash).await;
+                let _ = self.fifo.mark_canceled(&hash).await;
                 let err = PreconfError::Internal("responder dropped before send".to_string());
                 // No-op if the responder was already taken; idempotent.
                 self.fifo.cancel_responder(&hash, err.clone()).await;
@@ -277,13 +301,24 @@ where
                         PreconfError::Timeout { timeout_ms: preconf_timeout.as_millis() as u64 },
                     )
                     .await;
-                Ok(PreconfTxEvent {
+                let event = PreconfTxEvent {
                     tx_hash: hash,
                     status: WireStatus::Timeout,
                     reason: format!("preconf timeout after {preconf_timeout:?}"),
                     block_height: 0,
-                    receipt: PreconfTxReceipt { logs: vec![] },
-                })
+                    // Timeout branch: no EVM apply happened, wire logs = null.
+                    receipt: PreconfTxReceipt { logs: None },
+                };
+                // Broadcast the same event to subscribers. This covers
+                // the BaseFee/Queued orphan path where dispatch never
+                // saw the tx (fifo `mark_timeout` returned `NotFound`)
+                // and therefore never published — without this the
+                // subscription channel would silently drop such
+                // client-visible timeouts.
+                if let Some(p) = self.publisher.as_ref() {
+                    p.publish(event.clone());
+                }
+                Ok(event)
             }
         }
     }
@@ -307,10 +342,23 @@ where
 
 /// Map the internal `PreconfReceipt` to the wire-layer `PreconfTxEvent`.
 ///
-/// `PreconfStatus::Success`/`Failed` is derived from the boolean success
-/// bit on the receipt; `Waiting` and `Timeout` are never observed here
-/// (only the builder's `mark_succeeded` / `mark_failed` reach this
-/// conversion path via the responder).
+/// Wire-layer `Success`/`Failed` is derived from `receipt.status: bool`,
+/// which reflects EVM execution outcome (`false` = revert/halt, `true` =
+/// success). Both cases mean the tx **is on chain** — the receipt would
+/// not exist otherwise.
+///
+/// Note the semantic mismatch with fifo-layer `PreconfStatus::Failed`,
+/// which signals a builder pre-apply reject (nonce-too-low, block gas
+/// budget, ...) — tx **NOT on chain**. That state never reaches this
+/// conversion; it flows to the client through the `Ok(Ok(Err(err)))`
+/// arm's `PreconfError`, not the receipt path.
+///
+/// `Waiting` / `Timeout` are constructed directly by the RPC handler's
+/// other arms and never routed through this `From` impl. There is no
+/// wire `Canceled` variant — server pre-apply rejections (F1 gas
+/// budget, admin action) are surfaced as wire `Failed` with the
+/// specific reason in `PreconfTxEvent::reason`; the underlying fifo
+/// `PreconfStatus::Canceled` is an internal-only distinction.
 impl From<PreconfReceipt> for PreconfTxEvent {
     fn from(r: PreconfReceipt) -> Self {
         let status = if r.status { WireStatus::Success } else { WireStatus::Failed };
@@ -328,7 +376,10 @@ impl From<PreconfReceipt> for PreconfTxEvent {
             status,
             reason: r.reason,
             block_height: r.block_height,
-            receipt: PreconfTxReceipt { logs },
+            // Apply happened (via receipt path) — wrap logs in Some
+            // even when empty, to signal "apply succeeded, no logs
+            // emitted" (distinguished from Timeout's `None`).
+            receipt: PreconfTxReceipt { logs: Some(logs) },
         }
     }
 }
@@ -398,7 +449,7 @@ mod tests {
         assert_eq!(event.tx_hash, B256::from([0xaa; 32]));
         assert_eq!(event.block_height, 42);
         assert!(event.reason.is_empty());
-        assert_eq!(event.receipt.logs.len(), 1);
+        assert_eq!(event.receipt.logs.as_ref().map(|l| l.len()), Some(1));
     }
 
     #[test]
@@ -406,7 +457,7 @@ mod tests {
         let event: PreconfTxEvent = sample_receipt(false).into();
         assert_eq!(event.status, WireStatus::Failed);
         assert_eq!(event.reason, "execution reverted");
-        assert_eq!(event.receipt.logs.len(), 1);
+        assert_eq!(event.receipt.logs.as_ref().map(|l| l.len()), Some(1));
     }
 
     #[test]
@@ -421,11 +472,12 @@ mod tests {
             revert_data: PrimBytes::new(),
         };
         let event: PreconfTxEvent = receipt.into();
-        assert_eq!(event.receipt.logs.len(), 2);
-        assert_eq!(event.receipt.logs[0].address, Address::from([7; 20]));
-        assert_eq!(event.receipt.logs[0].topics, vec![B256::from([8; 32])]);
-        assert_eq!(event.receipt.logs[0].data, PrimBytes::from(vec![9, 9, 9, 9]));
-        assert_eq!(event.receipt.logs[1].address, Address::from([10; 20]));
+        let logs = event.receipt.logs.expect("Some logs");
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].address, Address::from([7; 20]));
+        assert_eq!(logs[0].topics, vec![B256::from([8; 32])]);
+        assert_eq!(logs[0].data, PrimBytes::from(vec![9, 9, 9, 9]));
+        assert_eq!(logs[1].address, Address::from([10; 20]));
     }
 
     #[test]
@@ -440,7 +492,7 @@ mod tests {
             revert_data: PrimBytes::new(),
         };
         let event: PreconfTxEvent = receipt.into();
-        assert_eq!(event.receipt.logs.len(), 0);
+        assert_eq!(event.receipt.logs.as_ref().map(|l| l.len()), Some(0));
     }
 
     #[test]

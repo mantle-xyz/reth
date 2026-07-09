@@ -10,7 +10,7 @@ use mantle_reth_preconf::{
     PreconfServiceBuilder, PreconfTxSet,
 };
 use reth_optimism_payload_builder::config::OpBuilderConfig;
-use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt, PreconfSubscribeApiServer};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, PrimitivesTy, TxTy};
@@ -99,6 +99,20 @@ pub struct PreconfWiring {
     pub cfg: Arc<PreconfConfig>,
     /// Commitment fifo shared between validator, RPC handler, and builder.
     pub fifo: Arc<PreconfTxSet>,
+    /// Optional journal — threaded into the pool listener so it can
+    /// detect reorg-reinjected txs (their hash is in `journal.sealed`)
+    /// and push them with `PreconfSource::Replay` to bypass the
+    /// dispatch deadline / gas-budget gates.
+    pub journal: Option<Arc<mantle_reth_preconf::PreconfJournal>>,
+    /// Handle to the application-level service builder — used by
+    /// [`MantlePoolBuilder::build_pool`] to run [`PreconfServiceBuilder::start`]
+    /// immediately after the pool is up, populating the
+    /// [`RestoredSet`](mantle_reth_preconf::RestoredSet) + wire
+    /// [`EventPublisher`](mantle_reth_preconf::EventPublisher) before any
+    /// pool listener / canon handler / payload builder task is spawned.
+    /// `None` when preconf is disabled on the node (the default
+    /// pass-through path).
+    pub svc: Option<Arc<PreconfServiceBuilder>>,
 }
 
 impl<T> Default for MantlePoolBuilder<T> {
@@ -128,11 +142,20 @@ impl<T> MantlePoolBuilder<T> {
         self
     }
 
-    /// Enable preconfirmation: thread `cfg` and `fifo` into the validator
-    /// decoration chain and spawn the pool listener that pushes
-    /// whitelisted txs into `fifo`.
-    pub fn with_preconf(mut self, cfg: Arc<PreconfConfig>, fifo: Arc<PreconfTxSet>) -> Self {
-        self.preconf = Some(PreconfWiring { cfg, fifo });
+    /// Enable preconfirmation: thread `cfg`, `fifo`, `journal`, and the
+    /// service builder handle into the validator decoration chain +
+    /// startup restore + pool listener spawn. `journal` may be `None`
+    /// when persistence is disabled — the listener then falls back to
+    /// the pre-journal behavior (every push uses `PreconfSource::Rpc`,
+    /// which does not distinguish reorg reinjects).
+    pub fn with_preconf(
+        mut self,
+        cfg: Arc<PreconfConfig>,
+        fifo: Arc<PreconfTxSet>,
+        journal: Option<Arc<mantle_reth_preconf::PreconfJournal>>,
+        svc: Arc<PreconfServiceBuilder>,
+    ) -> Self {
+        self.preconf = Some(PreconfWiring { cfg, fifo, journal, svc: Some(svc) });
         self
     }
 }
@@ -163,12 +186,12 @@ where
         // up preconf (`with_preconf` not invoked), supply default-disabled
         // handles so the `PreconfAwareValidator` layer becomes a cheap
         // pass-through (empty fifo + disabled cfg).
-        let (preconf_cfg, preconf_fifo) = match self.preconf.clone() {
-            Some(p) => (p.cfg, p.fifo),
+        let (preconf_cfg, preconf_fifo, preconf_journal, preconf_svc) = match self.preconf.clone() {
+            Some(p) => (p.cfg, p.fifo, p.journal, p.svc),
             None => {
                 let cfg = Arc::new(PreconfConfig::default());
                 let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
-                (cfg, fifo)
+                (cfg, fifo, None, None)
             }
         };
         // Clones moved into the validator-build closure. The listener
@@ -211,6 +234,30 @@ where
         // Mantle does not use OP interop — filter is always disabled
         let transaction_pool = OpPool::new(inner_pool, false);
 
+        // R5/D1 start hook: run preconf journal restore + wire the
+        // `EventPublisher` / `RestoredSet` BEFORE any background pool
+        // task starts consuming events. Ordering rationale (see the
+        // review plan §Q3 in R5/D1):
+        // - `spawn_maintenance_tasks` (below) fire-and-forget spawns
+        //   reth's own local-tx backup loader; if `svc.start` ran
+        //   *after*, its `pool.add_transaction` calls would race the
+        //   backup loader for the same pool mutex — the J5-fix path
+        //   (`AlreadyImported → Ok`) already handles the collision,
+        //   but the earlier ordering here avoids any subtle listener
+        //   source-tagging race in the first place.
+        // - The pool listener (further below) subscribes to pool
+        //   events; anything `svc.start` triggers happens before that
+        //   subscription and does not need the listener — the restore
+        //   helper pushes fifo entries directly.
+        if let Some(svc) = preconf_svc.as_ref() {
+            use mantle_reth_preconf::RestorePoolAdapter;
+            let adapter = RestorePoolAdapter::<_, T, TxTy<N::Types>>::new(transaction_pool.clone());
+            svc.start(&adapter)
+                .await
+                .map_err(|e| eyre::eyre!("preconf service start: {e:?}"))?;
+            info!(target: "reth::cli", "Mantle preconf service builder started (restore + wire)");
+        }
+
         reth_node_builder::components::spawn_maintenance_tasks(
             ctx,
             transaction_pool.clone(),
@@ -226,6 +273,7 @@ where
                 transaction_pool.clone(),
                 preconf_cfg.clone(),
                 preconf_fifo.clone(),
+                preconf_journal.clone(),
             );
             ctx.task_executor().spawn_critical_task("mantle-preconf-pool-listener", listener.run());
             info!(target: "reth::cli", "Mantle preconf pool listener spawned");
@@ -328,7 +376,12 @@ impl MantleNode {
         let mut pool_builder =
             MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional);
         if let Some(p) = &self.preconf {
-            pool_builder = pool_builder.with_preconf(p.cfg().clone(), p.fifo().clone());
+            pool_builder = pool_builder.with_preconf(
+                p.cfg().clone(),
+                p.fifo().clone(),
+                p.journal().cloned(),
+                p.clone(),
+            );
         }
 
         // Construct the preconf-aware payload service. When
@@ -341,15 +394,24 @@ impl MantleNode {
             self.op_node.gas_limit_config.clone(),
             args.sdm_enabled,
         );
-        let (cfg, fifo) = if let Some(p) = &self.preconf {
-            (p.cfg().clone(), p.fifo().clone())
+        // `svc` is passed by handle so the payload service reads the
+        // wire publisher lazily at spawn time — after `svc.start`
+        // (called from `MantlePoolBuilder::build_pool`) has populated
+        // `event_publisher()`. Pre-start / no-preconf both surface as
+        // `None` at spawn, which the dispatch loop tolerates silently.
+        let (cfg, fifo, svc) = if let Some(p) = &self.preconf {
+            (p.cfg().clone(), p.fifo().clone(), Some(p.clone()))
         } else {
             let default_svc = PreconfServiceBuilder::new(PreconfConfig::default())
                 .expect("default PreconfConfig validates");
-            (default_svc.cfg().clone(), default_svc.fifo().clone())
+            (default_svc.cfg().clone(), default_svc.fifo().clone(), None)
         };
-        let payload_service =
-            MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, fifo, builder_config);
+        let payload_service = MantlePreconfServiceBuilder::<OpPrimitives>::new(
+            cfg,
+            fifo,
+            builder_config,
+            svc,
+        );
 
         ComponentsBuilder::default()
             .node_types::<N>()
@@ -416,7 +478,8 @@ where
             // was called during `components()`.
             let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
                 preconf.as_ref().map(|svc| {
-                    let canon = svc.canon_handler(ctx.node().provider().clone());
+                    let canon = svc
+                        .canon_handler(ctx.node().provider().clone(), ctx.node().pool().clone());
                     ctx.node()
                         .task_executor()
                         .spawn_critical_task("mantle-preconf-canon-handler", canon.run());
@@ -459,8 +522,70 @@ where
             );
             ctx.modules.merge_configured(mantle_ext.into_rpc())?;
             info!(target: "reth::cli", "Mantle RPC extensions registered");
+
+            // `eth_subscribe("newPreconfTransaction")` — only wire when
+            // preconf is enabled on this node. The service builder's
+            // broadcast channel is live from construction, so ordering
+            // is safe even before `start()` fully wires the publisher.
+            if let Some(svc) = preconf.as_ref() {
+                let sub_handler = svc.subscription_handler();
+                ctx.modules.merge_configured(sub_handler.into_rpc())?;
+                info!(target: "reth::cli", "Mantle preconf subscription API registered");
+            }
             Ok(())
         });
         add_ons
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mantle_reth_preconf::PreconfConfig;
+    use reth_optimism_node::args::RollupArgs;
+
+    fn default_args() -> RollupArgs {
+        RollupArgs::default()
+    }
+
+    #[test]
+    fn new_starts_with_preconf_disabled() {
+        // Default constructor: preconf opt-in, must be None at entry. Regression
+        // guard for the "MantleNode behaves exactly like OpNode when preconf is
+        // not configured" contract.
+        let node = MantleNode::new(default_args());
+        assert!(node.preconf.is_none());
+    }
+
+    #[test]
+    fn with_preconf_attaches_service_builder() {
+        // `with_preconf` must store the service builder reachable through
+        // `self.preconf` so that `components()` / `add_ons()` can thread the
+        // same Arc<cfg, fifo, journal> handles into all consumers.
+        let svc =
+            PreconfServiceBuilder::new(PreconfConfig::default()).expect("default validates");
+        let cfg_ptr = svc.cfg().clone();
+        let fifo_ptr = svc.fifo().clone();
+
+        let node = MantleNode::new(default_args()).with_preconf(svc);
+        let stored = node.preconf.as_ref().expect("with_preconf must attach handle");
+        // Pointer-equal: no clone-and-rebuild — same Arc instance.
+        assert!(Arc::ptr_eq(stored.cfg(), &cfg_ptr));
+        assert!(Arc::ptr_eq(stored.fifo(), &fifo_ptr));
+    }
+
+    #[test]
+    fn with_preconf_replaces_previous_builder() {
+        // Last-wins semantics. Documents the builder contract — important
+        // because the call site in main.rs writes `node = node.with_preconf(...)`
+        // unconditionally within the `Some(cfg)` branch.
+        let svc1 = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
+        let svc2 = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
+        let fifo2 = svc2.fifo().clone();
+
+        let node = MantleNode::new(default_args()).with_preconf(svc1).with_preconf(svc2);
+        let stored = node.preconf.as_ref().expect("attached");
+        // svc1's handles dropped; stored points at svc2's.
+        assert!(Arc::ptr_eq(stored.fifo(), &fifo2));
     }
 }

@@ -6,18 +6,27 @@
 use alloy_primitives::{Address, map::foldhash::HashSet};
 use std::{path::PathBuf, time::Duration};
 
-/// Default client-side RPC oneshot wait — 200ms.
+/// Default client-side RPC oneshot wait — 1s.
 ///
-/// **Intentional difference from op-geth** (`PreconfTimeout=1s`):
-/// the v1 reth design prefers fast client failure over server-side slack.
-pub const DEFAULT_PRECONF_TIMEOUT: Duration = Duration::from_millis(200);
+/// Matches op-geth `PreconfTimeout=1s` default.
+pub const DEFAULT_PRECONF_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Default sweep ticker interval — 50ms.
+/// Default sweep ticker interval — 200ms.
 ///
-/// Sweep ticker cadence for the non-preconf (normal) tx path. Lower values
-/// reduce normal-tx latency at CPU cost; the preconf path is event-driven
-/// and not affected.
-pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
+/// Sweep ticker cadence for the non-preconf (normal) tx path. At each tick
+/// the pool best-tx branch is allowed to consume up to a time-proportional
+/// share of the block gas limit — see `builder::payload_builder` Stage 3
+/// select! loop. Lower values reduce normal-tx latency at CPU cost; the
+/// preconf path is event-driven and not affected.
+pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Default slot duration — 2 seconds.
+///
+/// Governs the time-proportional pool gas quota:
+/// `pool_cumulative_quota(t) = min(t / slot_duration, 1.0) × block_gas_limit`.
+/// Matches the OP-stack default block time. Change only if operating on a
+/// chain with non-standard slot cadence.
+pub const DEFAULT_SLOT_DURATION: Duration = Duration::from_secs(2);
 
 /// Default per-tx gas limit for preconf-eligible transactions — `2_000_000`.
 ///
@@ -43,17 +52,24 @@ pub const DEFAULT_REJOURNAL_INTERVAL: Duration = Duration::from_secs(60);
 /// Above this, rotation forces rename + new file.
 pub const DEFAULT_JOURNAL_MAX_SIZE: u64 = 1_073_741_824;
 
-/// Default broadcast channel capacity — 4096.
+/// Default broadcast channel capacity — 65536.
 ///
-/// Sized at ~20x worst-case burst; 4096 × ~40 bytes ≈ 160 KB memory.
+/// Sized at ~320x worst-case burst (assuming ~200 preconf-tx/block peak);
+/// 65536 × ~40 bytes ≈ 2.5 MB memory — negligible against the multi-GB
+/// sequencer working set.
+///
 /// Consumers receive `Lagged(n)` and fall back to snapshot reconcile when
-/// the channel overflows.
-pub const DEFAULT_BROADCAST_CAP: usize = 4096;
+/// the channel overflows. Bumped from 4096 → 65536 to give wide headroom
+/// for prolonged builder stalls under prod-shape throughput without forcing
+/// the (slower) snapshot-reconcile path.
+pub const DEFAULT_BROADCAST_CAP: usize = 65536;
 
-/// Runtime preconf configuration; passed by `Arc` throughout the subsystem.
+/// Runtime preconf configuration; distributed as `Arc<PreconfConfig>` after
+/// construction.
 ///
-/// **All fields are immutable after [`PreconfConfig::validate`]** — runtime
-/// reload requires a restart in v1.
+/// Lifecycle: build → [`Self::validate`] → `Arc::new`. Once wrapped in `Arc`,
+/// downstream readers (validator / pool listener / RPC handler / payload
+/// builder) cannot mutate it.
 #[derive(Debug, Clone)]
 pub struct PreconfConfig {
     /// Master switch: false → entire preconf subsystem stays inactive
@@ -74,13 +90,19 @@ pub struct PreconfConfig {
     /// `tx_pool_config::AllPreconfs`.
     pub all_preconfs: bool,
 
-    /// Client-side oneshot wait — default 200ms (see [`DEFAULT_PRECONF_TIMEOUT`]).
+    /// Client-side oneshot wait — default 1s (see [`DEFAULT_PRECONF_TIMEOUT`]).
     pub preconf_timeout: Duration,
 
-    /// Interval at which the payload builder yields to drain pending
-    /// preconf work before resuming the normal-path tx sweep — default
-    /// 50ms.
+    /// Interval at which the payload builder ticks the pool best-tx
+    /// sweep. Each tick admits pool txs up to the time-proportional
+    /// cumulative gas quota (see [`slot_duration`](Self::slot_duration))
+    /// — default 200ms.
     pub sweep_interval: Duration,
+
+    /// Total slot duration used as the denominator of the pool gas
+    /// quota schedule: `pool_cumulative_quota(t) = (t / slot_duration)
+    /// × block_gas_limit`. Default 2s (OP-stack block time).
+    pub slot_duration: Duration,
 
     // ===== Operator hardening =====
     /// Per-tx gas limit for preconf-eligible transactions.
@@ -109,13 +131,15 @@ pub struct PreconfConfig {
     // ===== Internal channel capacity =====
     /// Broadcast channel capacity for both `event_broadcast`
     /// (newPreconfTransaction subscription) and the fifo notifier.
-    /// Default 4096 (see [`DEFAULT_BROADCAST_CAP`]).
+    /// Default 65536 (see [`DEFAULT_BROADCAST_CAP`]).
     pub broadcast_cap: usize,
 }
 
 impl Default for PreconfConfig {
-    /// Constructs a disabled-by-default config — operator opts in via CLI
-    /// `--preconf.enable`.
+    /// Constructs a disabled-by-default config. Operator opts in by setting
+    /// the `MANTLE_PRECONF_ENABLE` env var (consumed by `mantle-reth-cli`'s
+    /// `main.rs`); a proper clap-derived `--preconf.enable` CLI flag is
+    /// planned but not yet wired (see review followups).
     fn default() -> Self {
         Self {
             enabled: false,
@@ -124,6 +148,7 @@ impl Default for PreconfConfig {
             all_preconfs: false,
             preconf_timeout: DEFAULT_PRECONF_TIMEOUT,
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
+            slot_duration: DEFAULT_SLOT_DURATION,
             preconf_max_gas_per_tx: DEFAULT_PRECONF_MAX_GAS_PER_TX,
             preconf_max_gas_per_block: DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
             journal_path: None,
@@ -152,6 +177,20 @@ pub enum PreconfConfigError {
     /// `sweep_interval == 0`.
     #[error("sweep_interval must be > 0")]
     InvalidSweepInterval,
+    /// `slot_duration == 0`.
+    #[error("slot_duration must be > 0")]
+    InvalidSlotDuration,
+    /// `sweep_interval > slot_duration` — a single tick would exceed the
+    /// entire slot, making the time-proportional pool quota meaningless.
+    #[error(
+        "sweep_interval ({sweep:?}) must be <= slot_duration ({slot:?})"
+    )]
+    SweepIntervalExceedsSlot {
+        /// Configured sweep interval.
+        sweep: Duration,
+        /// Configured slot duration.
+        slot: Duration,
+    },
     /// `preconf_max_gas_per_tx == 0`.
     #[error("preconf_max_gas_per_tx must be > 0")]
     InvalidPreconfMaxGasPerTx,
@@ -167,6 +206,12 @@ pub enum PreconfConfigError {
         /// Configured per-tx limit.
         per_tx: u64,
     },
+    /// `enabled = true` but no eligibility rules configured — `all_preconfs`
+    /// is false and `from_preconfs` is empty, meaning [`PreconfConfig::is_preconf_tx`]
+    /// would return false for every tx. Spawning the pool listener / journal
+    /// / canon handler in this state burns resources for no functional effect.
+    #[error("preconf enabled but no eligibility rules: set all_preconfs=true or populate from_preconfs")]
+    EnabledWithoutEligibility,
 }
 
 impl PreconfConfig {
@@ -207,6 +252,15 @@ impl PreconfConfig {
         if self.sweep_interval.is_zero() {
             return Err(PreconfConfigError::InvalidSweepInterval);
         }
+        if self.slot_duration.is_zero() {
+            return Err(PreconfConfigError::InvalidSlotDuration);
+        }
+        if self.sweep_interval > self.slot_duration {
+            return Err(PreconfConfigError::SweepIntervalExceedsSlot {
+                sweep: self.sweep_interval,
+                slot: self.slot_duration,
+            });
+        }
         if self.preconf_max_gas_per_tx == 0 {
             return Err(PreconfConfigError::InvalidPreconfMaxGasPerTx);
         }
@@ -226,6 +280,19 @@ impl PreconfConfig {
             if self.journal_max_size == 0 {
                 return Err(PreconfConfigError::InvalidJournalMaxSize);
             }
+        }
+        // `enabled` is only meaningful if some eligibility rule lets at least
+        // one tx through `is_preconf_tx`. Without `all_preconfs`, both whitelist
+        // sets must be non-empty: `is_preconf_tx` requires
+        // `from_preconfs.contains(from) && to_preconfs.contains(to)`, so an empty
+        // set on either side makes every tx fail the check. `enabled=true` in
+        // that state would spawn pool listener / journal / canon handler for
+        // zero functional effect.
+        if self.enabled
+            && !self.all_preconfs
+            && (self.from_preconfs.is_empty() || self.to_preconfs.is_empty())
+        {
+            return Err(PreconfConfigError::EnabledWithoutEligibility);
         }
         Ok(self)
     }
@@ -344,5 +411,147 @@ mod tests {
     fn validate_passes_default() {
         // Default config (journal disabled, sane defaults) must validate.
         assert!(PreconfConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_passes_block_budget_equal_to_per_tx() {
+        // Boundary: per_block == per_tx is the smallest valid block budget — a
+        // single max-sized preconf-tx must fit. The check is `>=`, not `>`, so
+        // equality must pass.
+        let mut cfg = PreconfConfig::default();
+        cfg.preconf_max_gas_per_tx = 2_000_000;
+        cfg.preconf_max_gas_per_block = 2_000_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_sweep_interval() {
+        // Companion to `validate_rejects_zero_timeout` — sweep_interval has its
+        // own InvalidSweepInterval variant but no direct test until now.
+        let mut cfg = PreconfConfig::default();
+        cfg.sweep_interval = Duration::ZERO;
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidSweepInterval)));
+    }
+
+    #[test]
+    fn validate_rejects_zero_slot_duration() {
+        let mut cfg = PreconfConfig::default();
+        cfg.slot_duration = Duration::ZERO;
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidSlotDuration)));
+    }
+
+    #[test]
+    fn validate_rejects_sweep_interval_larger_than_slot_duration() {
+        // A single tick larger than the slot itself makes the time-
+        // proportional pool quota degenerate to "full block immediately".
+        let mut cfg = PreconfConfig::default();
+        cfg.slot_duration = Duration::from_millis(500);
+        cfg.sweep_interval = Duration::from_millis(600);
+        assert!(matches!(
+            cfg.validate(),
+            Err(PreconfConfigError::SweepIntervalExceedsSlot { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_passes_sweep_interval_equal_to_slot_duration() {
+        // Boundary: single tick spanning the whole slot is allowed —
+        // it just means pool gets one shot at full quota at slot end,
+        // preconf has priority for the entire slot up until then.
+        let mut cfg = PreconfConfig::default();
+        cfg.slot_duration = Duration::from_millis(500);
+        cfg.sweep_interval = Duration::from_millis(500);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn default_config_slot_duration_matches_op_stack_block_time() {
+        // Anchor the default so unrelated refactors don't silently break
+        // production quota timing.
+        let cfg = PreconfConfig::default();
+        assert_eq!(cfg.slot_duration, DEFAULT_SLOT_DURATION);
+        assert_eq!(cfg.slot_duration, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn validate_rejects_zero_journal_max_size_when_enabled() {
+        // Companion to `validate_rejects_zero_rejournal_only_when_journal_enabled`
+        // — the other journal-gated field has its own variant; verify it fires
+        // only when journal_path is Some.
+        let mut cfg = PreconfConfig::default();
+        cfg.journal_max_size = 0;
+        // Journal disabled — zero max_size is ignored.
+        assert!(cfg.clone().validate().is_ok());
+        // Journal enabled — zero max_size must fail.
+        cfg.journal_path = Some(PathBuf::from("/tmp/preconf"));
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidJournalMaxSize)));
+    }
+
+    #[test]
+    fn validate_rejects_enabled_without_eligibility_rules() {
+        // enabled=true with no all_preconfs and both whitelists empty — would
+        // spawn background tasks for zero functional effect.
+        let mut cfg = PreconfConfig::default();
+        cfg.enabled = true;
+        assert!(matches!(
+            cfg.validate(),
+            Err(PreconfConfigError::EnabledWithoutEligibility)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_enabled_with_only_from_whitelist() {
+        // from-only whitelist is a misconfig: is_preconf_tx requires both from
+        // AND to to be in their respective sets (op-geth-aligned semantics),
+        // so empty to_preconfs makes every tx fail eligibility.
+        let mut cfg = PreconfConfig::default();
+        cfg.enabled = true;
+        cfg.from_preconfs.insert(addr(1));
+        // to_preconfs left empty.
+        assert!(matches!(
+            cfg.validate(),
+            Err(PreconfConfigError::EnabledWithoutEligibility)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_enabled_with_only_to_whitelist() {
+        // Symmetric to the from-only case.
+        let mut cfg = PreconfConfig::default();
+        cfg.enabled = true;
+        cfg.to_preconfs.insert(addr(2));
+        assert!(matches!(
+            cfg.validate(),
+            Err(PreconfConfigError::EnabledWithoutEligibility)
+        ));
+    }
+
+    #[test]
+    fn validate_passes_enabled_with_all_preconfs() {
+        // enabled=true + all_preconfs=true is the smallest valid eligible config.
+        let mut cfg = PreconfConfig::default();
+        cfg.enabled = true;
+        cfg.all_preconfs = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_passes_enabled_with_both_whitelists_populated() {
+        // enabled=true + non-empty (from, to) whitelists is valid.
+        let mut cfg = PreconfConfig::default();
+        cfg.enabled = true;
+        cfg.from_preconfs.insert(addr(1));
+        cfg.to_preconfs.insert(addr(2));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_passes_disabled_with_empty_whitelists() {
+        // enabled=false bypasses the eligibility check entirely — default
+        // config (all empty) must remain valid. Regression guard for the
+        // default-disabled wiring path used when MantleNode.preconf == None.
+        let cfg = PreconfConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.validate().is_ok());
     }
 }

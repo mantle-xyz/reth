@@ -152,7 +152,13 @@ async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
     let fifo = PreconfTxSet::new(16);
     let mut rx = fifo.subscribe();
 
-    let push_result = fifo.push_if_absent(tx.clone(), signers.addr1.address()).await;
+    let push_result = fifo
+        .push_if_absent(
+            tx.clone(),
+            signers.addr1.address(),
+            mantle_reth_preconf::types::PreconfSource::Rpc,
+        )
+        .await;
     assert!(matches!(push_result, PushResult::Inserted));
 
     // The broadcast notification should be visible immediately

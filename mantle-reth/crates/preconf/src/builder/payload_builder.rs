@@ -1,51 +1,49 @@
 //! `PreconfPayloadBuilder` — mantle's preconf-aware OP payload builder.
 //!
-//! Forked from `reth_optimism_payload_builder::OpPayloadBuilder` and
-//! `op-rbuilder`'s `StandardOpPayloadBuilder` (pinned via workspace
-//! Cargo.toml `reth-optimism-payload-builder`). See
-//! `docs/design/preconf-dev-plan.md` §P5f for the rationale (wrapper
-//! mode cannot satisfy "RPC receipt == sealed receipt byte-for-byte"
-//! because the applier has no channel into the inner OP builder's
-//! `State<DB>`; only the fork shares state).
+//! Forked from `reth_optimism_payload_builder::OpPayloadBuilder`. A
+//! fork (rather than a wrapper) is required so preconf txs and
+//! sequencer txs execute against the same in-flight `State<DB>`; that
+//! is what makes the RPC-returned receipt byte-equal to the sealed
+//! block's receipt.
 //!
 //! Reuses the upstream [`OpPayloadBuilderCtx`] verbatim — mantle does
 //! **not** add fields to ctx. The preconf-specific state
-//! (`PreconfConfig`, `PreconfTxSet`, the preconf-tx mpsc receiver)
-//! lives on this struct and is threaded into the build loop body.
-//!
-//! Stage A.1 lands across multiple commits:
-//!
-//! - **Step 2 (commit `08a4722c0`)**: struct skeleton + accessors
-//! - **Step 3a (this commit)**: `build_payload` async signature with the
-//!   upstream generic bounds; body is `unimplemented!()`
-//! - **Step 3b**: fork `OpBuilder::build` body (deposits + sequencer txs
-//!   + best txs + finalize) without preconf
-//! - **Step 4**: `dispatch.rs` adds the preconf `select!` arm
-//! - **Steps 5-9**: job / generator / cleanup / cli wiring / tests
+//! (`PreconfConfig`, `PreconfTxSet`) lives on this struct and is
+//! threaded into the build loop body.
 //!
 //! [`OpPayloadBuilderCtx`]: reth_optimism_payload_builder::builder::OpPayloadBuilderCtx
 
 use std::sync::Arc;
 
-use alloy_consensus::{BlockHeader, Sealable, TxEnvelope, transaction::Recovered};
+use alloy_consensus::{BlockHeader, Sealable, Transaction, TxEnvelope, Typed2718, transaction::Recovered};
 use alloy_evm::Evm;
-use alloy_primitives::{Address, Sealed};
+use alloy_primitives::{Address, Sealed, TxHash, U256};
 use op_alloy_consensus::{SDMGasEntry, TxPostExec, build_post_exec_tx};
-use op_revm::constants::L1_BLOCK_CONTRACT;
+use op_revm::{L1BlockInfo, constants::L1_BLOCK_CONTRACT};
 use reth_basic_payload_builder::BuildArguments;
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError};
+use reth_evm::execute::{
+    BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockValidationError,
+};
 use reth_execution_types::BlockExecutionOutput;
 use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt};
+use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpBuiltPayload;
 use reth_optimism_payload_builder::{
     OpAttributes, OpPayloadPrimitives,
-    builder::OpPayloadBuilderCtx,
+    builder::{ExecutionInfo, OpPayloadBuilderCtx},
     config::OpBuilderConfig,
+};
+use reth_optimism_primitives::OpTransaction;
+use reth_optimism_txpool::{
+    OpPooledTx,
+    estimated_da_size::DataAvailabilitySized,
+    interop::{MaybeInteropTransaction, is_valid_interop},
 };
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuildNextEnv, BuiltPayloadExecutedBlock};
-use reth_payload_util::BestPayloadTransactions;
+use reth_payload_util::{BestPayloadTransactions, PayloadTransactions};
 use reth_primitives_traits::{HeaderTy, SignedTransaction, TxTy};
+use reth_transaction_pool::PoolTransaction;
 use reth_revm::{
     State, cancelled::CancelOnDrop, context::Block as RevmBlockTrait,
     database::StateProviderDatabase,
@@ -57,7 +55,7 @@ use crate::{
     PreconfConfig, PreconfTxSet,
     apply::apply_preconf_tx,
     builder::{cancel::JobCancel, dispatch},
-    types::PreconfError,
+    types::{PreconfError, PreconfReceipt},
 };
 
 // Replicated from upstream private helper
@@ -98,9 +96,8 @@ where
 /// Mantle's preconf-aware OP payload builder.
 ///
 /// Construction is via [`PreconfPayloadBuilder::new`]. The driving
-/// loop lives in `build_payload` (lands in subsequent steps), invoked
-/// once per payload job by the matching
-/// `PreconfPayloadJobGenerator`.
+/// loop lives in [`Self::build_payload`], invoked once per payload
+/// job by the matching `PreconfPayloadJobGenerator`.
 ///
 /// Type parameters:
 /// - `Pool` — reth transaction pool (yields the best-txs iterator)
@@ -117,6 +114,11 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     builder_config: OpBuilderConfig,
     cfg: Arc<PreconfConfig>,
     fifo: Arc<PreconfTxSet>,
+    /// Optional wire-event publisher, produced by
+    /// [`crate::PreconfServiceBuilder::start`]. `None` when subscription
+    /// wiring is disabled or `start` has not yet run — the dispatch
+    /// loop then skips wire publish silently.
+    publisher: Option<Arc<crate::journal::EventPublisher>>,
 }
 
 impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
@@ -126,6 +128,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     /// Cloning the resulting builder is cheap — `cfg` / `fifo` are
     /// `Arc`s, pool / client / `evm_config` are typically `Arc`-backed
     /// too, and [`OpBuilderConfig`] is a small `Clone` struct.
+    ///
+    /// `publisher` is optional; pass `None` when subscription wiring
+    /// is not enabled for this node (default-empty preconf case) —
+    /// the dispatch loop will skip wire publishing.
     pub const fn new(
         pool: Pool,
         client: Client,
@@ -133,8 +139,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         builder_config: OpBuilderConfig,
         cfg: Arc<PreconfConfig>,
         fifo: Arc<PreconfTxSet>,
+        publisher: Option<Arc<crate::journal::EventPublisher>>,
     ) -> Self {
-        Self { pool, client, evm_config, builder_config, cfg, fifo }
+        Self { pool, client, evm_config, builder_config, cfg, fifo, publisher }
     }
 
     /// Borrow the underlying transaction pool.
@@ -166,38 +173,288 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     pub const fn fifo(&self) -> &Arc<PreconfTxSet> {
         &self.fifo
     }
+
+    /// Borrow the optional wire-event publisher.
+    pub const fn publisher(&self) -> &Option<Arc<crate::journal::EventPublisher>> {
+        &self.publisher
+    }
+}
+
+/// Convert an `Arc<TxEnvelope>` to the pipeline's `N::SignedTx` and
+/// recover its signer, then apply against the in-flight builder.
+///
+/// Shared helper used both by the carryover preamble and the fifo_rx
+/// arm of the select! loop; the callers wrap this in a thin closure
+/// that captures `&mut builder`, which is required so
+/// `dispatch::apply_one_preconf`'s `apply_fn` callback signature
+/// (`FnMut(Arc<TxEnvelope>, TxHash, u64) -> ...`) stays free of the
+/// builder generic.
+fn convert_and_apply_preconf<N, B>(
+    builder: &mut B,
+    tx: Arc<TxEnvelope>,
+    hash: TxHash,
+    height: u64,
+) -> Result<PreconfReceipt, PreconfError>
+where
+    N: OpPayloadPrimitives,
+    N::SignedTx: TryFrom<TxEnvelope>,
+    B: BlockBuilder<Primitives = N>,
+{
+    let envelope = (*tx).clone();
+    let signed: N::SignedTx = envelope.try_into().map_err(|_| {
+        PreconfError::BuilderRejected("TxEnvelope → N::SignedTx conversion failed".into())
+    })?;
+    let recovered: Recovered<N::SignedTx> = signed
+        .try_into_recovered()
+        .map_err(|_| PreconfError::BuilderRejected("ec-recover failed for preconf tx".into()))?;
+    apply_preconf_tx(builder, recovered, hash, height)
+}
+
+/// Preamble that walks the fifo snapshot in insertion order and
+/// applies every carryover entry to the new build:
+///
+/// - **`Waiting`** — journal-restored or dead-window RPC pushes whose
+///   broadcast never reached this job's subscriber. Applied with the
+///   original `source` intact so genuinely stale `Rpc` entries get
+///   timed out by the deadline gate.
+/// - **`Success`** — stale in-flight from a discarded prior job (a
+///   canon'd entry would have been removed by `forward()`).
+///   `reset_success_to_waiting` promotes the source to `Replay`
+///   so gates bypass and the previously-returned receipt is honored.
+/// - **`Failed` / `Timeout` / `Canceled`** — skipped (terminal).
+///
+/// Applying directly here (rather than via the broadcast queue)
+/// guarantees carryover lands ahead of any concurrently-queued fresh
+/// RPC pushes. `apply_one_preconf`'s gate ① dedup prevents double-apply
+/// if a carryover entry is also observed via broadcast later.
+async fn replay_fifo_carryover<F>(
+    fifo: &PreconfTxSet,
+    cfg: &PreconfConfig,
+    loop_state: &mut dispatch::LoopState,
+    mut apply_fn: F,
+) where
+    F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, PreconfError>,
+{
+    use crate::types::PreconfStatus;
+    for view in fifo.entries().await {
+        match view.status {
+            PreconfStatus::Waiting => {
+                dispatch::apply_one_preconf(fifo, cfg, view.hash, loop_state, &mut apply_fn).await;
+            }
+            PreconfStatus::Success => {
+                if fifo.reset_success_to_waiting(&view.hash).await.is_ok() {
+                    dispatch::apply_one_preconf(fifo, cfg, view.hash, loop_state, &mut apply_fn)
+                        .await;
+                }
+            }
+            PreconfStatus::Failed | PreconfStatus::Timeout | PreconfStatus::Canceled => {}
+        }
+    }
+}
+
+/// Derived schedule for the adaptive-N pool quota — see
+/// `build_payload` Stage 3 setup. Extracted as a pure function so the
+/// (`time_drift`, `sweep_interval`, `slot_duration`, `block_gas_limit`)
+/// → `(ticks_remaining, gas_per_batch, first_offset, build_delay_ms)`
+/// mapping is unit-testable without a real payload build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolQuotaSchedule {
+    /// Time-until-slot-deadline used for the derivation, clamped to
+    /// `[sweep_interval, slot_duration]`.
+    time_drift: std::time::Duration,
+    /// Number of quota ticks fitting in `time_drift` (rounded up so a
+    /// residual remainder gets its own tick). Always ≥ 1.
+    ticks_remaining: u64,
+    /// Per-tick pool gas share — `block_gas_limit / ticks_remaining`.
+    gas_per_batch: u64,
+    /// First tick offset — aligns subsequent ticks to `sweep_interval`
+    /// boundaries within the slot. Equal to `sweep_interval` when the
+    /// slot already sits on a boundary.
+    first_offset: std::time::Duration,
+    /// Delay from the target slot start to now, in milliseconds.
+    /// Useful for observability / alerting.
+    build_delay_ms: u64,
+}
+
+/// Compute the adaptive-N pool gas schedule from wall-clock inputs.
+///
+/// `time_drift_or_fallback` should be the caller's already-saturated
+/// remaining-time-to-slot-deadline (falling back to `sweep_interval`
+/// for late-FCU / clock-skew cases). This helper is deterministic
+/// modulo integer arithmetic — no wall-clock reads inside.
+fn derive_pool_quota_schedule(
+    time_drift_or_fallback: std::time::Duration,
+    sweep_interval: std::time::Duration,
+    slot_duration: std::time::Duration,
+    block_gas_limit: u64,
+) -> PoolQuotaSchedule {
+    let time_drift = time_drift_or_fallback.min(slot_duration);
+    let interval_ms = sweep_interval.as_millis().max(1) as u64;
+    let drift_ms = time_drift.as_millis() as u64;
+    let ticks_remaining = drift_ms.div_ceil(interval_ms).max(1);
+    let gas_per_batch = block_gas_limit / ticks_remaining;
+    let first_offset_ms = drift_ms.checked_rem(interval_ms).unwrap_or(0);
+    let first_offset = if first_offset_ms == 0 {
+        sweep_interval
+    } else {
+        std::time::Duration::from_millis(first_offset_ms)
+    };
+    let build_delay_ms = slot_duration.saturating_sub(time_drift).as_millis() as u64;
+    PoolQuotaSchedule { time_drift, ticks_remaining, gas_per_batch, first_offset, build_delay_ms }
+}
+
+/// Outcome of one iteration of the pool best-tx step inside the
+/// select! loop.
+enum BestTxStep {
+    /// Iterator still has candidates; the caller should keep polling.
+    Continue,
+    /// Iterator exhausted (or the current tx would over-fill the block
+    /// and marking-invalid drained descendants). Caller should disable
+    /// the best-tx branch.
+    Done,
+}
+
+/// One iteration of the pool best-tx loop: pulls the next candidate,
+/// applies limits / filtering, executes against the in-flight builder,
+/// updates `info`. Ported from `OpPayloadBuilderCtx::execute_best_transactions`
+/// but factored out so each call handles exactly one tx — lets the
+/// unified select! loop interleave best-tx application with preconf
+/// commitment application.
+#[allow(clippy::too_many_arguments)]
+fn apply_one_best_tx<N, Builder>(
+    best_txs: &mut impl PayloadTransactions<
+        Transaction: PoolTransaction<Consensus = N::SignedTx> + OpPooledTx,
+    >,
+    builder: &mut Builder,
+    info: &mut ExecutionInfo,
+    block_gas_limit: u64,
+    block_da_limit: Option<u64>,
+    tx_da_limit: Option<u64>,
+    base_fee: u64,
+    attrs_timestamp: u64,
+    da_footprint_gas_scalar: Option<u16>,
+) -> Result<BestTxStep, PayloadBuilderError>
+where
+    N: OpPayloadPrimitives,
+    Builder: BlockBuilder<Primitives = N>,
+{
+    let Some(tx) = best_txs.next(()) else {
+        return Ok(BestTxStep::Done);
+    };
+    let interop = tx.interop_deadline();
+    let tx_da_size = tx.estimated_da_size();
+    let tx = tx.into_consensus();
+
+    if info.is_tx_over_limits(
+        tx_da_size,
+        block_gas_limit,
+        tx_da_limit,
+        block_da_limit,
+        tx.gas_limit(),
+        da_footprint_gas_scalar,
+    ) {
+        best_txs.mark_invalid(tx.signer(), tx.nonce());
+        return Ok(BestTxStep::Continue);
+    }
+
+    if tx.is_eip4844() || tx.is_deposit() {
+        best_txs.mark_invalid(tx.signer(), tx.nonce());
+        return Ok(BestTxStep::Continue);
+    }
+
+    if let Some(interop) = interop
+        && !is_valid_interop(interop, attrs_timestamp)
+    {
+        best_txs.mark_invalid(tx.signer(), tx.nonce());
+        return Ok(BestTxStep::Continue);
+    }
+
+    let gas_used = match builder.execute_transaction(tx.clone()) {
+        Ok(g) => g,
+        Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { error, .. })) => {
+            if !error.is_nonce_too_low() {
+                best_txs.mark_invalid(tx.signer(), tx.nonce());
+            }
+            return Ok(BestTxStep::Continue);
+        }
+        Err(err) => {
+            return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
+        }
+    };
+    let tx_gas_used = gas_used.tx_gas_used();
+    info.cumulative_gas_used += tx_gas_used;
+    info.cumulative_da_bytes_used += tx_da_size;
+    let miner_fee = tx
+        .effective_tip_per_gas(base_fee)
+        .expect("fee is always valid; execution succeeded");
+    info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
+    Ok(BestTxStep::Continue)
 }
 
 // ─── build_payload (async) ──────────────────────────────────────────────────
 
-// Forked from `reth_optimism_payload_builder::builder::OpBuilder::build`
-// (path workspace dep, see Cargo.toml). The sync upstream is converted
-// into `async fn` so future steps can interleave a preconf-tx select!
-// arm without restructuring the signature. Generic bounds copied
-// verbatim from upstream.
+// Forked from `reth_optimism_payload_builder::builder::OpBuilder::build`.
+// The sync upstream is converted into `async fn` so the preconf-tx
+// select! arm can be interleaved without restructuring the signature.
+// Generic bounds are copied verbatim from upstream.
 impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
-    /// Drive a single payload job to completion against the in-flight
-    /// state, applying preconf-tx commitments mid-block via the inner
-    /// `select!` loop (added in Step 4).
+    /// Drive a single payload job to completion. Returns the final
+    /// [`OpBuiltPayload<N>`] on success; `cancel` cuts the build short
+    /// and seals whatever has been applied so far.
     ///
-    /// Returns the final [`OpBuiltPayload<N>`] on success. Cancellation
-    /// (via `cancel`) cuts the build short and seals whatever has been
-    /// applied so far (Step 4 will wire the cancel-aware finalize).
+    /// ## Execution stages
     ///
-    /// Generic parameters `N` (payload primitives) and `Attrs` (payload
-    /// attributes) are bound on the method rather than the `impl`
-    /// because each call may target different primitives (e.g.
-    /// `OpPrimitives` vs. `MantlePrimitives`) without instantiating a
-    /// new builder.
+    /// 1. **Prelude** — construct upstream [`OpPayloadBuilderCtx`], fetch
+    ///    the parent-block state provider twice (owned form; needed to
+    ///    keep the async future `Send`), preload the L1 block contract
+    ///    into the DB cache.
+    /// 2. **Stage 1** — `apply_pre_execution_changes` (EIP-2935 / 4788
+    ///    + OP-stack predeploys).
+    /// 3. **Stage 2** — `execute_sequencer_transactions` (deposits +
+    ///    L1 info + system txs).
+    /// 4. **Stage 3** — unified `select!` loop with four `biased`
+    ///    branches:
+    ///    - `cancel.wait()` — exits the loop.
+    ///    - `fifo_rx.recv()` — preconf-tx apply (`apply_one_preconf` on
+    ///      `Ok`, `reconcile_lagged` on `Lagged`, break on `Closed`).
+    ///    - **Level-triggered pool arm** (`ready(()) if
+    ///      pool_gas_used < pool_quota`) — each fire admits exactly one
+    ///      pool best-tx, then returns to `select!`. Cancel and preconf
+    ///      get preempt chances between every pool tx via biased
+    ///      priority.
+    ///    - `sweep_ticker.tick()` — edge-triggered ticker. Bumps
+    ///      `pool_quota` by [`PoolQuotaSchedule::gas_per_batch`] on
+    ///      each tick (adaptive-N derivation adapts `N` to remaining
+    ///      slot time so pool aims to fill the block regardless of
+    ///      build delay — op-rbuilder flashblocks pattern). Doesn't
+    ///      apply directly; the level-triggered pool arm consumes the
+    ///      new headroom.
     ///
-    /// Step 3b: body forked from upstream `OpBuilder::build` with the
-    /// preconf select! loop omitted. The cached-reads optimization
-    /// (sequencer mode) is also omitted in this step — see TODO below;
-    /// it will land alongside the Step-5 [`PayloadJob`] integration that
-    /// owns [`CachedReads`].
+    ///    Before the loop, a **carryover replay preamble**
+    ///    ([`replay_fifo_carryover`]) applies any stale in-flight or
+    ///    journal-restored entries directly (bypassing the broadcast
+    ///    queue) so they land ahead of concurrently-queued RPC pushes.
+    /// 5. **Stage 4** — SDM post-exec refund tx (only when
+    ///    `ctx.sdm_production_enabled()`).
+    /// 6. **Stage 5** — `builder.finish` → seal + wrap into
+    ///    `OpBuiltPayload`.
     ///
-    /// [`PayloadJob`]: reth_payload_builder::PayloadJob
-    /// [`CachedReads`]: reth_basic_payload_builder::CachedReads
+    /// Both preconf-tx and best-tx apply into the same in-flight
+    /// `State<DB>`, which is what makes the RPC-returned receipt
+    /// byte-equal to the sealed block's receipt.
+    ///
+    /// ## Generic parameter placement
+    ///
+    /// `N` and `Attrs` are bound on the method (not the `impl`) because
+    /// this is an inherent async method rather than a
+    /// [`reth_basic_payload_builder::PayloadBuilder`] impl (whose sync
+    /// `try_build` is incompatible with our async select! loop). No
+    /// struct field depends on `N` / `Attrs`, so method-level binding
+    /// keeps the struct free of `PhantomData<(N, Attrs)>` and lets a
+    /// single builder serve multiple primitive sets.
+    ///
+    /// [`OpPayloadBuilderCtx`]: reth_optimism_payload_builder::builder::OpPayloadBuilderCtx
+    /// [`PreconfTxSet::has_pending_unprocessed`]: crate::PreconfTxSet::has_pending_unprocessed
     #[allow(clippy::unused_async)]
     pub async fn build_payload<N, Attrs>(
         self,
@@ -226,28 +483,21 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         Attrs: OpAttributes<Transaction = TxTy<N>>,
     {
         // ── Destructure upstream BuildArguments ────────────────────────
-        let BuildArguments {
-            cached_reads: _cached_reads, // TODO(step 5): cached-reads sequencer path
-            config,
-            best_payload,
-            ..
-        } = args;
+        //
+        // The fork rebuilds `State<DB>` fresh on every call, so
+        // upstream's `CachedReads` reuse optimization is not wired here
+        // — the field is accepted for signature compatibility with
+        // `BuildArguments` and deliberately ignored.
+        let BuildArguments { cached_reads: _cached_reads, config, best_payload, .. } = args;
 
         // ── Construct upstream OpPayloadBuilderCtx ─────────────────────
-        // All fields are `pub` upstream, so direct struct construction is the
-        // public API. Mantle adds NO fields to ctx (see crate docs).
         let chain_spec = self.client.chain_spec();
         let parent_hash = config.parent_header.hash();
-        // OpPayloadBuilderCtx wants a `CancelOnDrop` (reth_revm's sync
-        // flag, polled by upstream's `execute_best_transactions` mid-loop).
-        // Our job-level cancel is async (`JobCancel`, polled by the
-        // select! arm below). We deliberately decouple them: a fresh
-        // CancelOnDrop is given to ctx (never flipped by external
-        // signals), and the JobCancel handles end-of-job cleanup via
-        // the select! loop. Trade-off: upstream's best-tx scan won't
-        // observe job cancellation, but Step 4 runs it to completion
-        // before entering the loop, so the only effect is a slightly
-        // longer worst-case shutdown.
+        // `cancel: CancelOnDrop::default()` — a fresh sync flag that is
+        // never flipped. Our job-level async cancel (`JobCancel`) drives
+        // teardown via the select! loop instead. Consequence: upstream's
+        // best-tx scan does not observe job cancellation and runs to
+        // completion (bounded by block gas limit) before the loop starts.
         let ctx = OpPayloadBuilderCtx {
             evm_config: self.evm_config.clone(),
             builder_config: self.builder_config.clone(),
@@ -266,30 +516,19 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         );
 
         // ── Fetch latest state ─────────────────────────────────────────
-        //
-        // We fetch the state provider TWICE: one ownership goes into
-        // `StateProviderDatabase` (consumed → owned by the in-flight
-        // `State<DB>` for the build loop), the other is held aside to
-        // pass to `builder.finish(...)` for state-root computation at
-        // seal time.
-        //
-        // Why owned instead of `&state_provider` like upstream's sync
-        // path: holding `&Box<dyn StateProvider + Send>` across the
-        // async select! `.await` points would make the build future
-        // non-`Send` (because `&Box<T>: Send` requires `T: Sync`, and
-        // `dyn StateProvider + Send` is not `Sync`). Owned form
-        // sidesteps the borrow entirely. The double-fetch cost is one
-        // extra `Arc::clone` worth of work — the underlying database
-        // handle is `Arc`-backed in production.
+        // Double fetch is deliberate: one goes into `StateProviderDatabase`
+        // (owned by the in-flight `State<DB>`), the other passes to
+        // `builder.finish(...)` for state-root computation. Owned rather
+        // than borrowed because `&Box<dyn StateProvider + Send>` held
+        // across async `.await` points would break `Send`.
         let state_provider_for_finish = self.client.state_by_block_hash(parent_hash)?;
         let state_provider_for_db = self.client.state_by_block_hash(parent_hash)?;
         let state_db = StateProviderDatabase::new(state_provider_for_db);
         let mut db = State::builder().with_database(state_db).with_bundle_update().build();
 
-        // Load the L1 block contract into the database cache. If the L1
-        // block contract is not pre-loaded the database will panic when
-        // trying to fetch the DA footprint gas scalar. (Forked from
-        // upstream `OpBuilder::build` line 430.)
+        // Preload L1 block contract into the DB cache; otherwise the DA
+        // footprint gas scalar fetch panics on first tx. (Forked from
+        // upstream `OpBuilder::build`.)
         db.load_cache_account(L1_BLOCK_CONTRACT).map_err(BlockExecutionError::other)?;
 
         // ── Stage 1: pre-execution changes ─────────────────────────────
@@ -306,75 +545,107 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
         let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
 
-        // ── Stage 3a: pool best-txs (synchronous, like upstream) ───────
-        //
-        // Step 4 keeps the upstream synchronous drain here (one pass
-        // through `best_transactions` before entering the async loop).
-        // Interleaving best-txs with preconf via per-tx async stepping
-        // is deferred to a follow-up step — see dev-plan §P5g.
-        //
-        // `ctx.cancel` is the decoupled CancelOnDrop, so the `Some(())`
-        // return is unreachable in practice; we ignore it for safety.
-        if !ctx.attributes().no_tx_pool() {
-            let best_txs_attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
-            let best_txs = BestPayloadTransactions::new(
-                self.pool.best_transactions_with_attributes(best_txs_attrs),
+        // ── Stage 3: unified select! loop (see method rustdoc) ────────
+
+        // Pool iterator — one-shot snapshot at build start.
+        let best_txs_iter_opt =
+            (!ctx.attributes().no_tx_pool()).then(|| {
+                let attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
+                BestPayloadTransactions::new(
+                    self.pool.best_transactions_with_attributes(attrs),
+                )
+            });
+
+        // Snapshot per-block limits (constant across the build).
+        let mut block_gas_limit = builder.evm_mut().block().gas_limit();
+        if let Some(cfg_limit) = self.builder_config.gas_limit_config.gas_limit() {
+            block_gas_limit = cfg_limit.min(block_gas_limit);
+        }
+        let block_da_limit = self.builder_config.da_config.max_da_block_size();
+        let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
+        let base_fee = builder.evm_mut().block().basefee();
+        let attrs_timestamp = ctx.attributes().timestamp();
+        // Post-Jovian DA footprint scalar is a per-block constant set by
+        // the Stage 2 L1 info tx — read once, reuse across all admissions.
+        let da_footprint_gas_scalar = self
+            .client
+            .chain_spec()
+            .is_jovian_active_at_timestamp(attrs_timestamp)
+            .then(|| {
+                L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut()).expect(
+                    "DA footprint should always be available from the database post jovian",
+                )
+            });
+
+        let mut best_txs_iter = best_txs_iter_opt;
+        let mut fifo_rx = self.fifo.subscribe();
+        let predicted_height = ctx.parent().number() + 1;
+        let mut loop_state =
+            dispatch::LoopState::new(predicted_height).with_publisher(self.publisher.clone());
+
+        // Adaptive-N pool quota schedule — see `derive_pool_quota_schedule`.
+        // SystemTime is read only here for the initial offset; the tokio
+        // ticker itself is monotonic.
+        let slot_deadline = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(attrs_timestamp);
+        let time_drift_input = slot_deadline
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(self.cfg.sweep_interval);
+        let schedule = derive_pool_quota_schedule(
+            time_drift_input,
+            self.cfg.sweep_interval,
+            self.cfg.slot_duration,
+            block_gas_limit,
+        );
+        let gas_per_batch = schedule.gas_per_batch;
+
+        if schedule.build_delay_ms > 100 {
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                build_delay_ms = schedule.build_delay_ms,
+                time_drift_ms = schedule.time_drift.as_millis() as u64,
+                ticks_remaining = schedule.ticks_remaining,
+                gas_per_batch,
+                "delayed build start; adapting pool quota to remaining slot"
             );
-            let _ = ctx.execute_best_transactions(&mut info, &mut builder, best_txs)?;
         }
 
-        // ── Stage 3b: preconf select! main loop ────────────────────────
-        //
-        // Drains preconf-tx commitments from the fifo's broadcast
-        // channel until the job is cancelled. The apply closure
-        // captures `&mut builder`, so each preconf-tx is executed
-        // against the same in-flight `State<DB>` that produced the
-        // sequencer-tx receipts above — which is exactly what makes
-        // "RPC receipt == sealed receipt byte-for-byte" hold.
-        //
-        // Conversion path: `Arc<TxEnvelope> → TxEnvelope → N::SignedTx
-        // (via TryFrom<TxEnvelope>) → Recovered<N::SignedTx> (via
-        // SignedTransaction::try_into_recovered) → apply_preconf_tx`.
-        // For OP-stack primitives `N::SignedTx == OpTxEnvelope`, so
-        // the TryFrom impl from op-alloy-consensus' EthereumTxEnvelope
-        // bridge satisfies the bound.
-        //
-        // `biased` so a torn-down job doesn't perform one more apply
-        // between cancel and the next yield point.
+        let mut sweep_ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + schedule.first_offset,
+            self.cfg.sweep_interval,
+        );
+        // Cumulative pool gas budget. Starts at 0 — pool cannot admit
+        // until the first sweep tick bumps it by `gas_per_batch`. From
+        // then on, each tick bumps by another `gas_per_batch`; the pool
+        // arm's guard `pool_gas_used < pool_quota` is a level trigger
+        // that self-disables once the current allocation is drained.
+        let mut pool_quota: u64 = 0;
+
+        // Carryover replay preamble — apply stale in-flight / journal-
+        // restored entries directly (see `replay_fifo_carryover`). The
+        // block scope drops `apply_fn` so its `&mut builder` borrow is
+        // released before the select! loop's arms.
         {
-            let mut fifo_rx = self.fifo.subscribe();
-            let predicted_height = ctx.parent().number() + 1;
-            let mut loop_state = dispatch::LoopState::new(predicted_height);
+            let mut apply_fn = |tx, hash, height| {
+                convert_and_apply_preconf::<N, _>(&mut builder, tx, hash, height)
+            };
+            let before = loop_state.preconf_gas_used();
+            replay_fifo_carryover(&self.fifo, &self.cfg, &mut loop_state, &mut apply_fn).await;
+            info.cumulative_gas_used += loop_state.preconf_gas_used() - before;
+        }
 
-            // Apply closure: real EVM execution against the in-flight
-            // builder. `&mut builder` is borrowed exclusively here for
-            // the duration of one preconf apply; the closure is FnMut
-            // so the select! loop can invoke it on every iteration.
-            let mut apply_fn =
-                |tx: Arc<TxEnvelope>, hash, height| -> Result<_, PreconfError> {
-                    let env = (*tx).clone();
-                    let signed: N::SignedTx = env
-                        .try_into()
-                        .map_err(|_| {
-                            PreconfError::BuilderRejected(
-                                "TxEnvelope → N::SignedTx conversion failed".into(),
-                            )
-                        })?;
-                    let recovered: Recovered<N::SignedTx> = signed
-                        .try_into_recovered()
-                        .map_err(|_| {
-                            PreconfError::BuilderRejected(
-                                "ec-recover failed for preconf tx".into(),
-                            )
-                        })?;
-                    apply_preconf_tx(&mut builder, recovered, hash, height)
-                };
-
-            loop {
-                tokio::select! {
-                    biased;
-                    () = cancel.wait() => break,
-                    recv = fifo_rx.recv() => match recv {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.wait() => break,
+                recv = fifo_rx.recv() => {
+                    // Closure re-created per arm-entry so its `&mut builder`
+                    // borrow does not clash with the pool arm.
+                    let mut apply_fn = |tx, hash, height| {
+                        convert_and_apply_preconf::<N, _>(&mut builder, tx, hash, height)
+                    };
+                    let before = loop_state.preconf_gas_used();
+                    match recv {
                         Ok(hash) => {
                             dispatch::apply_one_preconf(
                                 &self.fifo, &self.cfg, hash, &mut loop_state,
@@ -382,9 +653,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             )
                             .await;
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
                             dispatch::reconcile_lagged(
-                                &self.fifo, &self.cfg, &mut loop_state,
+                                &self.fifo, &self.cfg, &mut loop_state, n,
                                 &mut apply_fn,
                             )
                             .await;
@@ -397,11 +668,55 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             break;
                         }
                     }
+                    // Sync preconf gas delta into `info` so the pool arm's
+                    // `is_tx_over_limits` sees an accurate block-gas total.
+                    info.cumulative_gas_used += loop_state.preconf_gas_used() - before;
+                }
+                // Admits ONE pool tx per fire, then returns to select! so
+                // biased cancel / preconf can preempt between every tx.
+                _ = std::future::ready(()), if best_txs_iter.is_some()
+                    && loop_state.pool_gas_used() < pool_quota =>
+                {
+                    let iter = best_txs_iter.as_mut().expect("guard verified Some");
+                    let before = info.cumulative_gas_used;
+                    match apply_one_best_tx::<N, _>(
+                        iter,
+                        &mut builder,
+                        &mut info,
+                        block_gas_limit,
+                        block_da_limit,
+                        tx_da_limit,
+                        base_fee,
+                        attrs_timestamp,
+                        da_footprint_gas_scalar,
+                    )? {
+                        BestTxStep::Continue => {
+                            // delta == 0 → tx was filtered (mark_invalid /
+                            // nonce-too-low); iterator has advanced. Next
+                            // select! iteration re-fires this arm and
+                            // pulls the next tx.
+                            let delta = info.cumulative_gas_used - before;
+                            if delta > 0 {
+                                loop_state.record_pool_gas(delta);
+                            }
+                        }
+                        BestTxStep::Done => best_txs_iter = None,
+                    }
+                }
+                // Only bumps `pool_quota`; the pool arm above drains
+                // the new headroom on subsequent iterations.
+                _ = sweep_ticker.tick() => {
+                    pool_quota = pool_quota
+                        .saturating_add(gas_per_batch)
+                        .min(block_gas_limit);
                 }
             }
         }
 
         // ── Stage 4: SDM post-exec refund tx ───────────────────────────
+        // `take_post_exec_entries` collects entries from ALL prior applies
+        // uniformly (sequencer / pool / preconf) — preconf-tx contributions
+        // are automatically included, no special handling needed.
         if ctx.sdm_production_enabled() {
             let block_number = builder.evm_mut().block().number().saturating_to();
             let entries = builder.executor_mut().take_post_exec_entries();
@@ -446,7 +761,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PreconfStatus;
+    use crate::types::{PreconfSource, PreconfStatus};
+    use alloy_consensus::{Signed, TxLegacy};
+    use alloy_primitives::{B256, Signature};
 
     #[derive(Clone, Debug)]
     struct DummyPool;
@@ -467,14 +784,391 @@ mod tests {
             builder_config,
             cfg.clone(),
             fifo.clone(),
+            None,
         );
         assert!(Arc::ptr_eq(builder.cfg(), &cfg));
         assert!(Arc::ptr_eq(builder.fifo(), &fifo));
+        assert!(builder.publisher().is_none());
         // Arc counts: outer + inside builder = 2 each.
         assert_eq!(Arc::strong_count(&cfg), 2);
         assert_eq!(Arc::strong_count(&fifo), 2);
         // Smoke: PreconfStatus is reachable from this module via crate root
         // re-exports, no need to also test accessor traversals here.
         let _ = PreconfStatus::Waiting;
+    }
+
+    fn tx(byte: u8, nonce: u64) -> Arc<TxEnvelope> {
+        let inner = TxLegacy { nonce, gas_limit: 21_000, ..Default::default() };
+        let sig = Signature::test_signature();
+        let hash = B256::from([byte; 32]);
+        Arc::new(TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)))
+    }
+
+    fn synthetic_ok(
+        tx: Arc<TxEnvelope>,
+        hash: TxHash,
+        height: u64,
+    ) -> Result<PreconfReceipt, PreconfError> {
+        use alloy_primitives::Bytes;
+        Ok(PreconfReceipt {
+            tx_hash: hash,
+            block_height: height,
+            status: true,
+            logs: Vec::new(),
+            gas_used: tx.gas_limit(),
+            reason: String::new(),
+            revert_data: Bytes::new(),
+        })
+    }
+
+    /// `replay_fifo_carryover` applies both `Waiting` and `Success`
+    /// entries (each is a carryover source) and skips terminal-non-
+    /// success statuses (`Failed` / `Timeout` / `Canceled`).
+    #[tokio::test]
+    async fn replay_fifo_carryover_applies_waiting_and_success_only() {
+        use std::cell::RefCell;
+        let fifo = PreconfTxSet::new(16);
+        let cfg = PreconfConfig::default();
+        // Five entries covering every non-transient status.
+        let t_wait = tx(0xa1, 0);
+        let t_succ = tx(0xa2, 0);
+        let t_fail = tx(0xa3, 0);
+        let t_to = tx(0xa4, 0);
+        let t_cancel = tx(0xa5, 0);
+        fifo.push_if_absent(t_wait.clone(), Address::from([1; 20]), PreconfSource::Rpc).await;
+        fifo.push_if_absent(t_succ.clone(), Address::from([2; 20]), PreconfSource::Rpc).await;
+        fifo.push_if_absent(t_fail.clone(), Address::from([3; 20]), PreconfSource::Rpc).await;
+        fifo.push_if_absent(t_to.clone(), Address::from([4; 20]), PreconfSource::Rpc).await;
+        fifo.push_if_absent(t_cancel.clone(), Address::from([5; 20]), PreconfSource::Rpc).await;
+        fifo.mark_succeeded(t_succ.tx_hash()).await.unwrap();
+        fifo.mark_failed(t_fail.tx_hash()).await.unwrap();
+        fifo.mark_timeout(t_to.tx_hash()).await.unwrap();
+        fifo.mark_canceled(t_cancel.tx_hash()).await.unwrap();
+
+        let mut loop_state = dispatch::LoopState::new(1);
+        let seen: RefCell<Vec<TxHash>> = RefCell::new(Vec::new());
+        let apply_fn = |tx, hash, height| {
+            seen.borrow_mut().push(hash);
+            synthetic_ok(tx, hash, height)
+        };
+        replay_fifo_carryover(&fifo, &cfg, &mut loop_state, apply_fn).await;
+
+        // Waiting + Success applied (in insertion order); Failed / Timeout /
+        // Canceled skipped.
+        assert_eq!(*seen.borrow(), vec![*t_wait.tx_hash(), *t_succ.tx_hash()]);
+        // Both applied entries now Success (Waiting → Success direct; Success
+        // → Waiting → Success round trip).
+        assert_eq!(
+            fifo.find_by_hash(t_wait.tx_hash()).await.unwrap().status,
+            PreconfStatus::Success,
+        );
+        assert_eq!(
+            fifo.find_by_hash(t_succ.tx_hash()).await.unwrap().status,
+            PreconfStatus::Success,
+        );
+        // Terminal-non-success entries untouched.
+        assert_eq!(
+            fifo.find_by_hash(t_fail.tx_hash()).await.unwrap().status,
+            PreconfStatus::Failed,
+        );
+        assert_eq!(
+            fifo.find_by_hash(t_to.tx_hash()).await.unwrap().status,
+            PreconfStatus::Timeout,
+        );
+        assert_eq!(
+            fifo.find_by_hash(t_cancel.tx_hash()).await.unwrap().status,
+            PreconfStatus::Canceled,
+        );
+    }
+
+    /// Waiting entries keep their original `source` after replay — the
+    /// helper only upgrades source on the `Success → Waiting` reset
+    /// path, not on entries that were already `Waiting`. This is
+    /// intentional: Rpc-sourced Waiting entries must still respect the
+    /// deadline gate so genuinely stale RPC pushes get timed out.
+    #[tokio::test]
+    async fn replay_fifo_carryover_preserves_waiting_source() {
+        let fifo = PreconfTxSet::new(16);
+        let cfg = PreconfConfig::default();
+        let t_rpc = tx(0xb0, 0);
+        let t_journal = tx(0xb1, 0);
+        fifo.push_if_absent(t_rpc.clone(), Address::from([1; 20]), PreconfSource::Rpc).await;
+        fifo.push_if_absent(
+            t_journal.clone(),
+            Address::from([2; 20]),
+            PreconfSource::Replay,
+        )
+        .await;
+
+        let mut loop_state = dispatch::LoopState::new(1);
+        replay_fifo_carryover(&fifo, &cfg, &mut loop_state, synthetic_ok).await;
+
+        // Sources preserved for entries that were already Waiting.
+        assert_eq!(
+            fifo.find_by_hash(t_rpc.tx_hash()).await.unwrap().source,
+            PreconfSource::Rpc,
+        );
+        assert_eq!(
+            fifo.find_by_hash(t_journal.tx_hash()).await.unwrap().source,
+            PreconfSource::Replay,
+        );
+    }
+
+    /// Carryover replay applies entries in fifo insertion order —
+    /// critical for SLA determinism vs concurrent RPC pushes that
+    /// might race the preamble.
+    #[tokio::test]
+    async fn replay_fifo_carryover_preserves_fifo_order() {
+        use std::cell::RefCell;
+        let fifo = PreconfTxSet::new(16);
+        let cfg = PreconfConfig::default();
+        let mut expected = Vec::new();
+        for i in 0..3u8 {
+            let t = tx(0xc0 + i, 0);
+            expected.push(*t.tx_hash());
+            fifo.push_if_absent(t, Address::from([i + 1; 20]), PreconfSource::Rpc).await;
+            fifo.mark_succeeded(&expected[i as usize]).await.unwrap();
+        }
+
+        let mut loop_state = dispatch::LoopState::new(1);
+        let seen: RefCell<Vec<TxHash>> = RefCell::new(Vec::new());
+        let apply_fn = |tx, hash, height| {
+            seen.borrow_mut().push(hash);
+            synthetic_ok(tx, hash, height)
+        };
+        replay_fifo_carryover(&fifo, &cfg, &mut loop_state, apply_fn).await;
+
+        assert_eq!(*seen.borrow(), expected, "carryover replay must respect FIFO insertion order");
+    }
+
+    /// Stale Success entries always bypass the RPC-only deadline and
+    /// gas-budget gates — even under a tight budget the replay must
+    /// apply them (SLA: receipt already returned → tx must land).
+    /// Confirms the source-promotion side effect of
+    /// `reset_success_to_waiting` reaches `apply_one_preconf`'s gate.
+    #[tokio::test]
+    async fn replay_fifo_carryover_bypasses_gas_budget_gate_for_stale_success() {
+        let fifo = PreconfTxSet::new(16);
+        // Tight budget that would reject an Rpc-sourced entry.
+        let cfg = PreconfConfig {
+            preconf_max_gas_per_block: 10_000, // < tx.gas_limit (21_000)
+            preconf_max_gas_per_tx: 30_000,
+            ..PreconfConfig::default()
+        };
+        let t = tx(0xd0, 0);
+        let hash = *t.tx_hash();
+        fifo.push_if_absent(t, Address::from([1; 20]), PreconfSource::Rpc).await;
+        fifo.mark_succeeded(&hash).await.unwrap();
+
+        let mut loop_state = dispatch::LoopState::new(1);
+        replay_fifo_carryover(&fifo, &cfg, &mut loop_state, synthetic_ok).await;
+
+        // Applied despite over-budget — replay promoted source to Replay
+        // which bypasses the gas gate.
+        let entry = fifo.find_by_hash(&hash).await.unwrap();
+        assert_eq!(entry.status, PreconfStatus::Success);
+        assert_eq!(entry.source, PreconfSource::Replay);
+    }
+
+    /// Empty fifo — helper is a no-op, does not error.
+    #[tokio::test]
+    async fn replay_fifo_carryover_on_empty_fifo_is_noop() {
+        let fifo = PreconfTxSet::new(16);
+        let cfg = PreconfConfig::default();
+        let mut loop_state = dispatch::LoopState::new(1);
+        replay_fifo_carryover(&fifo, &cfg, &mut loop_state, synthetic_ok).await;
+        assert!(fifo.entries().await.is_empty());
+    }
+
+    // ============ try_include_post_exec_tx ============
+    //
+    // Tests exercise the helper's three branches via a fake `Tx` /
+    // `execute` closure, without spinning up a real BlockBuilder — the
+    // helper is upstream-shaped and doesn't depend on EVM state.
+
+    /// A minimal `Tx` stand-in that satisfies `From<Sealed<TxPostExec>>`
+    /// so `try_include_post_exec_tx` can construct it. The body is
+    /// irrelevant — the `execute` closure treats it as an opaque token.
+    struct FakePostExecTx;
+    impl From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>> for FakePostExecTx {
+        fn from(_: alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>) -> Self {
+            FakePostExecTx
+        }
+    }
+
+    /// Empty `entries` short-circuits to `Ok(false)` and the `execute`
+    /// closure is never invoked. Locks the "no-op signal" contract.
+    #[test]
+    fn try_include_post_exec_tx_empty_entries_returns_ok_false_without_invoking_execute() {
+        use std::cell::Cell;
+        let invoked = Cell::new(false);
+        let result = try_include_post_exec_tx::<FakePostExecTx, std::io::Error>(
+            42,
+            Vec::new(),
+            |_| {
+                invoked.set(true);
+                Ok(0)
+            },
+        );
+        assert!(matches!(result, Ok(false)));
+        assert!(!invoked.get(), "execute closure must not be called on empty entries");
+    }
+
+    /// Non-empty entries + `execute` returns Ok: helper returns
+    /// `Ok(true)` and invokes `execute` exactly once with a
+    /// `Recovered<Tx>` synthesised from the built post-exec tx.
+    #[test]
+    fn try_include_post_exec_tx_non_empty_ok_path_invokes_execute_once() {
+        use std::cell::Cell;
+        let call_count = Cell::new(0u32);
+        let entries = vec![SDMGasEntry::default()];
+        let result = try_include_post_exec_tx::<FakePostExecTx, std::io::Error>(
+            42,
+            entries,
+            |_recovered| {
+                call_count.set(call_count.get() + 1);
+                Ok(21_000)
+            },
+        );
+        assert!(matches!(result, Ok(true)));
+        assert_eq!(call_count.get(), 1, "execute must be invoked exactly once");
+    }
+
+    /// `execute` Err path: helper wraps the closure error in
+    /// `PayloadBuilderError::evm(..)` (fatal for the payload build).
+    #[test]
+    fn try_include_post_exec_tx_execute_err_wraps_into_payload_builder_error() {
+        let entries = vec![SDMGasEntry::default()];
+        let err = try_include_post_exec_tx::<FakePostExecTx, std::io::Error>(
+            42,
+            entries,
+            |_| Err(std::io::Error::other("synthetic execute failure")),
+        )
+        .expect_err("execute Err must surface as PayloadBuilderError");
+        // Only sanity-check that the error chain reaches down to our
+        // synthetic message — the wrapping variant `evm(..)` is an
+        // internal detail of `PayloadBuilderError`.
+        let chain = format!("{err:#}");
+        assert!(chain.contains("synthetic execute failure"), "unexpected error chain: {chain}");
+    }
+
+    // ============ derive_pool_quota_schedule ============
+    //
+    // Pure-function math tests for the adaptive-N pool quota schedule.
+    // These are wall-clock free — the caller pre-computes `time_drift`,
+    // so the helper is deterministic.
+
+    const TEST_SLOT: std::time::Duration = std::time::Duration::from_millis(2000);
+    const TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+    const TEST_BLOCK_GAS: u64 = 30_000_000;
+
+    /// No delay: full slot remaining. Schedule matches the "no-delay"
+    /// case documented in the state-machine comment — 10 ticks × 3M
+    /// each, first tick aligned to `sweep_interval`.
+    #[test]
+    fn quota_schedule_full_slot_produces_ten_ticks_of_three_million_each() {
+        let s = derive_pool_quota_schedule(TEST_SLOT, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
+        assert_eq!(s.ticks_remaining, 10);
+        assert_eq!(s.gas_per_batch, 3_000_000);
+        // Aligned drift → first tick equals full interval.
+        assert_eq!(s.first_offset, TEST_INTERVAL);
+        assert_eq!(s.build_delay_ms, 0);
+        assert_eq!(s.time_drift, TEST_SLOT);
+    }
+
+    /// Delay 1s (1s remaining). Adaptive-N shrinks to 5 ticks × 6M each
+    /// — pool still fills the whole block over the remaining window.
+    #[test]
+    fn quota_schedule_one_second_delay_produces_five_ticks_of_six_million_each() {
+        let drift = std::time::Duration::from_millis(1000);
+        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
+        assert_eq!(s.ticks_remaining, 5);
+        assert_eq!(s.gas_per_batch, 6_000_000);
+        assert_eq!(s.first_offset, TEST_INTERVAL); // 1000 % 200 == 0 → align to interval
+        assert_eq!(s.build_delay_ms, 1000);
+    }
+
+    /// Non-aligned drift: `first_offset` shrinks to the remainder so
+    /// every subsequent tick lands on an interval boundary within the
+    /// slot. 900ms remaining → first tick after 100ms, then every
+    /// 200ms → 5 ticks total: [100, 300, 500, 700, 900].
+    #[test]
+    fn quota_schedule_non_aligned_drift_uses_remainder_as_first_offset() {
+        let drift = std::time::Duration::from_millis(900);
+        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
+        assert_eq!(s.first_offset, std::time::Duration::from_millis(100));
+        // ceil(900/200) = 5 ticks; each tick admits 6M.
+        assert_eq!(s.ticks_remaining, 5);
+        assert_eq!(s.gas_per_batch, 6_000_000);
+        assert_eq!(s.build_delay_ms, 1100);
+    }
+
+    /// Extreme delay: less than one interval remaining. Schedule still
+    /// admits one tick with the full block budget — a "single-shot"
+    /// pool sweep at the end of the slot rather than degenerating to
+    /// zero pool admission.
+    #[test]
+    fn quota_schedule_sub_interval_drift_yields_one_tick_full_budget() {
+        let drift = std::time::Duration::from_millis(120);
+        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
+        assert_eq!(s.ticks_remaining, 1);
+        assert_eq!(s.gas_per_batch, TEST_BLOCK_GAS);
+        // 120 % 200 = 120 → first tick after 120ms.
+        assert_eq!(s.first_offset, std::time::Duration::from_millis(120));
+        assert_eq!(s.build_delay_ms, 1880);
+    }
+
+    /// Late FCU / clock skew: caller has already fallen back to
+    /// `sweep_interval` (its typical fallback). Schedule handles it
+    /// gracefully — one tick, full budget, offset = interval.
+    #[test]
+    fn quota_schedule_fallback_to_sweep_interval_is_valid() {
+        let s =
+            derive_pool_quota_schedule(TEST_INTERVAL, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
+        assert_eq!(s.ticks_remaining, 1);
+        assert_eq!(s.gas_per_batch, TEST_BLOCK_GAS);
+        assert_eq!(s.first_offset, TEST_INTERVAL);
+    }
+
+    /// Drift exceeds slot_duration (misconfigured attrs.timestamp far
+    /// in the future). Clamped to `slot_duration` — no unbounded quota.
+    #[test]
+    fn quota_schedule_over_long_drift_clamps_to_slot_duration() {
+        let drift = std::time::Duration::from_secs(60);
+        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
+        assert_eq!(s.time_drift, TEST_SLOT);
+        // Same as full-slot case.
+        assert_eq!(s.ticks_remaining, 10);
+        assert_eq!(s.gas_per_batch, 3_000_000);
+    }
+
+    /// Sum-invariant: `ticks_remaining × gas_per_batch` ≤
+    /// `block_gas_limit` (integer division floor). Pool never
+    /// over-admits by design; slight under-admission (up to
+    /// `ticks_remaining - 1` gas due to floor) is acceptable and
+    /// bounded.
+    #[test]
+    fn quota_schedule_total_admission_never_exceeds_block_gas() {
+        for drift_ms in [100u64, 200, 500, 900, 1000, 1500, 1900, 2000] {
+            let s = derive_pool_quota_schedule(
+                std::time::Duration::from_millis(drift_ms),
+                TEST_INTERVAL,
+                TEST_SLOT,
+                TEST_BLOCK_GAS,
+            );
+            let total_admitted = s.ticks_remaining.saturating_mul(s.gas_per_batch);
+            assert!(
+                total_admitted <= TEST_BLOCK_GAS,
+                "drift_ms={drift_ms}: total {total_admitted} exceeds block gas {TEST_BLOCK_GAS}",
+            );
+            // Under-admission bound: at most (ticks_remaining - 1) gas
+            // lost to floor rounding.
+            let under = TEST_BLOCK_GAS - total_admitted;
+            assert!(
+                under < s.ticks_remaining,
+                "drift_ms={drift_ms}: under-admission {under} exceeds ticks {ticks}",
+                ticks = s.ticks_remaining,
+            );
+        }
     }
 }

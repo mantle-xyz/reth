@@ -22,14 +22,15 @@
 //!
 //! ## What this generator does NOT do (yet)
 //!
-//! - **`on_new_state`**: no cached-reads pre-warming. Step 5 leaves
-//!   the default no-op trait impl in place; the cached-reads
-//!   optimisation lands alongside the cli wiring in Step 7 if needed.
-//! - **`ensure_only_one_payload`**: base cancels existing payload
-//!   jobs before spawning a new one (see `Base/.../generator.rs`).
-//!   We don't — `last_payload` cancel-on-drop semantics aren't needed
-//!   until production rollout, and skipping it keeps this step focused
-//!   on the trait wiring. The [`PayloadJob`]'s own `Drop` impl handles
+//! - **`on_new_state`**: no cached-reads pre-warming. Default no-op
+//!   trait impl in place; the cached-reads optimisation is a
+//!   follow-up if pool-side cache misses dominate slot latency.
+//! - **`ensure_only_one_payload`**: `BasicPayloadJobGenerator` cancels
+//!   existing payload jobs before spawning a new one (see
+//!   `basic-payload-builder/src/generator.rs`). This generator does
+//!   not — `last_payload` cancel-on-drop semantics are not needed
+//!   until production rollout, and skipping it keeps the trait
+//!   wiring focused. The [`PayloadJob`]'s own `Drop` impl handles
 //!   spawned-task cleanup.
 //! - **Deadlines**: no auto-cancel on slot deadline; the payload
 //!   service drives cancel via `resolve_kind` instead.
@@ -70,9 +71,8 @@ use crate::builder::{
 /// attributes and [`OpPayloadBuilderAttributes<N::SignedTx>`] (builder
 /// variant) for internal block building. This mirrors upstream's
 /// `OpPayloadBuilder::try_build` / `convert_build_args` split — see
-/// `op-reth/crates/payload/src/builder.rs:344`. The generic `Attrs`
-/// parameter was tried in earlier iterations (Step 7c) but couldn't
-/// express the wrapper-unwrap step
+/// `op-reth/crates/payload/src/builder.rs:344`. A generic `Attrs`
+/// parameter cannot express the wrapper-unwrap step
 /// (`OpPayloadAttrs.0 → OpPayloadAttributes → from_rpc_attrs`)
 /// through the trait system cleanly; going OP-specific is the path
 /// upstream itself takes.
@@ -187,8 +187,9 @@ where
         let config = PayloadConfig::new(Arc::new(parent_header), builder_attrs, id);
         let args: BuildArguments<OpPayloadBuilderAttributes<TxTy<N>>, OpBuiltPayload<N>> =
             BuildArguments::new(
-            // No cached-reads yet — Step 7 may wire this in via the
-            // service builder's `on_new_state` cache.
+            // No cached-reads yet — a follow-up may wire this in via
+            // `on_new_state` if pool-side cache misses become
+            // significant.
             Default::default(),
             cache,
             trie_handle,
@@ -295,7 +296,7 @@ mod tests {
     //! Generator-level tests require a full reth provider stack
     //! (`StateProviderFactory` + `ChainSpecProvider` + `BlockReaderIdExt`
     //! impls), which is too heavy for a unit-test mod. Integration
-    //! coverage lands alongside the e2e tests in Step 9 (where reth's
+    //! coverage is deferred to the e2e test suite (where reth's
     //! `MockEthProvider` or similar is plumbed up).
     //!
     //! Compile-time check: the constructor is callable with concrete
@@ -303,7 +304,7 @@ mod tests {
     //! would require a real `PreconfPayloadBuilder` which itself needs
     //! Pool/Client/Evm — also heavy. We rely on `cargo check` /
     //! downstream cli build to catch type-plumbing regressions until
-    //! Step 9.
+    //! the e2e suite lands.
 
     use super::*;
     use std::marker::PhantomData;

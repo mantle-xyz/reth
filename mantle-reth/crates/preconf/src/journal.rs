@@ -19,13 +19,16 @@
 //!
 //! - **sealed set** — hashes that the canonical-state handler has
 //!   reported as included in a sealed block. Used by the rotation step
-//!   to drop already-on-chain entries from the next file generation.
+//!   to drop already-on-chain entries from the next file generation,
+//!   and by the pool listener to detect reorg reinjects (a hash in the
+//!   sealed set that reappears via pool re-admission was previously
+//!   promised — see `pool_ext::preconf_pool_listener`).
 //!
-//! At this phase the journal supports `append_promised` / `load` /
-//! `mark_sealed` / `contains` and a simple `rotate` that drops sealed
-//! entries. The startup `restore_preconf_state` helper, the
-//! event-suppressing `RestoredSet`, and the background rotation loop
-//! follow next.
+//! The journal exposes `append_promised` / `load` / `mark_sealed` /
+//! `contains` / `rotate` for the durability path, plus the startup
+//! helper [`restore_preconf_state`], the event-suppressing
+//! [`RestoredSet`], the [`EventPublisher`] broadcast wrapper, and the
+//! background rotation loop [`spawn_rejournal_loop`].
 
 use std::{
     collections::HashSet,
@@ -237,6 +240,12 @@ impl PreconfJournal {
     /// 100 TPS.
     pub async fn rotate(&self) -> Result<RotateStats, JournalError> {
         let (entries, bad_before) = self.load().await?;
+        // Snapshot the sealed set once here. Any `mark_sealed` firing
+        // during the rewrite is intentionally not observed by this
+        // rotation — its hash will land in the sealed set for the
+        // *next* tick, which prevents a hash from being both dropped
+        // by this rotate AND missing from the sealed set on the same
+        // pass.
         let sealed_snapshot: HashSet<TxHash> = self.sealed.lock().await.clone();
 
         let mut kept = 0usize;
@@ -290,7 +299,10 @@ pub struct RotateStats {
     pub kept: usize,
     /// Sealed entries dropped during rotation.
     pub dropped: usize,
-    /// Corrupt lines skipped during the read pass.
+    /// Corrupt lines observed during the read pass. Rotate silently
+    /// removes them from the rewritten file (they're not carried over
+    /// into the new generation) — this count is reported for
+    /// operator-facing metrics only, not for retry / repair logic.
     pub bad_lines_skipped: usize,
 }
 
@@ -382,19 +394,40 @@ impl RestoredSet {
 #[async_trait::async_trait]
 pub trait RestorePool: Send + Sync {
     /// Whether the pool already knows about this tx (e.g. via its own
-    /// journal). Returning `true` short-circuits the re-injection
-    /// path; the fifo push still happens regardless.
+    /// journal). Currently unused by [`restore_preconf_state`] — the
+    /// unified `add_envelope` path handles both "new admit" and
+    /// "already imported" branches — but kept on the trait for
+    /// metric / telemetry callers that want an explicit pre-check.
     async fn contains(&self, hash: &TxHash) -> bool;
 
-    /// Decode + recover + admit `tx_rlp` into the pool. Returning `Ok`
-    /// means the tx is now in the pool's `Pending` (or `Queued`)
-    /// sub-pool; returning `Err` is treated as a soft failure — the
-    /// restore helper logs and continues with the remaining entries.
+    /// Decode + recover + attempt to admit `tx_rlp` into the pool.
     ///
-    /// The implementation is also responsible for delivering the
-    /// recovered [`TxEnvelope`] back so the journal can push it into
-    /// the fifo without re-decoding.
+    /// Returns `Ok(recovered)` in both of the following cases:
+    /// - the tx was newly admitted;
+    /// - the pool rejected admission with `AlreadyImported`
+    ///   (e.g. reth's local-tx backup restored the same tx first).
+    ///
+    /// In either case the caller needs the recovered envelope + sender
+    /// to push into the fifo — whether the pool already had the tx is
+    /// orthogonal.
+    ///
+    /// Only genuine pool errors (bad signature, nonce mismatch on the
+    /// post-restart state, ...) surface as `Err(reason)` — the restore
+    /// helper logs and skips those entries.
     async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, String>;
+
+    /// Synchronously remove transactions from the pool by hash. Used
+    /// by [`PreconfTxSet`](crate::PreconfTxSet)'s pool-eviction
+    /// callback path — every transition to a non-on-chain terminal
+    /// state (`Timeout` / `Canceled` / `Failed`) triggers a same-hash
+    /// eviction to close the "client saw failure but tx later lands"
+    /// SLA gap (R3/SLA-1).
+    ///
+    /// Idempotent — absent hashes are silently ignored (reth's
+    /// `pool.remove_transactions` returns an empty `Vec` in that
+    /// case). Sync because reth's `TransactionPool::remove_transactions`
+    /// is sync and holds only the pool's internal mutex briefly.
+    fn remove_transactions(&self, hashes: Vec<TxHash>);
 }
 
 /// Output of a successful [`RestorePool::add_envelope`] — the decoded
@@ -414,22 +447,23 @@ pub struct RestoredEnvelope {
 /// Walk the journal at startup and re-establish the in-memory state
 /// the running system expects.
 ///
-/// Steps, per entry, in order:
+/// For each entry, in order:
 ///
-/// 1. If the pool already knows about the hash (its own journal
-///    survived the crash), skip the re-injection — adding twice
-///    would just yield `AlreadyImported`.
-/// 2. Otherwise, decode + admit via [`RestorePool::add_envelope`].
-///    On failure (already on chain, signature broken on disk, ...)
-///    log and skip — best-effort restore, never block startup.
-/// 3. Push the (now-decoded) envelope into the fifo via
-///    [`PreconfTxSet::push_if_absent`] so the in-flight commitment
-///    state matches what the client saw before the crash.
-/// 4. Record the hash in the returned [`RestoredSet`].
+/// 1. Decode + attempt to admit into the pool via
+///    [`RestorePool::add_envelope`]. The trait treats `AlreadyImported`
+///    as success — reth's own local-tx backup may have restored the
+///    same tx from disk before this call, and either outcome yields
+///    the recovered envelope needed for the fifo push.
+/// 2. Push the recovered envelope into the fifo with
+///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so
+///    the dispatch layer's deadline / gas-budget gates bypass the tx
+///    (SLA: "receipt returned → tx must land").
+/// 3. Record the hash in the returned [`RestoredSet`].
 ///
-/// The function returns the [`RestoredSet`] regardless of how many
-/// individual entries failed; corrupt lines are already filtered out
-/// by [`PreconfJournal::load`].
+/// Non-recoverable failures (corrupt tx bytes, pool refusal for reasons
+/// other than `AlreadyImported`) are logged and skipped — best-effort
+/// restore, never block startup. The function returns the
+/// [`RestoredSet`] regardless of how many individual entries failed.
 pub async fn restore_preconf_state<P: RestorePool>(
     journal: &PreconfJournal,
     pool: &P,
@@ -454,49 +488,33 @@ pub async fn restore_preconf_state<P: RestorePool>(
     );
 
     let mut restored: Vec<TxHash> = Vec::with_capacity(entries.len());
-    let mut pool_skips = 0usize;
     let mut decode_failures = 0usize;
 
     for entry in entries {
-        // Step 1: pool already aware? Skip re-injection but still
-        // push to fifo because the in-memory fifo is local to this
-        // process and definitely lost the entry.
-        let need_inject = !pool.contains(&entry.hash).await;
-        let recovered = if need_inject {
-            match pool.add_envelope(&entry.tx_rlp).await {
-                Ok(rec) => rec,
-                Err(reason) => {
-                    warn!(
-                        target: "mantle::preconf::journal",
-                        hash = ?entry.hash,
-                        reason,
-                        "pool rejected restored tx; skipping fifo push"
-                    );
-                    decode_failures += 1;
-                    continue;
-                }
-            }
-        } else {
-            pool_skips += 1;
-            // Pool already had it — we still need a decoded envelope
-            // to push into the fifo. Ask the pool to decode without
-            // admitting (we don't care if admission fails because we
-            // ignore the AlreadyImported error here).
-            match pool.add_envelope(&entry.tx_rlp).await {
-                Ok(rec) => rec,
-                Err(_) => {
-                    // Already imported is the expected outcome; treat
-                    // as a soft skip without re-decoding logic
-                    // duplication.
-                    continue;
-                }
+        let recovered = match pool.add_envelope(&entry.tx_rlp).await {
+            Ok(rec) => rec,
+            Err(reason) => {
+                warn!(
+                    target: "mantle::preconf::journal",
+                    hash = ?entry.hash,
+                    reason,
+                    "pool rejected restored tx; skipping fifo push"
+                );
+                decode_failures += 1;
+                continue;
             }
         };
 
-        // Step 3: push to fifo. ConflictActive happens if a fresher
-        // tx already sits in the (sender, nonce) slot — accept the
+        // Push to fifo. `ConflictActive` happens if a fresher tx
+        // already occupies the (sender, nonce) slot — accept the
         // newer entry, don't shove a stale journaled one over it.
-        let _ = fifo.push_if_absent(Arc::new(recovered.envelope), recovered.from).await;
+        let _ = fifo
+            .push_if_absent(
+                Arc::new(recovered.envelope),
+                recovered.from,
+                crate::types::PreconfSource::Replay,
+            )
+            .await;
 
         restored.push(entry.hash);
     }
@@ -504,7 +522,6 @@ pub async fn restore_preconf_state<P: RestorePool>(
     info!(
         target: "mantle::preconf::journal",
         restored = restored.len(),
-        pool_skips,
         decode_failures,
         "preconf restore complete"
     );
@@ -609,8 +626,10 @@ impl EventPublisher {
 ///
 /// Returns the [`JoinHandle`] so the service builder can wait for
 /// graceful shutdown. Send `()` on `shutdown_rx`'s paired sender to
-/// stop the loop; the current rotation completes before exit so the
-/// file is never left in a half-written state.
+/// stop the loop. The `select!` inside is not preemptive across
+/// awaits *within* a rotate call, so a shutdown signal fired mid-
+/// rotate is observed only when the current rotate resolves — this
+/// guarantees the file is never left in a half-written state.
 ///
 /// The first rotation is skipped (the interval's immediate-first tick
 /// is consumed at start) so a long-running node does not rotate a
@@ -877,6 +896,9 @@ mod tests {
             self.contains_calls.lock().unwrap().push(*hash);
             self.known.contains(hash)
         }
+        fn remove_transactions(&self, _hashes: Vec<TxHash>) {
+            // No mark_* fires in journal-only tests; keep no-op.
+        }
         async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, String> {
             self.add_calls.lock().unwrap().push(tx_rlp.clone());
             if self.reject_add {
@@ -933,7 +955,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_skips_pool_inject_when_already_present() {
+    async fn restore_pushes_fifo_when_pool_already_contains() {
+        // Regression guard for J5: pre-fix, when pool.contains returned
+        // true, restore's inner branch called `add_envelope` and treated
+        // the resulting `Err(AlreadyImported)` as `continue;` — the
+        // fifo push was skipped. Post-fix, `add_envelope`'s trait
+        // contract treats AlreadyImported as `Ok(recovered)` and
+        // restore unconditionally pushes to the fifo.
         let (_dir, j) = fresh_journal().await;
         let e1 = entry(3, 30);
         j.append_promised(&e1).await.unwrap();
@@ -943,16 +971,11 @@ mod tests {
         let fifo = Arc::new(PreconfTxSet::new(16));
         let restored = restore_preconf_state(&j, &pool, &fifo).await;
 
-        // The hash returned by the journal is what makes it into
-        // RestoredSet — the stub fabricates a different hash for the
-        // envelope (derived from rlp byte), but the journal entry's
-        // hash is what's authoritative for restore-set membership.
         assert_eq!(restored.len(), 1);
         assert!(restored.contains(&e1.hash));
-        // add_envelope is called once (for decoding to push to fifo),
-        // not zero, because we need the envelope back even when the
-        // pool already has the tx.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 1);
+        // Core J5 assertion: fifo received the entry.
+        assert_eq!(fifo.snapshot().await.len(), 1);
     }
 
     #[tokio::test]
@@ -982,7 +1005,7 @@ mod tests {
             status: mantle_reth_rpc_ext::PreconfStatus::Success,
             reason: String::new(),
             block_height: 0,
-            receipt: mantle_reth_rpc_ext::PreconfTxReceipt { logs: vec![] },
+            receipt: mantle_reth_rpc_ext::PreconfTxReceipt { logs: None },
         }
     }
 
@@ -1075,5 +1098,37 @@ mod tests {
             .await
             .expect("loop did not shut down")
             .expect("loop panicked");
+    }
+
+    /// R6/T4 — After a restored hash's suppression window is closed
+    /// via `RestoredSet::take` (called by canon_handler on Commit),
+    /// subsequent `EventPublisher::publish` for the same hash must go
+    /// through. This is the design contract (see `EventPublisher` doc
+    /// §"Wraps the newPreconfTransaction subscription channel...").
+    ///
+    /// The publisher itself does NOT auto-drain restored entries on
+    /// publish — `contains` is a peek, not a take. Removal is the
+    /// canon-handler's responsibility.
+    #[tokio::test]
+    async fn event_publisher_take_after_suppress_allows_second_publish() {
+        let h = TxHash::from([0x77; 32]);
+        let restored = RestoredSet::with_hashes([h]);
+        let publisher = EventPublisher::new(8, restored.clone());
+        let mut rx = publisher.subscribe();
+
+        // First publish: suppressed because `h` is in restored set.
+        let event = event_with_hash(0x77);
+        assert!(!publisher.publish(event.clone()), "first publish suppressed");
+        assert!(rx.try_recv().is_err(), "subscriber saw nothing");
+
+        // Idle publish: peek did NOT drain restored — still suppressed.
+        assert!(!publisher.publish(event.clone()), "still suppressed on retry");
+
+        // Simulate canon-handler Commit: explicitly drain.
+        assert!(restored.take(&h), "take reports presence");
+
+        // Third publish: not suppressed anymore.
+        assert!(publisher.publish(event.clone()), "publish goes through after take");
+        assert_eq!(rx.try_recv().expect("event delivered").tx_hash, h);
     }
 }

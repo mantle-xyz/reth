@@ -1,19 +1,70 @@
 //! Common types shared across preconf modules.
 
-use alloy_primitives::{B256, Bytes, Log, TxHash};
+use alloy_primitives::{Bytes, Log, TxHash};
 use serde::{Deserialize, Serialize};
 
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
 /// by `mantle-reth-rpc-ext`.
 ///
-/// State machine (`mark_succeeded` / `mark_failed` / `mark_timeout`
-/// / `recover_from_timeout`):
+/// State machine (transitions via `PreconfTxSet::mark_*` / `recover_*` /
+/// `reset_success_to_waiting`):
 ///
 /// ```text
-///                  ┌──→ Success    (terminal)
-/// Waiting ────────┼──→ Failed     (terminal)
-///                  └──→ Timeout    (CAS from Waiting; recoverable to Waiting)
+///                     ┌──→ Success   (applied to an in-flight builder;
+///                     │              dropped by `forward()` on canon commit;
+///                     │              if still present after canon → stale
+///                     │              in-flight, reset via
+///                     │              `reset_success_to_waiting` → Waiting.
+///                     │              Note: EVM revert / halt also reach this
+///                     │              status — the receipt carries
+///                     │              `status = false`, but the tx does land
+///                     │              on chain, matching op-geth semantics.)
+///                     ├──→ Failed    (builder rejected the tx pre-execute
+///                     │              — nonce-too-low / gas-over-block-limit /
+///                     │              other `BlockExecutionError::Validation`;
+///                     │              tx NOT on chain. Distinct from EVM
+///                     │              revert / halt, which flow through the
+///                     │              Success arm above.)
+/// [push] → Waiting ──┤
+///                     ├──→ Timeout   (NOT on chain — client's deadline hit;
+///                     │               `recover_from_reclaimable` → Waiting)
+///                     └──→ Canceled  (NOT on chain — server pre-apply reject:
+///                                      block gas budget, admin kick, etc.;
+///                                      `recover_from_reclaimable` → Waiting)
 /// ```
+///
+/// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — they
+/// mean different things and are NOT connected by a direct mapping:
+/// - Fifo `Failed` = builder rejected pre-execute, tx NOT on chain
+/// - Wire `Failed` (see `mantle-reth-rpc-ext::PreconfStatus`) =
+///   `receipt.status == false` (revert / halt), tx IS on chain
+///
+/// The wire-layer status is derived by the RPC handler from the
+/// returned `PreconfReceipt.status` field, not from this enum.
+///
+/// All forward transitions are CAS: they require current status == Waiting,
+/// otherwise `MarkError::IllegalTransition(current)` is returned.
+///
+/// **Success is not strictly terminal**: a `Success` entry that still exists
+/// in the fifo means "applied to an in-flight builder but that builder's
+/// block was never canon'd" — because `canon_handler::forward()` drops the
+/// entry entirely on canon commit. On a new payload job start, such stale
+/// `Success` entries are reset to `Waiting` and re-applied against the new
+/// builder to honor the mantle preconf SLA ("receipt returned → tx must
+/// land on chain"). The presence-of-entry acts as the "in-flight, not
+/// canon" flag; no separate `InFlight` variant is needed.
+///
+/// **Timeout vs Canceled** — both are "not on chain, retryable" but signal
+/// different causes to the client:
+/// - `Timeout` — the RPC handler's deadline elapsed. Client's request was
+///   accepted; server may or may not have run apply.
+/// - `Canceled` — the server pre-apply rejected the tx (e.g. `BlockGasBudget`
+///   gate in the dispatch loop). Server explicitly declined; no EVM state
+///   change happened.
+///
+/// SDKs typically retry `Timeout` immediately (server might succeed next
+/// time) and back off / change strategy for `Canceled` (server said "not
+/// now" — retrying without changes may hit the same rejection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PreconfStatus {
     /// Awaiting builder apply.
@@ -28,6 +79,39 @@ pub enum PreconfStatus {
     /// Server-side timeout — only Waiting can transition here (CAS).
     #[serde(rename = "timeout")]
     Timeout,
+    /// Server pre-apply rejection (block gas budget, admin action, ...) —
+    /// only Waiting can transition here (CAS). Recoverable via
+    /// `recover_from_canceled`.
+    #[serde(rename = "canceled")]
+    Canceled,
+}
+
+/// Origin of a preconf entry in the fifo. Determines which pre-apply
+/// gates apply during dispatch.
+///
+/// - `Rpc` — pushed by the RPC handler on behalf of an active client
+///   session. Subject to the deadline and per-block gas budget gates so
+///   the client's SLA and server budget are both honored.
+/// - `Replay` — pushed to fulfill a commitment the sequencer has
+///   already promised to a client. Covers two triggers:
+///     - **Startup journal replay** (`restore_preconf_state`) — commitments
+///       persisted before a crash.
+///     - **Reorg reinject** — the pool re-admits a previously sealed tx
+///       after reorg; the pool listener detects the case via
+///       `journal.sealed` membership.
+///   In both cases the Mantle preconf SLA (*"once a receipt has been
+///   returned to the client, the tx must land on chain"*) requires
+///   these entries to **bypass** the deadline and per-block gas budget
+///   gates. They remain subject to the status / dedup gates and the
+///   underlying block gas limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PreconfSource {
+    /// Live RPC submission — subject to all pre-apply gates.
+    Rpc,
+    /// Replay of a previously-promised commitment (startup journal
+    /// restore or pool reorg reinject). Bypasses deadline and
+    /// gas-budget gates so promised txs are guaranteed to land.
+    Replay,
 }
 
 /// Receipt produced by builder apply; mirrored to the wire-layer
@@ -95,17 +179,19 @@ pub enum MarkError {
     IllegalTransition(PreconfStatus),
 }
 
-/// Errors returned by [`crate::preconf_tx_set::PreconfTxSet::recover_from_timeout`].
+/// Errors returned by [`crate::preconf_tx_set::PreconfTxSet::recover_from_timeout`]
+/// and [`crate::preconf_tx_set::PreconfTxSet::recover_from_canceled`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecoverError {
-    /// Entry no longer present — typically lost a race with `clean_timeout`.
+    /// Entry no longer present — typically lost a race with `clean_reclaimable`.
     /// RPC handler then falls back to `cancel_responder` with a cleaner error.
     #[error("entry not found")]
     NotFound,
-    /// Entry exists but is not in `Timeout` state — recovery is only valid
-    /// from `Timeout`. Caller logs current status.
-    #[error("expected Timeout but found {0:?}")]
-    NotTimeout(PreconfStatus),
+    /// Entry exists but is not in the state expected by the recovery method
+    /// — `recover_from_timeout` expects `Timeout`, `recover_from_canceled`
+    /// expects `Canceled`. Caller logs current status.
+    #[error("unexpected status for recovery: found {0:?}")]
+    UnexpectedStatus(PreconfStatus),
 }
 
 /// Top-level preconf error returned to RPC clients.
@@ -182,7 +268,120 @@ pub enum PreconfError {
     Internal(String),
 }
 
-/// Convenience marker for a recoverable transaction hash — currently aliased
-/// to `B256` to match the rest of the codebase. Kept as a type alias so we can
-/// strengthen it later if needed.
-pub type PreconfTxHash = B256;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: the serde tag names for `PreconfStatus` are the wire
+    /// format seen by RPC clients. Any accidental case / spelling change
+    /// silently breaks SDKs — pin the exact strings here.
+    #[test]
+    fn preconf_status_serde_wire_format() {
+        for (status, expected) in [
+            (PreconfStatus::Waiting, "\"waiting\""),
+            (PreconfStatus::Success, "\"success\""),
+            (PreconfStatus::Failed, "\"failed\""),
+            (PreconfStatus::Timeout, "\"timeout\""),
+            (PreconfStatus::Canceled, "\"canceled\""),
+        ] {
+            let s = serde_json::to_string(&status).unwrap();
+            assert_eq!(s, expected, "wire format for {status:?} changed");
+            let round: PreconfStatus = serde_json::from_str(&s).unwrap();
+            assert_eq!(round, status);
+        }
+    }
+
+    /// The Display strings for user-facing error variants are part of the
+    /// public wire contract — SDKs may parse them (e.g. the exact
+    /// "nonce gap: tx nonce N > pending nonce M" wording). Pin the
+    /// substrings to catch accidental rewording.
+    #[test]
+    fn preconf_error_display_wording_is_stable() {
+        assert_eq!(
+            PreconfError::NonceGap { tx_nonce: 85, pending_nonce: 75 }.to_string(),
+            "nonce gap: tx nonce 85 > pending nonce 75",
+        );
+        assert_eq!(
+            PreconfError::GasLimitExceeded { max: 2_000_000, limit: 3_500_000 }.to_string(),
+            "tx gas limit 3500000 exceeds preconf_max_gas_per_tx 2000000",
+        );
+        assert_eq!(
+            PreconfError::Timeout { timeout_ms: 200 }.to_string(),
+            "preconf timeout after 200ms",
+        );
+        assert_eq!(
+            PreconfError::BlockGasBudgetExceeded {
+                max: 6_000_000,
+                used: 5_500_000,
+                limit: 800_000,
+            }
+            .to_string(),
+            "preconf block gas budget exhausted: used 5500000 of preconf_max_gas_per_block \
+             6000000; tx gas limit 800000",
+        );
+        assert_eq!(
+            PreconfError::NotPreconfEligible.to_string(),
+            "transaction is not preconf eligible (whitelist miss)",
+        );
+    }
+
+    /// R7 D — `PreconfReceipt`'s `PartialEq` is byte-equal at the field
+    /// level, not derived semantically. This test locks the field set
+    /// so a future field addition without updating the wire mapper
+    /// surfaces as a compile error (missing field literal below), and
+    /// each field participates in equality (a differing value on any
+    /// one field must make the two receipts distinct).
+    #[test]
+    fn preconf_receipt_field_level_diff_participates_in_partialeq() {
+        use alloy_primitives::{Address, B256, Bytes, Log, LogData};
+
+        // Reference construction — every field explicitly named so a
+        // struct-shape change (new / removed field) forces update.
+        let base = PreconfReceipt {
+            tx_hash: B256::from([1; 32]),
+            block_height: 100,
+            status: true,
+            logs: vec![Log {
+                address: Address::from([2; 20]),
+                data: LogData::new_unchecked(
+                    vec![B256::from([3; 32])],
+                    Bytes::from(vec![4, 5, 6]),
+                ),
+            }],
+            gas_used: 21_000,
+            reason: String::new(),
+            revert_data: Bytes::new(),
+        };
+        assert_eq!(base, base.clone(), "identical clone equals base");
+
+        // Each field diverging in isolation makes the receipt unequal.
+        let mut r = base.clone();
+        r.tx_hash = B256::ZERO;
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.block_height = 101;
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.status = false;
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.logs.clear();
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.gas_used = 22_000;
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.reason = "revert".to_string();
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.revert_data = Bytes::from(vec![0xff]);
+        assert_ne!(r, base);
+    }
+}
+

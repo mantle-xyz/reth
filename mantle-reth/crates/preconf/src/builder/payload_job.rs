@@ -51,10 +51,13 @@ pub struct PreconfPayloadJob<Attrs, Payload> {
     /// [`Self::resolve_kind`] when the CL asks for the payload, or by
     /// `Drop` (via the generator's drop path) on job teardown.
     cancel: JobCancel,
-    /// [`JoinHandle`] for the spawned build task. Kept so the future is
-    /// not aborted on drop — tokio's default policy is to detach when
-    /// the handle is dropped, which is exactly what we want for graceful
-    /// shutdown driven by the cancel signal.
+    /// [`JoinHandle`] for the spawned build task. Held solely to keep
+    /// the join channel alive for the job's lifetime — no `.await` on
+    /// this handle happens. On drop the handle detaches (the closure
+    /// keeps running on the blocking-pool thread until it observes
+    /// the cancel signal and exits naturally). Renaming to
+    /// `_build_task_handle` was considered but the `_` prefix already
+    /// signals "field held for RAII, not read".
     _join_handle: JoinHandle<()>,
 }
 

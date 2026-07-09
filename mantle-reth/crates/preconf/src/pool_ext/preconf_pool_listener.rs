@@ -30,7 +30,9 @@ use op_alloy_consensus::OpTxEnvelope;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use tracing::{debug, trace};
 
-use crate::{config::PreconfConfig, preconf_tx_set::PreconfTxSet, types::PushResult};
+use crate::{
+    PreconfJournal, config::PreconfConfig, preconf_tx_set::PreconfTxSet, types::PushResult,
+};
 
 /// Long-running async task that bridges a [`TransactionPool`] event stream to
 /// [`PreconfTxSet`].
@@ -42,6 +44,16 @@ pub struct PreconfPoolListener<P, Tx, Cons> {
     pool: P,
     cfg: Arc<PreconfConfig>,
     fifo: Arc<PreconfTxSet>,
+    /// Optional journal handle used to distinguish reorg-reinjected txs
+    /// from fresh RPC submissions. When `Some`, every incoming pool event
+    /// is checked against `journal.sealed`; a hit means the tx was
+    /// previously promised to a client (mark_sealed fired on an earlier
+    /// canon commit) and must bypass the deadline / block-gas-budget
+    /// gates — so we push with [`PreconfSource::Replay`] to align
+    /// with the SLA "receipt returned → tx must land" contract. `None`
+    /// (journal feature disabled) falls back to the pre-journal behavior
+    /// where every push uses [`PreconfSource::Rpc`].
+    journal: Option<Arc<PreconfJournal>>,
     _tx: PhantomData<fn() -> Tx>,
     _cons: PhantomData<fn() -> Cons>,
 }
@@ -64,9 +76,16 @@ where
     Tx: PoolTransaction<Consensus = Cons> + 'static,
     Cons: Clone + Into<OpTxEnvelope>,
 {
-    /// Construct a listener bound to `pool`.
-    pub const fn new(pool: P, cfg: Arc<PreconfConfig>, fifo: Arc<PreconfTxSet>) -> Self {
-        Self { pool, cfg, fifo, _tx: PhantomData, _cons: PhantomData }
+    /// Construct a listener bound to `pool`. `journal` is optional; when
+    /// `Some`, the listener consults its sealed set to detect reorg
+    /// reinjects and route them through the SLA-bypass source.
+    pub const fn new(
+        pool: P,
+        cfg: Arc<PreconfConfig>,
+        fifo: Arc<PreconfTxSet>,
+        journal: Option<Arc<PreconfJournal>>,
+    ) -> Self {
+        Self { pool, cfg, fifo, journal, _tx: PhantomData, _cons: PhantomData }
     }
 
     /// Run the listener loop. Returns when the pool's listener stream closes.
@@ -105,7 +124,23 @@ where
 
             // Copy the hash out before moving the envelope into Arc.
             let hash = *envelope.tx_hash();
-            match self.fifo.push_if_absent(Arc::new(envelope), sender).await {
+
+            // Reorg reinject detection: if the hash has ever been
+            // `mark_sealed`-ed on a prior canon commit, this pool event
+            // is the pool's reorg re-inject path returning a
+            // previously-promised tx. Bypass the deadline / gas budget
+            // gates by pushing with `Replay` source.
+            let source = if let Some(journal) = self.journal.as_ref() {
+                if journal.contains(&hash).await {
+                    crate::types::PreconfSource::Replay
+                } else {
+                    crate::types::PreconfSource::Rpc
+                }
+            } else {
+                crate::types::PreconfSource::Rpc
+            };
+
+            match self.fifo.push_if_absent(Arc::new(envelope), sender, source).await {
                 PushResult::Inserted => {
                     debug!(
                         target: "mantle::preconf::listener",
@@ -138,7 +173,11 @@ where
 /// Drops `Deposit` (and any future OP-specific) variants by returning `None`.
 /// User-submitted variants (`Legacy` / `Eip1559` / `Eip2930` / `Eip7702`) are
 /// passed through unchanged.
-fn op_envelope_to_alloy(op_tx: OpTxEnvelope) -> Option<TxEnvelope> {
+///
+/// Shared with [`crate::pool_ext::pool_adapter::RestorePoolAdapter`] so
+/// listener and restore-time adapter agree on which OP tx variants are
+/// preconf-eligible.
+pub(crate) fn op_envelope_to_alloy(op_tx: OpTxEnvelope) -> Option<TxEnvelope> {
     match op_tx {
         OpTxEnvelope::Legacy(tx) => Some(TxEnvelope::Legacy(tx)),
         OpTxEnvelope::Eip2930(tx) => Some(TxEnvelope::Eip2930(tx)),

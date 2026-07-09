@@ -1,6 +1,9 @@
 //! Mantle preconf-aware OP payload builder — forked from upstream's
-//! `OpPayloadBuilder` (see `docs/design/preconf-dev-plan.md` §P5f for
-//! the rationale).
+//! `OpPayloadBuilder`. The fork is required so preconf-tx apply and the
+//! ordinary block-build path can share the same in-flight `State<DB>`;
+//! a wrapper cannot deliver "RPC receipt bytes == sealed receipt bytes"
+//! because the applier would have no state channel to the inner OP
+//! builder.
 //!
 //! Module layout:
 //!

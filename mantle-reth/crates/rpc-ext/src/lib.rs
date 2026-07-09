@@ -56,29 +56,47 @@ pub struct PreconfTxEvent {
     pub receipt: PreconfTxReceipt,
 }
 
-/// Preconfirmation status
+/// Preconfirmation status.
+///
+/// Matches op-geth's 4-variant `PreconfStatus` for cross-client SDK
+/// compatibility. Server pre-apply rejection (e.g. block gas budget) is
+/// collapsed into `Failed` at this wire boundary — the fine-grained
+/// reason travels in [`PreconfTxEvent::reason`]. The internal fifo state
+/// machine still distinguishes `Canceled` from `Failed` for replacement
+/// / clean-up semantics.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PreconfStatus {
-    /// Preconfirmation succeeded
+    /// EVM apply succeeded; tx on chain.
     #[serde(rename = "success")]
     Success,
-    /// Preconfirmation failed
+    /// Either (a) EVM apply revert/halt (tx on chain) OR (b) builder
+    /// pre-apply reject / server-side cancel (tx NOT on chain). The
+    /// [`PreconfTxEvent::reason`] field disambiguates.
     #[serde(rename = "failed")]
     Failed,
-    /// Preconfirmation timed out
+    /// Client-side deadline elapsed (`preconf_timeout`); tx NOT on chain.
     #[serde(rename = "timeout")]
     Timeout,
-    /// Preconfirmation is waiting
+    /// Preconfirmation is waiting (intermediate state; typically not
+    /// broadcast to subscribers).
     #[serde(rename = "waiting")]
     Waiting,
 }
 
-/// Preconfirmation transaction receipt
+/// Preconfirmation transaction receipt.
+///
+/// `logs` is `Option` rather than a plain `Vec` so absence semantics
+/// can be expressed on the wire: `null` when no EVM apply happened
+/// (Timeout / server pre-apply reject), `[]` when apply happened but
+/// emitted no logs. SDKs treat both as "no logs" but the wire shape
+/// preserves the distinction.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PreconfTxReceipt {
-    /// Event logs
+    /// Event logs. `None` ⇒ no EVM apply happened; `Some(vec![])` ⇒
+    /// apply happened but no logs; `Some(vec![...])` ⇒ apply happened
+    /// with logs.
     #[serde(default)]
-    pub logs: Vec<PreconfLog>,
+    pub logs: Option<Vec<PreconfLog>>,
 }
 
 /// Preconfirmation log entry
@@ -91,6 +109,27 @@ pub struct PreconfLog {
     pub topics: Vec<B256>,
     /// Log data
     pub data: Bytes,
+}
+
+// ─── Preconf subscription trait ──────────────────────────────────────────────
+
+/// `eth_subscribe("newPreconfTransaction")` — receive every preconf
+/// event the sequencer emits (Success / Failed / Timeout).
+///
+/// Emitted from the local builder path via `EventPublisher::publish`
+/// after each fifo status transition. The `RestoredSet` filter drops
+/// duplicates for replayed commitments after restart. Wire shape
+/// mirrors op-geth's `newPreconfTransaction` subscription channel.
+#[cfg_attr(not(test), rpc(server, namespace = "eth"))]
+#[cfg_attr(test, rpc(server, client, namespace = "eth"))]
+pub trait PreconfSubscribeApi {
+    /// Subscribe to the preconf event stream.
+    #[subscription(
+        name = "subscribe" => "newPreconfTransaction",
+        unsubscribe = "unsubscribe",
+        item = PreconfTxEvent
+    )]
+    async fn subscribe_new_preconf_transaction(&self) -> jsonrpsee::core::SubscriptionResult;
 }
 
 // ─── Preconf handler indirection ─────────────────────────────────────────────
@@ -703,5 +742,69 @@ mod tests {
 
         assert_eq!(cost_correct, U256::from(720_000_030_000_000u64));
         assert_eq!(cost_buggy, U256::ZERO);
+    }
+
+    // ─── PreconfTxReceipt.logs three-state serde ────────────────────
+    //
+    // R6/T7 — `logs` distinguishes "no EVM apply happened" (`null`)
+    // from "apply happened but no logs" (`[]`) on the wire. This is a
+    // deliberate contract that R5/D1 wire refactor introduced (changed
+    // from `Vec<PreconfLog>` to `Option<Vec<PreconfLog>>`). SDKs rely
+    // on the distinction to build UX around Timeout vs revert.
+
+    #[test]
+    fn preconf_tx_receipt_logs_none_serializes_as_null() {
+        let r = PreconfTxReceipt { logs: None };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"logs":null}"#);
+    }
+
+    #[test]
+    fn preconf_tx_receipt_logs_empty_vec_serializes_as_empty_array() {
+        let r = PreconfTxReceipt { logs: Some(vec![]) };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"logs":[]}"#);
+    }
+
+    #[test]
+    fn preconf_tx_receipt_logs_populated_roundtrips() {
+        let addr = alloy_primitives::Address::from([0xAB; 20]);
+        let r = PreconfTxReceipt {
+            logs: Some(vec![PreconfLog {
+                address: addr,
+                topics: vec![B256::from([0xCD; 32])],
+                data: Bytes::from(vec![0xEF, 0xEF]),
+            }]),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: PreconfTxReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn preconf_tx_receipt_null_and_empty_are_distinct() {
+        let null_r: PreconfTxReceipt = serde_json::from_str(r#"{"logs":null}"#).unwrap();
+        let empty_r: PreconfTxReceipt = serde_json::from_str(r#"{"logs":[]}"#).unwrap();
+        assert!(null_r.logs.is_none(), "null decodes as None");
+        assert_eq!(empty_r.logs, Some(vec![]), "[] decodes as Some(empty)");
+        assert_ne!(null_r, empty_r);
+    }
+
+    #[test]
+    fn preconf_status_wire_serde_has_four_variants() {
+        // R5/D1 decision 8B — wire enum matches op-geth's 4 variants.
+        // Regression guard against silently re-introducing `Canceled`.
+        for (variant, expected) in [
+            (PreconfStatus::Success, r#""success""#),
+            (PreconfStatus::Failed, r#""failed""#),
+            (PreconfStatus::Timeout, r#""timeout""#),
+            (PreconfStatus::Waiting, r#""waiting""#),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
+            let back: PreconfStatus = serde_json::from_str(expected).unwrap();
+            assert_eq!(back, variant);
+        }
+        // `"canceled"` must NOT deserialize (variant was deleted).
+        assert!(serde_json::from_str::<PreconfStatus>(r#""canceled""#).is_err());
     }
 }

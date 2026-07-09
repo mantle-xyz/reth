@@ -20,6 +20,7 @@ pub mod pool_ext;
 pub mod preconf_tx_set;
 pub mod rpc;
 pub mod service_builder;
+pub mod subscription;
 pub mod types;
 
 pub use builder::{
@@ -35,10 +36,12 @@ pub use journal::{
 };
 pub use pool_ext::{
     PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,
+    RestorePoolAdapter,
 };
 pub use preconf_tx_set::{PreconfTxSet, TxEntry};
 pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
+pub use subscription::PreconfSubscriptionHandler;
 pub use types::{
     AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult, RecoverError,
 };
