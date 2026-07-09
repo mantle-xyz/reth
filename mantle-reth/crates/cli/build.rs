@@ -38,9 +38,7 @@ fn main() {
         let base = if not_on_tag {
             describe
                 .rfind("-g")
-                .and_then(|g_pos| {
-                    describe[..g_pos].rfind('-').map(|dash_pos| &describe[..dash_pos])
-                })
+                .and_then(|g_pos| describe[..g_pos].rfind('-').map(|dash_pos| &describe[..dash_pos]))
                 .unwrap_or(&describe)
         } else {
             &describe

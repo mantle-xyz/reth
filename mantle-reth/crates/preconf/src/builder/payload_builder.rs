@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use alloy_consensus::{BlockHeader, Sealable, Transaction, TxEnvelope, Typed2718, transaction::Recovered};
 use alloy_evm::Evm;
-use alloy_primitives::{Address, Sealed, TxHash, U256};
+use alloy_primitives::{Address, Sealed, TxHash, TxKind, U256};
 use op_alloy_consensus::{SDMGasEntry, TxPostExec, build_post_exec_tx};
 use op_revm::{L1BlockInfo, constants::L1_BLOCK_CONTRACT};
 use reth_basic_payload_builder::BuildArguments;
@@ -322,6 +322,7 @@ enum BestTxStep {
 /// commitment application.
 #[allow(clippy::too_many_arguments)]
 fn apply_one_best_tx<N, Builder>(
+    cfg: &PreconfConfig,
     best_txs: &mut impl PayloadTransactions<
         Transaction: PoolTransaction<Consensus = N::SignedTx> + OpPooledTx,
     >,
@@ -341,6 +342,24 @@ where
     let Some(tx) = best_txs.next(()) else {
         return Ok(BestTxStep::Done);
     };
+    // Preconf-eligible txs are applied EXCLUSIVELY via the preconf arm.
+    // Without this filter, the pool arm could grab a preconf-eligible tx
+    // that was just admitted to the pool but whose fifo entry hasn't
+    // been pushed yet by the async pool listener — the tx would land on
+    // chain via the pool path while the client sees a Timeout/Failed
+    // response (responder never called). The preconf listener creates a
+    // fifo entry for every preconf-eligible tx entering the pool, so
+    // skipping here does not drop the tx — it merely constrains it to
+    // the preconf ordering.
+    let sender = tx.sender();
+    let to = match tx.kind() {
+        TxKind::Call(addr) => Some(addr),
+        TxKind::Create => None,
+    };
+    if cfg.is_preconf_tx(&sender, to.as_ref()) {
+        best_txs.mark_invalid(sender, tx.nonce());
+        return Ok(BestTxStep::Continue);
+    }
     let interop = tx.interop_deadline();
     let tx_da_size = tx.estimated_da_size();
     let tx = tx.into_consensus();
@@ -454,7 +473,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     /// single builder serve multiple primitive sets.
     ///
     /// [`OpPayloadBuilderCtx`]: reth_optimism_payload_builder::builder::OpPayloadBuilderCtx
-    /// [`PreconfTxSet::has_pending_unprocessed`]: crate::PreconfTxSet::has_pending_unprocessed
     #[allow(clippy::unused_async)]
     pub async fn build_payload<N, Attrs>(
         self,
@@ -680,6 +698,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     let iter = best_txs_iter.as_mut().expect("guard verified Some");
                     let before = info.cumulative_gas_used;
                     match apply_one_best_tx::<N, _>(
+                        &self.cfg,
                         iter,
                         &mut builder,
                         &mut info,

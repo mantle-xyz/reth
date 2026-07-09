@@ -33,9 +33,12 @@ use std::{marker::PhantomData, sync::Arc};
 use alloy_consensus::TxEnvelope;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_node_api::{FullNodeTypes, NodeTypes, PayloadTypes};
-use reth_node_builder::{BuilderContext, components::PayloadServiceBuilder};
+use reth_node_builder::{
+    BuilderContext,
+    components::{BasicPayloadServiceBuilder, PayloadServiceBuilder},
+};
 use reth_optimism_evm::ConfigurePostExecEvm;
-use reth_optimism_node::OpBuiltPayload;
+use reth_optimism_node::{OpBuiltPayload, node::OpPayloadBuilder};
 use reth_optimism_payload_builder::{
     OpPayloadAttrs, OpPayloadBuilderAttributes, OpPayloadPrimitives, config::OpBuilderConfig,
 };
@@ -166,6 +169,30 @@ where
         evm_config: EvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
         let Self { cfg, fifo, builder_config, svc, _pd } = self;
+
+        // Rollback safety — when `--preconf.enable` is absent, `cfg` is
+        // `PreconfConfig::default()` with `enabled: false`. In that case
+        // the fork's `PreconfPayloadBuilder` (select! loop, sweep-ticker
+        // gas quota, fifo carryover replay, ...) is bypassed entirely
+        // and reth's upstream `BasicPayloadServiceBuilder<OpPayloadBuilder>`
+        // is spawned instead. This gives operators a clean rollback path
+        // if a fatal preconf-fork bug is discovered in production —
+        // omitting `--preconf.enable` yields the same payload service
+        // as vanilla op-reth, no code revert needed.
+        if !cfg.enabled {
+            tracing::info!(
+                target: "mantle::preconf::payload",
+                "preconf disabled — delegating to upstream OP payload builder",
+            );
+            let upstream = OpPayloadBuilder::new(false)
+                .with_da_config(builder_config.da_config.clone())
+                .with_gas_limit_config(builder_config.gas_limit_config.clone())
+                .with_sdm_enabled(builder_config.sdm_enabled);
+            return BasicPayloadServiceBuilder::new(upstream)
+                .spawn_payload_builder_service(ctx, pool, evm_config)
+                .await;
+        }
+
         // Read the publisher lazily — `start` populates it during
         // `build_pool`, which runs before this method.
         let publisher = svc.as_ref().and_then(|s| s.event_publisher());

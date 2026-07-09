@@ -45,9 +45,8 @@ pub struct MantleArgs {
 
 /// Preconfirmation subsystem CLI flags.
 ///
-/// All fields also read from the corresponding `MANTLE_PRECONF_*` env var —
-/// CLI wins when both are set. Leave everything at defaults and preconf stays
-/// disabled (matches `MantleNode::new` behavior without `.with_preconf()`).
+/// Leave everything at defaults and preconf stays disabled (matches
+/// `MantleNode::new` behavior without `.with_preconf()`).
 #[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
 pub struct PreconfArgs {
     /// Enable the mantle preconfirmation subsystem.
@@ -72,15 +71,19 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.all")]
     pub all: bool,
 
-    /// Allowlisted sender addresses — repeatable. `--preconf.from 0x...
-    /// --preconf.from 0x...`. Ignored when `--preconf.all` is set.
-    #[arg(long = "preconf.from", value_name = "ADDRESS")]
+    /// Allowlisted sender addresses. Accepts a comma-separated list
+    /// (`--preconf.from 0x1,0x2,0x3`) matching op-geth's
+    /// `--txpool.frompreconfs="0x1,0x2,0x3"`, or repeated flags
+    /// (`--preconf.from 0x1 --preconf.from 0x2`) — both accumulate.
+    /// Ignored when `--preconf.all` is set.
+    #[arg(long = "preconf.from", value_name = "ADDRESSES", value_delimiter = ',')]
     pub from: Vec<Address>,
 
-    /// Allowlisted recipient addresses — repeatable. Same semantics as
-    /// `--preconf.from`. Contract-creation txs (`to == None`) are only
+    /// Allowlisted recipient addresses. Same semantics as `--preconf.from`
+    /// (comma-separated or repeated). Aligns with op-geth's
+    /// `--txpool.topreconfs`. Contract-creation txs (`to == None`) are only
     /// eligible when `--preconf.all` is on.
-    #[arg(long = "preconf.to", value_name = "ADDRESS")]
+    #[arg(long = "preconf.to", value_name = "ADDRESSES", value_delimiter = ',')]
     pub to: Vec<Address>,
 
     /// Client-visible RPC oneshot timeout, in milliseconds. Default matches
@@ -122,7 +125,7 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.journal-max-size")]
     pub journal_max_size: Option<u64>,
 
-    /// Broadcast channel capacity. Default 4096. Advanced tuning knob — the
+    /// Broadcast channel capacity. Default 65536. Advanced tuning knob — the
     /// broadcast serves both `newPreconfTransaction` subscription and the
     /// fifo notifier; consumers see `Lagged(n)` and fall back to snapshot
     /// reconcile when full.
@@ -228,20 +231,20 @@ mod tests {
     }
 
     #[test]
-    fn enable_with_all_and_journal_matches_env_var_shortcut() {
-        // Regression guard for the `MANTLE_PRECONF_ENABLE=1` +
-        // `MANTLE_PRECONF_JOURNAL=/tmp/j` env-var combo. The CLI form
-        // must produce a functionally identical config.
+    fn journal_path_flag_lands_on_config() {
+        // `--preconf.journal-path` maps to `PreconfConfig::journal_path`
+        // as a `PathBuf`, gated behind `--preconf.enable`. Regression
+        // guard against silent wiring drift.
         let a = parse(&[
             "--preconf.enable",
-            "--preconf.all",
             "--preconf.journal-path",
             "/tmp/mantle-preconf.jsonl",
         ]);
         let cfg = a.into_config().expect("enabled");
-        assert!(cfg.enabled);
-        assert!(cfg.all_preconfs);
-        assert_eq!(cfg.journal_path.as_deref(), Some(std::path::Path::new("/tmp/mantle-preconf.jsonl")));
+        assert_eq!(
+            cfg.journal_path.as_deref(),
+            Some(std::path::Path::new("/tmp/mantle-preconf.jsonl")),
+        );
     }
 
     #[test]
@@ -262,6 +265,23 @@ mod tests {
         ]);
         let cfg = a.into_config().expect("enabled");
         assert_eq!(cfg.from_preconfs.len(), 2);
+        assert_eq!(cfg.to_preconfs.len(), 2);
+    }
+
+    #[test]
+    fn comma_separated_from_to_matches_op_geth_format() {
+        // op-geth accepts `--txpool.frompreconfs="0x1,0x2,0x3"`.
+        // The CLI must parse the same shape when a single flag carries
+        // a comma-separated address list.
+        let a = parse(&[
+            "--preconf.enable",
+            "--preconf.from",
+            "0x1111111111111111111111111111111111111111,0x2222222222222222222222222222222222222222,0x3333333333333333333333333333333333333333",
+            "--preconf.to",
+            "0x4444444444444444444444444444444444444444,0x5555555555555555555555555555555555555555",
+        ]);
+        let cfg = a.into_config().expect("enabled");
+        assert_eq!(cfg.from_preconfs.len(), 3);
         assert_eq!(cfg.to_preconfs.len(), 2);
     }
 

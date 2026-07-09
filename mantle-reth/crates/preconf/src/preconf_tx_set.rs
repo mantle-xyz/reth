@@ -33,10 +33,7 @@ use alloy_primitives::{
 };
 use std::{
     collections::VecDeque,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -181,21 +178,6 @@ impl PreconfTxSetInner {
 pub struct PreconfTxSet {
     inner: Mutex<PreconfTxSetInner>,
     notifier: broadcast::Sender<TxHash>,
-    /// Sweep yield hint. Set by `push_if_absent` / `recover_from_reclaimable`,
-    /// cleared by the builder when it has drained pending fifo events.
-    /// Read-only `false → true → false` — `Ordering::Relaxed` is sufficient.
-    ///
-    /// **Store-before-send causal chain**: producers set this flag
-    /// with `Relaxed` **before** calling `notifier.send(hash)`. The
-    /// broadcast channel's internal synchronization (an `Arc<Mutex>`
-    /// on the buffer) provides the acquire-release edge that publishes
-    /// the store to observers — the hint is opportunistic anyway (the
-    /// builder's sweep-yield uses it as a coarse "maybe drain") so
-    /// even a Relaxed load that sees `false` after the actual broadcast
-    /// has landed is safe: the receiver will consume the hash from the
-    /// broadcast on its next poll regardless. The hint is a
-    /// **latency hint**, not a **correctness signal**.
-    has_pending: AtomicBool,
     /// Pool eviction callback for **non-on-chain terminal transitions**.
     /// Invoked automatically after any successful
     /// `mark_timeout` / `mark_canceled` / `mark_failed` — the tx is
@@ -224,7 +206,6 @@ impl PreconfTxSet {
         Self {
             inner: Mutex::new(PreconfTxSetInner::new()),
             notifier,
-            has_pending: AtomicBool::new(false),
             pool_evict: OnceLock::new(),
         }
     }
@@ -348,11 +329,6 @@ impl PreconfTxSet {
         inner.order.push_back(hash);
         drop(inner);
 
-        // Signal order matters: set the sweep-yield hint BEFORE broadcasting,
-        // otherwise a fast builder can drain the broadcast event and call
-        // `clear_pending_flag` before the `store(true)` lands — leaving the
-        // flag stuck at `true` with no further event to drive it back down.
-        self.has_pending.store(true, Ordering::Relaxed);
         let _ = self.notifier.send(hash);
 
         PushResult::Inserted
@@ -516,8 +492,8 @@ impl PreconfTxSet {
         Ok(())
     }
 
-    /// `Timeout | Canceled → Waiting` + broadcast notify + set
-    /// `has_pending`. Unified recover for the two reclaimable states —
+    /// `Timeout | Canceled → Waiting` + broadcast notify.
+    /// Unified recover for the two reclaimable states —
     /// the RPC handler's same-hash retry path uses this without needing
     /// to know which specific reclaimable state the entry is in. Any
     /// other status returns `UnexpectedStatus(current)`; a missing entry
@@ -531,8 +507,6 @@ impl PreconfTxSet {
         entry.status = PreconfStatus::Waiting;
         drop(inner);
 
-        // See `push_if_absent` for why the flag is set before the broadcast.
-        self.has_pending.store(true, Ordering::Relaxed);
         let _ = self.notifier.send(*hash);
         Ok(())
     }
@@ -555,11 +529,11 @@ impl PreconfTxSet {
     /// 2. `source: * → Replay` so `builder::dispatch`'s
     ///    pre-apply deadline and per-block gas budget gates bypass it.
     ///
-    /// A broadcast notify + sweep-yield hint are still fired for
-    /// callers that prefer a broadcast-driven pickup path. The
-    /// `build_payload` preamble does NOT rely on the broadcast: it
-    /// drives apply directly ahead of the select! loop so the stale
-    /// entries land before any concurrently-pushed fresh RPC entries.
+    /// A broadcast notify is still fired for callers that prefer a
+    /// broadcast-driven pickup path. The `build_payload` preamble does
+    /// NOT rely on the broadcast: it drives apply directly ahead of
+    /// the select! loop so the stale entries land before any
+    /// concurrently-pushed fresh RPC entries.
     ///
     /// Any other status returns `IllegalTransition(current)`; a
     /// missing entry returns `NotFound`.
@@ -573,23 +547,8 @@ impl PreconfTxSet {
         entry.source = PreconfSource::Replay;
         drop(inner);
 
-        // See `push_if_absent` for why the flag is set before the broadcast.
-        self.has_pending.store(true, Ordering::Relaxed);
         let _ = self.notifier.send(*hash);
         Ok(())
-    }
-
-    // ============ Sweep yield for preconf ============
-
-    /// True when a recent `push_if_absent` / `recover_from_reclaimable` set
-    /// the hint and the builder has not cleared it yet.
-    pub fn has_pending_unprocessed(&self) -> bool {
-        self.has_pending.load(Ordering::Relaxed)
-    }
-
-    /// Cleared by the builder when it has drained the fifo events queue.
-    pub fn clear_pending_flag(&self) {
-        self.has_pending.store(false, Ordering::Relaxed);
     }
 
     // ============ Responder slots (RPC path only) ============
@@ -697,7 +656,6 @@ impl PreconfTxSet {
 impl std::fmt::Debug for PreconfTxSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfTxSet")
-            .field("has_pending", &self.has_pending.load(Ordering::Relaxed))
             .field("receiver_count", &self.notifier.receiver_count())
             .finish_non_exhaustive()
     }
@@ -745,20 +703,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn has_pending_flag_is_idle_at_start() {
-        let set = PreconfTxSet::new(16);
-        assert!(!set.has_pending_unprocessed());
-    }
-
-    #[tokio::test]
-    async fn clear_pending_flag_is_idempotent() {
-        let set = PreconfTxSet::new(16);
-        set.clear_pending_flag();
-        set.clear_pending_flag();
-        assert!(!set.has_pending_unprocessed());
-    }
-
-    #[tokio::test]
     async fn remove_returns_false_when_absent() {
         let set = PreconfTxSet::new(16);
         assert!(!set.remove(&h(1)).await);
@@ -777,7 +721,6 @@ mod tests {
         assert!(set.contains(tx.tx_hash()).await);
         assert_eq!(set.snapshot().await, vec![*tx.tx_hash()]);
         assert!(set.find_by_sender_nonce(&addr(1), 0).await.is_some());
-        assert!(set.has_pending_unprocessed());
         assert_eq!(rx.try_recv().unwrap(), *tx.tx_hash());
     }
 
@@ -889,8 +832,8 @@ mod tests {
 
     /// Both reclaimable states (Timeout, Canceled) must round-trip
     /// through the unified `recover_from_reclaimable` back to `Waiting`
-    /// with the same side effects (broadcast + has_pending flag). Runs
-    /// each case in one test to prove the union doesn't specialise.
+    /// with the same broadcast side effect. Runs each case in one test
+    /// to prove the union doesn't specialise.
     #[tokio::test]
     async fn recover_from_reclaimable_handles_both_states() {
         for pre_status in [PreconfStatus::Timeout, PreconfStatus::Canceled] {
@@ -904,7 +847,6 @@ mod tests {
                 PreconfStatus::Canceled => set.mark_canceled(tx.tx_hash()).await.unwrap(),
                 _ => unreachable!(),
             }
-            set.clear_pending_flag();
 
             set.recover_from_reclaimable(tx.tx_hash()).await.unwrap();
             assert_eq!(
@@ -913,7 +855,6 @@ mod tests {
                 "state {pre_status:?} must round-trip to Waiting",
             );
             assert_eq!(rx.try_recv().unwrap(), *tx.tx_hash());
-            assert!(set.has_pending_unprocessed(), "flag must be set after recover from {pre_status:?}");
         }
     }
 
@@ -954,9 +895,9 @@ mod tests {
     // ============ reset_success_to_waiting ============
 
     /// Happy path: `Success → Waiting` transition, entry stays in fifo,
-    /// broadcast re-fires, has_pending flag is set. This is the primary
-    /// mechanism by which stale in-flight commitments (applied to a
-    /// dropped payload job's builder) get replayed by the next job.
+    /// broadcast re-fires. This is the primary mechanism by which stale
+    /// in-flight commitments (applied to a dropped payload job's
+    /// builder) get replayed by the next job.
     #[tokio::test]
     async fn reset_success_to_waiting_transitions_and_rebroadcasts() {
         let set = PreconfTxSet::new(16);
@@ -964,11 +905,9 @@ mod tests {
         let tx = make_tx(0, 1);
         set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
         set.mark_succeeded(tx.tx_hash()).await.unwrap();
-        // Drain the initial push notify and clear the sweep hint so we
-        // can attribute post-reset signals to the reset itself.
+        // Drain the initial push notify so we can attribute the
+        // post-reset broadcast to the reset itself.
         let _ = rx.try_recv();
-        set.clear_pending_flag();
-        assert!(!set.has_pending_unprocessed());
 
         set.reset_success_to_waiting(tx.tx_hash()).await.unwrap();
 
@@ -981,8 +920,6 @@ mod tests {
         assert_eq!(view.source, PreconfSource::Replay);
         // Hash re-broadcast so the dispatch loop picks it up.
         assert_eq!(rx.try_recv().unwrap(), *tx.tx_hash());
-        // Sweep-yield hint back on.
-        assert!(set.has_pending_unprocessed());
     }
 
     /// Only `Success` may transition; every other status returns
@@ -1473,31 +1410,6 @@ mod tests {
         let _ = PreconfTxSet::new(0);
     }
 
-    /// R7 D — Dekker-barrier observation side: after `push_if_absent`
-    /// returns `Inserted`, `has_pending_unprocessed` must observe
-    /// `true`. Producer (push) sets the flag with `Ordering::Relaxed`
-    /// **before** the broadcast send; the sweep-yield hint is a hint,
-    /// not a strict happens-before edge, but same-task consistency
-    /// (the flag store precedes any function return) is guaranteed.
-    #[tokio::test]
-    async fn push_if_absent_sets_has_pending_flag() {
-        let set = PreconfTxSet::new(4);
-        assert!(!set.has_pending_unprocessed(), "flag idle at start");
-
-        let tx = make_tx(0, 1);
-        let result = set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
-        assert!(matches!(result, PushResult::Inserted));
-        assert!(
-            set.has_pending_unprocessed(),
-            "push_if_absent Inserted must raise has_pending flag"
-        );
-    }
-
-    /// R7 D — Dekker-barrier observation side: after
-    /// `recover_from_reclaimable` returns Ok, `has_pending_unprocessed`
-    /// must also observe `true`. Symmetric to the push producer path —
-    /// the recover branch is a second broadcast producer and shares
-    /// the same store-then-notify pattern.
     /// R3/SLA-1 — `mark_timeout` / `mark_canceled` / `mark_failed`
     /// invoke the registered pool-eviction callback with the hash.
     /// `mark_succeeded` does NOT (canon commit's `mined_transactions`
@@ -1589,22 +1501,4 @@ mod tests {
         assert!(second_evicted.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn recover_from_reclaimable_sets_has_pending_flag() {
-        let set = PreconfTxSet::new(4);
-        let tx = make_tx(0, 1);
-        let hash = *tx.tx_hash();
-        set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
-        set.mark_timeout(&hash).await.unwrap();
-
-        // Manually clear so we can observe the recover-side raise.
-        set.clear_pending_flag();
-        assert!(!set.has_pending_unprocessed(), "flag cleared for test");
-
-        set.recover_from_reclaimable(&hash).await.unwrap();
-        assert!(
-            set.has_pending_unprocessed(),
-            "recover_from_reclaimable must raise has_pending flag"
-        );
-    }
 }

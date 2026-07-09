@@ -99,10 +99,10 @@ pub struct PreconfWiring {
     pub cfg: Arc<PreconfConfig>,
     /// Commitment fifo shared between validator, RPC handler, and builder.
     pub fifo: Arc<PreconfTxSet>,
-    /// Optional journal — threaded into the pool listener so it can
-    /// detect reorg-reinjected txs (their hash is in `journal.sealed`)
-    /// and push them with `PreconfSource::Replay` to bypass the
-    /// dispatch deadline / gas-budget gates.
+    /// Optional journal — persists commitments across restart (RPC
+    /// appends on Success, startup replays into fifo). Also consulted
+    /// by the pool listener to tag reorg-reinjected txs as
+    /// `PreconfSource::Replay`. `None` disables both.
     pub journal: Option<Arc<mantle_reth_preconf::PreconfJournal>>,
     /// Handle to the application-level service builder — used by
     /// [`MantlePoolBuilder::build_pool`] to run [`PreconfServiceBuilder::start`]
@@ -234,21 +234,15 @@ where
         // Mantle does not use OP interop — filter is always disabled
         let transaction_pool = OpPool::new(inner_pool, false);
 
-        // R5/D1 start hook: run preconf journal restore + wire the
-        // `EventPublisher` / `RestoredSet` BEFORE any background pool
-        // task starts consuming events. Ordering rationale (see the
-        // review plan §Q3 in R5/D1):
-        // - `spawn_maintenance_tasks` (below) fire-and-forget spawns
-        //   reth's own local-tx backup loader; if `svc.start` ran
-        //   *after*, its `pool.add_transaction` calls would race the
-        //   backup loader for the same pool mutex — the J5-fix path
-        //   (`AlreadyImported → Ok`) already handles the collision,
-        //   but the earlier ordering here avoids any subtle listener
-        //   source-tagging race in the first place.
-        // - The pool listener (further below) subscribes to pool
-        //   events; anything `svc.start` triggers happens before that
-        //   subscription and does not need the listener — the restore
-        //   helper pushes fifo entries directly.
+        // Run journal restore + wire the `EventPublisher` / `RestoredSet`
+        // before any background pool task starts consuming events. Two
+        // ordering constraints:
+        // - Must run before `spawn_maintenance_tasks` (which spawns
+        //   reth's local-tx backup loader) so the loader and the
+        //   restore path don't race on the pool mutex.
+        // - Must run before the pool listener is spawned so the restore
+        //   helper's fifo pushes are attributed to the restart path,
+        //   not to a fresh RPC submission.
         if let Some(svc) = preconf_svc.as_ref() {
             use mantle_reth_preconf::RestorePoolAdapter;
             let adapter = RestorePoolAdapter::<_, T, TxTy<N::Types>>::new(transaction_pool.clone());
@@ -298,14 +292,23 @@ where
 
 /// Type alias for the Mantle node component builder.
 ///
-/// Always uses [`MantlePreconfServiceBuilder`] as the payload service —
-/// when `MantleNode.preconf == None`, the cli supplies a default-empty
-/// `(cfg, fifo)` pair, so no preconf-eligible tx is ever applied. The
-/// fork's `build_payload` then sits in its `select!` loop until cancel,
-/// and the block seals at CL `getPayload` time. This trades a small
-/// timing diff vs. upstream `BasicPayloadServiceBuilder` (which returns
-/// the payload as-soon-as-built) for a single static `ComponentsBuilder`
-/// type across both modes.
+/// The outer type is always [`MantlePreconfServiceBuilder`] so the
+/// `ComponentsBuilder` type stays stable across enable/disable modes.
+/// At spawn time (`spawn_payload_builder_service`) the builder
+/// inspects `cfg.enabled`:
+///
+/// - `true` (preconf enabled) — spawns the fork's
+///   [`PreconfPayloadBuilder`] with the shared `(cfg, fifo)` pair, wire
+///   publisher, select! loop, sweep-ticker quota, etc.
+/// - `false` (preconf disabled) — delegates to reth's upstream
+///   [`BasicPayloadServiceBuilder`]`<`[`OpPayloadBuilder`]`>`, giving
+///   byte-identical behavior to vanilla op-reth. Provides a rollback
+///   path if a fatal preconf-fork bug is discovered in production —
+///   omit `--preconf.enable` and the fork is bypassed at runtime.
+///
+/// [`PreconfPayloadBuilder`]: mantle_reth_preconf::builder::payload_builder::PreconfPayloadBuilder
+/// [`BasicPayloadServiceBuilder`]: reth_node_builder::components::BasicPayloadServiceBuilder
+/// [`OpPayloadBuilder`]: reth_optimism_node::node::OpPayloadBuilder
 pub type MantleNodeComponentBuilder<N> = ComponentsBuilder<
     N,
     MantlePoolBuilder,
