@@ -10,7 +10,7 @@ use mantle_reth_preconf::{
     PreconfServiceBuilder, PreconfTxSet,
 };
 use reth_optimism_payload_builder::config::OpBuilderConfig;
-use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt, PreconfSubscribeApiServer};
+use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, PrimitivesTy, TxTy};
@@ -397,24 +397,15 @@ impl MantleNode {
             self.op_node.gas_limit_config.clone(),
             args.sdm_enabled,
         );
-        // `svc` is passed by handle so the payload service reads the
-        // wire publisher lazily at spawn time — after `svc.start`
-        // (called from `MantlePoolBuilder::build_pool`) has populated
-        // `event_publisher()`. Pre-start / no-preconf both surface as
-        // `None` at spawn, which the dispatch loop tolerates silently.
-        let (cfg, fifo, svc) = if let Some(p) = &self.preconf {
-            (p.cfg().clone(), p.fifo().clone(), Some(p.clone()))
+        let (cfg, fifo) = if let Some(p) = &self.preconf {
+            (p.cfg().clone(), p.fifo().clone())
         } else {
             let default_svc = PreconfServiceBuilder::new(PreconfConfig::default())
                 .expect("default PreconfConfig validates");
-            (default_svc.cfg().clone(), default_svc.fifo().clone(), None)
+            (default_svc.cfg().clone(), default_svc.fifo().clone())
         };
-        let payload_service = MantlePreconfServiceBuilder::<OpPrimitives>::new(
-            cfg,
-            fifo,
-            builder_config,
-            svc,
-        );
+        let payload_service =
+            MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, fifo, builder_config);
 
         ComponentsBuilder::default()
             .node_types::<N>()
@@ -526,15 +517,6 @@ where
             ctx.modules.merge_configured(mantle_ext.into_rpc())?;
             info!(target: "reth::cli", "Mantle RPC extensions registered");
 
-            // `eth_subscribe("newPreconfTransaction")` — only wire when
-            // preconf is enabled on this node. The service builder's
-            // broadcast channel is live from construction, so ordering
-            // is safe even before `start()` fully wires the publisher.
-            if let Some(svc) = preconf.as_ref() {
-                let sub_handler = svc.subscription_handler();
-                ctx.modules.merge_configured(sub_handler.into_rpc())?;
-                info!(target: "reth::cli", "Mantle preconf subscription API registered");
-            }
             Ok(())
         });
         add_ons

@@ -37,14 +37,10 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::TxHash;
-use mantle_reth_rpc_ext::{
-    PreconfLog, PreconfStatus as WireStatus, PreconfTxEvent, PreconfTxReceipt,
-};
 use tracing::{debug, trace, warn};
 
 use crate::{
     PreconfConfig, PreconfTxSet,
-    journal::EventPublisher,
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
@@ -76,26 +72,11 @@ pub(super) struct LoopState {
     /// of `preconf_gas_used` so quota accounting reflects only the
     /// pool arm, though both contribute to `ExecutionInfo::cumulative_gas_used`.
     pool_gas_used: u64,
-    /// Optional broadcast publisher for `newPreconfTransaction` wire
-    /// events. `None` when preconf subscription wiring is disabled
-    /// (e.g. the default-empty `PreconfServiceBuilder` used by the
-    /// pass-through path). Set to `Some` by
-    /// [`crate::PreconfServiceBuilder::start`]'s output and threaded
-    /// through the payload builder into each per-job `LoopState`.
-    ///
-    /// [`apply_one_preconf`] publishes to this handle after every fifo
-    /// status transition (Success / Failed / Timeout / server-side
-    /// cancel). The publisher's own `RestoredSet` filter handles
-    /// deduplication for restart-replayed commitments.
-    publisher: Option<Arc<EventPublisher>>,
 }
 
 impl LoopState {
     /// Construct a fresh local state for a payload job targeting
-    /// `predicted_height` (the parent's block number + 1). Wire-event
-    /// publishing is disabled — use [`Self::with_publisher`] to enable
-    /// it in production (the pool builder's start hook produces the
-    /// [`EventPublisher`]).
+    /// `predicted_height` (the parent's block number + 1).
     pub(super) fn new(predicted_height: u64) -> Self {
         Self {
             committed: HashSet::new(),
@@ -103,17 +84,7 @@ impl LoopState {
             predicted_height,
             preconf_gas_used: 0,
             pool_gas_used: 0,
-            publisher: None,
         }
-    }
-
-    /// Attach a wire-event publisher to this loop state. Subsequent
-    /// fifo status transitions in [`apply_one_preconf`] fan out to
-    /// `newPreconfTransaction` subscribers through this publisher.
-    #[must_use]
-    pub(super) fn with_publisher(mut self, publisher: Option<Arc<EventPublisher>>) -> Self {
-        self.publisher = publisher;
-        self
     }
 
     /// Cumulative preconf gas committed in this block so far. Used by
@@ -166,68 +137,6 @@ impl LoopState {
         self.excluded.len()
     }
 
-    /// Publish a wire event through the attached publisher, if any.
-    /// Static send/no-op when no publisher is attached — the field is
-    /// `Option` precisely so the pass-through path (default-disabled
-    /// preconf) avoids constructing a broadcast channel it will never
-    /// use.
-    pub(super) fn publish(&self, event: PreconfTxEvent) {
-        if let Some(p) = self.publisher.as_ref() {
-            p.publish(event);
-        }
-    }
-}
-
-/// Map an [`alloy_primitives::Log`] batch from the receipt path to the
-/// wire [`PreconfLog`] shape. Kept private to this module — the
-/// `PreconfTxReceipt` conversion in `rpc.rs` uses the same layout, but
-/// each caller constructs the vector at its terminal branch.
-fn logs_to_wire(logs: &[alloy_primitives::Log]) -> Vec<PreconfLog> {
-    logs.iter()
-        .map(|log| PreconfLog {
-            address: log.address,
-            topics: log.data.topics().to_vec(),
-            data: log.data.data.clone(),
-        })
-        .collect()
-}
-
-/// Build the on-chain wire event for a `mark_succeeded` / `mark_failed`
-/// path — status is derived from `receipt.status` (revert ⇒ wire
-/// `Failed`; success ⇒ wire `Success`), matching op-geth's `Preconf`
-/// path. Logs travel as `Some(vec)` even when empty so the wire shape
-/// preserves "apply happened, no logs" (distinguishable from
-/// `None` = "no apply happened").
-fn wire_event_from_receipt(receipt: &PreconfReceipt) -> PreconfTxEvent {
-    let status = if receipt.status { WireStatus::Success } else { WireStatus::Failed };
-    PreconfTxEvent {
-        tx_hash: receipt.tx_hash,
-        status,
-        reason: receipt.reason.clone(),
-        block_height: receipt.block_height,
-        receipt: PreconfTxReceipt { logs: Some(logs_to_wire(&receipt.logs)) },
-    }
-}
-
-/// Build a wire event for a terminal path that did **not** apply the tx
-/// (deadline gate, gas-budget gate, apply-fn Err). `receipt` is `None`
-/// on the wire — `PreconfTxReceipt.logs = None` signals "no EVM apply
-/// happened for this hash". For the F1 gas-budget path, wire status is
-/// `Failed` (matching op-geth's 4-variant enum — the fifo layer's
-/// `Canceled` distinction stays internal).
-fn wire_event_no_apply(
-    tx_hash: TxHash,
-    status: WireStatus,
-    reason: String,
-    predicted_height: u64,
-) -> PreconfTxEvent {
-    PreconfTxEvent {
-        tx_hash,
-        status,
-        reason,
-        block_height: predicted_height,
-        receipt: PreconfTxReceipt { logs: None },
-    }
 }
 
 /// Handle one preconf hash end-to-end: dedup → fetch → status gate →
@@ -306,12 +215,6 @@ pub(super) async fn apply_one_preconf<F>(
             PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 },
         )
         .await;
-        loop_state.publish(wire_event_no_apply(
-            hash,
-            WireStatus::Timeout,
-            format!("pre-apply deadline elapsed ({}ms)", cfg.preconf_timeout.as_millis()),
-            loop_state.predicted_height,
-        ));
         loop_state.record_excluded(hash);
         return;
     }
@@ -349,18 +252,6 @@ pub(super) async fn apply_one_preconf<F>(
             },
         )
         .await;
-        // Wire layer collapses server-side cancel into `Failed` to
-        // match op-geth's 4-variant enum (see decision 8 in R5/D1).
-        // The fifo layer's `Canceled` distinction stays internal.
-        loop_state.publish(wire_event_no_apply(
-            hash,
-            WireStatus::Failed,
-            format!(
-                "block gas budget exhausted (used={}, limit={}, max={})",
-                loop_state.preconf_gas_used, tx_gas_limit, cfg.preconf_max_gas_per_block
-            ),
-            loop_state.predicted_height,
-        ));
         loop_state.record_excluded(hash);
         return;
     }
@@ -382,11 +273,6 @@ pub(super) async fn apply_one_preconf<F>(
                     "mark_succeeded lost race"
                 );
             }
-            // Wire event: status derived from receipt.status
-            // (revert ⇒ Failed, success ⇒ Success). Publish before
-            // `take_responder` so subscribers see the transition even
-            // if the receiver has dropped.
-            loop_state.publish(wire_event_from_receipt(&receipt));
             if let Some(resp) = fifo.take_responder(&hash).await {
                 let _ = resp.send(Ok(receipt));
             }
@@ -405,16 +291,6 @@ pub(super) async fn apply_one_preconf<F>(
                     "mark_failed lost race"
                 );
             }
-            // Wire event: apply-fn Err ⇒ builder pre-apply reject
-            // (tx NOT on chain). Op-geth collapses this into wire
-            // `Failed` — no dedicated variant. The reason string
-            // carries the specific error for SDK inspection.
-            loop_state.publish(wire_event_no_apply(
-                hash,
-                WireStatus::Failed,
-                err.to_string(),
-                loop_state.predicted_height,
-            ));
             if let Some(resp) = fifo.take_responder(&hash).await {
                 let _ = resp.send(Err(err));
             }
@@ -1103,168 +979,4 @@ mod tests {
         assert_eq!(r_entry.status, PreconfStatus::Canceled);
     }
 
-    // ── Wire-event publish coverage ───────────────────────────────
-
-    /// Build a `LoopState` with a wire publisher and a paired
-    /// `broadcast::Receiver` for assertions. Uses
-    /// [`crate::journal::RestoredSet::empty`] so no suppression
-    /// applies to the events under test.
-    fn state_with_publisher(
-        predicted_height: u64,
-        broadcast_cap: usize,
-    ) -> (LoopState, tokio::sync::broadcast::Receiver<PreconfTxEvent>) {
-        let (tx, rx) = tokio::sync::broadcast::channel::<PreconfTxEvent>(broadcast_cap);
-        let publisher = Arc::new(crate::journal::EventPublisher::from_sender(
-            tx,
-            crate::journal::RestoredSet::empty(),
-        ));
-        let state = LoopState::new(predicted_height).with_publisher(Some(publisher));
-        (state, rx)
-    }
-
-    #[tokio::test]
-    async fn success_path_publishes_wire_success_with_receipt_logs() {
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-        let tx = make_tx(0x51);
-        let hash = *tx.tx_hash();
-        fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        let (mut state, mut rx) = state_with_publisher(1, 4);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
-
-        let event = rx.try_recv().expect("wire event published");
-        assert_eq!(event.tx_hash, hash);
-        assert!(matches!(event.status, WireStatus::Success));
-        // Successful path always carries `Some` logs (empty vec in this
-        // synthetic case) to distinguish from the no-apply paths below.
-        assert_eq!(event.receipt.logs.as_ref().map(|l| l.len()), Some(0));
-    }
-
-    #[tokio::test]
-    async fn deadline_gate_publishes_wire_timeout_with_null_logs() {
-        // Zero timeout → gate always fires. Same setup as
-        // `deadline_skip_marks_timeout_and_cancels_responder` but with
-        // a publisher attached.
-        let cfg = PreconfConfig {
-            preconf_timeout: Duration::from_millis(0),
-            ..PreconfConfig::default()
-        };
-        let fifo = PreconfTxSet::new(8);
-        let tx = make_tx(0x52);
-        let hash = *tx.tx_hash();
-        fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        let (mut state, mut rx) = state_with_publisher(1, 4);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
-
-        let event = rx.try_recv().expect("wire event published");
-        assert!(matches!(event.status, WireStatus::Timeout));
-        assert!(event.receipt.logs.is_none(), "no-apply path uses logs=null");
-    }
-
-    #[tokio::test]
-    async fn gas_budget_gate_publishes_wire_failed_no_canceled_variant() {
-        // F1 gate fires → wire status maps to `Failed` (decision 8B).
-        let cfg = PreconfConfig {
-            preconf_max_gas_per_block: 10_000,
-            preconf_max_gas_per_tx: 21_000,
-            ..PreconfConfig::default()
-        };
-        let fifo = PreconfTxSet::new(8);
-        let tx = make_tx(0x53);
-        let hash = *tx.tx_hash();
-        fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        let (mut state, mut rx) = state_with_publisher(1, 4);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
-
-        let event = rx.try_recv().expect("wire event published");
-        assert!(
-            matches!(event.status, WireStatus::Failed),
-            "F1 canceled fifo state must surface as wire Failed"
-        );
-        assert!(event.reason.contains("block gas budget"));
-        assert!(event.receipt.logs.is_none());
-    }
-
-    #[tokio::test]
-    async fn apply_error_publishes_wire_failed_with_error_reason() {
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-        let tx = make_tx(0x54);
-        let hash = *tx.tx_hash();
-        fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        let (mut state, mut rx) = state_with_publisher(1, 4);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err).await;
-
-        let event = rx.try_recv().expect("wire event published");
-        assert!(matches!(event.status, WireStatus::Failed));
-        assert!(event.reason.contains("synthetic error"));
-        assert!(event.receipt.logs.is_none(), "apply-fn Err has no receipt logs");
-    }
-
-    /// R6/T2 — LoopState constructed via plain `new()` (publisher =
-    /// None) must not panic when the dispatch loop invokes `publish`.
-    /// Default-empty-preconf path in cli/node.rs relies on this — the
-    /// pass-through node has no broadcast channel wired up.
-    #[tokio::test]
-    async fn publisher_none_publish_is_silent_noop() {
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-        let tx = make_tx(0x55);
-        let hash = *tx.tx_hash();
-        fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        // No publisher attached — default LoopState.
-        let mut state = LoopState::new(1);
-        // Success + Failed + Timeout + F1-cancel paths all publish
-        // internally; the None-publisher path is exercised on any
-        // successful apply.
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
-        assert_eq!(state.committed_len(), 1, "success path still records commit");
-    }
-
-    /// R6/T3 — revert receipt (status=false) surfaces as wire `Failed`
-    /// but preserves `Some(logs)` (empty vec here). Distinguishes from
-    /// no-apply paths (Timeout / apply-Err) whose `logs` is `None`.
-    #[tokio::test]
-    async fn revert_receipt_publishes_wire_failed_with_some_logs() {
-        // Custom apply closure returning a revert receipt (status=false).
-        fn synthetic_revert(
-            _tx: Arc<TxEnvelope>,
-            hash: TxHash,
-            height: u64,
-        ) -> Result<PreconfReceipt, PreconfError> {
-            Ok(PreconfReceipt {
-                tx_hash: hash,
-                block_height: height,
-                status: false, // ← revert
-                logs: Vec::new(),
-                gas_used: 21_000,
-                reason: "execution reverted".to_string(),
-                revert_data: Bytes::new(),
-            })
-        }
-
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-        let tx = make_tx(0x56);
-        let hash = *tx.tx_hash();
-        fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        let (mut state, mut rx) = state_with_publisher(1, 4);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_revert).await;
-
-        let event = rx.try_recv().expect("wire event published");
-        assert!(matches!(event.status, WireStatus::Failed), "revert ⇒ wire Failed");
-        // Distinguishes from apply-Err path: `Some(vec![])` not `None`.
-        assert_eq!(
-            event.receipt.logs.as_ref().map(|l| l.len()),
-            Some(0),
-            "revert path has receipt.logs = Some(empty) — tx IS on chain"
-        );
-        assert_eq!(event.reason, "execution reverted");
-    }
 }

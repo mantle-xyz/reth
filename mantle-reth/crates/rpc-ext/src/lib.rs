@@ -111,27 +111,6 @@ pub struct PreconfLog {
     pub data: Bytes,
 }
 
-// ─── Preconf subscription trait ──────────────────────────────────────────────
-
-/// `eth_subscribe("newPreconfTransaction")` — receive every preconf
-/// event the sequencer emits (Success / Failed / Timeout).
-///
-/// Emitted from the local builder path via `EventPublisher::publish`
-/// after each fifo status transition. The `RestoredSet` filter drops
-/// duplicates for replayed commitments after restart. Wire shape
-/// mirrors op-geth's `newPreconfTransaction` subscription channel.
-#[cfg_attr(not(test), rpc(server, namespace = "eth"))]
-#[cfg_attr(test, rpc(server, client, namespace = "eth"))]
-pub trait PreconfSubscribeApi {
-    /// Subscribe to the preconf event stream.
-    #[subscription(
-        name = "subscribe" => "newPreconfTransaction",
-        unsubscribe = "unsubscribe",
-        item = PreconfTxEvent
-    )]
-    async fn subscribe_new_preconf_transaction(&self) -> jsonrpsee::core::SubscriptionResult;
-}
-
 // ─── Preconf handler indirection ─────────────────────────────────────────────
 
 /// Dyn-safe entry point for the local preconf handler.

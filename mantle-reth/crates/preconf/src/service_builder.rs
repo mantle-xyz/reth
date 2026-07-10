@@ -31,17 +31,15 @@
 
 use std::{path::Path, sync::Arc};
 
-use mantle_reth_rpc_ext::PreconfTxEvent;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::NodePrimitives;
 use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::TransactionPool;
-use tokio::sync::{OnceCell, broadcast};
 
 use crate::{
     PreconfCanonHandler, PreconfConfig, PreconfJournal, PreconfRpcHandler, PreconfTxSet,
     config::PreconfConfigError,
-    journal::{EventPublisher, JournalError, RestorePool, RestoredSet, restore_preconf_state},
+    journal::{JournalError, RestorePool, restore_preconf_state},
 };
 use thiserror::Error;
 
@@ -68,19 +66,6 @@ pub enum PreconfStartError {}
 /// Owns and hands out the shared preconf handles for a single node
 /// instance. Construct once at startup; wrap in `Arc` at the CLI layer
 /// to distribute to consumers (pool builder, canon handler, RPC).
-///
-/// Startup ordering — the fields separate into two phases:
-///
-/// - **Eagerly constructed** in [`Self::new`] / [`Self::from_config`]:
-///   `cfg`, `fifo`, `journal`, and the `event_broadcast` channel. These
-///   are usable as soon as the builder exists.
-/// - **Set once by [`Self::start`]** (called from the pool builder
-///   after the pool is up but before the pool listener + canon handler
-///   are spawned): `restored` (the [`RestoredSet`] produced by
-///   [`restore_preconf_state`]) and `event_publisher` (the broadcast
-///   wrapper that filters restored hashes). Both use [`OnceCell`] so
-///   `start` is idempotent — calling it twice is a no-op after the
-///   first successful call.
 #[derive(Debug)]
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
@@ -90,22 +75,6 @@ pub struct PreconfServiceBuilder {
     /// via [`PreconfServiceBuilder::with_journal`] before installing
     /// the service builder in the node.
     journal: Option<Arc<PreconfJournal>>,
-    /// Broadcast channel for `newPreconfTransaction` subscribers.
-    /// Constructed eagerly so the RPC subscription API can take a
-    /// receiver before [`Self::start`] is called; the publish path
-    /// wraps this same sender in the [`EventPublisher`] created during
-    /// `start` (which layers the `RestoredSet` suppression on top).
-    event_broadcast: broadcast::Sender<PreconfTxEvent>,
-    /// Set once by [`Self::start`]. `Arc<RestoredSet>` is the set of
-    /// hashes replayed from the journal at startup — the canon handler
-    /// consults `RestoredSet::take` on every sealed hash to drop it
-    /// from the suppression set.
-    restored: OnceCell<Arc<RestoredSet>>,
-    /// Set once by [`Self::start`]. Wraps `event_broadcast` with the
-    /// `RestoredSet` filter so duplicated events for restored txs are
-    /// suppressed. Downstream (dispatch loop, RPC handler) publish
-    /// through this handle rather than the raw sender.
-    event_publisher: OnceCell<Arc<EventPublisher>>,
 }
 
 impl PreconfServiceBuilder {
@@ -142,31 +111,15 @@ impl PreconfServiceBuilder {
         let broadcast_cap = cfg.broadcast_cap;
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
-        let (event_broadcast, _) = broadcast::channel(broadcast_cap);
-        Ok(Self {
-            cfg,
-            fifo,
-            journal: None,
-            event_broadcast,
-            restored: OnceCell::new(),
-            event_publisher: OnceCell::new(),
-        })
+        Ok(Self { cfg, fifo, journal: None })
     }
 
     /// Open or create the on-disk commitment journal at `path` and
     /// install it on this builder. Subsequent calls to
     /// [`Self::rpc_handler`] / [`Self::canon_handler`] will thread the
-    /// journal handle into the produced handlers.
-    ///
-    /// The journal file is opened in append mode; existing contents
-    /// are preserved. Recovery from a previous run
-    /// ([`crate::restore_preconf_state`] + [`crate::RestoredSet`] +
-    /// [`crate::EventPublisher`]) is not wired into this builder yet;
-    /// the pieces exist as standalone helpers but the assembly hook
-    /// belongs with the payload-service startup path — tracked as
-    /// R5/D1 in the review plan. Until that lands, restart replay
-    /// does not happen and commitments made prior to restart are not
-    /// re-emitted.
+    /// journal handle into the produced handlers. The journal file is
+    /// opened in append mode; existing contents are preserved and
+    /// replayed into the fifo when [`Self::start`] runs.
     pub async fn with_journal(mut self, path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let journal = PreconfJournal::open(path).await?;
         self.journal = Some(Arc::new(journal));
@@ -189,70 +142,25 @@ impl PreconfServiceBuilder {
         self.journal.as_ref()
     }
 
-    /// Fresh subscriber for the `newPreconfTransaction` broadcast
-    /// channel. Called by the RPC subscription layer at trait
-    /// registration time to produce a `broadcast::Receiver` per
-    /// subscriber. The channel is live from `new` onward — subscribing
-    /// before [`Self::start`] is fine (nothing is published until the
-    /// builder path fires), and past events are not replayed (broadcast
-    /// semantics).
-    pub fn subscribe_events(&self) -> broadcast::Receiver<PreconfTxEvent> {
-        self.event_broadcast.subscribe()
-    }
-
-    /// Publish handle threaded into `LoopState` so the dispatch loop
-    /// can emit events after each fifo status transition. `None` until
-    /// [`Self::start`] has been called; the pool builder's start-hook
-    /// enforces this ordering.
-    pub fn event_publisher(&self) -> Option<Arc<EventPublisher>> {
-        self.event_publisher.get().cloned()
-    }
-
-    /// The [`RestoredSet`] built during [`Self::start`]. `None` until
-    /// start has been called; the canon handler factory pulls a clone
-    /// out to consult `take` on each sealed hash.
-    pub fn restored_set(&self) -> Option<Arc<RestoredSet>> {
-        self.restored.get().cloned()
-    }
-
-    /// Startup hook: journal → restore → construct `RestoredSet` +
-    /// `EventPublisher` — idempotent. Call once from the pool builder
-    /// after the pool is up, **before** the pool listener + canon
-    /// handler are spawned (so the RestoredSet is populated when they
-    /// start consuming events).
+    /// Startup hook: replay the journal into the fifo (if persistence
+    /// is on) and register the fifo → pool eviction callback.
     ///
-    /// If no journal is configured, the restored set is empty and the
-    /// publisher forwards every event without suppression.
-    ///
-    /// Subsequent calls are a no-op — the [`OnceCell`] fields short-
-    /// circuit. This lets `MantlePoolBuilder::build_pool` call it
-    /// unconditionally without worrying about double-invocation across
-    /// runtime reloads.
+    /// Call once from the pool builder after the pool is up, **before**
+    /// the pool listener + canon handler are spawned so the fifo state
+    /// is populated when they start consuming events.
     pub async fn start<P>(&self, pool: &P) -> Result<(), PreconfStartError>
     where
         P: RestorePool + Clone + 'static,
     {
-        if self.event_publisher.get().is_some() {
-            return Ok(());
+        if let Some(journal) = self.journal.as_ref() {
+            restore_preconf_state(journal, pool, &self.fifo).await;
         }
-        let restored = if let Some(journal) = self.journal.as_ref() {
-            restore_preconf_state(journal, pool, &self.fifo).await
-        } else {
-            RestoredSet::empty()
-        };
-        // OnceCell::set errors when already set — a concurrent start()
-        // won the race; either way both callers see the same value.
-        let _ = self.restored.set(restored.clone());
-        let publisher =
-            Arc::new(EventPublisher::from_sender(self.event_broadcast.clone(), restored));
-        let _ = self.event_publisher.set(publisher);
 
-        // R3/SLA-1: register the pool-eviction callback on the fifo.
         // Every non-on-chain terminal transition (mark_timeout /
-        // mark_canceled / mark_failed) now synchronously removes the
-        // tx from the pool, closing the window where a
-        // client-observed failure could be contradicted by a later
-        // on-chain landing via the pool iterator.
+        // mark_canceled / mark_failed) synchronously removes the tx
+        // from the pool, closing the window where a client-observed
+        // failure could be contradicted by a later on-chain landing
+        // via the pool iterator.
         let pool_for_evict = pool.clone();
         self.fifo.set_pool_eviction_callback(Arc::new(move |hash| {
             pool_for_evict.remove_transactions(vec![hash]);
@@ -282,12 +190,7 @@ impl PreconfServiceBuilder {
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
     {
-        // If `start` has run and produced a RestoredSet, use it; otherwise
-        // fall back to an empty set so `take` is a no-op. This keeps the
-        // factory callable both before and after start (e.g. tests that
-        // wire a canon handler without going through the pool builder).
-        let restored = self.restored.get().cloned().unwrap_or_else(RestoredSet::empty);
-        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.journal.clone(), restored)
+        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.journal.clone())
     }
 
     /// Construct the local-sequencer RPC handler. Returned by value so
@@ -304,16 +207,7 @@ impl PreconfServiceBuilder {
             self.fifo.clone(),
             self.cfg.clone(),
             self.journal.clone(),
-            self.event_publisher(),
         )
-    }
-
-    /// Construct the `eth_subscribe("newPreconfTransaction")` handler.
-    /// Callers register it into the reth RPC module via
-    /// [`jsonrpsee::server::RpcModule::merge`] using the auto-derived
-    /// `into_rpc` from the `PreconfSubscribeApi` trait.
-    pub fn subscription_handler(&self) -> crate::PreconfSubscriptionHandler {
-        crate::PreconfSubscriptionHandler::new(self.event_broadcast.clone())
     }
 }
 
@@ -434,44 +328,25 @@ mod tests {
             unreachable!("empty journal → restore_preconf_state must not call the pool")
         }
         fn remove_transactions(&self, _hashes: Vec<alloy_primitives::TxHash>) {
-            // No mark_* fires in these tests; the setup asserts on
-            // publisher + restored_set only.
+            // No mark_* fires in these tests; the setup asserts only
+            // on fifo state.
         }
     }
 
     #[tokio::test]
-    async fn start_without_journal_creates_empty_restored_and_publisher() {
+    async fn start_without_journal_is_noop_on_fifo() {
         let svc = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
-        assert!(svc.event_publisher().is_none(), "publisher unset before start");
-        assert!(svc.restored_set().is_none(), "restored set unset before start");
-
         svc.start(&UnreachablePool).await.unwrap();
-
-        // Both fields now set.
-        let publisher = svc.event_publisher().expect("publisher set");
-        let restored = svc.restored_set().expect("restored set set");
-        assert_eq!(restored.len(), 0, "no journal ⇒ empty restored set");
-        // Publisher forwards events (no suppression) — subscribe + publish sanity.
-        let mut rx = svc.subscribe_events();
-        publisher.publish(PreconfTxEvent {
-            tx_hash: alloy_primitives::B256::ZERO,
-            status: mantle_reth_rpc_ext::PreconfStatus::Success,
-            reason: String::new(),
-            block_height: 0,
-            receipt: mantle_reth_rpc_ext::PreconfTxReceipt { logs: None },
-        });
-        assert!(rx.try_recv().is_ok(), "subscriber received forwarded event");
+        // No journal ⇒ nothing was replayed into the fifo.
+        assert_eq!(svc.fifo().snapshot().await.len(), 0);
     }
 
     #[tokio::test]
     async fn start_is_idempotent() {
         let svc = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
+        // Calling twice must not panic; both calls succeed.
         svc.start(&UnreachablePool).await.unwrap();
-        let publisher_1 = svc.event_publisher().unwrap();
-        // Second call must be a no-op; publisher pointer stays.
         svc.start(&UnreachablePool).await.unwrap();
-        let publisher_2 = svc.event_publisher().unwrap();
-        assert!(Arc::ptr_eq(&publisher_1, &publisher_2));
     }
 
     /// R6/T5 — `start()` reads the journal from disk and pushes each
@@ -557,10 +432,6 @@ mod tests {
 
         // The adapter was invoked for each journal entry.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "one add per entry");
-        // RestoredSet has both hashes (drives event suppression until
-        // the canon handler drains via `take`).
-        let restored = svc.restored_set().expect("restored set populated");
-        assert_eq!(restored.len(), 2);
         // Fifo contains both restored envelopes.
         let snapshot = svc.fifo().snapshot().await;
         assert_eq!(snapshot.len(), 2);

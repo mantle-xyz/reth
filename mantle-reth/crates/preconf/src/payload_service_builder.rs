@@ -48,7 +48,7 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_storage_api::BlockReaderIdExt;
 
 use crate::{
-    PreconfConfig, PreconfServiceBuilder, PreconfTxSet,
+    PreconfConfig, PreconfTxSet,
     builder::{
         payload_builder::PreconfPayloadBuilder,
         payload_job_generator::PreconfPayloadJobGenerator,
@@ -75,14 +75,6 @@ pub struct MantlePreconfServiceBuilder<N> {
     fifo: Arc<PreconfTxSet>,
     /// OP builder settings (DA limits, max gas per tx, sdm-enable, ...).
     builder_config: OpBuilderConfig,
-    /// Optional handle to the application-level service builder. The
-    /// wire-event publisher lives on `svc` and is populated by
-    /// [`crate::PreconfServiceBuilder::start`] — which runs during
-    /// [`MantlePoolBuilder::build_pool`], **before** reth invokes
-    /// [`Self::spawn_payload_builder_service`]. So this indirection
-    /// lets us read the publisher lazily at spawn time, after `start`
-    /// has run. `None` when preconf is disabled on the node.
-    svc: Option<Arc<PreconfServiceBuilder>>,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
     /// constraining `N` itself.
     _pd: PhantomData<fn() -> N>,
@@ -90,16 +82,13 @@ pub struct MantlePreconfServiceBuilder<N> {
 
 impl<N> MantlePreconfServiceBuilder<N> {
     /// Construct a new service builder bound to shared preconf state
-    /// and OP builder settings. `svc` is optional; when `Some`, the
-    /// spawned payload builder pulls the wire-event publisher lazily
-    /// via [`PreconfServiceBuilder::event_publisher`] at spawn time.
+    /// and OP builder settings.
     pub const fn new(
         cfg: Arc<PreconfConfig>,
         fifo: Arc<PreconfTxSet>,
         builder_config: OpBuilderConfig,
-        svc: Option<Arc<PreconfServiceBuilder>>,
     ) -> Self {
-        Self { cfg, fifo, builder_config, svc, _pd: PhantomData }
+        Self { cfg, fifo, builder_config, _pd: PhantomData }
     }
 }
 
@@ -168,7 +157,7 @@ where
         pool: Pool,
         evm_config: EvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let Self { cfg, fifo, builder_config, svc, _pd } = self;
+        let Self { cfg, fifo, builder_config, _pd } = self;
 
         // Rollback safety — when `--preconf.enable` is absent, `cfg` is
         // `PreconfConfig::default()` with `enabled: false`. In that case
@@ -193,10 +182,6 @@ where
                 .await;
         }
 
-        // Read the publisher lazily — `start` populates it during
-        // `build_pool`, which runs before this method.
-        let publisher = svc.as_ref().and_then(|s| s.event_publisher());
-
         let builder = PreconfPayloadBuilder::new(
             pool,
             ctx.provider().clone(),
@@ -204,7 +189,6 @@ where
             builder_config,
             cfg,
             fifo,
-            publisher,
         );
 
         let generator: PreconfPayloadJobGenerator<Pool, Node::Provider, EvmConfig, N> =

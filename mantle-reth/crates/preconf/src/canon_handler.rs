@@ -42,7 +42,7 @@ use reth_primitives_traits::NodePrimitives;
 use reth_transaction_pool::TransactionPool;
 use tracing::{debug, trace, warn};
 
-use crate::{PreconfJournal, journal::RestoredSet, preconf_tx_set::PreconfTxSet};
+use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
 
 /// Long-running async task bridging `CanonStateNotification` events to
 /// [`PreconfTxSet`] cleanup.
@@ -68,14 +68,6 @@ pub struct PreconfCanonHandler<Pr, P, N> {
     /// disabled; reverted-chain observation falls back to the fifo
     /// proxy as before.
     journal: Option<Arc<PreconfJournal>>,
-    /// Startup-restore hash set. On every canon commit the handler
-    /// calls `restored.take(&hash)` for each sealed hash: once a
-    /// restored commitment actually lands on chain, the wire
-    /// `EventPublisher` no longer needs to suppress duplicate events
-    /// for it (see [`crate::journal::EventPublisher::publish`]).
-    /// [`RestoredSet::empty`] is used when the journal is disabled —
-    /// `take` on an empty set is a cheap no-op.
-    restored: Arc<RestoredSet>,
     _n: PhantomData<fn() -> N>,
 }
 
@@ -97,18 +89,14 @@ where
     /// Construct a handler bound to `provider`'s canonical-state stream.
     /// `journal` is optional; when `None`, the handler degrades to
     /// the pre-journal behaviour (fifo-membership proxy for reorg
-    /// signal, no sealed-set bookkeeping). `restored` should be the
-    /// same `Arc<RestoredSet>` the [`crate::journal::EventPublisher`]
-    /// consults — use [`RestoredSet::empty`] when journal is disabled
-    /// or [`crate::PreconfServiceBuilder::restored_set`] otherwise.
+    /// signal, no sealed-set bookkeeping).
     pub const fn new(
         provider: Pr,
         pool: P,
         fifo: Arc<PreconfTxSet>,
         journal: Option<Arc<PreconfJournal>>,
-        restored: Arc<RestoredSet>,
     ) -> Self {
-        Self { provider, pool, fifo, journal, restored, _n: PhantomData }
+        Self { provider, pool, fifo, journal, _n: PhantomData }
     }
 
     /// Run the listener loop. Returns when the canonical-state stream
@@ -156,13 +144,6 @@ where
                 for hash in &sealed_hashes {
                     journal.mark_sealed(*hash).await;
                 }
-            }
-
-            // Drop restored hashes from the wire-event suppression set
-            // once they actually land on chain. `RestoredSet::empty` +
-            // no-op `take` covers the journal-disabled case.
-            for hash in &sealed_hashes {
-                self.restored.take(hash);
             }
 
             let frontier = aggregate_nonce_frontier(pairs);

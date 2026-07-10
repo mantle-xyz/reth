@@ -114,11 +114,6 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     builder_config: OpBuilderConfig,
     cfg: Arc<PreconfConfig>,
     fifo: Arc<PreconfTxSet>,
-    /// Optional wire-event publisher, produced by
-    /// [`crate::PreconfServiceBuilder::start`]. `None` when subscription
-    /// wiring is disabled or `start` has not yet run — the dispatch
-    /// loop then skips wire publish silently.
-    publisher: Option<Arc<crate::journal::EventPublisher>>,
 }
 
 impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
@@ -128,10 +123,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     /// Cloning the resulting builder is cheap — `cfg` / `fifo` are
     /// `Arc`s, pool / client / `evm_config` are typically `Arc`-backed
     /// too, and [`OpBuilderConfig`] is a small `Clone` struct.
-    ///
-    /// `publisher` is optional; pass `None` when subscription wiring
-    /// is not enabled for this node (default-empty preconf case) —
-    /// the dispatch loop will skip wire publishing.
     pub const fn new(
         pool: Pool,
         client: Client,
@@ -139,9 +130,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         builder_config: OpBuilderConfig,
         cfg: Arc<PreconfConfig>,
         fifo: Arc<PreconfTxSet>,
-        publisher: Option<Arc<crate::journal::EventPublisher>>,
     ) -> Self {
-        Self { pool, client, evm_config, builder_config, cfg, fifo, publisher }
+        Self { pool, client, evm_config, builder_config, cfg, fifo }
     }
 
     /// Borrow the underlying transaction pool.
@@ -172,11 +162,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     /// Borrow the shared preconf fifo handle.
     pub const fn fifo(&self) -> &Arc<PreconfTxSet> {
         &self.fifo
-    }
-
-    /// Borrow the optional wire-event publisher.
-    pub const fn publisher(&self) -> &Option<Arc<crate::journal::EventPublisher>> {
-        &self.publisher
     }
 }
 
@@ -598,8 +583,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let mut best_txs_iter = best_txs_iter_opt;
         let mut fifo_rx = self.fifo.subscribe();
         let predicted_height = ctx.parent().number() + 1;
-        let mut loop_state =
-            dispatch::LoopState::new(predicted_height).with_publisher(self.publisher.clone());
+        let mut loop_state = dispatch::LoopState::new(predicted_height);
 
         // Adaptive-N pool quota schedule — see `derive_pool_quota_schedule`.
         // SystemTime is read only here for the initial offset; the tokio
@@ -803,11 +787,9 @@ mod tests {
             builder_config,
             cfg.clone(),
             fifo.clone(),
-            None,
         );
         assert!(Arc::ptr_eq(builder.cfg(), &cfg));
         assert!(Arc::ptr_eq(builder.fifo(), &fifo));
-        assert!(builder.publisher().is_none());
         // Arc counts: outer + inside builder = 2 each.
         assert_eq!(Arc::strong_count(&cfg), 2);
         assert_eq!(Arc::strong_count(&fifo), 2);

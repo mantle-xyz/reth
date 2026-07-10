@@ -65,12 +65,6 @@ pub struct PreconfRpcHandler<P, Pr> {
     /// durability; a crash before the next disk flush loses at most
     /// the most recent commitment).
     journal: Option<Arc<PreconfJournal>>,
-    /// Optional wire-event publisher. Only used to emit `Timeout`
-    /// events for the BaseFee/Queued orphan path (see the `Err(_elapsed)`
-    /// arm of `handle_inner`) — every other terminal transition is
-    /// published by the dispatch loop directly on the fifo entry it
-    /// owns. Threaded through from `PreconfServiceBuilder::start`.
-    publisher: Option<Arc<crate::journal::EventPublisher>>,
 }
 
 // Manual Debug — `P` (TransactionPool) and `Pr` (StateProviderFactory) do
@@ -88,18 +82,16 @@ impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
 
 impl<P, Pr> PreconfRpcHandler<P, Pr> {
     /// Construct a handler bound to the given pool + provider + fifo.
-    /// `journal` and `publisher` are optional; either / both may be
-    /// `None`, in which case the corresponding side-effect (persistence
-    /// / wire broadcast) is silently skipped.
+    /// `journal` is optional; when `None`, persistence of successful
+    /// commitments is silently skipped.
     pub const fn new(
         pool: P,
         provider: Pr,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
         journal: Option<Arc<PreconfJournal>>,
-        publisher: Option<Arc<crate::journal::EventPublisher>>,
     ) -> Self {
-        Self { pool, provider, fifo, cfg, journal, publisher }
+        Self { pool, provider, fifo, cfg, journal }
     }
 }
 
@@ -309,15 +301,6 @@ where
                     // Timeout branch: no EVM apply happened, wire logs = null.
                     receipt: PreconfTxReceipt { logs: None },
                 };
-                // Broadcast the same event to subscribers. This covers
-                // the BaseFee/Queued orphan path where dispatch never
-                // saw the tx (fifo `mark_timeout` returned `NotFound`)
-                // and therefore never published — without this the
-                // subscription channel would silently drop such
-                // client-visible timeouts.
-                if let Some(p) = self.publisher.as_ref() {
-                    p.publish(event.clone());
-                }
                 Ok(event)
             }
         }

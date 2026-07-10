@@ -26,27 +26,25 @@
 //!
 //! The journal exposes `append_promised` / `load` / `mark_sealed` /
 //! `contains` / `rotate` for the durability path, plus the startup
-//! helper [`restore_preconf_state`], the event-suppressing
-//! [`RestoredSet`], the [`EventPublisher`] broadcast wrapper, and the
-//! background rotation loop [`spawn_rejournal_loop`].
+//! helper [`restore_preconf_state`] and the background rotation loop
+//! [`spawn_rejournal_loop`].
 
 use std::{
     collections::HashSet,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
     time::Duration,
 };
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, Bytes, TxHash};
-use mantle_reth_rpc_ext::PreconfTxEvent;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, oneshot},
     task::JoinHandle,
     time::MissedTickBehavior,
 };
@@ -312,73 +310,6 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     PathBuf::from(tmp)
 }
 
-// ─── Restored set ───────────────────────────────────────────────────────────
-
-/// Set of transaction hashes that were re-injected from a [`PreconfJournal`]
-/// at node startup.
-///
-/// Two consumers later read from it:
-///
-/// 1. The `EventPublisher` (next phase) consults [`RestoredSet::contains`]
-///    before broadcasting a `newPreconfTransaction` event. Restored txs
-///    already had their original event delivered before the crash; replay
-///    must not produce a duplicate to surviving subscribers.
-/// 2. The canonical-state handler calls [`RestoredSet::take`] for every
-///    sealed tx so the set shrinks monotonically — once a restored
-///    commitment lands on chain, suppression is no longer necessary.
-///
-/// The set is small (at most one slot's worth of in-flight commitments
-/// per crash window) and accessed at low frequency (one query per
-/// broadcast / sealed tx). A sync `std::sync::Mutex` is enough; no
-/// `.await` blocks inside the critical section, so this is safe to
-/// share across tokio tasks.
-#[derive(Debug)]
-pub struct RestoredSet {
-    inner: StdMutex<HashSet<TxHash>>,
-}
-
-impl RestoredSet {
-    /// Empty set — what callers get when the journal feature is
-    /// disabled or the file was empty on startup.
-    pub fn empty() -> Arc<Self> {
-        Arc::new(Self { inner: StdMutex::new(HashSet::new()) })
-    }
-
-    /// Build from an iterator of hashes — used by
-    /// [`restore_preconf_state`] after walking the journal.
-    ///
-    /// Named `with_hashes` rather than `from_iter` so it does not
-    /// shadow the standard `FromIterator::from_iter` (which is a
-    /// confusing trait to implement here because the natural return
-    /// type is `Arc<Self>`, not `Self`).
-    pub fn with_hashes<I: IntoIterator<Item = TxHash>>(iter: I) -> Arc<Self> {
-        Arc::new(Self { inner: StdMutex::new(iter.into_iter().collect()) })
-    }
-
-    /// `true` if `hash` is still being suppressed. Cheap lock + lookup.
-    pub fn contains(&self, hash: &TxHash) -> bool {
-        self.inner.lock().expect("RestoredSet mutex poisoned").contains(hash)
-    }
-
-    /// Remove `hash` from the set. Returns `true` if it was present
-    /// (i.e. the caller just observed it transition from restored to
-    /// "no longer needs suppression"). Idempotent — subsequent calls
-    /// return `false`.
-    pub fn take(&self, hash: &TxHash) -> bool {
-        self.inner.lock().expect("RestoredSet mutex poisoned").remove(hash)
-    }
-
-    /// Current size — for telemetry / metric reporting.
-    pub fn len(&self) -> usize {
-        self.inner.lock().expect("RestoredSet mutex poisoned").len()
-    }
-
-    /// `true` when no hashes are tracked.
-    pub fn is_empty(&self) -> bool {
-        self.inner.lock().expect("RestoredSet mutex poisoned").is_empty()
-    }
-}
-
 // ─── Pool interaction trait ─────────────────────────────────────────────────
 
 /// Minimal pool-side surface [`restore_preconf_state`] needs.
@@ -458,26 +389,24 @@ pub struct RestoredEnvelope {
 ///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so
 ///    the dispatch layer's deadline / gas-budget gates bypass the tx
 ///    (SLA: "receipt returned → tx must land").
-/// 3. Record the hash in the returned [`RestoredSet`].
 ///
 /// Non-recoverable failures (corrupt tx bytes, pool refusal for reasons
 /// other than `AlreadyImported`) are logged and skipped — best-effort
-/// restore, never block startup. The function returns the
-/// [`RestoredSet`] regardless of how many individual entries failed.
+/// restore, never block startup.
 pub async fn restore_preconf_state<P: RestorePool>(
     journal: &PreconfJournal,
     pool: &P,
     fifo: &Arc<PreconfTxSet>,
-) -> Arc<RestoredSet> {
+) {
     let (entries, bad_lines) = match journal.load().await {
         Ok(v) => v,
         Err(e) => {
             warn!(
                 target: "mantle::preconf::journal",
                 ?e,
-                "journal load failed; continuing with empty restored set"
+                "journal load failed; continuing without restore"
             );
-            return RestoredSet::empty();
+            return;
         }
     };
     info!(
@@ -487,7 +416,7 @@ pub async fn restore_preconf_state<P: RestorePool>(
         "preconf journal load"
     );
 
-    let mut restored: Vec<TxHash> = Vec::with_capacity(entries.len());
+    let mut restored = 0usize;
     let mut decode_failures = 0usize;
 
     for entry in entries {
@@ -516,103 +445,15 @@ pub async fn restore_preconf_state<P: RestorePool>(
             )
             .await;
 
-        restored.push(entry.hash);
+        restored += 1;
     }
 
     info!(
         target: "mantle::preconf::journal",
-        restored = restored.len(),
+        restored,
         decode_failures,
         "preconf restore complete"
     );
-
-    RestoredSet::with_hashes(restored)
-}
-
-// ─── Event publishing ───────────────────────────────────────────────────────
-
-/// Wraps the `newPreconfTransaction` subscription channel with a
-/// [`RestoredSet`]-aware filter.
-///
-/// When the node restarts and replays journaled commitments back into
-/// the pool / fifo, the in-flight RPC subscribers that survived the
-/// restart already saw the original event before the crash. Re-emitting
-/// the same `PreconfTxEvent` from the replay path would surface as a
-/// duplicate to those clients — confusing, and a vector for accidental
-/// double-spend logic on naive SDK consumers.
-///
-/// [`EventPublisher::publish`] consults the restored set first:
-///
-/// - hash **is** restored → suppress (return `false`); the
-///   canonical-state handler will later `take()` the hash from the
-///   set so re-emissions for the same tx in future *non-restore*
-///   contexts are not blocked.
-/// - hash **is not** restored → forward to the broadcast channel.
-///
-/// The publisher owns the broadcast `Sender`. Consumers obtain
-/// receivers via [`EventPublisher::subscribe`]; subscription is
-/// independent of restored-set membership.
-#[derive(Debug)]
-pub struct EventPublisher {
-    broadcast: broadcast::Sender<PreconfTxEvent>,
-    restored: Arc<RestoredSet>,
-}
-
-impl EventPublisher {
-    /// Construct an event publisher with a fresh broadcast channel of
-    /// the given capacity. The same `restored` set passed in here
-    /// should be the one returned by [`restore_preconf_state`] at
-    /// startup so suppression behaves consistently.
-    pub fn new(broadcast_cap: usize, restored: Arc<RestoredSet>) -> Self {
-        let (broadcast, _) = broadcast::channel(broadcast_cap);
-        Self { broadcast, restored }
-    }
-
-    /// Construct a publisher from a pre-existing broadcast `Sender` —
-    /// useful when the channel must be created elsewhere (e.g. by the
-    /// service builder so the [`RestoredSet`] can be initialised after
-    /// the broadcast already has subscribers).
-    pub const fn from_sender(
-        broadcast: broadcast::Sender<PreconfTxEvent>,
-        restored: Arc<RestoredSet>,
-    ) -> Self {
-        Self { broadcast, restored }
-    }
-
-    /// Subscribe to the broadcast. Subscribers receive every event
-    /// published *after* their subscription that does not get
-    /// suppressed by the restored-set filter.
-    pub fn subscribe(&self) -> broadcast::Receiver<PreconfTxEvent> {
-        self.broadcast.subscribe()
-    }
-
-    /// Number of active subscribers — for telemetry / health probes.
-    pub fn subscriber_count(&self) -> usize {
-        self.broadcast.receiver_count()
-    }
-
-    /// Publish `event` unless it is for a restored hash.
-    ///
-    /// Returns `true` when the event was forwarded to the broadcast
-    /// (or attempted to be — sending with zero subscribers is not an
-    /// error, the channel just drops the value silently). Returns
-    /// `false` only when the event was deliberately suppressed by
-    /// the restored-set filter.
-    pub fn publish(&self, event: PreconfTxEvent) -> bool {
-        if self.restored.contains(&event.tx_hash) {
-            debug!(
-                target: "mantle::preconf::journal",
-                tx_hash = ?event.tx_hash,
-                "suppressing event for restored hash"
-            );
-            return false;
-        }
-        // `send` only errors when no receivers exist — that is not a
-        // failure (in production every node has at least one
-        // subscription only when a client has called the RPC).
-        let _ = self.broadcast.send(event);
-        true
-    }
 }
 
 // ─── Background rotation loop ───────────────────────────────────────────────
@@ -828,41 +669,6 @@ mod tests {
         assert_eq!(after, vec![e_b]);
     }
 
-    // ── RestoredSet ─────────────────────────────────────────────────
-
-    #[test]
-    fn restored_set_empty_starts_empty() {
-        let s = RestoredSet::empty();
-        assert!(s.is_empty());
-        assert_eq!(s.len(), 0);
-    }
-
-    #[test]
-    fn restored_set_with_hashes_collects_unique() {
-        let h1 = TxHash::from([1; 32]);
-        let h2 = TxHash::from([2; 32]);
-        let s = RestoredSet::with_hashes([h1, h2, h1]); // dup ignored
-        assert_eq!(s.len(), 2);
-        assert!(s.contains(&h1));
-        assert!(s.contains(&h2));
-    }
-
-    #[test]
-    fn restored_set_take_returns_membership_and_removes() {
-        let h = TxHash::from([7; 32]);
-        let s = RestoredSet::with_hashes([h]);
-        assert!(s.take(&h), "first take must report presence");
-        assert!(!s.take(&h), "second take must report absence");
-        assert!(!s.contains(&h));
-    }
-
-    #[test]
-    fn restored_set_take_unknown_hash_is_noop() {
-        let s = RestoredSet::with_hashes([TxHash::from([1; 32])]);
-        assert!(!s.take(&TxHash::from([9; 32])));
-        assert_eq!(s.len(), 1);
-    }
-
     // ── restore_preconf_state ──────────────────────────────────────
 
     /// Stub pool that records `contains` / `add_envelope` calls. We
@@ -873,8 +679,8 @@ mod tests {
         // Hashes the stub will report as already-present.
         known: HashSet<TxHash>,
         // Counts for assertions.
-        contains_calls: StdMutex<Vec<TxHash>>,
-        add_calls: StdMutex<Vec<Bytes>>,
+        contains_calls: std::sync::Mutex<Vec<TxHash>>,
+        add_calls: std::sync::Mutex<Vec<Bytes>>,
         // Whether add_envelope should return Err.
         reject_add: bool,
     }
@@ -883,8 +689,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 known: HashSet::new(),
-                contains_calls: StdMutex::new(Vec::new()),
-                add_calls: StdMutex::new(Vec::new()),
+                contains_calls: std::sync::Mutex::new(Vec::new()),
+                add_calls: std::sync::Mutex::new(Vec::new()),
                 reject_add: false,
             }
         }
@@ -923,33 +729,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_from_empty_journal_returns_empty_set() {
+    async fn restore_from_empty_journal_is_noop() {
         let (_dir, j) = fresh_journal().await;
         let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        let restored = restore_preconf_state(&j, &pool, &fifo).await;
-        assert!(restored.is_empty());
+        restore_preconf_state(&j, &pool, &fifo).await;
         assert!(pool.contains_calls.lock().unwrap().is_empty());
         assert!(pool.add_calls.lock().unwrap().is_empty());
+        assert!(fifo.snapshot().await.is_empty());
     }
 
     #[tokio::test]
     async fn restore_injects_missing_txs_and_pushes_fifo() {
         let (_dir, j) = fresh_journal().await;
-        let e1 = entry(1, 10);
-        let e2 = entry(2, 11);
-        j.append_promised(&e1).await.unwrap();
-        j.append_promised(&e2).await.unwrap();
+        j.append_promised(&entry(1, 10)).await.unwrap();
+        j.append_promised(&entry(2, 11)).await.unwrap();
 
-        let pool = StubPool::new(); // knows nothing — every entry gets injected
+        let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        let restored = restore_preconf_state(&j, &pool, &fifo).await;
+        restore_preconf_state(&j, &pool, &fifo).await;
 
-        assert_eq!(restored.len(), 2);
-        assert!(restored.contains(&e1.hash));
-        assert!(restored.contains(&e2.hash));
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "both txs admitted");
-        // Fifo got both pushes (synthetic hashes from the stub).
         let snapshot = fifo.snapshot().await;
         assert_eq!(snapshot.len(), 2);
     }
@@ -969,10 +769,8 @@ mod tests {
         let mut pool = StubPool::new();
         pool.known.insert(e1.hash);
         let fifo = Arc::new(PreconfTxSet::new(16));
-        let restored = restore_preconf_state(&j, &pool, &fifo).await;
+        restore_preconf_state(&j, &pool, &fifo).await;
 
-        assert_eq!(restored.len(), 1);
-        assert!(restored.contains(&e1.hash));
         assert_eq!(pool.add_calls.lock().unwrap().len(), 1);
         // Core J5 assertion: fifo received the entry.
         assert_eq!(fifo.snapshot().await.len(), 1);
@@ -987,67 +785,12 @@ mod tests {
         let mut pool = StubPool::new();
         pool.reject_add = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
-        let restored = restore_preconf_state(&j, &pool, &fifo).await;
+        restore_preconf_state(&j, &pool, &fifo).await;
 
-        // Both entries' add_envelope calls return Err — none make it
-        // into the restored set. Crucially the function does not panic
-        // and walks all entries.
-        assert!(restored.is_empty());
+        // Both entries' add_envelope calls return Err — the function
+        // does not panic and walks all entries.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2);
         assert!(fifo.snapshot().await.is_empty());
-    }
-
-    // ── EventPublisher ──────────────────────────────────────────────
-
-    fn event_with_hash(byte: u8) -> PreconfTxEvent {
-        PreconfTxEvent {
-            tx_hash: TxHash::from([byte; 32]),
-            status: mantle_reth_rpc_ext::PreconfStatus::Success,
-            reason: String::new(),
-            block_height: 0,
-            receipt: mantle_reth_rpc_ext::PreconfTxReceipt { logs: None },
-        }
-    }
-
-    #[tokio::test]
-    async fn event_publisher_forwards_unrestored_events() {
-        let restored = RestoredSet::empty();
-        let pub_ = EventPublisher::new(16, restored);
-        let mut rx = pub_.subscribe();
-        let event = event_with_hash(1);
-        assert!(pub_.publish(event.clone()));
-        let got = rx.recv().await.unwrap();
-        assert_eq!(got, event);
-    }
-
-    #[tokio::test]
-    async fn event_publisher_suppresses_restored_events() {
-        let hash = TxHash::from([2; 32]);
-        let restored = RestoredSet::with_hashes([hash]);
-        let pub_ = EventPublisher::new(16, restored);
-        let mut rx = pub_.subscribe();
-        let event = event_with_hash(2);
-        // publish returns false: suppressed.
-        assert!(!pub_.publish(event.clone()));
-        // try_recv: no event delivered.
-        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
-    }
-
-    #[tokio::test]
-    async fn event_publisher_send_with_no_subscribers_is_not_an_error() {
-        let pub_ = EventPublisher::new(16, RestoredSet::empty());
-        // No subscribe() call; receiver_count = 0.
-        assert_eq!(pub_.subscriber_count(), 0);
-        // publish must still return true (not suppressed) and not panic.
-        assert!(pub_.publish(event_with_hash(3)));
-    }
-
-    #[tokio::test]
-    async fn event_publisher_subscriber_count_reflects_active_receivers() {
-        let pub_ = EventPublisher::new(16, RestoredSet::empty());
-        let _rx1 = pub_.subscribe();
-        let _rx2 = pub_.subscribe();
-        assert_eq!(pub_.subscriber_count(), 2);
     }
 
     // ── spawn_rejournal_loop ────────────────────────────────────────
@@ -1100,35 +843,4 @@ mod tests {
             .expect("loop panicked");
     }
 
-    /// R6/T4 — After a restored hash's suppression window is closed
-    /// via `RestoredSet::take` (called by canon_handler on Commit),
-    /// subsequent `EventPublisher::publish` for the same hash must go
-    /// through. This is the design contract (see `EventPublisher` doc
-    /// §"Wraps the newPreconfTransaction subscription channel...").
-    ///
-    /// The publisher itself does NOT auto-drain restored entries on
-    /// publish — `contains` is a peek, not a take. Removal is the
-    /// canon-handler's responsibility.
-    #[tokio::test]
-    async fn event_publisher_take_after_suppress_allows_second_publish() {
-        let h = TxHash::from([0x77; 32]);
-        let restored = RestoredSet::with_hashes([h]);
-        let publisher = EventPublisher::new(8, restored.clone());
-        let mut rx = publisher.subscribe();
-
-        // First publish: suppressed because `h` is in restored set.
-        let event = event_with_hash(0x77);
-        assert!(!publisher.publish(event.clone()), "first publish suppressed");
-        assert!(rx.try_recv().is_err(), "subscriber saw nothing");
-
-        // Idle publish: peek did NOT drain restored — still suppressed.
-        assert!(!publisher.publish(event.clone()), "still suppressed on retry");
-
-        // Simulate canon-handler Commit: explicitly drain.
-        assert!(restored.take(&h), "take reports presence");
-
-        // Third publish: not suppressed anymore.
-        assert!(publisher.publish(event.clone()), "publish goes through after take");
-        assert_eq!(rx.try_recv().expect("event delivered").tx_hash, h);
-    }
 }
