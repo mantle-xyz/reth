@@ -155,6 +155,13 @@ where
                         "fifo already contains this hash; idempotent skip"
                     );
                 }
+                PushResult::Revived => {
+                    debug!(
+                        target: "mantle::preconf::listener",
+                        ?hash, ?sender,
+                        "revived reclaimable fifo entry (Timeout/Canceled → Waiting)"
+                    );
+                }
                 PushResult::ConflictActive(existing) => {
                     debug!(
                         target: "mantle::preconf::listener",

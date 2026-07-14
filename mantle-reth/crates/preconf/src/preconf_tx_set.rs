@@ -41,7 +41,6 @@ use tracing::error;
 
 use crate::types::{
     AttachError, MarkError, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus, PushResult,
-    RecoverError,
 };
 
 /// A single fifo entry.
@@ -271,7 +270,35 @@ impl PreconfTxSet {
 
         let mut inner = self.inner.lock().await;
 
-        if inner.entries.contains_key(&hash) {
+        // Same-hash entry already present — three outcomes depending on
+        // its current status:
+        //
+        // - `Timeout` / `Canceled` (reclaimable) → revive to `Waiting`.
+        //   Adopt the fresh responder + origin_instant from
+        //   `pending_responders` (if the RPC handler pre-attached one
+        //   for this resubmit) so dispatch's deadline gate measures
+        //   against the new submission, then broadcast. Closes the
+        //   "same-hash resubmit after timeout" loop that would
+        //   otherwise wedge under the pool-eviction callback.
+        // - `Waiting` / `Success` / `Failed` (active) → idempotent
+        //   no-op; callers should treat this as "someone else already
+        //   owns the slot" (the RPC handler surfaces it as
+        //   `AlreadyInProgress`).
+        if let Some(existing) = inner.entries.get_mut(&hash) {
+            if matches!(
+                existing.status,
+                PreconfStatus::Timeout | PreconfStatus::Canceled
+            ) {
+                // `attach_responder`'s reclaimable-state branch already
+                // installed the fresh responder + refreshed
+                // `inserted_at` before this push landed. All we need
+                // here is the status flip + broadcast that turns the
+                // entry back into a live dispatch candidate.
+                existing.status = PreconfStatus::Waiting;
+                drop(inner);
+                let _ = self.notifier.send(hash);
+                return PushResult::Revived;
+            }
             return PushResult::AlreadyExists;
         }
 
@@ -479,10 +506,13 @@ impl PreconfTxSet {
     }
 
     /// `Waiting → Timeout`. **Soft terminal** — unlike `Success` / `Failed`,
-    /// a `Timeout` entry can be revived via [`Self::recover_from_reclaimable`]
-    /// (used by the same-hash client-retry path). Called by RPC handler
-    /// when the client-side `preconf_timeout` fires before a receipt is
-    /// delivered, or by dispatch's pre-apply deadline gate.
+    /// a `Timeout` entry is **revivable**: a same-hash retry from the
+    /// client re-runs through `attach_responder` (which refreshes the
+    /// responder + `inserted_at`) and the subsequent listener push
+    /// through [`Self::push_if_absent`] flips the entry back to
+    /// `Waiting`. Called by the RPC handler when the client-side
+    /// `preconf_timeout` fires before a receipt is delivered, or by
+    /// dispatch's pre-apply deadline gate.
     ///
     /// Same pool-eviction hook as `mark_failed`.
     pub async fn mark_timeout(&self, hash: &TxHash) -> Result<(), MarkError> {
@@ -492,7 +522,8 @@ impl PreconfTxSet {
     }
 
     /// `Waiting → Canceled`. **Soft terminal** — like `Timeout`, revivable
-    /// via [`Self::recover_from_reclaimable`]. Signals **server pre-apply
+    /// via same-hash retry through `attach_responder` +
+    /// [`Self::push_if_absent`]. Signals **server pre-apply
     /// rejection** (block gas budget exhausted, admin action, ...) — the
     /// EVM was never run, so the tx is guaranteed not to land on chain.
     /// Semantically distinct from `Timeout` (client's deadline hit).
@@ -517,25 +548,6 @@ impl PreconfTxSet {
             return Err(MarkError::IllegalTransition(entry.status));
         }
         entry.status = target;
-        Ok(())
-    }
-
-    /// `Timeout | Canceled → Waiting` + broadcast notify.
-    /// Unified recover for the two reclaimable states —
-    /// the RPC handler's same-hash retry path uses this without needing
-    /// to know which specific reclaimable state the entry is in. Any
-    /// other status returns `UnexpectedStatus(current)`; a missing entry
-    /// returns `NotFound`.
-    pub async fn recover_from_reclaimable(&self, hash: &TxHash) -> Result<(), RecoverError> {
-        let mut inner = self.inner.lock().await;
-        let entry = inner.entries.get_mut(hash).ok_or(RecoverError::NotFound)?;
-        if !matches!(entry.status, PreconfStatus::Timeout | PreconfStatus::Canceled) {
-            return Err(RecoverError::UnexpectedStatus(entry.status));
-        }
-        entry.status = PreconfStatus::Waiting;
-        drop(inner);
-
-        let _ = self.notifier.send(*hash);
         Ok(())
     }
 
@@ -603,11 +615,41 @@ impl PreconfTxSet {
     ) -> Result<(), AttachError> {
         let mut inner = self.inner.lock().await;
         if let Some(entry) = inner.entries.get_mut(&hash) {
-            if entry.responder.is_some() {
-                return Err(AttachError::AlreadyAttached);
+            match entry.status {
+                // A prior client already resolved on this hash — either
+                // `mark_succeeded`/`mark_failed` fired and the receipt
+                // (or error) has been delivered. Any second submission
+                // would have nothing new to await, so surface as
+                // `AlreadyInProgress` at the caller.
+                PreconfStatus::Success | PreconfStatus::Failed => {
+                    return Err(AttachError::AlreadyAttached);
+                }
+                // Waiting — the entry is live. Allow attach only when
+                // no responder is currently registered (fresh listener-
+                // only push, or the RPC handler that owns the slot has
+                // taken its responder). If a responder is present, a
+                // client is actively waiting and we must not overwrite
+                // its `oneshot::Sender`.
+                PreconfStatus::Waiting => {
+                    if entry.responder.is_some() {
+                        return Err(AttachError::AlreadyAttached);
+                    }
+                    entry.responder = Some(responder);
+                    return Ok(());
+                }
+                // Reclaimable — this is a same-hash retry after a
+                // `Timeout` or `Canceled`. Install the fresh responder
+                // and refresh `inserted_at` so `builder::dispatch`'s
+                // deadline gate measures against the second submission
+                // rather than the (already-expired) first. The
+                // subsequent `push_if_absent` from the pool listener
+                // flips the entry back to `Waiting` and broadcasts.
+                PreconfStatus::Timeout | PreconfStatus::Canceled => {
+                    entry.responder = Some(responder);
+                    entry.inserted_at = origin_instant;
+                    return Ok(());
+                }
             }
-            entry.responder = Some(responder);
-            return Ok(());
         }
         if inner.pending_responders.contains_key(&hash) {
             return Err(AttachError::AlreadyAttached);
@@ -854,70 +896,6 @@ mod tests {
         assert_eq!(set.mark_succeeded(&h(99)).await.unwrap_err(), MarkError::NotFound);
         assert_eq!(set.mark_failed(&h(99)).await.unwrap_err(), MarkError::NotFound);
         assert_eq!(set.mark_timeout(&h(99)).await.unwrap_err(), MarkError::NotFound);
-    }
-
-    // ============ recover_from_reclaimable ============
-
-    /// Both reclaimable states (Timeout, Canceled) must round-trip
-    /// through the unified `recover_from_reclaimable` back to `Waiting`
-    /// with the same broadcast side effect. Runs each case in one test
-    /// to prove the union doesn't specialise.
-    #[tokio::test]
-    async fn recover_from_reclaimable_handles_both_states() {
-        for pre_status in [PreconfStatus::Timeout, PreconfStatus::Canceled] {
-            let set = PreconfTxSet::new(16);
-            let mut rx = set.subscribe();
-            let tx = make_tx(0, 1);
-            set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
-            let _ = rx.try_recv(); // drain push notify
-            match pre_status {
-                PreconfStatus::Timeout => set.mark_timeout(tx.tx_hash()).await.unwrap(),
-                PreconfStatus::Canceled => set.mark_canceled(tx.tx_hash()).await.unwrap(),
-                _ => unreachable!(),
-            }
-
-            set.recover_from_reclaimable(tx.tx_hash()).await.unwrap();
-            assert_eq!(
-                set.find_by_hash(tx.tx_hash()).await.unwrap().status,
-                PreconfStatus::Waiting,
-                "state {pre_status:?} must round-trip to Waiting",
-            );
-            assert_eq!(rx.try_recv().unwrap(), *tx.tx_hash());
-        }
-    }
-
-    /// Any non-reclaimable status (Waiting / Success / Failed) must
-    /// return `UnexpectedStatus(current)` — the entry is NOT reset.
-    #[tokio::test]
-    async fn recover_from_reclaimable_rejects_non_reclaimable_states() {
-        for pre_status in [PreconfStatus::Waiting, PreconfStatus::Success, PreconfStatus::Failed]
-        {
-            let set = PreconfTxSet::new(16);
-            let tx = make_tx(0, 1);
-            set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
-            match pre_status {
-                PreconfStatus::Waiting => {}
-                PreconfStatus::Success => set.mark_succeeded(tx.tx_hash()).await.unwrap(),
-                PreconfStatus::Failed => set.mark_failed(tx.tx_hash()).await.unwrap(),
-                _ => unreachable!(),
-            }
-
-            let err = set.recover_from_reclaimable(tx.tx_hash()).await.unwrap_err();
-            assert_eq!(
-                err,
-                RecoverError::UnexpectedStatus(pre_status),
-                "recover must reject state {pre_status:?}",
-            );
-            // Failed recover doesn't touch state.
-            assert_eq!(set.find_by_hash(tx.tx_hash()).await.unwrap().status, pre_status);
-        }
-    }
-
-    #[tokio::test]
-    async fn recover_from_reclaimable_returns_not_found_for_unknown_hash() {
-        let set = PreconfTxSet::new(16);
-        let err = set.recover_from_reclaimable(&h(99)).await.unwrap_err();
-        assert_eq!(err, RecoverError::NotFound);
     }
 
     // ============ reset_success_to_waiting ============

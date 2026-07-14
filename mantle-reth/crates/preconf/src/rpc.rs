@@ -48,7 +48,7 @@ use tracing::{debug, trace, warn};
 use crate::{
     PreconfConfig, PreconfJournal, PreconfTxSet,
     journal::JournalEntry,
-    types::{AttachError, PreconfError, PreconfReceipt, PreconfStatus, RecoverError},
+    types::{AttachError, PreconfError, PreconfReceipt, PreconfStatus},
 };
 
 /// Generic preconf RPC handler. Constructed by the preconf `ServiceBuilder`
@@ -181,40 +181,20 @@ where
         }
 
         // Step 4 — submit to pool.
+        //
+        // `Ok(_)` and `Err(AlreadyImported)` are both admission successes
+        // and fall through to Step 5. The pool listener will observe
+        // whichever admission path took effect and call
+        // `push_if_absent`, which handles the same-hash retry case
+        // internally: if the fifo entry for this hash is in a
+        // reclaimable terminal state (`Timeout` / `Canceled`), it is
+        // revived to `Waiting` and broadcast so dispatch can pick it up.
+        // Active-state resubmits are rejected earlier at Step 3
+        // (`attach_responder`) — by the time we reach Step 4 we know
+        // the fifo entry is either absent or in a reclaimable state.
         match self.pool.add_transaction(TransactionOrigin::External, pool_tx).await {
-            Ok(_) => { /* normal — fall through to await responder */ }
-
-            // Same-hash retry. If the fifo entry is in a reclaimable state
-            // (Timeout or Canceled), atomically revive it (→ Waiting +
-            // broadcast) so the responder attached at step 3 can be
-            // reused. The unified `recover_from_reclaimable` handles both
-            // states — RPC layer doesn't need to distinguish.
-            Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {
-                match self.fifo.recover_from_reclaimable(&hash).await {
-                    Ok(()) => {
-                        debug!(target: "mantle::preconf::rpc", ?hash, "recovered reclaimable entry on AlreadyImported retry");
-                    }
-                    Err(RecoverError::UnexpectedStatus(status)) => {
-                        // Active commitment for this hash (Waiting / Success /
-                        // Failed) — refuse silently overlapping requests.
-                        warn!(target: "mantle::preconf::rpc", ?hash, ?status, "AlreadyImported but entry is not reclaimable");
-                        self.fifo.cancel_responder(&hash, PreconfError::AlreadyInProgress).await;
-                        return Err(preconf_error_to_rpc(&PreconfError::AlreadyInProgress));
-                    }
-                    Err(RecoverError::NotFound) => {
-                        // Entry vanished between the pool add and our
-                        // recover call (clean_reclaimable race). Treat as
-                        // transient and ask the client to retry.
-                        let err = PreconfError::Internal(
-                            "transient: fifo entry cleaned between pool add and recover"
-                                .to_string(),
-                        );
-                        self.fifo.cancel_responder(&hash, err.clone()).await;
-                        return Err(preconf_error_to_rpc(&err));
-                    }
-                }
-            }
-
+            Ok(_) => {}
+            Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
             Err(e) => {
                 let err = PreconfError::PoolRejected(format!("{}", e.kind));
                 self.fifo.cancel_responder(&hash, err.clone()).await;

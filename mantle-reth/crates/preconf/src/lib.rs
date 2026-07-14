@@ -41,5 +41,5 @@ pub use preconf_tx_set::{PreconfTxSet, TxEntry};
 pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
 pub use types::{
-    AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult, RecoverError,
+    AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult,
 };

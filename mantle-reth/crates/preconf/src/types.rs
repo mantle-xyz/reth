@@ -27,10 +27,12 @@ use serde::{Deserialize, Serialize};
 ///                     │              Success arm above.)
 /// [push] → Waiting ──┤
 ///                     ├──→ Timeout   (NOT on chain — client's deadline hit;
-///                     │               `recover_from_reclaimable` → Waiting)
+///                     │               same-hash retry revives via
+///                     │               `push_if_absent` → Waiting)
 ///                     └──→ Canceled  (NOT on chain — server pre-apply reject:
 ///                                      block gas budget, admin kick, etc.;
-///                                      `recover_from_reclaimable` → Waiting)
+///                                      same-hash retry revives via
+///                                      `push_if_absent` → Waiting)
 /// ```
 ///
 /// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — they
@@ -146,8 +148,25 @@ pub struct PreconfReceipt {
 pub enum PushResult {
     /// New entry created and broadcast notified.
     Inserted,
-    /// Same hash already present — idempotent no-op.
+    /// Same hash already present and in an active status
+    /// (`Waiting` / `Success` / `Failed`) — idempotent no-op.
     AlreadyExists,
+    /// Same hash was in a **reclaimable** terminal state
+    /// (`Timeout` / `Canceled`) and has been revived back to `Waiting`.
+    /// Any fresh responder that the RPC handler attached to
+    /// `pending_responders` is now installed on the entry, and the
+    /// entry's insertion clock is refreshed to the fresh submission
+    /// time — so dispatch's deadline gate measures against the second
+    /// submission, not the (already-expired) first.
+    ///
+    /// This closes the "same-hash resubmit after timeout" loop that
+    /// would otherwise wedge under the pool-eviction callback: the
+    /// second `pool.add_transaction` returns `Ok(_)` (fresh admission)
+    /// rather than `Err(AlreadyImported)`, so any RPC-side revive
+    /// logic keyed on `AlreadyImported` never fires — but the pool
+    /// listener still ends up calling `push_if_absent`, which now
+    /// revives the reclaimable entry here and broadcasts.
+    Revived,
     /// Different hash but same (sender, nonce) in an active status —
     /// blocks the replacement attempt (carrying the existing hash so callers
     /// can inspect / log it).
@@ -179,20 +198,6 @@ pub enum MarkError {
     IllegalTransition(PreconfStatus),
 }
 
-/// Errors returned by [`crate::preconf_tx_set::PreconfTxSet::recover_from_timeout`]
-/// and [`crate::preconf_tx_set::PreconfTxSet::recover_from_canceled`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum RecoverError {
-    /// Entry no longer present — typically lost a race with `clean_reclaimable`.
-    /// RPC handler then falls back to `cancel_responder` with a cleaner error.
-    #[error("entry not found")]
-    NotFound,
-    /// Entry exists but is not in the state expected by the recovery method
-    /// — `recover_from_timeout` expects `Timeout`, `recover_from_canceled`
-    /// expects `Canceled`. Caller logs current status.
-    #[error("unexpected status for recovery: found {0:?}")]
-    UnexpectedStatus(PreconfStatus),
-}
 
 /// Top-level preconf error returned to RPC clients.
 ///
@@ -230,15 +235,6 @@ pub enum PreconfError {
     /// Builder apply returned a terminal `Failed` status.
     #[error("builder rejected: {0}")]
     BuilderRejected(String),
-    /// Per-tx gas limit exceeded — operator hardening against pathological
-    /// large-gas spam.
-    #[error("tx gas limit {limit} exceeds preconf_max_gas_per_tx {max}")]
-    GasLimitExceeded {
-        /// Configured `preconf_max_gas_per_tx`.
-        max: u64,
-        /// Tx's gas limit.
-        limit: u64,
-    },
     /// Cumulative preconf gas budget for the current block has been
     /// exhausted — caller may retry once the next block opens.
     #[error(
@@ -300,10 +296,6 @@ mod tests {
         assert_eq!(
             PreconfError::NonceGap { tx_nonce: 85, pending_nonce: 75 }.to_string(),
             "nonce gap: tx nonce 85 > pending nonce 75",
-        );
-        assert_eq!(
-            PreconfError::GasLimitExceeded { max: 2_000_000, limit: 3_500_000 }.to_string(),
-            "tx gas limit 3500000 exceeds preconf_max_gas_per_tx 2000000",
         );
         assert_eq!(
             PreconfError::Timeout { timeout_ms: 200 }.to_string(),
