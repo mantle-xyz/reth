@@ -31,6 +31,7 @@
 
 use std::{
     collections::HashSet,
+    future::Future,
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -458,70 +459,130 @@ pub async fn restore_preconf_state<P: RestorePool>(
 
 // ─── Background rotation loop ───────────────────────────────────────────────
 
-/// Spawn a background task that periodically rotates `journal` to drop
-/// entries already observed in sealed blocks.
+/// Runs the journal rotation loop until `shutdown` resolves, then performs
+/// one final rotation and returns.
 ///
 /// The loop wakes every `interval`, calls [`PreconfJournal::rotate`],
 /// and logs the [`RotateStats`]. Rotation failures are logged but do
 /// not terminate the loop — the next tick retries.
 ///
-/// Returns the [`JoinHandle`] so the service builder can wait for
-/// graceful shutdown. Send `()` on `shutdown_rx`'s paired sender to
-/// stop the loop. The `select!` inside is not preemptive across
-/// awaits *within* a rotate call, so a shutdown signal fired mid-
-/// rotate is observed only when the current rotate resolves — this
-/// guarantees the file is never left in a half-written state.
+/// `shutdown` is any future that resolves to `()` when the caller wants
+/// the loop to stop. `select!` is not preemptive across awaits *within*
+/// a rotate call, so a shutdown signal fired mid-rotate is observed
+/// only when the current rotate resolves — this guarantees the file
+/// is never left in a half-written state.
+///
+/// After the shutdown signal is observed, one **final** rotation is
+/// attempted so any entries that have accumulated since the last tick
+/// (in particular sealed hashes reported by the canonical-state handler
+/// on the way down) are dropped from the on-disk file before the
+/// process exits. Callers that hold a reth `GracefulShutdownGuard` must
+/// keep it alive across this call so the `TaskManager` waits for the
+/// final rotate.
 ///
 /// The first rotation is skipped (the interval's immediate-first tick
 /// is consumed at start) so a long-running node does not rotate a
 /// nearly-empty journal in the first few seconds after boot.
-pub fn spawn_rejournal_loop(
+pub async fn run_rejournal_loop<F, T>(
     journal: Arc<PreconfJournal>,
     interval: Duration,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Consume the immediate-first tick so we don't rotate at t=0.
-        ticker.tick().await;
-        debug!(
-            target: "mantle::preconf::journal",
-            ?interval,
-            "preconf journal rotation loop started"
-        );
-        loop {
-            tokio::select! {
-                // `biased` — drain shutdown first so a torn-down
-                // service does not perform one more rotation after
-                // the shutdown signal.
-                biased;
-                _ = &mut shutdown_rx => {
-                    debug!(target: "mantle::preconf::journal", "rotation loop shutting down");
-                    return;
-                }
-                _ = ticker.tick() => {
-                    match journal.rotate().await {
-                        Ok(stats) => {
-                            debug!(
-                                target: "mantle::preconf::journal",
-                                kept = stats.kept,
-                                dropped = stats.dropped,
-                                bad = stats.bad_lines_skipped,
-                                "rotation tick"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                target: "mantle::preconf::journal",
-                                ?e,
-                                "rotation failed; retrying next tick"
-                            );
-                        }
+    shutdown: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the immediate-first tick so we don't rotate at t=0.
+    ticker.tick().await;
+    debug!(
+        target: "mantle::preconf::journal",
+        ?interval,
+        "preconf journal rotation loop started"
+    );
+    tokio::pin!(shutdown);
+    let signal_output = loop {
+        tokio::select! {
+            // `biased` — drain shutdown first so a torn-down
+            // service does not perform one more rotation after
+            // the shutdown signal.
+            biased;
+            output = &mut shutdown => {
+                debug!(target: "mantle::preconf::journal", "rotation loop shutting down");
+                break output;
+            }
+            _ = ticker.tick() => {
+                match journal.rotate().await {
+                    Ok(stats) => {
+                        debug!(
+                            target: "mantle::preconf::journal",
+                            kept = stats.kept,
+                            dropped = stats.dropped,
+                            bad = stats.bad_lines_skipped,
+                            "rotation tick"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "mantle::preconf::journal",
+                            ?e,
+                            "rotation failed; retrying next tick"
+                        );
                     }
                 }
             }
         }
+    };
+
+    // Final rotate on shutdown — persist any sealed hashes accumulated
+    // since the last tick before exiting. `signal_output` is held alive
+    // across this await so callers passing a graceful-shutdown guard as
+    // `T` keep their runtime's shutdown latch open until the final
+    // on-disk write completes. Failures are logged; we do not surface
+    // them because the process is going away anyway.
+    match journal.rotate().await {
+        Ok(stats) => {
+            debug!(
+                target: "mantle::preconf::journal",
+                kept = stats.kept,
+                dropped = stats.dropped,
+                bad = stats.bad_lines_skipped,
+                "final rotation on shutdown"
+            );
+        }
+        Err(e) => {
+            warn!(
+                target: "mantle::preconf::journal",
+                ?e,
+                "final rotation on shutdown failed"
+            );
+        }
+    }
+
+    signal_output
+}
+
+/// Spawns [`run_rejournal_loop`] on the ambient tokio runtime, driven
+/// by a `oneshot::Receiver<()>` shutdown channel.
+///
+/// This is a convenience wrapper primarily used by tests and any caller
+/// that owns its own runtime. Production wiring in `mantle-reth-cli`
+/// uses [`run_rejournal_loop`] directly under
+/// `TaskExecutor::spawn_critical_with_graceful_shutdown_signal` so
+/// the reth `TaskManager` participates in the graceful shutdown handoff.
+pub fn spawn_rejournal_loop(
+    journal: Arc<PreconfJournal>,
+    interval: Duration,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // `oneshot::Receiver` resolves `Err` when the sender is dropped;
+        // treat both `Ok(())` and drop as shutdown signals so callers
+        // don't have to send explicitly.
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+        };
+        let () = run_rejournal_loop(journal, interval, shutdown).await;
     })
 }
 
@@ -832,7 +893,9 @@ mod tests {
         let j = Arc::new(j);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         // Interval larger than the test waits — only the first
-        // (immediately-consumed) tick happens; no rotation calls.
+        // (immediately-consumed) tick happens; no interval rotation calls.
+        // (A single final rotate on shutdown still runs by design; see
+        // `graceful_shutdown_performs_final_rotate` for that behavior.)
         let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(60), shutdown_rx);
 
         // Hand the shutdown signal immediately.
@@ -843,4 +906,56 @@ mod tests {
             .expect("loop panicked");
     }
 
+    #[tokio::test]
+    async fn graceful_shutdown_performs_final_rotate() {
+        // Regression guard for the graceful-shutdown contract:
+        // `run_rejournal_loop` MUST perform one final rotate after the
+        // shutdown signal fires, so hashes appended to `sealed` between
+        // the last periodic tick and the shutdown are not lost on the
+        // on-disk file.
+        let (_dir, j) = fresh_journal().await;
+        j.append_promised(&entry(1, 100)).await.unwrap();
+        let j = Arc::new(j);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Interval large — no periodic tick will fire during the test.
+        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(60), shutdown_rx);
+
+        // Mark sealed AFTER the loop starts but BEFORE shutdown — the
+        // sealed hash lives only in memory until a rotate flushes it.
+        j.mark_sealed(TxHash::from([1; 32])).await;
+
+        // Trigger shutdown; the loop's final rotate must drop the sealed entry.
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("loop did not shut down")
+            .expect("loop panicked");
+
+        let (after, _) = j.load().await.unwrap();
+        assert!(
+            after.is_empty(),
+            "final rotate on shutdown must have dropped the sealed entry; got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_rejournal_loop_returns_shutdown_output_after_final_rotate() {
+        // Anchors the generic-output contract of `run_rejournal_loop`:
+        // callers passing a graceful-shutdown guard as `T` need it kept
+        // alive across the final-rotate await, then returned so their
+        // outer task can drop it explicitly.
+        let (_dir, j) = fresh_journal().await;
+        let j = Arc::new(j);
+
+        // Sentinel type in place of a `GracefulShutdownGuard`; if the
+        // loop forgot to return the signal output, the assertion below
+        // wouldn't compile.
+        #[derive(Debug, PartialEq)]
+        struct Sentinel(u32);
+
+        let shutdown = async { Sentinel(7) };
+        let out = run_rejournal_loop(j.clone(), Duration::from_secs(60), shutdown).await;
+        assert_eq!(out, Sentinel(7));
+    }
 }

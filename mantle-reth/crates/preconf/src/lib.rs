@@ -31,7 +31,7 @@ pub use canon_handler::PreconfCanonHandler;
 pub use config::PreconfConfig;
 pub use journal::{
     JournalEntry, JournalError, PreconfJournal, RestorePool, RestoredEnvelope, RotateStats,
-    restore_preconf_state, spawn_rejournal_loop,
+    restore_preconf_state, run_rejournal_loop, spawn_rejournal_loop,
 };
 pub use pool_ext::{
     PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,

@@ -480,26 +480,42 @@ where
                     info!(target: "reth::cli", "Mantle preconf canonical-state handler spawned");
 
                     // If persistence is on, drive the periodic rotation
-                    // loop. The shutdown sender is intentionally leaked
-                    // via `mem::forget` — there is no clean teardown
-                    // hook in the `extend_rpc_modules` closure to land
-                    // it on, and process exit reclaims everything
-                    // regardless. The loop itself is registered as a
-                    // critical task so the reth TaskManager owns its
-                    // lifecycle.
+                    // loop under the reth `TaskManager`'s graceful-
+                    // shutdown protocol. Holding the `GracefulShutdownGuard`
+                    // across `run_rejournal_loop`'s final rotate makes the
+                    // `TaskManager` wait for the last on-disk write to
+                    // finish before returning from process shutdown, so
+                    // sealed hashes reported by the canon handler on the
+                    // way down are dropped from the journal file before
+                    // the node exits.
                     if let Some(journal) = svc.journal() {
-                        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                        let loop_fut = mantle_reth_preconf::spawn_rejournal_loop(
-                            journal.clone(),
-                            svc.cfg().rejournal_interval,
-                            shutdown_rx,
+                        let journal = journal.clone();
+                        let interval = svc.cfg().rejournal_interval;
+                        ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(
+                            "mantle-preconf-rejournal-loop",
+                            move |signal| async move {
+                                // `signal` (`GracefulShutdown`) resolves to
+                                // a `GracefulShutdownGuard` when the reth
+                                // `TaskManager` begins shutdown. Passing it
+                                // as the shutdown future to
+                                // `run_rejournal_loop` — whose `T` type
+                                // parameter carries the guard through the
+                                // final-rotate step — keeps the guard alive
+                                // until the last on-disk write finishes,
+                                // so the process only exits after the
+                                // journal file has been closed cleanly.
+                                let guard = mantle_reth_preconf::run_rejournal_loop(
+                                    journal,
+                                    interval,
+                                    signal,
+                                )
+                                .await;
+                                // Explicit drop for clarity; the guard is
+                                // released here, letting `TaskManager`'s
+                                // outstanding-tasks counter reach zero.
+                                drop(guard);
+                            },
                         );
-                        // `spawn_rejournal_loop` already calls `tokio::spawn`
-                        // internally; we ignore the returned handle and
-                        // rely on the reth runtime drop to cancel the
-                        // task on node shutdown.
-                        std::mem::drop(loop_fut);
-                        std::mem::forget(shutdown_tx);
                         info!(target: "reth::cli", "Mantle preconf journal rotation loop spawned");
                     }
 
