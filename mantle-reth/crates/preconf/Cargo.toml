@@ -109,6 +109,13 @@ thiserror.workspace = true
 # Tracing
 tracing.workspace = true
 
+# Metrics — histogram / counter facade for observing preconf pipeline
+# latencies (apply duration, elapsed-at-gate) and terminal-state
+# transitions (deadline skip, gas-budget skip, applied, apply failed,
+# RPC-level timeout). Consumed by the same `metrics` collector reth
+# core uses; the underlying exporter is wired up by mantle-reth-cli.
+metrics.workspace = true
+
 # Serde
 serde = { workspace = true, features = ["derive", "std"] }
 

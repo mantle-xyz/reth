@@ -5206,6 +5206,7 @@ dependencies = [
  "reth-rpc-api",
  "reth-tasks",
  "reth-tracing",
+ "reth-transaction-pool",
  "revm",
  "serde_json",
  "tokio",

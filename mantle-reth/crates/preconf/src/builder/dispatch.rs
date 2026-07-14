@@ -202,13 +202,28 @@ pub(super) async fn apply_one_preconf<F>(
     // even if the SLA widens.
     const SAFETY_MARGIN: Duration = Duration::from_millis(40);
     let margin = SAFETY_MARGIN;
-    if is_rpc && entry.inserted_at.elapsed() + margin >= cfg.preconf_timeout {
+
+    // Sample the elapsed-since-insertion for every RPC-sourced dispatch
+    // decision (skipped and applied alike). Downstream analysis reads
+    // the distribution to see how close the pipeline runs to the client
+    // deadline, informing tuning of `SAFETY_MARGIN` and
+    // `preconf_timeout`. Replay-sourced entries are excluded because
+    // their `inserted_at` reflects a journal restore, not the client's
+    // clock.
+    let elapsed_at_gate = entry.inserted_at.elapsed();
+    if is_rpc {
+        metrics::histogram!("preconf.dispatch.elapsed_at_gate_ms")
+            .record(elapsed_at_gate.as_millis() as f64);
+    }
+
+    if is_rpc && elapsed_at_gate + margin >= cfg.preconf_timeout {
         debug!(
             target: "mantle::preconf::dispatch",
             ?hash,
-            elapsed_ms = entry.inserted_at.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed_at_gate.as_millis() as u64,
             "pre-apply deadline passed; aborting"
         );
+        metrics::counter!("preconf.dispatch.deadline_skipped_total").increment(1);
         let _ = fifo.mark_timeout(&hash).await;
         fifo.cancel_responder(
             &hash,
@@ -242,6 +257,7 @@ pub(super) async fn apply_one_preconf<F>(
             max = cfg.preconf_max_gas_per_block,
             "block gas budget exhausted; aborting apply"
         );
+        metrics::counter!("preconf.dispatch.gas_budget_skipped_total").increment(1);
         let _ = fifo.mark_canceled(&hash).await;
         fifo.cancel_responder(
             &hash,
@@ -258,8 +274,18 @@ pub(super) async fn apply_one_preconf<F>(
 
     // ── Apply via caller-supplied closure (real EVM in production,
     //    synthetic receipt in tests). ────────────────────────────────
-    match apply_fn(entry.tx.clone(), hash, loop_state.predicted_height) {
+    let apply_started = std::time::Instant::now();
+    let apply_result = apply_fn(entry.tx.clone(), hash, loop_state.predicted_height);
+    let apply_duration = apply_started.elapsed();
+    // Distribution of EVM apply latency — feeds SAFETY_MARGIN tuning.
+    // Recorded once per call regardless of outcome; success / failure
+    // counters (below) provide the breakdown.
+    metrics::histogram!("preconf.execute.duration_ms")
+        .record(apply_duration.as_millis() as f64);
+
+    match apply_result {
         Ok(receipt) => {
+            metrics::counter!("preconf.tx.success_total").increment(1);
             loop_state.record_committed(hash);
             loop_state.preconf_gas_used =
                 loop_state.preconf_gas_used.saturating_add(receipt.gas_used);
@@ -283,6 +309,7 @@ pub(super) async fn apply_one_preconf<F>(
                 ?hash, ?err,
                 "preconf apply failed; marking entry as Failed"
             );
+            metrics::counter!("preconf.tx.failure_total").increment(1);
             loop_state.record_excluded(hash);
             if let Err(e) = fifo.mark_failed(&hash).await {
                 trace!(

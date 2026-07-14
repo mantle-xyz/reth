@@ -277,6 +277,12 @@ where
             // off the wire status keep working unchanged.
             Err(_elapsed) => {
                 debug!(target: "mantle::preconf::rpc", ?hash, ?preconf_timeout, "preconf timeout");
+                // Client-observed timeout — the responder oneshot didn't
+                // fire within `preconf_timeout`. Distinct from dispatch's
+                // pre-apply deadline skip; the RPC-layer counter tells us
+                // how often the SLA burned end-to-end on the client's
+                // clock, independent of where the pipeline stalled.
+                metrics::counter!("preconf.api.timeout_total").increment(1);
                 // Best-effort: try to flip Waiting → Timeout. Returns
                 // `NotFound` when the pool listener never created an entry
                 // (e.g. tx routed to BaseFee/Queued), and
