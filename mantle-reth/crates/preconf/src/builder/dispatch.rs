@@ -272,6 +272,38 @@ pub(super) async fn apply_one_preconf<F>(
         return;
     }
 
+    // ── Point of no return begins here ────────────────────────────────
+    //
+    // Acquire the per-entry `apply_lock` before running `apply_fn`.
+    // Held through the entire commit path (`apply_fn` + mark_* + send)
+    // so the RPC deadline branch in `rpc::handle_inner` cannot mark
+    // this entry `Timeout` while its receipt is on its way to the
+    // client. Guarantees "wire Timeout ⇒ tx not committed to builder
+    // state".
+    let Some(_apply_guard) = fifo.lock_for_apply(&hash).await else {
+        // Entry vanished between the gate reads above and this
+        // acquisition — very rare (raced with `drop_hash`). Skip.
+        loop_state.record_excluded(hash);
+        return;
+    };
+
+    // Re-check status under lock. The RPC deadline branch may have
+    // already transitioned the entry to `Timeout` in the window between
+    // our earlier gate reads and this acquisition; running `apply_fn`
+    // now would violate the invariant "committed to builder state ⇒
+    // wire not Timeout".
+    if let Some(re_entry) = fifo.find_by_hash(&hash).await {
+        if re_entry.status != PreconfStatus::Waiting {
+            trace!(
+                target: "mantle::preconf::dispatch",
+                ?hash, status = ?re_entry.status,
+                "status flipped before we acquired apply_lock; skipping apply"
+            );
+            loop_state.record_excluded(hash);
+            return;
+        }
+    }
+
     // ── Apply via caller-supplied closure (real EVM in production,
     //    synthetic receipt in tests). ────────────────────────────────
     let apply_started = std::time::Instant::now();
@@ -1006,4 +1038,99 @@ mod tests {
         assert_eq!(r_entry.status, PreconfStatus::Canceled);
     }
 
+    /// Race regression: an RPC-side timeout deadline fires **while**
+    /// `apply_one_preconf` is inside `apply_fn`. The per-entry
+    /// `apply_lock` acquired by dispatch before `apply_fn` must block
+    /// the RPC's `lock_for_apply` acquisition until dispatch finishes
+    /// `mark_succeeded` + `resp.send(...)`. When the RPC finally
+    /// acquires the lock, fifo status is `Success` and `resp_rx` has
+    /// the receipt queued — so `try_recv` returns it, and the client
+    /// sees `Success`, not `Timeout`.
+    ///
+    /// Regression guard for the SLA invariant "wire `Timeout` ⇒ tx not
+    /// committed to builder state". Without the `apply_lock` scheme,
+    /// the RPC deadline branch would previously flip the entry to
+    /// `Timeout` while dispatch had already committed the tx to the
+    /// in-flight builder, producing an on-chain landing under a
+    /// Timeout wire response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_lock_blocks_rpc_timeout_race_and_yields_success() {
+        let fifo = Arc::new(PreconfTxSet::new(8));
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x99);
+        let hash = *tx.tx_hash();
+
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
+        assert!(matches!(
+            fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+
+        // Slow apply closure — `std::thread::sleep` blocks the worker
+        // that dispatch runs on but leaves other workers free (test
+        // uses multi_thread). Simulates a ~200ms EVM apply.
+        const APPLY_DURATION: Duration = Duration::from_millis(200);
+        let slow_apply = |tx: Arc<TxEnvelope>, h: TxHash, height: u64| {
+            std::thread::sleep(APPLY_DURATION);
+            Ok(PreconfReceipt {
+                tx_hash: h,
+                block_height: height,
+                status: true,
+                logs: Vec::new(),
+                gas_used: alloy_consensus::Transaction::gas_limit(tx.as_ref()),
+                reason: String::new(),
+                revert_data: Bytes::new(),
+            })
+        };
+
+        // Spawn dispatch — will grab apply_lock and run slow_apply for
+        // ~200ms before releasing.
+        let fifo_clone = fifo.clone();
+        let cfg_clone = cfg.clone();
+        let dispatch_task = tokio::spawn(async move {
+            let mut state = LoopState::new(7);
+            apply_one_preconf(&fifo_clone, &cfg_clone, hash, &mut state, slow_apply).await;
+        });
+
+        // Give dispatch time to enter `apply_fn` (holding apply_lock).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Simulate the RPC-side deadline branch: acquire apply_lock.
+        // Dispatch is inside apply_fn → this must block until dispatch
+        // finishes mark_succeeded + send + drop guard.
+        let acquire_start = std::time::Instant::now();
+        let guard = fifo.lock_for_apply(&hash).await;
+        let acquire_duration = acquire_start.elapsed();
+        assert!(guard.is_some(), "lock_for_apply must return Some for the pushed entry");
+
+        // Must have waited for dispatch to finish (~150ms remaining
+        // after our 50ms head start).
+        assert!(
+            acquire_duration >= Duration::from_millis(100),
+            "RPC lock acquisition should have blocked on dispatch's apply_lock; \
+             waited {acquire_duration:?} but expected ≥ 100ms",
+        );
+
+        // Under the lock, fifo status must be final and the receipt
+        // must be queued in resp_rx (dispatch's `resp.send(...)`
+        // completed inside the critical section).
+        let final_status = fifo.find_by_hash(&hash).await.map(|e| e.status);
+        assert_eq!(
+            final_status,
+            Some(PreconfStatus::Success),
+            "dispatch must have finished mark_succeeded before releasing apply_lock",
+        );
+
+        match resp_rx.try_recv() {
+            Ok(Ok(receipt)) => {
+                assert_eq!(receipt.tx_hash, hash);
+                assert!(receipt.status);
+            }
+            other => panic!("resp_rx must have queued receipt; got {other:?}"),
+        }
+
+        drop(guard);
+        dispatch_task.await.expect("dispatch task join");
+    }
 }

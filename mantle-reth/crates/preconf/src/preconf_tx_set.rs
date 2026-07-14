@@ -36,7 +36,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Instant,
 };
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
 use tracing::error;
 
 use crate::types::{
@@ -73,6 +73,19 @@ pub struct TxEntry {
     /// pool.add succeeded; `None` for listener-pushed entries.
     /// Take-once: `take_responder` moves it out.
     pub responder: Option<oneshot::Sender<Result<PreconfReceipt, PreconfError>>>,
+    /// Per-entry lock serialising `apply_fn + mark_succeeded/failed +
+    /// send(receipt)` in `builder::dispatch::apply_one_preconf` with any
+    /// concurrent `mark_timeout` initiated by the RPC deadline branch
+    /// in `rpc::handle_inner`. When dispatch holds this lock the RPC
+    /// handler waits for it before deciding whether to mark Timeout —
+    /// after acquiring the lock the RPC handler sees the definitive
+    /// final status (`Success` / `Failed` / `Waiting`) and either
+    /// picks up the receipt from the responder channel or transitions
+    /// the entry to `Timeout`. Held only across the "point of no
+    /// return" (from just before `apply_fn` to just after
+    /// `resp.send(receipt)` in dispatch). Never held while acquiring
+    /// [`PreconfTxSet::inner`] — that direction would deadlock.
+    pub apply_lock: Arc<Mutex<()>>,
 }
 
 impl TxEntry {
@@ -323,6 +336,7 @@ impl PreconfTxSet {
             status: PreconfStatus::Waiting,
             source,
             responder,
+            apply_lock: Arc::new(Mutex::new(())),
         };
         inner.entries.insert(hash, entry);
         inner.by_sender.insert((from, nonce), hash);
@@ -377,6 +391,23 @@ impl PreconfTxSet {
     pub async fn find_by_hash(&self, hash: &TxHash) -> Option<TxEntryView> {
         let inner = self.inner.lock().await;
         inner.entries.get(hash).map(TxEntry::snapshot_view)
+    }
+
+    /// Acquire the per-entry `apply_lock` — held across `apply_fn +
+    /// mark_* + send(receipt)` in dispatch, and acquired by the RPC
+    /// deadline branch to serialize with dispatch's "point of no
+    /// return". Returns `None` if no entry with `hash` exists.
+    ///
+    /// Implementation: clones the entry's `Arc<Mutex<()>>` under
+    /// `inner`, then drops `inner` before calling `.lock_owned().await`
+    /// so that waiters do not hold `inner`. Lock ordering must remain
+    /// `apply_lock → inner` — never the reverse.
+    pub async fn lock_for_apply(&self, hash: &TxHash) -> Option<OwnedMutexGuard<()>> {
+        let lock_arc = {
+            let inner = self.inner.lock().await;
+            inner.entries.get(hash)?.apply_lock.clone()
+        };
+        Some(lock_arc.lock_owned().await)
     }
 
     /// Drops entries with `from == addr && nonce < new_nonce` — called by
@@ -435,13 +466,12 @@ impl PreconfTxSet {
 
     /// `Waiting → Failed`. Truly terminal — symmetric to `mark_succeeded`.
     /// Called by builder when apply_fn returned Err (nonce-too-low,
-    /// gas-over-block-limit, etc.). **tx NOT on chain** (see M4 in the
-    /// review handover).
+    /// gas-over-block-limit, etc.). **tx NOT on chain**.
     ///
     /// On success, invokes the pool-eviction callback (if registered)
-    /// to synchronously remove `hash` from the transaction pool —
-    /// closes R3/SLA-1 window ("client saw Failed but tx later lands
-    /// via pool path").
+    /// to synchronously remove `hash` from the transaction pool. This
+    /// closes the SLA window where the client saw `Failed` but the tx
+    /// could still land later via the pool best-tx iterator.
     pub async fn mark_failed(&self, hash: &TxHash) -> Result<(), MarkError> {
         self.transition_from_waiting(hash, PreconfStatus::Failed).await?;
         self.evict_from_pool(*hash);
@@ -454,8 +484,7 @@ impl PreconfTxSet {
     /// when the client-side `preconf_timeout` fires before a receipt is
     /// delivered, or by dispatch's pre-apply deadline gate.
     ///
-    /// Same pool-eviction hook as `mark_failed` — closes R3/SLA-1
-    /// window.
+    /// Same pool-eviction hook as `mark_failed`.
     pub async fn mark_timeout(&self, hash: &TxHash) -> Result<(), MarkError> {
         self.transition_from_waiting(hash, PreconfStatus::Timeout).await?;
         self.evict_from_pool(*hash);
@@ -468,8 +497,7 @@ impl PreconfTxSet {
     /// EVM was never run, so the tx is guaranteed not to land on chain.
     /// Semantically distinct from `Timeout` (client's deadline hit).
     ///
-    /// Same pool-eviction hook as `mark_failed` / `mark_timeout` —
-    /// closes R3/SLA-1 window.
+    /// Same pool-eviction hook as `mark_failed` / `mark_timeout`.
     pub async fn mark_canceled(&self, hash: &TxHash) -> Result<(), MarkError> {
         self.transition_from_waiting(hash, PreconfStatus::Canceled).await?;
         self.evict_from_pool(*hash);
@@ -1160,6 +1188,7 @@ mod tests {
             status: PreconfStatus::Waiting,
             source: PreconfSource::Rpc,
             responder: Some(resp_tx),
+            apply_lock: Arc::new(Mutex::new(())),
         };
         let view = entry.snapshot_view();
         assert_eq!(view.hash, entry.hash);
@@ -1334,12 +1363,12 @@ mod tests {
         assert!(inner.pending_responders.is_empty());
     }
 
-    /// R6/T1 — attach_responder's `origin_instant` argument must land in
+    /// `attach_responder`'s `origin_instant` argument must land in
     /// `TxEntry.inserted_at` on the subsequent `push_if_absent`.
-    /// Regression guard for R4/D1: dispatch's deadline gate reads
-    /// `entry.inserted_at.elapsed()` against `preconf_timeout`, so if the
-    /// RPC-supplied instant is not threaded through, the gate would tick
-    /// from listener-drain time rather than client-visible time.
+    /// Dispatch's deadline gate reads `entry.inserted_at.elapsed()`
+    /// against `preconf_timeout`, so if the RPC-supplied instant is not
+    /// threaded through, the gate would tick from listener-drain time
+    /// rather than client-visible time.
     #[tokio::test]
     async fn attach_responder_origin_instant_lands_in_tx_entry() {
         let set = PreconfTxSet::new(4);
@@ -1410,8 +1439,8 @@ mod tests {
         let _ = PreconfTxSet::new(0);
     }
 
-    /// R3/SLA-1 — `mark_timeout` / `mark_canceled` / `mark_failed`
-    /// invoke the registered pool-eviction callback with the hash.
+    /// `mark_timeout` / `mark_canceled` / `mark_failed` must invoke the
+    /// registered pool-eviction callback with the hash.
     /// `mark_succeeded` does NOT (canon commit's `mined_transactions`
     /// handles that path). Callback firing is verified via a
     /// `Vec<TxHash>` sink protected by `Mutex`.
@@ -1457,9 +1486,9 @@ mod tests {
         assert!(!evicted_hashes.contains(&h(4)), "succeeded must not trigger eviction");
     }
 
-    /// R3/SLA-1 — Without a registered callback, mark_* transitions
-    /// still succeed silently. Guards against a regression where the
-    /// hook accidentally panics or errors when unregistered.
+    /// Without a registered callback, `mark_*` transitions must still
+    /// succeed silently. Guards against a regression where the hook
+    /// accidentally panics or errors when unregistered.
     #[tokio::test]
     async fn mark_terminals_are_silent_without_pool_eviction_callback() {
         let set = PreconfTxSet::new(4);
@@ -1473,9 +1502,9 @@ mod tests {
         assert_eq!(entry.status, PreconfStatus::Timeout);
     }
 
-    /// R3/SLA-1 — `set_pool_eviction_callback` is idempotent (OnceLock
+    /// `set_pool_eviction_callback` must be idempotent (`OnceLock`
     /// first-write wins). Guards against silent behavior split if
-    /// service_builder starts get called twice with different
+    /// `service_builder::start` gets called twice with different
     /// closures.
     #[tokio::test]
     async fn set_pool_eviction_callback_is_first_write_wins() {
