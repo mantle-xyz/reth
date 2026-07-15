@@ -698,19 +698,17 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             info.cumulative_gas_used += loop_state.preconf_gas_used() - before;
         }
 
+        // no_tx_pool builds have no dispatch work: both arms are gated.
+        // Skip straight to seal — mirrors upstream `OpBuilder::build`
+        // returning right after Stage 2 in this case.
         loop {
+            if !allow_preconf {
+                break;
+            }
             tokio::select! {
                 biased;
                 () = cancel.wait() => break,
-                // `if allow_preconf` gates the preconf arm entirely
-                // during `no_tx_pool=true` derivation builds. Without
-                // this guard, a broadcast from the pool listener during
-                // the build window would still inject the preconf tx
-                // and diverge the block hash. New submissions arriving
-                // while `!allow_preconf` remain parked in the fifo and
-                // are dispatched by the next `allow_preconf=true`
-                // build.
-                recv = fifo_rx.recv(), if allow_preconf => {
+                recv = fifo_rx.recv() => {
                     // Closure re-created per arm-entry so its `&mut builder`
                     // borrow does not clash with the pool arm.
                     let mut apply_fn = |tx, hash, height| {
