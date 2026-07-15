@@ -195,6 +195,35 @@ where
     apply_preconf_tx(builder, recovered, hash, height)
 }
 
+/// Synchronous canon-forward — drops fifo entries whose nonce has
+/// already been sealed as of the parent block. Called at
+/// `build_payload` start, **before** [`replay_fifo_carryover`]; the
+/// pair together replace the async `canon_handler::forward()` sweep
+/// that used to race with new payload jobs (FCU for slot N+1 fires
+/// before / during / after `canon_handler`'s notification handler for
+/// slot N, so a new build could observe stale `Success` entries and
+/// incorrectly replay them via `reset_success_to_waiting`).
+///
+/// Iterates the fifo once to collect the set of unique senders, queries
+/// each sender's on-chain nonce from the parent-block state provider,
+/// and calls [`PreconfTxSet::forward`] per sender. Idempotent — a
+/// sender with no fifo entries or all entries at `nonce ≥ on_chain_nonce`
+/// results in a no-op forward.
+async fn sync_fifo_forward_to_head<S>(fifo: &PreconfTxSet, state_provider: &S)
+where
+    S: reth_storage_api::StateProvider + ?Sized,
+{
+    use std::collections::HashSet;
+    let entries = fifo.entries().await;
+    let senders: HashSet<Address> = entries.iter().map(|e| e.from).collect();
+    drop(entries);
+    for sender in senders {
+        let on_chain_nonce =
+            state_provider.account_nonce(&sender).ok().flatten().unwrap_or(0);
+        fifo.forward(&sender, on_chain_nonce).await;
+    }
+}
+
 /// Preamble that walks the fifo snapshot in insertion order and
 /// applies every carryover entry to the new build:
 ///
@@ -202,10 +231,12 @@ where
 ///   broadcast never reached this job's subscriber. Applied with the
 ///   original `source` intact so genuinely stale `Rpc` entries get
 ///   timed out by the deadline gate.
-/// - **`Success`** — stale in-flight from a discarded prior job (a
-///   canon'd entry would have been removed by `forward()`).
-///   `reset_success_to_waiting` promotes the source to `Replay`
-///   so gates bypass and the previously-returned receipt is honored.
+/// - **`Success`** — stale in-flight from a discarded prior job. A
+///   canon'd entry would have been removed by the immediately-preceding
+///   [`sync_fifo_forward_to_head`], so any Success reaching this arm is
+///   an un-canon'd in-flight (client already got a receipt; must land).
+///   `reset_success_to_waiting` promotes the source to `Replay` so
+///   gates bypass and the previously-returned receipt is honored.
 /// - **`Failed` / `Timeout` / `Canceled`** — skipped (terminal).
 ///
 /// Applying directly here (rather than via the broadcast queue)
@@ -622,6 +653,15 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // arm's guard `pool_gas_used < pool_quota` is a level trigger
         // that self-disables once the current allocation is drained.
         let mut pool_quota: u64 = 0;
+
+        // Synchronous canon-forward — drop fifo entries whose nonce is
+        // already sealed as of parent block. Replaces the async
+        // `canon_handler::forward()` which raced with new PayloadJob
+        // start (see `sync_fifo_forward_to_head` docs for details).
+        // Reads via `state_provider_for_finish` (owned, not-yet-moved
+        // into `builder.finish`); `.account_nonce(...)` takes `&self`
+        // so the later move at Stage 5 is unaffected.
+        sync_fifo_forward_to_head(&self.fifo, state_provider_for_finish.as_ref()).await;
 
         // Carryover replay preamble — apply stale in-flight / journal-
         // restored entries directly (see `replay_fifo_carryover`). The

@@ -1,20 +1,28 @@
 //! Canonical-state listener that keeps [`PreconfTxSet`] in sync with the chain.
 //!
 //! Subscribes to a provider's [`CanonStateSubscriptions::canonical_state_stream`]
-//! and drives two best-effort cleanups:
+//! and drives best-effort cleanups on committed / reverted chain events:
 //!
-//! - **Committed chain**: each sealed block's transactions advance the
-//!   per-sender nonce frontier. For every distinct sender we compute
-//!   `max_nonce_in_chain + 1` and call [`PreconfTxSet::forward`], which
-//!   drops fifo entries whose nonce sits strictly below the new frontier.
-//!   Immediately after, [`PreconfTxSet::clean_reclaimable`] runs once
-//!   to evict `Timeout` and `Canceled` entries — this generalises
-//!   op-geth's tail-of-block-build `cleanTimeoutPreconfTxs` and prevents
-//!   both states from accumulating on senders that never post another
-//!   tx. The same evicted hashes are then `remove_transactions`-ed
-//!   from the pool so a preconf tx that already surfaced a `Timeout`
-//!   or `Canceled` to the client cannot silently land on chain later
-//!   (which would corrupt off-chain reconciliation).
+//! - **Committed chain**: journals the sealed hashes (so the rejournal
+//!   loop can drop them on its next rotate tick) and runs
+//!   [`PreconfTxSet::clean_reclaimable`] to evict `Timeout` / `Canceled`
+//!   / `Failed` entries — three "not on chain" states that must not
+//!   linger on senders who never post another nonce. Evicted hashes
+//!   are then `remove_transactions`-ed from the pool so a preconf tx
+//!   that already surfaced a not-on-chain wire signal to the client
+//!   cannot silently land on chain later (which would corrupt
+//!   off-chain reconciliation).
+//!
+//!   **Nonce-frontier `forward()` moved out**: the per-sender fifo
+//!   forward that used to run here now runs synchronously at
+//!   `PayloadJob` start (see
+//!   `builder::payload_builder::sync_fifo_forward_to_head`). Rationale:
+//!   the async fanout of `CanonStateNotification` raced with the next
+//!   FCU — a new PayloadJob could observe stale `Success` entries and
+//!   incorrectly replay them via `reset_success_to_waiting`, silently
+//!   double-counting `preconf_gas_used` in the fresh slot. Running the
+//!   forward from the PayloadJob prologue guarantees fifo consistency
+//!   with the parent block state before any dispatch decision.
 //! - **Reverted chain**: a reorg produces a warn log for every reverted
 //!   tx whose hash is tracked (journal `sealed` set when persistence is
 //!   enabled, fifo membership as fallback). This handler performs no
@@ -31,16 +39,15 @@
 //! Returns when the broadcast subscription's sender side closes (typically
 //! at node shutdown).
 
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc};
 
 use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
-use alloy_primitives::Address;
 use futures::StreamExt;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_execution_types::Chain;
 use reth_primitives_traits::NodePrimitives;
 use reth_transaction_pool::TransactionPool;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
 
@@ -111,8 +118,8 @@ where
                 self.observe_reorg(&old).await;
             }
 
-            // Committed chain — forward fifo entries past each sender's
-            // new nonce frontier. The owned-clone iter
+            // Committed chain — collect sealed hashes for journal
+            // marking. The owned-clone iter
             // (`clone_transactions_recovered`) is used because the
             // borrowed `&Tx` variants would require
             // `&Tx: alloy_consensus::Transaction`, which is gated by
@@ -120,19 +127,15 @@ where
             // references. Tx clones for canonical notifications are
             // low-frequency (block cadence) and small (consensus tx with
             // no sidecars).
+            //
+            // The sender-nonce frontier that used to drive per-sender
+            // `fifo.forward()` here now runs in `PayloadJob` prologue
+            // (`sync_fifo_forward_to_head`) — see module docs.
             let committed = notif.committed();
-            // Walk the recovered txs once; capture both the per-tx
-            // hash (for journal sealing) and the (sender, nonce) pair
-            // (for fifo forwarding). Two-pass would re-clone the same
-            // recovered iterator; one pass + two accumulators is
-            // cheaper at the cost of two `Vec`s of trivial size per
-            // sealed block.
-            let mut pairs: Vec<(Address, u64)> = Vec::new();
             let mut sealed_hashes: Vec<alloy_primitives::TxHash> = Vec::new();
             for recovered in
                 committed.blocks_iter().flat_map(|block| block.clone_transactions_recovered())
             {
-                pairs.push((recovered.signer(), recovered.inner().nonce()));
                 sealed_hashes.push(*recovered.inner().tx_hash());
             }
             drop(committed);
@@ -146,23 +149,14 @@ where
                 }
             }
 
-            let frontier = aggregate_nonce_frontier(pairs);
-            for (sender, next_nonce) in frontier {
-                trace!(
-                    target: "mantle::preconf::canon",
-                    ?sender, ?next_nonce,
-                    "forward fifo cleanup for sealed sender"
-                );
-                self.fifo.forward(&sender, next_nonce).await;
-            }
-
-            // Housekeeping: evict `Timeout` + `Canceled` entries in one
-            // pass — both are "server-side pre-apply reclaimable" and
-            // must NOT linger, or the (sender, nonce) slot they hold
-            // would block future preconf submissions from the same
-            // sender. `forward` above only drops entries whose nonce
-            // trails the sealed frontier; reclaimable entries whose
-            // sender never posts another nonce would otherwise stay
+            // Housekeeping: evict `Timeout` / `Canceled` / `Failed`
+            // entries in one pass — all three are "not on chain,
+            // reclaimable" and must NOT linger, or the (sender, nonce)
+            // slot they hold would block future preconf submissions
+            // from the same sender. `sync_fifo_forward_to_head` at
+            // PayloadJob start only drops entries whose nonce trails
+            // the sealed frontier; reclaimable entries whose sender
+            // never posts another nonce would otherwise stay
             // indefinitely. Running per-notification (~ per sealed
             // block, so ~2s on OP L2) matches op-geth's cadence without
             // requiring a separate background task.
@@ -232,88 +226,7 @@ where
     }
 }
 
-/// Reduce a `(sender, observed_nonce)` stream to a `sender → next_nonce`
-/// map, where `next_nonce = max(observed_nonce) + 1` per sender.
-///
-/// This is exactly the argument [`PreconfTxSet::forward`] expects (drops
-/// entries whose nonce is strictly less than the supplied value).
-///
-/// Taking already-extracted `(Address, u64)` pairs instead of recovered
-/// txs avoids leaking `NodePrimitives`/lifetime generics into the helper
-/// signature, which keeps the unit tests trivial.
-fn aggregate_nonce_frontier(
-    items: impl IntoIterator<Item = (Address, u64)>,
-) -> HashMap<Address, u64> {
-    let mut frontier: HashMap<Address, u64> = HashMap::new();
-    for (sender, nonce) in items {
-        let next_nonce = nonce.saturating_add(1);
-        frontier
-            .entry(sender)
-            .and_modify(|cur| {
-                if next_nonce > *cur {
-                    *cur = next_nonce;
-                }
-            })
-            .or_insert(next_nonce);
-    }
-    frontier
-}
-
-#[cfg(test)]
-mod tests {
-    //! The free `aggregate_nonce_frontier` helper is the only piece of
-    //! the handler exercisable in isolation. Listener-loop tests need a
-    //! real `CanonStateSubscriptions` impl emitting `CanonStateNotification`
-    //! with the OP `NodePrimitives` family — same scaffolding cost as
-    //! the pool listener tests, deferred to end-to-end coverage by the
-    //! same rationale.
-
-    use super::*;
-
-    fn addr(byte: u8) -> Address {
-        Address::from([byte; 20])
-    }
-
-    #[test]
-    fn aggregates_single_sender_takes_max_plus_one() {
-        let a = addr(1);
-        let frontier = aggregate_nonce_frontier([(a, 3), (a, 7), (a, 5)]);
-        assert_eq!(frontier.len(), 1);
-        assert_eq!(frontier[&a], 8); // max(3,7,5) + 1
-    }
-
-    #[test]
-    fn aggregates_multi_sender_independent_frontiers() {
-        let (a, b) = (addr(1), addr(2));
-        let frontier = aggregate_nonce_frontier([(a, 2), (b, 9), (a, 4), (b, 0)]);
-        assert_eq!(frontier[&a], 5); // max(2, 4) + 1
-        assert_eq!(frontier[&b], 10); // max(9, 0) + 1
-    }
-
-    #[test]
-    fn aggregates_empty_iterator_yields_empty_map() {
-        let frontier = aggregate_nonce_frontier(std::iter::empty::<(Address, u64)>());
-        assert!(frontier.is_empty());
-    }
-
-    #[test]
-    fn aggregates_saturating_add_handles_max_nonce() {
-        let a = addr(1);
-        let frontier = aggregate_nonce_frontier([(a, u64::MAX)]);
-        // saturating_add: u64::MAX + 1 saturates to u64::MAX. forward()
-        // then drops every entry with `nonce < u64::MAX` (i.e. all but
-        // pathological u64::MAX entries) — acceptable for what is already
-        // an impossible-on-chain scenario.
-        assert_eq!(frontier[&a], u64::MAX);
-    }
-
-    #[test]
-    fn aggregates_first_seen_lower_then_higher() {
-        let a = addr(1);
-        let frontier = aggregate_nonce_frontier([(a, 5), (a, 3)]);
-        // First insertion is `5+1=6`. Second tries `3+1=4` which is less,
-        // so the entry stays at 6 — `and_modify` only overwrites on strict
-        // greater-than.
-        assert_eq!(frontier[&a], 6);
-    }
-}
+// Note: `aggregate_nonce_frontier` and its unit tests used to live here.
+// The per-sender fifo forward driven by that helper has moved to
+// `builder::payload_builder::sync_fifo_forward_to_head` (see module docs
+// for the rationale — eliminates the canon vs new-PayloadJob race).
