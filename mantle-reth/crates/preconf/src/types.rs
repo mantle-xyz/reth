@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 ///                     │              status — the receipt carries
 ///                     │              `status = false`, but the tx does land
 ///                     │              on chain, matching op-geth semantics.)
-///                     ├──→ Failed    (builder rejected the tx pre-execute
-///                     │              — nonce-too-low / gas-over-block-limit /
-///                     │              other `BlockExecutionError::Validation`;
-///                     │              tx NOT on chain. Distinct from EVM
-///                     │              revert / halt, which flow through the
-///                     │              Success arm above.)
+///                     ├──→ Failed    (NOT on chain — reth builder rejected
+///                     │              the tx pre-execute: nonce-too-low /
+///                     │              gas-over-block-limit / other
+///                     │              `BlockExecutionError::Validation`.
+///                     │              Distinct from EVM revert / halt, which
+///                     │              flow through the Success arm above.
+///                     │              Reclaimable: same-hash retry revives
+///                     │              via `push_if_absent` → Waiting.)
 /// [push] → Waiting ──┤
 ///                     ├──→ Timeout   (NOT on chain — client's deadline hit;
 ///                     │               same-hash retry revives via
@@ -34,6 +36,14 @@ use serde::{Deserialize, Serialize};
 ///                                      same-hash retry revives via
 ///                                      `push_if_absent` → Waiting)
 /// ```
+///
+/// All three "not on chain" states (`Failed` / `Timeout` / `Canceled`)
+/// are **reclaimable** — the pool eviction hook fires from `mark_*`, and
+/// a subsequent same-hash resubmit is revived back to `Waiting` by
+/// `push_if_absent`. This mirrors the "typically transient" nature of
+/// each cause: `Timeout` (client just gave up too early), `Canceled`
+/// (F1 budget resets next slot), `Failed` (in-flight state race that
+/// the next slot's fresh block state usually resolves).
 ///
 /// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — they
 /// mean different things and are NOT connected by a direct mapping:
@@ -56,17 +66,21 @@ use serde::{Deserialize, Serialize};
 /// land on chain"). The presence-of-entry acts as the "in-flight, not
 /// canon" flag; no separate `InFlight` variant is needed.
 ///
-/// **Timeout vs Canceled** — both are "not on chain, retryable" but signal
-/// different causes to the client:
-/// - `Timeout` — the RPC handler's deadline elapsed. Client's request was
-///   accepted; server may or may not have run apply.
-/// - `Canceled` — the server pre-apply rejected the tx (e.g. `BlockGasBudget`
-///   gate in the dispatch loop). Server explicitly declined; no EVM state
-///   change happened.
+/// **Timeout vs Canceled vs Failed** — all three are "not on chain,
+/// reclaimable" but signal different causes to the client:
+/// - `Timeout` — the RPC handler's deadline elapsed. Client's request
+///   was accepted; server may or may not have run apply.
+/// - `Canceled` — the F1 pre-apply gate rejected the tx (e.g. block
+///   gas budget). Server explicitly declined; no EVM state change.
+/// - `Failed` — reth's block builder rejected pre-execute (in-flight
+///   nonce / balance race, block gas exhausted at builder level). tx
+///   NOT on chain; typically resolves on next slot.
 ///
-/// SDKs typically retry `Timeout` immediately (server might succeed next
-/// time) and back off / change strategy for `Canceled` (server said "not
-/// now" — retrying without changes may hit the same rejection).
+/// SDKs retry all three the same way: same-hash resubmit is safe;
+/// `push_if_absent` revives the fifo entry back to `Waiting` and the
+/// dispatch loop picks it up. Client-visible fast Err (same-slot dedup
+/// forwards the stored reason) or Ok(Timeout) (RPC deadline) both
+/// signal "try next slot".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PreconfStatus {
     /// Awaiting builder apply.
@@ -75,7 +89,12 @@ pub enum PreconfStatus {
     /// Builder apply succeeded; receipt available.
     #[serde(rename = "success")]
     Success,
-    /// Builder apply failed (revert / halt).
+    /// Reth builder rejected pre-execute (in-flight nonce/balance race,
+    /// block gas exhausted at builder level, or other
+    /// `BlockExecutionError::Validation`). tx NOT on chain. Reclaimable
+    /// via same-hash resubmit (`push_if_absent` Timeout/Canceled/Failed →
+    /// Waiting revive branch). Distinct from wire-layer `Failed`, which
+    /// means EVM revert with tx on chain.
     #[serde(rename = "failed")]
     Failed,
     /// Server-side timeout — only Waiting can transition here (CAS).

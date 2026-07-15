@@ -273,21 +273,25 @@ impl PreconfTxSet {
         // Same-hash entry already present — three outcomes depending on
         // its current status:
         //
-        // - `Timeout` / `Canceled` (reclaimable) → revive to `Waiting`.
-        //   Adopt the fresh responder + origin_instant from
+        // - `Timeout` / `Canceled` / `Failed` (reclaimable) → revive to
+        //   `Waiting`. Adopt the fresh responder + origin_instant from
         //   `pending_responders` (if the RPC handler pre-attached one
         //   for this resubmit) so dispatch's deadline gate measures
         //   against the new submission, then broadcast. Closes the
-        //   "same-hash resubmit after timeout" loop that would
-        //   otherwise wedge under the pool-eviction callback.
-        // - `Waiting` / `Success` / `Failed` (active) → idempotent
-        //   no-op; callers should treat this as "someone else already
-        //   owns the slot" (the RPC handler surfaces it as
-        //   `AlreadyInProgress`).
+        //   "same-hash resubmit after non-Success terminal" loop that
+        //   would otherwise wedge under the pool-eviction callback.
+        //   `Failed` is included because its trigger — reth builder
+        //   pre-execute reject (in-flight nonce / balance race,
+        //   block gas exhausted at builder level) — is typically a
+        //   within-slot state race, not an intrinsic tx defect;
+        //   next-slot retry naturally resolves it.
+        // - `Waiting` / `Success` (active) → idempotent no-op; callers
+        //   should treat this as "someone else already owns the slot"
+        //   (the RPC handler surfaces it as `AlreadyInProgress`).
         if let Some(existing) = inner.entries.get_mut(&hash) {
             if matches!(
                 existing.status,
-                PreconfStatus::Timeout | PreconfStatus::Canceled
+                PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
             ) {
                 // `attach_responder`'s reclaimable-state branch already
                 // installed the fresh responder + refreshed
@@ -303,18 +307,27 @@ impl PreconfTxSet {
         }
 
         // Replacement check: same `(sender, nonce)` but a different hash.
-        // Only "server pre-apply reclaimable" states release the slot —
-        // `Timeout` (client 200ms deadline) and `Canceled` (server pre-
-        // apply reject, e.g. block gas budget). `Waiting` / `Success` /
-        // `Failed` all block replacement.
+        // Reclaimable terminal states release the slot — `Timeout`
+        // (client deadline), `Canceled` (F1 pre-apply reject), and
+        // `Failed` (reth builder pre-execute reject; tx NOT on chain,
+        // same "safe to replace" property as the other two).
+        // `Waiting` / `Success` block replacement (`Success` is either
+        // on chain or in-flight, replacement would double-apply).
         if let Some(existing_hash) = inner.by_sender.get(&(from, nonce)).copied() {
             let existing_status = inner.entries.get(&existing_hash).map(|e| e.status);
             match existing_status {
-                Some(s) if s != PreconfStatus::Timeout && s != PreconfStatus::Canceled => {
+                Some(s)
+                    if !matches!(
+                        s,
+                        PreconfStatus::Timeout
+                            | PreconfStatus::Canceled
+                            | PreconfStatus::Failed
+                    ) =>
+                {
                     return PushResult::ConflictActive(existing_hash);
                 }
                 Some(_) => {
-                    // Timeout or Canceled — evict, then fall through to insert.
+                    // Timeout / Canceled / Failed — evict, then fall through to insert.
                     inner.drop_hash(&existing_hash);
                 }
                 None => {
@@ -452,20 +465,26 @@ impl PreconfTxSet {
         }
     }
 
-    /// Evicts every entry in a server-pre-apply reclaimable state —
-    /// `Timeout` (client's 200ms deadline elapsed) and `Canceled`
-    /// (server pre-apply reject, e.g. block gas budget). Broader than
-    /// op-geth's `FIFOTxSet::CleanTimeout` which only clears the timeout
-    /// case; the split into two states in this fifo means both must be
-    /// swept together to avoid stale entries pinning the (sender, nonce)
-    /// slot forever. Returns evicted hashes.
+    /// Evicts every entry in a reclaimable terminal state —
+    /// `Timeout` (client deadline elapsed), `Canceled` (F1 pre-apply
+    /// reject, e.g. block gas budget), and `Failed` (reth builder
+    /// pre-execute reject; tx NOT on chain). Broader than op-geth's
+    /// `FIFOTxSet::CleanTimeout` which only clears the timeout case;
+    /// the split into three states in this fifo means all must be swept
+    /// together to avoid stale entries pinning the (sender, nonce) slot
+    /// forever. Returns evicted hashes.
     pub async fn clean_reclaimable(&self) -> Vec<TxHash> {
         let mut inner = self.inner.lock().await;
         let to_drop: Vec<TxHash> = inner
             .entries
             .iter()
             .filter(|(_, e)| {
-                e.status == PreconfStatus::Timeout || e.status == PreconfStatus::Canceled
+                matches!(
+                    e.status,
+                    PreconfStatus::Timeout
+                        | PreconfStatus::Canceled
+                        | PreconfStatus::Failed
+                )
             })
             .map(|(h, _)| *h)
             .collect();
@@ -491,9 +510,17 @@ impl PreconfTxSet {
         self.transition_from_waiting(hash, PreconfStatus::Success).await
     }
 
-    /// `Waiting → Failed`. Truly terminal — symmetric to `mark_succeeded`.
-    /// Called by builder when apply_fn returned Err (nonce-too-low,
-    /// gas-over-block-limit, etc.). **tx NOT on chain**.
+    /// `Waiting → Failed`. **Soft terminal** — like `Timeout` /
+    /// `Canceled`, a `Failed` entry is **revivable** via same-hash
+    /// resubmit (`push_if_absent`'s Timeout/Canceled/Failed → Waiting
+    /// branch). Called by builder when apply_fn returned Err
+    /// (in-flight nonce / balance race, block gas exhausted at builder
+    /// level). **tx NOT on chain**.
+    ///
+    /// Reclaim rationale: all three "not on chain" causes are typically
+    /// transient (deadline overreach, F1 budget resets next slot, or
+    /// in-flight state race that clears when the next slot's fresh
+    /// block state comes in). SDKs retry all three the same way.
     ///
     /// On success, invokes the pool-eviction callback (if registered)
     /// to synchronously remove `hash` from the transaction pool. This
@@ -505,16 +532,15 @@ impl PreconfTxSet {
         Ok(())
     }
 
-    /// `Waiting → Timeout`. **Soft terminal** — unlike `Success` / `Failed`,
-    /// a `Timeout` entry is **revivable**: a same-hash retry from the
-    /// client re-runs through `attach_responder` (which refreshes the
-    /// responder + `inserted_at`) and the subsequent listener push
-    /// through [`Self::push_if_absent`] flips the entry back to
-    /// `Waiting`. Called by the RPC handler when the client-side
-    /// `preconf_timeout` fires before a receipt is delivered, or by
-    /// dispatch's pre-apply deadline gate.
+    /// `Waiting → Timeout`. **Soft terminal** — a `Timeout` entry is
+    /// **revivable**: a same-hash retry from the client re-runs through
+    /// `attach_responder` (which refreshes the responder + `inserted_at`)
+    /// and the subsequent listener push through [`Self::push_if_absent`]
+    /// flips the entry back to `Waiting`. Called by the RPC handler when
+    /// the client-side `preconf_timeout` fires before a receipt is
+    /// delivered, or by dispatch's pre-apply deadline gate.
     ///
-    /// Same pool-eviction hook as `mark_failed`.
+    /// Same pool-eviction hook as `mark_failed` / `mark_canceled`.
     pub async fn mark_timeout(&self, hash: &TxHash) -> Result<(), MarkError> {
         self.transition_from_waiting(hash, PreconfStatus::Timeout).await?;
         self.evict_from_pool(*hash);
@@ -616,12 +642,12 @@ impl PreconfTxSet {
         let mut inner = self.inner.lock().await;
         if let Some(entry) = inner.entries.get_mut(&hash) {
             match entry.status {
-                // A prior client already resolved on this hash — either
-                // `mark_succeeded`/`mark_failed` fired and the receipt
-                // (or error) has been delivered. Any second submission
-                // would have nothing new to await, so surface as
-                // `AlreadyInProgress` at the caller.
-                PreconfStatus::Success | PreconfStatus::Failed => {
+                // A prior client already resolved on this hash — the
+                // apply succeeded and the receipt was delivered via
+                // `mark_succeeded` + `take_responder`. Any second
+                // submission would have nothing new to await, so
+                // surface as `AlreadyInProgress` at the caller.
+                PreconfStatus::Success => {
                     return Err(AttachError::AlreadyAttached);
                 }
                 // Waiting — the entry is live. Allow attach only when
@@ -638,13 +664,17 @@ impl PreconfTxSet {
                     return Ok(());
                 }
                 // Reclaimable — this is a same-hash retry after a
-                // `Timeout` or `Canceled`. Install the fresh responder
-                // and refresh `inserted_at` so `builder::dispatch`'s
+                // `Timeout` (client deadline), `Canceled` (F1 pre-apply
+                // reject), or `Failed` (reth builder pre-execute reject;
+                // tx NOT on chain). Install the fresh responder and
+                // refresh `inserted_at` so `builder::dispatch`'s
                 // deadline gate measures against the second submission
                 // rather than the (already-expired) first. The
                 // subsequent `push_if_absent` from the pool listener
                 // flips the entry back to `Waiting` and broadcasts.
-                PreconfStatus::Timeout | PreconfStatus::Canceled => {
+                PreconfStatus::Timeout
+                | PreconfStatus::Canceled
+                | PreconfStatus::Failed => {
                     entry.responder = Some(responder);
                     entry.inserted_at = origin_instant;
                     return Ok(());
@@ -832,6 +862,53 @@ mod tests {
         assert!(set.contains(tx2.tx_hash()).await);
     }
 
+    /// Symmetric to `push_conflict_after_timeout_evicts_and_inserts`:
+    /// once the sitting entry has been `mark_failed`-ed (reth builder
+    /// pre-execute reject; tx NOT on chain), a different-hash tx for
+    /// the same (sender, nonce) must be admissible. Locks the
+    /// "Failed is reclaimable" replacement branch.
+    #[tokio::test]
+    async fn push_conflict_after_failed_evicts_and_inserts() {
+        let set = PreconfTxSet::new(16);
+        let tx1 = make_tx(0, 1);
+        let tx2 = make_tx(0, 2);
+        set.push_if_absent(tx1.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_failed(tx1.tx_hash()).await.unwrap();
+
+        let r = set.push_if_absent(tx2.clone(), addr(1), PreconfSource::Rpc).await;
+        assert_eq!(r, PushResult::Inserted);
+        assert!(!set.contains(tx1.tx_hash()).await);
+        assert!(set.contains(tx2.tx_hash()).await);
+    }
+
+    /// Same-hash resubmit after `mark_failed` revives the entry to
+    /// `Waiting` (Revived branch of `push_if_absent`) and broadcasts,
+    /// so dispatch picks the tx up for a fresh apply attempt.
+    #[tokio::test]
+    async fn push_same_hash_after_failed_revives_to_waiting() {
+        let set = PreconfTxSet::new(16);
+        let mut rx = set.subscribe();
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        // Drain the initial broadcast so the assertion below only sees
+        // the revival notify.
+        let _ = rx.try_recv();
+        set.mark_failed(tx.tx_hash()).await.unwrap();
+        assert_eq!(
+            set.find_by_hash(tx.tx_hash()).await.unwrap().status,
+            PreconfStatus::Failed,
+        );
+
+        let r = set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        assert_eq!(r, PushResult::Revived);
+        assert_eq!(
+            set.find_by_hash(tx.tx_hash()).await.unwrap().status,
+            PreconfStatus::Waiting,
+        );
+        // Revive broadcasts the hash so dispatch re-picks it up.
+        assert_eq!(rx.try_recv().unwrap(), *tx.tx_hash());
+    }
+
     // ============ status transitions ============
 
     #[tokio::test]
@@ -995,9 +1072,11 @@ mod tests {
     // ============ clean_reclaimable ============
 
     #[tokio::test]
-    async fn clean_reclaimable_evicts_timeout_and_canceled_entries() {
+    async fn clean_reclaimable_evicts_timeout_canceled_and_failed_entries() {
         // 5 entries: Waiting, Success, Failed, Timeout, Canceled.
-        // `clean_reclaimable` must drop the last two, keep the first three.
+        // `clean_reclaimable` must drop the last three (Failed / Timeout
+        // / Canceled — all reclaimable, all "not on chain"), keep the
+        // first two (Waiting is live, Success is on-chain-or-in-flight).
         let set = PreconfTxSet::new(16);
         let t_wait = make_tx(0, 1);
         let t_ok = make_tx(1, 2);
@@ -1016,15 +1095,15 @@ mod tests {
 
         let mut evicted = set.clean_reclaimable().await;
         evicted.sort();
-        let mut expected = vec![*t_to.tx_hash(), *t_cancel.tx_hash()];
+        let mut expected = vec![*t_fail.tx_hash(), *t_to.tx_hash(), *t_cancel.tx_hash()];
         expected.sort();
         assert_eq!(evicted, expected);
 
         // Kept.
         assert!(set.contains(t_wait.tx_hash()).await);
         assert!(set.contains(t_ok.tx_hash()).await);
-        assert!(set.contains(t_fail.tx_hash()).await);
         // Evicted.
+        assert!(!set.contains(t_fail.tx_hash()).await);
         assert!(!set.contains(t_to.tx_hash()).await);
         assert!(!set.contains(t_cancel.tx_hash()).await);
     }

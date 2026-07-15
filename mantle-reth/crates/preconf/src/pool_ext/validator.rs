@@ -130,26 +130,29 @@ where
         let to = Transaction::to(&transaction);
         let is_preconf_eligible = self.cfg.is_preconf_tx(&sender, to.as_ref());
 
-        // Replacement guard: only server pre-apply reclaimable states
-        // release the (sender, nonce) slot — `Timeout` (client deadline)
-        // and `Canceled` (server pre-apply reject). Waiting / Success /
-        // Failed all block replacement attempts.
+        // Replacement guard: only reclaimable terminal states release
+        // the (sender, nonce) slot — `Timeout` (client deadline),
+        // `Canceled` (F1 pre-apply reject), and `Failed` (reth builder
+        // pre-execute reject; tx NOT on chain). `Waiting` / `Success`
+        // block replacement (`Success` is on-chain or in-flight, so
+        // replacement would double-apply).
         if let Some(existing) = self.fifo.find_by_sender_nonce(&sender, nonce).await
             && existing.hash != tx_hash
         {
-            if existing.status != PreconfStatus::Timeout
-                && existing.status != PreconfStatus::Canceled
-            {
+            if !matches!(
+                existing.status,
+                PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
+            ) {
                 return TransactionValidationOutcome::Invalid(
                     transaction,
                     InvalidPoolTransactionError::Other(Box::new(ReplaceActivePreconf)),
                 );
             }
-            // Slot is Timeout or Canceled — drop the stale fifo entry so
-            // the new tx can occupy the slot cleanly. The replacement
-            // only proceeds via the rest of the validator chain; we do
-            // not re-push here — the pool listener will pick up the new
-            // tx once it lands in the pool.
+            // Slot is Timeout / Canceled / Failed — drop the stale fifo
+            // entry so the new tx can occupy the slot cleanly. The
+            // replacement only proceeds via the rest of the validator
+            // chain; we do not re-push here — the pool listener will
+            // pick up the new tx once it lands in the pool.
             self.fifo.remove(&existing.hash).await;
         }
 
