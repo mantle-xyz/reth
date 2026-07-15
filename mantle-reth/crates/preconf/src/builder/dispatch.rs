@@ -153,6 +153,15 @@ impl LoopState {
         self.excluded.entry(hash).or_insert(reason);
     }
 
+    /// Drop a hash from the excluded map. Called by `apply_one_preconf`
+    /// when a prior `Timeout` exclusion needs to be re-evaluated
+    /// against a fresh `entry.inserted_at` (refreshed by
+    /// `attach_responder` on same-hash resubmit), so a stale exclusion
+    /// does not shadow a legitimately re-eligible tx.
+    pub(super) fn clear_excluded(&mut self, hash: &TxHash) {
+        self.excluded.remove(hash);
+    }
+
     /// Number of committed hashes — used by tests/metrics.
     #[cfg(test)]
     pub(super) fn committed_len(&self) -> usize {
@@ -198,18 +207,40 @@ pub(super) async fn apply_one_preconf<F>(
     // newly-attached responder so a same-slot resubmit sees the same
     // error the first attempt fired, rather than waiting the full
     // `preconf_timeout` for the RPC-layer deadline to elapse.
+    //
+    // Exception: a prior `Timeout` exclusion is **re-evaluated** rather
+    // than forwarded. The deadline gate below checks
+    // `entry.inserted_at.elapsed()` against `cfg.preconf_timeout`, and
+    // `attach_responder`'s reclaimable-state branch refreshes
+    // `inserted_at` when the client resubmits after a Timeout. So the
+    // deadline that fired for the first submission does NOT apply to
+    // the fresh submission — forwarding the stale Timeout would deny
+    // service to a legitimately re-eligible tx. We drop the stale
+    // exclusion here and let the gate below fire against the refreshed
+    // clock; if the deadline is still exceeded, the gate will re-record
+    // exclusion with the fresh timeout.
     if loop_state.is_committed(&hash) {
         trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; already committed");
         return;
     }
     if let Some(reason) = loop_state.excluded_reason(&hash).cloned() {
-        trace!(
-            target: "mantle::preconf::dispatch",
-            ?hash, ?reason,
-            "dedup hit; forwarding prior rejection to any pending responder"
-        );
-        fifo.cancel_responder(&hash, reason).await;
-        return;
+        if matches!(reason, PreconfError::Timeout { .. }) {
+            trace!(
+                target: "mantle::preconf::dispatch",
+                ?hash,
+                "prior exclusion was Timeout; clearing to re-evaluate against refreshed inserted_at"
+            );
+            loop_state.clear_excluded(&hash);
+            // Fall through to gate evaluation.
+        } else {
+            trace!(
+                target: "mantle::preconf::dispatch",
+                ?hash, ?reason,
+                "dedup hit; forwarding prior rejection to any pending responder"
+            );
+            fifo.cancel_responder(&hash, reason).await;
+            return;
+        }
     }
 
     let Some(entry) = fifo.find_by_hash(&hash).await else {
@@ -595,6 +626,72 @@ mod tests {
         // Fifo entry is now Timeout.
         let entry = fifo.find_by_hash(&hash).await.unwrap();
         assert_eq!(entry.status, PreconfStatus::Timeout);
+    }
+
+    /// Simulates a same-slot client resubmit after a Timeout:
+    /// 1. First dispatch: deadline gate fires, records `Timeout` excluded.
+    /// 2. Client resubmits: `attach_responder` refreshes `inserted_at`,
+    ///    `push_if_absent` revives fifo entry back to `Waiting`.
+    /// 3. Second dispatch: dedup finds the prior `Timeout` reason but
+    ///    **clears** it (since the deadline gate is tied to the
+    ///    entry's `inserted_at`, which is now fresh) and falls through
+    ///    to re-evaluate the gates. With fresh insertion time well
+    ///    under `preconf_timeout`, the gate does not fire and apply
+    ///    proceeds. The fresh responder observes the receipt.
+    ///
+    /// Locks the "Timeout is not a stable exclusion" invariant: a
+    /// regression that forwards stored Timeout via `cancel_responder`
+    /// would deny service to a legitimately re-eligible tx.
+    #[tokio::test]
+    async fn dedup_timeout_re_evaluates_gate_on_fresh_inserted_at() {
+        use std::time::Instant;
+
+        let cfg = PreconfConfig {
+            preconf_timeout: Duration::from_millis(50),
+            ..PreconfConfig::default()
+        };
+        let fifo = PreconfTxSet::new(8);
+        let tx = make_tx(0x55);
+        let hash = *tx.tx_hash();
+
+        // Step 1: initial insert; sleep past deadline so the gate fires.
+        let (resp_tx1, resp_rx1) = oneshot::channel();
+        fifo.attach_responder(hash, Instant::now(), resp_tx1).await.unwrap();
+        fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let mut state = LoopState::new(1);
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        // First dispatch: Timeout via deadline gate.
+        let err = resp_rx1.await.expect("responder closed").expect_err("must be Timeout");
+        assert!(matches!(err, PreconfError::Timeout { .. }));
+        assert_eq!(state.excluded_len(), 1);
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.unwrap().status,
+            PreconfStatus::Timeout,
+        );
+
+        // Step 2: client resubmit — refresh `inserted_at`, revive to Waiting.
+        let (resp_tx2, resp_rx2) = oneshot::channel();
+        fifo.attach_responder(hash, Instant::now(), resp_tx2).await.unwrap();
+        fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.unwrap().status,
+            PreconfStatus::Waiting,
+            "revive must flip status back to Waiting",
+        );
+
+        // Step 3: second dispatch. Dedup CLEARS the stale Timeout and
+        // falls through; deadline gate reads fresh inserted_at (< 50ms)
+        // and passes; apply succeeds.
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+
+        assert_eq!(state.excluded_len(), 0, "stale Timeout exclusion must be cleared");
+        assert_eq!(state.committed_len(), 1, "second dispatch must apply successfully");
+
+        // Fresh responder observes the receipt from the successful apply.
+        let receipt = resp_rx2.await.expect("responder closed").expect("must be Ok");
+        assert!(receipt.status);
     }
 
     #[tokio::test]
