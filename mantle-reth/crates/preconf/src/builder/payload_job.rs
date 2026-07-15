@@ -49,7 +49,10 @@ pub struct PreconfPayloadJob<Attrs, Payload> {
     payload_rx: watch::Receiver<Option<Payload>>,
     /// Cancel handle shared with the spawned build task. Flipped by
     /// [`Self::resolve_kind`] when the CL asks for the payload, or by
-    /// `Drop` (via the generator's drop path) on job teardown.
+    /// the [`Drop`] impl when the payload service prunes this job
+    /// (e.g. after a reorg switches to a different fork's attributes,
+    /// or when job-cache capacity forces eviction). Idempotent — both
+    /// paths may fire in sequence without ill effect.
     cancel: JobCancel,
     /// [`JoinHandle`] for the spawned build task. Held solely to keep
     /// the join channel alive for the job's lifetime — no `.await` on
@@ -94,6 +97,33 @@ where
             .field("attributes", &self.attributes)
             .field("cancelled", &self.cancel.is_cancelled())
             .finish_non_exhaustive()
+    }
+}
+
+// ─── Drop impl — pruned-job cancellation ────────────────────────────────────
+//
+// The payload service holds a bounded LRU-ish cache of active jobs.
+// When a new job for a different `PayloadId` is created (typical case:
+// reorg — engine sends an FCU pointing at a fresh head/attrs, and the
+// old job's PayloadId no longer matches), the service may evict the
+// stale job by dropping it. Without an explicit cancel signal the
+// spawned build task would keep running against the now-obsolete parent
+// state until its own natural exit (Stage 5 finalize), wasting compute
+// and holding the shared `PreconfTxSet` in a state visible to the newly-
+// started job.
+//
+// Signaling cancel from Drop guarantees the build task observes the
+// cancel arm of its `select!` and unwinds through Stage 4/5 promptly.
+// The final `payload_tx.send(...)` will silently fail because the
+// receiver has already been dropped alongside the job (see
+// `payload_job_generator.rs::new_payload_job` for the send-fail log).
+//
+// Idempotent with respect to `resolve_kind`'s own `cancel.signal()` —
+// `JobCancel::signal` is a single `watch::Sender::send(true)` and a
+// second call is a no-op.
+impl<Attrs, Payload> Drop for PreconfPayloadJob<Attrs, Payload> {
+    fn drop(&mut self) {
+        self.cancel.signal();
     }
 }
 
@@ -272,6 +302,53 @@ mod tests {
             .await
             .expect("job did not resolve after cancel")
             .expect("job returned error");
+    }
+
+    /// Dropping a job (payload-service prunes it, e.g. after a reorg
+    /// evicts the old-parent job in favor of the new-fork one) must
+    /// signal cancel so the spawned build task can unwind promptly
+    /// instead of running to natural completion against an obsolete
+    /// parent state.
+    #[tokio::test]
+    async fn dropping_job_signals_cancel() {
+        let (_tx, rx) = watch::channel::<Option<()>>(None);
+        let cancel = JobCancel::new();
+        let cancel_observer = cancel.clone();
+        let handle = tokio::spawn(async {});
+        let job = PreconfPayloadJob::new((), rx, cancel, handle);
+
+        assert!(!cancel_observer.is_cancelled(), "cancel starts clear");
+        drop(job);
+        assert!(
+            cancel_observer.is_cancelled(),
+            "drop must signal cancel so the build task can exit its select! loop"
+        );
+    }
+
+    /// Drop after cancel has already been signalled (either by
+    /// `resolve_kind` or an external caller) is a no-op —
+    /// `JobCancel::signal` is idempotent. Locks the invariant so the
+    /// Drop-triggered cancel can't accidentally regress state when it
+    /// races with a resolve_kind-triggered cancel.
+    #[tokio::test]
+    async fn drop_after_prior_cancel_is_idempotent() {
+        let (_tx, rx) = watch::channel::<Option<()>>(None);
+        let cancel = JobCancel::new();
+        let cancel_observer = cancel.clone();
+        let handle = tokio::spawn(async {});
+        let job = PreconfPayloadJob::new((), rx, cancel.clone(), handle);
+
+        // Simulate `resolve_kind`'s cancel firing before drop.
+        cancel.signal();
+        assert!(cancel_observer.is_cancelled(), "explicit signal marks cancel");
+
+        // Dropping the (already-cancelled) job must not panic or
+        // otherwise regress state — cancel stays observably cancelled.
+        drop(job);
+        assert!(
+            cancel_observer.is_cancelled(),
+            "drop is idempotent — cancel remains set after redundant signal"
+        );
     }
 
     #[tokio::test]
