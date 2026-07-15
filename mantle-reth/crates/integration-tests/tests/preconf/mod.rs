@@ -19,6 +19,7 @@ mod canon_cleanup;
 mod chain_id_pair;
 mod gas_budgets;
 mod happy_path;
+mod no_tx_pool;
 mod predeploy_genesis;
 mod race_pool_arm;
 mod replacement;

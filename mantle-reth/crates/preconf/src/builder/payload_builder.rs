@@ -654,6 +654,19 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // that self-disables once the current allocation is drained.
         let mut pool_quota: u64 = 0;
 
+        // `no_tx_pool=true` on the payload attrs signals a
+        // **deterministic derivation build**: the block must exactly
+        // reproduce what other nodes derive from L1 data (deposits +
+        // sequencer-batched txs only). Injecting any preconf tx here —
+        // whether a fresh RPC push, a Waiting carryover, or a
+        // Replay-sourced journal entry — would diverge the block hash
+        // from the network consensus and cause a safe-head fork. Gate
+        // the entire preconf pipeline on this flag; fifo entries stay
+        // put and get dispatched on the next `no_tx_pool=false` build
+        // (their SLA is upheld by delayed landing, NOT by forcing them
+        // into the derivation block).
+        let allow_preconf = !ctx.attributes().no_tx_pool();
+
         // Synchronous canon-forward — drop fifo entries whose nonce is
         // already sealed as of parent block. Replaces the async
         // `canon_handler::forward()` which raced with new PayloadJob
@@ -661,13 +674,22 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Reads via `state_provider_for_finish` (owned, not-yet-moved
         // into `builder.finish`); `.account_nonce(...)` takes `&self`
         // so the later move at Stage 5 is unaffected.
+        //
+        // Runs regardless of `allow_preconf`: `forward` only prunes
+        // canon-stale entries, it does not apply any tx into the
+        // in-flight block, so it is safe (and desirable — keeps fifo
+        // aligned with chain state) during derivation builds too.
         sync_fifo_forward_to_head(&self.fifo, state_provider_for_finish.as_ref()).await;
 
         // Carryover replay preamble — apply stale in-flight / journal-
         // restored entries directly (see `replay_fifo_carryover`). The
         // block scope drops `apply_fn` so its `&mut builder` borrow is
         // released before the select! loop's arms.
-        {
+        //
+        // Skipped entirely when `!allow_preconf` — the fifo entries
+        // (including Replay-sourced ones with `must-land` SLA) remain
+        // in the fifo and get dispatched on the next normal-slot build.
+        if allow_preconf {
             let mut apply_fn = |tx, hash, height| {
                 convert_and_apply_preconf::<N, _>(&mut builder, tx, hash, height)
             };
@@ -680,7 +702,15 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             tokio::select! {
                 biased;
                 () = cancel.wait() => break,
-                recv = fifo_rx.recv() => {
+                // `if allow_preconf` gates the preconf arm entirely
+                // during `no_tx_pool=true` derivation builds. Without
+                // this guard, a broadcast from the pool listener during
+                // the build window would still inject the preconf tx
+                // and diverge the block hash. New submissions arriving
+                // while `!allow_preconf` remain parked in the fifo and
+                // are dispatched by the next `allow_preconf=true`
+                // build.
+                recv = fifo_rx.recv(), if allow_preconf => {
                     // Closure re-created per arm-entry so its `&mut builder`
                     // borrow does not clash with the pool arm.
                     let mut apply_fn = |tx, hash, height| {
