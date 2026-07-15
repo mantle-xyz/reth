@@ -115,12 +115,20 @@ async fn preconf_happy_path_on_mantle_sepolia() {
     run_pair_case!(5003);
 }
 
-/// Guarded by a `#[ignore]` until op-geth ships `MantleHoodiUpgradeConfig`
-/// — enabling it before then would exercise a chain id the wider stack
-/// does not yet recognise. Kept in-tree so the matrix is complete on
-/// paper and easy to switch on with a one-line change.
+/// Mantle Hoodi (chain_id=50002) preconf happy path.
+///
+/// Pins mantle-reth's chain-id independence for the preconf pipeline:
+/// with `mantle_chain_spec_for(50002)` patched into the genesis, the
+/// standard preconf flow (whitelist → attach → dispatch → seal) must
+/// work identically to mainnet / sepolia — a regression that adds a
+/// hardcoded chain-id check would surface here.
+///
+/// **Scope note**: passing this test only proves this repo's preconf
+/// logic is chain-id agnostic. Full-stack Hoodi readiness additionally
+/// requires `MantleHoodiUpgradeConfig` in op-geth's `params/mantle.go`
+/// (tracked separately in cross-repo Gap table) and op-node config
+/// wiring.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "waiting for MantleHoodiUpgradeConfig in op-geth params/mantle.go"]
 async fn preconf_happy_path_on_mantle_hoodi() {
     run_pair_case!(50002);
 }
@@ -248,8 +256,10 @@ async fn preconf_block_gas_budget_enforced_on_mantle_sepolia() {
     run_gas_budget_case!(5003);
 }
 
+/// See `preconf_happy_path_on_mantle_hoodi` for scope: this pins the
+/// F1 block-gas-budget path is chain-id agnostic for 50002. Full-stack
+/// Hoodi readiness is tracked separately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "waiting for MantleHoodiUpgradeConfig in op-geth params/mantle.go"]
 async fn preconf_block_gas_budget_enforced_on_mantle_hoodi() {
     run_gas_budget_case!(50002);
 }
