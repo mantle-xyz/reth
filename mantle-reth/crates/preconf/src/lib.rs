@@ -28,7 +28,7 @@ pub use builder::{
 };
 pub use payload_service_builder::MantlePreconfServiceBuilder;
 pub use canon_handler::PreconfCanonHandler;
-pub use config::PreconfConfig;
+pub use config::{PreconfConfig, DEFAULT_SAFETY_MARGIN};
 pub use journal::{
     JournalEntry, JournalError, PreconfJournal, RestorePool, RestoredEnvelope, RotateStats,
     restore_preconf_state, run_rejournal_loop, spawn_rejournal_loop,

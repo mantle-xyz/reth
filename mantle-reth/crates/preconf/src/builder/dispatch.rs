@@ -33,7 +33,7 @@
 //! the state-machine invariants are exercised in isolation. End-to-end
 //! EVM behaviour is covered by devnet integration tests.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::TxHash;
@@ -52,8 +52,13 @@ use crate::{
 pub(super) struct LoopState {
     /// Hashes already committed to the in-flight block.
     committed: HashSet<TxHash>,
-    /// Hashes excluded — terminal-non-success, deadline-skip, etc.
-    excluded: HashSet<TxHash>,
+    /// Hashes excluded — terminal-non-success, deadline-skip, etc. The
+    /// stored [`PreconfError`] is the rejection reason from the first
+    /// time this hash was excluded; a subsequent same-slot resubmit
+    /// dedups against this map and forwards the same reason to any
+    /// newly-attached responder, so the client observes a consistent
+    /// error rather than a slow-Timeout on retry.
+    excluded: HashMap<TxHash, PreconfError>,
     /// Predicted L2 block height for this slot. Stamped onto every
     /// receipt as `PreconfReceipt::block_height`.
     predicted_height: u64,
@@ -80,7 +85,7 @@ impl LoopState {
     pub(super) fn new(predicted_height: u64) -> Self {
         Self {
             committed: HashSet::new(),
-            excluded: HashSet::new(),
+            excluded: HashMap::new(),
             predicted_height,
             preconf_gas_used: 0,
             pool_gas_used: 0,
@@ -110,9 +115,29 @@ impl LoopState {
     }
 
     /// `true` iff the hash has already been committed or excluded by
-    /// this loop instance.
+    /// this loop instance. Retained as a bool wrapper for tests; the
+    /// dispatch loop uses [`Self::is_committed`] / [`Self::excluded_reason`]
+    /// to distinguish the two branches.
+    #[cfg(test)]
     pub(super) fn contains(&self, hash: &TxHash) -> bool {
-        self.committed.contains(hash) || self.excluded.contains(hash)
+        self.committed.contains(hash) || self.excluded.contains_key(hash)
+    }
+
+    /// `true` iff the hash was recorded as committed (apply succeeded).
+    /// Callers use this to distinguish "already applied, silently skip"
+    /// from "already excluded, forward the recorded rejection reason".
+    pub(super) fn is_committed(&self, hash: &TxHash) -> bool {
+        self.committed.contains(hash)
+    }
+
+    /// If `hash` was previously excluded in this loop instance, return
+    /// the stored rejection reason. `None` when the hash is either
+    /// unseen or was committed. Callers forward the returned error to
+    /// any late-arriving responder so a same-slot resubmit sees the
+    /// same wire error as the first submission, rather than waiting the
+    /// full `preconf_timeout` and getting a generic `Ok(Timeout)`.
+    pub(super) fn excluded_reason(&self, hash: &TxHash) -> Option<&PreconfError> {
+        self.excluded.get(hash)
     }
 
     /// Mark hash as committed. Idempotent.
@@ -120,9 +145,12 @@ impl LoopState {
         self.committed.insert(hash);
     }
 
-    /// Mark hash as excluded. Idempotent.
-    pub(super) fn record_excluded(&mut self, hash: TxHash) {
-        self.excluded.insert(hash);
+    /// Mark hash as excluded with the rejection reason. The first
+    /// exclusion wins — subsequent calls with the same hash keep the
+    /// original reason so re-submissions in the same slot observe the
+    /// wire error that fired on the initial gate.
+    pub(super) fn record_excluded(&mut self, hash: TxHash, reason: PreconfError) {
+        self.excluded.entry(hash).or_insert(reason);
     }
 
     /// Number of committed hashes — used by tests/metrics.
@@ -163,8 +191,24 @@ pub(super) async fn apply_one_preconf<F>(
 ) where
     F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, PreconfError>,
 {
-    if loop_state.contains(&hash) {
-        trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; skipping");
+    // Dedup — short-circuit if we've already made a decision on this
+    // hash in this build. Committed hashes just return silently (the
+    // apply's responder was consumed by `take_responder` earlier);
+    // excluded hashes forward the stored rejection reason to any
+    // newly-attached responder so a same-slot resubmit sees the same
+    // error the first attempt fired, rather than waiting the full
+    // `preconf_timeout` for the RPC-layer deadline to elapse.
+    if loop_state.is_committed(&hash) {
+        trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; already committed");
+        return;
+    }
+    if let Some(reason) = loop_state.excluded_reason(&hash).cloned() {
+        trace!(
+            target: "mantle::preconf::dispatch",
+            ?hash, ?reason,
+            "dedup hit; forwarding prior rejection to any pending responder"
+        );
+        fifo.cancel_responder(&hash, reason).await;
         return;
     }
 
@@ -176,8 +220,18 @@ pub(super) async fn apply_one_preconf<F>(
     if entry.status != PreconfStatus::Waiting {
         // Already terminal — either a prior iteration finished it or
         // the RPC timeout flipped it. Record so the next broadcast
-        // event short-circuits at the dedup gate above.
-        loop_state.record_excluded(hash);
+        // event short-circuits at the dedup gate above; the reason is
+        // derived from the terminal status since we did not run the
+        // gate ourselves.
+        let reason = match entry.status {
+            PreconfStatus::Timeout => PreconfError::Timeout {
+                timeout_ms: cfg.preconf_timeout.as_millis() as u64,
+            },
+            other => PreconfError::Internal(format!(
+                "preconf entry already terminal ({other:?}) at dispatch entry"
+            )),
+        };
+        loop_state.record_excluded(hash, reason);
         return;
     }
 
@@ -190,18 +244,16 @@ pub(super) async fn apply_one_preconf<F>(
     // enforced by the block builder.
     let is_rpc = entry.source == PreconfSource::Rpc;
 
-    // Pre-apply deadline check — see crate-level docs.
-    //
-    // Safety margin is a fixed 40ms — sized to slightly exceed measured
-    // p99 apply latency on the target hardware, so deadline-skip only
-    // fires on genuine race conditions rather than merely slow but
-    // in-budget applies. Hardcoded (rather than scaled off
-    // `preconf_timeout`) because the two knobs serve different purposes:
-    // `preconf_timeout` is the client-facing SLA, whereas the safety
-    // margin tracks builder execution jitter and should stay bounded
-    // even if the SLA widens.
-    const SAFETY_MARGIN: Duration = Duration::from_millis(40);
-    let margin = SAFETY_MARGIN;
+    // Pre-apply deadline check — see crate-level docs. `cfg.safety_margin`
+    // (default 40ms, see `DEFAULT_SAFETY_MARGIN`) is sized to slightly
+    // exceed measured p99 apply latency on the target hardware so the
+    // skip only fires on genuine races rather than merely slow-but-in-
+    // budget applies. Kept separate from `preconf_timeout` (the client-
+    // facing SLA) so hardware tuning does not implicitly widen the client
+    // contract. Setting `cfg.safety_margin = Duration::ZERO` opens the
+    // full race window for tests that need to exercise `rpc.rs`'s
+    // race-resolution branch.
+    let margin = cfg.safety_margin;
 
     // Sample the elapsed-since-insertion for every RPC-sourced dispatch
     // decision (skipped and applied alike). Downstream analysis reads
@@ -225,12 +277,10 @@ pub(super) async fn apply_one_preconf<F>(
         );
         metrics::counter!("preconf.dispatch.deadline_skipped_total").increment(1);
         let _ = fifo.mark_timeout(&hash).await;
-        fifo.cancel_responder(
-            &hash,
-            PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 },
-        )
-        .await;
-        loop_state.record_excluded(hash);
+        let reason =
+            PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
+        fifo.cancel_responder(&hash, reason.clone()).await;
+        loop_state.record_excluded(hash, reason);
         return;
     }
 
@@ -259,16 +309,13 @@ pub(super) async fn apply_one_preconf<F>(
         );
         metrics::counter!("preconf.dispatch.gas_budget_skipped_total").increment(1);
         let _ = fifo.mark_canceled(&hash).await;
-        fifo.cancel_responder(
-            &hash,
-            PreconfError::BlockGasBudgetExceeded {
-                max: cfg.preconf_max_gas_per_block,
-                used: loop_state.preconf_gas_used,
-                limit: tx_gas_limit,
-            },
-        )
-        .await;
-        loop_state.record_excluded(hash);
+        let reason = PreconfError::BlockGasBudgetExceeded {
+            max: cfg.preconf_max_gas_per_block,
+            used: loop_state.preconf_gas_used,
+            limit: tx_gas_limit,
+        };
+        fifo.cancel_responder(&hash, reason.clone()).await;
+        loop_state.record_excluded(hash, reason);
         return;
     }
 
@@ -283,7 +330,10 @@ pub(super) async fn apply_one_preconf<F>(
     let Some(_apply_guard) = fifo.lock_for_apply(&hash).await else {
         // Entry vanished between the gate reads above and this
         // acquisition — very rare (raced with `drop_hash`). Skip.
-        loop_state.record_excluded(hash);
+        loop_state.record_excluded(
+            hash,
+            PreconfError::Internal("preconf entry vanished before apply_lock".into()),
+        );
         return;
     };
 
@@ -299,7 +349,15 @@ pub(super) async fn apply_one_preconf<F>(
                 ?hash, status = ?re_entry.status,
                 "status flipped before we acquired apply_lock; skipping apply"
             );
-            loop_state.record_excluded(hash);
+            let reason = match re_entry.status {
+                PreconfStatus::Timeout => PreconfError::Timeout {
+                    timeout_ms: cfg.preconf_timeout.as_millis() as u64,
+                },
+                other => PreconfError::Internal(format!(
+                    "preconf entry flipped to {other:?} before apply_lock"
+                )),
+            };
+            loop_state.record_excluded(hash, reason);
             return;
         }
     }
@@ -342,7 +400,7 @@ pub(super) async fn apply_one_preconf<F>(
                 "preconf apply failed; marking entry as Failed"
             );
             metrics::counter!("preconf.tx.failure_total").increment(1);
-            loop_state.record_excluded(hash);
+            loop_state.record_excluded(hash, err.clone());
             if let Err(e) = fifo.mark_failed(&hash).await {
                 trace!(
                     target: "mantle::preconf::dispatch",

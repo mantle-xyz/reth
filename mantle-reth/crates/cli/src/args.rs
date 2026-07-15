@@ -163,6 +163,7 @@ impl PreconfArgs {
                 .timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_PRECONF_TIMEOUT),
+            safety_margin: mantle_reth_preconf::DEFAULT_SAFETY_MARGIN,
             sweep_interval: self
                 .sweep_interval_ms
                 .map(Duration::from_millis)

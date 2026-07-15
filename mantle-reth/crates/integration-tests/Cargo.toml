@@ -27,11 +27,17 @@ name = "token_ratio_midblock"
 path = "tests/token_ratio_midblock.rs"
 harness = true
 
+[[test]]
+name = "preconf"
+path = "tests/preconf/mod.rs"
+harness = true
+
 [dependencies]
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }
 mantle-reth-cli = { workspace = true }
 mantle-reth-eth-api = { workspace = true }
+mantle-reth-preconf = { workspace = true }
 mantle-reth-rpc-ext = { workspace = true }
 
 # op-reth
@@ -41,11 +47,13 @@ reth-optimism-rpc = { workspace = true }
 
 # reth
 reth-e2e-test-utils = { workspace = true }
+reth-node-api = { workspace = true }
 reth-node-builder = { workspace = true, features = ["test-utils"] }
 reth-node-core = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true }
 reth-tasks = { workspace = true }
+reth-transaction-pool = { workspace = true }
 reth-rpc-api = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-tracing = { workspace = true }

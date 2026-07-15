@@ -42,6 +42,17 @@ pub const DEFAULT_PRECONF_MAX_GAS_PER_TX: u64 = 2_000_000;
 /// preconf-eligible traffic that would otherwise crowd out non-preconf txs.
 pub const DEFAULT_PRECONF_MAX_GAS_PER_BLOCK: u64 = 6_000_000;
 
+/// Default dispatch-time preemption margin — 40ms.
+///
+/// `apply_one_preconf` aborts a Waiting entry when
+/// `entry.inserted_at.elapsed() + safety_margin >= preconf_timeout`.
+/// Sized to slightly exceed measured p99 apply latency on the target
+/// hardware so the abort only fires on genuine races rather than merely
+/// slow-but-in-budget applies. Kept separate from `preconf_timeout` (the
+/// client-facing SLA) so operator hardware tuning does not silently
+/// widen the client contract.
+pub const DEFAULT_SAFETY_MARGIN: Duration = Duration::from_millis(40);
+
 /// Default journal rotation interval — 60s.
 ///
 /// Matches op-geth `--txpool.rejournal` default.
@@ -92,6 +103,15 @@ pub struct PreconfConfig {
 
     /// Client-side oneshot wait — default 1s (see [`DEFAULT_PRECONF_TIMEOUT`]).
     pub preconf_timeout: Duration,
+
+    /// Dispatch-time preemption margin — see [`DEFAULT_SAFETY_MARGIN`].
+    /// `apply_one_preconf` skips a tx when
+    /// `elapsed_since_insertion + safety_margin >= preconf_timeout`, so
+    /// the receipt never lands after the client has already given up.
+    /// Tune per hardware; kept separate from `preconf_timeout` (the
+    /// client SLA) so operator hardening does not implicitly change the
+    /// client contract.
+    pub safety_margin: Duration,
 
     /// Interval at which the payload builder ticks the pool best-tx
     /// sweep. Each tick admits pool txs up to the time-proportional
@@ -147,6 +167,7 @@ impl Default for PreconfConfig {
             to_preconfs: HashSet::default(),
             all_preconfs: false,
             preconf_timeout: DEFAULT_PRECONF_TIMEOUT,
+            safety_margin: DEFAULT_SAFETY_MARGIN,
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             slot_duration: DEFAULT_SLOT_DURATION,
             preconf_max_gas_per_tx: DEFAULT_PRECONF_MAX_GAS_PER_TX,
