@@ -15,6 +15,15 @@ workspace = true
 # Alloy
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
 alloy-consensus = { workspace = true, features = ["std"] }
+# alloy-eips — `Encodable2718` to serialise a preconf `TxEnvelope` to its
+# canonical bytes for the DA-footprint (H3) size estimate.
+alloy-eips.workspace = true
+
+# op-alloy-flz — `tx_estimated_size_fjord_bytes`, the fastlz-based DA size
+# estimator. Used by the preconf DA-footprint gate so its estimate is
+# byte-identical to the pool path (`OpPooledTransaction::estimated_da_size`),
+# which shares the same block DA budget.
+op-alloy-flz.workspace = true
 
 # revm — for the builder's State / CacheState / TransitionState carry-forward
 # helpers in `builder::state_carry`. Re-exports from reth-revm so we stay

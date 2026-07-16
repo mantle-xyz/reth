@@ -17,6 +17,7 @@ pub mod helpers;
 
 mod canon_cleanup;
 mod chain_id_pair;
+mod da_footprint;
 mod gas_budgets;
 mod happy_path;
 mod no_tx_pool;

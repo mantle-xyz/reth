@@ -265,7 +265,24 @@ macro_rules! launch_preconf_node {
     ($cfg:expr) => {
         $crate::launch_preconf_node!($cfg, $crate::helpers::mantle_test_chain_spec())
     };
-    ($cfg:expr, $chain_spec:expr) => {{
+    ($cfg:expr, $chain_spec:expr) => {
+        $crate::launch_preconf_node!(
+            @build $cfg, $chain_spec,
+            |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
+        )
+    };
+    // Variant that additionally installs an `OpDAConfig` on the node so
+    // tests can exercise the DA-footprint (H3) gate with a tight per-tx /
+    // per-block DA limit. `$da` is any `OpDAConfig` expression.
+    ($cfg:expr, $chain_spec:expr, da_config = $da:expr) => {
+        $crate::launch_preconf_node!(
+            @build $cfg, $chain_spec,
+            |svc| mantle_reth_cli::node::MantleNode::default()
+                .with_preconf(svc)
+                .with_da_config($da)
+        )
+    };
+    (@build $cfg:expr, $chain_spec:expr, $make_node:expr) => {{
         async {
             use $crate::helpers::mantle_payload_attributes;
             use mantle_reth_cli::node::MantleNode;
@@ -304,7 +321,8 @@ macro_rules! launch_preconf_node {
             let svc = PreconfServiceBuilder::from_config($cfg)
                 .await
                 .expect("preconf svc init");
-            let node_type = MantleNode::default().with_preconf(svc);
+            let make_node = $make_node;
+            let node_type = make_node(svc);
 
             let runtime = Runtime::test();
             let node_handle = NodeBuilder::new(config)

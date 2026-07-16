@@ -5203,6 +5203,7 @@ dependencies = [
  "reth-node-core",
  "reth-optimism-chainspec",
  "reth-optimism-node",
+ "reth-optimism-payload-builder",
  "reth-optimism-rpc",
  "reth-provider",
  "reth-rpc-api",
@@ -5219,6 +5220,7 @@ name = "mantle-reth-preconf"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips 2.0.5",
  "alloy-evm",
  "alloy-primitives",
  "alloy-signer",
@@ -5231,6 +5233,7 @@ dependencies = [
  "mantle-reth-rpc-ext",
  "metrics",
  "op-alloy-consensus",
+ "op-alloy-flz",
  "op-revm",
  "reth-basic-payload-builder",
  "reth-chain-state",

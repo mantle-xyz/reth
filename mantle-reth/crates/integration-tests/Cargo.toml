@@ -44,6 +44,8 @@ mantle-reth-rpc-ext = { workspace = true }
 reth-optimism-chainspec = { workspace = true }
 reth-optimism-node = { workspace = true, features = ["test-utils"] }
 reth-optimism-rpc = { workspace = true }
+# OpDAConfig — DA-footprint (H3) integration test injects a tight DA limit.
+reth-optimism-payload-builder = { workspace = true }
 
 # reth
 reth-e2e-test-utils = { workspace = true }

@@ -268,6 +268,28 @@ pub enum PreconfError {
         /// Tx's gas limit that would have pushed `used` past `max`.
         limit: u64,
     },
+    /// The preconf tx's estimated data-availability (DA) footprint would
+    /// push the in-flight block past a configured DA limit (per-tx,
+    /// per-block, or the post-Jovian footprint-gas bound). Rejected
+    /// **before** touching the builder — a preconf tx over the DA budget
+    /// would make the sealed block DA-invalid and get rejected by op-node,
+    /// silently breaking the commitment (design §5.5.1, H3).
+    ///
+    /// Unlike [`Self::BlockGasBudgetExceeded`] (an operator-hardening
+    /// budget bypassed by `Replay`-sourced entries), the DA limit is a
+    /// consensus constraint enforced for **all** sources. The tx stays
+    /// reclaimable — a same-hash resubmit in a later slot (with DA
+    /// headroom) is revived and applied.
+    #[error("preconf tx exceeds DA limit: tx DA {tx_da} bytes, {used} already used, limit {limit}")]
+    DaLimitExceeded {
+        /// DA bytes already committed to the in-flight block.
+        used: u64,
+        /// This tx's estimated DA footprint.
+        tx_da: u64,
+        /// The DA bound that would be exceeded (per-tx / per-block bytes,
+        /// or the post-Jovian footprint-gas bound, whichever fired).
+        limit: u64,
+    },
     /// Another in-flight responder already exists for this hash.
     /// Maps to `AttachError::AlreadyAttached` at the fifo layer.
     #[error("a preconf request is already in progress for this hash")]
@@ -333,6 +355,10 @@ mod tests {
         assert_eq!(
             PreconfError::NotPreconfEligible.to_string(),
             "transaction is not preconf eligible (whitelist miss)",
+        );
+        assert_eq!(
+            PreconfError::DaLimitExceeded { used: 1_000, tx_da: 500, limit: 1_200 }.to_string(),
+            "preconf tx exceeds DA limit: tx DA 500 bytes, 1000 already used, limit 1200",
         );
     }
 

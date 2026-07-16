@@ -92,10 +92,12 @@ impl LoopState {
         }
     }
 
-    /// Cumulative preconf gas committed in this block so far. Used by
-    /// the payload builder to keep `ExecutionInfo::cumulative_gas_used`
-    /// in sync (so pool best-tx `is_tx_over_limits` sees the true block
-    /// gas usage), and by tests to assert budget tracking.
+    /// Cumulative preconf gas committed in this block so far. Test-only
+    /// accessor for budget-tracking assertions — production accounting
+    /// reads the `preconf_gas_used` field directly in the budget gate, and
+    /// the payload builder now folds gas into `ExecutionInfo` inside
+    /// `apply_preconf_with_da` rather than syncing via this getter.
+    #[cfg(test)]
     pub(super) fn preconf_gas_used(&self) -> u64 {
         self.preconf_gas_used
     }
