@@ -67,6 +67,9 @@ alloy-rpc-types-eth = { workspace = true }
 alloy-rpc-types-engine = { workspace = true }
 alloy-network = { workspace = true }
 alloy-op-hardforks = { workspace = true }
+# alloy-signer-local — `PrivateKeySigner` type named by the journal-rotation
+# test's per-sender signing helper (`Wallet::wallet_gen()` element type).
+alloy-signer-local = { workspace = true }
 op-alloy-rpc-types-engine = { workspace = true }
 
 # revm / op-revm (for replay tests)
