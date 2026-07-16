@@ -268,6 +268,7 @@ impl OpNode {
             .with_historical_rpc(self.args.historical_rpc.clone())
             .with_flashblocks(self.args.flashblocks_url.clone())
             .with_flashblock_consensus(self.args.flashblock_consensus)
+            .with_tx_pool_admission(self.args.enable_tx_pool_admission)
     }
 
     /// Instantiates the [`ProviderFactoryBuilder`] for an opstack node.
@@ -825,6 +826,9 @@ pub struct OpAddOnsBuilder<NetworkT, RpcMiddleware = Identity> {
     flashblocks_url: Option<Url>,
     /// Enable flashblock consensus client to drive chain forward.
     flashblock_consensus: bool,
+    /// Add RPC-submitted txs to the local pool even when forwarded to a sequencer. Off by default
+    /// for forwarding nodes; mirrors op-geth's `--rollup.enabletxpooladmission`.
+    enable_tx_pool_admission: bool,
 }
 
 impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
@@ -843,6 +847,7 @@ impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
             tokio_runtime: None,
             flashblocks_url: None,
             flashblock_consensus: false,
+            enable_tx_pool_admission: false,
         }
     }
 }
@@ -920,6 +925,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             _nt,
             flashblocks_url,
             flashblock_consensus,
+            enable_tx_pool_admission,
             ..
         } = self;
         OpAddOnsBuilder {
@@ -936,6 +942,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             tokio_runtime,
             flashblocks_url,
             flashblock_consensus,
+            enable_tx_pool_admission,
         }
     }
 
@@ -948,6 +955,12 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
     /// With a flashblock consensus client to drive chain forward.
     pub const fn with_flashblock_consensus(mut self, flashblock_consensus: bool) -> Self {
         self.flashblock_consensus = flashblock_consensus;
+        self
+    }
+
+    /// Retain RPC-submitted txs in the local pool even when they are forwarded to a sequencer.
+    pub const fn with_tx_pool_admission(mut self, enable_tx_pool_admission: bool) -> Self {
+        self.enable_tx_pool_admission = enable_tx_pool_admission;
         self
     }
 }
@@ -977,6 +990,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             tokio_runtime,
             flashblocks_url,
             flashblock_consensus,
+            enable_tx_pool_admission,
             ..
         } = self;
 
@@ -988,7 +1002,8 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
                     .with_min_suggested_priority_fee(min_suggested_priority_fee)
                     .with_sdm_enabled(sdm_enabled)
                     .with_flashblocks(flashblocks_url)
-                    .with_flashblock_consensus(flashblock_consensus),
+                    .with_flashblock_consensus(flashblock_consensus)
+                    .with_tx_pool_admission(enable_tx_pool_admission),
                 PVB::default(),
                 EB::default(),
                 EVB::default(),

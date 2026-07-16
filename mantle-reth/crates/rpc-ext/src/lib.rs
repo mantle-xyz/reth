@@ -35,7 +35,9 @@ use reth_rpc_eth_api::{
     helpers::{EthBlocks, EthCall, EthFees},
 };
 use reth_rpc_server_types::result::invalid_params_rpc_err;
-use reth_storage_api::{BlockIdReader, BlockReaderIdExt, StateProviderFactory};
+use reth_storage_api::{
+    BlockIdReader, BlockReaderIdExt, StateProviderBox, StateProviderFactory, errors::ProviderResult,
+};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -92,9 +94,18 @@ pub enum PreconfStatus {
 /// preserves the distinction.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PreconfTxReceipt {
-    /// Event logs. `None` ⇒ no EVM apply happened; `Some(vec![])` ⇒
-    /// apply happened but no logs; `Some(vec![...])` ⇒ apply happened
-    /// with logs.
+    /// Event logs, echoed verbatim from the sequencer.
+    ///
+    /// Modeled as `Option` so the sequencer's exact JSON shape round-trips. An op-geth sequencer
+    /// emits `"logs": null` for a reverted tx (Go nil slice) and `"logs": []` / `[..]` otherwise.
+    /// A plain `Vec<PreconfLog>` with `#[serde(default)]` both rejected an explicit `null` on the
+    /// wire (`invalid type: null, expected a sequence`) *and* would re-serialize an empty result
+    /// as `[]`, diverging from geth. `Option<Vec<_>>` deserializes null→None and re-serializes
+    /// None→null, so a forwarding reth node returns byte-identical shape to the geth sequencer.
+    ///
+    /// (Internally the preconf handler also uses this: `None` ⇒ no EVM apply happened —
+    /// Timeout / server pre-apply reject — while `Some(vec![])` ⇒ apply happened but emitted
+    /// no logs.)
     #[serde(default)]
     pub logs: Option<Vec<PreconfLog>>,
 }
@@ -221,6 +232,41 @@ const GETH_MANTLE_RPC_GAS_CAP: u64 = 0x4000000000000;
 /// Caps gas for the L1 cost envelope, matching geth's `CallDefaults` behavior.
 fn capped_gas_for_l1_envelope(request_gas: Option<u64>) -> u64 {
     request_gas.map(|gas| gas.min(GETH_MANTLE_RPC_GAS_CAP)).unwrap_or(GETH_MANTLE_RPC_GAS_CAP)
+}
+
+/// Minimal state-source seam for [`read_token_ratio`].
+///
+/// A blanket impl covers every [`StateProviderFactory`], so production passes the real
+/// provider unchanged; tests implement just this one method to inject provider failures
+/// without standing up a full provider stack.
+trait BlockState {
+    fn state_at(&self, block_id: BlockId) -> ProviderResult<StateProviderBox>;
+}
+
+impl<P: StateProviderFactory> BlockState for P {
+    fn state_at(&self, block_id: BlockId) -> ProviderResult<StateProviderBox> {
+        self.state_by_block_id(block_id)
+    }
+}
+
+/// Reads the Mantle `token_ratio` (`GasPriceOracle` slot 0) from `block_id`'s post-state.
+///
+/// `token_ratio` is not carried in the L1-attributes calldata, so it must be read from
+/// state. It is the last (multiplicative) factor of the Arsia L1 data fee, so a silently
+/// swallowed provider error would leave it at the default `0` and drop the entire L1 data
+/// fee component — a large, silent under-estimate. We therefore propagate provider errors,
+/// and treat a missing slot (`Ok(None)`) as the on-chain zero value (matching geth, which
+/// reads the same slot from the same target-block state).
+fn read_token_ratio<S: BlockState>(source: &S, block_id: BlockId) -> RpcResult<U256> {
+    let state = source.state_at(block_id).map_err(|e| {
+        ErrorObject::owned(-32000, format!("failed to load state for token_ratio: {e}"), None::<()>)
+    })?;
+    Ok(state
+        .storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
+        .map_err(|e| {
+            ErrorObject::owned(-32000, format!("failed to read token_ratio: {e}"), None::<()>)
+        })?
+        .unwrap_or(U256::ZERO))
 }
 
 fn estimate_total_fee_gas_price(
@@ -459,13 +505,12 @@ where
         // Calculate L1 data fee + operator fee from L1BlockInfo
         let (l1_data_fee, operator_fee) = match extract_l1_info(block.body()) {
             Ok(mut l1_block_info) => {
-                // Read token_ratio from GasOracle contract state
-                if let Ok(state) = self.provider().state_by_block_hash(header.parent_hash()) &&
-                    let Ok(Some(ratio)) =
-                        state.storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
-                {
-                    l1_block_info.token_ratio = ratio;
-                }
+                // `token_ratio` (GasPriceOracle slot 0) is not in the L1-attributes calldata;
+                // read it from the target block's post-state (matches geth's
+                // `StateAndHeaderByNumberOrHash`). Propagate provider errors rather than
+                // silently keeping the default 0 — `token_ratio` is the multiplicative factor
+                // of the L1 data fee, so swallowing an error would drop the whole L1 component.
+                l1_block_info.token_ratio = read_token_ratio(self.provider(), block_id)?;
 
                 // Build a proxy envelope matching geth's CallDefaults + ToTransaction:
                 // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with RPCGasCap,
@@ -785,5 +830,143 @@ mod tests {
         }
         // `"canceled"` must NOT deserialize (variant was deleted).
         assert!(serde_json::from_str::<PreconfStatus>(r#""canceled""#).is_err());
+    }
+
+    /// Regression for the cross-client `eth_estimateTotalFee` divergence at Sepolia-QA4
+    /// block 597707 (PR #73). `token_ratio` (`GasPriceOracle` slot 0) changed `3231` ->
+    /// `3224` *inside* that block, so reading it from the parent block (`3231`) instead of
+    /// the target block's post-state (`3224`) inflated the L1 data fee. `token_ratio` is
+    /// the last (multiplicative) factor in the Arsia L1 cost, so the per-client delta is
+    /// exactly the L1 data fee difference between the two ratios — and it must match the
+    /// divergence observed on-chain: reth `0x82759e66553fe` - geth `0x8254fc7e3b730` =
+    /// `2_242_484_739_278`.
+    ///
+    /// This pins the formula's exact linearity in `token_ratio` and the real on-chain
+    /// delta, guarding against any change that reintroduces a stale-ratio L1 cost.
+    #[test]
+    fn l1_cost_token_ratio_597707_divergence() {
+        // Real L1BlockInfo inputs captured at block 597707 (L1Block 0x42..0015):
+        //   slot 1 l1_base_fee       = 0x411e5766
+        //   slot 3 baseFeeScalar     = 169019  (bytes 16..20)
+        //          blobBaseFeeScalar = 4544124 (bytes 20..24)
+        //   slot 7 l1_blob_base_fee  = 0x0344616e
+        let info = |token_ratio: u64| op_revm::L1BlockInfo {
+            l1_base_fee: U256::from(0x411e_5766u64),
+            l1_base_fee_scalar: U256::from(169_019u64),
+            l1_blob_base_fee: Some(U256::from(0x0344_616eu64)),
+            l1_blob_base_fee_scalar: Some(U256::from(4_544_124u64)),
+            token_ratio: U256::from(token_ratio),
+            ..Default::default()
+        };
+
+        // The same proxy envelope `estimate_total_fee` builds for the RM-02d request:
+        // legacy tx (explicit gasPrice 0xba43b7400), gas = GETH_MANTLE_RPC_GAS_CAP,
+        // value 0, empty calldata.
+        let request = TransactionRequest {
+            to: Some(TxKind::Call("0xB287edE875C18e1F468563a77E3b9a12A7e00349".parse().unwrap())),
+            value: Some(U256::ZERO),
+            gas_price: Some(0xba43b7400),
+            ..Default::default()
+        };
+        let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
+        let envelope = build_unsigned_tx_envelope(&request, envelope_gas, 0, 0x3569128);
+
+        let spec_id = op_revm::OpSpecId::ARSIA;
+        // 3231 = parent (pre-update, the bug); 3224 = target post-state (correct, matches geth).
+        let cost_parent = info(3231).calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
+        let cost_target = info(3224).calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
+
+        assert!(cost_parent > cost_target, "a higher token_ratio must yield a higher L1 cost");
+        // Exact linearity in token_ratio: cost(r) = base * r (token_ratio applied last).
+        assert_eq!(
+            cost_parent * U256::from(3224u64),
+            cost_target * U256::from(3231u64),
+            "L1 cost must be exactly linear in token_ratio"
+        );
+        // The reth/geth divergence equals the L1 data fee delta between the two ratios.
+        assert_eq!(
+            cost_parent - cost_target,
+            U256::from(2_242_484_739_278u64),
+            "must reproduce the on-chain 597707 divergence \
+             (reth 0x82759e66553fe - geth 0x8254fc7e3b730)"
+        );
+    }
+
+    // ─── token_ratio state-read error propagation ───────────────────────
+
+    use reth_storage_api::errors::ProviderError;
+
+    /// A [`BlockState`] whose state lookup always fails, so we can assert that
+    /// [`read_token_ratio`] surfaces provider errors instead of silently falling back to
+    /// `token_ratio = 0` (which would drop the entire L1 data fee).
+    struct FailingState;
+
+    impl BlockState for FailingState {
+        fn state_at(&self, _: BlockId) -> ProviderResult<StateProviderBox> {
+            Err(ProviderError::StateForNumberNotFound(0))
+        }
+    }
+
+    #[test]
+    fn read_token_ratio_propagates_state_error() {
+        // Pre-hardening, the read used `if let Ok(state) = state_by_block_id(..)` and silently
+        // left `token_ratio = 0` on error, zeroing the L1 data fee. The hardened helper must
+        // surface the provider error instead.
+        let result = read_token_ratio(&FailingState, BlockId::Number(1u64.into()));
+        assert!(
+            result.is_err(),
+            "a provider error while reading token_ratio must propagate, not silently yield 0"
+        );
+    }
+
+    // ─── preconf event deserialization ──────────────────────────────────
+
+    #[test]
+    fn preconf_receipt_accepts_null_logs() {
+        // The sequencer sends `"logs": null` (not `[]`) for reverted transactions. Before the
+        // `Option<Vec<_>>` change this failed with "invalid type: null, expected a sequence".
+        let json = r#"{
+            "txHash": "0x66199f44ede67884fa62012bde48a4e7823c2ce6a827f4c33e28d001a9c37cf3",
+            "status": "failed",
+            "reason": "execution reverted: ERC20: insufficient balance",
+            "blockHeight": "0xe9be5",
+            "receipt": { "logs": null }
+        }"#;
+        let event: PreconfTxEvent = serde_json::from_str(json).expect("null logs must deserialize");
+        assert_eq!(event.status, PreconfStatus::Failed);
+        assert_eq!(event.receipt.logs, None);
+        // Byte-parity with geth: null must round-trip back to null (not []).
+        let reser = serde_json::to_value(&event).unwrap();
+        assert!(reser["receipt"]["logs"].is_null(), "null logs must re-serialize as null");
+    }
+
+    #[test]
+    fn preconf_receipt_accepts_missing_logs() {
+        let json = r#"{
+            "txHash": "0x66199f44ede67884fa62012bde48a4e7823c2ce6a827f4c33e28d001a9c37cf3",
+            "status": "success",
+            "reason": "",
+            "blockHeight": "0xe9be5",
+            "receipt": {}
+        }"#;
+        let event: PreconfTxEvent = serde_json::from_str(json).expect("missing logs must default");
+        assert_eq!(event.receipt.logs, None);
+    }
+
+    #[test]
+    fn preconf_receipt_roundtrips_empty_and_populated_logs() {
+        // Empty array stays an empty array (a successful, log-less tx), and a populated array is
+        // preserved — reth echoes the sequencer's exact shape in every case.
+        let empty: PreconfTxReceipt = serde_json::from_str(r#"{ "logs": [] }"#).unwrap();
+        assert_eq!(empty.logs, Some(vec![]));
+        assert_eq!(serde_json::to_value(&empty).unwrap()["logs"].to_string(), "[]");
+
+        let json = r#"{ "logs": [{
+            "address": "0x5bec7df4940345b717361664c4847bb3b794eaca",
+            "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
+            "data": "0x000000000000000000000000000000000000000000000000000000000000000a"
+        }] }"#;
+        let populated: PreconfTxReceipt = serde_json::from_str(json).unwrap();
+        assert_eq!(populated.logs.as_ref().map(Vec::len), Some(1));
     }
 }

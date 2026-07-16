@@ -216,7 +216,12 @@ where
                 .map(move |validator| {
                     let op_validator = reth_optimism_txpool::OpTransactionValidator::new(validator)
                         .require_l1_data_gas_fee(!ctx.config().dev.dev);
-                    let mantle_validator = MantleTransactionValidator::new(op_validator);
+                    // Enforce `--rpc.txfeecap` for all RPC-submitted txs (op-geth parity);
+                    // see MantleTransactionValidator docs for why this can't live in the
+                    // inner (upstream) validator. Same config source as `set_tx_fee_cap` above.
+                    let mantle_validator =
+                        MantleTransactionValidator::new(op_validator, ctx.config().rpc.rpc_tx_fee_cap);
+                    // Wrap with the preconf replacement/gas guard.
                     // `.map` takes `FnMut`; clone the Arcs on every call.
                     PreconfAwareValidator::new(
                         mantle_validator,

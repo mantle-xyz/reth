@@ -49,6 +49,26 @@ pub struct RollupArgs {
     #[arg(long = "rollup.enable-tx-conditional", default_value = "false")]
     pub enable_tx_conditional: bool,
 
+    /// MANTLE PATCH: add RPC-submitted transactions to the local txpool even when they are
+    /// forwarded to a configured sequencer (`--rollup.sequencer`).
+    ///
+    /// Off by default for forwarding nodes: such a node does not build blocks, so retaining
+    /// forwarded txs in its local pool produces a mempool view — and a `pending` nonce/state —
+    /// that need not match the sequencer. Mirrors op-geth's `--rollup.enabletxpooladmission`.
+    ///
+    /// When no sequencer is configured this flag has no effect: RPC-submitted transactions always
+    /// enter the local pool (that is how sequencer/non-forwarding nodes work).
+    ///
+    /// Upstream op-reth (now at ethereum-optimism/optimism, `rust/op-reth/`) still retains
+    /// unconditionally; requested upstream in paradigmxyz/reth#15868 / #15893 (closed on repo
+    /// migration, not on merit). Upstream candidate — keep this marker for re-sync.
+    #[arg(
+        long = "rollup.enabletxpooladmission",
+        alias = "rollup.enable-tx-pool-admission",
+        default_value_t = false
+    )]
+    pub enable_tx_pool_admission: bool,
+
     /// Enable experimental SDM support for integration tests.
     ///
     /// SDM is not scheduled for Jovian or Karst; leave this disabled for production networks.
@@ -179,6 +199,7 @@ impl Default for RollupArgs {
             compute_pending_block: false,
             discovery_v4: false,
             enable_tx_conditional: false,
+            enable_tx_pool_admission: false,
             sdm_enabled: false,
             supervisor_http: None,
             supervisor_safety_level: SafetyLevel::CrossUnsafe,

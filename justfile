@@ -114,7 +114,27 @@ clippy:
 # Run all linters (fmt + clippy)
 lint: fmt clippy
 
-# Run workspace unit tests
+# PR-tier tests: every test that runs in well under a minute — workspace unit tests
+# plus ALL Mantle integration suites (offline `replay`/`token_ratio_midblock` and the
+# node-spawning `it` harness, incl. the estimate_total_fee token_ratio regression).
+#
+# Two invocations on purpose: `-p mantle-reth-integration-tests --tests` runs *every*
+# test target of that crate, so newly-added suites are covered automatically without
+# editing a name list — and it is scoped to the Mantle crate, so it does NOT pull in
+# the ~24 upstream op-reth integration tests a bare `--workspace --tests` would.
+# Measured: the second invocation only re-links the Mantle test binaries (~45s, no
+# op-reth/revm/alloy recompile), so the resolver thrash this previously feared does
+# not occur for this lib-then-tests ordering.
+#
+# Doctests run here too, but with DEFAULT features so they reuse the codegen from the
+# `--lib` build above (~30s incremental). The exhaustive `--all-features` doctest pass
+# is a full from-scratch build (~11min) and stays in nightly (`just test-doc`).
+test-ci:
+  cargo test --workspace --lib
+  cargo test -p mantle-reth-integration-tests --tests
+  cargo test --doc --workspace
+
+# Run the full local test suite (examples + benches + all features)
 test:
   cargo test --workspace --lib --examples --tests --benches --all-features
 
@@ -122,8 +142,8 @@ test:
 test-doc:
   cargo test --doc --workspace --all-features
 
-# Full pre-PR check: lint + test
-pr: lint test test-doc
+# Full pre-PR check: lint + CI tests + doc tests (use `just test` for the exhaustive suite)
+pr: lint test-ci test-doc
 
 # ==================== Docker ====================
 

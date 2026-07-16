@@ -52,6 +52,7 @@ reth-e2e-test-utils = { workspace = true }
 reth-node-api = { workspace = true }
 reth-node-builder = { workspace = true, features = ["test-utils"] }
 reth-node-core = { workspace = true }
+reth-payload-primitives = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true }
 reth-tasks = { workspace = true }
@@ -70,6 +71,7 @@ alloy-op-hardforks = { workspace = true }
 # alloy-signer-local — `PrivateKeySigner` type named by the journal-rotation
 # test's per-sender signing helper (`Wallet::wallet_gen()` element type).
 alloy-signer-local = { workspace = true }
+op-alloy-consensus = { workspace = true }
 op-alloy-rpc-types-engine = { workspace = true }
 
 # revm / op-revm (for replay tests)
@@ -80,4 +82,4 @@ op-revm = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["full"] }
 eyre = { workspace = true }
 serde_json = { workspace = true }
-jsonrpsee = { workspace = true, features = ["http-client"] }
+jsonrpsee = { workspace = true, features = ["http-client", "server"] }
