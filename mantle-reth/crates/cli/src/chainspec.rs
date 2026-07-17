@@ -3,11 +3,14 @@ use reth_cli::chainspec::{ChainSpecParser, parse_genesis};
 use reth_optimism_chainspec::OpChainSpec;
 use std::sync::Arc;
 
-const MANTLE_SUPPORTED_CHAINS: &[&str] = &["mantle", "mantle-sepolia"];
+// `mantle` is the canonical mainnet name and stays first so it remains the default.
+// `mantle-mainnet` is a backwards-compatible alias for the pre-elysium chain name.
+const MANTLE_SUPPORTED_CHAINS: &[&str] = &["mantle", "mantle-mainnet", "mantle-sepolia"];
 
 /// Mantle chain specification parser.
 ///
-/// Supports `--chain mantle`, `--chain mantle-sepolia`, and JSON genesis files.
+/// Supports `--chain mantle` (alias `mantle-mainnet`), `--chain mantle-sepolia`, and JSON
+/// genesis files.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct MantleChainSpecParser;
@@ -19,7 +22,7 @@ impl ChainSpecParser for MantleChainSpecParser {
 
     fn parse(s: &str) -> eyre::Result<Arc<Self::ChainSpec>> {
         match s {
-            "mantle" => Ok(MANTLE_MAINNET.clone()),
+            "mantle" | "mantle-mainnet" => Ok(MANTLE_MAINNET.clone()),
             "mantle-sepolia" => Ok(MANTLE_SEPOLIA.clone()),
             _ => {
                 let genesis = parse_genesis(s)?;
@@ -36,6 +39,13 @@ mod tests {
     #[test]
     fn parse_mantle_mainnet() {
         let spec = MantleChainSpecParser::parse("mantle").unwrap();
+        assert_eq!(spec.chain.id(), 5000);
+    }
+
+    #[test]
+    fn parse_mantle_mainnet_alias() {
+        // `mantle-mainnet` is a backwards-compatible alias for `mantle` (pre-elysium name).
+        let spec = MantleChainSpecParser::parse("mantle-mainnet").unwrap();
         assert_eq!(spec.chain.id(), 5000);
     }
 
