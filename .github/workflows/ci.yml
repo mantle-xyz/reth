@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [mantle-elysium, main]
+  push:
+    branches: [mantle-elysium, main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # sccache caches individual rustc compilations across runs — including the cfg(test)
+  # builds and git-dependency crates that Swatinem's target/ cache misses. Today ~250
+  # upstream op-reth/revm/alloy crates recompile on every PR *despite* a Swatinem cache
+  # hit (they rebuild because cargo's per-run fingerprints differ); sccache replays their
+  # cached object output instead. Requires incremental compilation to be off.
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: "sccache"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          components: clippy
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      # Install sccache before any cargo step so RUSTC_WRAPPER resolves.
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: extractions/setup-just@v2
+      - run: just fmt
+      - run: just clippy
+      - run: sccache --show-stats
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Tests compile a lot of code; do not fail the build on warnings here
+    # (warnings are already gated by the clippy job above).
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: extractions/setup-just@v2
+      - run: just test-ci
+      - run: sccache --show-stats

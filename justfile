@@ -1,0 +1,181 @@
+# Mantle op-reth Build System
+
+GIT_SHA := `git rev-parse HEAD`
+GIT_TAG := `git describe --tags --abbrev=0 2>/dev/null || echo "unknown"`
+BIN_DIR := "dist/bin"
+CARGO_TARGET_DIR := env("CARGO_TARGET_DIR", "target")
+
+# Default features: jemalloc + asm-keccak + min-debug-logs (no jemalloc on Windows)
+FEATURES := env("FEATURES", if os() == "windows" { "asm-keccak min-debug-logs" } else { "jemalloc asm-keccak min-debug-logs" })
+
+# Mantle debug features: adds state-export for root mismatch debugging
+MANTLE_DEBUG_FEATURES := env("MANTLE_DEBUG_FEATURES", FEATURES + " state-export")
+
+PROFILE := env("PROFILE", "release")
+
+# Docker image name (override in CI)
+DOCKER_IMAGE_NAME := env("DOCKER_IMAGE_NAME", "ghcr.io/mantle-xyz/op-reth")
+
+# default recipe
+default:
+  @just --list
+
+# ==================== Build ====================
+
+# Build op-reth binary (release)
+build:
+  cargo build -p mantle-reth-cli --bin op-reth --features "{{FEATURES}}" --profile "{{PROFILE}}"
+
+# Alias: backward-compatible with old Makefile `make build-op`
+build-op: build
+
+# Build op-reth binary (debug, with Mantle state-export feature)
+build-debug:
+  cargo build -p mantle-reth-cli --bin op-reth --features "{{MANTLE_DEBUG_FEATURES}}"
+
+# Build op-reth with maximum performance optimisations
+build-maxperf:
+  RUSTFLAGS="-C target-cpu=native" cargo build -p mantle-reth-cli --profile maxperf --features "jemalloc asm-keccak" --bin op-reth
+
+# Build op-reth with profiling symbols
+build-profiling:
+  RUSTFLAGS="-C target-cpu=native" cargo build -p mantle-reth-cli --profile profiling --features "jemalloc asm-keccak" --bin op-reth
+
+# Build and install op-reth to $CARGO_HOME/bin
+install:
+  cargo install --path mantle-reth/crates/cli --bin op-reth --force --locked \
+    --features "{{FEATURES}}" \
+    --profile "{{PROFILE}}"
+
+# ==================== Cross-compilation ====================
+
+# Build op-reth natively for a specific target
+build-native target:
+  cargo build -p mantle-reth-cli --bin op-reth --target {{target}} --features "{{FEATURES}}" --profile "{{PROFILE}}"
+
+# Cross-compile op-reth for a specific target (requires `cross` and Docker)
+build-cross target:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  features="{{FEATURES}}"
+  env_args=()
+  if [[ "{{target}}" == "aarch64-unknown-linux-gnu" ]]; then
+    env_args+=(JEMALLOC_SYS_WITH_LG_PAGE=16)
+  fi
+  if [[ "{{target}}" == "x86_64-pc-windows-gnu" ]]; then
+    features=$(echo "$features" | sed 's/jemalloc-prof//g; s/jemalloc//g' | xargs)
+  fi
+  # Ubuntu 24.04 containers need:
+  # - LIBCLANG_PATH: use system clang-18, not cross's bundled libclang 3.8
+  #   libclang-dev installs libclang-18.so in /usr/lib/x86_64-linux-gnu/
+  # - BINDGEN_EXTRA_CLANG_ARGS: gcc-13 stdarg.h path (clang-18 package misses it)
+  # CROSS_CONTAINER_OPTS injects -e flags into docker run
+  export CROSS_CONTAINER_OPTS="${CROSS_CONTAINER_OPTS:--e LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu -e BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/13/include}"
+  env "${env_args[@]}" \
+    RUSTFLAGS="-C link-arg=-lgcc -Clink-arg=-static-libgcc" \
+    cross build -p mantle-reth-cli --bin op-reth --target {{target}} --features "$features" --profile "{{PROFILE}}"
+
+# Shorthand targets
+build-x86_64-unknown-linux-gnu: (build-cross "x86_64-unknown-linux-gnu")
+build-aarch64-unknown-linux-gnu: (build-cross "aarch64-unknown-linux-gnu")
+build-x86_64-apple-darwin: (build-native "x86_64-apple-darwin")
+build-aarch64-apple-darwin: (build-native "aarch64-apple-darwin")
+
+# Build release tarballs for Linux targets
+build-release-tarballs:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  mkdir -p {{BIN_DIR}}
+  just build-x86_64-unknown-linux-gnu
+  cp {{CARGO_TARGET_DIR}}/x86_64-unknown-linux-gnu/{{PROFILE}}/op-reth {{BIN_DIR}}/op-reth
+  (cd {{BIN_DIR}} && tar -czf op-reth-{{GIT_TAG}}-x86_64-unknown-linux-gnu.tar.gz op-reth && rm op-reth)
+  just build-aarch64-unknown-linux-gnu
+  cp {{CARGO_TARGET_DIR}}/aarch64-unknown-linux-gnu/{{PROFILE}}/op-reth {{BIN_DIR}}/op-reth
+  (cd {{BIN_DIR}} && tar -czf op-reth-{{GIT_TAG}}-aarch64-unknown-linux-gnu.tar.gz op-reth && rm op-reth)
+
+# ==================== Quality ====================
+
+# Type-check all workspace crates
+check:
+  cargo check --workspace
+
+# Format code (requires nightly)
+fmt:
+  cargo +nightly fmt --all
+
+# Run clippy lints (stable, matching upstream)
+clippy:
+  cargo clippy \
+    --workspace \
+    --lib --examples --tests --benches \
+    --all-features \
+    -- -D warnings
+
+# Run all linters (fmt + clippy)
+lint: fmt clippy
+
+# PR-tier tests: every test that runs in well under a minute — workspace unit tests
+# plus ALL Mantle integration suites (offline `replay`/`token_ratio_midblock` and the
+# node-spawning `it` harness, incl. the estimate_total_fee token_ratio regression).
+#
+# Two invocations on purpose: `-p mantle-reth-integration-tests --tests` runs *every*
+# test target of that crate, so newly-added suites are covered automatically without
+# editing a name list — and it is scoped to the Mantle crate, so it does NOT pull in
+# the ~24 upstream op-reth integration tests a bare `--workspace --tests` would.
+# Measured: the second invocation only re-links the Mantle test binaries (~45s, no
+# op-reth/revm/alloy recompile), so the resolver thrash this previously feared does
+# not occur for this lib-then-tests ordering.
+#
+# Doctests run here too, but with DEFAULT features so they reuse the codegen from the
+# `--lib` build above (~30s incremental). The exhaustive `--all-features` doctest pass
+# is a full from-scratch build (~11min) and stays in nightly (`just test-doc`).
+test-ci:
+  cargo test --workspace --lib
+  cargo test -p mantle-reth-integration-tests --tests
+  cargo test --doc --workspace
+
+# Run the full local test suite (examples + benches + all features)
+test:
+  cargo test --workspace --lib --examples --tests --benches --all-features
+
+# Run documentation tests
+test-doc:
+  cargo test --doc --workspace --all-features
+
+# Full pre-PR check: lint + CI tests + doc tests (use `just test` for the exhaustive suite)
+pr: lint test-ci test-doc
+
+# ==================== Docker ====================
+
+# Build and push multi-arch Docker image with given tags
+docker-build-push-tags build_tag push_tag features=FEATURES:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  FEATURES="{{features}}" just build-x86_64-unknown-linux-gnu
+  mkdir -p {{BIN_DIR}}/amd64
+  cp {{CARGO_TARGET_DIR}}/x86_64-unknown-linux-gnu/{{PROFILE}}/op-reth {{BIN_DIR}}/amd64/op-reth
+  FEATURES="{{features}}" just build-aarch64-unknown-linux-gnu
+  mkdir -p {{BIN_DIR}}/arm64
+  cp {{CARGO_TARGET_DIR}}/aarch64-unknown-linux-gnu/{{PROFILE}}/op-reth {{BIN_DIR}}/arm64/op-reth
+  docker buildx build --file ./op-reth/DockerfileOp.cross . \
+    --platform linux/amd64,linux/arm64 \
+    --tag {{DOCKER_IMAGE_NAME}}:{{build_tag}} \
+    --tag {{DOCKER_IMAGE_NAME}}:{{push_tag}} \
+    --provenance=false \
+    --push
+
+# Docker: tag with git tag
+docker-build-push: (docker-build-push-tags GIT_TAG GIT_TAG)
+
+# Docker: tag with git SHA
+docker-build-push-git-sha: (docker-build-push-tags GIT_SHA GIT_SHA)
+
+# Docker: tag with latest
+docker-build-push-latest: (docker-build-push-tags GIT_TAG "latest")
+
+# ==================== Misc ====================
+
+# Clean build artifacts
+clean:
+  cargo clean
+  rm -rf {{BIN_DIR}}

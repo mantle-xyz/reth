@@ -1,18 +1,26 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+# syntax=docker/dockerfile:1
+# Single-stage build of the op-reth binary.
+#
+# The chef layer-cache tool is intentionally NOT used: the elysium workspace has
+# a local [patch] path dependency (patches/reth-trie-common) that chef's cook
+# step cannot resolve from recipe.json alone and panics on. A plain COPY of the
+# whole tree (incl. patches/) and a direct compile avoids that.
+#
+# Keep the literal build-command string out of comments: the mantle-config
+# pipeline injects a JFrog config RUN before any line matching it, so an
+# occurrence in a comment above FROM would produce "no build stage".
+#
+# BuildKit cache mounts persist the cargo registry/git and the target dir across
+# builds on a persistent/remote builder, turning a ~18m cold compile into a fast
+# incremental one. The binary is copied out inside the same RUN because cache
+# mounts are only present for the RUN that declares them.
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS builder
 WORKDIR /app
 
-LABEL org.opencontainers.image.source=https://github.com/paradigmxyz/reth
+LABEL org.opencontainers.image.source=https://github.com/mantle-xyz/reth
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
-
-# Builds a cargo-chef plan
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
 
 ARG BUILD_PROFILE=release
 ENV BUILD_PROFILE=$BUILD_PROFILE
@@ -20,16 +28,15 @@ ENV BUILD_PROFILE=$BUILD_PROFILE
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS="$RUSTFLAGS"
 
-ARG FEATURES=""
+# Mantle op-reth is the `mantle-reth-cli` package (elysium workspace layout).
+ARG FEATURES="jemalloc asm-keccak min-debug-logs"
 ENV FEATURES=$FEATURES
 
-RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json --manifest-path /app/crates/optimism/bin/Cargo.toml
-
 COPY . .
-RUN cargo build --profile $BUILD_PROFILE --features "$FEATURES" --bin op-reth --manifest-path /app/crates/optimism/bin/Cargo.toml
 
-RUN ls -la /app/target/$BUILD_PROFILE/op-reth
-RUN cp /app/target/$BUILD_PROFILE/op-reth /app/op-reth
+# NOTE: this must stay a SINGLE physical line — the pipeline injects a RUN before
+# the line containing the build command, which would split a `\`-continued RUN.
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/app/target cargo build --profile $BUILD_PROFILE --features "$FEATURES" --bin op-reth --manifest-path /app/mantle-reth/crates/cli/Cargo.toml && cp /app/target/$BUILD_PROFILE/op-reth /app/op-reth
 
 FROM ubuntu:24.04 AS runtime
 
@@ -40,7 +47,6 @@ RUN apt-get update && \
 WORKDIR /app
 COPY --from=builder /app/op-reth /usr/local/bin/
 RUN chmod +x /usr/local/bin/op-reth
-COPY LICENSE-* ./
 
 EXPOSE 30303 30303/udp 9001 8545 8546 7545 8551
 ENTRYPOINT ["/usr/local/bin/op-reth"]
