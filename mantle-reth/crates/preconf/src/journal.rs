@@ -17,12 +17,11 @@
 //!
 //! In-memory state tracked alongside the file:
 //!
-//! - **sealed set** — hashes that the canonical-state handler has
-//!   reported as included in a sealed block. Used by the rotation step
-//!   to drop already-on-chain entries from the next file generation,
-//!   and by the pool listener to detect reorg reinjects (a hash in the
-//!   sealed set that reappears via pool re-admission was previously
-//!   promised — see `pool_ext::preconf_pool_listener`).
+//! - **sealed set** — hashes that the canonical-state handler has reported as included in a sealed
+//!   block. Used by the rotation step to drop already-on-chain entries from the next file
+//!   generation, and by the pool listener to detect reorg reinjects (a hash in the sealed set that
+//!   reappears via pool re-admission was previously promised — see
+//!   `pool_ext::preconf_pool_listener`).
 //!
 //! The journal exposes `append_promised` / `load` / `mark_sealed` /
 //! `contains` / `rotate` for the durability path, plus the startup
@@ -34,7 +33,10 @@ use std::{
     future::Future,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -45,9 +47,9 @@ use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, Notify, oneshot},
     task::JoinHandle,
-    time::MissedTickBehavior,
+    time::{Instant, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
 
@@ -115,6 +117,19 @@ pub struct PreconfJournal {
     /// on a sealed block. Updated by the canonical-state handler;
     /// consulted by rotation to skip "already on chain" entries.
     sealed: Mutex<HashSet<TxHash>>,
+    /// On-disk size cap in bytes that arms size-triggered rotation.
+    /// Config validation guarantees a positive value whenever the journal
+    /// is enabled (see [`crate::PreconfConfig`]).
+    max_size: u64,
+    /// Running on-disk byte count. Maintained by `append_promised`
+    /// (`+= line.len()`, under the writer lock) and reset by `rotate`
+    /// to the kept-bytes total. Avoids a `stat` syscall on the hot path.
+    size_bytes: AtomicU64,
+    /// Pinged by `append_promised` when `size_bytes` crosses `max_size`,
+    /// waking [`run_rejournal_loop`] to force a rotation off the hot
+    /// path. `notify_one` coalesces a burst of appends into a single
+    /// pending permit.
+    rotate_notify: Notify,
 }
 
 impl PreconfJournal {
@@ -123,7 +138,14 @@ impl PreconfJournal {
     /// If the file already exists, its contents are left untouched —
     /// recovery callers should invoke [`Self::load`] before starting
     /// to append.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+    ///
+    /// `max_size` is the on-disk size cap that arms size-triggered
+    /// rotation: once the file grows to `max_size` bytes, `append_promised`
+    /// wakes [`run_rejournal_loop`] to rotate off the hot path. The byte
+    /// counter is seeded from the existing file so the cap is enforced
+    /// across restarts against pre-existing survivors. Config validation
+    /// guarantees a positive cap whenever the journal is enabled.
+    pub async fn open(path: impl AsRef<Path>, max_size: u64) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             // Best-effort dir creation; operator may have pre-created.
@@ -132,7 +154,15 @@ impl PreconfJournal {
             }
         }
         let file = OpenOptions::new().create(true).append(true).open(&path).await?;
-        Ok(Self { path, writer: Mutex::new(file), sealed: Mutex::new(HashSet::new()) })
+        let init_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            path,
+            writer: Mutex::new(file),
+            sealed: Mutex::new(HashSet::new()),
+            max_size,
+            size_bytes: AtomicU64::new(init_size),
+            rotate_notify: Notify::new(),
+        })
     }
 
     /// Path the journal is bound to. Stable for the lifetime of the
@@ -150,9 +180,23 @@ impl PreconfJournal {
         // Encode first so a bad serialise does not partially write.
         let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
         line.push(b'\n');
-        let mut writer = self.writer.lock().await;
-        writer.write_all(&line).await?;
-        writer.flush().await?;
+        let len = line.len() as u64;
+        // The size counter is bumped *under the writer lock*, so the
+        // on-disk write and the count stay consistent w.r.t. `rotate`'s
+        // swap+reset (which also holds the writer lock). `notify_one`
+        // is deferred until after the lock is released.
+        let new_size = {
+            let mut writer = self.writer.lock().await;
+            writer.write_all(&line).await?;
+            writer.flush().await?;
+            self.size_bytes.fetch_add(len, Ordering::Relaxed) + len
+        };
+        // Size-triggered rotation: wake the rejournal loop when the file
+        // crosses the cap. The heavy `rotate()` runs off this hot path;
+        // the loop rate-limits repeated triggers (see `run_rejournal_loop`).
+        if new_size >= self.max_size {
+            self.rotate_notify.notify_one();
+        }
         Ok(())
     }
 
@@ -249,6 +293,7 @@ impl PreconfJournal {
 
         let mut kept = 0usize;
         let mut dropped = 0usize;
+        let mut kept_bytes = 0u64;
         let tmp_path = tmp_path_for(&self.path);
 
         {
@@ -262,6 +307,7 @@ impl PreconfJournal {
                 let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
                 line.push(b'\n');
                 tmp.write_all(&line).await?;
+                kept_bytes += line.len() as u64;
                 kept += 1;
             }
             tmp.flush().await?;
@@ -273,6 +319,10 @@ impl PreconfJournal {
         let mut writer = self.writer.lock().await;
         tokio::fs::rename(&tmp_path, &self.path).await?;
         *writer = OpenOptions::new().create(true).append(true).open(&self.path).await?;
+        // Reset the byte counter to the new file's true size while still
+        // holding the writer lock, so it stays consistent with any
+        // `append_promised` that serialises before/after this swap.
+        self.size_bytes.store(kept_bytes, Ordering::Relaxed);
 
         // Sealed entries that just left the file are also redundant
         // in memory now: rotate is the point at which a commitment
@@ -336,8 +386,8 @@ pub trait RestorePool: Send + Sync {
     ///
     /// Returns `Ok(recovered)` in both of the following cases:
     /// - the tx was newly admitted;
-    /// - the pool rejected admission with `AlreadyImported`
-    ///   (e.g. reth's local-tx backup restored the same tx first).
+    /// - the pool rejected admission with `AlreadyImported` (e.g. reth's local-tx backup restored
+    ///   the same tx first).
     ///
     /// In either case the caller needs the recovered envelope + sender
     /// to push into the fifo — whether the pool already had the tx is
@@ -381,15 +431,13 @@ pub struct RestoredEnvelope {
 ///
 /// For each entry, in order:
 ///
-/// 1. Decode + attempt to admit into the pool via
-///    [`RestorePool::add_envelope`]. The trait treats `AlreadyImported`
-///    as success — reth's own local-tx backup may have restored the
-///    same tx from disk before this call, and either outcome yields
-///    the recovered envelope needed for the fifo push.
+/// 1. Decode + attempt to admit into the pool via [`RestorePool::add_envelope`]. The trait treats
+///    `AlreadyImported` as success — reth's own local-tx backup may have restored the same tx from
+///    disk before this call, and either outcome yields the recovered envelope needed for the fifo
+///    push.
 /// 2. Push the recovered envelope into the fifo with
-///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so
-///    the dispatch layer's deadline / gas-budget gates bypass the tx
-///    (SLA: "receipt returned → tx must land").
+///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so the dispatch layer's
+///    deadline / gas-budget gates bypass the tx (SLA: "receipt returned → tx must land").
 ///
 /// Non-recoverable failures (corrupt tx bytes, pool refusal for reasons
 /// other than `AlreadyImported`) are logged and skipped — best-effort
@@ -495,9 +543,17 @@ where
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Consume the immediate-first tick so we don't rotate at t=0.
     ticker.tick().await;
+    // Rate-limit size-triggered rotations so a burst of appends over the
+    // cap (e.g. survivors alone exceed `max_size`) can't spin the
+    // expensive full-file `rotate()` on every append. Capped at the
+    // periodic interval so it never rotates more often than the timer
+    // would anyway. `None` ⇒ never rotated yet ⇒ first trigger is honoured.
+    let min_gap = interval.min(SIZE_ROTATE_MIN_GAP);
+    let mut last_rotate: Option<Instant> = None;
     debug!(
         target: "mantle::preconf::journal",
         ?interval,
+        ?min_gap,
         "preconf journal rotation loop started"
     );
     tokio::pin!(shutdown);
@@ -511,25 +567,20 @@ where
                 debug!(target: "mantle::preconf::journal", "rotation loop shutting down");
                 break output;
             }
-            _ = ticker.tick() => {
-                match journal.rotate().await {
-                    Ok(stats) => {
-                        debug!(
-                            target: "mantle::preconf::journal",
-                            kept = stats.kept,
-                            dropped = stats.dropped,
-                            bad = stats.bad_lines_skipped,
-                            "rotation tick"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "mantle::preconf::journal",
-                            ?e,
-                            "rotation failed; retrying next tick"
-                        );
-                    }
+            // Size-triggered rotation. Honour only if `min_gap` has
+            // elapsed since the last rotate; otherwise drop this wake —
+            // a later append re-notifies (the file is still over the cap)
+            // and the periodic ticker is the safety net.
+            _ = journal.rotate_notify.notified() => {
+                let now = Instant::now();
+                if last_rotate.is_none_or(|t| now.duration_since(t) >= min_gap) {
+                    log_rotate(journal.rotate().await, "size");
+                    last_rotate = Some(now);
                 }
+            }
+            _ = ticker.tick() => {
+                log_rotate(journal.rotate().await, "tick");
+                last_rotate = Some(Instant::now());
             }
         }
     };
@@ -540,26 +591,37 @@ where
     // `T` keep their runtime's shutdown latch open until the final
     // on-disk write completes. Failures are logged; we do not surface
     // them because the process is going away anyway.
-    match journal.rotate().await {
-        Ok(stats) => {
-            debug!(
-                target: "mantle::preconf::journal",
-                kept = stats.kept,
-                dropped = stats.dropped,
-                bad = stats.bad_lines_skipped,
-                "final rotation on shutdown"
-            );
-        }
-        Err(e) => {
-            warn!(
-                target: "mantle::preconf::journal",
-                ?e,
-                "final rotation on shutdown failed"
-            );
-        }
-    }
+    log_rotate(journal.rotate().await, "shutdown");
 
     signal_output
+}
+
+/// Minimum wall-clock gap between two size-triggered rotations, before
+/// being capped at the periodic interval (see [`run_rejournal_loop`]).
+/// Set to the default L2 slot (2s): a burst of size triggers within one
+/// slot collapses to a single rotate, so the expensive full-file rewrite
+/// runs at most once per slot off the hot path.
+const SIZE_ROTATE_MIN_GAP: Duration = Duration::from_secs(2);
+
+/// Log a rotation outcome uniformly across the tick / size / shutdown
+/// trigger sites.
+fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
+    match result {
+        Ok(stats) => debug!(
+            target: "mantle::preconf::journal",
+            reason,
+            kept = stats.kept,
+            dropped = stats.dropped,
+            bad = stats.bad_lines_skipped,
+            "journal rotation"
+        ),
+        Err(e) => warn!(
+            target: "mantle::preconf::journal",
+            reason,
+            ?e,
+            "journal rotation failed"
+        ),
+    }
 }
 
 /// Spawns [`run_rejournal_loop`] on the ambient tokio runtime, driven
@@ -604,7 +666,7 @@ mod tests {
     async fn fresh_journal() -> (TempDir, PreconfJournal) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
-        let j = PreconfJournal::open(&path).await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
         (dir, j)
     }
 
@@ -612,7 +674,7 @@ mod tests {
     async fn open_creates_parent_directory() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nested").join("dir").join("preconf.jsonl");
-        let j = PreconfJournal::open(&path).await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
         assert!(path.exists(), "open must create the file");
         assert_eq!(j.path(), path);
     }
@@ -638,6 +700,9 @@ mod tests {
             path: path.clone(),
             writer: Mutex::new(File::create(dir.path().join("dummy")).await.unwrap()),
             sealed: Mutex::new(HashSet::new()),
+            max_size: 0,
+            size_bytes: AtomicU64::new(0),
+            rotate_notify: Notify::new(),
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());
@@ -653,7 +718,7 @@ mod tests {
         let bad = "{this is not json}";
         let last = serde_json::to_string(&entry(8, 80)).unwrap();
         tokio::fs::write(&path, format!("{good}\n{bad}\n{last}\n")).await.unwrap();
-        let j = PreconfJournal::open(&path).await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
         let (loaded, bad_count) = j.load().await.unwrap();
         assert_eq!(loaded, vec![entry(7, 70), entry(8, 80)]);
         assert_eq!(bad_count, 1);
@@ -666,7 +731,7 @@ mod tests {
         let good = serde_json::to_string(&entry(3, 30)).unwrap();
         // Triple blank lines around the good one.
         tokio::fs::write(&path, format!("\n\n{good}\n\n")).await.unwrap();
-        let j = PreconfJournal::open(&path).await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
         let (loaded, bad) = j.load().await.unwrap();
         assert_eq!(loaded, vec![entry(3, 30)]);
         assert_eq!(bad, 0);
@@ -888,6 +953,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn size_trigger_rotates_dropping_sealed_without_periodic_tick() {
+        // Tiny `max_size` (1 byte) → every append crosses the cap and
+        // pings the rotate notify. A huge interval guarantees the
+        // periodic ticker cannot rotate within the test window, so any
+        // rotation observed is purely size-triggered.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
+        let e1 = entry(1, 10);
+        let e2 = entry(2, 11);
+        let e3 = entry(3, 12);
+        j.append_promised(&e1).await.unwrap();
+        j.append_promised(&e2).await.unwrap();
+        j.append_promised(&e3).await.unwrap();
+        j.mark_sealed(e1.hash).await;
+        j.mark_sealed(e2.hash).await;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
+
+        // Let the loop consume the pending size-notify and rotate.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (after, _) = j.load().await.unwrap();
+        assert_eq!(
+            after,
+            vec![e3],
+            "size-triggered rotation must drop sealed entries and keep the unsealed survivor"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("loop did not shut down")
+            .expect("loop panicked");
+    }
+
+    #[tokio::test]
+    async fn open_with_max_size_seeds_counter_from_existing_file() {
+        // A pre-existing (unsealed) entry already exceeding the cap must
+        // be counted at open, so the very first post-restart append trips
+        // the size trigger even though on its own it is tiny.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        {
+            let seed = PreconfJournal::open(&path, 0).await.unwrap();
+            seed.append_promised(&entry(1, 10)).await.unwrap();
+        }
+        let existing = tokio::fs::metadata(&path).await.unwrap().len();
+        assert!(existing > 0);
+        // Reopen with a cap just at the existing size; counter seeded so a
+        // notify is armed on the next append.
+        let j = PreconfJournal::open(&path, existing).await.unwrap();
+        j.append_promised(&entry(2, 11)).await.unwrap();
+        // A permit should be pending (size now > cap) — consume it without blocking.
+        tokio::time::timeout(Duration::from_millis(50), j.rotate_notify.notified())
+            .await
+            .expect("size trigger must be armed after reopen seeding");
+    }
+
+    #[tokio::test]
     async fn rejournal_loop_shuts_down_promptly_without_rotating() {
         let (_dir, j) = fresh_journal().await;
         let j = Arc::new(j);
@@ -957,5 +1083,204 @@ mod tests {
         let shutdown = async { Sentinel(7) };
         let out = run_rejournal_loop(j.clone(), Duration::from_secs(60), shutdown).await;
         assert_eq!(out, Sentinel(7));
+    }
+
+    // ── size-trigger rate limit / byte-counter invariants ──────────
+
+    #[tokio::test]
+    async fn size_trigger_second_rotation_rate_limited_within_min_gap() {
+        // Two size triggers fired within `SIZE_ROTATE_MIN_GAP` (2s) must
+        // collapse to a single rotation: the first is honoured, the second
+        // dropped. A huge interval keeps the periodic ticker from firing
+        // inside the sub-second window, so any rotation is purely
+        // size-triggered; `max_size = 1` makes every append trip the cap.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
+        let e1 = entry(1, 10);
+        let e2 = entry(2, 11);
+        let e3 = entry(3, 12);
+        j.append_promised(&e1).await.unwrap();
+        j.append_promised(&e2).await.unwrap();
+        j.append_promised(&e3).await.unwrap();
+        j.mark_sealed(e1.hash).await;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
+
+        // First (coalesced) size trigger is honoured → sealed e1 dropped.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (after_first, _) = j.load().await.unwrap();
+        assert_eq!(after_first, vec![e2.clone(), e3], "first size trigger drops sealed e1");
+
+        // Seal e2 and fire a *second* trigger well within `min_gap`
+        // (~150ms elapsed ≪ 2s). It must be rate-limited — e2 stays on disk.
+        j.mark_sealed(e2.hash).await;
+        j.append_promised(&entry(4, 13)).await.unwrap(); // re-notifies (over cap)
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (after_second, _) = j.load().await.unwrap();
+        assert!(
+            after_second.iter().any(|e| e.hash == e2.hash),
+            "second trigger within min_gap must be dropped; e2 must survive, got {after_second:?}"
+        );
+
+        // (The final rotate on shutdown WILL drop e2 — expected, not asserted.)
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("loop did not shut down")
+            .expect("loop panicked");
+    }
+
+    #[tokio::test]
+    async fn rotate_does_not_self_retrigger_when_survivors_exceed_cap() {
+        // A size-triggered `rotate()` whose survivors still exceed
+        // `max_size` must NOT keep the loop rotating on its own: the size
+        // trigger fires only from `append_promised`, never from `rotate`.
+        // Guards against a future change that re-notifies inside `rotate`
+        // (which would spin the full-file rewrite on every wake while the
+        // file stays over the cap).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // `max_size = 1` ⇒ even the lone survivor exceeds the cap.
+        let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
+        let e1 = entry(1, 10);
+        let e2 = entry(2, 11);
+        j.append_promised(&e1).await.unwrap();
+        j.append_promised(&e2).await.unwrap();
+        j.mark_sealed(e1.hash).await;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
+
+        // First append-driven trigger drops e1; survivor e2 alone still
+        // exceeds `max_size = 1`.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (after_first, _) = j.load().await.unwrap();
+        assert_eq!(after_first, vec![e2.clone()], "first rotate drops sealed e1, keeps e2");
+
+        // Seal e2 but issue NO further append. Wait past `min_gap` (2s) so a
+        // self-retrigger, if it existed, would be free to fire.
+        j.mark_sealed(e2.hash).await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+
+        let (after_wait, _) = j.load().await.unwrap();
+        assert_eq!(
+            after_wait,
+            vec![e2.clone()],
+            "no append ⇒ no size trigger; sealed e2 must survive over the cap, got {after_wait:?}"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("loop did not shut down")
+            .expect("loop panicked");
+    }
+
+    #[tokio::test]
+    async fn rotate_resets_size_counter_to_true_on_disk_size() {
+        // Approach-A invariant: `size_bytes` tracks the real on-disk size
+        // without a stat syscall on the hot path. It must stay equal to the
+        // file's true length across both `append_promised` (+= line) and
+        // `rotate` (reset to kept-bytes). Drift here silently breaks the
+        // size trigger (it would fire late, or never).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // `max_size` is irrelevant to the counter mechanics; 0 keeps the
+        // trigger out of the way.
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
+
+        let e1 = entry(1, 10);
+        let e2 = entry(2, 11);
+        let e3 = entry(3, 12);
+        j.append_promised(&e1).await.unwrap();
+        j.append_promised(&e2).await.unwrap();
+        j.append_promised(&e3).await.unwrap();
+
+        // After appends: counter == on-disk size.
+        let on_disk = tokio::fs::metadata(&path).await.unwrap().len();
+        assert_eq!(
+            j.size_bytes.load(Ordering::Relaxed),
+            on_disk,
+            "counter must equal file size after appends"
+        );
+
+        // Drop two sealed entries; the counter must reset to the kept-bytes
+        // total, which equals the rewritten file's true size.
+        j.mark_sealed(e1.hash).await;
+        j.mark_sealed(e3.hash).await;
+        let stats = j.rotate().await.unwrap();
+        assert_eq!((stats.kept, stats.dropped), (1, 2));
+
+        let on_disk_after = tokio::fs::metadata(&path).await.unwrap().len();
+        assert_eq!(
+            j.size_bytes.load(Ordering::Relaxed),
+            on_disk_after,
+            "counter must reset to kept-bytes = true file size after rotate"
+        );
+        assert!(on_disk_after > 0, "the surviving entry keeps the file non-empty");
+        let (after, _) = j.load().await.unwrap();
+        assert_eq!(after, vec![e2]);
+    }
+
+    #[tokio::test]
+    async fn rotate_drops_corrupt_lines_and_reports_count() {
+        // `rotate()` rewrites the file via `load()`, which skips corrupt
+        // lines. The corrupt line must NOT be carried into the new
+        // generation, and its count must surface as `bad_lines_skipped`.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let good_a = serde_json::to_string(&entry(7, 70)).unwrap();
+        let bad = "{not valid json}";
+        let good_b = serde_json::to_string(&entry(8, 80)).unwrap();
+        tokio::fs::write(&path, format!("{good_a}\n{bad}\n{good_b}\n")).await.unwrap();
+
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
+        let stats = j.rotate().await.unwrap();
+        assert_eq!(stats.kept, 2, "both good entries survive");
+        assert_eq!(stats.dropped, 0, "nothing sealed → nothing dropped");
+        assert_eq!(stats.bad_lines_skipped, 1, "one corrupt line reported");
+
+        // The corrupt line is gone from the rewritten file: a second load
+        // sees the two good entries and zero bad lines.
+        let (after, bad_after) = j.load().await.unwrap();
+        assert_eq!(after, vec![entry(7, 70), entry(8, 80)]);
+        assert_eq!(bad_after, 0, "corrupt line must not be carried into the new file");
+    }
+
+    #[tokio::test]
+    async fn size_trigger_fires_at_exact_boundary_not_below() {
+        // The trigger condition is `new_size >= max_size` (inclusive). Pin
+        // the boundary: an append landing the file *exactly* at `max_size`
+        // arms the notify; one byte short does not.
+        let line_len = {
+            let mut v = serde_json::to_vec(&entry(1, 10)).unwrap();
+            v.push(b'\n');
+            v.len() as u64
+        };
+
+        // Exactly at the cap ⇒ armed.
+        {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("preconf.jsonl");
+            let j = PreconfJournal::open(&path, line_len).await.unwrap();
+            j.append_promised(&entry(1, 10)).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(50), j.rotate_notify.notified())
+                .await
+                .expect("append landing exactly at max_size must arm the size trigger");
+        }
+
+        // One byte above the cap ⇒ NOT armed (a single line stays under).
+        {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("preconf.jsonl");
+            let j = PreconfJournal::open(&path, line_len + 1).await.unwrap();
+            j.append_promised(&entry(1, 10)).await.unwrap();
+            let armed = tokio::time::timeout(Duration::from_millis(50), j.rotate_notify.notified())
+                .await
+                .is_ok();
+            assert!(!armed, "a file one byte under the cap must NOT arm the size trigger");
+        }
     }
 }

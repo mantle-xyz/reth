@@ -121,7 +121,7 @@ impl PreconfServiceBuilder {
     /// opened in append mode; existing contents are preserved and
     /// replayed into the fifo when [`Self::start`] runs.
     pub async fn with_journal(mut self, path: impl AsRef<Path>) -> Result<Self, JournalError> {
-        let journal = PreconfJournal::open(path).await?;
+        let journal = PreconfJournal::open(path, self.cfg.journal_max_size).await?;
         self.journal = Some(Arc::new(journal));
         Ok(self)
     }

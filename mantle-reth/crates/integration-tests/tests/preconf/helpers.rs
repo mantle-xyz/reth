@@ -131,6 +131,7 @@ pub struct PreconfCfgBuilder {
     max_gas_per_tx: u64,
     max_gas_per_block: u64,
     journal_path: Option<PathBuf>,
+    journal_max_size: u64,
 }
 
 impl Default for PreconfCfgBuilder {
@@ -144,6 +145,7 @@ impl Default for PreconfCfgBuilder {
             max_gas_per_tx: 2_000_000,
             max_gas_per_block: 6_000_000,
             journal_path: None,
+            journal_max_size: PreconfConfig::default().journal_max_size,
         }
     }
 }
@@ -207,6 +209,12 @@ impl PreconfCfgBuilder {
         self
     }
 
+    /// Journal file size ceiling in bytes. 
+    pub fn journal_max_size(mut self, max: u64) -> Self {
+        self.journal_max_size = max;
+        self
+    }
+
     /// Materialise the config. Panics on invariant violations because
     /// these are test-controlled inputs — a panic is more useful than
     /// threading a `Result` through every launch call site.
@@ -221,6 +229,7 @@ impl PreconfCfgBuilder {
             preconf_max_gas_per_tx: self.max_gas_per_tx,
             preconf_max_gas_per_block: self.max_gas_per_block,
             journal_path: self.journal_path,
+            journal_max_size: self.journal_max_size,
             ..PreconfConfig::default()
         }
     }

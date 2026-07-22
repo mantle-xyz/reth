@@ -21,6 +21,7 @@ mod da_footprint;
 mod gas_budgets;
 mod happy_path;
 mod journal_rotation;
+mod journal_size_rotation;
 mod journal_write;
 mod no_tx_pool;
 mod predeploy_genesis;

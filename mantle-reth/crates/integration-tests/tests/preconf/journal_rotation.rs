@@ -10,9 +10,10 @@
 //! Rotation here is driven by calling `PreconfJournal::rotate()` directly
 //! (the same call the background `run_rejournal_loop` makes on its
 //! interval) so the test is deterministic — no dependency on the 60s
-//! loop cadence. Size-triggered rotation is intentionally not exercised:
-//! `journal_max_size` is validated but does not currently drive a
-//! force-rotate in `append_promised` (design §5.9.2 vs implementation).
+//! loop cadence. Size-triggered rotation is exercised separately, end-to-end
+//! through a running node, in `journal_size_rotation.rs`; this module stays
+//! focused on the disk-layer `rotate()` semantics + the restore-replay
+//! property.
 //!
 //! Coverage:
 //! - `rotate_drops_sealed_then_relaunch_replays_only_survivors` — three
@@ -102,7 +103,7 @@ async fn rotate_drops_sealed_then_relaunch_replays_only_survivors() {
 
     // ── Phase 1: build + seal + rotate the journal directly ────────────
     {
-        let journal = PreconfJournal::open(&journal_file).await.expect("open journal");
+        let journal = PreconfJournal::open(&journal_file, 0).await.expect("open journal");
         journal.append_promised(&journal_entry(&tx_a)).await.expect("append A");
         journal.append_promised(&journal_entry(&tx_b)).await.expect("append B");
         journal.append_promised(&journal_entry(&tx_c)).await.expect("append C");
