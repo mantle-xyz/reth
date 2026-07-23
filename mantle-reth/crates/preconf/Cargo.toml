@@ -1,0 +1,144 @@
+[package]
+name = "mantle-reth-preconf"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Mantle preconfirmation core types for op-reth"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Alloy
+alloy-primitives = { workspace = true, features = ["std", "serde"] }
+alloy-consensus = { workspace = true, features = ["std"] }
+# alloy-sol-types — decode a revert's `Error(string)` payload so the preconf
+# `reason` matches op-geth's `abi.UnpackRevert` ("execution reverted: <msg>").
+alloy-sol-types.workspace = true
+# alloy-eips — `Encodable2718` to serialise a preconf `TxEnvelope` to its
+# canonical bytes for the DA-footprint (H3) size estimate.
+alloy-eips.workspace = true
+
+# op-alloy-flz — `tx_estimated_size_fjord_bytes`, the fastlz-based DA size
+# estimator. Used by the preconf DA-footprint gate so its estimate is
+# byte-identical to the pool path (`OpPooledTransaction::estimated_da_size`),
+# which shares the same block DA budget.
+op-alloy-flz.workspace = true
+
+# revm — for the builder's State / CacheState / TransitionState carry-forward
+# helpers in `builder::state_carry`. Re-exports from reth-revm so we stay
+# version-aligned with the rest of the reth payload-building stack.
+reth-revm = { workspace = true, features = ["std"] }
+
+# reth-evm — for the BlockBuilder / ExecutorTx traits used by apply_preconf_tx
+reth-evm.workspace = true
+
+# alloy-evm — for the TxResult trait + ExecutionResult re-exports
+alloy-evm.workspace = true
+
+# reth-transaction-pool — for the TransactionValidator trait wrapped by
+# `PreconfAwareValidator` and the TransactionPool trait consumed by
+# `PreconfPoolListener`
+reth-transaction-pool.workspace = true
+
+# futures — `StreamExt::next` used to drive
+# `TransactionPool::new_pending_pool_transactions_listener` (returns a
+# Stream rather than an mpsc::Receiver)
+futures.workspace = true
+
+# reth-optimism-txpool — for `OpPooledTx` trait bound on the wrapped tx type
+reth-optimism-txpool.workspace = true
+
+# reth-primitives-traits — for SealedBlock used in `on_new_head_block`
+reth-primitives-traits.workspace = true
+
+# OP-stack consensus types — listener bridges `OpTxEnvelope` to alloy
+# `TxEnvelope` and drops Deposit / PostExec variants
+op-alloy-consensus.workspace = true
+
+# reth storage — RPC handler reads on-chain account nonce via
+# `StateProviderFactory::latest()` + `StateProvider::account_nonce` to compute
+# the pending nonce floor for the nonce-gap pre-check.
+reth-storage-api.workspace = true
+
+# reth-chain-state — `CanonStateSubscriptions` + `CanonStateNotification`
+# stream consumed by the canonical-state handler.
+reth-chain-state.workspace = true
+
+# reth-execution-types — `Chain` type referenced by the canon handler's
+# reorg observation helper.
+reth-execution-types.workspace = true
+
+# reth payload traits — `PayloadJob` + `PayloadJobGenerator` impls for the
+# preconf payload-builder skeleton.
+reth-payload-builder.workspace = true
+reth-payload-builder-primitives.workspace = true
+reth-payload-primitives.workspace = true
+
+# P5f fork dependencies — mantle's preconf payload builder is a fork of
+# `OpPayloadBuilder` (see `docs/design/preconf-dev-plan.md` §P5f).
+# We import upstream's `OpPayloadBuilderCtx` / `ExecutionInfo` /
+# `OpBuiltPayload` / `OpPayloadBuilderAttributes` directly, only the
+# build-loop body is forked.
+reth-optimism-payload-builder.workspace = true
+reth-optimism-evm.workspace = true
+reth-optimism-node.workspace = true
+reth-optimism-primitives.workspace = true
+reth-optimism-forks.workspace = true
+reth-basic-payload-builder.workspace = true
+reth-chainspec.workspace = true
+reth-payload-util.workspace = true
+op-revm.workspace = true
+either.workspace = true
+
+# Step 7b: payload-service builder integration — implements reth's
+# `PayloadServiceBuilder` trait so the mantle cli can swap our
+# preconf-aware service in for the default `BasicPayloadServiceBuilder`.
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+eyre.workspace = true
+
+# Journal serialisation — one JSON Lines record per appended commitment.
+serde_json = { workspace = true, features = ["std"] }
+
+# reth rpc / jsonrpsee — RPC handler returns `RpcResult<PreconfTxEvent>`.
+mantle-reth-rpc-ext.workspace = true
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+async-trait.workspace = true
+
+# raw-tx decoding helper used by the RPC handler
+reth-rpc-eth-types.workspace = true
+
+# Async runtime + sync primitives + async fs for the journal
+tokio = { workspace = true, features = ["sync", "macros", "time", "fs", "io-util", "rt"] }
+
+# Error handling
+thiserror.workspace = true
+
+# Tracing
+tracing.workspace = true
+
+# Metrics — histogram / counter facade for observing preconf pipeline
+# latencies (apply duration, elapsed-at-gate) and terminal-state
+# transitions (deadline skip, gas-budget skip, applied, apply failed,
+# RPC-level timeout). Consumed by the same `metrics` collector reth
+# core uses; the underlying exporter is wired up by mantle-reth-cli.
+metrics.workspace = true
+
+# Serde
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "test-util", "fs"] }
+tempfile.workspace = true
+
+# P6 e2e harness — in-process EVM tests for build_payload (see
+# `docs/design/preconf-dev-plan.md` §P6).
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-optimism-chainspec.workspace = true
+reth-optimism-primitives.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
