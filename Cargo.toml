@@ -112,6 +112,16 @@ lto = "thin"
 # ==================== WORKSPACE DEPENDENCIES ====================
 [workspace.dependencies]
 
+# Transitive deps pulled in by the vendored `patches/reth-provider` (versions match
+# paradigmxyz/reth rev 88505c7). Remove once the hashed-snapshot exec-read fix lands upstream
+# and the [patch] entry for reth-provider is dropped.
+reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-node-types = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", default-features = false }
+reth-testing-utils = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+notify = { version = "8.0.0", default-features = false, features = ["macos_fsevent"] }
+rocksdb = { version = "0.24" }
+
 # Transitive deps pulled in by the vendored `patches/reth-transaction-pool` (versions match
 # paradigmxyz/reth rev 88505c7). Remove once the extra_balance_cost hook lands upstream and the
 # patch is dropped.
@@ -413,6 +423,7 @@ url = "2.5"
 reth-trie-common = { path = "patches/reth-trie-common" }
 # reth-rpc = { path = "patches/reth-rpc" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
+reth-provider = { path = "patches/reth-provider" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,

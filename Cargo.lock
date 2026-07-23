@@ -1391,6 +1391,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4858a9d740c5007a9069007c3b4e91152d0506f13c1b31dd49051fd537656156"
 
 [[package]]
+name = "assert_matches"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
+
+[[package]]
 name = "async-compression"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3551,8 +3557,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -4062,7 +4068,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4426,6 +4432,15 @@ name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -9357,18 +9372,19 @@ dependencies = [
 [[package]]
 name = "reth-provider"
 version = "2.2.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=88505c7fcbfdebfd3b56d88c86b62e950043c6c4#88505c7fcbfdebfd3b56d88c86b62e950043c6c4"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-engine",
+ "assert_matches",
  "eyre",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "metrics",
  "notify",
  "parking_lot",
+ "rand 0.9.4",
  "rayon",
  "reth-chain-state",
  "reth-chainspec",
@@ -9390,12 +9406,16 @@ dependencies = [
  "reth-storage-api",
  "reth-storage-errors",
  "reth-tasks",
+ "reth-testing-utils",
+ "reth-tracing",
  "reth-trie",
  "reth-trie-db",
  "revm-database",
+ "revm-database-interface",
  "revm-state",
  "rocksdb",
  "strum",
+ "tempfile",
  "tokio",
  "tracing",
 ]
