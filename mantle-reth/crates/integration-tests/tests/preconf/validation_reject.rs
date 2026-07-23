@@ -11,13 +11,12 @@
 //!
 //! ### Preconf-specific rejections
 //!
-//! - **Whitelist gate** (`is_preconf_tx`, `rpc.rs`) — rejects
-//!   non-whitelisted `(sender, to)` before `attach_responder`.
-//! - **Nonce-gap gate** (`rpc.rs`) — rejects `tx.nonce > pending_nonce`
-//!   before `attach_responder` and before `pool.add_transaction`.
-//! - **Preconf per-tx gas ceiling** (`PreconfAwareValidator`, pool layer)
-//!   — rejects `tx.gas_limit > preconf_max_gas_per_tx` at pool admission
-//!   with a typed `PreconfGasLimitExceeded`.
+//! - **Whitelist gate** (`is_preconf_tx`, `rpc.rs`) — rejects non-whitelisted `(sender, to)` before
+//!   `attach_responder`.
+//! - **Nonce-gap gate** (`rpc.rs`) — rejects `tx.nonce > pending_nonce` before `attach_responder`
+//!   and before `pool.add_transaction`.
+//! - **Preconf per-tx gas ceiling** (`PreconfAwareValidator`, pool layer) — rejects `tx.gas_limit >
+//!   preconf_max_gas_per_tx` at pool admission with a typed `PreconfGasLimitExceeded`.
 //!
 //! ### Generic pool-validator rejections
 //!
@@ -36,17 +35,16 @@
 //!
 //! Notes on adjacent coverage:
 //!
-//! - `nonce_too_low` (stale nonce, `tx.nonce < on_chain_nonce`) requires a
-//!   two-slot setup (commit + canon first). Skipped in Phase 1 — the same
-//!   `PoolRejected` wire wrapping applies; message contains "nonce too low".
-//! - `replacement_underpriced` requires parking a first tx in pool then
-//!   submitting a replacement with lower fees. Skipped in Phase 1 for the
-//!   same reason.
+//! - `nonce_too_low` (stale nonce, `tx.nonce < on_chain_nonce`) requires a two-slot setup (commit +
+//!   canon first). Skipped in Phase 1 — the same `PoolRejected` wire wrapping applies; message
+//!   contains "nonce too low".
+//! - `replacement_underpriced` requires parking a first tx in pool then submitting a replacement
+//!   with lower fees. Skipped in Phase 1 for the same reason.
 //! - `base_fee` sub-pool routing is covered by
-//!   `timeout::basefee_orphan_returns_timeout_and_clears_responder`
-//!   (handles both the "pool sync reject" and "orphan → Timeout" branches).
+//!   `timeout::basefee_orphan_returns_timeout_and_clears_responder` (handles both the "pool sync
+//!   reject" and "orphan → Timeout" branches).
 
-use super::helpers::{send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
@@ -84,18 +82,16 @@ async fn non_whitelisted_returns_not_eligible() {
     // Placeholder whitelist satisfies `enabled=true` validation while
     // guaranteeing every `send_preconf` from `wallet_0` misses the gate.
     let placeholder = Address::from([0xFE; 20]);
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(placeholder)
-        .whitelist_to(placeholder)
-        .build();
+    let cfg =
+        PreconfCfgBuilder::new().whitelist_from(placeholder).whitelist_to(placeholder).build();
 
     let (_node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
     let raw_tx = signed_transfer(chain_id, &wallet, 0, 21_000).await;
     let start = std::time::Instant::now();
-    let err = send_preconf(&http, raw_tx).await.expect_err(
-        "empty whitelist + all_preconfs=false must reject with NotPreconfEligible",
-    );
+    let err = send_preconf(&http, raw_tx)
+        .await
+        .expect_err("empty whitelist + all_preconfs=false must reject with NotPreconfEligible");
     let elapsed = start.elapsed();
 
     match err {
@@ -146,9 +142,9 @@ async fn nonce_gap_rejected_synchronously() {
     // nonce=5 with on-chain nonce=0 and no prior pool state.
     let raw_tx = signed_transfer(chain_id, &wallet, 5, 21_000).await;
     let start = std::time::Instant::now();
-    let err = send_preconf(&http, raw_tx).await.expect_err(
-        "nonce gap must surface as an Err, not a Timeout / Success event",
-    );
+    let err = send_preconf(&http, raw_tx)
+        .await
+        .expect_err("nonce gap must surface as an Err, not a Timeout / Success event");
     let elapsed = start.elapsed();
 
     match err {
@@ -159,11 +155,7 @@ async fn nonce_gap_rejected_synchronously() {
             // pool-layer `NonceTooLow` / `nonce mismatch` errors, hiding
             // a regression where rpc.rs's synchronous nonce-gap gate is
             // bypassed and the tx reaches the pool.
-            assert!(
-                msg.contains("nonce gap"),
-                "unexpected error message: {}",
-                e.message(),
-            );
+            assert!(msg.contains("nonce gap"), "unexpected error message: {}", e.message(),);
             assert!(
                 e.message().contains('5'),
                 "message must mention the offending tx nonce (5); got {}",
@@ -273,8 +265,8 @@ async fn signed_transfer_with_value(
 ///
 /// Wire contract pinned:
 ///  - top-level wrapping: `pool rejected: ...` (from `PreconfError::PoolRejected`)
-///  - inner substring: something like `intrinsic gas` / `gas limit too low`
-///    (reth's pool error text; loose match to survive minor wording drift)
+///  - inner substring: something like `intrinsic gas` / `gas limit too low` (reth's pool error
+///    text; loose match to survive minor wording drift)
 ///  - fast-fail: no responder is parked, elapsed < 500ms
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn intrinsic_gas_too_low_pool_rejects() {
@@ -297,9 +289,9 @@ async fn intrinsic_gas_too_low_pool_rejects() {
     // rejects at admission with an `IntrinsicGasTooLow`-flavoured error.
     let raw_tx = signed_transfer(chain_id, &wallet, 0, 20_000).await;
     let start = std::time::Instant::now();
-    let err = send_preconf(&http, raw_tx).await.expect_err(
-        "sub-intrinsic-gas tx must be rejected by the pool validator",
-    );
+    let err = send_preconf(&http, raw_tx)
+        .await
+        .expect_err("sub-intrinsic-gas tx must be rejected by the pool validator");
     let elapsed = start.elapsed();
 
     match err {
@@ -311,10 +303,10 @@ async fn intrinsic_gas_too_low_pool_rejects() {
                 e.message(),
             );
             assert!(
-                msg.contains("intrinsic gas")
-                    || msg.contains("gas limit too low")
-                    || msg.contains("intrinsic")
-                    || msg.contains("gas too low"),
+                msg.contains("intrinsic gas") ||
+                    msg.contains("gas limit too low") ||
+                    msg.contains("intrinsic") ||
+                    msg.contains("gas too low"),
                 "expected inner substring naming intrinsic-gas rejection; got {}",
                 e.message(),
             );
@@ -353,9 +345,9 @@ async fn insufficient_funds_pool_rejects() {
     // Pool's account-state check fires before any preconf-specific gate.
     let raw_tx = signed_transfer_with_value(chain_id, &wallet, 0, U256::MAX).await;
     let start = std::time::Instant::now();
-    let err = send_preconf(&http, raw_tx).await.expect_err(
-        "over-balance tx must be rejected by the pool validator",
-    );
+    let err = send_preconf(&http, raw_tx)
+        .await
+        .expect_err("over-balance tx must be rejected by the pool validator");
     let elapsed = start.elapsed();
 
     match err {
@@ -367,9 +359,7 @@ async fn insufficient_funds_pool_rejects() {
                 e.message(),
             );
             assert!(
-                msg.contains("insufficient")
-                    || msg.contains("funds")
-                    || msg.contains("balance"),
+                msg.contains("insufficient") || msg.contains("funds") || msg.contains("balance"),
                 "expected inner substring naming insufficient-funds rejection; got {}",
                 e.message(),
             );
@@ -417,9 +407,9 @@ async fn block_gas_limit_exceeded_pool_rejects() {
     // 40M > 30M block_gas_limit → pool rejects.
     let raw_tx = signed_transfer(chain_id, &wallet, 0, 40_000_000).await;
     let start = std::time::Instant::now();
-    let err = send_preconf(&http, raw_tx).await.expect_err(
-        "tx gas_limit above block gas_limit must be rejected by the pool validator",
-    );
+    let err = send_preconf(&http, raw_tx)
+        .await
+        .expect_err("tx gas_limit above block gas_limit must be rejected by the pool validator");
     let elapsed = start.elapsed();
 
     match err {
@@ -431,9 +421,7 @@ async fn block_gas_limit_exceeded_pool_rejects() {
                 e.message(),
             );
             assert!(
-                msg.contains("gas limit")
-                    || msg.contains("gas_limit")
-                    || msg.contains("exceeds"),
+                msg.contains("gas limit") || msg.contains("gas_limit") || msg.contains("exceeds"),
                 "expected inner substring naming gas-limit-exceeded rejection; got {}",
                 e.message(),
             );

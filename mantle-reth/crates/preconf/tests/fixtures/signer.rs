@@ -77,8 +77,7 @@ pub fn test_signers() -> TestSigners {
 ///
 /// Defaults:
 /// - `chain_id`: OP mainnet (10) — matches `test_chain_spec`
-/// - `gas_price`: 1 gwei (well above the 1 gwei `base_fee_per_gas` the
-///   parent header carries)
+/// - `gas_price`: 1 gwei (well above the 1 gwei `base_fee_per_gas` the parent header carries)
 /// - `gas_limit`: `21_000` (intrinsic + 0 data = standard transfer)
 ///
 /// The recovered signer of the returned envelope equals `from.address()`,
@@ -103,9 +102,7 @@ pub fn sign_legacy_transfer(
         value: value_wei,
         input: Default::default(),
     };
-    let sig = from
-        .sign_hash_sync(&tx.signature_hash())
-        .expect("PrivateKeySigner can always sign");
+    let sig = from.sign_hash_sync(&tx.signature_hash()).expect("PrivateKeySigner can always sign");
     // `into_signed` computes the canonical tx hash from the RLP encoding —
     // matches what `Signed::hash()` would return on a fresh `new_unhashed`.
     let signed = tx.into_signed(sig);

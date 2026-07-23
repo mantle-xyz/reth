@@ -14,7 +14,7 @@
 //! `validation_reject.rs` — it's a pre-fifo rejection path, not part
 //! of the dispatch-time budget accounting.
 
-use super::helpers::{send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
@@ -108,15 +108,12 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
     let t2 = tokio::spawn(async move { send_preconf(&http_clone, tx2).await });
 
     // Pre-compute the three hashes for post-seal SLA verification.
-    let tx0_hash = alloy_primitives::keccak256(
-        &signed_transfer_with_gas(chain_id, &wallet, 0, 21_000).await,
-    );
-    let tx1_hash = alloy_primitives::keccak256(
-        &signed_transfer_with_gas(chain_id, &wallet, 1, 21_000).await,
-    );
-    let tx2_hash = alloy_primitives::keccak256(
-        &signed_transfer_with_gas(chain_id, &wallet, 2, 21_000).await,
-    );
+    let tx0_hash =
+        alloy_primitives::keccak256(&signed_transfer_with_gas(chain_id, &wallet, 0, 21_000).await);
+    let tx1_hash =
+        alloy_primitives::keccak256(&signed_transfer_with_gas(chain_id, &wallet, 1, 21_000).await);
+    let tx2_hash =
+        alloy_primitives::keccak256(&signed_transfer_with_gas(chain_id, &wallet, 2, 21_000).await);
 
     // Give dispatch a beat to work through all three, then finalize.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -130,10 +127,8 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
 
     let ev0 = t0.await.expect("t0 join").expect("tx0 RPC must not be an error");
     let ev1 = t1.await.expect("t1 join").expect("tx1 RPC must not be an error");
-    let err2 = t2
-        .await
-        .expect("t2 join")
-        .expect_err("tx2 must be rejected by the block gas budget gate");
+    let err2 =
+        t2.await.expect("t2 join").expect_err("tx2 must be rejected by the block gas budget gate");
 
     assert!(
         matches!(ev0.status, PreconfStatus::Success),
@@ -260,10 +255,7 @@ async fn canceled_tx_recoverable_in_next_slot() {
 
     let _ = t0.await.expect("t0 join").expect("tx0 must succeed");
     let _ = t1.await.expect("t1 join").expect("tx1 must succeed");
-    let err2 = t2_first
-        .await
-        .expect("t2 join")
-        .expect_err("tx2 must be F1-rejected in slot 1");
+    let err2 = t2_first.await.expect("t2 join").expect_err("tx2 must be F1-rejected in slot 1");
     match err2 {
         ClientError::Call(ref e) => {
             assert!(
@@ -427,10 +419,8 @@ async fn block_gas_budget_rejects_third_sender_in_same_slot() {
 
     let ev_a = ta.await.expect("ta join").expect("sender A RPC must not err");
     let ev_b = tb.await.expect("tb join").expect("sender B RPC must not err");
-    let err_c = tc
-        .await
-        .expect("tc join")
-        .expect_err("sender C tx must trip the block gas budget gate");
+    let err_c =
+        tc.await.expect("tc join").expect_err("sender C tx must trip the block gas budget gate");
 
     assert!(matches!(ev_a.status, PreconfStatus::Success), "sender A: {:?}", ev_a.reason);
     assert!(matches!(ev_b.status, PreconfStatus::Success), "sender B: {:?}", ev_b.reason);
@@ -487,12 +477,11 @@ async fn block_gas_budget_rejects_third_sender_in_same_slot() {
 /// covered by `canceled_tx_recoverable_in_next_slot`.
 ///
 /// Regression risks this guards:
-///  - `LoopState::excluded` reverting from `HashMap<TxHash, PreconfError>`
-///    back to a plain `HashSet<TxHash>` — the dedup branch would then
-///    have no reason to forward and the client would fall back to
-///    waiting the full `preconf_timeout`.
-///  - The dedup branch dropping its `cancel_responder(..., reason)`
-///    call and just `return`ing — same slow-Timeout regression.
+///  - `LoopState::excluded` reverting from `HashMap<TxHash, PreconfError>` back to a plain
+///    `HashSet<TxHash>` — the dedup branch would then have no reason to forward and the client
+///    would fall back to waiting the full `preconf_timeout`.
+///  - The dedup branch dropping its `cancel_responder(..., reason)` call and just `return`ing —
+///    same slow-Timeout regression.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -540,10 +529,8 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     // First submit: dispatch F1 fires → Err(BlockGasBudgetExceeded).
     let _ = t0.await.expect("t0 join").expect("tx0 must succeed");
     let _ = t1.await.expect("t1 join").expect("tx1 must succeed");
-    let err_first = t2_first
-        .await
-        .expect("t2 first join")
-        .expect_err("first tx2 submit must be F1-rejected");
+    let err_first =
+        t2_first.await.expect("t2 first join").expect_err("first tx2 submit must be F1-rejected");
     let first_message = match err_first {
         ClientError::Call(ref e) => {
             assert!(
@@ -649,10 +636,7 @@ async fn replay_source_bypasses_block_gas_budget() {
     // construction in `restart_replay.rs`.
     let journal_dir = std::env::temp_dir().join(format!(
         "mantle-preconf-journal-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
@@ -721,10 +705,7 @@ async fn replay_source_bypasses_block_gas_budget() {
         .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
         .collect();
 
-    assert!(
-        sealed.contains(&tx0_hash),
-        "replay tx0 must land; sealed={sealed:?}",
-    );
+    assert!(sealed.contains(&tx0_hash), "replay tx0 must land; sealed={sealed:?}",);
     assert!(
         sealed.contains(&tx1_hash),
         "replay tx1 must land despite cumulative preconf gas (42k) exceeding \
@@ -734,4 +715,3 @@ async fn replay_source_bypasses_block_gas_budget() {
 
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
-

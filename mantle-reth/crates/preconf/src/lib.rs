@@ -26,13 +26,13 @@ pub use builder::{
     JobCancel, PreconfPayloadBuilder, PreconfPayloadJob, PreconfPayloadJobGenerator,
     ResolvePayloadFuture,
 };
-pub use payload_service_builder::MantlePreconfServiceBuilder;
 pub use canon_handler::PreconfCanonHandler;
-pub use config::{PreconfConfig, DEFAULT_SAFETY_MARGIN};
+pub use config::{DEFAULT_SAFETY_MARGIN, PreconfConfig};
 pub use journal::{
     JournalEntry, JournalError, PreconfJournal, RestorePool, RestoredEnvelope, RotateStats,
     restore_preconf_state, run_rejournal_loop, spawn_rejournal_loop,
 };
+pub use payload_service_builder::MantlePreconfServiceBuilder;
 pub use pool_ext::{
     PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,
     RestorePoolAdapter,
@@ -40,6 +40,4 @@ pub use pool_ext::{
 pub use preconf_tx_set::{PreconfTxSet, TxEntry};
 pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
-pub use types::{
-    AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult,
-};
+pub use types::{AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult};

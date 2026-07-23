@@ -11,10 +11,10 @@
 //! `assets/genesis.json`, mirroring op-e2e's practice of pinning fork
 //! timing to `time 0` for the whole matrix.
 
-use super::helpers::{mantle_chain_spec_for, send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, mantle_chain_spec_for, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use jsonrpsee::core::ClientError;
 use mantle_reth_rpc_ext::PreconfStatus;
@@ -45,10 +45,8 @@ macro_rules! run_pair_case {
         let recipient: Address = RECIPIENT.parse().unwrap();
         let wallet_addr = Wallet::default().with_chain_id($chain_id).inner.address();
 
-        let cfg = PreconfCfgBuilder::new()
-            .whitelist_from(wallet_addr)
-            .whitelist_to(recipient)
-            .build();
+        let cfg =
+            PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
         let (mut node, http, wallet, chain_id) =
             launch_preconf_node!(cfg, mantle_chain_spec_for($chain_id)).await;
@@ -70,8 +68,7 @@ macro_rules! run_pair_case {
             .expect("payload_id present");
 
         let http_clone = http.clone();
-        let rpc_task =
-            tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
+        let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let payload = node
@@ -91,12 +88,8 @@ macro_rules! run_pair_case {
             event.reason,
         );
 
-        let sealed: Vec<B256> = payload
-            .block()
-            .body()
-            .transactions()
-            .map(|tx| keccak256(tx.encoded_2718()))
-            .collect();
+        let sealed: Vec<B256> =
+            payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
         assert!(
             sealed.contains(&event.tx_hash),
             "chainId={} preconf tx must land in block 1; sealed = {sealed:?}",

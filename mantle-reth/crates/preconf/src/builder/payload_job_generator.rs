@@ -4,36 +4,30 @@
 //!
 //! ## Lifecycle (per slot)
 //!
-//! 1. CL hits `engine_forkchoiceUpdatedVx`. The payload service calls
-//!    [`Self::new_payload_job`] with the new
-//!    [`BuildNewPayload<Attrs>`].
-//! 2. The generator looks up the parent header via
-//!    [`BlockReaderIdExt::sealed_header_by_hash`] and assembles a
-//!    [`BuildArguments`] in the upstream shape (so we can reuse the
-//!    fork's `build_payload` signature verbatim).
-//! 3. A fresh [`JobCancel`] and a `watch::channel(None)` are created.
-//!    A tokio task is spawned that drives
-//!    [`PreconfPayloadBuilder::build_payload`] to completion, then
-//!    sends the final `Option<OpBuiltPayload<N>>` into the watch
-//!    sender. On error the sender is dropped (without sending).
-//! 4. The [`PreconfPayloadJob`] returned to the payload service holds
-//!    the watch receiver + cancel handle + join handle. Subsequent
-//!    `best_payload()` / `resolve_kind()` calls read through those.
+//! 1. CL hits `engine_forkchoiceUpdatedVx`. The payload service calls [`Self::new_payload_job`]
+//!    with the new [`BuildNewPayload<Attrs>`].
+//! 2. The generator looks up the parent header via [`BlockReaderIdExt::sealed_header_by_hash`] and
+//!    assembles a [`BuildArguments`] in the upstream shape (so we can reuse the fork's
+//!    `build_payload` signature verbatim).
+//! 3. A fresh [`JobCancel`] and a `watch::channel(None)` are created. A tokio task is spawned that
+//!    drives [`PreconfPayloadBuilder::build_payload`] to completion, then sends the final
+//!    `Option<OpBuiltPayload<N>>` into the watch sender. On error the sender is dropped (without
+//!    sending).
+//! 4. The [`PreconfPayloadJob`] returned to the payload service holds the watch receiver + cancel
+//!    handle + join handle. Subsequent `best_payload()` / `resolve_kind()` calls read through
+//!    those.
 //!
 //! ## What this generator does NOT do (yet)
 //!
-//! - **`on_new_state`**: no cached-reads pre-warming. Default no-op
-//!   trait impl in place; the cached-reads optimisation is a
-//!   follow-up if pool-side cache misses dominate slot latency.
-//! - **`ensure_only_one_payload`**: `BasicPayloadJobGenerator` cancels
-//!   existing payload jobs before spawning a new one (see
-//!   `basic-payload-builder/src/generator.rs`). This generator does
-//!   not — `last_payload` cancel-on-drop semantics are not needed
-//!   until production rollout, and skipping it keeps the trait
-//!   wiring focused. The [`PayloadJob`]'s own `Drop` impl handles
-//!   spawned-task cleanup.
-//! - **Deadlines**: no auto-cancel on slot deadline; the payload
-//!   service drives cancel via `resolve_kind` instead.
+//! - **`on_new_state`**: no cached-reads pre-warming. Default no-op trait impl in place; the
+//!   cached-reads optimisation is a follow-up if pool-side cache misses dominate slot latency.
+//! - **`ensure_only_one_payload`**: `BasicPayloadJobGenerator` cancels existing payload jobs before
+//!   spawning a new one (see `basic-payload-builder/src/generator.rs`). This generator does not —
+//!   `last_payload` cancel-on-drop semantics are not needed until production rollout, and skipping
+//!   it keeps the trait wiring focused. The [`PayloadJob`]'s own `Drop` impl handles spawned-task
+//!   cleanup.
+//! - **Deadlines**: no auto-cancel on slot deadline; the payload service drives cancel via
+//!   `resolve_kind` instead.
 //!
 //! [`PayloadJobGenerator`]: reth_payload_builder::PayloadJobGenerator
 //! [`PreconfPayloadBuilder::build_payload`]: crate::builder::payload_builder::PreconfPayloadBuilder::build_payload
@@ -58,9 +52,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::builder::{
-    cancel::JobCancel,
-    payload_builder::PreconfPayloadBuilder,
-    payload_job::PreconfPayloadJob,
+    cancel::JobCancel, payload_builder::PreconfPayloadBuilder, payload_job::PreconfPayloadJob,
 };
 
 /// `PayloadJobGenerator` impl that spawns the mantle preconf-aware
@@ -113,8 +105,7 @@ where
     }
 }
 
-impl<Pool, Client, Evm, N> PayloadJobGenerator
-    for PreconfPayloadJobGenerator<Pool, Client, Evm, N>
+impl<Pool, Client, Evm, N> PayloadJobGenerator for PreconfPayloadJobGenerator<Pool, Client, Evm, N>
 where
     // Builder must be Clone + Send + 'static so we can move a clone
     // into the spawned tokio task.
@@ -146,8 +137,8 @@ where
         + Send
         + 'static,
     N: OpPayloadPrimitives,
-    N::SignedTx: From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>>
-        + TryFrom<TxEnvelope>,
+    N::SignedTx:
+        From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>> + TryFrom<TxEnvelope>,
 {
     type Job = PreconfPayloadJob<OpPayloadAttrs, OpBuiltPayload<N>>;
 
@@ -177,30 +168,27 @@ where
         // `from_rpc_attrs` — same shape as upstream's private
         // `convert_build_args` (op-reth payload/src/builder.rs:344).
         let attributes_for_job = rpc_attrs.clone();
-        let builder_attrs = OpPayloadBuilderAttributes::<TxTy<N>>::from_rpc_attrs(
-            parent_hash,
-            id,
-            rpc_attrs.0,
-        )
-        .map_err(PayloadBuilderError::other)?;
+        let builder_attrs =
+            OpPayloadBuilderAttributes::<TxTy<N>>::from_rpc_attrs(parent_hash, id, rpc_attrs.0)
+                .map_err(PayloadBuilderError::other)?;
 
         let config = PayloadConfig::new(Arc::new(parent_header), builder_attrs, id);
         let args: BuildArguments<OpPayloadBuilderAttributes<TxTy<N>>, OpBuiltPayload<N>> =
             BuildArguments::new(
-            // No cached-reads yet — a follow-up may wire this in via
-            // `on_new_state` if pool-side cache misses become
-            // significant.
-            Default::default(),
-            cache,
-            trie_handle,
-            config,
-            // The CancelOnDrop in BuildArguments is consumed by the
-            // upstream OpPayloadBuilderCtx. Our async cancel signal is
-            // separate (see build_payload's body) — this fresh handle
-            // is never flipped from the outside.
-            CancelOnDrop::default(),
-            None,
-        );
+                // No cached-reads yet — a follow-up may wire this in via
+                // `on_new_state` if pool-side cache misses become
+                // significant.
+                Default::default(),
+                cache,
+                trie_handle,
+                config,
+                // The CancelOnDrop in BuildArguments is consumed by the
+                // upstream OpPayloadBuilderCtx. Our async cancel signal is
+                // separate (see build_payload's body) — this fresh handle
+                // is never flipped from the outside.
+                CancelOnDrop::default(),
+                None,
+            );
 
         // Wire up the (cancel, payload-result) channels shared with
         // the spawned build task.
@@ -235,10 +223,7 @@ where
         // under that. Production hardening (e.g. a bounded pool of
         // worker threads we own) is a follow-up if observed needed.
         let handle = tokio::task::spawn_blocking(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(err) => {
                     warn!(
@@ -311,9 +296,7 @@ mod tests {
 
     // Compile-time witness that the generator can name its types.
     #[allow(dead_code)]
-    fn _witness_name<Pool, Client, Evm, N>(
-        _: &PreconfPayloadJobGenerator<Pool, Client, Evm, N>,
-    ) {
+    fn _witness_name<Pool, Client, Evm, N>(_: &PreconfPayloadJobGenerator<Pool, Client, Evm, N>) {
         let _phantom: PhantomData<N> = PhantomData;
     }
 }

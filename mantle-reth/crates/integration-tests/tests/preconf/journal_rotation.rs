@@ -16,15 +16,14 @@
 //! property.
 //!
 //! Coverage:
-//! - `rotate_drops_sealed_then_relaunch_replays_only_survivors` — three
-//!   independent senders' commitments journaled; one marked sealed and
-//!   rotated out; a node launched against the rotated file replays only
-//!   the two survivors.
+//! - `rotate_drops_sealed_then_relaunch_replays_only_survivors` — three independent senders'
+//!   commitments journaled; one marked sealed and rotated out; a node launched against the rotated
+//!   file replays only the two survivors.
 
-use super::helpers::{mantle_test_chain_spec, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::{JournalEntry, PreconfJournal};
 use reth_chainspec::EthChainSpec;
@@ -52,12 +51,7 @@ async fn signed_nonce0_transfer(
 }
 
 fn journal_entry(raw: &alloy_primitives::Bytes) -> JournalEntry {
-    JournalEntry {
-        hash: keccak256(raw),
-        tx_rlp: raw.clone(),
-        block_height: 1,
-        committed_at_ms: 0,
-    }
+    JournalEntry { hash: keccak256(raw), tx_rlp: raw.clone(), block_height: 1, committed_at_ms: 0 }
 }
 
 /// Append three commitments (independent senders, each nonce 0), mark one
@@ -93,10 +87,7 @@ async fn rotate_drops_sealed_then_relaunch_replays_only_survivors() {
     // Unique tempdir + journal path.
     let journal_dir = std::env::temp_dir().join(format!(
         "mantle-preconf-journal-rotate-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal dir");
     let journal_file = journal_dir.join("preconf.journal");
@@ -160,25 +151,15 @@ async fn rotate_drops_sealed_then_relaunch_replays_only_survivors() {
         .expect("resolve_kind")
         .expect("payload build");
 
-    let sealed: Vec<B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
 
     assert!(
         !sealed.contains(&hash_a),
         "rotated-out (sealed) commitment must NOT be replayed; sealed={sealed:?}"
     );
-    assert!(
-        sealed.contains(&hash_b),
-        "survivor B must be replayed and land; sealed={sealed:?}"
-    );
-    assert!(
-        sealed.contains(&hash_c),
-        "survivor C must be replayed and land; sealed={sealed:?}"
-    );
+    assert!(sealed.contains(&hash_b), "survivor B must be replayed and land; sealed={sealed:?}");
+    assert!(sealed.contains(&hash_c), "survivor C must be replayed and land; sealed={sealed:?}");
 
     let _ = std::fs::remove_dir_all(&journal_dir);
 }

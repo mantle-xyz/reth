@@ -17,16 +17,17 @@
 //! upstream `RollupArgs` convention — every configuration knob lives on the
 //! command line and is discoverable via `--help`.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use alloy_primitives::{Address, map::foldhash::HashSet};
 use clap::Args;
-use mantle_reth_preconf::PreconfConfig;
-use mantle_reth_preconf::config::{
-    DEFAULT_BROADCAST_CAP, DEFAULT_JOURNAL_MAX_SIZE, DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
-    DEFAULT_PRECONF_MAX_GAS_PER_TX, DEFAULT_PRECONF_TIMEOUT, DEFAULT_REJOURNAL_INTERVAL,
-    DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
+use mantle_reth_preconf::{
+    PreconfConfig,
+    config::{
+        DEFAULT_BROADCAST_CAP, DEFAULT_JOURNAL_MAX_SIZE, DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
+        DEFAULT_PRECONF_MAX_GAS_PER_TX, DEFAULT_PRECONF_TIMEOUT, DEFAULT_REJOURNAL_INTERVAL,
+        DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
+    },
 };
 use reth_optimism_node::args::RollupArgs;
 
@@ -54,7 +55,6 @@ pub struct PreconfArgs {
     /// When absent (default), the node behaves exactly like upstream
     /// `op-reth` — no preconf validator, listener, canon handler, or RPC
     /// method registration.
-    ///
     #[arg(long = "preconf.enable")]
     pub enable: bool,
 
@@ -236,11 +236,7 @@ mod tests {
         // `--preconf.journal-path` maps to `PreconfConfig::journal_path`
         // as a `PathBuf`, gated behind `--preconf.enable`. Regression
         // guard against silent wiring drift.
-        let a = parse(&[
-            "--preconf.enable",
-            "--preconf.journal-path",
-            "/tmp/mantle-preconf.jsonl",
-        ]);
+        let a = parse(&["--preconf.enable", "--preconf.journal-path", "/tmp/mantle-preconf.jsonl"]);
         let cfg = a.into_config().expect("enabled");
         assert_eq!(
             cfg.journal_path.as_deref(),

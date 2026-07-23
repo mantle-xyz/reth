@@ -8,16 +8,15 @@
 //! `0x4200…` addresses.
 //!
 //! This file verifies two things:
-//! 1. A node launched against that spec is still functional end-to-end:
-//!    the preconf happy-path lands a whitelisted tx in the first block.
-//! 2. The L1Block predeploy actually has bytecode after boot — i.e. the
-//!    fixture was carried through into the live in-memory state, not
-//!    silently dropped by the spec-loader.
+//! 1. A node launched against that spec is still functional end-to-end: the preconf happy-path
+//!    lands a whitelisted tx in the first block.
+//! 2. The L1Block predeploy actually has bytecode after boot — i.e. the fixture was carried through
+//!    into the live in-memory state, not silently dropped by the spec-loader.
 
-use super::helpers::{mantle_chain_spec_with_predeploys_for, send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
@@ -51,10 +50,7 @@ async fn predeploy_genesis_boots_and_l1block_has_code() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(5000).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
     let (mut node, http, wallet, chain_id) =
         launch_preconf_node!(cfg, mantle_chain_spec_with_predeploys_for(5000)).await;
@@ -63,11 +59,7 @@ async fn predeploy_genesis_boots_and_l1block_has_code() {
     // Post-boot state must expose the L1Block predeploy bytecode from
     // the devnet dump — otherwise the fixture was dropped by the
     // spec-loader.
-    let state = node
-        .inner
-        .provider
-        .latest()
-        .expect("state provider");
+    let state = node.inner.provider.latest().expect("state provider");
     let code = state
         .account_code(&L1_BLOCK_ADDR)
         .expect("account_code lookup")
@@ -114,12 +106,8 @@ async fn predeploy_genesis_boots_and_l1block_has_code() {
         event.reason,
     );
 
-    let sealed: Vec<B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&event.tx_hash),
         "preconf tx must land under predeploy-populated genesis; sealed = {sealed:?}",

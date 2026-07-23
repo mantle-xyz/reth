@@ -13,9 +13,8 @@
 //! Returns `Ok(recovered)` in **both** cases:
 //!
 //! - The tx was newly admitted to the pool.
-//! - The pool rejected admission with `AlreadyImported` (typically
-//!   because reth's own local-tx backup restored the same tx from disk
-//!   before this call).
+//! - The pool rejected admission with `AlreadyImported` (typically because reth's own local-tx
+//!   backup restored the same tx from disk before this call).
 //!
 //! In either case the caller ([`crate::restore_preconf_state`]) needs
 //! the decoded envelope + sender to `push_if_absent` into the fifo —

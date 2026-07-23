@@ -3,14 +3,12 @@
 //!
 //! Two checks are added on top of whatever inner validator is wrapped:
 //!
-//! 1. **Replacement guard**: a tx whose `(sender, nonce)` collides with a
-//!    non-`Timeout` `PreconfTxSet` entry of a different hash is rejected.
-//!    `Timeout` entries release the slot — the existing fifo record is
-//!    actively removed so the new tx can proceed cleanly.
+//! 1. **Replacement guard**: a tx whose `(sender, nonce)` collides with a non-`Timeout`
+//!    `PreconfTxSet` entry of a different hash is rejected. `Timeout` entries release the slot —
+//!    the existing fifo record is actively removed so the new tx can proceed cleanly.
 //!
-//! 2. **Per-tx gas ceiling (operator hardening)**: preconf-eligible txs
-//!    whose `gas_limit` exceeds `cfg.preconf_max_gas_per_tx` are rejected.
-//!    Non-preconf txs pass through unaffected.
+//! 2. **Per-tx gas ceiling (operator hardening)**: preconf-eligible txs whose `gas_limit` exceeds
+//!    `cfg.preconf_max_gas_per_tx` are rejected. Non-preconf txs pass through unaffected.
 //!
 //! All other concerns (signature, balance, basefee, EIP-155, `MetaTx`, ...)
 //! are delegated to the inner validator unchanged.
@@ -36,12 +34,10 @@ pub struct ReplaceActivePreconf;
 impl reth_transaction_pool::error::PoolTransactionError for ReplaceActivePreconf {
     fn is_bad_transaction(&self) -> bool {
         // `is_bad_transaction == true` triggers, in reth's network layer:
-        //   1. P2P reputation hit on the announcing peer
-        //      (`ReputationChangeKind::BadTransactions`, weight ≈ -16384;
-        //      ~4 hits and the peer is below the ban threshold)
-        //   2. The tx hash is added to the `bad_imports` cache, so future
-        //      announcements of the same hash from any peer are rejected
-        //      without re-running validation
+        //   1. P2P reputation hit on the announcing peer (`ReputationChangeKind::BadTransactions`,
+        //      weight ≈ -16384; ~4 hits and the peer is below the ban threshold)
+        //   2. The tx hash is added to the `bad_imports` cache, so future announcements of the same
+        //      hash from any peer are rejected without re-running validation
         //   3. (Skipped while the node is syncing)
         //
         // A replacement collision is not the sender's fault — they have no
@@ -136,8 +132,8 @@ where
         // pre-execute reject; tx NOT on chain). `Waiting` / `Success`
         // block replacement (`Success` is on-chain or in-flight, so
         // replacement would double-apply).
-        if let Some(existing) = self.fifo.find_by_sender_nonce(&sender, nonce).await
-            && existing.hash != tx_hash
+        if let Some(existing) = self.fifo.find_by_sender_nonce(&sender, nonce).await &&
+            existing.hash != tx_hash
         {
             if !matches!(
                 existing.status,

@@ -8,33 +8,30 @@
 //!
 //! Coverage:
 //!
-//! - `journal_replay_lands_promised_tx_in_next_block` — base case:
-//!   single entry, restore → apply → land.
-//! - `journal_replay_multiple_entries_all_land_in_first_block` — 3
-//!   entries from same sender (nonces 0/1/2) all land in block 1.
-//!   Guards `restore_preconf_state`'s per-entry loop + nonce-order
+//! - `journal_replay_lands_promised_tx_in_next_block` — base case: single entry, restore → apply →
+//!   land.
+//! - `journal_replay_multiple_entries_all_land_in_first_block` — 3 entries from same sender (nonces
+//!   0/1/2) all land in block 1. Guards `restore_preconf_state`'s per-entry loop + nonce-order
 //!   preservation in `replay_fifo_carryover`.
-//! - `journal_replay_across_multiple_senders` — 2 senders, each 1
-//!   entry, both land in block 1. Guards per-entry independence in
-//!   restore.
-//! - `empty_journal_file_starts_normally` — journal file exists but
-//!   is empty. Startup must not panic; a subsequent fresh RPC tx
-//!   flows normally.
+//! - `journal_replay_across_multiple_senders` — 2 senders, each 1 entry, both land in block 1.
+//!   Guards per-entry independence in restore.
+//! - `empty_journal_file_starts_normally` — journal file exists but is empty. Startup must not
+//!   panic; a subsequent fresh RPC tx flows normally.
 //!
 //! Related Replay semantics (covered elsewhere):
 //! - `gas_budgets::replay_source_bypasses_block_gas_budget` — F1 bypass
-//! - `no_tx_pool::no_tx_pool_gates_replay_source_entry` — derivation
-//!   builds still gate Replay to preserve chain safety
+//! - `no_tx_pool::no_tx_pool_gates_replay_source_entry` — derivation builds still gate Replay to
+//!   preserve chain safety
 //!
 //! Each test constructs the journal file by hand (JSON Lines, one
 //! `JournalEntry` per line) and launches the node against it — this is
 //! the observable end of the restart path without needing to actually
 //! restart a process.
 
-use super::helpers::{mantle_test_chain_spec, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, TxKind, U256};
+use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::JournalEntry;
 use reth_chainspec::EthChainSpec;
@@ -74,10 +71,7 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
     // Pre-seed a JSON-Lines journal file with a single promised commitment.
     let journal_dir = std::env::temp_dir().join(format!(
         "mantle-preconf-journal-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
@@ -126,11 +120,8 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
         .expect("payload build");
 
     let block = payload.block();
-    let sealed: Vec<alloy_primitives::B256> = block
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<alloy_primitives::B256> =
+        block.body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&tx_hash),
         "journal-restored tx must land in the first block after startup; \
@@ -145,10 +136,7 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
 fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::PathBuf) {
     let journal_dir = std::env::temp_dir().join(format!(
         "mantle-preconf-journal-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
@@ -237,12 +225,8 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
         .expect("resolve_kind")
         .expect("payload build");
 
-    let sealed: Vec<alloy_primitives::B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
 
     for (label, h) in [("nonce=0", hash0), ("nonce=1", hash1), ("nonce=2", hash2)] {
         assert!(
@@ -355,12 +339,8 @@ async fn journal_replay_across_multiple_senders() {
         .expect("resolve_kind")
         .expect("payload build");
 
-    let sealed: Vec<alloy_primitives::B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&hash_a),
         "sender A's journal-restored tx must land in block 1; sealed={sealed:?}",
@@ -420,8 +400,7 @@ async fn empty_journal_file_starts_normally() {
         .expect("payload_id present");
 
     let http_c = http.clone();
-    let rpc_task =
-        tokio::spawn(async move { super::helpers::send_preconf(&http_c, raw_tx).await });
+    let rpc_task = tokio::spawn(async move { super::helpers::send_preconf(&http_c, raw_tx).await });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let payload = node
@@ -440,12 +419,8 @@ async fn empty_journal_file_starts_normally() {
         event.reason,
     );
 
-    let sealed: Vec<alloy_primitives::B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&expected_hash),
         "fresh preconf tx must land in block 1 after empty-journal startup; sealed={sealed:?}",

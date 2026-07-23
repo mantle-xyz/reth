@@ -4,18 +4,16 @@
 //! The select! main loop inside `build_payload` calls these helpers
 //! one hash at a time. Four invariants are enforced for every hash:
 //!
-//! - **Dedup**: a hash already in `committed` or `excluded` is
-//!   short-circuited before any fifo / EVM work.
-//! - **Status gate**: only `Waiting` entries proceed; terminal entries
-//!   are recorded as excluded and skipped.
-//! - **Pre-apply deadline**: when `entry.inserted_at.elapsed() +
-//!   safety_margin >= preconf_timeout`, the tx is *not* applied; the
-//!   fifo entry is flipped to `Timeout` and the responder is cancelled
-//!   directly here. This closes the race where the RPC client has
-//!   already given up but the builder is about to commit a receipt.
-//! - **Responder ownership**: every terminal path (success, deadline
-//!   skip, status-already-terminal) calls exactly one of
-//!   `take_responder` / `cancel_responder`, never both.
+//! - **Dedup**: a hash already in `committed` or `excluded` is short-circuited before any fifo /
+//!   EVM work.
+//! - **Status gate**: only `Waiting` entries proceed; terminal entries are recorded as excluded and
+//!   skipped.
+//! - **Pre-apply deadline**: when `entry.inserted_at.elapsed() + safety_margin >= preconf_timeout`,
+//!   the tx is *not* applied; the fifo entry is flipped to `Timeout` and the responder is cancelled
+//!   directly here. This closes the race where the RPC client has already given up but the builder
+//!   is about to commit a receipt.
+//! - **Responder ownership**: every terminal path (success, deadline skip, status-already-terminal)
+//!   calls exactly one of `take_responder` / `cancel_responder`, never both.
 //!
 //! ## Apply-fn injection
 //!
@@ -33,7 +31,10 @@
 //! the state-machine invariants are exercised in isolation. End-to-end
 //! EVM behaviour is covered by devnet integration tests.
 
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::TxHash;
@@ -175,7 +176,6 @@ impl LoopState {
     pub(super) fn excluded_len(&self) -> usize {
         self.excluded.len()
     }
-
 }
 
 /// Handle one preconf hash end-to-end: dedup → fetch → status gate →
@@ -257,9 +257,9 @@ pub(super) async fn apply_one_preconf<F>(
         // derived from the terminal status since we did not run the
         // gate ourselves.
         let reason = match entry.status {
-            PreconfStatus::Timeout => PreconfError::Timeout {
-                timeout_ms: cfg.preconf_timeout.as_millis() as u64,
-            },
+            PreconfStatus::Timeout => {
+                PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
+            }
             other => PreconfError::Internal(format!(
                 "preconf entry already terminal ({other:?}) at dispatch entry"
             )),
@@ -310,8 +310,7 @@ pub(super) async fn apply_one_preconf<F>(
         );
         metrics::counter!("preconf.dispatch.deadline_skipped_total").increment(1);
         let _ = fifo.mark_timeout(&hash).await;
-        let reason =
-            PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
+        let reason = PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
         fifo.cancel_responder(&hash, reason.clone()).await;
         loop_state.record_excluded(hash, reason);
         return;
@@ -328,9 +327,8 @@ pub(super) async fn apply_one_preconf<F>(
     // chain) — semantically distinct from `Failed` (EVM apply ran and
     // reverted, tx on chain).
     let tx_gas_limit = alloy_consensus::Transaction::gas_limit(entry.tx.as_ref());
-    if is_rpc
-        && loop_state.preconf_gas_used.saturating_add(tx_gas_limit)
-            > cfg.preconf_max_gas_per_block
+    if is_rpc &&
+        loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
     {
         debug!(
             target: "mantle::preconf::dispatch",
@@ -383,9 +381,9 @@ pub(super) async fn apply_one_preconf<F>(
                 "status flipped before we acquired apply_lock; skipping apply"
             );
             let reason = match re_entry.status {
-                PreconfStatus::Timeout => PreconfError::Timeout {
-                    timeout_ms: cfg.preconf_timeout.as_millis() as u64,
-                },
+                PreconfStatus::Timeout => {
+                    PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
+                }
                 other => PreconfError::Internal(format!(
                     "preconf entry flipped to {other:?} before apply_lock"
                 )),
@@ -403,8 +401,7 @@ pub(super) async fn apply_one_preconf<F>(
     // Distribution of EVM apply latency — feeds SAFETY_MARGIN tuning.
     // Recorded once per call regardless of outcome; success / failure
     // counters (below) provide the breakdown.
-    metrics::histogram!("preconf.execute.duration_ms")
-        .record(apply_duration.as_millis() as f64);
+    metrics::histogram!("preconf.execute.duration_ms").record(apply_duration.as_millis() as f64);
 
     match apply_result {
         Ok(receipt) => {
@@ -632,14 +629,12 @@ mod tests {
 
     /// Simulates a same-slot client resubmit after a Timeout:
     /// 1. First dispatch: deadline gate fires, records `Timeout` excluded.
-    /// 2. Client resubmits: `attach_responder` refreshes `inserted_at`,
-    ///    `push_if_absent` revives fifo entry back to `Waiting`.
-    /// 3. Second dispatch: dedup finds the prior `Timeout` reason but
-    ///    **clears** it (since the deadline gate is tied to the
-    ///    entry's `inserted_at`, which is now fresh) and falls through
-    ///    to re-evaluate the gates. With fresh insertion time well
-    ///    under `preconf_timeout`, the gate does not fire and apply
-    ///    proceeds. The fresh responder observes the receipt.
+    /// 2. Client resubmits: `attach_responder` refreshes `inserted_at`, `push_if_absent` revives
+    ///    fifo entry back to `Waiting`.
+    /// 3. Second dispatch: dedup finds the prior `Timeout` reason but **clears** it (since the
+    ///    deadline gate is tied to the entry's `inserted_at`, which is now fresh) and falls through
+    ///    to re-evaluate the gates. With fresh insertion time well under `preconf_timeout`, the
+    ///    gate does not fire and apply proceeds. The fresh responder observes the receipt.
     ///
     /// Locks the "Timeout is not a stable exclusion" invariant: a
     /// regression that forwards stored Timeout via `cancel_responder`
@@ -668,10 +663,7 @@ mod tests {
         let err = resp_rx1.await.expect("responder closed").expect_err("must be Timeout");
         assert!(matches!(err, PreconfError::Timeout { .. }));
         assert_eq!(state.excluded_len(), 1);
-        assert_eq!(
-            fifo.find_by_hash(&hash).await.unwrap().status,
-            PreconfStatus::Timeout,
-        );
+        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Timeout,);
 
         // Step 2: client resubmit — refresh `inserted_at`, revive to Waiting.
         let (resp_tx2, resp_rx2) = oneshot::channel();
@@ -865,8 +857,8 @@ mod tests {
     ///
     /// - NOT invoke `apply_fn`
     /// - NOT touch responders
-    /// - NOT record the hash in loop_state (allowing a future re-push
-    ///   of the same hash to proceed normally)
+    /// - NOT record the hash in loop_state (allowing a future re-push of the same hash to proceed
+    ///   normally)
     #[tokio::test]
     async fn missing_fifo_entry_is_silent_noop() {
         use std::cell::Cell;
@@ -932,11 +924,7 @@ mod tests {
 
             apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut apply_fn).await;
 
-            assert_eq!(
-                call_count.get(),
-                0,
-                "apply_fn must not run when status={pre_status:?}",
-            );
+            assert_eq!(call_count.get(), 0, "apply_fn must not run when status={pre_status:?}",);
             assert_eq!(state.committed_len(), 0);
             assert_eq!(state.excluded_len(), 1, "must record_excluded for status={pre_status:?}");
             // Responder untouched — the entry's terminal transition path

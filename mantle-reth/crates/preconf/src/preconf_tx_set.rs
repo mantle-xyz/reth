@@ -15,13 +15,13 @@
 //!
 //! ## Invariants
 //!
-//! - At most one entry per `(sender, nonce)` whose status is not `Timeout`.
-//!   A new push with the same `(sender, nonce)` evicts an existing `Timeout`
-//!   entry; an active (Waiting / Success / Failed) entry blocks the push.
-//! - At most one responder per hash. Either lives inside an existing entry, or
-//!   in `pending_responders` until the matching `push_if_absent` consumes it.
-//! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and
-//!   reconcile via `snapshot()`.
+//! - At most one entry per `(sender, nonce)` whose status is not `Timeout`. A new push with the
+//!   same `(sender, nonce)` evicts an existing `Timeout` entry; an active (Waiting / Success /
+//!   Failed) entry blocks the push.
+//! - At most one responder per hash. Either lives inside an existing entry, or in
+//!   `pending_responders` until the matching `push_if_absent` consumes it.
+//! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and reconcile via
+//!   `snapshot()`.
 
 use alloy_consensus::{Transaction, TxEnvelope};
 // foldhash HashMap: faster than SipHash on high-entropy keys (TxHash /
@@ -215,11 +215,7 @@ impl PreconfTxSet {
     /// validated upstream via `PreconfConfig::validate`.
     pub fn new(broadcast_cap: usize) -> Self {
         let (notifier, _) = broadcast::channel(broadcast_cap);
-        Self {
-            inner: Mutex::new(PreconfTxSetInner::new()),
-            notifier,
-            pool_evict: OnceLock::new(),
-        }
+        Self { inner: Mutex::new(PreconfTxSetInner::new()), notifier, pool_evict: OnceLock::new() }
     }
 
     /// Register the pool-eviction callback fired after any transition
@@ -254,8 +250,8 @@ impl PreconfTxSet {
     /// Returns:
     /// - [`PushResult::Inserted`] — new entry created and broadcast notified.
     /// - [`PushResult::AlreadyExists`] — same hash already present (no-op).
-    /// - [`PushResult::ConflictActive(existing_hash)`] — same `(from, nonce)`
-    ///   but different hash, and the existing entry is not `Timeout`.
+    /// - [`PushResult::ConflictActive(existing_hash)`] — same `(from, nonce)` but different hash,
+    ///   and the existing entry is not `Timeout`.
     ///
     /// When the existing entry IS `Timeout`, it is evicted and the new tx
     /// is inserted in its place.
@@ -273,21 +269,17 @@ impl PreconfTxSet {
         // Same-hash entry already present — three outcomes depending on
         // its current status:
         //
-        // - `Timeout` / `Canceled` / `Failed` (reclaimable) → revive to
-        //   `Waiting`. Adopt the fresh responder + origin_instant from
-        //   `pending_responders` (if the RPC handler pre-attached one
-        //   for this resubmit) so dispatch's deadline gate measures
-        //   against the new submission, then broadcast. Closes the
-        //   "same-hash resubmit after non-Success terminal" loop that
-        //   would otherwise wedge under the pool-eviction callback.
-        //   `Failed` is included because its trigger — reth builder
-        //   pre-execute reject (in-flight nonce / balance race,
-        //   block gas exhausted at builder level) — is typically a
-        //   within-slot state race, not an intrinsic tx defect;
-        //   next-slot retry naturally resolves it.
-        // - `Waiting` / `Success` (active) → idempotent no-op; callers
-        //   should treat this as "someone else already owns the slot"
-        //   (the RPC handler surfaces it as `AlreadyInProgress`).
+        // - `Timeout` / `Canceled` / `Failed` (reclaimable) → revive to `Waiting`. Adopt the fresh
+        //   responder + origin_instant from `pending_responders` (if the RPC handler pre-attached
+        //   one for this resubmit) so dispatch's deadline gate measures against the new submission,
+        //   then broadcast. Closes the "same-hash resubmit after non-Success terminal" loop that
+        //   would otherwise wedge under the pool-eviction callback. `Failed` is included because
+        //   its trigger — reth builder pre-execute reject (in-flight nonce / balance race, block
+        //   gas exhausted at builder level) — is typically a within-slot state race, not an
+        //   intrinsic tx defect; next-slot retry naturally resolves it.
+        // - `Waiting` / `Success` (active) → idempotent no-op; callers should treat this as
+        //   "someone else already owns the slot" (the RPC handler surfaces it as
+        //   `AlreadyInProgress`).
         if let Some(existing) = inner.entries.get_mut(&hash) {
             if matches!(
                 existing.status,
@@ -319,9 +311,7 @@ impl PreconfTxSet {
                 Some(s)
                     if !matches!(
                         s,
-                        PreconfStatus::Timeout
-                            | PreconfStatus::Canceled
-                            | PreconfStatus::Failed
+                        PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
                     ) =>
                 {
                     return PushResult::ConflictActive(existing_hash);
@@ -481,9 +471,7 @@ impl PreconfTxSet {
             .filter(|(_, e)| {
                 matches!(
                     e.status,
-                    PreconfStatus::Timeout
-                        | PreconfStatus::Canceled
-                        | PreconfStatus::Failed
+                    PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
                 )
             })
             .map(|(h, _)| *h)
@@ -590,10 +578,9 @@ impl PreconfTxSet {
     /// This API performs two coupled changes atomically under the
     /// fifo lock:
     ///
-    /// 1. `status: Success → Waiting` so the entry becomes eligible
-    ///    for re-apply.
-    /// 2. `source: * → Replay` so `builder::dispatch`'s
-    ///    pre-apply deadline and per-block gas budget gates bypass it.
+    /// 1. `status: Success → Waiting` so the entry becomes eligible for re-apply.
+    /// 2. `source: * → Replay` so `builder::dispatch`'s pre-apply deadline and per-block gas budget
+    ///    gates bypass it.
     ///
     /// A broadcast notify is still fired for callers that prefer a
     /// broadcast-driven pickup path. The `build_payload` preamble does
@@ -672,9 +659,7 @@ impl PreconfTxSet {
                 // rather than the (already-expired) first. The
                 // subsequent `push_if_absent` from the pool listener
                 // flips the entry back to `Waiting` and broadcasts.
-                PreconfStatus::Timeout
-                | PreconfStatus::Canceled
-                | PreconfStatus::Failed => {
+                PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed => {
                     entry.responder = Some(responder);
                     entry.inserted_at = origin_instant;
                     return Ok(());
@@ -828,8 +813,14 @@ mod tests {
     async fn push_same_hash_returns_already_exists() {
         let set = PreconfTxSet::new(16);
         let tx = make_tx(0, 1);
-        assert_eq!(set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await, PushResult::Inserted);
-        assert_eq!(set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await, PushResult::AlreadyExists);
+        assert_eq!(
+            set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await,
+            PushResult::Inserted
+        );
+        assert_eq!(
+            set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await,
+            PushResult::AlreadyExists
+        );
         // Single entry — no duplicates.
         assert_eq!(set.snapshot().await.len(), 1);
     }
@@ -839,7 +830,10 @@ mod tests {
         let set = PreconfTxSet::new(16);
         let tx1 = make_tx(0, 1);
         let tx2 = make_tx(0, 2); // same nonce, different hash
-        assert_eq!(set.push_if_absent(tx1.clone(), addr(1), PreconfSource::Rpc).await, PushResult::Inserted);
+        assert_eq!(
+            set.push_if_absent(tx1.clone(), addr(1), PreconfSource::Rpc).await,
+            PushResult::Inserted
+        );
         assert_eq!(
             set.push_if_absent(tx2.clone(), addr(1), PreconfSource::Rpc).await,
             PushResult::ConflictActive(*tx1.tx_hash())
@@ -894,17 +888,11 @@ mod tests {
         // the revival notify.
         let _ = rx.try_recv();
         set.mark_failed(tx.tx_hash()).await.unwrap();
-        assert_eq!(
-            set.find_by_hash(tx.tx_hash()).await.unwrap().status,
-            PreconfStatus::Failed,
-        );
+        assert_eq!(set.find_by_hash(tx.tx_hash()).await.unwrap().status, PreconfStatus::Failed,);
 
         let r = set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
         assert_eq!(r, PushResult::Revived);
-        assert_eq!(
-            set.find_by_hash(tx.tx_hash()).await.unwrap().status,
-            PreconfStatus::Waiting,
-        );
+        assert_eq!(set.find_by_hash(tx.tx_hash()).await.unwrap().status, PreconfStatus::Waiting,);
         // Revive broadcasts the hash so dispatch re-picks it up.
         assert_eq!(rx.try_recv().unwrap(), *tx.tx_hash());
     }
@@ -1471,7 +1459,10 @@ mod tests {
         // First push at (sender, nonce=0) — Inserted.
         let tx_a = make_tx(0, 1); // nonce=0, hash byte 1
         let hash_a = *tx_a.tx_hash();
-        assert!(matches!(set.push_if_absent(tx_a, sender, PreconfSource::Rpc).await, PushResult::Inserted));
+        assert!(matches!(
+            set.push_if_absent(tx_a, sender, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
 
         // Second push at same (sender, nonce=0) with a different hash —
         // ConflictActive, payload must be `hash_a`, NOT the new tx's
@@ -1586,5 +1577,4 @@ mod tests {
         assert_eq!(first_evicted.lock().unwrap().len(), 1);
         assert!(second_evicted.lock().unwrap().is_empty());
     }
-
 }

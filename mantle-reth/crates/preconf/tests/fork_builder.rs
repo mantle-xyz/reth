@@ -17,8 +17,7 @@
 mod fixtures;
 
 use fixtures::{
-    chainspec::test_chain_spec, evm::test_evm_config, provider::test_provider,
-    signer::TestSigners,
+    chainspec::test_chain_spec, evm::test_evm_config, provider::test_provider, signer::TestSigners,
 };
 
 /// Step 2 wiring smoke test: every fixture constructor returns
@@ -51,13 +50,11 @@ fn fixtures_wire_up() {
 /// Step 3 — Seed pattern verification.
 ///
 /// Verifies the minimum provider seeding works:
-/// 1. A parent header inserted via `add_header` can be looked up via
-///    the trait `BlockReaderIdExt::sealed_header_by_hash(parent_hash)`
-///    — this is the exact call `PreconfPayloadJobGenerator::new_payload_job`
-///    makes
-/// 2. Pre-funded accounts inserted via `add_account` are observable
-///    through `StateProvider::account_balance` — exercised by the EVM
-///    when paying for tx gas
+/// 1. A parent header inserted via `add_header` can be looked up via the trait
+///    `BlockReaderIdExt::sealed_header_by_hash(parent_hash)` — this is the exact call
+///    `PreconfPayloadJobGenerator::new_payload_job` makes
+/// 2. Pre-funded accounts inserted via `add_account` are observable through
+///    `StateProvider::account_balance` — exercised by the EVM when paying for tx gas
 ///
 /// Once both checks pass, the harness is ready to drive `build_payload`
 /// from end to end. Steps 4-8 then add per-test fixture (sign tx, push
@@ -73,10 +70,8 @@ fn step3_seed_pattern_verifies_provider_serves_header_and_balance() {
     let provider = test_provider();
     let signers = TestSigners::new();
 
-    let seeded = seed_with_genesis_parent(
-        &provider,
-        &[signers.addr1.address(), signers.addr3.address()],
-    );
+    let seeded =
+        seed_with_genesis_parent(&provider, &[signers.addr1.address(), signers.addr3.address()]);
 
     // ── Header lookup (used by generator) ─────────────────────────
     let looked_up = provider
@@ -101,12 +96,12 @@ fn step3_seed_pattern_verifies_provider_serves_header_and_balance() {
 /// Step 4 — Signed-tx → fifo integration.
 ///
 /// Verifies that:
-/// 1. The `sign_legacy_transfer` fixture produces a syntactically-valid
-///    `TxEnvelope` whose recovered signer matches the sender
-/// 2. `PreconfTxSet::push_if_absent` accepts the signed tx + emits a
-///    broadcast event (the same event the fork's select! loop awaits)
-/// 3. The stored `TxEntry` carries the right hash / sender / nonce —
-///    the indices that `find_by_sender_nonce` / `find_by_hash` use
+/// 1. The `sign_legacy_transfer` fixture produces a syntactically-valid `TxEnvelope` whose
+///    recovered signer matches the sender
+/// 2. `PreconfTxSet::push_if_absent` accepts the signed tx + emits a broadcast event (the same
+///    event the fork's select! loop awaits)
+/// 3. The stored `TxEntry` carries the right hash / sender / nonce — the indices that
+///    `find_by_sender_nonce` / `find_by_hash` use
 ///
 /// Together these cover everything the **non-EVM** parts of the fork
 /// rely on. Verifying the actual EVM `apply_preconf_tx` call requires
@@ -119,8 +114,7 @@ async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
     use mantle_reth_preconf::{PreconfTxSet, types::PushResult};
     use reth_primitives_traits::SignedTransaction;
 
-    use fixtures::signer::sign_legacy_transfer;
-    use fixtures::signer::ADDR2;
+    use fixtures::signer::{ADDR2, sign_legacy_transfer};
 
     let signers = TestSigners::new();
     let tx = sign_legacy_transfer(
@@ -163,11 +157,10 @@ async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
 
     // The broadcast notification should be visible immediately
     // (PreconfTxSet's store-before-send ordering).
-    let broadcast_hash =
-        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
-            .await
-            .expect("broadcast event ready")
-            .expect("broadcast not closed");
+    let broadcast_hash = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+        .await
+        .expect("broadcast event ready")
+        .expect("broadcast not closed");
     assert_eq!(broadcast_hash, *tx.tx_hash());
 
     // ── (3) Stored entry carries correct indices ──────────────────
@@ -191,27 +184,26 @@ async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
 // seeded State<DB>. In the in-process MockEthProvider stack we cannot
 // realistically:
 //
-// - Seed the L1 block contract code + storage (would need to embed the
-//   compiled OP system contracts as test fixtures, ~50 KB each)
-// - Stand up a `BlockBuilder` over `MockEthProvider`'s state (the
-//   trait integration goes through ConfigurePostExecEvm which
-//   constructs a real `OpEvm` — needs production state-provider impl)
+// - Seed the L1 block contract code + storage (would need to embed the compiled OP system contracts
+//   as test fixtures, ~50 KB each)
+// - Stand up a `BlockBuilder` over `MockEthProvider`'s state (the trait integration goes through
+//   ConfigurePostExecEvm which constructs a real `OpEvm` — needs production state-provider impl)
 //
 // What WAS verified in this session (Step 1-4):
 // - Fork mode preserves type signatures (cli wiring compiles)
 // - Fifo state machine + responder ownership (109 lib unit tests)
 // - Dispatch closure invocation + branching (4 dispatch tests)
-// - PayloadJob future semantics + flashblock-prep watch handling
-//   (5 payload_job tests, candidate-A refactor)
+// - PayloadJob future semantics + flashblock-prep watch handling (5 payload_job tests, candidate-A
+//   refactor)
 // - Test harness fixture wiring (Step 2)
 // - Provider seed pattern (Step 3)
 // - Signing + fifo integration + tx conversion path (Step 4 — this commit)
 //
 // What remains for real EVM apply verification:
-// - Either: build a `BlockBuilder` over MockEthProvider with the
-//   missing system-contract seeds (significant, ~500-800 LoC fixture)
-// - Or: drop into devnet-level integration testing (P6.5 — outside
-//   P6 in-process scope per dev-plan)
+// - Either: build a `BlockBuilder` over MockEthProvider with the missing system-contract seeds
+//   (significant, ~500-800 LoC fixture)
+// - Or: drop into devnet-level integration testing (P6.5 — outside P6 in-process scope per
+//   dev-plan)
 //
 // The 6 `#[ignore]`d tests below remain as documented design intent
 // for that future work; their bodies are pre-fleshed unimplemented!()

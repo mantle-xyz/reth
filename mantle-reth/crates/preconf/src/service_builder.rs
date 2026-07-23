@@ -6,10 +6,10 @@
 //! optional [`Arc<PreconfJournal>`] — and exposes typed factories for
 //! the per-task handlers that consume them:
 //!
-//! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical-
-//!   state notifications and forward the fifo past sealed block nonces.
-//! - [`PreconfServiceBuilder::rpc_handler`] — to back the local
-//!   `eth_sendRawTransactionWithPreconf` entry on the sequencer node.
+//! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical- state notifications and
+//!   forward the fifo past sealed block nonces.
+//! - [`PreconfServiceBuilder::rpc_handler`] — to back the local `eth_sendRawTransactionWithPreconf`
+//!   entry on the sequencer node.
 //!
 //! Distinct from [`crate::payload_service_builder::MantlePreconfServiceBuilder`],
 //! which is a **reth node-builder trait impl** (`PayloadServiceBuilder`)
@@ -179,11 +179,7 @@ impl PreconfServiceBuilder {
     /// pool; the handler uses it to `remove_transactions` on hashes
     /// evicted by `PreconfTxSet::clean_reclaimable`, so a Timeout / Canceled preconf
     /// tx cannot land on chain after the client already saw `Timeout`.
-    pub fn canon_handler<Pr, P, N>(
-        &self,
-        provider: Pr,
-        pool: P,
-    ) -> PreconfCanonHandler<Pr, P, N>
+    pub fn canon_handler<Pr, P, N>(&self, provider: Pr, pool: P) -> PreconfCanonHandler<Pr, P, N>
     where
         Pr: CanonStateSubscriptions<Primitives = N> + 'static,
         P: TransactionPool + 'static,
@@ -374,10 +370,7 @@ mod tests {
             async fn contains(&self, _hash: &TxHash) -> bool {
                 false
             }
-            async fn add_envelope(
-                &self,
-                tx_rlp: &Bytes,
-            ) -> Result<RestoredEnvelope, String> {
+            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, String> {
                 self.add_calls.lock().unwrap().push(tx_rlp.clone());
                 // Fabricate a deterministic legacy envelope keyed off
                 // the first byte of the RLP so every restored entry

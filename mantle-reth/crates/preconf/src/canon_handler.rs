@@ -3,15 +3,12 @@
 //! Subscribes to a provider's [`CanonStateSubscriptions::canonical_state_stream`]
 //! and drives best-effort cleanups on committed / reverted chain events:
 //!
-//! - **Committed chain**: journals the sealed hashes (so the rejournal
-//!   loop can drop them on its next rotate tick) and runs
-//!   [`PreconfTxSet::clean_reclaimable`] to evict `Timeout` / `Canceled`
-//!   / `Failed` entries — three "not on chain" states that must not
-//!   linger on senders who never post another nonce. Evicted hashes
-//!   are then `remove_transactions`-ed from the pool so a preconf tx
-//!   that already surfaced a not-on-chain wire signal to the client
-//!   cannot silently land on chain later (which would corrupt
-//!   off-chain reconciliation).
+//! - **Committed chain**: journals the sealed hashes (so the rejournal loop can drop them on its
+//!   next rotate tick) and runs [`PreconfTxSet::clean_reclaimable`] to evict `Timeout` / `Canceled`
+//!   / `Failed` entries — three "not on chain" states that must not linger on senders who never
+//!   post another nonce. Evicted hashes are then `remove_transactions`-ed from the pool so a
+//!   preconf tx that already surfaced a not-on-chain wire signal to the client cannot silently land
+//!   on chain later (which would corrupt off-chain reconciliation).
 //!
 //!   **Nonce-frontier `forward()` moved out**: the per-sender fifo
 //!   forward that used to run here now runs synchronously at
@@ -23,16 +20,14 @@
 //!   double-counting `preconf_gas_used` in the fresh slot. Running the
 //!   forward from the PayloadJob prologue guarantees fifo consistency
 //!   with the parent block state before any dispatch decision.
-//! - **Reverted chain**: a reorg produces a warn log for every reverted
-//!   tx whose hash is tracked (journal `sealed` set when persistence is
-//!   enabled, fifo membership as fallback). This handler performs no
-//!   recovery action — reorg reinject is delegated to the reth pool's
-//!   own reset flow (`transaction-pool/src/maintain.rs` re-admits
-//!   pruned txs via `add_external_transactions`), which the preconf
-//!   pool listener picks up on the next new-pending event and pushes
-//!   into the fifo with `PreconfSource::Replay` (see the listener's
-//!   `journal.contains` check). The client-observed `block_height` may
-//!   drift for reorged commitments; op-geth has the same behavior.
+//! - **Reverted chain**: a reorg produces a warn log for every reverted tx whose hash is tracked
+//!   (journal `sealed` set when persistence is enabled, fifo membership as fallback). This handler
+//!   performs no recovery action — reorg reinject is delegated to the reth pool's own reset flow
+//!   (`transaction-pool/src/maintain.rs` re-admits pruned txs via `add_external_transactions`),
+//!   which the preconf pool listener picks up on the next new-pending event and pushes into the
+//!   fifo with `PreconfSource::Replay` (see the listener's `journal.contains` check). The
+//!   client-observed `block_height` may drift for reorged commitments; op-geth has the same
+//!   behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
 //! then spawned as a `spawn_critical_task` on the reth task executor.

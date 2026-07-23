@@ -5,22 +5,21 @@
 //! part the RPC handler owns — plus the op-geth-aligned persistence scope
 //! (design §5.9.1):
 //!
-//! - `rpc_success_appends_to_journal_file` — a live `eth_sendRawTransactionWithPreconf`
-//!   that returns `Success` must leave a matching `JournalEntry` on disk.
-//!   Guards `rpc.rs`'s `journal.append_promised` call + the on-disk format.
-//! - `listener_path_preconf_not_journaled` — a whitelisted tx admitted via
-//!   the **plain** `eth_sendRawTransaction` path (listener → fifo, no RPC
-//!   responder) lands on chain but must **not** be journaled. Guards the
-//!   "only RPC + Success is persisted" scope: the listener path has no
-//!   1:1 waiting client, so there is no commitment to protect.
+//! - `rpc_success_appends_to_journal_file` — a live `eth_sendRawTransactionWithPreconf` that
+//!   returns `Success` must leave a matching `JournalEntry` on disk. Guards `rpc.rs`'s
+//!   `journal.append_promised` call + the on-disk format.
+//! - `listener_path_preconf_not_journaled` — a whitelisted tx admitted via the **plain**
+//!   `eth_sendRawTransaction` path (listener → fifo, no RPC responder) lands on chain but must
+//!   **not** be journaled. Guards the "only RPC + Success is persisted" scope: the listener path
+//!   has no 1:1 waiting client, so there is no commitment to protect.
 //!
 //! Together these pin the write side end-to-end without needing to
 //! actually restart a process (the disk file is the observable boundary).
 
-use super::helpers::{mantle_test_chain_spec, send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::JournalEntry;
 use mantle_reth_rpc_ext::PreconfStatus;
@@ -51,10 +50,7 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 fn fresh_journal_path() -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "mantle-preconf-journal-write-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&dir).expect("mkdir journal dir");
     (dir.join("preconf.journal"), dir)
@@ -189,12 +185,8 @@ async fn listener_path_preconf_not_journaled() {
 
     // Sanity: the tx did land (so "not journaled" is a scope decision, not
     // a "tx dropped" artifact).
-    let sealed: Vec<B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&tx_hash),
         "listener-path whitelisted tx must land on chain; sealed={sealed:?}"

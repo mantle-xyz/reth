@@ -13,10 +13,10 @@
 //! landing on the next `no_tx_pool=false` build, NOT by forcing the
 //! tx into the derivation block.
 
-use super::helpers::{mantle_payload_attributes, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, mantle_payload_attributes};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, TxKind, U256};
+use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::JournalEntry;
 use reth_chainspec::EthChainSpec;
@@ -47,13 +47,12 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 ///
 /// Steps:
 /// 1. Pre-load journal with a single promised tx (nonce=0).
-/// 2. Launch node → journal restore pushes the tx into the fifo as
-///    `PreconfSource::Replay` (see `service_builder::start`).
+/// 2. Launch node → journal restore pushes the tx into the fifo as `PreconfSource::Replay` (see
+///    `service_builder::start`).
 /// 3. Drive a build with `no_tx_pool=true` payload attrs.
 /// 4. Assert the sealed block does **not** contain the promised tx.
-/// 5. Then drive a normal `no_tx_pool=false` build and assert the tx
-///    lands there — proves the entry was preserved, not consumed by
-///    the gated build.
+/// 5. Then drive a normal `no_tx_pool=false` build and assert the tx lands there — proves the entry
+///    was preserved, not consumed by the gated build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_tx_pool_gates_replay_source_entry() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -69,10 +68,7 @@ async fn no_tx_pool_gates_replay_source_entry() {
     // `restart_replay::journal_replay_lands_promised_tx_in_next_block`.
     let journal_dir = std::env::temp_dir().join(format!(
         "mantle-preconf-journal-notxpool-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");

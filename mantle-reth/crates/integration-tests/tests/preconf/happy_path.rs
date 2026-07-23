@@ -4,19 +4,18 @@
 //! scratch, submits a raw tx through `eth_sendRawTransactionWithPreconf`,
 //! and verifies:
 //!
-//! 1. the RPC response shape (`PreconfTxEvent { status, block_height,
-//!    receipt.logs, ... }`), and
+//! 1. the RPC response shape (`PreconfTxEvent { status, block_height, receipt.logs, ... }`), and
 //! 2. the resulting on-chain state after a single slot is advanced.
 
 use super::helpers::{
-    mantle_chain_spec_with_predeploys_for, mantle_test_chain_spec, send_preconf, PreconfCfgBuilder,
+    PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, mantle_test_chain_spec, send_preconf,
 };
 use crate::launch_preconf_node;
-use reth_chainspec::EthChainSpec;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_rpc_ext::PreconfStatus;
+use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 use reth_provider::StateProviderFactory;
 
@@ -49,8 +48,7 @@ async fn success_returns_receipt_and_lands_on_chain() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let sender = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg =
-        PreconfCfgBuilder::new().whitelist_from(sender).whitelist_to(recipient).build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(sender).whitelist_to(recipient).build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -69,8 +67,7 @@ async fn success_returns_receipt_and_lands_on_chain() {
         .expect("payload_id must be present when attributes are supplied");
 
     let http_clone = http.clone();
-    let rpc_task =
-        tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -82,10 +79,7 @@ async fn success_returns_receipt_and_lands_on_chain() {
         .expect("resolve_kind not cancelled")
         .expect("payload build must produce a sealed payload");
 
-    let event = rpc_task
-        .await
-        .expect("rpc task join")
-        .expect("preconf RPC must succeed");
+    let event = rpc_task.await.expect("rpc task join").expect("preconf RPC must succeed");
 
     assert!(
         matches!(event.status, PreconfStatus::Success),
@@ -125,14 +119,10 @@ async fn success_returns_receipt_and_lands_on_chain() {
 /// `multi_sender_land_in_one_block`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_nonce_same_sender_land_in_one_block() {
-
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -212,7 +202,6 @@ async fn multi_nonce_same_sender_land_in_one_block() {
 /// order in which the RPCs arrived (fifo across senders).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_sender_land_in_one_block() {
-
     let recipient: Address = RECIPIENT.parse().unwrap();
 
     let chain_id_for_addrs = mantle_test_chain_spec().chain().id();
@@ -307,7 +296,6 @@ async fn multi_sender_land_in_one_block() {
 /// the preconf pipeline and lands on chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn all_preconfs_mode_accepts_arbitrary_sender() {
-
     // No whitelist calls — validate `all_preconfs=true` skips the check.
     let cfg = PreconfCfgBuilder::new().all_preconfs().build();
 
@@ -395,10 +383,7 @@ async fn weth_transfer_over_balance_lands_as_reverted() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(WETH9)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(WETH9).build();
 
     let (mut node, http, wallet, chain_id) =
         launch_preconf_node!(cfg, mantle_chain_spec_with_predeploys_for(5000)).await;
@@ -423,10 +408,7 @@ async fn weth_transfer_over_balance_lands_as_reverted() {
             input: TransactionInput::new(calldata.into()),
             ..Default::default()
         };
-        TransactionTestContext::sign_tx(wallet.inner.clone(), request)
-            .await
-            .encoded_2718()
-            .into()
+        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
     };
     let expected_hash = alloy_primitives::keccak256(&raw_tx);
 
@@ -524,10 +506,7 @@ async fn weth_deposit_carries_log_through_to_receipt() {
 
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(WETH9)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(WETH9).build();
 
     let (mut node, http, wallet, chain_id) =
         launch_preconf_node!(cfg, mantle_chain_spec_with_predeploys_for(5000)).await;
@@ -545,10 +524,7 @@ async fn weth_deposit_carries_log_through_to_receipt() {
             input: TransactionInput::new(DEPOSIT_SELECTOR.to_vec().into()),
             ..Default::default()
         };
-        TransactionTestContext::sign_tx(wallet.inner.clone(), request)
-            .await
-            .encoded_2718()
-            .into()
+        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
     };
 
     let attrs = node.payload.next_attributes();
@@ -626,8 +602,7 @@ async fn weth_deposit_carries_log_through_to_receipt() {
         .expect("storage lookup")
         .unwrap_or_default();
     assert_eq!(
-        wallet_weth,
-        deposit_amount,
+        wallet_weth, deposit_amount,
         "WETH9.balanceOf[wallet] must equal the deposit amount post-canon; got {wallet_weth}",
     );
 }

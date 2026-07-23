@@ -9,18 +9,16 @@
 //! and no manual `rotate()` call.
 //!
 //! Coverage:
-//! - `size_triggered_rotation_drops_sealed_entry` — the cap is sized
-//!   between one and two journal entries. tx0 lands + is canon-sealed
-//!   while the file is still under the cap (nothing rotates it). tx1's
-//!   append then pushes the file over the cap, arming the size trigger
-//!   for the *first* time (so the rate limit's `min_gap` is irrelevant —
-//!   the first trigger is always honoured). The loop rotates, dropping the
-//!   sealed tx0 and keeping the still-unsealed tx1.
+//! - `size_triggered_rotation_drops_sealed_entry` — the cap is sized between one and two journal
+//!   entries. tx0 lands + is canon-sealed while the file is still under the cap (nothing rotates
+//!   it). tx1's append then pushes the file over the cap, arming the size trigger for the *first*
+//!   time (so the rate limit's `min_gap` is irrelevant — the first trigger is always honoured). The
+//!   loop rotates, dropping the sealed tx0 and keeping the still-unsealed tx1.
 
-use super::helpers::{mantle_test_chain_spec, send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, TxKind, U256};
+use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::JournalEntry;
 use mantle_reth_rpc_ext::PreconfStatus;
@@ -49,10 +47,7 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 fn fresh_journal_path() -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "mantle-preconf-journal-size-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&dir).expect("mkdir journal dir");
     (dir.join("preconf.journal"), dir)

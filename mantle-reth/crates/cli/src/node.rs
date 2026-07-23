@@ -9,16 +9,13 @@ use mantle_reth_preconf::{
     MantlePreconfServiceBuilder, PreconfAwareValidator, PreconfConfig, PreconfPoolListener,
     PreconfServiceBuilder, PreconfTxSet,
 };
-use reth_optimism_payload_builder::config::OpBuilderConfig;
 use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, PrimitivesTy, TxTy};
 use reth_node_builder::{
     BuilderContext, Node, NodeAdapter, NodeComponentsBuilder,
-    components::{
-        ComponentsBuilder, PoolBuilder, PoolBuilderConfigOverrides, TxPoolBuilder,
-    },
+    components::{ComponentsBuilder, PoolBuilder, PoolBuilderConfigOverrides, TxPoolBuilder},
     node::{FullNodeTypes, NodeTypes},
     rpc::BasicEngineValidatorBuilder,
 };
@@ -28,7 +25,7 @@ use reth_optimism_node::{
     OpAddOns, OpConsensusBuilder, OpExecutorBuilder, OpFullNodeTypes, OpNetworkBuilder,
     OpNodeTypes, args::RollupArgs, engine::OpEngineTypes, rpc::OpEthApiBuilder,
 };
-use reth_optimism_payload_builder::config::{OpDAConfig, OpGasLimitConfig};
+use reth_optimism_payload_builder::config::{OpBuilderConfig, OpDAConfig, OpGasLimitConfig};
 use reth_optimism_primitives::OpPrimitives;
 use reth_optimism_storage::OpStorage;
 use reth_optimism_txpool::{OpPool, OpPooledTransaction, OpPooledTx};
@@ -219,8 +216,10 @@ where
                     // Enforce `--rpc.txfeecap` for all RPC-submitted txs (op-geth parity);
                     // see MantleTransactionValidator docs for why this can't live in the
                     // inner (upstream) validator. Same config source as `set_tx_fee_cap` above.
-                    let mantle_validator =
-                        MantleTransactionValidator::new(op_validator, ctx.config().rpc.rpc_tx_fee_cap);
+                    let mantle_validator = MantleTransactionValidator::new(
+                        op_validator,
+                        ctx.config().rpc.rpc_tx_fee_cap,
+                    );
                     // Wrap with the preconf replacement/gas guard.
                     // `.map` takes `FnMut`; clone the Arcs on every call.
                     PreconfAwareValidator::new(
@@ -242,18 +241,14 @@ where
         // Run journal restore + wire the `EventPublisher` / `RestoredSet`
         // before any background pool task starts consuming events. Two
         // ordering constraints:
-        // - Must run before `spawn_maintenance_tasks` (which spawns
-        //   reth's local-tx backup loader) so the loader and the
-        //   restore path don't race on the pool mutex.
-        // - Must run before the pool listener is spawned so the restore
-        //   helper's fifo pushes are attributed to the restart path,
-        //   not to a fresh RPC submission.
+        // - Must run before `spawn_maintenance_tasks` (which spawns reth's local-tx backup loader)
+        //   so the loader and the restore path don't race on the pool mutex.
+        // - Must run before the pool listener is spawned so the restore helper's fifo pushes are
+        //   attributed to the restart path, not to a fresh RPC submission.
         if let Some(svc) = preconf_svc.as_ref() {
             use mantle_reth_preconf::RestorePoolAdapter;
             let adapter = RestorePoolAdapter::<_, T, TxTy<N::Types>>::new(transaction_pool.clone());
-            svc.start(&adapter)
-                .await
-                .map_err(|e| eyre::eyre!("preconf service start: {e:?}"))?;
+            svc.start(&adapter).await.map_err(|e| eyre::eyre!("preconf service start: {e:?}"))?;
             info!(target: "reth::cli", "Mantle preconf service builder started (restore + wire)");
         }
 
@@ -302,14 +297,12 @@ where
 /// At spawn time (`spawn_payload_builder_service`) the builder
 /// inspects `cfg.enabled`:
 ///
-/// - `true` (preconf enabled) — spawns the fork's
-///   [`PreconfPayloadBuilder`] with the shared `(cfg, fifo)` pair, wire
-///   publisher, select! loop, sweep-ticker quota, etc.
+/// - `true` (preconf enabled) — spawns the fork's [`PreconfPayloadBuilder`] with the shared `(cfg,
+///   fifo)` pair, wire publisher, select! loop, sweep-ticker quota, etc.
 /// - `false` (preconf disabled) — delegates to reth's upstream
-///   [`BasicPayloadServiceBuilder`]`<`[`OpPayloadBuilder`]`>`, giving
-///   byte-identical behavior to vanilla op-reth. Provides a rollback
-///   path if a fatal preconf-fork bug is discovered in production —
-///   omit `--preconf.enable` and the fork is bypassed at runtime.
+///   [`BasicPayloadServiceBuilder`]`<`[`OpPayloadBuilder`]`>`, giving byte-identical behavior to
+///   vanilla op-reth. Provides a rollback path if a fatal preconf-fork bug is discovered in
+///   production — omit `--preconf.enable` and the fork is bypassed at runtime.
 ///
 /// [`PreconfPayloadBuilder`]: mantle_reth_preconf::builder::payload_builder::PreconfPayloadBuilder
 /// [`BasicPayloadServiceBuilder`]: reth_node_builder::components::BasicPayloadServiceBuilder
@@ -477,8 +470,8 @@ where
             // was called during `components()`.
             let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
                 preconf.as_ref().map(|svc| {
-                    let canon = svc
-                        .canon_handler(ctx.node().provider().clone(), ctx.node().pool().clone());
+                    let canon =
+                        svc.canon_handler(ctx.node().provider().clone(), ctx.node().pool().clone());
                     ctx.node()
                         .task_executor()
                         .spawn_critical_task("mantle-preconf-canon-handler", canon.run());
@@ -510,9 +503,7 @@ where
                                 // so the process only exits after the
                                 // journal file has been closed cleanly.
                                 let guard = mantle_reth_preconf::run_rejournal_loop(
-                                    journal,
-                                    interval,
-                                    signal,
+                                    journal, interval, signal,
                                 )
                                 .await;
                                 // Explicit drop for clarity; the guard is
@@ -568,8 +559,7 @@ mod tests {
         // `with_preconf` must store the service builder reachable through
         // `self.preconf` so that `components()` / `add_ons()` can thread the
         // same Arc<cfg, fifo, journal> handles into all consumers.
-        let svc =
-            PreconfServiceBuilder::new(PreconfConfig::default()).expect("default validates");
+        let svc = PreconfServiceBuilder::new(PreconfConfig::default()).expect("default validates");
         let cfg_ptr = svc.cfg().clone();
         let fifo_ptr = svc.fifo().clone();
 

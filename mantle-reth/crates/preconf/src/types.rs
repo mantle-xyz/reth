@@ -48,8 +48,8 @@ use serde::{Deserialize, Serialize};
 /// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — they
 /// mean different things and are NOT connected by a direct mapping:
 /// - Fifo `Failed` = builder rejected pre-execute, tx NOT on chain
-/// - Wire `Failed` (see `mantle-reth-rpc-ext::PreconfStatus`) =
-///   `receipt.status == false` (revert / halt), tx IS on chain
+/// - Wire `Failed` (see `mantle-reth-rpc-ext::PreconfStatus`) = `receipt.status == false` (revert /
+///   halt), tx IS on chain
 ///
 /// The wire-layer status is derived by the RPC handler from the
 /// returned `PreconfReceipt.status` field, not from this enum.
@@ -68,13 +68,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// **Timeout vs Canceled vs Failed** — all three are "not on chain,
 /// reclaimable" but signal different causes to the client:
-/// - `Timeout` — the RPC handler's deadline elapsed. Client's request
-///   was accepted; server may or may not have run apply.
-/// - `Canceled` — the F1 pre-apply gate rejected the tx (e.g. block
-///   gas budget). Server explicitly declined; no EVM state change.
-/// - `Failed` — reth's block builder rejected pre-execute (in-flight
-///   nonce / balance race, block gas exhausted at builder level). tx
-///   NOT on chain; typically resolves on next slot.
+/// - `Timeout` — the RPC handler's deadline elapsed. Client's request was accepted; server may or
+///   may not have run apply.
+/// - `Canceled` — the F1 pre-apply gate rejected the tx (e.g. block gas budget). Server explicitly
+///   declined; no EVM state change.
+/// - `Failed` — reth's block builder rejected pre-execute (in-flight nonce / balance race, block
+///   gas exhausted at builder level). tx NOT on chain; typically resolves on next slot.
 ///
 /// SDKs retry all three the same way: same-hash resubmit is safe;
 /// `push_if_absent` revives the fifo entry back to `Waiting` and the
@@ -110,16 +109,15 @@ pub enum PreconfStatus {
 /// Origin of a preconf entry in the fifo. Determines which pre-apply
 /// gates apply during dispatch.
 ///
-/// - `Rpc` — pushed by the RPC handler on behalf of an active client
-///   session. Subject to the deadline and per-block gas budget gates so
-///   the client's SLA and server budget are both honored.
-/// - `Replay` — pushed to fulfill a commitment the sequencer has
-///   already promised to a client. Covers two triggers:
-///     - **Startup journal replay** (`restore_preconf_state`) — commitments
-///       persisted before a crash.
-///     - **Reorg reinject** — the pool re-admits a previously sealed tx
-///       after reorg; the pool listener detects the case via
-///       `journal.sealed` membership.
+/// - `Rpc` — pushed by the RPC handler on behalf of an active client session. Subject to the
+///   deadline and per-block gas budget gates so the client's SLA and server budget are both
+///   honored.
+/// - `Replay` — pushed to fulfill a commitment the sequencer has already promised to a client.
+///   Covers two triggers:
+///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
+///       crash.
+///     - **Reorg reinject** — the pool re-admits a previously sealed tx after reorg; the pool
+///       listener detects the case via `journal.sealed` membership.
 ///   In both cases the Mantle preconf SLA (*"once a receipt has been
 ///   returned to the client, the tx must land on chain"*) requires
 ///   these entries to **bypass** the deadline and per-block gas budget
@@ -216,7 +214,6 @@ pub enum MarkError {
     #[error("illegal transition from {0:?}")]
     IllegalTransition(PreconfStatus),
 }
-
 
 /// Top-level preconf error returned to RPC clients.
 ///
@@ -380,10 +377,7 @@ mod tests {
             status: true,
             logs: vec![Log {
                 address: Address::from([2; 20]),
-                data: LogData::new_unchecked(
-                    vec![B256::from([3; 32])],
-                    Bytes::from(vec![4, 5, 6]),
-                ),
+                data: LogData::new_unchecked(vec![B256::from([3; 32])], Bytes::from(vec![4, 5, 6])),
             }],
             gas_used: 21_000,
             reason: String::new(),
@@ -421,4 +415,3 @@ mod tests {
         assert_ne!(r, base);
     }
 }
-

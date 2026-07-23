@@ -13,19 +13,15 @@
 //! 3. Nonce-gap pre-check against `pending_nonce = max(on_chain_nonce,
 //!    pool.highest_consecutive(sender).nonce() + 1)`.
 //! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
-//!    [`TransactionPool::add_transaction`] — otherwise the listener could
-//!    push the entry and the builder could apply it before the responder
-//!    is registered, dropping the receipt.
-//! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash
-//!    retry path — if the fifo entry is in `Timeout`, atomically revive it
-//!    back to `Waiting` and re-notify the builder.
-//! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`].
-//!    On elapsed, return `Ok(Timeout event)` (op-geth-aligned) and clean
-//!    both the fifo entry CAS (`mark_timeout`) **and** any stale responder
-//!    (`cancel_responder`). The second call is mandatory because the
-//!    pool listener filters to `SubPool::Pending` — txs routed to
-//!    `BaseFee`/`Queued` never produce a fifo entry, so `mark_timeout`
-//!    returns `NotFound` and the responder would otherwise be stuck in
+//!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
+//!    builder could apply it before the responder is registered, dropping the receipt.
+//! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if the fifo
+//!    entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the builder.
+//! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return `Ok(Timeout
+//!    event)` (op-geth-aligned) and clean both the fifo entry CAS (`mark_timeout`) **and** any
+//!    stale responder (`cancel_responder`). The second call is mandatory because the pool listener
+//!    filters to `SubPool::Pending` — txs routed to `BaseFee`/`Queued` never produce a fifo entry,
+//!    so `mark_timeout` returns `NotFound` and the responder would otherwise be stuck in
 //!    `pending_responders`.
 
 use std::sync::Arc;
@@ -220,7 +216,9 @@ where
         tokio::pin!(deadline);
         let mut resp_rx = resp_rx;
 
-        let recv_result: Option<Result<Result<PreconfReceipt, PreconfError>, oneshot::error::RecvError>> = tokio::select! {
+        let recv_result: Option<
+            Result<Result<PreconfReceipt, PreconfError>, oneshot::error::RecvError>,
+        > = tokio::select! {
             biased;
             recv = &mut resp_rx => Some(recv),
             _ = &mut deadline => None,
@@ -232,8 +230,8 @@ where
             // single record).
             Some(Ok(Ok(receipt))) => {
                 let event = PreconfTxEvent::from(receipt);
-                if matches!(event.status, WireStatus::Success)
-                    && let Some(journal) = self.journal.as_ref()
+                if matches!(event.status, WireStatus::Success) &&
+                    let Some(journal) = self.journal.as_ref()
                 {
                     let entry = JournalEntry {
                         hash,
@@ -303,8 +301,8 @@ where
                         match resp_rx.try_recv() {
                             Ok(Ok(receipt)) => {
                                 let event = PreconfTxEvent::from(receipt);
-                                if matches!(event.status, WireStatus::Success)
-                                    && let Some(journal) = self.journal.as_ref()
+                                if matches!(event.status, WireStatus::Success) &&
+                                    let Some(journal) = self.journal.as_ref()
                                 {
                                     let entry = JournalEntry {
                                         hash,

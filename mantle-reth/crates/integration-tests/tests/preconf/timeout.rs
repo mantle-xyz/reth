@@ -1,35 +1,29 @@
 //! Preconf `Timeout` state-machine semantics.
 //!
-//! - `deadline_elapsed_returns_timeout_and_evicts_pool` — RPC-layer
-//!   deadline fires, tx flipped to `Timeout` and evicted from pool
-//!   (R3/SLA-1); subsequent build must not include it.
-//! - `timeout_recovered_by_same_hash_resubmit` — same-hash retry after
-//!   Timeout revives the fifo entry (`push_if_absent`'s reclaimable
-//!   branch) and the tx lands on the next build.
-//! - `dispatch_safety_margin_marks_timeout_before_apply` — dispatch-
-//!   layer preemptive timeout (40ms SAFETY_MARGIN before the SLA
-//!   deadline) fires from within `apply_one_preconf`, surfacing as
+//! - `deadline_elapsed_returns_timeout_and_evicts_pool` — RPC-layer deadline fires, tx flipped to
+//!   `Timeout` and evicted from pool (R3/SLA-1); subsequent build must not include it.
+//! - `timeout_recovered_by_same_hash_resubmit` — same-hash retry after Timeout revives the fifo
+//!   entry (`push_if_absent`'s reclaimable branch) and the tx lands on the next build.
+//! - `dispatch_safety_margin_marks_timeout_before_apply` — dispatch- layer preemptive timeout (40ms
+//!   SAFETY_MARGIN before the SLA deadline) fires from within `apply_one_preconf`, surfacing as
 //!   `Err(Call)` at the wire (distinct from RPC-layer `Ok(Timeout)`).
 //!
-//! - `race_resolution_returns_success_when_apply_completes_after_deadline`
-//!   — RPC deadline fires while dispatch is mid-apply; `rpc.rs`'s
-//!   `lock_for_apply` + `try_recv` fallback harvests the receipt so
-//!   the client sees `Success`. Exercises the branch by disabling
-//!   `safety_margin` (which would otherwise preemptively abort
-//!   dispatch and hide the race).
-//! - `basefee_orphan_returns_timeout_and_clears_responder` — tx routed
-//!   to the pool's `BaseFee` sub-pool never enters the fifo (listener
-//!   only subscribes to `Pending`); RPC deadline fires with
-//!   `final_status == None` and hits `mark_timeout`'s `NotFound`
-//!   fallback, but must still clear `pending_responders` so a same-
-//!   hash resubmit is not permanently wedged with `AlreadyInProgress`.
+//! - `race_resolution_returns_success_when_apply_completes_after_deadline` — RPC deadline fires
+//!   while dispatch is mid-apply; `rpc.rs`'s `lock_for_apply` + `try_recv` fallback harvests the
+//!   receipt so the client sees `Success`. Exercises the branch by disabling `safety_margin` (which
+//!   would otherwise preemptively abort dispatch and hide the race).
+//! - `basefee_orphan_returns_timeout_and_clears_responder` — tx routed to the pool's `BaseFee`
+//!   sub-pool never enters the fifo (listener only subscribes to `Pending`); RPC deadline fires
+//!   with `final_status == None` and hits `mark_timeout`'s `NotFound` fallback, but must still
+//!   clear `pending_responders` so a same- hash resubmit is not permanently wedged with
+//!   `AlreadyInProgress`.
 //!
 //! Timeout entry releasing the `(sender, nonce)` slot for a differently-
 //! signed tx is a **replacement** semantic and lives in
 //! `replacement.rs`. Pre-fifo synchronous rejection paths (nonce gap,
 //! whitelist, per-tx gas cap) live in `validation_reject.rs`.
 
-use super::helpers::{send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
@@ -59,8 +53,8 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 ///
 /// Send a whitelisted preconf tx but never trigger an FCU. The
 /// responder is parked; after `preconf_timeout` the RPC handler:
-/// 1. flips the fifo entry to `Timeout` (or reports `NotFound` when
-///    the pool listener routed the tx to `BaseFee` / `Queued`),
+/// 1. flips the fifo entry to `Timeout` (or reports `NotFound` when the pool listener routed the tx
+///    to `BaseFee` / `Queued`),
 /// 2. cancels the pending responder, and
 /// 3. returns `Ok(PreconfTxEvent { status: Timeout, receipt.logs: None, ... })`.
 ///
@@ -84,9 +78,9 @@ async fn deadline_elapsed_returns_timeout_and_evicts_pool() {
     let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
     let expected_hash = alloy_primitives::keccak256(&raw_tx);
     let start = std::time::Instant::now();
-    let event = send_preconf(&http, raw_tx).await.expect(
-        "timeout must surface as Ok(Timeout event), not as a jsonrpsee error",
-    );
+    let event = send_preconf(&http, raw_tx)
+        .await
+        .expect("timeout must surface as Ok(Timeout event), not as a jsonrpsee error");
     let elapsed = start.elapsed();
 
     assert!(
@@ -115,10 +109,10 @@ async fn deadline_elapsed_returns_timeout_and_evicts_pool() {
 
     // SLA guard: "wire Timeout ⇒ this tx MUST NOT land on chain".
     // Two mechanisms combine to enforce this:
-    //   1. `mark_timeout` synchronously evicts the tx from the pool via
-    //      the pool-eviction callback registered by the service builder.
-    //   2. `replay_fifo_carryover` skips `Timeout` entries in subsequent
-    //      builds so the preconf arm cannot resurrect the tx either.
+    //   1. `mark_timeout` synchronously evicts the tx from the pool via the pool-eviction callback
+    //      registered by the service builder.
+    //   2. `replay_fifo_carryover` skips `Timeout` entries in subsequent builds so the preconf arm
+    //      cannot resurrect the tx either.
     // If either regresses, the pool arm here would pack the stale tx and
     // violate the client's "not-landing" contract.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -351,9 +345,9 @@ async fn race_resolution_returns_success_when_apply_completes_after_deadline() {
 ///
 /// **Wire signature is different from the RPC-layer Timeout**:
 /// - RPC layer fires → `Ok(PreconfTxEvent { status: Timeout, ... })`
-/// - Dispatch layer fires → `cancel_responder(Err(TimeoutError))`
-///   flows back through `handle_inner`'s `Ok(Ok(Err(err)))` arm →
-///   client sees `Err(Call)` with a typed `PreconfError::Timeout`.
+/// - Dispatch layer fires → `cancel_responder(Err(TimeoutError))` flows back through
+///   `handle_inner`'s `Ok(Ok(Err(err)))` arm → client sees `Err(Call)` with a typed
+///   `PreconfError::Timeout`.
 ///
 /// Setup: `preconf_timeout = 200ms`. Spawn the RPC and sleep 165ms —
 /// dispatch is delayed by not starting a build until then. When the
@@ -416,9 +410,8 @@ async fn dispatch_safety_margin_marks_timeout_before_apply() {
     // Wire signature: SAFETY_MARGIN closes the responder with an Err,
     // NOT with an Ok(Timeout event). Distinguishes from the RPC-layer
     // deadline path (`deadline_elapsed_returns_timeout_and_evicts_pool`).
-    let err = outcome.expect_err(
-        "SAFETY_MARGIN dispatch abort must surface as Err(Call), not Ok(TimeoutEvent)",
-    );
+    let err = outcome
+        .expect_err("SAFETY_MARGIN dispatch abort must surface as Err(Call), not Ok(TimeoutEvent)");
     match err {
         ClientError::Call(ref e) => {
             let msg = e.message().to_lowercase();
@@ -500,10 +493,7 @@ async fn basefee_orphan_returns_timeout_and_clears_responder() {
             input: TransactionInput::default(),
             ..Default::default()
         };
-        TransactionTestContext::sign_tx(wallet.inner.clone(), request)
-            .await
-            .encoded_2718()
-            .into()
+        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
     };
 
     // First call: sub-basefee routing → orphan timeout path.
@@ -526,10 +516,7 @@ async fn basefee_orphan_returns_timeout_and_clears_responder() {
             // an `underpriced` / `fee cap below base fee` error, which
             // is a different (also legitimate) rejection path. If that
             // happens, this test doesn't apply — bail out with a note.
-            if msg.contains("underpriced")
-                || msg.contains("base fee")
-                || msg.contains("fee cap")
-            {
+            if msg.contains("underpriced") || msg.contains("base fee") || msg.contains("fee cap") {
                 eprintln!(
                     "SKIP: pool validator rejected sub-basefee tx synchronously with '{}' — \
                      BaseFee orphan path is not reachable via this fee-cap approach on this build",

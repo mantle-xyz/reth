@@ -203,9 +203,7 @@ pub enum PreconfConfigError {
     InvalidSlotDuration,
     /// `sweep_interval > slot_duration` — a single tick would exceed the
     /// entire slot, making the time-proportional pool quota meaningless.
-    #[error(
-        "sweep_interval ({sweep:?}) must be <= slot_duration ({slot:?})"
-    )]
+    #[error("sweep_interval ({sweep:?}) must be <= slot_duration ({slot:?})")]
     SweepIntervalExceedsSlot {
         /// Configured sweep interval.
         sweep: Duration,
@@ -231,7 +229,9 @@ pub enum PreconfConfigError {
     /// is false and `from_preconfs` is empty, meaning [`PreconfConfig::is_preconf_tx`]
     /// would return false for every tx. Spawning the pool listener / journal
     /// / canon handler in this state burns resources for no functional effect.
-    #[error("preconf enabled but no eligibility rules: set all_preconfs=true or populate from_preconfs")]
+    #[error(
+        "preconf enabled but no eligibility rules: set all_preconfs=true or populate from_preconfs"
+    )]
     EnabledWithoutEligibility,
 }
 
@@ -309,9 +309,9 @@ impl PreconfConfig {
         // set on either side makes every tx fail the check. `enabled=true` in
         // that state would spawn pool listener / journal / canon handler for
         // zero functional effect.
-        if self.enabled
-            && !self.all_preconfs
-            && (self.from_preconfs.is_empty() || self.to_preconfs.is_empty())
+        if self.enabled &&
+            !self.all_preconfs &&
+            (self.from_preconfs.is_empty() || self.to_preconfs.is_empty())
         {
             return Err(PreconfConfigError::EnabledWithoutEligibility);
         }
@@ -468,10 +468,7 @@ mod tests {
         let mut cfg = PreconfConfig::default();
         cfg.slot_duration = Duration::from_millis(500);
         cfg.sweep_interval = Duration::from_millis(600);
-        assert!(matches!(
-            cfg.validate(),
-            Err(PreconfConfigError::SweepIntervalExceedsSlot { .. })
-        ));
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::SweepIntervalExceedsSlot { .. })));
     }
 
     #[test]
@@ -514,10 +511,7 @@ mod tests {
         // spawn background tasks for zero functional effect.
         let mut cfg = PreconfConfig::default();
         cfg.enabled = true;
-        assert!(matches!(
-            cfg.validate(),
-            Err(PreconfConfigError::EnabledWithoutEligibility)
-        ));
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::EnabledWithoutEligibility)));
     }
 
     #[test]
@@ -529,10 +523,7 @@ mod tests {
         cfg.enabled = true;
         cfg.from_preconfs.insert(addr(1));
         // to_preconfs left empty.
-        assert!(matches!(
-            cfg.validate(),
-            Err(PreconfConfigError::EnabledWithoutEligibility)
-        ));
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::EnabledWithoutEligibility)));
     }
 
     #[test]
@@ -541,10 +532,7 @@ mod tests {
         let mut cfg = PreconfConfig::default();
         cfg.enabled = true;
         cfg.to_preconfs.insert(addr(2));
-        assert!(matches!(
-            cfg.validate(),
-            Err(PreconfConfigError::EnabledWithoutEligibility)
-        ));
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::EnabledWithoutEligibility)));
     }
 
     #[test]

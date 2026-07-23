@@ -7,19 +7,17 @@
 //!
 //! Module layout:
 //!
-//! - [`payload_builder`] — the fork itself: struct + `async
-//!   build_payload` (deposits → sequencer txs → preconf select! loop
-//!   → SDM post-exec → finalize).
-//! - [`dispatch`] — the select! loop's per-event helpers
-//!   (`apply_one_preconf` + `reconcile_lagged`), separated so the
-//!   state-machine invariants are unit-testable without standing up
-//!   the full EVM stack.
+//! - [`payload_builder`] — the fork itself: struct + `async build_payload` (deposits → sequencer
+//!   txs → preconf select! loop → SDM post-exec → finalize).
+//! - [`dispatch`] — the select! loop's per-event helpers (`apply_one_preconf` +
+//!   `reconcile_lagged`), separated so the state-machine invariants are unit-testable without
+//!   standing up the full EVM stack.
 //! - [`payload_job`] — `PreconfPayloadJob` implementing reth's
 //!   [`PayloadJob`](reth_payload_builder::PayloadJob) trait.
-//! - [`payload_job_generator`] — `PreconfPayloadJobGenerator`
-//!   implementing reth's [`PayloadJobGenerator`](reth_payload_builder::PayloadJobGenerator) trait.
-//! - [`cancel`] — `JobCancel`, the async-aware cancel signal shared
-//!   between the job and the spawned build task.
+//! - [`payload_job_generator`] — `PreconfPayloadJobGenerator` implementing reth's
+//!   [`PayloadJobGenerator`](reth_payload_builder::PayloadJobGenerator) trait.
+//! - [`cancel`] — `JobCancel`, the async-aware cancel signal shared between the job and the spawned
+//!   build task.
 
 pub mod cancel;
 pub(crate) mod dispatch;

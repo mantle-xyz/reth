@@ -9,22 +9,19 @@
 //!
 //! Coverage:
 //!
-//! - `preconf_eligible_regular_sendtx_still_lands` — matches predicate,
-//!   pool arm skips, preconf arm applies.
-//! - `non_preconf_eligible_regular_sendtx_lands_via_pool_arm` — does
-//!   NOT match predicate, gate is a no-op, tx lands through the
-//!   vanilla pool best-tx iterator. Guards against a regression where
-//!   the gate accidentally rejects all pool-path txs on a preconf-
-//!   enabled node.
-//! - `preconf_and_pool_txs_coexist_in_one_block` — a preconf-RPC tx and
-//!   a regular-sendTx tx (from independent senders) target the same
-//!   slot; both land in that block, and the `select!`-biased preconf
-//!   arm ensures the preconf tx precedes the pool-arm tx.
+//! - `preconf_eligible_regular_sendtx_still_lands` — matches predicate, pool arm skips, preconf arm
+//!   applies.
+//! - `non_preconf_eligible_regular_sendtx_lands_via_pool_arm` — does NOT match predicate, gate is a
+//!   no-op, tx lands through the vanilla pool best-tx iterator. Guards against a regression where
+//!   the gate accidentally rejects all pool-path txs on a preconf- enabled node.
+//! - `preconf_and_pool_txs_coexist_in_one_block` — a preconf-RPC tx and a regular-sendTx tx (from
+//!   independent senders) target the same slot; both land in that block, and the `select!`-biased
+//!   preconf arm ensures the preconf tx precedes the pool-arm tx.
 
 use super::helpers::PreconfCfgBuilder;
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
@@ -59,10 +56,7 @@ async fn preconf_eligible_regular_sendtx_still_lands() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
     let (mut node, _http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -96,11 +90,8 @@ async fn preconf_eligible_regular_sendtx_still_lands() {
 
     let block = payload.block();
     assert_eq!(block.number, 1);
-    let sealed: Vec<B256> = block
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        block.body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&tx_hash),
         "preconf-eligible tx submitted via regular sendRawTransaction must still land \
@@ -124,10 +115,8 @@ async fn non_preconf_eligible_regular_sendtx_lands_via_pool_arm() {
     // on the from-list, and RECIPIENT is not on the to-list ⇒
     // `is_preconf_tx` returns false for the tx below ⇒ pool arm handles it.
     let placeholder = Address::from([0xFE; 20]);
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(placeholder)
-        .whitelist_to(placeholder)
-        .build();
+    let cfg =
+        PreconfCfgBuilder::new().whitelist_from(placeholder).whitelist_to(placeholder).build();
 
     let (mut node, _http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -164,11 +153,8 @@ async fn non_preconf_eligible_regular_sendtx_lands_via_pool_arm() {
         .expect("payload build");
 
     let block = payload.block();
-    let sealed: Vec<B256> = block
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        block.body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&tx_hash),
         "non-preconf-eligible tx must land through the pool arm; \
@@ -235,10 +221,7 @@ async fn preconf_and_pool_txs_coexist_in_one_block() {
             input: TransactionInput::default(),
             ..Default::default()
         };
-        TransactionTestContext::sign_tx(pool_sender_signer, request)
-            .await
-            .encoded_2718()
-            .into()
+        TransactionTestContext::sign_tx(pool_sender_signer, request).await.encoded_2718().into()
     };
     let pool_hash: B256 = node.rpc.inject_tx(pool_tx).await.expect("pool sendTx accepted");
 
@@ -265,12 +248,8 @@ async fn preconf_and_pool_txs_coexist_in_one_block() {
     let event = rpc_task.await.expect("rpc join").expect("preconf tx must succeed");
     assert_eq!(event.tx_hash, preconf_hash);
 
-    let sealed: Vec<B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     let idx_preconf = sealed
         .iter()
         .position(|h| *h == preconf_hash)

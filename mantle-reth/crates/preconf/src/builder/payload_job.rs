@@ -4,16 +4,13 @@
 //! The build runs on a separately-spawned tokio task; this job is just
 //! the read-side handle the payload service polls:
 //!
-//! - **`best_payload()`**: reads the latest payload from a `watch`
-//!   receiver (set once by the build task when it finishes). Returns
-//!   `MissingPayload` until the build completes.
+//! - **`best_payload()`**: reads the latest payload from a `watch` receiver (set once by the build
+//!   task when it finishes). Returns `MissingPayload` until the build completes.
 //! - **`payload_attributes()`**: clones the cached attributes — no I/O.
-//! - **`resolve_kind()`**: signals the build task's cancel + returns a
-//!   future that resolves to the final payload (or `MissingPayload`
-//!   if the build errored out and the sender dropped).
-//! - **`Future` impl**: returns `Pending` until cancel fires, then
-//!   `Ready(Ok(()))` — matches reth's contract that the job future
-//!   resolves on completion, not on payload availability.
+//! - **`resolve_kind()`**: signals the build task's cancel + returns a future that resolves to the
+//!   final payload (or `MissingPayload` if the build errored out and the sender dropped).
+//! - **`Future` impl**: returns `Pending` until cancel fires, then `Ready(Ok(()))` — matches reth's
+//!   contract that the job future resolves on completion, not on payload availability.
 //!
 //! Concretely the read side is one [`tokio::sync::watch::Receiver`]
 //! initialised with `None`. The build task sends `Some(payload)` on
@@ -161,10 +158,7 @@ where
     type BuiltPayload = Payload;
 
     fn best_payload(&self) -> Result<Self::BuiltPayload, PayloadBuilderError> {
-        self.payload_rx
-            .borrow()
-            .clone()
-            .ok_or(PayloadBuilderError::MissingPayload)
+        self.payload_rx.borrow().clone().ok_or(PayloadBuilderError::MissingPayload)
     }
 
     fn payload_attributes(&self) -> Result<Self::PayloadAttributes, PayloadBuilderError> {
@@ -199,16 +193,13 @@ where
 /// "return first `Some`" was almost-always equivalent. But it has
 /// two latent issues:
 ///
-/// 1. **Race window** in the single-set case: if the receiver polls
-///    before the spawned task sends, then sees `None`, then polls
-///    again right after the send but before the task exits, the
-///    "first `Some`" returns immediately. That's fine for single-set
-///    but **wrong for flashblocks**, where the sender will set
-///    intermediate flashblock payloads — "first `Some`" would return
-///    a mid-build snapshot instead of the final block.
-/// 2. **Semantic mismatch**: `resolve_kind` is called when the CL asks
-///    for the *finished* payload. We should wait for the build to
-///    actually complete (sender drop), not opportunistically grab
+/// 1. **Race window** in the single-set case: if the receiver polls before the spawned task sends,
+///    then sees `None`, then polls again right after the send but before the task exits, the "first
+///    `Some`" returns immediately. That's fine for single-set but **wrong for flashblocks**, where
+///    the sender will set intermediate flashblock payloads — "first `Some`" would return a
+///    mid-build snapshot instead of the final block.
+/// 2. **Semantic mismatch**: `resolve_kind` is called when the CL asks for the *finished* payload.
+///    We should wait for the build to actually complete (sender drop), not opportunistically grab
 ///    whatever's in the cell.
 ///
 /// New semantic (forward-compatible with flashblocks): loop on
@@ -228,10 +219,11 @@ pub struct ResolvePayloadFuture<Payload> {
 impl<Payload> ResolvePayloadFuture<Payload>
 where
     // `Sync` is needed because the async block holds a
-    // `watch::Receiver` whose `borrow()` returns a `Ref<'_, T>` —
-    // crossing `.await` requires `T: Sync`. The future itself must
-    // also be `Send`, which transitively requires
-    // `Receiver<Option<Payload>>: Send`.
+    // `watch::Receiver` whose `borrow()` returns a `Ref<'_,
+    // T>` — crossing `.await` requires `T: Sync`. The
+    // future itself must also be `Send`, which
+    // transitively requires `Receiver<Option<Payload>>:
+    // Send`.
     Payload: Clone + Send + Sync + 'static,
 {
     /// Build a future that resolves when the build task drops its
@@ -252,10 +244,7 @@ where
                 // emit more (flashblocks) or be finishing finalize.
             }
             // Sender dropped — read whatever's in the cell.
-            payload_rx
-                .borrow()
-                .clone()
-                .ok_or(PayloadBuilderError::MissingPayload)
+            payload_rx.borrow().clone().ok_or(PayloadBuilderError::MissingPayload)
         };
         Self { inner: Box::pin(fut) }
     }
@@ -435,10 +424,7 @@ mod tests {
         // at ~60ms). If it does, that means the future returned early
         // on first Some — the old buggy semantic.
         let early = tokio::time::timeout(Duration::from_millis(30), fut).await;
-        assert!(
-            early.is_err(),
-            "future resolved before sender dropped — wrong semantic"
-        );
+        assert!(early.is_err(), "future resolved before sender dropped — wrong semantic");
         let _ = send_then_hold.await;
     }
 }

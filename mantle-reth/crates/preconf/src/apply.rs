@@ -26,12 +26,11 @@ use reth_revm::context::result::ExecutionResult;
 /// commits — see reth-evm `crates/evm/evm/src/execute.rs:334-344`).
 ///
 /// Errors:
-/// - [`PreconfError::BuilderRejected`] — the EVM rejected the transaction
-///   (signature / nonce / balance / etc.). State is left unchanged.
-/// - [`PreconfError::Internal`] — the closure was somehow never invoked. This
-///   should not happen with a correctly-implemented `BlockBuilder`, but the
-///   trait signature does not guarantee single-shot invocation, so we
-///   defensively surface this as `Internal` rather than `panic!`.
+/// - [`PreconfError::BuilderRejected`] — the EVM rejected the transaction (signature / nonce /
+///   balance / etc.). State is left unchanged.
+/// - [`PreconfError::Internal`] — the closure was somehow never invoked. This should not happen
+///   with a correctly-implemented `BlockBuilder`, but the trait signature does not guarantee
+///   single-shot invocation, so we defensively surface this as `Internal` rather than `panic!`.
 pub fn apply_preconf_tx<B>(
     builder: &mut B,
     tx: impl ExecutorTx<B::Executor>,
@@ -229,11 +228,7 @@ mod tests {
             output: Bytes::from_static(&hex!("08c379a0")),
         };
         let r = build_receipt(h(2), 100, &result);
-        assert!(
-            r.logs.is_empty(),
-            "EIP-658 requires failed receipts drop logs; got {:?}",
-            r.logs
-        );
+        assert!(r.logs.is_empty(), "EIP-658 requires failed receipts drop logs; got {:?}", r.logs);
         assert!(!r.status);
     }
 
@@ -362,11 +357,8 @@ mod tests {
              0000000000000000000000000000000000000000000000000000000000000004\
              626f6f6d00000000000000000000000000000000000000000000000000000000"
         ));
-        let result: ExecutionResult<HaltReason> = ExecutionResult::Revert {
-            gas: gas(30_000),
-            logs: vec![],
-            output: payload.clone(),
-        };
+        let result: ExecutionResult<HaltReason> =
+            ExecutionResult::Revert { gas: gas(30_000), logs: vec![], output: payload.clone() };
         let r = build_receipt(h(2), 100, &result);
 
         // Full payload preserved (structural check, not just length).
@@ -395,11 +387,8 @@ mod tests {
             HaltReason::StackUnderflow,
             HaltReason::PrecompileError,
         ] {
-            let result: ExecutionResult<HaltReason> = ExecutionResult::Halt {
-                reason: reason.clone(),
-                gas: gas(50_000),
-                logs: vec![],
-            };
+            let result: ExecutionResult<HaltReason> =
+                ExecutionResult::Halt { reason: reason.clone(), gas: gas(50_000), logs: vec![] };
             let r = build_receipt(h(3), 200, &result);
             assert!(!r.status, "halt ⇒ status false");
             assert!(!r.reason.is_empty(), "halt reason string must be non-empty for {reason:?}");

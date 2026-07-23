@@ -5,22 +5,21 @@
 //! slot: the next-nonce tx from the same sender is admitted, applied and
 //! lands in the following block. Coverage:
 //!
-//! - `canon_commit_permits_next_nonce_from_same_sender` — base case:
-//!   single nonce lands + canon → next nonce lands in next block.
-//! - `canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot` —
-//!   multi-nonce batch (0/1/2) in slot 1 canon'd → nonce=3 lands in
-//!   slot 2. Guards `sync_fifo_forward_to_head`'s multi-nonce forward.
-//! - `canon_does_not_leak_across_senders` — sender A's canon does not
-//!   affect sender B's fresh submission. Guards per-sender scoping.
-//! - `canon_across_sequential_slots_forwards_on_every_new_job` —
-//!   nonce 0/1/2 across three separate slots; each canon runs
-//!   `sync_fifo_forward_to_head` afresh. Guards against a caching bug
-//!   that would skip forward after the first PayloadJob.
+//! - `canon_commit_permits_next_nonce_from_same_sender` — base case: single nonce lands + canon →
+//!   next nonce lands in next block.
+//! - `canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot` — multi-nonce batch (0/1/2) in
+//!   slot 1 canon'd → nonce=3 lands in slot 2. Guards `sync_fifo_forward_to_head`'s multi-nonce
+//!   forward.
+//! - `canon_does_not_leak_across_senders` — sender A's canon does not affect sender B's fresh
+//!   submission. Guards per-sender scoping.
+//! - `canon_across_sequential_slots_forwards_on_every_new_job` — nonce 0/1/2 across three separate
+//!   slots; each canon runs `sync_fifo_forward_to_head` afresh. Guards against a caching bug that
+//!   would skip forward after the first PayloadJob.
 
-use super::helpers::{send_preconf, PreconfCfgBuilder};
+use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
@@ -50,10 +49,7 @@ async fn canon_commit_permits_next_nonce_from_same_sender() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -134,16 +130,10 @@ async fn canon_commit_permits_next_nonce_from_same_sender() {
 
     let block = payload.block();
     assert_eq!(block.number, 2);
-    let sealed: Vec<B256> = block
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        block.body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(sealed.contains(&event.tx_hash), "block 2 must contain the nonce=1 tx");
-    assert!(
-        !sealed.contains(&hash0),
-        "block 2 must not re-include the already-canon nonce=0 tx",
-    );
+    assert!(!sealed.contains(&hash0), "block 2 must not re-include the already-canon nonce=0 tx",);
 }
 
 /// Multi-nonce batch canon: same sender lands nonces 0/1/2 in slot 1,
@@ -161,10 +151,7 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -211,17 +198,10 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
     let _ = t1.await.expect("t1 join").expect("tx1 must succeed");
     let _ = t2.await.expect("t2 join").expect("tx2 must succeed");
 
-    let sealed_1: Vec<B256> = payload_1
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed_1: Vec<B256> =
+        payload_1.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     for (label, h) in [("nonce=0", hash0), ("nonce=1", hash1), ("nonce=2", hash2)] {
-        assert!(
-            sealed_1.contains(&h),
-            "slot 1 must contain {label}; sealed={sealed_1:?}",
-        );
+        assert!(sealed_1.contains(&h), "slot 1 must contain {label}; sealed={sealed_1:?}",);
     }
 
     let new_head = node.submit_payload(payload_1).await.expect("submit_payload");
@@ -264,12 +244,8 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
     );
     assert_eq!(event.block_height, 2, "nonce=3 must predict block 2");
 
-    let sealed_2: Vec<B256> = payload_2
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed_2: Vec<B256> =
+        payload_2.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(sealed_2.contains(&event.tx_hash), "block 2 must contain nonce=3");
     // Slot 1's fully-sealed nonces must NOT reappear in block 2. Guards
     // against a `sync_fifo_forward_to_head` regression that fails to
@@ -303,8 +279,7 @@ async fn canon_does_not_leak_across_senders() {
     // whitelist config, then we re-derive signers with the launched
     // chain_id for actual signing (see happy_path::multi_sender_land_in_one_block).
     let chain_id_for_addrs = mantle_test_chain_spec().chain().id();
-    let signers_for_addr =
-        Wallet::new(3).with_chain_id(chain_id_for_addrs).wallet_gen();
+    let signers_for_addr = Wallet::new(3).with_chain_id(chain_id_for_addrs).wallet_gen();
     let sender_a_addr = signers_for_addr[0].address();
     // signers[1] collides with RECIPIENT; skip and use [2] as sender B.
     let sender_b_addr = signers_for_addr[2].address();
@@ -348,12 +323,8 @@ async fn canon_does_not_leak_across_senders() {
         .expect("payload 1");
     let _ = rpc_a.await.expect("rpc_a join").expect("A must succeed");
 
-    let sealed_1: Vec<B256> = payload_1
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed_1: Vec<B256> =
+        payload_1.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(sealed_1.contains(&hash_a), "sender A's tx must land in slot 1");
 
     let new_head = node.submit_payload(payload_1).await.expect("submit_payload");
@@ -411,16 +382,9 @@ async fn canon_does_not_leak_across_senders() {
     );
     assert_eq!(event_b.block_height, 2);
 
-    let sealed_2: Vec<B256> = payload_2
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
-    assert!(
-        sealed_2.contains(&hash_b),
-        "block 2 must contain sender B's tx; sealed={sealed_2:?}",
-    );
+    let sealed_2: Vec<B256> =
+        payload_2.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(sealed_2.contains(&hash_b), "block 2 must contain sender B's tx; sealed={sealed_2:?}",);
     assert!(
         !sealed_2.contains(&hash_a),
         "block 2 must NOT re-include sender A's canon'd tx; sealed={sealed_2:?}",
@@ -447,10 +411,7 @@ async fn canon_across_sequential_slots_forwards_on_every_new_job() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .build();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -495,18 +456,10 @@ async fn canon_across_sequential_slots_forwards_on_every_new_job() {
         );
         // Predicted block_height starts at 1 and advances by 1 per
         // canon step.
-        assert_eq!(
-            event.block_height,
-            nonce + 1,
-            "nonce={nonce} predicted block_height mismatch",
-        );
+        assert_eq!(event.block_height, nonce + 1, "nonce={nonce} predicted block_height mismatch",);
 
-        let sealed: Vec<B256> = payload
-            .block()
-            .body()
-            .transactions()
-            .map(|tx| keccak256(tx.encoded_2718()))
-            .collect();
+        let sealed: Vec<B256> =
+            payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
         assert!(
             sealed.contains(&hash),
             "block {} must contain nonce={nonce} tx; sealed={sealed:?}",

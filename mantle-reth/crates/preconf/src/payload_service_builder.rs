@@ -50,8 +50,7 @@ use reth_storage_api::BlockReaderIdExt;
 use crate::{
     PreconfConfig, PreconfTxSet,
     builder::{
-        payload_builder::PreconfPayloadBuilder,
-        payload_job_generator::PreconfPayloadJobGenerator,
+        payload_builder::PreconfPayloadBuilder, payload_job_generator::PreconfPayloadJobGenerator,
     },
 };
 
@@ -111,14 +110,14 @@ where
     // (`OpPayloadBuilderAttributes<N::SignedTx>`) before calling
     // `build_payload`.
     Node: FullNodeTypes<
-            Types: NodeTypes<
-                Primitives = N,
-                Payload: PayloadTypes<
-                    BuiltPayload = OpBuiltPayload<N>,
-                    PayloadAttributes = OpPayloadAttrs,
-                >,
+        Types: NodeTypes<
+            Primitives = N,
+            Payload: PayloadTypes<
+                BuiltPayload = OpBuiltPayload<N>,
+                PayloadAttributes = OpPayloadAttrs,
             >,
         >,
+    >,
     Node::Provider: BlockReaderIdExt<Header = HeaderTy<N>>
         + reth_chainspec::ChainSpecProvider<ChainSpec: reth_optimism_forks::OpHardforks>
         + reth_storage_api::StateProviderFactory
@@ -148,8 +147,8 @@ where
         + Send
         + 'static,
     N: OpPayloadPrimitives,
-    N::SignedTx: From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>>
-        + TryFrom<TxEnvelope>,
+    N::SignedTx:
+        From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>> + TryFrom<TxEnvelope>,
 {
     async fn spawn_payload_builder_service(
         self,

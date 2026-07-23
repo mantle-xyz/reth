@@ -53,17 +53,15 @@ pub struct SeededParent {
 ///
 /// - A sealed parent header (`number = PARENT_BLOCK_NUMBER`) so
 ///   `client.sealed_header_by_hash(parent_hash)` returns `Some(header)`
-/// - `funded_addresses` get `1000 ETH` balance each — covers gas
-///   payment for tx fixtures
+/// - `funded_addresses` get `1000 ETH` balance each — covers gas payment for tx fixtures
 ///
 /// **Known TODO** (uncovered until first real EVM test is exercised in
 /// Steps 3-8 — these are placeholders the test will reveal whether we
 /// need):
-/// - L1 block contract code (`op_revm::constants::L1_BLOCK_CONTRACT`)
-///   may need to be pre-seeded so `db.load_cache_account(L1_BLOCK_CONTRACT)`
-///   in `build_payload` doesn't panic
-/// - Hardfork-conditional pre-execution helpers (e.g. `4788_BEACON_ROOTS`)
-///   may need to be pre-seeded post-Cancun
+/// - L1 block contract code (`op_revm::constants::L1_BLOCK_CONTRACT`) may need to be pre-seeded so
+///   `db.load_cache_account(L1_BLOCK_CONTRACT)` in `build_payload` doesn't panic
+/// - Hardfork-conditional pre-execution helpers (e.g. `4788_BEACON_ROOTS`) may need to be
+///   pre-seeded post-Cancun
 pub fn seed_with_genesis_parent(
     provider: &TestProvider,
     funded_addresses: &[Address],
@@ -81,7 +79,10 @@ pub fn seed_with_genesis_parent(
 
     // Pre-fund test addresses. `ExtendedAccount::new` takes (nonce, balance).
     for &addr in funded_addresses {
-        provider.add_account(addr, ExtendedAccount::new(0, U256::from(1_000) * U256::from(10).pow(U256::from(18))));
+        provider.add_account(
+            addr,
+            ExtendedAccount::new(0, U256::from(1_000) * U256::from(10).pow(U256::from(18))),
+        );
     }
 
     SeededParent { hash, number: PARENT_BLOCK_NUMBER, timestamp: PARENT_TIMESTAMP }

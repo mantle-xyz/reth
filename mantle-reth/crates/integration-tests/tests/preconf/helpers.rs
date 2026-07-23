@@ -33,11 +33,9 @@ pub fn mantle_test_chain_spec() -> Arc<OpChainSpec> {
 /// - `50002` — Mantle Hoodi
 pub fn mantle_chain_spec_for(chain_id: u64) -> Arc<OpChainSpec> {
     let raw = include_str!("../assets/genesis.json");
-    let mut value: serde_json::Value =
-        serde_json::from_str(raw).expect("valid genesis JSON");
+    let mut value: serde_json::Value = serde_json::from_str(raw).expect("valid genesis JSON");
     value["config"]["chainId"] = serde_json::Value::from(chain_id);
-    let genesis: Genesis =
-        serde_json::from_value(value).expect("patched genesis deserialises");
+    let genesis: Genesis = serde_json::from_value(value).expect("patched genesis deserialises");
     Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
 }
 
@@ -45,17 +43,15 @@ pub fn mantle_chain_spec_for(chain_id: u64) -> Arc<OpChainSpec> {
 /// set of L2 predeploys (proxies + implementations + storage slots).
 ///
 /// Composition:
-/// - **Header + config** come entirely from `assets/genesis.json` (the
-///   same file `mantle_chain_spec_for` uses) — single source of truth
-///   for chain-config, hardfork timeline, EIP-1559 params and header
-///   fields. `chainId` is patched to the caller-supplied value.
-/// - **Alloc** is the merge of `genesis.json`'s Hardhat-mnemonic EOAs
-///   and `assets/predeploys.json`'s contract entries. `predeploys.json`
-///   is filtered from op-chain-ops' `BuildL2DeveloperGenesis` dump
-///   (kept in `src/mantle-v2/.devnet/genesis-l2.json`) to include only
-///   entries carrying `code` — every proxy + implementation +
-///   pre-configured storage slot ends up here, and EOA balances are
-///   left to `genesis.json` so both helpers share the same fund state.
+/// - **Header + config** come entirely from `assets/genesis.json` (the same file
+///   `mantle_chain_spec_for` uses) — single source of truth for chain-config, hardfork timeline,
+///   EIP-1559 params and header fields. `chainId` is patched to the caller-supplied value.
+/// - **Alloc** is the merge of `genesis.json`'s Hardhat-mnemonic EOAs and
+///   `assets/predeploys.json`'s contract entries. `predeploys.json` is filtered from op-chain-ops'
+///   `BuildL2DeveloperGenesis` dump (kept in `src/mantle-v2/.devnet/genesis-l2.json`) to include
+///   only entries carrying `code` — every proxy + implementation + pre-configured storage slot ends
+///   up here, and EOA balances are left to `genesis.json` so both helpers share the same fund
+///   state.
 ///
 /// This split guarantees that `mantle_chain_spec_for` and
 /// `mantle_chain_spec_with_predeploys_for` differ **only** by the
@@ -82,16 +78,14 @@ pub fn mantle_chain_spec_with_predeploys_for(chain_id: u64) -> Arc<OpChainSpec> 
     let predeploys: serde_json::Value =
         serde_json::from_str(predeploys_raw).expect("valid predeploys JSON");
     if let Some(pre_alloc) = predeploys.get("alloc").and_then(|v| v.as_object()) {
-        let base_alloc = base["alloc"]
-            .as_object_mut()
-            .expect("genesis.json `alloc` must be an object");
+        let base_alloc =
+            base["alloc"].as_object_mut().expect("genesis.json `alloc` must be an object");
         for (k, v) in pre_alloc {
             base_alloc.insert(k.clone(), v.clone());
         }
     }
 
-    let genesis: Genesis =
-        serde_json::from_value(base).expect("merged genesis deserialises");
+    let genesis: Genesis = serde_json::from_value(base).expect("merged genesis deserialises");
     Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
 }
 
@@ -209,7 +203,7 @@ impl PreconfCfgBuilder {
         self
     }
 
-    /// Journal file size ceiling in bytes. 
+    /// Journal file size ceiling in bytes.
     pub fn journal_max_size(mut self, max: u64) -> Self {
         self.journal_max_size = max;
         self
