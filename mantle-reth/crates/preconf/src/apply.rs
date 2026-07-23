@@ -16,8 +16,10 @@ use crate::types::{PreconfError, PreconfReceipt};
 use alloy_evm::block::TxResult;
 use alloy_primitives::{Bytes, TxHash};
 use alloy_sol_types::{Revert, SolError};
+use core::any::Any;
+use op_revm::OpHaltReason;
 use reth_evm::execute::{BlockBuilder, ExecutorTx};
-use reth_revm::context::result::ExecutionResult;
+use reth_revm::context::result::{ExecutionResult, HaltReason, OutOfGasError};
 
 /// Apply a single transaction via the supplied [`BlockBuilder`] and produce a
 /// [`PreconfReceipt`] from the EVM execution result.
@@ -74,9 +76,10 @@ fn interpret_apply_result(
 ///
 /// Pure function — no side effects. Generic over the halt-reason type so
 /// callers can pass either the stock revm `HaltReason` or the OP-stack
-/// `OpHaltReason`; we format the reason via `Debug` (matching the wire-layer
-/// `reason: String` shape exposed by `PreconfTxEvent`).
-pub fn build_receipt<H: core::fmt::Debug>(
+/// `OpHaltReason`; the halt reason is mapped to op-geth-compatible text via
+/// [`GethHaltReason`] (e.g. out-of-gas → "out of gas") when the concrete type
+/// is recognized, else rendered via `Debug`.
+pub fn build_receipt<H: core::fmt::Debug + 'static>(
     tx_hash: TxHash,
     block_height: u64,
     result: &ExecutionResult<H>,
@@ -116,15 +119,73 @@ pub fn build_receipt<H: core::fmt::Debug>(
                 revert_data: output.clone(),
             }
         }
-        ExecutionResult::Halt { reason, gas, .. } => PreconfReceipt {
-            tx_hash,
-            block_height,
-            status: false,
-            logs: Vec::new(),
-            gas_used: gas.tx_gas_used(),
-            reason: format!("{reason:?}"),
-            revert_data: Bytes::new(),
-        },
+        ExecutionResult::Halt { reason, gas, .. } => {
+            // Map to op-geth's vm-error text when the concrete halt type is
+            // known (production: OpHaltReason). build_receipt is generic over
+            // the EVM's abstract HaltReason, so we downcast rather than thread
+            // a new trait bound through the (deliberately generic) builder
+            // path; unknown halt types keep their opaque Debug form.
+            let any = reason as &dyn Any;
+            let reason = any
+                .downcast_ref::<OpHaltReason>()
+                .map(|h| h.geth_halt_reason())
+                .or_else(|| any.downcast_ref::<HaltReason>().map(|h| h.geth_halt_reason()))
+                .unwrap_or_else(|| format!("{reason:?}"));
+            PreconfReceipt {
+                tx_hash,
+                block_height,
+                status: false,
+                logs: Vec::new(),
+                gas_used: gas.tx_gas_used(),
+                reason,
+                revert_data: Bytes::new(),
+            }
+        }
+    }
+}
+
+/// Renders a halt reason as an op-geth-compatible `reason` string.
+///
+/// Mirrors revm-inspectors' callTracer text (`tracing::utils::fmt_error_msg`),
+/// which is how op-geth's `vm.Err*` messages read — so a preconf `reason` for
+/// e.g. an out-of-gas halt is "out of gas", matching op-geth. Variants that
+/// `fmt_error_msg` doesn't special-case fall back to `Debug`, exactly as the
+/// callTracer does.
+pub trait GethHaltReason {
+    /// The op-geth-style reason string for this halt.
+    fn geth_halt_reason(&self) -> String;
+}
+
+impl GethHaltReason for HaltReason {
+    fn geth_halt_reason(&self) -> String {
+        match self {
+            Self::OutOfGas(OutOfGasError::Basic | OutOfGasError::Precompile) => "out of gas",
+            Self::OutOfGas(OutOfGasError::Memory) => "out of gas: out of memory",
+            Self::OutOfGas(OutOfGasError::MemoryLimit) => "out of gas: reach memory limit",
+            Self::OutOfGas(OutOfGasError::InvalidOperand) => "out of gas: invalid operand",
+            Self::OutOfGas(OutOfGasError::ReentrancySentry) => {
+                "out of gas: not enough gas for reentrancy sentry"
+            }
+            Self::OpcodeNotFound => "invalid opcode",
+            Self::InvalidFEOpcode => "invalid opcode: INVALID",
+            Self::InvalidJump => "invalid jump destination",
+            Self::StackOverflow => "Out of stack",
+            Self::PrecompileError => "precompiled failed",
+            Self::OutOfFunds => "insufficient balance for transfer",
+            // Not special-cased by op-geth's callTracer either → opaque Debug.
+            other => return format!("{other:?}"),
+        }
+        .to_string()
+    }
+}
+
+impl GethHaltReason for OpHaltReason {
+    fn geth_halt_reason(&self) -> String {
+        match self {
+            Self::Base(inner) => inner.geth_halt_reason(),
+            // OP-specific; no op-geth vm-error equivalent — keep the Debug form.
+            Self::FailedDeposit => format!("{self:?}"),
+        }
     }
 }
 
@@ -222,11 +283,29 @@ mod tests {
         assert!(!r.status);
         assert_eq!(r.gas_used, 50_000);
         assert!(r.logs.is_empty());
-        // Halt reason rendered via Debug — exact format isn't fixed, but it
-        // must be non-empty and mention the variant.
-        assert!(!r.reason.is_empty());
-        assert!(r.reason.contains("OutOfGas") || r.reason.contains("Basic"));
+        // OOG halt reason is mapped to op-geth's text.
+        assert_eq!(r.reason, "out of gas");
         assert!(r.revert_data.is_empty());
+    }
+
+    #[test]
+    fn geth_halt_reason_maps_variants_like_op_geth() {
+        assert_eq!(HaltReason::OutOfGas(OutOfGasError::Basic).geth_halt_reason(), "out of gas");
+        assert_eq!(
+            HaltReason::OutOfGas(OutOfGasError::Memory).geth_halt_reason(),
+            "out of gas: out of memory"
+        );
+        assert_eq!(HaltReason::OpcodeNotFound.geth_halt_reason(), "invalid opcode");
+        assert_eq!(HaltReason::InvalidJump.geth_halt_reason(), "invalid jump destination");
+        assert_eq!(HaltReason::PrecompileError.geth_halt_reason(), "precompiled failed");
+        // Not special-cased → opaque Debug, same as op-geth's callTracer.
+        assert_eq!(HaltReason::StackUnderflow.geth_halt_reason(), "StackUnderflow");
+        // OP wrapper: Base delegates; FailedDeposit keeps its Debug form.
+        assert_eq!(
+            OpHaltReason::Base(HaltReason::OutOfGas(OutOfGasError::Basic)).geth_halt_reason(),
+            "out of gas"
+        );
+        assert_eq!(OpHaltReason::FailedDeposit.geth_halt_reason(), "FailedDeposit");
     }
 
     #[test]
