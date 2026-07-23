@@ -15,6 +15,9 @@ workspace = true
 # Alloy
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
 alloy-consensus = { workspace = true, features = ["std"] }
+# alloy-sol-types — decode a revert's `Error(string)` payload so the preconf
+# `reason` matches op-geth's `abi.UnpackRevert` ("execution reverted: <msg>").
+alloy-sol-types.workspace = true
 # alloy-eips — `Encodable2718` to serialise a preconf `TxEnvelope` to its
 # canonical bytes for the DA-footprint (H3) size estimate.
 alloy-eips.workspace = true

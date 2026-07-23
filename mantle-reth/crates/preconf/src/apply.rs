@@ -15,6 +15,7 @@
 use crate::types::{PreconfError, PreconfReceipt};
 use alloy_evm::block::TxResult;
 use alloy_primitives::{Bytes, TxHash};
+use alloy_sol_types::{Revert, SolError};
 use reth_evm::execute::{BlockBuilder, ExecutorTx};
 use reth_revm::context::result::ExecutionResult;
 
@@ -90,22 +91,31 @@ pub fn build_receipt<H: core::fmt::Debug>(
             reason: String::new(),
             revert_data: Bytes::new(),
         },
-        ExecutionResult::Revert { gas, output, .. } => PreconfReceipt {
-            tx_hash,
-            block_height,
-            status: false,
-            // revm surfaces "logs emitted before revert" as an
-            // observability field, but the EVM's state rollback erases
-            // them from statedb. Op-geth reads receipts from statedb
-            // (`state_processor.go:281`) so its Failed-status receipts
-            // observe empty logs naturally. To keep our preconf receipt
-            // byte-equal with the eventually-sealed receipt, we drop
-            // revm's pre-revert log snapshot here.
-            logs: Vec::new(),
-            gas_used: gas.tx_gas_used(),
-            reason: "execution reverted".into(),
-            revert_data: output.clone(),
-        },
+        ExecutionResult::Revert { gas, output, .. } => {
+            // Decode `Error(string)` → "execution reverted: <msg>", matching
+            // op-geth's `abi.UnpackRevert`. Panic/custom/raw reverts miss the
+            // selector → `Err` → bare "execution reverted".
+            let reason = match Revert::abi_decode(output.as_ref()) {
+                Ok(r) => format!("execution reverted: {}", r.reason),
+                Err(_) => "execution reverted".to_string(),
+            };
+            PreconfReceipt {
+                tx_hash,
+                block_height,
+                status: false,
+                // revm surfaces "logs emitted before revert" as an
+                // observability field, but the EVM's state rollback erases
+                // them from statedb. Op-geth reads receipts from statedb
+                // (`state_processor.go:281`) so its Failed-status receipts
+                // observe empty logs naturally. To keep our preconf receipt
+                // byte-equal with the eventually-sealed receipt, we drop
+                // revm's pre-revert log snapshot here.
+                logs: Vec::new(),
+                gas_used: gas.tx_gas_used(),
+                reason,
+                revert_data: output.clone(),
+            }
+        }
         ExecutionResult::Halt { reason, gas, .. } => PreconfReceipt {
             tx_hash,
             block_height,
@@ -177,8 +187,26 @@ mod tests {
         assert!(!r.status);
         assert_eq!(r.gas_used, 30_000);
         assert!(r.logs.is_empty());
+        // Bare `Error(string)` selector with no body is NOT decodable →
+        // reason falls back to the plain string (matches op-geth's behavior
+        // for reverts it can't unpack).
         assert_eq!(r.reason, "execution reverted");
         assert_eq!(r.revert_data, revert_payload);
+    }
+
+    #[test]
+    fn build_receipt_revert_decodes_error_string_reason() {
+        // A well-formed `Error(string)` payload (as emitted by
+        // `require(false, "…")`) must surface as `execution reverted: <msg>`,
+        // byte-for-byte matching op-geth's `abi.UnpackRevert` output.
+        let payload = Bytes::from(Revert { reason: "allowance insufficient".into() }.abi_encode());
+        let result: ExecutionResult<HaltReason> =
+            ExecutionResult::Revert { gas: gas(30_000), logs: vec![], output: payload.clone() };
+        let r = build_receipt(h(4), 101, &result);
+        assert!(!r.status);
+        assert_eq!(r.reason, "execution reverted: allowance insufficient");
+        // Raw ABI bytes are still preserved verbatim for downstream consumers.
+        assert_eq!(r.revert_data, payload);
     }
 
     #[test]

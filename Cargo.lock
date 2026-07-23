@@ -5228,6 +5228,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer",
  "alloy-signer-local",
+ "alloy-sol-types",
  "async-trait",
  "either",
  "eyre",
