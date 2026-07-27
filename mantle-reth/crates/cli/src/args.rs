@@ -87,7 +87,7 @@ pub struct PreconfArgs {
     pub to: Vec<Address>,
 
     /// Client-visible RPC oneshot timeout, in milliseconds. Default matches
-    /// [`mantle_reth_preconf::config::DEFAULT_PRECONF_TIMEOUT`] (200ms).
+    /// [`mantle_reth_preconf::config::DEFAULT_PRECONF_TIMEOUT`] (1s).
     #[arg(long = "preconf.timeout-ms")]
     pub timeout_ms: Option<u64>,
 
