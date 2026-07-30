@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 /// a subsequent same-hash resubmit is revived back to `Waiting` by
 /// `push_if_absent`. This mirrors the "typically transient" nature of
 /// each cause: `Timeout` (client just gave up too early), `Canceled`
-/// (F1 budget resets next slot), `Failed` (in-flight state race that
+/// (block gas budget resets next slot), `Failed` (in-flight state race that
 /// the next slot's fresh block state usually resolves).
 ///
 /// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — they
@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 /// reclaimable" but signal different causes to the client:
 /// - `Timeout` — the RPC handler's deadline elapsed. Client's request was accepted; server may or
 ///   may not have run apply.
-/// - `Canceled` — the F1 pre-apply gate rejected the tx (e.g. block gas budget). Server explicitly
+/// - `Canceled` — the block-gas-budget pre-apply gate rejected the tx (e.g. block gas budget). Server explicitly
 ///   declined; no EVM state change.
 /// - `Failed` — reth's block builder rejected pre-execute (in-flight nonce / balance race, block
 ///   gas exhausted at builder level). tx NOT on chain; typically resolves on next slot.
@@ -271,7 +271,7 @@ pub enum PreconfError {
     /// per-block, or the post-Jovian footprint-gas bound). Rejected
     /// **before** touching the builder — a preconf tx over the DA budget
     /// would make the sealed block DA-invalid and get rejected by op-node,
-    /// silently breaking the commitment (design §5.5.1, H3).
+    /// silently breaking the commitment (a DA consensus constraint).
     ///
     /// Unlike [`Self::BlockGasBudgetExceeded`] (an operator-hardening
     /// budget bypassed by `Replay`-sourced entries), the DA limit is a
@@ -360,7 +360,7 @@ mod tests {
         );
     }
 
-    /// R7 D — `PreconfReceipt`'s `PartialEq` is byte-equal at the field
+    /// `PreconfReceipt`'s `PartialEq` is byte-equal at the field
     /// level, not derived semantically. This test locks the field set
     /// so a future field addition without updating the wire mapper
     /// surfaces as a compile error (missing field literal below), and

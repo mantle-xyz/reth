@@ -362,7 +362,7 @@ where
                     }
                     Some(PreconfStatus::Timeout | PreconfStatus::Canceled) => {
                         // Some other path beat us (e.g. dispatch's
-                        // deadline gate or F1 block-gas-budget gate
+                        // deadline gate or block-gas-budget gate
                         // ran mark_* concurrently). The tx is not on
                         // chain; return Timeout to the client.
                         drop(apply_guard);
@@ -429,7 +429,7 @@ where
 ///
 /// `Waiting` / `Timeout` are constructed directly by the RPC handler's
 /// other arms and never routed through this `From` impl. There is no
-/// wire `Canceled` variant — server pre-apply rejections (F1 gas
+/// wire `Canceled` variant — server pre-apply rejections (the block-gas-budget gate gas
 /// budget, admin action) are surfaced as wire `Failed` with the
 /// specific reason in `PreconfTxEvent::reason`; the underlying fifo
 /// `PreconfStatus::Canceled` is an internal-only distinction.

@@ -19,7 +19,7 @@
 //!   panic; a subsequent fresh RPC tx flows normally.
 //!
 //! Related Replay semantics (covered elsewhere):
-//! - `gas_budgets::replay_source_bypasses_block_gas_budget` — F1 bypass
+//! - `gas_budgets::replay_source_bypasses_block_gas_budget` — block-gas-budget bypass
 //! - `no_tx_pool::no_tx_pool_gates_replay_source_entry` — derivation builds still gate Replay to
 //!   preserve chain safety
 //!

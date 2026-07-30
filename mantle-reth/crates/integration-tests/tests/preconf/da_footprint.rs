@@ -1,4 +1,4 @@
-//! DA-footprint (H3) gate on the preconf apply path.
+//! DA-footprint gate on the preconf apply path.
 //!
 //! The preconf builder applies preconf txs against the same in-flight
 //! `State<DB>` that gets sealed. If a preconf tx's data-availability
@@ -7,7 +7,7 @@
 //! breaking the "receipt returned → tx lands" commitment. The builder
 //! therefore runs a DA pre-check (`payload_builder::preconf_da_check`)
 //! before applying, mirroring the pool best-tx path's
-//! `ExecutionInfo::is_tx_over_limits` DA logic. See design §5.5.1.
+//! `ExecutionInfo::is_tx_over_limits` DA logic.
 //!
 //! These tests install a tight `OpDAConfig` per-tx limit via the
 //! `launch_preconf_node!(cfg, spec, da_config = ...)` macro variant and

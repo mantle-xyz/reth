@@ -37,13 +37,28 @@ use std::{
 };
 
 use alloy_consensus::TxEnvelope;
-use alloy_primitives::TxHash;
+use alloy_primitives::{Address, TxHash};
 use tracing::{debug, trace, warn};
 
 use crate::{
     PreconfConfig, PreconfTxSet,
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
+
+/// How a sender's preconf chain is blocked for the rest of the current slot
+/// once one of its txs cannot enter the in-flight block. Same-sender entries
+/// at a nonce ≥ the blocked head inherit this outcome — they depend on the
+/// blocked predecessor landing first, so admitting them independently would
+/// only produce a spurious nonce-too-high failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlockKind {
+    /// Predecessor was deferred (transient capacity) → successor is also kept
+    /// `Waiting` and retried next slot.
+    Defer,
+    /// Predecessor was permanently rejected → successor can never land either
+    /// (permanent nonce gap) → `mark_canceled` (server pre-apply rejection).
+    Reject,
+}
 
 /// Per-job local state for the preconf dispatch loop.
 ///
@@ -71,13 +86,13 @@ pub(super) struct LoopState {
     /// apply — reserving `gas_limit` would over-count against later
     /// txs that could still fit.
     preconf_gas_used: u64,
-    /// Cumulative pool best-tx gas committed in this block. Compared
-    /// against the time-proportional pool quota
-    /// (`payload_builder::pool_cumulative_quota`) at each sweep tick;
-    /// pool txs only admit while `pool_gas_used < quota`. Independent
-    /// of `preconf_gas_used` so quota accounting reflects only the
-    /// pool arm, though both contribute to `ExecutionInfo::cumulative_gas_used`.
-    pool_gas_used: u64,
+    /// Senders whose preconf chain is blocked this slot: `sender → (lowest
+    /// blocked nonce, kind)`. Populated when a preconf tx is deferred or
+    /// permanently rejected by the block-capacity admission gate; consulted
+    /// before admitting any same-sender entry so nonce successors inherit the
+    /// predecessor's outcome instead of being applied out of order (which
+    /// would nonce-too-high fail). Slot-local — reset each build.
+    blocked_senders: HashMap<Address, (u64, BlockKind)>,
 }
 
 impl LoopState {
@@ -89,8 +104,33 @@ impl LoopState {
             excluded: HashMap::new(),
             predicted_height,
             preconf_gas_used: 0,
-            pool_gas_used: 0,
+            blocked_senders: HashMap::new(),
         }
+    }
+
+    /// Record that `sender`'s preconf chain is blocked from `nonce` onward
+    /// this slot with `kind`. Keeps the **lowest** blocked nonce (and that
+    /// head's kind), so the earliest non-admitted tx governs the chain even
+    /// if entries are seen slightly out of order.
+    pub(super) fn block_sender(&mut self, sender: Address, nonce: u64, kind: BlockKind) {
+        self.blocked_senders
+            .entry(sender)
+            .and_modify(|head| {
+                if nonce < head.0 {
+                    *head = (nonce, kind);
+                }
+            })
+            .or_insert((nonce, kind));
+    }
+
+    /// If `sender` is blocked this slot at a head nonce ≤ `nonce`, return the
+    /// [`BlockKind`] the entry should inherit. `None` when the sender is
+    /// unblocked or `nonce` is below the blocked head (a predecessor that
+    /// should still be attempted).
+    pub(super) fn sender_blocked_at(&self, sender: &Address, nonce: u64) -> Option<BlockKind> {
+        self.blocked_senders
+            .get(sender)
+            .and_then(|(head_nonce, kind)| (nonce >= *head_nonce).then_some(*kind))
     }
 
     /// Cumulative preconf gas committed in this block so far. Test-only
@@ -101,29 +141,6 @@ impl LoopState {
     #[cfg(test)]
     pub(super) fn preconf_gas_used(&self) -> u64 {
         self.preconf_gas_used
-    }
-
-    /// Cumulative pool best-tx gas committed in this block so far.
-    /// Independent counter used by the sweep-ticker branch to compare
-    /// against the time-proportional pool quota.
-    pub(super) fn pool_gas_used(&self) -> u64 {
-        self.pool_gas_used
-    }
-
-    /// Record a pool best-tx apply that consumed `gas_used` gas.
-    /// Called by the payload builder's sweep-tick arm after each
-    /// successful `apply_one_best_tx`.
-    pub(super) fn record_pool_gas(&mut self, gas_used: u64) {
-        self.pool_gas_used = self.pool_gas_used.saturating_add(gas_used);
-    }
-
-    /// `true` iff the hash has already been committed or excluded by
-    /// this loop instance. Retained as a bool wrapper for tests; the
-    /// dispatch loop uses [`Self::is_committed`] / [`Self::excluded_reason`]
-    /// to distinguish the two branches.
-    #[cfg(test)]
-    pub(super) fn contains(&self, hash: &TxHash) -> bool {
-        self.committed.contains(hash) || self.excluded.contains_key(hash)
     }
 
     /// `true` iff the hash was recorded as committed (apply succeeded).
@@ -445,32 +462,6 @@ pub(super) async fn apply_one_preconf<F>(
     }
 }
 
-/// On broadcast `Lagged`, walk the fifo snapshot and apply any entry
-/// not yet seen by this loop instance. Dedup is delegated to
-/// [`apply_one_preconf`]'s gate ①. `apply_fn` must be `FnMut` since
-/// it is invoked once per pending hash.
-///
-/// `skipped` is the count reported by `RecvError::Lagged(n)` — surfaced
-/// to the warn log for devnet observability of lag severity.
-pub(super) async fn reconcile_lagged<F>(
-    fifo: &PreconfTxSet,
-    cfg: &PreconfConfig,
-    loop_state: &mut LoopState,
-    skipped: u64,
-    mut apply_fn: F,
-) where
-    F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, PreconfError>,
-{
-    warn!(
-        target: "mantle::preconf::dispatch",
-        skipped,
-        "broadcast lagged; reconciling via fifo snapshot"
-    );
-    for hash in fifo.snapshot().await {
-        apply_one_preconf(fifo, cfg, hash, loop_state, &mut apply_fn).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -488,6 +479,43 @@ mod tests {
         let sig = Signature::test_signature();
         let hash = B256::from([hash_byte; 32]);
         Arc::new(TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)))
+    }
+
+    // ============ LoopState::blocked_senders (same-sender cascade) ============
+
+    /// Blocking a sender at nonce `n0` makes every same-sender entry at
+    /// `nonce ≥ n0` inherit the kind; lower nonces (predecessors) and other
+    /// senders stay unblocked.
+    #[test]
+    fn blocked_senders_cascade_query() {
+        let s = Address::from([9u8; 20]);
+        let other = Address::from([8u8; 20]);
+        let mut st = LoopState::new(1);
+
+        assert_eq!(st.sender_blocked_at(&s, 5), None, "unblocked sender");
+
+        st.block_sender(s, 5, BlockKind::Defer);
+        assert_eq!(st.sender_blocked_at(&s, 5), Some(BlockKind::Defer), "at head nonce");
+        assert_eq!(st.sender_blocked_at(&s, 6), Some(BlockKind::Defer), "above head nonce");
+        assert_eq!(st.sender_blocked_at(&s, 4), None, "predecessor below head");
+        assert_eq!(st.sender_blocked_at(&other, 6), None, "other sender");
+    }
+
+    /// `block_sender` keeps the lowest nonce as the chain head (and that
+    /// head's kind); a later higher-nonce block must not raise the head, a
+    /// lower-nonce block lowers it and its kind governs.
+    #[test]
+    fn block_sender_keeps_lowest_nonce_head() {
+        let s = Address::from([9u8; 20]);
+        let mut st = LoopState::new(1);
+
+        st.block_sender(s, 5, BlockKind::Defer);
+        st.block_sender(s, 8, BlockKind::Reject); // higher — must not move head
+        assert_eq!(st.sender_blocked_at(&s, 8), Some(BlockKind::Defer), "head stays at 5/Defer");
+
+        st.block_sender(s, 3, BlockKind::Reject); // lower — lowers head, its kind wins
+        assert_eq!(st.sender_blocked_at(&s, 3), Some(BlockKind::Reject));
+        assert_eq!(st.sender_blocked_at(&s, 4), Some(BlockKind::Reject));
     }
 
     /// Test apply closure that fabricates an always-success receipt
@@ -801,26 +829,6 @@ mod tests {
 
     /// Cumulative tracking: successful applies increment
     /// `preconf_gas_used` by the receipt's `gas_used`. Three sequential
-    /// `LoopState` `pool_gas_used` tracks the pool best-tx sweep independently
-    /// of `preconf_gas_used` — `record_pool_gas` must accumulate and stay
-    /// separate from `preconf_gas_used`.
-    #[test]
-    fn loop_state_pool_gas_used_accumulates_independently_of_preconf() {
-        let mut state = LoopState::new(1);
-        assert_eq!(state.pool_gas_used(), 0);
-        assert_eq!(state.preconf_gas_used(), 0);
-
-        state.record_pool_gas(21_000);
-        state.record_pool_gas(50_000);
-        assert_eq!(state.pool_gas_used(), 71_000);
-        // preconf counter untouched.
-        assert_eq!(state.preconf_gas_used(), 0);
-
-        // Saturating add: extreme delta must not panic.
-        state.record_pool_gas(u64::MAX);
-        assert_eq!(state.pool_gas_used(), u64::MAX);
-    }
-
     /// applies must sum correctly.
     #[tokio::test]
     async fn apply_one_preconf_success_increments_preconf_gas_used() {
@@ -941,148 +949,6 @@ mod tests {
             let entry = fifo.find_by_hash(&hash).await.unwrap();
             assert_eq!(entry.status, pre_status);
         }
-    }
-
-    /// `reconcile_lagged` applies pending fifo entries in FIFO (insertion)
-    /// order. Locks the `snapshot()` → `VecDeque` `order` guarantee so a
-    /// future refactor to `HashMap` iteration would fail this test.
-    #[tokio::test]
-    async fn reconcile_lagged_applies_all_pending_in_fifo_order() {
-        use std::cell::RefCell;
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-
-        let mut hashes = Vec::new();
-        for i in 0..3u8 {
-            let tx = make_tx_with_gas(0xa0 + i, i as u64, 21_000);
-            let h = *tx.tx_hash();
-            fifo.push_if_absent(tx, Address::from([i + 1; 20]), PreconfSource::Rpc).await;
-            hashes.push(h);
-        }
-
-        let mut state = LoopState::new(1);
-        let seen: RefCell<Vec<TxHash>> = RefCell::new(Vec::new());
-        let mut apply_fn = |tx, h, height| {
-            seen.borrow_mut().push(h);
-            synthetic_ok(tx, h, height)
-        };
-        reconcile_lagged(&fifo, &cfg, &mut state, 0, &mut apply_fn).await;
-
-        assert_eq!(*seen.borrow(), hashes, "reconcile must apply in FIFO order");
-        assert_eq!(state.committed_len(), 3);
-        assert_eq!(state.excluded_len(), 0);
-    }
-
-    /// `reconcile_lagged` relies on `apply_one_preconf`'s gate ① for
-    /// dedup. Hashes already in `loop_state.committed` must be skipped
-    /// (`apply_fn` not invoked).
-    #[tokio::test]
-    async fn reconcile_lagged_dedups_against_prior_committed() {
-        use std::cell::Cell;
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-
-        let mut hashes = Vec::new();
-        for i in 0..3u8 {
-            let tx = make_tx_with_gas(0xb0 + i, i as u64, 21_000);
-            hashes.push(*tx.tx_hash());
-            fifo.push_if_absent(tx, Address::from([i + 1; 20]), PreconfSource::Rpc).await;
-        }
-
-        let mut state = LoopState::new(1);
-        // Pretend two of them were already handled via broadcast path.
-        state.record_committed(hashes[0]);
-        state.record_committed(hashes[1]);
-
-        let call_count = Cell::new(0u32);
-        let mut apply_fn = |tx, h, height| {
-            call_count.set(call_count.get() + 1);
-            synthetic_ok(tx, h, height)
-        };
-        reconcile_lagged(&fifo, &cfg, &mut state, 0, &mut apply_fn).await;
-
-        assert_eq!(call_count.get(), 1, "only the one un-seen hash must trigger apply");
-        assert_eq!(state.committed_len(), 3);
-    }
-
-    /// `reconcile_lagged` shares `LoopState.preconf_gas_used` with the
-    /// broadcast path. Pre-loading `preconf_gas_used` so the second tx
-    /// would exceed `preconf_max_gas_per_block` must cause it to be
-    /// Canceled via the same gate `apply_one_preconf` uses.
-    #[tokio::test]
-    async fn reconcile_lagged_shares_gas_budget_with_apply_one_preconf() {
-        let cfg = PreconfConfig {
-            preconf_max_gas_per_block: 42_000,
-            preconf_max_gas_per_tx: 30_000,
-            ..PreconfConfig::default()
-        };
-        let fifo = PreconfTxSet::new(8);
-
-        // Two pending waiting txs of 21_000 gas each.
-        let tx1 = make_tx_with_gas(0xc0, 0, 21_000);
-        let h1 = *tx1.tx_hash();
-        fifo.push_if_absent(tx1, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        let tx2 = make_tx_with_gas(0xc1, 0, 21_000);
-        let h2 = *tx2.tx_hash();
-        fifo.push_if_absent(tx2, Address::from([2; 20]), PreconfSource::Rpc).await;
-
-        // Pre-load 21_000: 21_000 + 21_000 = 42_000 = max → tx1 accepted
-        // at boundary; 42_000 + 21_000 = 63_000 > 42_000 → tx2 rejected.
-        let mut state = LoopState::new(1);
-        state.preconf_gas_used = 21_000;
-
-        reconcile_lagged(&fifo, &cfg, &mut state, 0, synthetic_ok).await;
-
-        assert_eq!(state.preconf_gas_used(), 42_000, "only tx1 counted");
-        assert_eq!(state.committed_len(), 1);
-        assert_eq!(state.excluded_len(), 1);
-
-        let e1 = fifo.find_by_hash(&h1).await.unwrap();
-        assert_eq!(e1.status, PreconfStatus::Success);
-        let e2 = fifo.find_by_hash(&h2).await.unwrap();
-        assert_eq!(e2.status, PreconfStatus::Canceled);
-    }
-
-    /// `reconcile_lagged` iterates the whole `order` `VecDeque` including
-    /// entries in terminal states (mark_* keeps entries until forward /
-    /// `clean_reclaimable` removes them). Those must be filtered by
-    /// `apply_one_preconf`'s status gate — `apply_fn` only fires for the
-    /// Waiting entry.
-    #[tokio::test]
-    async fn reconcile_lagged_skips_non_waiting_entries() {
-        use std::cell::Cell;
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-
-        let waiting = make_tx_with_gas(0xd0, 0, 21_000);
-        let h_waiting = *waiting.tx_hash();
-        fifo.push_if_absent(waiting, Address::from([1; 20]), PreconfSource::Rpc).await;
-
-        let timed = make_tx_with_gas(0xd1, 0, 21_000);
-        let h_timed = *timed.tx_hash();
-        fifo.push_if_absent(timed, Address::from([2; 20]), PreconfSource::Rpc).await;
-        fifo.mark_timeout(&h_timed).await.unwrap();
-
-        let succ = make_tx_with_gas(0xd2, 0, 21_000);
-        let h_succ = *succ.tx_hash();
-        fifo.push_if_absent(succ, Address::from([3; 20]), PreconfSource::Rpc).await;
-        fifo.mark_succeeded(&h_succ).await.unwrap();
-
-        let mut state = LoopState::new(1);
-        let call_count = Cell::new(0u32);
-        let mut apply_fn = |tx, h, height| {
-            call_count.set(call_count.get() + 1);
-            synthetic_ok(tx, h, height)
-        };
-        reconcile_lagged(&fifo, &cfg, &mut state, 0, &mut apply_fn).await;
-
-        assert_eq!(call_count.get(), 1, "apply_fn only for the Waiting entry");
-        assert_eq!(state.committed_len(), 1);
-        assert_eq!(state.excluded_len(), 2, "terminal entries recorded as excluded");
-        assert!(state.contains(&h_waiting));
-        assert!(state.contains(&h_timed));
-        assert!(state.contains(&h_succ));
     }
 
     // ── Source-differentiated gate tests (mantle preconf SLA: journal

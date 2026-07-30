@@ -275,7 +275,7 @@ macro_rules! launch_preconf_node {
         )
     };
     // Variant that additionally installs an `OpDAConfig` on the node so
-    // tests can exercise the DA-footprint (H3) gate with a tight per-tx /
+    // tests can exercise the DA-footprint gate with a tight per-tx /
     // per-block DA limit. `$da` is any `OpDAConfig` expression.
     ($cfg:expr, $chain_spec:expr, da_config = $da:expr) => {
         $crate::launch_preconf_node!(

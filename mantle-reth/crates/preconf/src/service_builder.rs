@@ -345,7 +345,7 @@ mod tests {
         svc.start(&UnreachablePool).await.unwrap();
     }
 
-    /// R6/T5 — `start()` reads the journal from disk and pushes each
+    /// `start()` reads the journal from disk and pushes each
     /// promised entry into the fifo via the adapter. Covers the
     /// journal-enabled end-to-end wiring that
     /// `start_without_journal_...` cannot exercise.

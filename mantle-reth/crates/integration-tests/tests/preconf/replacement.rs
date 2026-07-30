@@ -18,7 +18,7 @@
 //!   tx.
 //! - `timeout_slot_replaceable_by_different_hash` — `Timeout` entries are reclaimable, releasing
 //!   the slot; a differently-signed tx for the same slot admits and lands on chain.
-//! - `canceled_slot_replaceable_by_different_hash` — symmetric to Timeout: F1-Canceled entries also
+//! - `canceled_slot_replaceable_by_different_hash` — symmetric to Timeout: budget-Canceled entries also
 //!   release the slot.
 //!
 //! - `failed_slot_replaceable_by_different_hash` — symmetric to the Timeout / Canceled cases.
@@ -293,11 +293,11 @@ async fn waiting_slot_blocks_different_hash_replacement() {
 }
 
 /// Symmetric to `timeout_slot_replaceable_by_different_hash`: a
-/// `Canceled` fifo entry (F1 pre-apply rejection, e.g. block gas budget)
+/// `Canceled` fifo entry (block-gas-budget pre-apply rejection, e.g. block gas budget)
 /// also releases the `(sender, nonce)` slot. A differently-signed tx
 /// for the same slot admits and lands on chain in the next slot.
 ///
-/// The Canceled state is set up via the same F1 pattern as
+/// The Canceled state is set up via the same the block-gas-budget gate pattern as
 /// `gas_budgets::canceled_tx_recoverable_in_next_slot`: three 21k-gas
 /// txs against a 50k block cap; the third gets Canceled. Then a
 /// different-hash tx replaces it after canon.
@@ -316,7 +316,7 @@ async fn canceled_slot_replaceable_by_different_hash() {
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
-    // ── Slot 1: tx0/tx1 land, tx2 F1-rejected (Canceled) ─────────────
+    // ── Slot 1: tx0/tx1 land, tx2 budget-rejected (Canceled) ─────────────
     let attrs = node.payload.next_attributes();
     let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
     let payload_id = node
@@ -355,13 +355,13 @@ async fn canceled_slot_replaceable_by_different_hash() {
 
     let _ = t0.await.expect("t0 join").expect("tx0 must succeed");
     let _ = t1.await.expect("t1 join").expect("tx1 must succeed");
-    let err_2 = t2.await.expect("t2 join").expect_err("tx2 must be F1-rejected → fifo Canceled");
+    let err_2 = t2.await.expect("t2 join").expect_err("tx2 must be budget-rejected → fifo Canceled");
     assert!(
         matches!(err_2, ClientError::Call(ref e) if e.message().to_lowercase().contains("gas budget")),
         "expected BlockGasBudgetExceeded to produce fifo Canceled state; got {err_2:?}",
     );
 
-    // Canonicalise slot 1 so on-chain nonce advances to 2 and the F1
+    // Canonicalise slot 1 so on-chain nonce advances to 2 and the block-gas-budget gate
     // budget resets. tx2's fifo entry stays in `Canceled` state
     // (nonce=2 is at the head of the sender's frontier; `forward` at
     // slot-2 prologue would clear entries with nonce < 2, leaving tx2

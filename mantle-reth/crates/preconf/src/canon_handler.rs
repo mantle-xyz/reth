@@ -168,7 +168,7 @@ where
             // pick up an evicted tx from the pool iterator. The window
             // is µs-scale (both are same-task sequential calls, no await
             // between them beyond mutex acquisition) and has not been
-            // observed in devnet — see R7/C1 for the followup.
+            // observed in devnet — a followup tracks it.
             let evicted = self.fifo.clean_reclaimable().await;
             if !evicted.is_empty() {
                 let pool_removed = self.pool.remove_transactions(evicted.clone());

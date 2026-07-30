@@ -300,7 +300,7 @@ impl PreconfTxSet {
 
         // Replacement check: same `(sender, nonce)` but a different hash.
         // Reclaimable terminal states release the slot — `Timeout`
-        // (client deadline), `Canceled` (F1 pre-apply reject), and
+        // (client deadline), `Canceled` (block-gas-budget pre-apply reject), and
         // `Failed` (reth builder pre-execute reject; tx NOT on chain,
         // same "safe to replace" property as the other two).
         // `Waiting` / `Success` block replacement (`Success` is either
@@ -456,7 +456,7 @@ impl PreconfTxSet {
     }
 
     /// Evicts every entry in a reclaimable terminal state —
-    /// `Timeout` (client deadline elapsed), `Canceled` (F1 pre-apply
+    /// `Timeout` (client deadline elapsed), `Canceled` (block-gas-budget pre-apply
     /// reject, e.g. block gas budget), and `Failed` (reth builder
     /// pre-execute reject; tx NOT on chain). Broader than op-geth's
     /// `FIFOTxSet::CleanTimeout` which only clears the timeout case;
@@ -506,7 +506,7 @@ impl PreconfTxSet {
     /// level). **tx NOT on chain**.
     ///
     /// Reclaim rationale: all three "not on chain" causes are typically
-    /// transient (deadline overreach, F1 budget resets next slot, or
+    /// transient (deadline overreach, block gas budget resets next slot, or
     /// in-flight state race that clears when the next slot's fresh
     /// block state comes in). SDKs retry all three the same way.
     ///
@@ -651,7 +651,7 @@ impl PreconfTxSet {
                     return Ok(());
                 }
                 // Reclaimable — this is a same-hash retry after a
-                // `Timeout` (client deadline), `Canceled` (F1 pre-apply
+                // `Timeout` (client deadline), `Canceled` (block-gas-budget pre-apply
                 // reject), or `Failed` (reth builder pre-execute reject;
                 // tx NOT on chain). Install the fresh responder and
                 // refresh `inserted_at` so `builder::dispatch`'s
@@ -1249,7 +1249,7 @@ mod tests {
     /// `debug_assert!` (intentional dev-time signal), so this test runs
     /// only in release mode. `cargo test --release` executes it.
     ///
-    /// TODO(R6): replace with `tracing-test` capture to also verify the
+    /// TODO: replace with `tracing-test` capture to also verify the
     /// `error!()` line fires. For now assert observable side effects only.
     #[tokio::test]
     #[cfg(not(debug_assertions))]
@@ -1284,7 +1284,7 @@ mod tests {
 
     /// `drop_hash` must be tolerant of partially-populated index state: if
     /// `entries[hash]` is missing, it should still clean `order` /
-    /// `by_sender` / `pending_responders`. Non-self-heal companion to R6's
+    /// `by_sender` / `pending_responders`. Non-self-heal companion to the
     /// "dangling `by_sender`" case — here the direction is opposite: entry
     /// gone first, aux indices need scrubbing.
     #[tokio::test]
@@ -1447,7 +1447,7 @@ mod tests {
         );
     }
 
-    /// R7 D — `PushResult::ConflictActive(hash)` carries the **old**
+    /// `PushResult::ConflictActive(hash)` carries the **old**
     /// (colliding) hash so `PreconfPoolListener` can log both the new
     /// and existing hash on a slot collision. Doc-only assertion until
     /// now; this test locks the payload semantic.
@@ -1476,7 +1476,7 @@ mod tests {
         }
     }
 
-    /// R7 D — `PreconfTxSet::new(broadcast_cap = 0)` must panic. The
+    /// `PreconfTxSet::new(broadcast_cap = 0)` must panic. The
     /// broadcast channel needs at least capacity 1 (subscribers must
     /// be able to hold one buffered event before falling behind);
     /// tokio panics on `broadcast::channel(0)`, so this test also

@@ -1,7 +1,7 @@
 //! Preconf `Timeout` state-machine semantics.
 //!
 //! - `deadline_elapsed_returns_timeout_and_evicts_pool` — RPC-layer deadline fires, tx flipped to
-//!   `Timeout` and evicted from pool (R3/SLA-1); subsequent build must not include it.
+//!   `Timeout` and evicted from pool; subsequent build must not include it.
 //! - `timeout_recovered_by_same_hash_resubmit` — same-hash retry after Timeout revives the fifo
 //!   entry (`push_if_absent`'s reclaimable branch) and the tx lands on the next build.
 //! - `dispatch_safety_margin_marks_timeout_before_apply` — dispatch- layer preemptive timeout (40ms
@@ -437,7 +437,7 @@ async fn dispatch_safety_margin_marks_timeout_before_apply() {
         "SAFETY_MARGIN-aborted tx must not land in the sealed block; sealed={sealed:?}",
     );
 
-    // Layer-1 SLA: pool eviction fired from `mark_timeout` inside the
+    // first-layer SLA: pool eviction fired from `mark_timeout` inside the
     // dispatch gate.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(

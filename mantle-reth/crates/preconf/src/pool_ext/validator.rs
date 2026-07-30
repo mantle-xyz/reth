@@ -128,7 +128,7 @@ where
 
         // Replacement guard: only reclaimable terminal states release
         // the (sender, nonce) slot — `Timeout` (client deadline),
-        // `Canceled` (F1 pre-apply reject), and `Failed` (reth builder
+        // `Canceled` (block-gas-budget pre-apply reject), and `Failed` (reth builder
         // pre-execute reject; tx NOT on chain). `Waiting` / `Success`
         // block replacement (`Success` is on-chain or in-flight, so
         // replacement would double-apply).

@@ -403,7 +403,7 @@ pub trait RestorePool: Send + Sync {
     /// callback path — every transition to a non-on-chain terminal
     /// state (`Timeout` / `Canceled` / `Failed`) triggers a same-hash
     /// eviction to close the "client saw failure but tx later lands"
-    /// SLA gap (R3/SLA-1).
+    /// SLA gap.
     ///
     /// Idempotent — absent hashes are silently ignored (reth's
     /// `pool.remove_transactions` returns an empty `Vec` in that

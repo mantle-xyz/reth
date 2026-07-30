@@ -250,7 +250,7 @@ async fn preconf_block_gas_budget_enforced_on_mantle_sepolia() {
 }
 
 /// See `preconf_happy_path_on_mantle_hoodi` for scope: this pins the
-/// F1 block-gas-budget path is chain-id agnostic for 50002. Full-stack
+/// block-gas-budget path is chain-id agnostic for 50002. Full-stack
 /// Hoodi readiness is tracked separately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preconf_block_gas_budget_enforced_on_mantle_hoodi() {
