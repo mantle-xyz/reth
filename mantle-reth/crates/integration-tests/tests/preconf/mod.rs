@@ -31,5 +31,6 @@ mod replay_da;
 mod replay_nonce_consumed;
 mod replay_transient_defer;
 mod restart_replay;
+mod single_payload;
 mod timeout;
 mod validation_reject;

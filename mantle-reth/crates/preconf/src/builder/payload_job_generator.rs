@@ -17,23 +17,33 @@
 //!    handle + join handle. Subsequent `best_payload()` / `resolve_kind()` calls read through
 //!    those.
 //!
+//! ## `ensure_only_one_payload`
+//!
+//! [`Self::new_payload_job`] signal-cancels the previously spawned build, keeping **at most one
+//! live**. Otherwise a build that is never resolved (`getPayload`) nor evicted (reorg `Drop`) would
+//! linger forever — still subscribed to the shared [`PreconfTxSet`] broadcast — and could apply
+//! preconf txs into a block that never commits, stealing them from the job that will. It is a no-op
+//! in steady state (the previous job was already cancelled by its own `resolve_kind`); it only
+//! matters for abandoned / superseded jobs. Upstream [`BasicPayloadJobGenerator`] instead bounds
+//! job lifetime with a per-job deadline, which we avoid — it would cut a slow build short and break
+//! the preconf must-land SLA.
+//!
 //! ## What this generator does NOT do (yet)
 //!
 //! - **`on_new_state`**: no cached-reads pre-warming. Default no-op trait impl in place; the
 //!   cached-reads optimisation is a follow-up if pool-side cache misses dominate slot latency.
-//! - **`ensure_only_one_payload`**: `BasicPayloadJobGenerator` cancels existing payload jobs before
-//!   spawning a new one (see `basic-payload-builder/src/generator.rs`). This generator does not —
-//!   `last_payload` cancel-on-drop semantics are not needed until production rollout, and skipping
-//!   it keeps the trait wiring focused. The [`PayloadJob`]'s own `Drop` impl handles spawned-task
-//!   cleanup.
-//! - **Deadlines**: no auto-cancel on slot deadline; the payload service drives cancel via
-//!   `resolve_kind` instead.
+//!
+//! [`PreconfTxSet`]: crate::preconf_tx_set::PreconfTxSet
+//! [`BasicPayloadJobGenerator`]: reth_basic_payload_builder::BasicPayloadJobGenerator
 //!
 //! [`PayloadJobGenerator`]: reth_payload_builder::PayloadJobGenerator
 //! [`PreconfPayloadBuilder::build_payload`]: crate::builder::payload_builder::PreconfPayloadBuilder::build_payload
 //! [`BlockReaderIdExt::sealed_header_by_hash`]: reth_storage_api::BlockReaderIdExt::sealed_header_by_hash
 
-use std::{marker::PhantomData, sync::Arc};
+use std::{
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 
 use alloy_consensus::TxEnvelope;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
@@ -77,6 +87,10 @@ pub struct PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
     /// `Arc<PreconfConfig>` / `Arc<PreconfTxSet>` and the OP builder
     /// config (DA / gas / SDM-enable).
     builder: PreconfPayloadBuilder<Pool, Client, Evm>,
+    /// `ensure_only_one_payload`: cancel handle of the most-recently
+    /// spawned build. Signalled when the next job is created so at most
+    /// one build task is ever live — see [`Self::new_payload_job`].
+    last_cancel: Arc<Mutex<Option<JobCancel>>>,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
     /// constraining `N` itself.
     _pd: PhantomData<fn() -> N>,
@@ -84,8 +98,9 @@ pub struct PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
 
 impl<Pool, Client, Evm, N> PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
     /// Wrap a template builder so each `new_payload_job` call clones it.
-    pub const fn new(builder: PreconfPayloadBuilder<Pool, Client, Evm>) -> Self {
-        Self { builder, _pd: PhantomData }
+    // Not `const` — `Arc::new`/`Mutex::new` are not const-constructible.
+    pub fn new(builder: PreconfPayloadBuilder<Pool, Client, Evm>) -> Self {
+        Self { builder, last_cancel: Arc::new(Mutex::new(None)), _pd: PhantomData }
     }
 
     /// Borrow the inner template builder. Useful in tests / assertions.
@@ -193,6 +208,19 @@ where
         // Wire up the (cancel, payload-result) channels shared with
         // the spawned build task.
         let cancel = JobCancel::new();
+
+        // `ensure_only_one_payload`: cancel the previously spawned build so at
+        // most one is ever live (rationale in the module docs). Idempotent in
+        // steady state — the previous job was already cancelled by `resolve_kind`.
+        if let Some(prev) = self
+            .last_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(cancel.clone())
+        {
+            prev.signal();
+        }
+
         let cancel_for_build = cancel.clone();
         let (payload_tx, payload_rx) = watch::channel::<Option<OpBuiltPayload<N>>>(None);
 

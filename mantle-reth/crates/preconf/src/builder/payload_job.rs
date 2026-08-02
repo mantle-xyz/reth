@@ -117,7 +117,10 @@ where
 //
 // Idempotent with respect to `resolve_kind`'s own `cancel.signal()` —
 // `JobCancel::signal` is a single `watch::Sender::send(true)` and a
-// second call is a no-op.
+// second call is a no-op. It is also complementary to the generator's
+// `ensure_only_one_payload` (see `payload_job_generator.rs`), which cancels the
+// *previous* job when a *new* one is spawned: Drop covers the eviction path,
+// `ensure_only_one_payload` the supersede path; both funnel to the same signal.
 impl<Attrs, Payload> Drop for PreconfPayloadJob<Attrs, Payload> {
     fn drop(&mut self) {
         self.cancel.signal();

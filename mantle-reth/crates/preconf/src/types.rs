@@ -118,12 +118,11 @@ pub enum PreconfStatus {
 ///       crash.
 ///     - **Reorg reinject** — the pool re-admits a previously sealed tx after reorg; the pool
 ///       listener detects the case via `journal.sealed` membership.
-///
-///   In both cases the Mantle preconf SLA (*"once a receipt has been
-///   returned to the client, the tx must land on chain"*) requires
-///   these entries to **bypass** the deadline and per-block gas budget
-///   gates. They remain subject to the status / dedup gates and the
-///   underlying block gas limit.
+///       In both cases the Mantle preconf SLA (*"once a receipt has been
+///       returned to the client, the tx must land on chain"*) requires
+///       these entries to **bypass** the deadline and per-block gas budget
+///       gates. They remain subject to the status / dedup gates and the
+///       underlying block gas limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
     /// Live RPC submission — subject to all pre-apply gates.
