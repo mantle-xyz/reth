@@ -60,7 +60,7 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
     }
     let cfg = cfg.journal_path(fresh_journal("multiblock")).build();
 
-    let (mut node, http, _wallet, launched) = launch_preconf_node!(cfg).await;
+    let (node, http, _wallet, launched) = launch_preconf_node!(cfg).await;
     assert_eq!(launched, chain_id, "launched chain id must match signer chain id");
 
     // Height n=0 — the common ancestor we later rewind to (L1 origin 1).

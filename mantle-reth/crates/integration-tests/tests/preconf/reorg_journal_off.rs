@@ -46,7 +46,7 @@ async fn reorg_with_journal_disabled_stays_healthy_and_never_duplicates() {
 
     // Journal OFF: no `.journal_path(..)` — the degraded path.
     let cfg = PreconfCfgBuilder::new().whitelist_from(sender).whitelist_to(recipient).build();
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
     let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
     let (base, _) = op_node_slot_l1!(node, on = genesis, n = 0, l1 = 1);
@@ -98,9 +98,9 @@ async fn reorg_with_journal_disabled_stays_healthy_and_never_duplicates() {
     let ev2 = rpc2.await.expect("rpc join");
     // If the earlier commitment dropped, nonce 1 may be a gap; tolerate either a
     // success-and-land or a benign gap rejection, but the node must not crash.
-    if let Ok(ev2) = ev2 {
-        if ev2.status == PreconfStatus::Success {
-            assert!(sealed_cont.contains(&hash2), "continuity tx claimed success must land");
-        }
+    if let Ok(ev2) = ev2
+        && ev2.status == PreconfStatus::Success
+    {
+        assert!(sealed_cont.contains(&hash2), "continuity tx claimed success must land");
     }
 }

@@ -11,12 +11,11 @@
 //! exercising the real open→drop→reopen engine sequence guards against it.
 //!
 //! Engine calls exercised (the full op-node → reth request sequence):
-//!   1. engine_forkchoiceUpdatedV3(attrs) on H   -> build#1 opened (payload_id_1)
-//!   2. eth_sendRawTransactionWithPreconf         -> preconf enters the FIFO (Success)
-//!   3. engine_forkchoiceUpdatedV3(attrs') on H   -> build#2 opened; ensure_only_one_payload
-//!                                                   cancels build#1 (build#1 never getPayload'd)
-//!   4. engine_getPayloadV5(payload_id_2)         -> carryover re-dispatches the preconf
-//!   5. engine_newPayloadV4 + forkchoiceUpdated   -> commit build#2
+//!   1. `engine_forkchoiceUpdatedV3(attrs)` on H   -> build#1 opened (`payload_id_1`)
+//!   2. `eth_sendRawTransactionWithPreconf`         -> preconf enters the FIFO (Success)
+//!   3. `engine_forkchoiceUpdatedV3(attrs`') on H   -> build#2 opened; `ensure_only_one_payload` cancels build#1 (never getPayload'd)
+//!   4. `engine_getPayloadV5(payload_id_2)`         -> carryover re-dispatches the preconf
+//!   5. `engine_newPayloadV4` + forkchoiceUpdated   -> commit build#2
 
 use super::helpers::{PreconfCfgBuilder, fresh_journal, send_preconf};
 use crate::{fcu_v3_commit, fcu_v3_start, get_payload_v5, launch_preconf_node, new_payload_v4, op_node_slot};

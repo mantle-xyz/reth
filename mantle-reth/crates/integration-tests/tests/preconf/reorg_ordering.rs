@@ -75,7 +75,7 @@ async fn preconf_carryover_orders_ahead_of_higher_tip_after_reorg() {
         .whitelist_to(preconf_to)
         .journal_path(fresh_journal("ordering"))
         .build();
-    let (mut node, http, _wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (node, http, _wallet, chain_id) = launch_preconf_node!(cfg).await;
 
     let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
     let (base, _) = op_node_slot_l1!(node, on = genesis, n = 0, l1 = 1);
@@ -140,7 +140,7 @@ async fn ordering_journal_off_characterisation() {
         .whitelist_from(preconf_signer.address())
         .whitelist_to(preconf_to)
         .build();
-    let (mut node, http, _wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (node, http, _wallet, chain_id) = launch_preconf_node!(cfg).await;
 
     let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
     let (base, _) = op_node_slot_l1!(node, on = genesis, n = 0, l1 = 1);

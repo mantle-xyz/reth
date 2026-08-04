@@ -44,7 +44,7 @@ async fn relanded_commitment_not_duplicated_and_sender_continues() {
         .whitelist_to(recipient)
         .journal_path(fresh_journal("dedup"))
         .build();
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
     let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
     let (base, _) = op_node_slot_l1!(node, on = genesis, n = 0, l1 = 1);

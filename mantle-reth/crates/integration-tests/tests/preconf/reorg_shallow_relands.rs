@@ -55,7 +55,7 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
         .journal_path(fresh_journal("shallow")) // journal ON — so the reverted commitment can be replayed
         .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
     // Block at height n=0 — the reorg base, referencing L1 origin 1.
     let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
