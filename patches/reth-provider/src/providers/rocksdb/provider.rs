@@ -2701,6 +2701,9 @@ impl Iterator for RocksDBRawIter<'_> {
 /// Iterator over a `RocksDB` table within a transaction.
 ///
 /// Yields decoded `(Key, Value)` pairs. Sees uncommitted writes.
+// [MANTLE PATCH] allow(unnameable_types): re-exported through a private module;
+// upstream reth has the same shape. Newer clippy promotes this to deny under -D warnings.
+#[allow(unnameable_types)]
 pub struct RocksTxIter<'tx, T: Table> {
     inner: rocksdb::DBIteratorWithThreadMode<'tx, Transaction<'tx, OptimisticTransactionDB>>,
     _marker: std::marker::PhantomData<T>,

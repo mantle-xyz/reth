@@ -456,17 +456,17 @@ async fn canceled_slot_replaceable_by_different_hash() {
 ///
 /// 3. Build loop's `biased` select! prioritises `fifo_rx.recv` over the pool arm, whose gate
 ///    `pool_gas_used < pool_quota` is blocked at build start because `pool_quota = 0` until the
-///    first `sweep_ticker.tick()` fires (~sweep_interval = 200ms). So the preconf tx nonce=1 is
+///    first `sweep_ticker.tick()` fires (~`sweep_interval` = 200ms). So the preconf tx nonce=1 is
 ///    dispatched BEFORE the pool arm applies the shadow tx nonce=0. Reth's builder sees the
 ///    in-flight state's sender nonce is still 0, but tx.nonce=1 — nonce mismatch → the builder
 ///    returns Err(nonce_...) → `apply_preconf_tx` wraps as `PreconfError::BuilderRejected(...)` →
 ///    `apply_one_preconf` marks the fifo entry `Failed` and sends the Err to the responder.
 ///    Client's `send_preconf` awaits and receives `Err(Call { "builder rejected: ..." })`.
 ///
-/// 4. After the sweep_ticker fires and pool arm applies the shadow tx nonce=0, the block is sealed
-///    containing just that tx. Canon slot 1 → sender's on-chain nonce = 1; the `Failed` fifo entry
-///    at nonce=1 survives `sync_fifo_forward_to_head` (nonce=1 is NOT < the new on-chain nonce of
-///    1).
+/// 4. After the `sweep_ticker` fires and pool arm applies the shadow tx nonce=0, the block is
+///    sealed containing just that tx. Canon slot 1 → sender's on-chain nonce = 1; the `Failed` fifo
+///    entry at nonce=1 survives `sync_fifo_forward_to_head` (nonce=1 is NOT < the new on-chain
+///    nonce of 1).
 ///
 /// 5. Slot 2: the client submits a **replacement** preconf tx: same sender, nonce=1, but different
 ///    `value` (⇒ different hash). The pool validator's
@@ -483,10 +483,10 @@ async fn canceled_slot_replaceable_by_different_hash() {
 /// **Marked `#[ignore]` because the setup is time-sensitive under
 /// parallel test load**: the fifo `Failed` trigger relies on the biased
 /// select! running preconf dispatch BEFORE the pool arm's first
-/// sweep_ticker tick applies the shadow tx nonce=0. Under contention,
+/// `sweep_ticker` tick applies the shadow tx nonce=0. Under contention,
 /// reth's canon-state propagation between slot 1 and slot 2 can also
 /// lag past the 500ms sleep, leaving the state provider observing the
-/// pre-block-1 snapshot when slot 2's PayloadJob queries it — the
+/// pre-block-1 snapshot when slot 2's `PayloadJob` queries it — the
 /// replacement tx then sees `expected nonce = 0` at the builder and
 /// fails again with `BuilderRejected("nonce 1 too high")`. In
 /// isolation (`cargo test ... failed_slot_replaceable_by_different_hash

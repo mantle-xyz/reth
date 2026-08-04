@@ -26,6 +26,9 @@ type LoadedJarRef<'a> =
 
 /// Helper type to reuse an associated static file mmap handle on created cursors.
 #[derive(Debug)]
+// [MANTLE PATCH] allow(unnameable_types): re-exported through a private module;
+// upstream reth has the same shape. Newer clippy promotes this to deny under -D warnings.
+#[allow(unnameable_types)]
 pub struct LoadedJar {
     jar: NippyJar<SegmentHeader>,
     mmap_handle: Arc<reth_nippy_jar::DataReader>,

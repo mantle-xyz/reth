@@ -47,7 +47,7 @@ pub struct PreconfPoolListener<P, Tx, Cons> {
     /// Optional journal handle used to distinguish reorg-reinjected txs
     /// from fresh RPC submissions. When `Some`, every incoming pool event
     /// is checked against `journal.sealed`; a hit means the tx was
-    /// previously promised to a client (mark_sealed fired on an earlier
+    /// previously promised to a client (`mark_sealed` fired on an earlier
     /// canon commit) and must bypass the deadline / block-gas-budget
     /// gates — so we push with [`PreconfSource::Replay`] to align
     /// with the SLA "receipt returned → tx must land" contract. `None`

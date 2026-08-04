@@ -2,9 +2,9 @@ name: ci
 
 on:
   pull_request:
-    branches: [mantle-elysium, main]
+    branches: [mantle-stage2, main]
   push:
-    branches: [mantle-elysium, main]
+    branches: [mantle-stage2, main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}

@@ -8,6 +8,9 @@ use strum::{EnumIter, IntoEnumIterator};
 
 /// Metrics for the static file provider.
 #[derive(Debug)]
+// [MANTLE PATCH] allow(unnameable_types): re-exported through a private module;
+// upstream reth has the same shape. Newer clippy promotes this to deny under -D warnings.
+#[allow(unnameable_types)]
 pub struct StaticFileProviderMetrics {
     segments: StaticFileMap<StaticFileSegmentMetrics>,
     segment_operations: HashMap<

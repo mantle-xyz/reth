@@ -501,7 +501,7 @@ impl PreconfTxSet {
     /// `Waiting → Failed`. **Soft terminal** — like `Timeout` /
     /// `Canceled`, a `Failed` entry is **revivable** via same-hash
     /// resubmit (`push_if_absent`'s Timeout/Canceled/Failed → Waiting
-    /// branch). Called by builder when apply_fn returned Err
+    /// branch). Called by builder when `apply_fn` returned Err
     /// (in-flight nonce / balance race, block gas exhausted at builder
     /// level). **tx NOT on chain**.
     ///
@@ -683,7 +683,7 @@ impl PreconfTxSet {
     /// violated (both slots occupied for the same hash), the ghost
     /// responder in `pending_responders` is dropped rather than leaked as
     /// a zombie — its client will observe `RecvError` instead of a stuck
-    /// oneshot. Minimal-cost defense; no logging or debug_assert because
+    /// oneshot. Minimal-cost defense; no logging or `debug_assert` because
     /// the primary slot's caller already saw a Some(responder) result.
     pub async fn cancel_responder(&self, hash: &TxHash, err: PreconfError) {
         let responder = {
@@ -711,7 +711,7 @@ impl PreconfTxSet {
     /// `pending_responders.remove(hash)` drops any ghost that would
     /// otherwise leak under invariant #2 violation. The caller sends
     /// Ok(receipt) via the returned Sender; the ghost's receiver
-    /// observes RecvError.
+    /// observes `RecvError`.
     pub async fn take_responder(
         &self,
         hash: &TxHash,
@@ -1285,7 +1285,7 @@ mod tests {
     /// `drop_hash` must be tolerant of partially-populated index state: if
     /// `entries[hash]` is missing, it should still clean `order` /
     /// `by_sender` / `pending_responders`. Non-self-heal companion to R6's
-    /// "dangling by_sender" case — here the direction is opposite: entry
+    /// "dangling `by_sender`" case — here the direction is opposite: entry
     /// gone first, aux indices need scrubbing.
     #[tokio::test]
     async fn drop_hash_tolerates_missing_entry() {
@@ -1315,7 +1315,7 @@ mod tests {
 
     /// `cancel_responder` belt-and-braces cleanup: even if invariant #2 is
     /// violated (both `entry.responder` and `pending_responders[hash]` hold
-    /// a responder), the ghost in pending_responders must be dropped so the
+    /// a responder), the ghost in `pending_responders` must be dropped so the
     /// client observes `RecvError` rather than waiting forever. The
     /// primary slot (entry.responder) still gets the typed `Err(...)`.
     #[tokio::test]
@@ -1362,7 +1362,7 @@ mod tests {
     /// invariant #2 violation (both slots occupied), `take_responder`
     /// returns the primary responder AND drops the ghost. Caller then
     /// sends Ok(receipt) via the returned Sender; ghost's receiver sees
-    /// RecvError.
+    /// `RecvError`.
     #[tokio::test]
     async fn take_responder_drops_ghost_pending_slot() {
         let set = PreconfTxSet::new(4);

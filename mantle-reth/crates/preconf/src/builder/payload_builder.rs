@@ -171,7 +171,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
 /// Convert an `Arc<TxEnvelope>` to the pipeline's `N::SignedTx` and
 /// recover its signer, then apply against the in-flight builder.
 ///
-/// Shared helper used both by the carryover preamble and the fifo_rx
+/// Shared helper used both by the carryover preamble and the `fifo_rx`
 /// arm of the select! loop; the callers wrap this in a thin closure
 /// that captures `&mut builder`, which is required so
 /// `dispatch::apply_one_preconf`'s `apply_fn` callback signature
@@ -1153,7 +1153,7 @@ mod tests {
     struct FakePostExecTx;
     impl From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>> for FakePostExecTx {
         fn from(_: alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>) -> Self {
-            FakePostExecTx
+            Self
         }
     }
 
@@ -1282,7 +1282,7 @@ mod tests {
         assert_eq!(s.first_offset, TEST_INTERVAL);
     }
 
-    /// Drift exceeds slot_duration (misconfigured attrs.timestamp far
+    /// Drift exceeds `slot_duration` (misconfigured attrs.timestamp far
     /// in the future). Clamped to `slot_duration` — no unbounded quota.
     #[test]
     fn quota_schedule_over_long_drift_clamps_to_slot_duration() {
@@ -1340,7 +1340,7 @@ mod tests {
         }
     }
 
-    /// No DA limits configured (pre-Jovian, no da_config) → every tx passes.
+    /// No DA limits configured (pre-Jovian, no `da_config`) → every tx passes.
     /// This is the default integration-harness state, so preconf behaviour
     /// is unchanged unless an operator sets DA limits.
     #[test]

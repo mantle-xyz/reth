@@ -373,24 +373,24 @@ pub(super) async fn apply_one_preconf<F>(
     // our earlier gate reads and this acquisition; running `apply_fn`
     // now would violate the invariant "committed to builder state ⇒
     // wire not Timeout".
-    if let Some(re_entry) = fifo.find_by_hash(&hash).await {
-        if re_entry.status != PreconfStatus::Waiting {
-            trace!(
-                target: "mantle::preconf::dispatch",
-                ?hash, status = ?re_entry.status,
-                "status flipped before we acquired apply_lock; skipping apply"
-            );
-            let reason = match re_entry.status {
-                PreconfStatus::Timeout => {
-                    PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
-                }
-                other => PreconfError::Internal(format!(
-                    "preconf entry flipped to {other:?} before apply_lock"
-                )),
-            };
-            loop_state.record_excluded(hash, reason);
-            return;
-        }
+    if let Some(re_entry) = fifo.find_by_hash(&hash).await &&
+        re_entry.status != PreconfStatus::Waiting
+    {
+        trace!(
+            target: "mantle::preconf::dispatch",
+            ?hash, status = ?re_entry.status,
+            "status flipped before we acquired apply_lock; skipping apply"
+        );
+        let reason = match re_entry.status {
+            PreconfStatus::Timeout => {
+                PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
+            }
+            other => PreconfError::Internal(format!(
+                "preconf entry flipped to {other:?} before apply_lock"
+            )),
+        };
+        loop_state.record_excluded(hash, reason);
+        return;
     }
 
     // ── Apply via caller-supplied closure (real EVM in production,
@@ -801,7 +801,7 @@ mod tests {
 
     /// Cumulative tracking: successful applies increment
     /// `preconf_gas_used` by the receipt's `gas_used`. Three sequential
-    /// LoopState `pool_gas_used` tracks the pool best-tx sweep independently
+    /// `LoopState` `pool_gas_used` tracks the pool best-tx sweep independently
     /// of `preconf_gas_used` — `record_pool_gas` must accumulate and stay
     /// separate from `preconf_gas_used`.
     #[test]
@@ -857,7 +857,7 @@ mod tests {
     ///
     /// - NOT invoke `apply_fn`
     /// - NOT touch responders
-    /// - NOT record the hash in loop_state (allowing a future re-push of the same hash to proceed
+    /// - NOT record the hash in `loop_state` (allowing a future re-push of the same hash to proceed
     ///   normally)
     #[tokio::test]
     async fn missing_fifo_entry_is_silent_noop() {
@@ -943,9 +943,9 @@ mod tests {
         }
     }
 
-    /// reconcile_lagged applies pending fifo entries in FIFO (insertion)
-    /// order. Locks the `snapshot()` → VecDeque `order` guarantee so a
-    /// future refactor to HashMap iteration would fail this test.
+    /// `reconcile_lagged` applies pending fifo entries in FIFO (insertion)
+    /// order. Locks the `snapshot()` → `VecDeque` `order` guarantee so a
+    /// future refactor to `HashMap` iteration would fail this test.
     #[tokio::test]
     async fn reconcile_lagged_applies_all_pending_in_fifo_order() {
         use std::cell::RefCell;
@@ -973,9 +973,9 @@ mod tests {
         assert_eq!(state.excluded_len(), 0);
     }
 
-    /// reconcile_lagged relies on `apply_one_preconf`'s gate ① for
+    /// `reconcile_lagged` relies on `apply_one_preconf`'s gate ① for
     /// dedup. Hashes already in `loop_state.committed` must be skipped
-    /// (apply_fn not invoked).
+    /// (`apply_fn` not invoked).
     #[tokio::test]
     async fn reconcile_lagged_dedups_against_prior_committed() {
         use std::cell::Cell;
@@ -1005,7 +1005,7 @@ mod tests {
         assert_eq!(state.committed_len(), 3);
     }
 
-    /// reconcile_lagged shares `LoopState.preconf_gas_used` with the
+    /// `reconcile_lagged` shares `LoopState.preconf_gas_used` with the
     /// broadcast path. Pre-loading `preconf_gas_used` so the second tx
     /// would exceed `preconf_max_gas_per_block` must cause it to be
     /// Canceled via the same gate `apply_one_preconf` uses.
@@ -1044,10 +1044,10 @@ mod tests {
         assert_eq!(e2.status, PreconfStatus::Canceled);
     }
 
-    /// reconcile_lagged iterates the whole `order` VecDeque including
+    /// `reconcile_lagged` iterates the whole `order` `VecDeque` including
     /// entries in terminal states (mark_* keeps entries until forward /
-    /// clean_reclaimable removes them). Those must be filtered by
-    /// `apply_one_preconf`'s status gate — apply_fn only fires for the
+    /// `clean_reclaimable` removes them). Those must be filtered by
+    /// `apply_one_preconf`'s status gate — `apply_fn` only fires for the
     /// Waiting entry.
     #[tokio::test]
     async fn reconcile_lagged_skips_non_waiting_entries() {
@@ -1089,7 +1089,7 @@ mod tests {
     //    replay must never silently drop a promised tx). ─────────────
 
     /// Journal-replayed entries bypass the pre-apply deadline gate.
-    /// Even after the timeout has elapsed since insertion, apply_fn
+    /// Even after the timeout has elapsed since insertion, `apply_fn`
     /// still fires and the tx transitions to Success — the RPC-source
     /// counterpart under the same conditions goes to Timeout (see
     /// `deadline_skip_marks_timeout_and_cancels_responder`).
@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(entry.status, PreconfStatus::Success);
     }
 
-    /// Mixed sources share the LoopState `preconf_gas_used` accounting:
+    /// Mixed sources share the `LoopState` `preconf_gas_used` accounting:
     /// a Journal tx that bypasses the gate still contributes to the
     /// running total, so a subsequent RPC tx sees the true cost and
     /// can be gated properly.

@@ -76,12 +76,8 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
 
-    let entry = JournalEntry {
-        hash: tx_hash,
-        tx_rlp: raw_tx.clone().into(),
-        block_height: 1,
-        committed_at_ms: 0,
-    };
+    let entry =
+        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0 };
     let mut line = serde_json::to_vec(&entry).expect("encode JournalEntry");
     line.push(b'\n');
     std::fs::write(&journal_file, &line).expect("write journal file");
@@ -174,24 +170,9 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
     let hash2 = keccak256(&tx2);
 
     let entries = [
-        JournalEntry {
-            hash: hash0,
-            tx_rlp: tx0.clone().into(),
-            block_height: 1,
-            committed_at_ms: 0,
-        },
-        JournalEntry {
-            hash: hash1,
-            tx_rlp: tx1.clone().into(),
-            block_height: 1,
-            committed_at_ms: 0,
-        },
-        JournalEntry {
-            hash: hash2,
-            tx_rlp: tx2.clone().into(),
-            block_height: 1,
-            committed_at_ms: 0,
-        },
+        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash1, tx_rlp: tx1.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash2, tx_rlp: tx2.clone(), block_height: 1, committed_at_ms: 0 },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 
@@ -293,18 +274,8 @@ async fn journal_replay_across_multiple_senders() {
     let hash_b = keccak256(&tx_b);
 
     let entries = [
-        JournalEntry {
-            hash: hash_a,
-            tx_rlp: tx_a.clone().into(),
-            block_height: 1,
-            committed_at_ms: 0,
-        },
-        JournalEntry {
-            hash: hash_b,
-            tx_rlp: tx_b.clone().into(),
-            block_height: 1,
-            committed_at_ms: 0,
-        },
+        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0 },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 

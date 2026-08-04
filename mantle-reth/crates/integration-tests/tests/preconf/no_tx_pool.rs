@@ -73,12 +73,8 @@ async fn no_tx_pool_gates_replay_source_entry() {
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
 
-    let entry = JournalEntry {
-        hash: tx_hash,
-        tx_rlp: raw_tx.clone().into(),
-        block_height: 1,
-        committed_at_ms: 0,
-    };
+    let entry =
+        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0 };
     let mut line = serde_json::to_vec(&entry).expect("encode JournalEntry");
     line.push(b'\n');
     std::fs::write(&journal_file, &line).expect("write journal file");
@@ -142,7 +138,7 @@ async fn no_tx_pool_gates_replay_source_entry() {
     // build did not consume it, only deferred it.
     let attrs_2 = node.payload.next_attributes();
     assert!(
-        attrs_2.0.no_tx_pool.unwrap_or(false) == false,
+        !attrs_2.0.no_tx_pool.unwrap_or(false),
         "sanity: default mantle_payload_attributes must produce no_tx_pool=false/None",
     );
     let fcu_state_2 = node.current_forkchoice_state().expect("forkchoice state 2");
