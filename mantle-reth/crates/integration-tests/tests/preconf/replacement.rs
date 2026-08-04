@@ -463,10 +463,10 @@ async fn canceled_slot_replaceable_by_different_hash() {
 ///    `apply_one_preconf` marks the fifo entry `Failed` and sends the Err to the responder.
 ///    Client's `send_preconf` awaits and receives `Err(Call { "builder rejected: ..." })`.
 ///
-/// 4. After the `sweep_ticker` fires and pool arm applies the shadow tx nonce=0, the block is sealed
-///    containing just that tx. Canon slot 1 → sender's on-chain nonce = 1; the `Failed` fifo entry
-///    at nonce=1 survives `sync_fifo_forward_to_head` (nonce=1 is NOT < the new on-chain nonce of
-///    1).
+/// 4. After the `sweep_ticker` fires and pool arm applies the shadow tx nonce=0, the block is
+///    sealed containing just that tx. Canon slot 1 → sender's on-chain nonce = 1; the `Failed` fifo
+///    entry at nonce=1 survives `sync_fifo_forward_to_head` (nonce=1 is NOT < the new on-chain
+///    nonce of 1).
 ///
 /// 5. Slot 2: the client submits a **replacement** preconf tx: same sender, nonce=1, but different
 ///    `value` (⇒ different hash). The pool validator's

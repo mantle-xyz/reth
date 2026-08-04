@@ -73,12 +73,8 @@ async fn no_tx_pool_gates_replay_source_entry() {
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
 
-    let entry = JournalEntry {
-        hash: tx_hash,
-        tx_rlp: raw_tx.clone(),
-        block_height: 1,
-        committed_at_ms: 0,
-    };
+    let entry =
+        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0 };
     let mut line = serde_json::to_vec(&entry).expect("encode JournalEntry");
     line.push(b'\n');
     std::fs::write(&journal_file, &line).expect("write journal file");

@@ -373,24 +373,25 @@ pub(super) async fn apply_one_preconf<F>(
     // our earlier gate reads and this acquisition; running `apply_fn`
     // now would violate the invariant "committed to builder state ⇒
     // wire not Timeout".
-    if let Some(re_entry) = fifo.find_by_hash(&hash).await
-        && re_entry.status != PreconfStatus::Waiting {
-            trace!(
-                target: "mantle::preconf::dispatch",
-                ?hash, status = ?re_entry.status,
-                "status flipped before we acquired apply_lock; skipping apply"
-            );
-            let reason = match re_entry.status {
-                PreconfStatus::Timeout => {
-                    PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
-                }
-                other => PreconfError::Internal(format!(
-                    "preconf entry flipped to {other:?} before apply_lock"
-                )),
-            };
-            loop_state.record_excluded(hash, reason);
-            return;
-        }
+    if let Some(re_entry) = fifo.find_by_hash(&hash).await &&
+        re_entry.status != PreconfStatus::Waiting
+    {
+        trace!(
+            target: "mantle::preconf::dispatch",
+            ?hash, status = ?re_entry.status,
+            "status flipped before we acquired apply_lock; skipping apply"
+        );
+        let reason = match re_entry.status {
+            PreconfStatus::Timeout => {
+                PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
+            }
+            other => PreconfError::Internal(format!(
+                "preconf entry flipped to {other:?} before apply_lock"
+            )),
+        };
+        loop_state.record_excluded(hash, reason);
+        return;
+    }
 
     // ── Apply via caller-supplied closure (real EVM in production,
     //    synthetic receipt in tests). ────────────────────────────────

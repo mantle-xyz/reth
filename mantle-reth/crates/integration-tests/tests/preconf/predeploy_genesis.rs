@@ -10,8 +10,8 @@
 //! This file verifies two things:
 //! 1. A node launched against that spec is still functional end-to-end: the preconf happy-path
 //!    lands a whitelisted tx in the first block.
-//! 2. The `L1Block` predeploy actually has bytecode after boot — i.e. the fixture was carried through
-//!    into the live in-memory state, not silently dropped by the spec-loader.
+//! 2. The `L1Block` predeploy actually has bytecode after boot — i.e. the fixture was carried
+//!    through into the live in-memory state, not silently dropped by the spec-loader.
 
 use super::helpers::{PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, send_preconf};
 use crate::launch_preconf_node;

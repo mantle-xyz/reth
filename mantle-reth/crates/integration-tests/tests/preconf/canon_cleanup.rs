@@ -445,8 +445,10 @@ async fn canon_across_sequential_slots_forwards_on_every_new_job() {
             .await
             .expect("resolve_kind")
             .expect("payload");
-        let event =
-            rpc_task.await.expect("rpc join").unwrap_or_else(|_| panic!("nonce={nonce} must succeed"));
+        let event = rpc_task
+            .await
+            .expect("rpc join")
+            .unwrap_or_else(|_| panic!("nonce={nonce} must succeed"));
 
         assert!(
             matches!(event.status, PreconfStatus::Success),
