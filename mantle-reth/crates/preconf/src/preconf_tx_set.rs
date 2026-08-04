@@ -215,7 +215,20 @@ impl PreconfTxSet {
     /// validated upstream via `PreconfConfig::validate`.
     pub fn new(broadcast_cap: usize) -> Self {
         let (notifier, _) = broadcast::channel(broadcast_cap);
+        // Register the gauge at 0 so it has a baseline from startup.
+        metrics::gauge!("preconf.fifo.pending").set(0.0);
         Self { inner: Mutex::new(PreconfTxSetInner::new()), notifier, pool_evict: OnceLock::new() }
+    }
+
+    /// Sample the current `Waiting` backlog into the `preconf.fifo.pending`
+    /// gauge. Called once per payload build job (~per slot) rather than at
+    /// every fifo mutation — the gauge is a sampled quantity, so slot-level
+    /// granularity is enough and keeps the mutation paths free of the scan.
+    pub async fn publish_pending_gauge(&self) {
+        let inner = self.inner.lock().await;
+        let pending =
+            inner.entries.values().filter(|e| e.status == PreconfStatus::Waiting).count();
+        metrics::gauge!("preconf.fifo.pending").set(pending as f64);
     }
 
     /// Register the pool-eviction callback fired after any transition

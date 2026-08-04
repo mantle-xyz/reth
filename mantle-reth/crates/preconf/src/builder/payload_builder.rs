@@ -1009,6 +1009,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // into the derivation block).
         let allow_preconf = !ctx.attributes().no_tx_pool();
 
+        // Sample the pending-backlog gauge once per build job (~per slot).
+        self.fifo.publish_pending_gauge().await;
+
         // Synchronous canon-forward — drop fifo entries whose nonce is
         // already sealed as of parent block. Replaces the async
         // `canon_handler::forward()` which raced with new PayloadJob

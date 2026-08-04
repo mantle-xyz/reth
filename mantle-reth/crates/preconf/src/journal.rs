@@ -155,6 +155,8 @@ impl PreconfJournal {
         }
         let file = OpenOptions::new().create(true).append(true).open(&path).await?;
         let init_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        // Seed the gauge from the on-disk size (carried across restarts).
+        metrics::gauge!("preconf.journal.size_bytes").set(init_size as f64);
         Ok(Self {
             path,
             writer: Mutex::new(file),
@@ -191,6 +193,7 @@ impl PreconfJournal {
             writer.flush().await?;
             self.size_bytes.fetch_add(len, Ordering::Relaxed) + len
         };
+        metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
         // Size-triggered rotation: wake the rejournal loop when the file
         // crosses the cap. The heavy `rotate()` runs off this hot path;
         // the loop rate-limits repeated triggers (see `run_rejournal_loop`).
@@ -323,6 +326,7 @@ impl PreconfJournal {
         // holding the writer lock, so it stays consistent with any
         // `append_promised` that serialises before/after this swap.
         self.size_bytes.store(kept_bytes, Ordering::Relaxed);
+        metrics::gauge!("preconf.journal.size_bytes").set(kept_bytes as f64);
 
         // Sealed entries that just left the file are also redundant
         // in memory now: rotate is the point at which a commitment

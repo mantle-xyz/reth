@@ -82,6 +82,18 @@ impl reth_transaction_pool::error::PoolTransactionError for PreconfGasLimitExcee
     }
 }
 
+/// Records `preconf.validate.duration_ms` on drop so all early-return paths
+/// of [`PreconfAwareValidator::validate_transaction`] are covered. Spans the
+/// inner (OP / Mantle) validator too — op-geth `preconf/txpool/filter` analogue.
+struct ValidateTimer(std::time::Instant);
+
+impl Drop for ValidateTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("preconf.validate.duration_ms")
+            .record(self.0.elapsed().as_millis() as f64);
+    }
+}
+
 /// Validator decorator that enforces preconf-specific rules before delegating.
 ///
 /// Constructed via [`Self::new`] and threaded into the pool validation chain.
@@ -120,6 +132,8 @@ where
         origin: TransactionOrigin,
         transaction: Self::Transaction,
     ) -> TransactionValidationOutcome<Self::Transaction> {
+        let _timer = ValidateTimer(std::time::Instant::now());
+
         let sender = transaction.sender();
         let nonce = transaction.nonce();
         let tx_hash = *transaction.hash();

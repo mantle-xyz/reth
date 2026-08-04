@@ -408,7 +408,13 @@ where
     Pr: StateProviderFactory + 'static,
 {
     async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
-        self.handle_inner(bytes).await
+        // Preconf-handling latency, measured around `handle_inner` to cover
+        // every early-return path (reject / timeout / success).
+        let started = std::time::Instant::now();
+        let out = self.handle_inner(bytes).await;
+        metrics::histogram!("preconf.api.handle_duration_ms")
+            .record(started.elapsed().as_millis() as f64);
+        out
     }
 }
 

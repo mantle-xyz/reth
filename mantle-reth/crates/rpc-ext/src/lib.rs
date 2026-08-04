@@ -413,18 +413,20 @@ where
         // Path 2: follower node → forward to upstream sequencer (existing behavior).
         if let Some(sequencer) = self.sequencer_client.as_ref() {
             debug!(target: "rpc::eth::mantle", "forwarding raw transaction with preconf to sequencer");
-            let raw: serde_json::Value = sequencer
-                .forward_raw_transaction_with_preconf(bytes.as_ref())
-                .await
-                .map_err(|err| {
-                    ErrorObject::owned(
-                        -32000,
-                        format!(
-                            "failed to forward tx to sequencer, please try again. Error: '{err}'"
-                        ),
-                        None::<()>,
-                    )
-                })?;
+            // Follower→sequencer forward latency (success and error paths).
+            // op-geth `preconf/txpool/forward` analogue; follower-only.
+            let started = std::time::Instant::now();
+            let forward_result =
+                sequencer.forward_raw_transaction_with_preconf(bytes.as_ref()).await;
+            metrics::histogram!("preconf.forward.duration_ms")
+                .record(started.elapsed().as_millis() as f64);
+            let raw: serde_json::Value = forward_result.map_err(|err| {
+                ErrorObject::owned(
+                    -32000,
+                    format!("failed to forward tx to sequencer, please try again. Error: '{err}'"),
+                    None::<()>,
+                )
+            })?;
             serde_json::from_value::<PreconfTxEvent>(raw).map_err(|err| {
                 ErrorObject::owned(
                     -32000,
