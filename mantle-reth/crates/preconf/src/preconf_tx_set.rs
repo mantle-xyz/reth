@@ -226,8 +226,7 @@ impl PreconfTxSet {
     /// granularity is enough and keeps the mutation paths free of the scan.
     pub async fn publish_pending_gauge(&self) {
         let inner = self.inner.lock().await;
-        let pending =
-            inner.entries.values().filter(|e| e.status == PreconfStatus::Waiting).count();
+        let pending = inner.entries.values().filter(|e| e.status == PreconfStatus::Waiting).count();
         metrics::gauge!("preconf.fifo.pending").set(pending as f64);
     }
 

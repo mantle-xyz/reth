@@ -529,8 +529,10 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     // First submit: dispatch the block-gas-budget gate fires → Err(BlockGasBudgetExceeded).
     let _ = t0.await.expect("t0 join").expect("tx0 must succeed");
     let _ = t1.await.expect("t1 join").expect("tx1 must succeed");
-    let err_first =
-        t2_first.await.expect("t2 first join").expect_err("first tx2 submit must be budget-rejected");
+    let err_first = t2_first
+        .await
+        .expect("t2 first join")
+        .expect_err("first tx2 submit must be budget-rejected");
     let first_message = match err_first {
         ClientError::Call(ref e) => {
             assert!(

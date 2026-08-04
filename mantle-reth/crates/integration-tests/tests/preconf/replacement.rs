@@ -18,8 +18,8 @@
 //!   tx.
 //! - `timeout_slot_replaceable_by_different_hash` — `Timeout` entries are reclaimable, releasing
 //!   the slot; a differently-signed tx for the same slot admits and lands on chain.
-//! - `canceled_slot_replaceable_by_different_hash` — symmetric to Timeout: budget-Canceled entries also
-//!   release the slot.
+//! - `canceled_slot_replaceable_by_different_hash` — symmetric to Timeout: budget-Canceled entries
+//!   also release the slot.
 //!
 //! - `failed_slot_replaceable_by_different_hash` — symmetric to the Timeout / Canceled cases.
 //!   Triggering fifo `Failed` in the integration layer needs a builder-level rejection that
@@ -355,7 +355,8 @@ async fn canceled_slot_replaceable_by_different_hash() {
 
     let _ = t0.await.expect("t0 join").expect("tx0 must succeed");
     let _ = t1.await.expect("t1 join").expect("tx1 must succeed");
-    let err_2 = t2.await.expect("t2 join").expect_err("tx2 must be budget-rejected → fifo Canceled");
+    let err_2 =
+        t2.await.expect("t2 join").expect_err("tx2 must be budget-rejected → fifo Canceled");
     assert!(
         matches!(err_2, ClientError::Call(ref e) if e.message().to_lowercase().contains("gas budget")),
         "expected BlockGasBudgetExceeded to produce fifo Canceled state; got {err_2:?}",

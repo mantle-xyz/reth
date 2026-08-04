@@ -204,7 +204,7 @@ where
 /// ([`apply_one_best_tx`]).
 #[derive(Debug, Clone, Copy)]
 struct BuildConstraints {
-    /// Block gas hard cap (also the footprint-gas DA bound). 
+    /// Block gas hard cap (also the footprint-gas DA bound).
     block_gas_limit: u64,
     /// Max DA bytes for the whole block (`da_config.max_da_block_size`).
     block_da_limit: Option<u64>,
@@ -240,7 +240,11 @@ fn estimated_tx_da_size(tx: &TxEnvelope) -> u64 {
 /// not a soft budget. On over-limit the tx is left reclaimable (dispatch
 /// maps the `Err` to fifo `Failed`; a later-slot resubmit with DA headroom
 /// revives it).
-fn preconf_da_check(tx_da: u64, da_used: u64, limits: BuildConstraints) -> Result<(), PreconfError> {
+fn preconf_da_check(
+    tx_da: u64,
+    da_used: u64,
+    limits: BuildConstraints,
+) -> Result<(), PreconfError> {
     if limits.tx_da_limit.is_some_and(|l| tx_da > l) {
         return Err(PreconfError::DaLimitExceeded {
             used: da_used,
@@ -298,8 +302,8 @@ enum Admission {
 /// Classification rule = *"does this tx fit an empty block?"*:
 /// - **Permanent** (exceeds a per-tx / per-block bound even alone) → `Reject`.
 /// - **Fits** the current block's remaining headroom → `Admit`.
-/// - **Transient** (fits an empty block, but the current block is too full) →
-///   `Defer` for `Replay`, `Reject` for `Rpc`.
+/// - **Transient** (fits an empty block, but the current block is too full) → `Defer` for `Replay`,
+///   `Reject` for `Rpc`.
 fn preconf_admission(
     tx_da: u64,
     tx_gas_limit: u64,
@@ -311,18 +315,18 @@ fn preconf_admission(
     // ── Permanent: does the tx fit an *empty* block (da_used = gas_used = 0)? ──
     // A tx that alone exceeds a per-tx / per-block bound can never be included
     // in any block → hard reject regardless of source.
-    if let Some(limit) = limits.tx_da_limit
-        && tx_da > limit
+    if let Some(limit) = limits.tx_da_limit &&
+        tx_da > limit
     {
         return Admission::Reject(PreconfError::DaLimitExceeded { used: da_used, tx_da, limit });
     }
-    if let Some(limit) = limits.block_da_limit
-        && tx_da > limit
+    if let Some(limit) = limits.block_da_limit &&
+        tx_da > limit
     {
         return Admission::Reject(PreconfError::DaLimitExceeded { used: da_used, tx_da, limit });
     }
-    if let Some(scalar) = limits.da_footprint_gas_scalar
-        && tx_da.saturating_mul(scalar as u64) > limits.block_gas_limit
+    if let Some(scalar) = limits.da_footprint_gas_scalar &&
+        tx_da.saturating_mul(scalar as u64) > limits.block_gas_limit
     {
         return Admission::Reject(PreconfError::DaLimitExceeded {
             used: da_used,
@@ -448,8 +452,8 @@ async fn admit_and_dispatch<N, B>(
     // (1) Same-sender cascade — Replay entries only. A successor inherits the
     // predecessor's non-admission outcome; it cannot execute before the
     // predecessor lands.
-    if source == PreconfSource::Replay
-        && let Some(kind) = loop_state.sender_blocked_at(&sender, nonce)
+    if source == PreconfSource::Replay &&
+        let Some(kind) = loop_state.sender_blocked_at(&sender, nonce)
     {
         match kind {
             dispatch::BlockKind::Defer => {
@@ -483,9 +487,8 @@ async fn admit_and_dispatch<N, B>(
     let gas_used = info.cumulative_gas_used;
     match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source) {
         Admission::Admit => {
-            let mut apply_fn = |tx, h, height| {
-                apply_preconf_with_da::<N, _>(builder, info, limits, tx, h, height)
-            };
+            let mut apply_fn =
+                |tx, h, height| apply_preconf_with_da::<N, _>(builder, info, limits, tx, h, height);
             dispatch::apply_one_preconf(fifo, cfg, hash, loop_state, &mut apply_fn).await;
         }
         Admission::Defer => {
@@ -768,9 +771,9 @@ where
     let tx_gas_used = gas_used.tx_gas_used();
     info.cumulative_gas_used += tx_gas_used;
     info.cumulative_da_bytes_used += tx_da_size;
-    let miner_fee =
-        tx.effective_tip_per_gas(constraints.base_fee)
-            .expect("fee is always valid; execution succeeded");
+    let miner_fee = tx
+        .effective_tip_per_gas(constraints.base_fee)
+        .expect("fee is always valid; execution succeeded");
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
     Ok(BestTxStep::Continue)
 }

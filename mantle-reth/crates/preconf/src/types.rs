@@ -70,8 +70,8 @@ use serde::{Deserialize, Serialize};
 /// reclaimable" but signal different causes to the client:
 /// - `Timeout` — the RPC handler's deadline elapsed. Client's request was accepted; server may or
 ///   may not have run apply.
-/// - `Canceled` — the block-gas-budget pre-apply gate rejected the tx (e.g. block gas budget). Server explicitly
-///   declined; no EVM state change.
+/// - `Canceled` — the block-gas-budget pre-apply gate rejected the tx (e.g. block gas budget).
+///   Server explicitly declined; no EVM state change.
 /// - `Failed` — reth's block builder rejected pre-execute (in-flight nonce / balance race, block
 ///   gas exhausted at builder level). tx NOT on chain; typically resolves on next slot.
 ///
@@ -117,12 +117,10 @@ pub enum PreconfStatus {
 ///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
 ///       crash.
 ///     - **Reorg reinject** — the pool re-admits a previously sealed tx after reorg; the pool
-///       listener detects the case via `journal.sealed` membership.
-///       In both cases the Mantle preconf SLA (*"once a receipt has been
-///       returned to the client, the tx must land on chain"*) requires
-///       these entries to **bypass** the deadline and per-block gas budget
-///       gates. They remain subject to the status / dedup gates and the
-///       underlying block gas limit.
+///       listener detects the case via `journal.sealed` membership. In both cases the Mantle
+///       preconf SLA (*"once a receipt has been returned to the client, the tx must land on
+///       chain"*) requires these entries to **bypass** the deadline and per-block gas budget gates.
+///       They remain subject to the status / dedup gates and the underlying block gas limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
     /// Live RPC submission — subject to all pre-apply gates.

@@ -121,12 +121,8 @@ macro_rules! build_block {
             .await
             .expect("resolve_kind")
             .expect("payload build");
-        let $sealed: Vec<B256> = $payload
-            .block()
-            .body()
-            .transactions()
-            .map(|tx| keccak256(tx.encoded_2718()))
-            .collect();
+        let $sealed: Vec<B256> =
+            $payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     };
 }
 

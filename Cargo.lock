@@ -5292,6 +5292,7 @@ dependencies = [
  "alloy-serde 2.0.5",
  "async-trait",
  "jsonrpsee",
+ "metrics",
  "op-revm",
  "reth-chainspec",
  "reth-optimism-evm",
