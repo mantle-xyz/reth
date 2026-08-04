@@ -15,7 +15,7 @@ just pr
 3. `just test-doc` — exhaustive `--all-features` doctests (full from-scratch build; PR CI relies on the lighter default-feature doctests inside `test-ci` instead)
 
 CI (`.github/workflows/ci.yml`) runs `lint` and `test` (`just test-ci`) in
-parallel on every PR to `mantle-elysium` and `main`. Running `just pr` first
+parallel on every PR to `mantle-stage2` and `main`. Running `just pr` first
 avoids round-trips waiting on CI.
 
 ## Test tiers
