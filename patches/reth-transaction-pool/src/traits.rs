@@ -619,6 +619,17 @@ pub trait TransactionPool: Clone + Debug + Send + Sync {
         on_chain_nonce: u64,
     ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>>;
 
+    /// Single-scan `(pending_nonce, cumulative_cost)` for the sender: the next
+    /// promotable nonce and `Σ cost + extra_balance_cost` over the gapless
+    /// chain below it. Folds the nonce-gap and balance pre-checks into one
+    /// lookup; a tx at `pending_nonce` is promotable iff
+    /// `cumulative_cost + tx.cost() + tx.extra_balance_cost() <= balance`.
+    fn get_pending_nonce_and_cumulative_cost(
+        &self,
+        sender: Address,
+        on_chain_nonce: u64,
+    ) -> (u64, U256);
+
     /// Returns a transaction sent by a given user and a nonce
     fn get_transaction_by_sender_and_nonce(
         &self,

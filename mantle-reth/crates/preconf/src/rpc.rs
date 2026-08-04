@@ -10,8 +10,8 @@
 //!
 //! 1. Decode + recover the raw transaction.
 //! 2. Whitelist check via [`PreconfConfig::is_preconf_tx`].
-//! 3. Nonce-gap pre-check against `pending_nonce = max(on_chain_nonce,
-//!    pool.highest_consecutive(sender).nonce() + 1)`.
+//! 3. Nonce-gap + cumulative-balance pre-checks against a single `latest`
+//!    snapshot and one pool scan (`get_pending_nonce_and_cumulative_cost`).
 //! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
 //!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
 //!    builder could apply it before the responder is registered, dropping the receipt.
@@ -126,46 +126,50 @@ where
             return Err(preconf_error_to_rpc(&PreconfError::NotPreconfEligible));
         }
 
-        // Step 2 — nonce-gap pre-check (synchronous rejection).
-        //
-        // Without this check, a gap-up tx would land in the pool's
-        // `Queued` sub-pool; the pool listener filters to `Pending` only,
-        // so no fifo entry is ever created, the client waits the full
-        // `preconf_timeout` for nothing, and — worse — once the missing
-        // prior-nonce tx eventually arrives, the queued tx gets promoted
-        // and silently sealed without a preconf commitment. Surfacing
-        // the gap here keeps the client's view and the chain's view in
-        // sync; the cost is that SDKs must explicitly handle
-        // `PreconfError::NonceGap` by resending in nonce order. See the
-        // doc-comment on `PreconfError::NonceGap` for the full
-        // rationale.
-        let on_chain_nonce = self
-            .provider
-            .latest()
-            .map_err(|e| internal_err(&e))?
-            .account_nonce(&sender)
-            .map_err(|e| internal_err(&e))?
-            .unwrap_or(0);
-        // `get_highest_consecutive_transaction_by_sender` returns the
-        // highest non-nonce-gapped pending tx given the on-chain nonce;
-        // if `None`, the pool has nothing executable from this sender,
-        // so the next expected nonce is the on-chain nonce itself.
-        // `nonce < on_chain_nonce` (stale) is intentionally not checked
-        // here — the inner pool validator catches it with a precise
-        // `NonceTooLow` error during `add_transaction` (step 4),
-        // surfaced to the client through the catch-all `PoolRejected`
-        // branch.
-        let pending_nonce = self
-            .pool
-            .get_highest_consecutive_transaction_by_sender(sender, on_chain_nonce)
-            .map(|tx| tx.nonce() + 1)
-            .unwrap_or(on_chain_nonce);
+        // Step 2 — nonce-gap + balance pre-checks. A tx that is valid per-tx
+        // but parked (nonce gap → `Queued`; cumulative funds short →
+        // `!ENOUGH_BALANCE`) never reaches `Pending`, so it gets no fifo entry
+        // and the client blocks the full timeout. Reject both synchronously.
+        // One snapshot + one scan yield nonce, balance, `pending_nonce`, and
+        // `committed_cost` (Σ over the gapless chain below `pending_nonce`).
+        // Stale (`nonce < on_chain_nonce`) is left to the inner validator.
+        let state = self.provider.latest().map_err(|e| internal_err(&e))?;
+        let on_chain_nonce =
+            state.account_nonce(&sender).map_err(|e| internal_err(&e))?.unwrap_or(0);
+        let on_chain_balance =
+            state.account_balance(&sender).map_err(|e| internal_err(&e))?.unwrap_or_default();
+        let (pending_nonce, committed_cost) =
+            self.pool.get_pending_nonce_and_cumulative_cost(sender, on_chain_nonce);
         if nonce > pending_nonce {
             debug!(target: "mantle::preconf::rpc", ?sender, ?nonce, ?pending_nonce, "nonce gap rejected");
             return Err(preconf_error_to_rpc(&PreconfError::NonceGap {
                 tx_nonce: nonce,
                 pending_nonce,
             }));
+        }
+
+        // Append case only, and only the *cumulative* shortfall the pool would
+        // silently park: a tx that is individually affordable (so the inner
+        // validator admits it) but whose running total across the sender's
+        // pending chain exceeds the balance (`!ENOUGH_BALANCE` → non-pending).
+        // A tx that alone exceeds the balance, or a replacement
+        // (`nonce < pending_nonce`), is left to the inner validator / pool —
+        // reth already rejects those synchronously. `saturating_add` guards the
+        // `value == U256::MAX` edge. Replacements are left to the pool.
+        if nonce == pending_nonce {
+            let own_cost = pool_tx.cost().saturating_add(pool_tx.extra_balance_cost());
+            let required = committed_cost.saturating_add(own_cost);
+            if own_cost <= on_chain_balance && required > on_chain_balance {
+                debug!(
+                    target: "mantle::preconf::rpc",
+                    ?sender, ?nonce, %required, %on_chain_balance,
+                    "insufficient funds rejected"
+                );
+                return Err(preconf_error_to_rpc(&PreconfError::InsufficientFunds {
+                    balance: on_chain_balance,
+                    required,
+                }));
+            }
         }
 
         // Step 3 — attach responder BEFORE pool.add. See module-level docs.

@@ -1,6 +1,6 @@
 //! Common types shared across preconf modules.
 
-use alloy_primitives::{Bytes, Log, TxHash};
+use alloy_primitives::{Bytes, Log, TxHash, U256};
 use serde::{Deserialize, Serialize};
 
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
@@ -243,6 +243,23 @@ pub enum PreconfError {
         /// Pool's reported pending nonce for the sender.
         pending_nonce: u64,
     },
+    /// Cumulative cost across the sender's pending txs exceeds its balance, so
+    /// the pool parks this tx (`!ENOUGH_BALANCE`) instead of promoting it —
+    /// rejected synchronously to avoid a full-timeout block, same as
+    /// [`Self::NonceGap`]. Best-effort: the builder's gates are the final
+    /// authority.
+    #[error(
+        "insufficient funds: sender balance {balance} < required {required} \
+         (cumulative cost across the sender's pending txs)"
+    )]
+    InsufficientFunds {
+        /// Sender's on-chain balance.
+        balance: U256,
+        /// Cumulative cost required to promote this tx: the sum of
+        /// `cost + extra_balance_cost` over the sender's gapless pending
+        /// chain, including this tx.
+        required: U256,
+    },
     /// Pool rejected the transaction (validator error / underpriced / etc.).
     #[error("pool rejected: {0}")]
     PoolRejected(String),
@@ -354,6 +371,15 @@ mod tests {
         assert_eq!(
             PreconfError::DaLimitExceeded { used: 1_000, tx_da: 500, limit: 1_200 }.to_string(),
             "preconf tx exceeds DA limit: tx DA 500 bytes, 1000 already used, limit 1200",
+        );
+        assert_eq!(
+            PreconfError::InsufficientFunds {
+                balance: U256::from(100),
+                required: U256::from(150),
+            }
+            .to_string(),
+            "insufficient funds: sender balance 100 < required 150 \
+             (cumulative cost across the sender's pending txs)",
         );
     }
 

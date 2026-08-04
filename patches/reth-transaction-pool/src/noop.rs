@@ -310,6 +310,14 @@ impl<T: EthPoolTransaction> TransactionPool for NoopTransactionPool<T> {
         None
     }
 
+    fn get_pending_nonce_and_cumulative_cost(
+        &self,
+        _sender: Address,
+        on_chain_nonce: u64,
+    ) -> (u64, U256) {
+        (on_chain_nonce, U256::ZERO)
+    }
+
     fn get_transaction_by_sender_and_nonce(
         &self,
         _sender: Address,
