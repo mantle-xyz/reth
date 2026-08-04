@@ -5,7 +5,7 @@
 //! - `timeout_recovered_by_same_hash_resubmit` — same-hash retry after Timeout revives the fifo
 //!   entry (`push_if_absent`'s reclaimable branch) and the tx lands on the next build.
 //! - `dispatch_safety_margin_marks_timeout_before_apply` — dispatch- layer preemptive timeout (40ms
-//!   SAFETY_MARGIN before the SLA deadline) fires from within `apply_one_preconf`, surfacing as
+//!   `SAFETY_MARGIN` before the SLA deadline) fires from within `apply_one_preconf`, surfacing as
 //!   `Err(Call)` at the wire (distinct from RPC-layer `Ok(Timeout)`).
 //!
 //! - `race_resolution_returns_success_when_apply_completes_after_deadline` — RPC deadline fires

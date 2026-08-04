@@ -15,10 +15,10 @@
 //!   `PayloadJob` start (see
 //!   `builder::payload_builder::sync_fifo_forward_to_head`). Rationale:
 //!   the async fanout of `CanonStateNotification` raced with the next
-//!   FCU — a new PayloadJob could observe stale `Success` entries and
+//!   FCU — a new `PayloadJob` could observe stale `Success` entries and
 //!   incorrectly replay them via `reset_success_to_waiting`, silently
 //!   double-counting `preconf_gas_used` in the fresh slot. Running the
-//!   forward from the PayloadJob prologue guarantees fifo consistency
+//!   forward from the `PayloadJob` prologue guarantees fifo consistency
 //!   with the parent block state before any dispatch decision.
 //! - **Reverted chain**: a reorg produces a warn log for every reverted tx whose hash is tracked
 //!   (journal `sealed` set when persistence is enabled, fifo membership as fallback). This handler

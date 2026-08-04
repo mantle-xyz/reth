@@ -258,7 +258,7 @@ async fn signed_transfer_with_value(
 /// the client as `Err(Call { message: "pool rejected: <inner>" })`.
 ///
 /// Setup: submit a preconf-eligible whitelisted tx with `gas_limit = 20_000`,
-/// under the 21_000 intrinsic gas required for a plain transfer. The
+/// under the `21_000` intrinsic gas required for a plain transfer. The
 /// preconf per-tx ceiling is set high enough (`preconf_max_gas_per_tx =
 /// 1_000_000`) that it does NOT fire first — the underlying
 /// `OpTransactionValidator` is the one that catches this.
@@ -375,9 +375,9 @@ async fn insufficient_funds_pool_rejects() {
 /// `tx.gas_limit > block.gas_limit` is rejected at pool admission and
 /// surfaced as `Err(Call { message: "pool rejected: <inner>" })`.
 ///
-/// Setup: block_gas_limit is 30_000_000 (0x1c9c380, see `assets/genesis.json`).
+/// Setup: `block_gas_limit` is `30_000_000` (0x1c9c380, see `assets/genesis.json`).
 /// Submit a whitelisted preconf tx with `gas_limit = 40_000_000`. The
-/// preconf per-tx ceiling is deliberately set to 100_000_000 so it does
+/// preconf per-tx ceiling is deliberately set to `100_000_000` so it does
 /// NOT catch this first — the underlying pool validator's block-gas-limit
 /// check is what fires.
 ///

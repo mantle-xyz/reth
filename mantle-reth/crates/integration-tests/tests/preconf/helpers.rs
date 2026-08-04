@@ -243,7 +243,7 @@ pub async fn send_preconf(
     http.request("eth_sendRawTransactionWithPreconf", vec![tx_rlp.to_string()]).await
 }
 
-/// Launch a preconf-enabled MantleNode.
+/// Launch a preconf-enabled `MantleNode`.
 ///
 /// Yields a tuple `(node_ctx, http, wallet, chain_id)` — the `NodeTestContext`
 /// (for engine-API / advance / assert helpers), a jsonrpsee HTTP client

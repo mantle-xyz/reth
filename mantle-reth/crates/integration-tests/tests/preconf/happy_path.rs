@@ -1,6 +1,6 @@
 //! Happy-path preconf submission.
 //!
-//! Every test in this module starts a preconf-enabled MantleNode from
+//! Every test in this module starts a preconf-enabled `MantleNode` from
 //! scratch, submits a raw tx through `eth_sendRawTransactionWithPreconf`,
 //! and verifies:
 //!
@@ -495,7 +495,7 @@ async fn weth_deposit_carries_log_through_to_receipt() {
         0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x06,
     ]);
-    /// `deposit()` — keccak256("deposit()")[0..4].
+    /// `deposit()` — `keccak256("deposit()`")[0..4].
     const DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
     /// `keccak256("Deposit(address,uint256)")` — WETH9's Deposit event.
     const DEPOSIT_EVENT_TOPIC: [u8; 32] = [

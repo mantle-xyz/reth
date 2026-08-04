@@ -81,7 +81,7 @@ async fn size_triggered_rotation_drops_sealed_entry() {
     let tx0 = signed_transfer(chain_id, &wallet, 0).await;
     let sample = JournalEntry {
         hash: keccak256(&tx0),
-        tx_rlp: tx0.clone().into(),
+        tx_rlp: tx0.clone(),
         block_height: 1,
         committed_at_ms: 1_700_000_000_000,
     };

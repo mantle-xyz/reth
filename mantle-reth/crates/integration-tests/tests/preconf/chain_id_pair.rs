@@ -108,7 +108,7 @@ async fn preconf_happy_path_on_mantle_sepolia() {
     run_pair_case!(5003);
 }
 
-/// Mantle Hoodi (chain_id=50002) preconf happy path.
+/// Mantle Hoodi (`chain_id=50002`) preconf happy path.
 ///
 /// Pins mantle-reth's chain-id independence for the preconf pipeline:
 /// with `mantle_chain_spec_for(50002)` patched into the genesis, the

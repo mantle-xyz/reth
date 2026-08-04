@@ -644,13 +644,13 @@ async fn replay_source_bypasses_block_gas_budget() {
     let entries = [
         JournalEntry {
             hash: tx0_hash,
-            tx_rlp: tx0.clone().into(),
+            tx_rlp: tx0.clone(),
             block_height: 1,
             committed_at_ms: 0,
         },
         JournalEntry {
             hash: tx1_hash,
-            tx_rlp: tx1.clone().into(),
+            tx_rlp: tx1.clone(),
             block_height: 1,
             committed_at_ms: 0,
         },

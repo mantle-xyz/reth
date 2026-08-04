@@ -367,10 +367,10 @@ mod tests {
         );
     }
 
-    /// R7 D — revert_data's first 4 bytes are the ABI selector. The
+    /// R7 D — `revert_data`'s first 4 bytes are the ABI selector. The
     /// canonical `Error(string)` selector is `0x08c379a0` (see solc
     /// docs / EIP-838). SDKs downstream (op-geth compat) unpack via
-    /// this selector; ensuring build_receipt preserves the selector
+    /// this selector; ensuring `build_receipt` preserves the selector
     /// prefix intact is a byte-level contract, not a doc.
     #[test]
     fn build_receipt_revert_data_preserves_error_selector() {
@@ -401,7 +401,7 @@ mod tests {
         );
     }
 
-    /// R7 D — build_receipt's `Halt` branch renders `HaltReason` via
+    /// R7 D — `build_receipt`'s `Halt` branch renders `HaltReason` via
     /// its `Debug` impl. Existing coverage only checks
     /// `OutOfGas::Basic`; a Debug-format shift on other variants would
     /// silently degrade log messages. Spot-check a few common variants

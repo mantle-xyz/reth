@@ -14,7 +14,7 @@
 //!   submission. Guards per-sender scoping.
 //! - `canon_across_sequential_slots_forwards_on_every_new_job` — nonce 0/1/2 across three separate
 //!   slots; each canon runs `sync_fifo_forward_to_head` afresh. Guards against a caching bug that
-//!   would skip forward after the first PayloadJob.
+//!   would skip forward after the first `PayloadJob`.
 
 use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::launch_preconf_node;
@@ -392,7 +392,7 @@ async fn canon_does_not_leak_across_senders() {
 }
 
 /// Sequential canon across three slots, one tx per slot. Verifies
-/// `sync_fifo_forward_to_head` runs on every new PayloadJob (not just
+/// `sync_fifo_forward_to_head` runs on every new `PayloadJob` (not just
 /// the first) and that per-slot state does not leak into later blocks.
 ///
 /// Complements `canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot`,
@@ -401,7 +401,7 @@ async fn canon_does_not_leak_across_senders() {
 /// N times.
 ///
 /// Regression guard: a caching bug that skips
-/// `sync_fifo_forward_to_head` after the first PayloadJob would leak
+/// `sync_fifo_forward_to_head` after the first `PayloadJob` would leak
 /// slot-1 Success entries into slot 3's `replay_fifo_carryover`, and
 /// `reset_success_to_waiting` would try to re-apply them against a
 /// state where their nonces are already consumed → `BuilderRejected` /
@@ -446,7 +446,7 @@ async fn canon_across_sequential_slots_forwards_on_every_new_job() {
             .expect("resolve_kind")
             .expect("payload");
         let event =
-            rpc_task.await.expect("rpc join").expect(&format!("nonce={nonce} must succeed"));
+            rpc_task.await.expect("rpc join").unwrap_or_else(|_| panic!("nonce={nonce} must succeed"));
 
         assert!(
             matches!(event.status, PreconfStatus::Success),

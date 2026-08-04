@@ -105,11 +105,11 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.slot-duration-ms")]
     pub slot_duration_ms: Option<u64>,
 
-    /// Per-tx gas cap for preconf-eligible txs. Default 2_000_000.
+    /// Per-tx gas cap for preconf-eligible txs. Default `2_000_000`.
     #[arg(long = "preconf.max-gas-per-tx")]
     pub max_gas_per_tx: Option<u64>,
 
-    /// Cumulative preconf gas budget per block. Default 6_000_000. Must be
+    /// Cumulative preconf gas budget per block. Default `6_000_000`. Must be
     /// `>=` `preconf.max-gas-per-tx` (checked by `PreconfConfig::validate`).
     #[arg(long = "preconf.max-gas-per-block")]
     pub max_gas_per_block: Option<u64>,
@@ -119,7 +119,7 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.rejournal-interval-secs")]
     pub rejournal_interval_secs: Option<u64>,
 
-    /// Journal file size ceiling, in bytes. Default 1 GiB (1_073_741_824).
+    /// Journal file size ceiling, in bytes. Default 1 GiB (`1_073_741_824`).
     /// Above this, rotation renames the current file and starts a new one.
     /// Only meaningful when `--preconf.journal-path` is set.
     #[arg(long = "preconf.journal-max-size")]

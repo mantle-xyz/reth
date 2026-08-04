@@ -78,7 +78,7 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
 
     let entry = JournalEntry {
         hash: tx_hash,
-        tx_rlp: raw_tx.clone().into(),
+        tx_rlp: raw_tx.clone(),
         block_height: 1,
         committed_at_ms: 0,
     };
@@ -176,19 +176,19 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
     let entries = [
         JournalEntry {
             hash: hash0,
-            tx_rlp: tx0.clone().into(),
+            tx_rlp: tx0.clone(),
             block_height: 1,
             committed_at_ms: 0,
         },
         JournalEntry {
             hash: hash1,
-            tx_rlp: tx1.clone().into(),
+            tx_rlp: tx1.clone(),
             block_height: 1,
             committed_at_ms: 0,
         },
         JournalEntry {
             hash: hash2,
-            tx_rlp: tx2.clone().into(),
+            tx_rlp: tx2.clone(),
             block_height: 1,
             committed_at_ms: 0,
         },
@@ -295,13 +295,13 @@ async fn journal_replay_across_multiple_senders() {
     let entries = [
         JournalEntry {
             hash: hash_a,
-            tx_rlp: tx_a.clone().into(),
+            tx_rlp: tx_a.clone(),
             block_height: 1,
             committed_at_ms: 0,
         },
         JournalEntry {
             hash: hash_b,
-            tx_rlp: tx_b.clone().into(),
+            tx_rlp: tx_b.clone(),
             block_height: 1,
             committed_at_ms: 0,
         },
