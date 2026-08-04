@@ -267,6 +267,9 @@ impl<N: NodePrimitives> Deref for StaticFileProvider<N> {
 
 /// [`StaticFileProviderInner`] manages all existing [`StaticFileJarProvider`].
 #[derive(Debug)]
+// [MANTLE PATCH] allow(unnameable_types): re-exported through a private module;
+// upstream reth has the same shape. Newer clippy promotes this to deny under -D warnings.
+#[allow(unnameable_types)]
 pub struct StaticFileProviderInner<N> {
     /// Maintains a map which allows for concurrent access to different `NippyJars`, over different
     /// segments and ranges.
