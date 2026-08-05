@@ -234,9 +234,10 @@ where
             // single record).
             Some(Ok(Ok(receipt))) => {
                 let event = PreconfTxEvent::from(receipt);
-                if matches!(event.status, WireStatus::Success) &&
-                    let Some(journal) = self.journal.as_ref()
-                {
+                // Receipt path ⇒ the tx is on chain (`From` maps it to
+                // Success, or Failed for an EVM revert — a receipt exists
+                // either way), so always journal when persistence is on.
+                if let Some(journal) = self.journal.as_ref() {
                     let entry = JournalEntry {
                         hash,
                         tx_rlp: bytes.clone(),
@@ -255,8 +256,17 @@ where
                 Ok(event)
             }
 
-            // Builder signalled an error through the responder.
-            Some(Ok(Err(err))) => Err(preconf_error_to_rpc(&err)),
+            // Builder signalled an error through the responder. A
+            // `Timeout` error is surfaced as an `Ok(Timeout event)`
+            // (op-geth-aligned wire shape), never a JSON-RPC error —
+            // matching the deadline branch's own timeout handling.
+            Some(Ok(Err(err))) => {
+                if matches!(err, PreconfError::Timeout { .. }) {
+                    Ok(build_timeout_event(hash, preconf_timeout))
+                } else {
+                    Err(preconf_error_to_rpc(&err))
+                }
+            }
 
             // Builder dropped the responder without sending — should not
             // happen on healthy paths. Mark the entry `Canceled`
@@ -305,9 +315,9 @@ where
                         match resp_rx.try_recv() {
                             Ok(Ok(receipt)) => {
                                 let event = PreconfTxEvent::from(receipt);
-                                if matches!(event.status, WireStatus::Success) &&
-                                    let Some(journal) = self.journal.as_ref()
-                                {
+                                // Receipt path ⇒ on chain (Success or an
+                                // EVM-revert Failed), so always journal.
+                                if let Some(journal) = self.journal.as_ref() {
                                     let entry = JournalEntry {
                                         hash,
                                         tx_rlp: bytes.clone(),
