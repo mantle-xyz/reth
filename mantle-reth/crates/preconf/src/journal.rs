@@ -285,6 +285,10 @@ impl PreconfJournal {
     /// behind the same writer `Mutex` — typically a few ms even at
     /// 100 TPS.
     pub async fn rotate(&self) -> Result<RotateStats, JournalError> {
+        // Records `preconf.journal.rotate_duration_ms` on every exit path
+        // (including the `?` early returns below).
+        let _timer = RotateTimer(std::time::Instant::now());
+
         let (entries, bad_before) = self.load().await?;
         // Snapshot the sealed set once here. Any `mark_sealed` firing
         // during the rewrite is intentionally not observed by this
@@ -293,6 +297,7 @@ impl PreconfJournal {
         // by this rotate AND missing from the sealed set on the same
         // pass.
         let sealed_snapshot: HashSet<TxHash> = self.sealed.lock().await.clone();
+        metrics::gauge!("preconf.journal.sealed_len").set(sealed_snapshot.len() as f64);
 
         let mut kept = 0usize;
         let mut dropped = 0usize;
@@ -363,6 +368,17 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     PathBuf::from(tmp)
+}
+
+/// Records `preconf.journal.rotate_duration_ms` on drop, so every exit path
+/// of [`PreconfJournal::rotate`] (including the `?` early returns) is timed.
+struct RotateTimer(std::time::Instant);
+
+impl Drop for RotateTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("preconf.journal.rotate_duration_ms")
+            .record(self.0.elapsed().as_millis() as f64);
+    }
 }
 
 // ─── Pool interaction trait ─────────────────────────────────────────────────
