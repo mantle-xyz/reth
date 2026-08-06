@@ -5224,6 +5224,7 @@ dependencies = [
  "reth-optimism-node",
  "reth-optimism-payload-builder",
  "reth-optimism-rpc",
+ "reth-optimism-trie",
  "reth-payload-primitives",
  "reth-provider",
  "reth-rpc-api",
@@ -5232,6 +5233,7 @@ dependencies = [
  "reth-transaction-pool",
  "revm",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

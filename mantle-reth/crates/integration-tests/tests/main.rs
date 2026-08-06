@@ -8,5 +8,6 @@ mod fill_transaction;
 mod gas_estimation;
 mod gas_limit;
 mod preconf_forwarding;
+mod proofs_history;
 mod txpool;
 mod txpool_admission;
