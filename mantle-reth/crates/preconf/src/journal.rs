@@ -326,6 +326,12 @@ impl PreconfJournal {
         // (including the `?` early returns below).
         let _timer = RotateTimer(std::time::Instant::now());
 
+        // Hold the writer lock for the WHOLE rotate (load → rename → reset),
+        // not just the swap: an `append_promised` landing between `load()` and
+        // the rename would otherwise be silently discarded by it. Appends
+        // block until the new file is in place, then land in it.
+        let mut writer = self.writer.lock().await;
+
         let (entries, bad_before) = self.load().await?;
         // Snapshot the sealed set once here. Any `mark_sealed` firing
         // during the rewrite is intentionally not observed by this
@@ -358,10 +364,8 @@ impl PreconfJournal {
             tmp.flush().await?;
         }
 
-        // Atomic swap. Hold the writer lock so any concurrent
-        // `append_promised` waits until the new file is in place,
-        // then re-opens against the new inode.
-        let mut writer = self.writer.lock().await;
+        // Atomic swap (writer lock held since the top): rename into place,
+        // then re-open the writer against the new inode.
         tokio::fs::rename(&tmp_path, &self.path).await?;
         *writer = OpenOptions::new().create(true).append(true).open(&self.path).await?;
         // Reset the byte counter to the new file's true size while still
@@ -869,6 +873,50 @@ mod tests {
         let j = PreconfJournal::open(&path, 0).await.unwrap();
         j.mark_sealed_batch([e.hash]).await;
         assert!(j.contains(&e.hash).await, "reopened journal must admit on-disk commitment");
+    }
+
+    #[tokio::test]
+    async fn rotate_does_not_lose_concurrent_appends() {
+        // Regression: an append racing a rotate must not be lost (nothing is
+        // sealed here, so every appended entry must survive). Deterministic
+        // post-fix; pre-fix it drops entries landing in the load→rename window.
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = Arc::new(PreconfJournal::open(&path, 0).await.unwrap());
+
+        // Unsealed survivors widen rotate's tmp-write window.
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, i as u64)).await.unwrap();
+        }
+
+        // Race a burst of appends against one rotate.
+        let n: u8 = 30;
+        let rot = {
+            let j = j.clone();
+            tokio::spawn(async move { j.rotate().await.unwrap() })
+        };
+        let mut appends = Vec::new();
+        for i in 5..n {
+            let j = j.clone();
+            appends.push(tokio::spawn(async move {
+                j.append_promised(&entry(i, i as u64)).await.unwrap()
+            }));
+        }
+        rot.await.unwrap();
+        for a in appends {
+            a.await.unwrap();
+        }
+
+        // Nothing was sealed ⇒ every appended hash must still be on disk.
+        let (after, _) = j.load().await.unwrap();
+        let on_disk: HashSet<TxHash> = after.iter().map(|e| e.hash).collect();
+        for i in 0..n {
+            assert!(
+                on_disk.contains(&TxHash::from([i; 32])),
+                "entry {i} lost across concurrent rotate"
+            );
+        }
     }
 
     #[tokio::test]
