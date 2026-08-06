@@ -18,11 +18,12 @@
 //! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if the fifo
 //!    entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the builder.
 //! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return `Ok(Timeout
-//!    event)` (op-geth-aligned) and clean both the fifo entry CAS (`mark_timeout`) **and** any
-//!    stale responder (`cancel_responder`). The second call is mandatory because the pool listener
-//!    filters to `SubPool::Pending` — txs routed to `BaseFee`/`Queued` never produce a fifo entry,
-//!    so `mark_timeout` returns `NotFound` and the responder would otherwise be stuck in
-//!    `pending_responders`.
+//!    event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
+//!    (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
+//!    fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
+//!    and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
+//!    (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
+//!    `pending_responders`).
 
 use std::sync::Arc;
 
@@ -358,11 +359,17 @@ where
                         }
                     }
                     Some(PreconfStatus::Waiting) | None => {
-                        // Apply never committed. Transition to Timeout
-                        // under the still-held lock (or without any
-                        // lock if entry was absent — mark_timeout will
-                        // return `NotFound`, which is fine).
-                        let _ = self.fifo.mark_timeout(&hash).await;
+                        // Apply never committed. `mark_timeout`'s `Waiting →
+                        // Timeout` CAS evicts the tx from the pool via its
+                        // callback — but a pool-admitted tx with no fifo entry
+                        // (parked in `BaseFee`/`Queued`, so the `Pending`-only
+                        // listener never pushed it) returns `NotFound` and skips
+                        // that callback. Evict it directly, else the orphan
+                        // lingers and is mined once eligible — after the client
+                        // saw `Timeout`.
+                        if self.fifo.mark_timeout(&hash).await.is_err() {
+                            self.pool.remove_transactions(vec![hash]);
+                        }
                         drop(apply_guard);
                         self.fifo
                             .cancel_responder(

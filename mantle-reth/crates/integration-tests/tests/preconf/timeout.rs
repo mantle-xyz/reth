@@ -17,6 +17,11 @@
 //!   with `final_status == None` and hits `mark_timeout`'s `NotFound` fallback, but must still
 //!   clear `pending_responders` so a same- hash resubmit is not permanently wedged with
 //!   `AlreadyInProgress`.
+//! - `basefee_orphan_evicted_from_pool_on_timeout` — same `BaseFee`-orphan path, but pins the
+//!   SLA half the other test omits: because no fifo entry exists, `mark_timeout` returns `NotFound`
+//!   and its pool-eviction callback never fires, so the RPC handler must remove the tx from the pool
+//!   itself. Otherwise the orphan lingers in `BaseFee` and gets mined once the base fee drops —
+//!   after the client already saw `Timeout`.
 //!
 //! Timeout entry releasing the `(sender, nonce)` slot for a differently-
 //! signed tx is a **replacement** semantic and lives in
@@ -557,4 +562,97 @@ async fn basefee_orphan_returns_timeout_and_clears_responder() {
         }
         Err(other) => panic!("unexpected error kind on resubmit: {other:?}"),
     }
+}
+
+/// BaseFee-orphan SLA: a timed-out orphan must be **evicted from the pool**.
+///
+/// A sub-basefee tx parks in the `BaseFee` sub-pool and never gets a fifo entry
+/// (the listener only subscribes to `Pending`), so the RPC deadline's
+/// `mark_timeout` returns `NotFound` and its pool-eviction callback never fires.
+/// Unless the handler evicts the tx itself, the orphan is mined once the base fee
+/// drops — after the client saw `Timeout`.
+///
+/// Reaching `BaseFee` needs a positive pool base-fee threshold, which a fresh
+/// Mantle node lacks (`pending_basefee` starts at 0). So we first mine two blocks
+/// with a 1 gwei Jovian `min_base_fee` floor (lifting the threshold to 1 gwei),
+/// then submit a 0.5 gwei tx — above the `MIN_PROTOCOL_BASE_FEE` chain floor (so
+/// it's admitted) yet below base fee (so it parks in `BaseFee`, not `Pending`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn basefee_orphan_evicted_from_pool_on_timeout() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(200)
+        .build();
+
+    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+
+    // Lift the pool's `BaseFee`-subpool threshold to 1 gwei via two `min_base_fee`
+    // = 1 gwei blocks (Jovian floors the next block's base fee at the parent's
+    // encoded `min_base_fee`).
+    for _ in 0..2 {
+        let head = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
+        let mut attrs = node.payload.next_attributes();
+        attrs.0.min_base_fee = Some(1_000_000_000);
+        let pid = crate::fcu_v3_start!(node, head, attrs);
+        let payload = crate::get_payload_v5!(node, pid);
+        let _ = crate::canonize_built!(node, payload);
+    }
+    assert_eq!(
+        reth_transaction_pool::TransactionPool::block_info(&node.inner.pool).pending_basefee,
+        1_000_000_000,
+        "test setup: pool base-fee threshold must be 1 gwei before the sub-basefee submission",
+    );
+
+    // Fee cap 0.5 gwei: >= MIN_PROTOCOL_BASE_FEE (admitted) but < 1 gwei base fee
+    // (parks in `BaseFee`, so the `Pending`-only listener never creates a fifo entry).
+    let raw_tx: alloy_primitives::Bytes = {
+        let request = TransactionRequest {
+            chain_id: Some(chain_id),
+            nonce: Some(0),
+            to: Some(TxKind::Call(recipient)),
+            gas: Some(21_000),
+            max_fee_per_gas: Some(500_000_000u128),
+            max_priority_fee_per_gas: Some(500_000_000u128),
+            value: Some(U256::from(1u64)),
+            input: TransactionInput::default(),
+            ..Default::default()
+        };
+        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
+    };
+
+    // Drive the send on a task so we can observe the pool while the RPC blocks on
+    // its deadline: the tx must be parked in `BaseFee` with no fifo entry.
+    let http_c = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_c, raw_tx).await });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let mid = reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool);
+    assert_eq!(
+        (mid.total, mid.basefee, mid.pending),
+        (1, 1, 0),
+        "test setup: the 0.5 gwei tx must park in the BaseFee sub-pool (orphan), not Pending",
+    );
+
+    let event = rpc_task
+        .await
+        .expect("rpc join")
+        .expect("BaseFee-orphan timeout must surface as Ok(Timeout event), not an RPC error");
+    assert!(
+        matches!(event.status, PreconfStatus::Timeout),
+        "BaseFee-orphaned tx must surface as Timeout, got {:?}",
+        event.status,
+    );
+
+    // SLA: once the client has been told `Timeout`, the orphan must not linger in
+    // the pool where a later (lower-base-fee) build would still mine it.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool).total,
+        0,
+        "SLA violation: BaseFee-orphaned tx still in pool after Timeout — it will be mined once \
+         the base fee drops, despite the client having seen Timeout",
+    );
 }
