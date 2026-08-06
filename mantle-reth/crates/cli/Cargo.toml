@@ -27,6 +27,8 @@ reth-node-core.workspace = true
 reth-db.workspace = true
 reth-db-api.workspace = true
 reth-tasks.workspace = true
+reth-rpc-api.workspace = true
+reth-rpc-eth-api.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-transaction-pool.workspace = true
@@ -60,6 +62,7 @@ op-alloy-consensus.workspace = true
 # async / misc
 eyre.workspace = true
 futures-util.workspace = true
+jsonrpsee-types.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 metrics.workspace = true
 tracing.workspace = true

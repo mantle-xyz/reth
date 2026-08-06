@@ -20,4 +20,7 @@ pub mod version;
 pub mod metrics_seed;
 pub use metrics_seed::seed_blockchain_tree_metrics;
 
+pub mod proofs_history;
+pub use proofs_history::{spawn_proofs_db_metrics, with_proofs_history};
+
 pub use reth_optimism_node::OpNode;
