@@ -158,12 +158,12 @@ where
                     InvalidPoolTransactionError::Other(Box::new(ReplaceActivePreconf)),
                 );
             }
-            // Slot is Timeout / Canceled / Failed — drop the stale fifo
-            // entry so the new tx can occupy the slot cleanly. The
-            // replacement only proceeds via the rest of the validator
-            // chain; we do not re-push here — the pool listener will
-            // pick up the new tx once it lands in the pool.
-            self.fifo.remove(&existing.hash).await;
+            // Slot is reclaimable — evict the stale entry. `remove_reclaimable`
+            // re-checks under lock: if it was revived to `Waiting` or is
+            // mid-apply since the read above, it's left intact and the later
+            // `push_if_absent` returns `ConflictActive`. We don't re-push; the
+            // listener picks the new tx up from the pool.
+            self.fifo.remove_reclaimable(&existing.hash).await;
         }
 
         // Per-tx gas ceiling: applies only to preconf-eligible txs.

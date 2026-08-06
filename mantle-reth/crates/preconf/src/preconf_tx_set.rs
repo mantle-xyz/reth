@@ -390,14 +390,27 @@ impl PreconfTxSet {
         PushResult::Inserted
     }
 
-    /// Removes an entry by hash. Returns true if removed, false if absent.
-    ///
-    /// Idempotent. Also removes the `by_sender` index entry and any pending
-    /// responder. Does NOT signal the responder — callers that want to
-    /// fail-fast the RPC client should use `cancel_responder` instead.
-    pub async fn remove(&self, hash: &TxHash) -> bool {
+    /// Removes `hash` only if safe to evict: a reclaimable terminal state
+    /// (`Timeout` / `Canceled` / `Failed`) and not mid-apply. Returns true iff
+    /// removed. Status check and removal share one `inner` lock, so a
+    /// concurrent `Timeout → Waiting` revival can't be evicted; the `try_lock`
+    /// on `apply_lock` (non-blocking — a blocking acquire under `inner` would
+    /// invert the `inner → apply_lock` order and deadlock) skips an entry
+    /// dispatch is still finalizing, so its receipt is never stranded.
+    /// Idempotent; the only public eviction path (unconditional removal stays
+    /// internal to `drop_hash`).
+    pub async fn remove_reclaimable(&self, hash: &TxHash) -> bool {
         let mut inner = self.inner.lock().await;
-        inner.drop_hash(hash).is_some()
+        let safe_to_drop = match inner.entries.get(hash) {
+            Some(e) => {
+                matches!(
+                    e.status,
+                    PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
+                ) && e.apply_lock.try_lock().is_ok()
+            }
+            None => false,
+        };
+        if safe_to_drop { inner.drop_hash(hash).is_some() } else { false }
     }
 
     /// Returns true if the hash is currently present in `entries`.
@@ -800,9 +813,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_returns_false_when_absent() {
+    async fn remove_reclaimable_returns_false_when_absent() {
         let set = PreconfTxSet::new(16);
-        assert!(!set.remove(&h(1)).await);
+        assert!(!set.remove_reclaimable(&h(1)).await);
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_refuses_waiting_entry() {
+        // A `Waiting` entry (an in-apply entry's state) must never be evicted.
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        assert!(!set.remove_reclaimable(tx.tx_hash()).await, "Waiting must not be removed");
+        assert!(set.contains(tx.tx_hash()).await, "entry must survive");
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_removes_terminal_entry() {
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_timeout(tx.tx_hash()).await.unwrap();
+        assert!(set.remove_reclaimable(tx.tx_hash()).await, "Timeout is reclaimable");
+        assert!(!set.contains(tx.tx_hash()).await);
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_refuses_revived_entry() {
+        // Same-hash resubmit revives `Timeout` → `Waiting`; the atomic status
+        // re-read must catch the flip and decline (else a landing tx's
+        // receipt is stranded).
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_timeout(tx.tx_hash()).await.unwrap();
+        assert_eq!(
+            set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await,
+            PushResult::Revived
+        );
+        assert!(
+            !set.remove_reclaimable(tx.tx_hash()).await,
+            "revived Waiting must not be removed"
+        );
+        assert!(set.contains(tx.tx_hash()).await);
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_declines_while_apply_lock_held() {
+        // Terminal status but dispatch still holds `apply_lock` through
+        // `take_responder`: `try_lock` must decline, not snatch the responder.
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_failed(tx.tx_hash()).await.unwrap();
+
+        let guard = set.lock_for_apply(tx.tx_hash()).await.expect("entry present");
+        assert!(
+            !set.remove_reclaimable(tx.tx_hash()).await,
+            "must decline while apply_lock is held"
+        );
+        assert!(set.contains(tx.tx_hash()).await);
+
+        drop(guard);
+        assert!(set.remove_reclaimable(tx.tx_hash()).await, "removable once lock released");
+        assert!(!set.contains(tx.tx_hash()).await);
     }
 
     // ============ push_if_absent ============
