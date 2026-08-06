@@ -379,11 +379,13 @@ fn preconf_admission(
     Admission::Admit
 }
 
-/// Apply a preconf tx with the DA-footprint gate in front. On success
-/// folds this tx's gas and DA footprint into `info` so the pool best-tx arm
-/// (which reads `info.cumulative_gas_used` / `info.cumulative_da_bytes_used`
-/// via [`ExecutionInfo::is_tx_over_limits`]) sees the true running block
-/// totals — preconf and pool share one block DA + gas budget.
+/// Apply a preconf tx with the DA-footprint gate in front. On success folds
+/// this tx's gas, DA footprint, **and priority fee** into `info` so the pool
+/// best-tx arm (which reads `info.cumulative_gas_used` /
+/// `info.cumulative_da_bytes_used` via [`ExecutionInfo::is_tx_over_limits`]) sees
+/// the true running block totals — preconf and pool share one block DA + gas
+/// budget — and the sealed payload's block value (`total_fees`) includes preconf
+/// revenue, same as pool txs.
 ///
 /// The DA gate runs **before** [`convert_and_apply_preconf`], so an
 /// over-DA tx never touches the in-flight `State<DB>` (no cache pollution).
@@ -405,9 +407,16 @@ where
         metrics::counter!("preconf.fifo.da_rejected_total").increment(1);
         return Err(e);
     }
+    // Miner tip is independent of gas used — capture it before `tx` is consumed
+    // by apply, then fold `tip × gas_used` into the block value below.
+    let miner_tip = tx.effective_tip_per_gas(limits.base_fee).unwrap_or_default();
     let receipt = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
     info.cumulative_da_bytes_used = info.cumulative_da_bytes_used.saturating_add(tx_da);
     info.cumulative_gas_used += receipt.gas_used;
+    // Count the preconf tx's priority fee toward `total_fees` (the payload block
+    // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
+    // `blockValue` and `is_better_payload` ignore preconf-sourced revenue.
+    info.total_fees += U256::from(miner_tip) * U256::from(receipt.gas_used);
     Ok(receipt)
 }
 
