@@ -21,7 +21,7 @@
 //! path — the tx re-enters the fifo from the journal as `Replay`.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec};
-use crate::launch_preconf_node;
+use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -178,8 +178,7 @@ async fn transient_da_replay_defers_then_lands_next_block() {
     );
 
     // Canonicalize block 1 so its DA budget is released for block 2.
-    let new_head = node.submit_payload(payload1).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("finalize block 1");
+    canonize_built!(node, payload1);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // ── Block 2: B was kept Waiting (deferred, not Failed) → it lands. ──
@@ -250,8 +249,7 @@ async fn same_sender_replay_cascade_defers_together() {
         "S nonce 1 must CASCADE-defer (not nonce-too-high fail) in block 1; sealed={sealed1:?}",
     );
 
-    let new_head = node.submit_payload(payload1).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("finalize block 1");
+    canonize_built!(node, payload1);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // ── Block 2: both S entries kept Waiting → both land, in nonce order. ──

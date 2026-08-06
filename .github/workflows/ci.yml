@@ -64,5 +64,8 @@ jobs:
         with:
           cache-on-failure: true
       - uses: extractions/setup-just@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - run: just test-ci
       - run: sccache --show-stats

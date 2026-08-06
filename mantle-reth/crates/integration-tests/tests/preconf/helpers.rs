@@ -252,6 +252,46 @@ pub async fn send_normal(http: &HttpClient, tx_rlp: Bytes) -> Result<B256, jsonr
     http.request("eth_sendRawTransaction", vec![tx_rlp.to_string()]).await
 }
 
+/// Poll `eth_getTransactionCount(sender, "pending")` until it reaches `want`.
+///
+/// Gates same-sender multi-tx submission on observed pool state instead of a
+/// fixed sleep: the pool admits asynchronously, so under load a follow-up tx's
+/// nonce-gap pre-check can run before the prior tx is pending and reject it as a
+/// gap. Panics if the nonce never advances within ~2s.
+pub async fn wait_pending_nonce(http: &HttpClient, sender: Address, want: u64) {
+    for _ in 0..100 {
+        let n: U256 = http
+            .request("eth_getTransactionCount", vec![sender.to_string(), "pending".to_string()])
+            .await
+            .expect("eth_getTransactionCount");
+        if n >= U256::from(want) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("pending nonce for {sender:?} never reached {want}");
+}
+
+/// Poll `eth_getTransactionCount(sender, "latest")` until it reaches `want` —
+/// i.e. until a just-canonicalised block's state is applied.
+///
+/// Gates on canon settlement before the next slot: under load `canon_handler::
+/// forward` lags the FCU, so a fixed sleep can let the next job re-apply the
+/// prior slot's still-`Success` entries. Panics if it never advances within ~5s.
+pub async fn wait_latest_nonce(http: &HttpClient, sender: Address, want: u64) {
+    for _ in 0..250 {
+        let n: U256 = http
+            .request("eth_getTransactionCount", vec![sender.to_string(), "latest".to_string()])
+            .await
+            .expect("eth_getTransactionCount");
+        if n >= U256::from(want) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("on-chain nonce for {sender:?} never reached {want}");
+}
+
 /// Create a fresh empty journal file under a unique tempdir so the journal-on
 /// (reorg-replay) path is active. `prefix` disambiguates concurrent tests.
 pub fn fresh_journal(prefix: &str) -> PathBuf {
@@ -478,10 +518,12 @@ macro_rules! fcu_v3_start {
         };
         let attrs = $attrs;
         // A freshly-switched forkchoice (esp. a reorg to an ancestor) can briefly
-        // report SYNCING → no payload_id. Retry the FCU until the build starts,
-        // mirroring `NodeTestContext::sync_to`'s FCU loop.
+        // report SYNCING → no payload_id. Retry until the build starts. Generous
+        // budget (150ms × 133 ≈ 20s): a starved or slow-start node can take
+        // several seconds to leave SYNCING; the loop breaks as soon as it opens,
+        // so the happy path is unaffected.
         let mut payload_id = None;
-        for _ in 0..40 {
+        for _ in 0..133 {
             let res = $node
                 .inner
                 .add_ons_handle
@@ -544,6 +586,91 @@ macro_rules! fcu_v3_commit {
     }};
 }
 
+/// Status-aware canonization: re-drive newPayload+FCU until the FCU is **VALID**
+/// and the canonical head reaches block `$target_number` (via `eth_blockNumber`).
+/// Returns the head hash.
+///
+/// The plain `submit_payload`/`update_forkchoice` helpers discard the engine
+/// status, so a transient `SYNCING` under load leaves the head un-advanced and
+/// mis-drives the next slot. Re-sending newPayload each retry lets the engine
+/// (re)validate the block — the step that actually closes the race.
+#[macro_export]
+macro_rules! canonize {
+    ($node:expr, $http:expr, $payload:expr, $target_number:expr) => {{
+        let payload = $payload;
+        let head = $node.submit_payload(payload.clone()).await.expect("newPayload");
+        let mut canonized = false;
+        for _ in 0..200 {
+            let fcu = $node
+                .inner
+                .add_ons_handle
+                .beacon_engine_handle
+                .fork_choice_updated(
+                    ::alloy_rpc_types_engine::ForkchoiceState {
+                        head_block_hash: head,
+                        safe_block_hash: head,
+                        finalized_block_hash: head,
+                    },
+                    None,
+                )
+                .await;
+            if matches!(&fcu, Ok(f) if f.is_valid()) {
+                let bn: ::alloy_primitives::U256 =
+                    $http.request("eth_blockNumber", Vec::<String>::new()).await.unwrap_or_default();
+                if bn >= ::alloy_primitives::U256::from($target_number as u64) {
+                    canonized = true;
+                    break;
+                }
+            }
+            // FCU was SYNCING (or head hasn't advanced yet) — re-insert the
+            // block so the engine can (re)validate it, then retry.
+            let _ = $node.submit_payload(payload.clone()).await;
+            ::tokio::time::sleep(::std::time::Duration::from_millis(50)).await;
+        }
+        assert!(canonized, "canonize: block {} never became canonical", $target_number);
+        head
+    }};
+}
+
+/// Like [`canonize!`] but for a payload already built inside a slot macro:
+/// re-drives newPayload+FCU until the FCU is **VALID**, using the FCU status
+/// directly (no RPC handle needed). The `fcu_v3_commit!` replacement — the
+/// latter can't re-send newPayload (it lacks the payload), which is the step
+/// that closes the race. Returns the head hash.
+#[macro_export]
+macro_rules! canonize_built {
+    ($node:expr, $payload:expr) => {{
+        let payload = $payload;
+        let head =
+            $node.submit_payload(payload.clone()).await.expect("engine_newPayloadV4 submit");
+        let mut canonized = false;
+        for _ in 0..200 {
+            let fcu = $node
+                .inner
+                .add_ons_handle
+                .beacon_engine_handle
+                .fork_choice_updated(
+                    ::alloy_rpc_types_engine::ForkchoiceState {
+                        head_block_hash: head,
+                        safe_block_hash: head,
+                        finalized_block_hash: head,
+                    },
+                    None,
+                )
+                .await;
+            if matches!(&fcu, Ok(f) if f.is_valid()) {
+                canonized = true;
+                break;
+            }
+            // FCU SYNCING — re-insert the block so the engine (re)validates it.
+            let _ = $node.submit_payload(payload.clone()).await;
+            ::tokio::time::sleep(::std::time::Duration::from_millis(50)).await;
+        }
+        assert!(canonized, "canonize_built: FCU never returned VALID for the committed head");
+        head
+    }};
+}
+
 /// One op-node output slot on parent `$on`:
 ///   FCUv3(build) → getPayloadV5 → newPayloadV4 → FCUv3(commit).
 /// Returns `(new_head, sealed_tx_hashes)`.
@@ -565,8 +692,7 @@ macro_rules! op_node_slot {
                 ::alloy_network::eip2718::Encodable2718::encoded_2718(tx),
             ))
             .collect();
-        let head = $crate::new_payload_v4!($node, payload);
-        $crate::fcu_v3_commit!($node, head);
+        let head = $crate::canonize_built!($node, payload);
         (head, sealed)
     }};
 }
@@ -591,8 +717,7 @@ macro_rules! op_node_slot_l1 {
                 ::alloy_network::eip2718::Encodable2718::encoded_2718(tx),
             ))
             .collect();
-        let head = $crate::new_payload_v4!($node, payload);
-        $crate::fcu_v3_commit!($node, head);
+        let head = $crate::canonize_built!($node, payload);
         (head, sealed)
     }};
 }

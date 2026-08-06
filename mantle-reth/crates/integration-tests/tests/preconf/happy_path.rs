@@ -9,8 +9,9 @@
 
 use super::helpers::{
     PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, mantle_test_chain_spec, send_preconf,
+    wait_pending_nonce,
 };
-use crate::launch_preconf_node;
+use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -152,10 +153,10 @@ async fn multi_nonce_same_sender_land_in_one_block() {
     // dictates the sealed-block index order asserted below.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 1).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 2).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2).await });
 
@@ -469,8 +470,7 @@ async fn weth_transfer_over_balance_lands_as_reverted() {
     // Canonicalise the block so the state provider serves post-execution
     // state, then confirm the failed transfer left `balanceOf[recipient]`
     // untouched at 0 — the revert must have rolled back EVM state.
-    let new_head = node.submit_payload(payload).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("canonicalise reverted block");
+    canonize_built!(node, payload);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let state = node.inner.provider.latest().expect("state provider");
     let recipient_balance = state
@@ -593,8 +593,7 @@ async fn weth_deposit_carries_log_through_to_receipt() {
     // WETH9's `balanceOf[wallet_addr]` must now equal the deposited wad.
     // This guards against a hypothetical regression where the receipt
     // reports success but the state write was silently dropped.
-    let new_head = node.submit_payload(payload).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("canonicalise deposit block");
+    canonize_built!(node, payload);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let state = node.inner.provider.latest().expect("state provider");
     let wallet_weth = state

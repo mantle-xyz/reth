@@ -30,7 +30,7 @@
 //! than which layer did the skipping.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
-use crate::launch_preconf_node;
+use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -156,8 +156,7 @@ async fn replay_skip_of_consumed_nonce_does_not_block_other_sender() {
 
     // Canonicalise block 1 → A's on-chain nonce advances to 1, so the
     // still-present Replay entry for A's nonce 0 is now stale.
-    let new_head = node.submit_payload(payload_1).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("finalize block 1");
+    canonize_built!(node, payload_1);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // ── Block 2: B's fresh tx lands; A's stale Replay entry must be skipped. ──
@@ -231,8 +230,7 @@ async fn sender_continues_with_next_nonce_after_replay_skip() {
     // Block 1: Replay lands tx0; canonicalise so nonce 0 is consumed.
     let (payload_1, sealed_1) = build_block!(node);
     assert!(sealed_1.contains(&hash0), "block 1 must land the Replay tx0; sealed={sealed_1:?}");
-    let new_head = node.submit_payload(payload_1).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("finalize block 1");
+    canonize_built!(node, payload_1);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Block 2: submit a fresh nonce=1 via RPC. It must succeed and land even

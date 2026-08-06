@@ -14,8 +14,8 @@
 //! `validation_reject.rs` — it's a pre-fifo rejection path, not part
 //! of the dispatch-time budget accounting.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf};
-use crate::launch_preconf_node;
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_latest_nonce, wait_pending_nonce};
+use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -94,16 +94,15 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
     let tx1 = signed_transfer_with_gas(chain_id, &wallet, 1, 21_000).await;
     let tx2 = signed_transfer_with_gas(chain_id, &wallet, 2, 21_000).await;
 
-    // Send serially so nonces enter the pool in order — `pool.add`
-    // rejects gap-out nonces at admission, so parallel spawns would
-    // race and could surface as `PoolRejected(nonce gap)` instead of
-    // the block gas budget gate we're trying to test.
+    // Submit in nonce order, waiting for each to become pending — otherwise a
+    // follow-up tx's nonce-gap pre-check races admission and surfaces as
+    // `PoolRejected(nonce gap)` instead of the block-gas-budget gate under test.
     let http_clone = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_clone, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 1).await;
     let http_clone = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_clone, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 2).await;
     let http_clone = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_clone, tx2).await });
 
@@ -197,6 +196,12 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
 /// the tx on chain. Symmetric to Timeout recovery, but the trigger is
 /// the server-side block-gas-budget gate (`mark_canceled`), not the client-side
 /// deadline. Guards the must-land SLA's promise that Canceled is not terminal.
+///
+/// Two determinism gates keep this stable under parallel load:
+/// `wait_pending_nonce` (slot-1 nonce-gap race) and `wait_latest_nonce`
+/// (slot-2 canon-settlement race — without it the slot-2 job re-applies the
+/// still-`Success` tx0/tx1 before canon-`forward` drops them, exhausting the
+/// budget before tx2's retry).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canceled_tx_recoverable_in_next_slot() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -233,12 +238,15 @@ async fn canceled_tx_recoverable_in_next_slot() {
     let tx2 = signed_transfer_with_gas(chain_id, &wallet, 2, 21_000).await;
     let tx2_hash = alloy_primitives::keccak256(&tx2);
 
+    // Submit in nonce order, waiting for each to become pending before the
+    // next — otherwise the follow-up tx's nonce-gap pre-check can race the
+    // pool's async admission and reject it as a gap under load.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 1).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 2).await;
     let http_c = http.clone();
     let tx2_first_send = tx2.clone();
     let t2_first = tokio::spawn(async move { send_preconf(&http_c, tx2_first_send).await });
@@ -267,11 +275,11 @@ async fn canceled_tx_recoverable_in_next_slot() {
         other => panic!("expected Call error, got {other:?}"),
     }
 
-    // Canonicalise slot 1 so on-chain nonce advances to 2 and the block-gas-budget gate
-    // budget resets for slot 2.
-    let new_head = node.submit_payload(payload_1).await.expect("submit slot 1");
-    node.update_forkchoice(new_head, new_head).await.expect("canon slot 1");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Canonicalise slot 1 so the block-gas-budget resets and the still-`Success`
+    // tx0/tx1 are dropped (else the slot-2 job re-applies them and exhausts the
+    // budget before tx2's retry). `wait_latest_nonce` confirms canon settled.
+    canonize_built!(node, payload_1);
+    wait_latest_nonce(&http, wallet_addr, 2).await;
 
     // ── Slot 2: same-hash tx2 must succeed ───────────────────────────
     let attrs_2 = node.payload.next_attributes();
@@ -516,12 +524,15 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     let tx2 = signed_transfer_with_gas(chain_id, &wallet, 2, 21_000).await;
     let tx2_hash = alloy_primitives::keccak256(&tx2);
 
+    // Submit in nonce order, waiting for each to become pending before the next
+    // — otherwise the follow-up tx's nonce-gap pre-check races the pool's async
+    // admission and is rejected as a gap under load.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 1).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 2).await;
     let http_c = http.clone();
     let tx2_first = tx2.clone();
     let t2_first = tokio::spawn(async move { send_preconf(&http_c, tx2_first).await });

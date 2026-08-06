@@ -29,12 +29,12 @@
 //!   arm applies nonce=0, so reth's builder sees `tx.nonce=1 > expected 0` and rejects → fifo
 //!   `Failed`.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf};
-use crate::launch_preconf_node;
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_latest_nonce, wait_pending_nonce};
+use crate::{canonize, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use jsonrpsee::core::ClientError;
+use jsonrpsee::core::{ClientError, client::ClientT};
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
@@ -297,10 +297,15 @@ async fn waiting_slot_blocks_different_hash_replacement() {
 /// also releases the `(sender, nonce)` slot. A differently-signed tx
 /// for the same slot admits and lands on chain in the next slot.
 ///
-/// The Canceled state is set up via the same the block-gas-budget gate pattern as
+/// The Canceled state is set up via the same block-gas-budget gate pattern as
 /// `gas_budgets::canceled_tx_recoverable_in_next_slot`: three 21k-gas
 /// txs against a 50k block cap; the third gets Canceled. Then a
 /// different-hash tx replaces it after canon.
+///
+/// Two determinism gates keep this stable under load: `wait_pending_nonce`
+/// (slot-1 nonce-gap) and `canonize!` (slot-1 canon-progress — otherwise the
+/// slot-2 job re-applies the still-`Success` tx0/tx1 and exhausts the budget
+/// before the replacement lands).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canceled_slot_replaceable_by_different_hash() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -335,12 +340,15 @@ async fn canceled_slot_replaceable_by_different_hash() {
     let tx1 = signed_transfer(chain_id, &wallet, 1).await;
     let tx2_canceled = signed_transfer(chain_id, &wallet, 2).await;
 
+    // Submit in nonce order, waiting for each to become pending before the
+    // next — otherwise the follow-up tx's nonce-gap pre-check races the pool's
+    // async admission and is rejected as a gap under load.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 1).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 2).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2_canceled).await });
 
@@ -362,14 +370,10 @@ async fn canceled_slot_replaceable_by_different_hash() {
         "expected BlockGasBudgetExceeded to produce fifo Canceled state; got {err_2:?}",
     );
 
-    // Canonicalise slot 1 so on-chain nonce advances to 2 and the block-gas-budget gate
-    // budget resets. tx2's fifo entry stays in `Canceled` state
-    // (nonce=2 is at the head of the sender's frontier; `forward` at
-    // slot-2 prologue would clear entries with nonce < 2, leaving tx2
-    // intact).
-    let new_head = node.submit_payload(payload_1).await.expect("submit slot 1");
-    node.update_forkchoice(new_head, new_head).await.expect("canon slot 1");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Canonicalise slot 1 so the budget resets. tx2's `Canceled` fifo entry
+    // survives (nonce 2 is at the frontier head; `forward` clears only nonce < 2).
+    let _new_head = canonize!(node, http, payload_1, 1);
+    wait_latest_nonce(&http, wallet_addr, 2).await;
 
     // ── Slot 2: submit tx2_replacement — same sender + same nonce=2,
     //    different `value` (⇒ different hash). Must replace the
