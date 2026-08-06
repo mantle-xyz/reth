@@ -28,10 +28,13 @@ use alloy_primitives::Address;
 use futures::StreamExt;
 use op_alloy_consensus::OpTxEnvelope;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::{
-    PreconfJournal, config::PreconfConfig, preconf_tx_set::PreconfTxSet, types::PushResult,
+    PreconfJournal,
+    config::PreconfConfig,
+    preconf_tx_set::PreconfTxSet,
+    types::{PreconfError, PushResult},
 };
 
 /// Long-running async task that bridges a [`TransactionPool`] event stream to
@@ -163,12 +166,24 @@ where
                     );
                 }
                 PushResult::ConflictActive(existing) => {
-                    debug!(
+                    // `hash` shares its `(sender, nonce)` with an active commitment
+                    // (`existing`) of a different hash: the replacement guard was
+                    // raced (validated before `existing` hit the fifo), so `hash`
+                    // entered the pool and evicted `existing` from it. `existing`
+                    // still lands from the fifo, so `hash` can never execute — left
+                    // in the pool it is a ghost that silently vanishes on the next
+                    // canon update. Reject it: drop from the pool and fail its
+                    // responder (immediate error rather than a deadline hang).
+                    warn!(
                         target: "mantle::preconf::listener",
                         ?hash,
                         existing_hash = ?existing,
-                        "fifo (sender, nonce) slot occupied by another active commitment"
+                        "replacement of active preconf commitment bypassed the validator guard; \
+                         rejecting and evicting from pool"
                     );
+                    metrics::counter!("preconf.listener.replacement_rejected_total").increment(1);
+                    let _ = self.pool.remove_transactions(vec![hash]);
+                    self.fifo.cancel_responder(&hash, PreconfError::AlreadyInProgress).await;
                 }
             }
         }
