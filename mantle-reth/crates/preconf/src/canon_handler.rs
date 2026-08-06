@@ -139,9 +139,7 @@ where
             // can drop them on its next tick. No-op when persistence
             // is disabled.
             if let Some(journal) = self.journal.as_ref() {
-                for hash in &sealed_hashes {
-                    journal.mark_sealed(*hash).await;
-                }
+                journal.mark_sealed_batch(sealed_hashes.iter().copied()).await;
             }
 
             // Housekeeping: evict `Timeout` / `Canceled` / `Failed`
