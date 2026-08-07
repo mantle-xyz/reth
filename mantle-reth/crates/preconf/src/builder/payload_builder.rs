@@ -949,7 +949,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             block_gas_limit,
         );
         if schedule.build_delay_ms > 100 {
-            warn!(
+            debug!(
                 target: "mantle::preconf::payload_builder",
                 build_delay_ms = schedule.build_delay_ms,
                 time_drift_ms = schedule.time_drift.as_millis() as u64,
