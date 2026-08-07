@@ -103,11 +103,9 @@ pub struct PreconfWiring {
     pub journal: Option<Arc<mantle_reth_preconf::PreconfJournal>>,
     /// Handle to the application-level service builder — used by
     /// [`MantlePoolBuilder::build_pool`] to run [`PreconfServiceBuilder::start`]
-    /// immediately after the pool is up, populating the
-    /// [`RestoredSet`](mantle_reth_preconf::RestoredSet) + wire
-    /// [`EventPublisher`](mantle_reth_preconf::EventPublisher) before any
-    /// pool listener / canon handler / payload builder task is spawned.
-    /// `None` when preconf is disabled on the node (the default
+    /// immediately after the pool is up, replaying any journaled commitments
+    /// into the fifo before any pool listener / canon handler / payload builder
+    /// task is spawned. `None` when preconf is disabled on the node (the default
     /// pass-through path).
     pub svc: Option<Arc<PreconfServiceBuilder>>,
 }
@@ -238,9 +236,8 @@ where
         // Mantle does not use OP interop — filter is always disabled
         let transaction_pool = OpPool::new(inner_pool, false);
 
-        // Run journal restore + wire the `EventPublisher` / `RestoredSet`
-        // before any background pool task starts consuming events. Two
-        // ordering constraints:
+        // Run journal restore before any background pool task starts consuming
+        // events. Two ordering constraints:
         // - Must run before `spawn_maintenance_tasks` (which spawns reth's local-tx backup loader)
         //   so the loader and the restore path don't race on the pool mutex.
         // - Must run before the pool listener is spawned so the restore helper's fifo pushes are

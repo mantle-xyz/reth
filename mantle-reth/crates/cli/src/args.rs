@@ -125,10 +125,9 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.journal-max-size")]
     pub journal_max_size: Option<u64>,
 
-    /// Broadcast channel capacity. Default 65536. Advanced tuning knob — the
-    /// broadcast serves both `newPreconfTransaction` subscription and the
-    /// fifo notifier; consumers see `Lagged(n)` and fall back to snapshot
-    /// reconcile when full.
+    /// Broadcast channel capacity. Default 65536. Advanced tuning knob — sizes
+    /// the fifo notifier broadcast channel; consumers see `Lagged(n)` and fall
+    /// back to snapshot reconcile when full.
     #[arg(long = "preconf.broadcast-cap")]
     pub broadcast_cap: Option<usize>,
 }
