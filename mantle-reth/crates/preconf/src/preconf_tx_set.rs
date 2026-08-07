@@ -34,7 +34,7 @@ use alloy_primitives::{
 use std::{
     collections::VecDeque,
     sync::{Arc, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
 use tracing::error;
@@ -505,6 +505,35 @@ impl PreconfTxSet {
             inner.drop_hash(h);
         }
         to_drop
+    }
+
+    /// Evict `pending_responders` slots older than `max_age`; returns the
+    /// count dropped.
+    ///
+    /// Backstop for an orphaned responder: if the tx never reaches
+    /// `SubPool::Pending` (so the Pending-only listener never pushes) **and**
+    /// the RPC future is cancelled before Step 5's cleanup runs, the responder
+    /// has no other GC path — `drop_hash` only runs for `entries`-backed
+    /// hashes, never a lone pending responder. Past `max_age` (well beyond
+    /// `preconf_timeout`) it can't deliver anything useful, so dropping its
+    /// `oneshot::Sender` is safe (a live receiver just sees `RecvError`).
+    pub async fn expire_pending_responders(&self, max_age: Duration) -> usize {
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        let expired: Vec<TxHash> = inner
+            .pending_responders
+            .iter()
+            .filter(|(_, (origin, _))| now.saturating_duration_since(*origin) > max_age)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &expired {
+            inner.pending_responders.remove(hash);
+        }
+        if !expired.is_empty() {
+            metrics::counter!("preconf.pending_responders.expired_total")
+                .increment(expired.len() as u64);
+        }
+        expired.len()
     }
 
     /// Builder subscribes the broadcast notifier here.
@@ -1397,6 +1426,39 @@ mod tests {
             assert!(inner.by_sender.is_empty());
             assert!(inner.pending_responders.is_empty());
         }
+    }
+
+    /// `expire_pending_responders` drops aged slots, keeps fresh ones, and
+    /// releases the evicted slot's `oneshot::Sender` (receiver sees `RecvError`).
+    #[tokio::test]
+    async fn expire_pending_responders_drops_only_aged_slots() {
+        let set = PreconfTxSet::new(4);
+        let aged = h(1);
+        let fresh = h(2);
+
+        let (aged_tx, aged_rx) = oneshot::channel::<Result<PreconfReceipt, PreconfError>>();
+        let (fresh_tx, _fresh_rx) = oneshot::channel::<Result<PreconfReceipt, PreconfError>>();
+        {
+            let mut inner = set.inner.lock().await;
+            // `aged` stamped 10s in the past; `fresh` at ~now.
+            inner
+                .pending_responders
+                .insert(aged, (Instant::now() - Duration::from_secs(10), aged_tx));
+            inner.pending_responders.insert(fresh, (Instant::now(), fresh_tx));
+        }
+
+        // Sweep with a 5s TTL: `aged` (10s) evicted, `fresh` (~0s) retained.
+        let dropped = set.expire_pending_responders(Duration::from_secs(5)).await;
+        assert_eq!(dropped, 1, "only the aged slot should be swept");
+
+        {
+            let inner = set.inner.lock().await;
+            assert!(!inner.pending_responders.contains_key(&aged), "aged slot removed");
+            assert!(inner.pending_responders.contains_key(&fresh), "fresh slot retained");
+        }
+
+        // Evicted slot's sender was dropped → receiver observes RecvError.
+        assert!(aged_rx.await.is_err(), "orphaned responder's receiver must observe RecvError");
     }
 
     /// `cancel_responder` belt-and-braces cleanup: even if invariant #2 is

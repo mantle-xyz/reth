@@ -34,7 +34,7 @@
 //! Returns when the broadcast subscription's sender side closes (typically
 //! at node shutdown).
 
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
 use futures::StreamExt;
@@ -45,6 +45,12 @@ use reth_transaction_pool::TransactionPool;
 use tracing::{debug, warn};
 
 use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
+
+/// Max age for an unconsumed `pending_responders` slot before the canon sweep
+/// drops it. Well beyond any realistic `preconf_timeout` so an in-flight
+/// responder is never evicted early (see
+/// [`PreconfTxSet::expire_pending_responders`]).
+const PENDING_RESPONDER_TTL: Duration = Duration::from_secs(60);
 
 /// Long-running async task bridging `CanonStateNotification` events to
 /// [`PreconfTxSet`] cleanup.
@@ -177,6 +183,17 @@ where
                     "clean_reclaimable evicted {} fifo entries; removed {} from pool",
                     evicted.len(),
                     pool_removed.len(),
+                );
+            }
+
+            // Backstop GC for orphaned RPC responders (see
+            // `PreconfTxSet::expire_pending_responders`).
+            let expired = self.fifo.expire_pending_responders(PENDING_RESPONDER_TTL).await;
+            if expired > 0 {
+                debug!(
+                    target: "mantle::preconf::canon",
+                    expired,
+                    "swept orphaned pending preconf responders",
                 );
             }
         }

@@ -26,6 +26,7 @@ const COUNTERS: &[&str] = &[
     "preconf.dispatch.gas_budget_skipped_total",
     "preconf.listener.replacement_rejected_total",
     "preconf.journal.abandoned_total",
+    "preconf.pending_responders.expired_total",
 ];
 
 /// Gauge series. Registered **non-destructively** via `increment(0.0)`: the
