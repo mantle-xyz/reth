@@ -4,7 +4,7 @@ use clap::Parser;
 use mantle_reth_cli::{
     MantleArgs, MantleChainSpecParser, MantleNode, seed_blockchain_tree_metrics,
 };
-use mantle_reth_preconf::PreconfServiceBuilder;
+use mantle_reth_preconf::{PreconfServiceBuilder, seed_preconf_metrics};
 use tracing::info;
 
 #[global_allocator]
@@ -28,7 +28,9 @@ fn main() {
         async move |builder, args| {
             info!(target: "reth::cli", "Launching Mantle node");
             let mut node = MantleNode::new(args.rollup);
-            match args.preconf.into_config() {
+            let preconf_cfg = args.preconf.into_config();
+            let preconf_enabled = preconf_cfg.is_some();
+            match preconf_cfg {
                 Some(cfg) => {
                     let all = cfg.all_preconfs;
                     let journal = cfg.journal_path.clone();
@@ -50,8 +52,13 @@ fn main() {
             }
             let handle = builder
                 .node(node)
-                .on_node_started(|full_node| {
+                .on_node_started(move |full_node| {
                     seed_blockchain_tree_metrics(&full_node.provider);
+                    // Pre-register preconf metric series (0 baseline) so alerts
+                    // don't see "no data" before the first emit. Preconf-only.
+                    if preconf_enabled {
+                        seed_preconf_metrics();
+                    }
                     Ok(())
                 })
                 .launch()

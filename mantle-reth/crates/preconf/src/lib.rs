@@ -15,6 +15,7 @@ pub mod builder;
 pub mod canon_handler;
 pub mod config;
 pub mod journal;
+pub mod metrics_seed;
 pub mod payload_service_builder;
 pub mod pool_ext;
 pub mod preconf_tx_set;
@@ -32,6 +33,7 @@ pub use journal::{
     JournalEntry, JournalError, PreconfJournal, RestorePool, RestoredEnvelope, RotateStats,
     restore_preconf_state, run_rejournal_loop, spawn_rejournal_loop,
 };
+pub use metrics_seed::seed_preconf_metrics;
 pub use payload_service_builder::MantlePreconfServiceBuilder;
 pub use pool_ext::{
     PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,
