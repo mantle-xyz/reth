@@ -12,7 +12,9 @@
 //! 3. A fresh [`JobCancel`] and a `watch::channel(None)` are created. A tokio task is spawned that
 //!    drives [`PreconfPayloadBuilder::build_payload`] to completion, then sends the final
 //!    `Option<OpBuiltPayload<N>>` into the watch sender. On error the sender is dropped (without
-//!    sending).
+//!    sending). A panic inside the build is caught (`catch_unwind`), logged at `error!`, counted
+//!    via `preconf.build.panic_total`, and then degrades the same way (sender dropped →
+//!    `MissingPayload`) rather than being silently swallowed by the never-awaited join handle.
 //! 4. The [`PreconfPayloadJob`] returned to the payload service holds the watch receiver + cancel
 //!    handle + join handle. Subsequent `best_payload()` / `resolve_kind()` calls read through
 //!    those.
@@ -59,7 +61,7 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_revm::cancelled::CancelOnDrop;
 use reth_storage_api::BlockReaderIdExt;
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::builder::{
     cancel::JobCancel, payload_builder::PreconfPayloadBuilder, payload_job::PreconfPayloadJob,
@@ -226,30 +228,15 @@ where
 
         let builder_clone = self.builder.clone();
 
-        // Why `spawn_blocking + current_thread runtime + block_on`
-        // instead of plain `tokio::spawn`:
+        // The build future is `!Send` (upstream's block builder holds a
+        // non-`Sync` `State<DB>` across the select! `.await`), so
+        // `tokio::spawn` rejects it. Instead run it to completion on a local
+        // `current_thread` runtime inside `spawn_blocking`, where it never
+        // crosses threads and `Send` is not required.
         //
-        // Upstream's `OpPayloadBuilderCtx::block_builder(&mut state)`
-        // returns `impl BlockBuilder + '_`, and the concrete type is
-        // not `Send` (its State<DB> path holds `Box<dyn StateProvider
-        // + Send>` which is not `Sync`, so `&State<DB>` is not Send).
-        // Holding that builder across the select! `.await` makes the
-        // whole build future non-`Send`, so `tokio::spawn(future)`
-        // rejects it at the trait-bound level.
-        //
-        // `spawn_blocking` accepts a `FnOnce() -> R + Send + 'static`
-        // closure (not a future), runs it on tokio's blocking-thread
-        // pool, and returns a `JoinHandle<R>`. Inside that closure we
-        // build a single-threaded tokio runtime (`new_current_thread`)
-        // and `block_on` the !Send future on it. The future never
-        // crosses thread boundaries (it runs to completion on the
-        // blocking-pool thread), so Send is not needed.
-        //
-        // Cost: one OS thread from the blocking pool per active
-        // payload job. The pool defaults to 512 threads; the worst
-        // case (slot duration × concurrent payload requests) is well
-        // under that. Production hardening (e.g. a bounded pool of
-        // worker threads we own) is a follow-up if observed needed.
+        // Cost: one blocking-pool thread per active job (pool default 512, far
+        // above our concurrent-jobs worst case); a bounded owned pool is a
+        // follow-up if ever needed.
         let handle = tokio::task::spawn_blocking(move || {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -265,34 +252,55 @@ where
                     return;
                 }
             };
-            rt.block_on(async move {
-                match builder_clone.build_payload(args, cancel_for_build).await {
-                    Ok(payload) => {
-                        // `send` only fails when the receiver has been
-                        // dropped, which means the job was torn down
-                        // before we finished. Nothing we can do — log
-                        // and exit.
-                        if payload_tx.send(Some(payload)).is_err() {
-                            tracing::trace!(
-                                target: "mantle::preconf::payload_job_generator",
-                                "payload receiver dropped before build completed"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
+            // The join handle is never awaited (`PreconfPayloadJob::_join_handle`
+            // is RAII-only), so a `build_payload` panic would be swallowed
+            // silently; catch it here to log + count + degrade to `MissingPayload`.
+            let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                rt.block_on(builder_clone.build_payload(args, cancel_for_build))
+            }));
+
+            match build_result {
+                Ok(Ok(payload)) => {
+                    // `send` only fails when the receiver has been dropped,
+                    // which means the job was torn down before we finished.
+                    // Nothing we can do — log and exit.
+                    if payload_tx.send(Some(payload)).is_err() {
+                        tracing::trace!(
                             target: "mantle::preconf::payload_job_generator",
-                            ?err,
-                            "preconf payload build failed"
+                            "payload receiver dropped before build completed"
                         );
-                        // Drop `payload_tx` without sending → the watch
-                        // receiver's `changed()` returns Err, which
-                        // `ResolvePayloadFuture` surfaces as
-                        // `MissingPayload`.
-                        drop(payload_tx);
                     }
                 }
-            });
+                Ok(Err(err)) => {
+                    warn!(
+                        target: "mantle::preconf::payload_job_generator",
+                        ?err,
+                        %id,
+                        "preconf payload build failed"
+                    );
+                    // Drop `payload_tx` without sending → the watch
+                    // receiver's `changed()` returns Err, which
+                    // `ResolvePayloadFuture` surfaces as `MissingPayload`.
+                    drop(payload_tx);
+                }
+                Err(panic) => {
+                    // Panic payloads are `&str` (from `expect`) or `String`.
+                    let panic_msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    metrics::counter!("preconf.build.panic_total").increment(1);
+                    error!(
+                        target: "mantle::preconf::payload_job_generator",
+                        %id,
+                        panic = %panic_msg,
+                        "preconf payload build panicked; degrading to MissingPayload"
+                    );
+                    // Drop the sender → `MissingPayload`, same as the error arm.
+                    drop(payload_tx);
+                }
+            }
         });
 
         Ok(PreconfPayloadJob::new(attributes_for_job, payload_rx, cancel, handle))
