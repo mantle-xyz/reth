@@ -228,51 +228,6 @@ fn estimated_tx_da_size(tx: &TxEnvelope) -> u64 {
     op_alloy_flz::tx_estimated_size_fjord_bytes(&tx.encoded_2718())
 }
 
-/// DA-footprint pre-check for a preconf tx. Replicates the DA portion
-/// of [`ExecutionInfo::is_tx_over_limits`] (per-tx bytes, per-block bytes,
-/// and the post-Jovian footprint-gas bound) but **omits** the block-gas
-/// term — preconf gas is enforced by [`dispatch::apply_one_preconf`]'s own
-/// budget gate + the block builder itself.
-///
-/// Applies to **all** sources (RPC and Replay): unlike the operator gas
-/// budget, exceeding the DA limit would make the sealed block DA-invalid
-/// (op-node would reject it), so the constraint is a consensus invariant,
-/// not a soft budget. On over-limit the tx is left reclaimable (dispatch
-/// maps the `Err` to fifo `Failed`; a later-slot resubmit with DA headroom
-/// revives it).
-fn preconf_da_check(
-    tx_da: u64,
-    da_used: u64,
-    limits: BuildConstraints,
-) -> Result<(), PreconfError> {
-    if limits.tx_da_limit.is_some_and(|l| tx_da > l) {
-        return Err(PreconfError::DaLimitExceeded {
-            used: da_used,
-            tx_da,
-            limit: limits.tx_da_limit.expect("is_some_and matched"),
-        });
-    }
-    let total = da_used.saturating_add(tx_da);
-    if limits.block_da_limit.is_some_and(|l| total > l) {
-        return Err(PreconfError::DaLimitExceeded {
-            used: da_used,
-            tx_da,
-            limit: limits.block_da_limit.expect("is_some_and matched"),
-        });
-    }
-    if let Some(scalar) = limits.da_footprint_gas_scalar {
-        let footprint = total.saturating_mul(scalar as u64);
-        if footprint > limits.block_gas_limit {
-            return Err(PreconfError::DaLimitExceeded {
-                used: da_used,
-                tx_da,
-                limit: limits.block_gas_limit,
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Outcome of the pre-dispatch block-capacity admission check for a preconf
 /// tx. Decided **before** the hash is dispatched to
 /// [`dispatch::apply_one_preconf`], which drives the [`PreconfTxSet`] entry
@@ -379,16 +334,17 @@ fn preconf_admission(
     Admission::Admit
 }
 
-/// Apply a preconf tx with the DA-footprint gate in front. On success folds
-/// this tx's gas, DA footprint, **and priority fee** into `info` so the pool
-/// best-tx arm (which reads `info.cumulative_gas_used` /
+/// Apply a preconf tx and fold its gas, DA footprint, **and priority fee** into
+/// `info` so the pool best-tx arm (which reads `info.cumulative_gas_used` /
 /// `info.cumulative_da_bytes_used` via [`ExecutionInfo::is_tx_over_limits`]) sees
 /// the true running block totals — preconf and pool share one block DA + gas
 /// budget — and the sealed payload's block value (`total_fees`) includes preconf
 /// revenue, same as pool txs.
 ///
-/// The DA gate runs **before** [`convert_and_apply_preconf`], so an
-/// over-DA tx never touches the in-flight `State<DB>` (no cache pollution).
+/// No DA gate here: [`preconf_admission`] already enforces the per-tx / per-block
+/// DA + footprint bounds against the same `info.cumulative_da_bytes_used`
+/// (unchanged in the single-task window between admission and apply), and only
+/// dispatches on `Admit`. A gate here would be dead code.
 fn apply_preconf_with_da<N, B>(
     builder: &mut B,
     info: &mut ExecutionInfo,
@@ -403,10 +359,6 @@ where
     B: BlockBuilder<Primitives = N>,
 {
     let tx_da = estimated_tx_da_size(&tx);
-    if let Err(e) = preconf_da_check(tx_da, info.cumulative_da_bytes_used, limits) {
-        metrics::counter!("preconf.fifo.da_rejected_total").increment(1);
-        return Err(e);
-    }
     // Miner tip is independent of gas used — capture it before `tx` is consumed
     // by apply, then fold `tip × gas_used` into the block value below.
     let miner_tip = tx.effective_tip_per_gas(limits.base_fee).unwrap_or_default();
@@ -1527,10 +1479,13 @@ mod tests {
         }
     }
 
-    // ============ preconf_da_check (DA footprint gate) ============
+    // ============ preconf_admission (block-capacity gate) ============
     //
-    // Pure-function tests for the DA pre-check. No EVM / builder needed —
-    // the gate is byte-arithmetic over (tx_da, cumulative_da, limits).
+    // Pure-function tests for the pre-dispatch admission gate. Classifies a tx as
+    // Admit / Defer / Reject via the "fits an empty block?" rule. This is the
+    // single DA + block-gas gate — the former `preconf_da_check` was a dead
+    // subset of it (see `apply_preconf_with_da`), so its DA bounds are exercised
+    // here too.
 
     const BLOCK_GAS: u64 = 30_000_000;
 
@@ -1544,87 +1499,6 @@ mod tests {
             timestamp: 0,
         }
     }
-
-    /// No DA limits configured (pre-Jovian, no `da_config`) → every tx passes.
-    /// This is the default integration-harness state, so preconf behaviour
-    /// is unchanged unless an operator sets DA limits.
-    #[test]
-    fn preconf_da_check_no_limits_always_passes() {
-        let limits = da_limits(None, None, None);
-        assert!(preconf_da_check(1_000_000, 5_000_000, limits).is_ok());
-        assert!(preconf_da_check(u64::MAX, u64::MAX, limits).is_ok());
-    }
-
-    /// Per-tx DA limit: `tx_da > limit` rejects; boundary (`==`) passes
-    /// (gate uses `>`).
-    #[test]
-    fn preconf_da_check_per_tx_limit_boundary_and_reject() {
-        let limits = da_limits(None, Some(100), None);
-        assert!(preconf_da_check(100, 0, limits).is_ok(), "boundary equal must pass");
-        match preconf_da_check(101, 0, limits) {
-            Err(PreconfError::DaLimitExceeded { used, tx_da, limit }) => {
-                assert_eq!((used, tx_da, limit), (0, 101, 100));
-            }
-            other => panic!("expected DaLimitExceeded, got {other:?}"),
-        }
-    }
-
-    /// Per-block DA limit is checked against the *cumulative* DA
-    /// (`used + tx_da`), not the single tx. Boundary passes, over rejects.
-    #[test]
-    fn preconf_da_check_block_limit_uses_cumulative() {
-        let limits = da_limits(Some(1_000), None, None);
-        // 900 already used + 100 = 1000 == limit → ok.
-        assert!(preconf_da_check(100, 900, limits).is_ok());
-        // 900 + 101 = 1001 > 1000 → reject; error reports the block limit.
-        match preconf_da_check(101, 900, limits) {
-            Err(PreconfError::DaLimitExceeded { used, tx_da, limit }) => {
-                assert_eq!((used, tx_da, limit), (900, 101, 1_000));
-            }
-            other => panic!("expected DaLimitExceeded, got {other:?}"),
-        }
-    }
-
-    /// Post-Jovian footprint-gas bound: `(used + tx_da) * scalar` must not
-    /// exceed `block_gas_limit`. Boundary passes, over rejects (error
-    /// reports the gas bound).
-    #[test]
-    fn preconf_da_check_footprint_gas_scalar_bound() {
-        // scalar 1000, block gas 1_000_000 → total DA must stay ≤ 1000 bytes.
-        let limits = BuildConstraints {
-            block_gas_limit: 1_000_000,
-            block_da_limit: None,
-            tx_da_limit: None,
-            da_footprint_gas_scalar: Some(1_000),
-            base_fee: 0,
-            timestamp: 0,
-        };
-        // 1000 * 1000 = 1_000_000 == limit → ok.
-        assert!(preconf_da_check(1_000, 0, limits).is_ok());
-        // 1001 * 1000 = 1_001_000 > 1_000_000 → reject.
-        match preconf_da_check(1_001, 0, limits) {
-            Err(PreconfError::DaLimitExceeded { limit, .. }) => assert_eq!(limit, 1_000_000),
-            other => panic!("expected DaLimitExceeded, got {other:?}"),
-        }
-    }
-
-    /// Per-tx limit fires before the block limit when both would reject —
-    /// the earliest gate wins so the error names the tightest bound hit
-    /// first (per-tx). Guards evaluation order.
-    #[test]
-    fn preconf_da_check_per_tx_limit_takes_precedence() {
-        let limits = da_limits(Some(50), Some(100), None);
-        // tx_da 200 exceeds both; per-tx (100) is checked first.
-        match preconf_da_check(200, 0, limits) {
-            Err(PreconfError::DaLimitExceeded { limit, .. }) => assert_eq!(limit, 100),
-            other => panic!("expected DaLimitExceeded, got {other:?}"),
-        }
-    }
-
-    // ============ preconf_admission (block-capacity gate) ============
-    //
-    // Pure-function tests for the pre-dispatch admission gate. Classifies
-    // a tx as Admit / Defer / Reject via the "fits an empty block?" rule.
 
     /// A tx well within all DA + gas headroom → `Admit`, both sources.
     #[test]
@@ -1701,7 +1575,7 @@ mod tests {
     }
 
     /// Boundary: cumulative exactly at the block limit still `Admit`s (gate
-    /// uses strict `>` for over-limit, matching `preconf_da_check`).
+    /// uses strict `>` for over-limit).
     #[test]
     fn preconf_admission_cumulative_boundary_admits() {
         let limits = da_limits(Some(1_000), Some(1_000), None);
