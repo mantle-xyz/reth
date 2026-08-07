@@ -56,7 +56,7 @@ use tracing::{debug, warn};
 
 use crate::{
     PreconfConfig, PreconfTxSet,
-    apply::apply_preconf_tx,
+    apply::{ApplyError, apply_preconf_tx},
     builder::{cancel::JobCancel, dispatch},
     types::{PreconfError, PreconfReceipt, PreconfSource},
 };
@@ -182,19 +182,23 @@ fn convert_and_apply_preconf<N, B>(
     tx: Arc<TxEnvelope>,
     hash: TxHash,
     height: u64,
-) -> Result<PreconfReceipt, PreconfError>
+) -> Result<PreconfReceipt, ApplyError>
 where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
 {
+    // Conversion / ec-recover failures are per-tx faults (a malformed
+    // envelope can never land) → `Rejected`, not `Fatal`.
     let envelope = (*tx).clone();
     let signed: N::SignedTx = envelope.try_into().map_err(|_| {
-        PreconfError::BuilderRejected("TxEnvelope → N::SignedTx conversion failed".into())
+        ApplyError::Rejected(PreconfError::BuilderRejected(
+            "TxEnvelope → N::SignedTx conversion failed".into(),
+        ))
     })?;
-    let recovered: Recovered<N::SignedTx> = signed
-        .try_into_recovered()
-        .map_err(|_| PreconfError::BuilderRejected("ec-recover failed for preconf tx".into()))?;
+    let recovered: Recovered<N::SignedTx> = signed.try_into_recovered().map_err(|_| {
+        ApplyError::Rejected(PreconfError::BuilderRejected("ec-recover failed for preconf tx".into()))
+    })?;
     apply_preconf_tx(builder, recovered, hash, height)
 }
 
@@ -352,7 +356,7 @@ fn apply_preconf_with_da<N, B>(
     tx: Arc<TxEnvelope>,
     hash: TxHash,
     height: u64,
-) -> Result<PreconfReceipt, PreconfError>
+) -> Result<PreconfReceipt, ApplyError>
 where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
@@ -399,12 +403,13 @@ async fn admit_and_dispatch<N, B>(
     builder: &mut B,
     info: &mut ExecutionInfo,
     limits: BuildConstraints,
-) where
+) -> Result<(), PayloadBuilderError>
+where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
 {
-    let Some(entry) = fifo.find_by_hash(&hash).await else { return };
+    let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
@@ -424,7 +429,7 @@ async fn admit_and_dispatch<N, B>(
                     ?hash, ?sender, nonce,
                     "replay tx cascade-deferred (predecessor deferred)"
                 );
-                return;
+                return Ok(());
             }
             dispatch::BlockKind::Reject => {
                 // Server pre-apply rejection (predecessor can't land → nonce
@@ -437,7 +442,7 @@ async fn admit_and_dispatch<N, B>(
                         "preconf predecessor from same sender rejected (nonce gap)".into(),
                     ),
                 );
-                return;
+                return Ok(());
             }
         }
     }
@@ -450,7 +455,10 @@ async fn admit_and_dispatch<N, B>(
         Admission::Admit => {
             let mut apply_fn =
                 |tx, h, height| apply_preconf_with_da::<N, _>(builder, info, limits, tx, h, height);
-            dispatch::apply_one_preconf(fifo, cfg, hash, loop_state, &mut apply_fn).await;
+            // Propagate a fatal apply error to abort the whole build; a
+            // per-tx rejection resolves inside `apply_one_preconf` and
+            // returns `Ok(())`.
+            dispatch::apply_one_preconf(fifo, cfg, hash, loop_state, &mut apply_fn).await?;
         }
         Admission::Defer => {
             loop_state.block_sender(sender, nonce, dispatch::BlockKind::Defer);
@@ -475,6 +483,7 @@ async fn admit_and_dispatch<N, B>(
             loop_state.record_excluded(hash, e);
         }
     }
+    Ok(())
 }
 
 /// Synchronous canon-forward — drops fifo entries whose nonce has
@@ -1013,7 +1022,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     &mut info,
                     constraints,
                 )
-                .await;
+                .await?;
             }
         }
 
@@ -1034,7 +1043,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                 &self.fifo, &self.cfg, hash, &mut loop_state,
                                 &mut builder, &mut info, constraints,
                             )
-                            .await;
+                            .await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             // Broadcast overflow — re-scan the fifo snapshot and
@@ -1051,7 +1060,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                     &self.fifo, &self.cfg, hash, &mut loop_state,
                                     &mut builder, &mut info, constraints,
                                 )
-                                .await;
+                                .await?;
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {

@@ -40,8 +40,11 @@ use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, TxHash};
 use tracing::{debug, trace, warn};
 
+use reth_payload_builder_primitives::PayloadBuilderError;
+
 use crate::{
     PreconfConfig, PreconfTxSet,
+    apply::ApplyError,
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
@@ -210,14 +213,23 @@ impl LoopState {
 ///
 /// All terminal paths invoke `take_responder` or `cancel_responder`
 /// exactly once.
+///
+/// Returns `Err(PayloadBuilderError)` **only** when `apply_fn` reports an
+/// [`ApplyError::Fatal`] — a non-tx-specific execution error (DB / header /
+/// fatal precompile). In that case the caller must abort the whole build
+/// (mirroring the pool arm); the fifo entry is left `Waiting` and its
+/// responder untouched so the commitment is retried on the next build cycle
+/// rather than reneged on. Every other path — success, per-tx
+/// [`ApplyError::Rejected`], and all pre-apply gates — returns `Ok(())`.
 pub(super) async fn apply_one_preconf<F>(
     fifo: &PreconfTxSet,
     cfg: &PreconfConfig,
     hash: TxHash,
     loop_state: &mut LoopState,
     mut apply_fn: F,
-) where
-    F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, PreconfError>,
+) -> Result<(), PayloadBuilderError>
+where
+    F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, ApplyError>,
 {
     // Dedup — short-circuit if we've already made a decision on this
     // hash in this build. Committed hashes just return silently (the
@@ -240,7 +252,7 @@ pub(super) async fn apply_one_preconf<F>(
     // exclusion with the fresh timeout.
     if loop_state.is_committed(&hash) {
         trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; already committed");
-        return;
+        return Ok(());
     }
     if let Some(reason) = loop_state.excluded_reason(&hash).cloned() {
         if matches!(reason, PreconfError::Timeout { .. }) {
@@ -258,13 +270,13 @@ pub(super) async fn apply_one_preconf<F>(
                 "dedup hit; forwarding prior rejection to any pending responder"
             );
             fifo.cancel_responder(&hash, reason).await;
-            return;
+            return Ok(());
         }
     }
 
     let Some(entry) = fifo.find_by_hash(&hash).await else {
         trace!(target: "mantle::preconf::dispatch", ?hash, "no fifo entry; skipping");
-        return;
+        return Ok(());
     };
 
     if entry.status != PreconfStatus::Waiting {
@@ -282,7 +294,7 @@ pub(super) async fn apply_one_preconf<F>(
             )),
         };
         loop_state.record_excluded(hash, reason);
-        return;
+        return Ok(());
     }
 
     // The deadline and per-block gas budget gates below only apply to
@@ -330,7 +342,7 @@ pub(super) async fn apply_one_preconf<F>(
         let reason = PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
         fifo.cancel_responder(&hash, reason.clone()).await;
         loop_state.record_excluded(hash, reason);
-        return;
+        return Ok(());
     }
 
     // Block-level preconf gas budget gate. Pessimistic check: if adding
@@ -364,7 +376,7 @@ pub(super) async fn apply_one_preconf<F>(
         };
         fifo.cancel_responder(&hash, reason.clone()).await;
         loop_state.record_excluded(hash, reason);
-        return;
+        return Ok(());
     }
 
     // ── Point of no return begins here ────────────────────────────────
@@ -382,7 +394,7 @@ pub(super) async fn apply_one_preconf<F>(
             hash,
             PreconfError::Internal("preconf entry vanished before apply_lock".into()),
         );
-        return;
+        return Ok(());
     };
 
     // Re-check status under lock. The RPC deadline branch may have
@@ -407,7 +419,7 @@ pub(super) async fn apply_one_preconf<F>(
             )),
         };
         loop_state.record_excluded(hash, reason);
-        return;
+        return Ok(());
     }
 
     // ── Apply via caller-supplied closure (real EVM in production,
@@ -440,11 +452,14 @@ pub(super) async fn apply_one_preconf<F>(
                 let _ = resp.send(Ok(receipt));
             }
         }
-        Err(err) => {
+        // Per-tx rejection: the tx itself is invalid. Mark the entry
+        // `Failed` (revivable via same-hash resubmit), evict it from the
+        // pool, hand the client the concrete error, and keep building.
+        Err(ApplyError::Rejected(err)) => {
             warn!(
                 target: "mantle::preconf::dispatch",
                 ?hash, ?err,
-                "preconf apply failed; marking entry as Failed"
+                "preconf apply rejected tx; marking entry as Failed"
             );
             metrics::counter!("preconf.tx.failure_total").increment(1);
             loop_state.record_excluded(hash, err.clone());
@@ -459,7 +474,26 @@ pub(super) async fn apply_one_preconf<F>(
                 let _ = resp.send(Err(err));
             }
         }
+        // Fatal, non-tx-specific execution error (DB / header / fatal
+        // precompile). The execution environment is untrustworthy, so we
+        // abort the whole build — same policy as the pool arm
+        // (`payload_builder::apply_one_best_tx`). Crucially we do NOT
+        // `mark_failed` / evict / respond: the entry stays `Waiting` and
+        // its responder stays attached so the still-valid commitment is
+        // retried on the next build cycle instead of being silently
+        // dropped while a possibly-corrupt block gets sealed.
+        Err(ApplyError::Fatal(e)) => {
+            warn!(
+                target: "mantle::preconf::dispatch",
+                ?hash, ?e,
+                "preconf apply hit fatal execution error; aborting build \
+                 (commitment left Waiting for retry)"
+            );
+            metrics::counter!("preconf.tx.fatal_total").increment(1);
+            return Err(e);
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -526,7 +560,7 @@ mod tests {
         tx: Arc<TxEnvelope>,
         hash: TxHash,
         height: u64,
-    ) -> Result<PreconfReceipt, PreconfError> {
+    ) -> Result<PreconfReceipt, ApplyError> {
         Ok(PreconfReceipt {
             tx_hash: hash,
             block_height: height,
@@ -538,14 +572,25 @@ mod tests {
         })
     }
 
-    /// Test apply closure that always errors — exercises the
-    /// `mark_failed` + `take_responder(Err)` branch.
+    /// Test apply closure that reports a per-tx REJECTION — exercises the
+    /// `ApplyError::Rejected` → `mark_failed` + `take_responder(Err)` branch.
     fn synthetic_err(
         _: Arc<TxEnvelope>,
         _: TxHash,
         _: u64,
-    ) -> Result<PreconfReceipt, PreconfError> {
-        Err(PreconfError::BuilderRejected("synthetic error for test".into()))
+    ) -> Result<PreconfReceipt, ApplyError> {
+        Err(ApplyError::Rejected(PreconfError::BuilderRejected("synthetic error for test".into())))
+    }
+
+    /// Test apply closure that reports a FATAL execution error — exercises
+    /// the `ApplyError::Fatal` → build-abort branch. `std::fmt::Error` is a
+    /// convenient zero-field `Error + Send + Sync` payload.
+    fn synthetic_fatal(
+        _: Arc<TxEnvelope>,
+        _: TxHash,
+        _: u64,
+    ) -> Result<PreconfReceipt, ApplyError> {
+        Err(ApplyError::Fatal(PayloadBuilderError::other(std::fmt::Error)))
     }
 
     #[tokio::test]
@@ -563,7 +608,7 @@ mod tests {
         ));
 
         let mut state = LoopState::new(42);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         // Responder got the synthetic receipt.
         let receipt = resp_rx.await.expect("responder closed").expect("synthetic ok");
@@ -599,12 +644,12 @@ mod tests {
             call_count.set(call_count.get() + 1);
             synthetic_ok(tx, h, height)
         };
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
         assert_eq!(call_count.get(), 1);
         assert_eq!(state.committed_len(), 1);
 
         // Second call: dedup guard fires before apply_fn is invoked.
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
         assert_eq!(call_count.get(), 1, "apply closure must not be called twice");
         assert_eq!(state.committed_len(), 1);
     }
@@ -636,7 +681,7 @@ mod tests {
             apply_called.set(true);
             synthetic_ok(tx, h, height)
         };
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut tracking_apply).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut tracking_apply).await.unwrap();
 
         // apply closure must NOT have been invoked — deadline gate fires
         // earlier so the in-flight builder is untouched.
@@ -686,7 +731,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
         // First dispatch: Timeout via deadline gate.
         let err = resp_rx1.await.expect("responder closed").expect_err("must be Timeout");
         assert!(matches!(err, PreconfError::Timeout { .. }));
@@ -706,7 +751,7 @@ mod tests {
         // Step 3: second dispatch. Dedup CLEARS the stale Timeout and
         // falls through; deadline gate reads fresh inserted_at (< 50ms)
         // and passes; apply succeeds.
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.excluded_len(), 0, "stale Timeout exclusion must be cleared");
         assert_eq!(state.committed_len(), 1, "second dispatch must apply successfully");
@@ -728,7 +773,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(99);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err).await.unwrap();
 
         // Responder got the apply error verbatim.
         let err = resp_rx.await.expect("responder closed").expect_err("must be Err");
@@ -741,6 +786,53 @@ mod tests {
         // Fifo entry transitioned to Failed (not Success).
         let entry = fifo.find_by_hash(&hash).await.unwrap();
         assert_eq!(entry.status, PreconfStatus::Failed);
+    }
+
+    /// A FATAL apply error (DB / header / fatal precompile) must abort the
+    /// whole build — `apply_one_preconf` returns `Err` — and, unlike the
+    /// per-tx `Rejected` path, must leave the commitment intact for retry:
+    /// the fifo entry stays `Waiting` (NOT `Failed`, so it is never evicted
+    /// from the pool), nothing is recorded in loop state, and the responder
+    /// stays attached so the client keeps waiting for the next build cycle.
+    /// This is the asymmetry the fix removes: the pool arm already aborts
+    /// on this class; the preconf arm used to silently drop the commitment.
+    #[tokio::test]
+    async fn apply_fatal_aborts_build_and_leaves_entry_waiting() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x4f);
+        let hash = *tx.tx_hash();
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
+        fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+
+        let mut state = LoopState::new(7);
+        let out = apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_fatal).await;
+
+        // 1. Propagates as a build-aborting error.
+        assert!(out.is_err(), "fatal apply must abort the build (return Err)");
+
+        // 2. Entry left Waiting — NOT terminal, so never evicted from pool.
+        let entry = fifo.find_by_hash(&hash).await.expect("entry must survive a fatal abort");
+        assert_eq!(
+            entry.status,
+            PreconfStatus::Waiting,
+            "fatal must not mark the entry terminal — it stays revivable for retry"
+        );
+
+        // 3. Neither committed nor excluded — the commitment is untouched.
+        assert_eq!(state.committed_len(), 0);
+        assert_eq!(state.excluded_len(), 0, "fatal must not record the tx as excluded");
+
+        // 4. Responder still attached (not consumed) so the client keeps
+        //    waiting for the retry rather than receiving a spurious error.
+        assert!(
+            fifo.take_responder(&hash).await.is_some(),
+            "fatal must leave the responder attached for the retry"
+        );
+        // The oneshot sender is still alive until we drop it here.
+        drop(resp_rx);
     }
 
     /// Build a synthetic tx with a caller-chosen `gas_limit` and hash
@@ -771,7 +863,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         let receipt = resp_rx.await.expect("responder closed").expect("must succeed at boundary");
         assert_eq!(receipt.gas_used, 21_000);
@@ -803,7 +895,7 @@ mod tests {
         fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         // Responder got the typed error with all three fields.
         let err = resp_rx.await.expect("responder closed").expect_err("must be Err");
@@ -845,7 +937,7 @@ mod tests {
             let tx = make_tx_with_gas(0x77 + i as u8, i as u64, gas);
             let hash = *tx.tx_hash();
             fifo.push_if_absent(tx, Address::from([i as u8 + 1; 20]), PreconfSource::Rpc).await;
-            apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+            apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
             expected_total += gas;
             assert_eq!(
                 state.preconf_gas_used(),
@@ -880,7 +972,7 @@ mod tests {
         };
 
         // hash never seen — no push_if_absent, no attach_responder.
-        apply_one_preconf(&fifo, &cfg, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn).await;
+        apply_one_preconf(&fifo, &cfg, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn).await.unwrap();
 
         assert_eq!(call_count.get(), 0, "apply_fn must not be invoked when entry missing");
         assert_eq!(state.committed_len(), 0);
@@ -930,7 +1022,7 @@ mod tests {
                 synthetic_ok(tx, h, height)
             };
 
-            apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut apply_fn).await;
+            apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut apply_fn).await.unwrap();
 
             assert_eq!(call_count.get(), 0, "apply_fn must not run when status={pre_status:?}",);
             assert_eq!(state.committed_len(), 0);
@@ -974,7 +1066,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal-replayed tx must apply despite deadline");
         assert_eq!(state.excluded_len(), 0);
@@ -1001,7 +1093,7 @@ mod tests {
         let hash = *tx.tx_hash();
         fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Replay).await;
 
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal tx must apply despite over-budget");
         assert_eq!(state.excluded_len(), 0);
@@ -1032,14 +1124,14 @@ mod tests {
         let j_tx = make_tx_with_gas(0xe2, 0, 30_000);
         let j_hash = *j_tx.tx_hash();
         fifo.push_if_absent(j_tx, Address::from([1; 20]), PreconfSource::Replay).await;
-        apply_one_preconf(&fifo, &cfg, j_hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, j_hash, &mut state, synthetic_ok).await.unwrap();
         assert_eq!(state.preconf_gas_used(), 30_000);
 
         // RPC tx: 21_000 gas. 30_000 + 21_000 = 51_000 > 40_000 → rejected.
         let r_tx = make_tx_with_gas(0xe3, 0, 21_000);
         let r_hash = *r_tx.tx_hash();
         fifo.push_if_absent(r_tx, Address::from([2; 20]), PreconfSource::Rpc).await;
-        apply_one_preconf(&fifo, &cfg, r_hash, &mut state, synthetic_ok).await;
+        apply_one_preconf(&fifo, &cfg, r_hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "only the journal tx committed");
         assert_eq!(state.excluded_len(), 1, "RPC tx was gated out");
@@ -1101,7 +1193,7 @@ mod tests {
         let cfg_clone = cfg.clone();
         let dispatch_task = tokio::spawn(async move {
             let mut state = LoopState::new(7);
-            apply_one_preconf(&fifo_clone, &cfg_clone, hash, &mut state, slow_apply).await;
+            apply_one_preconf(&fifo_clone, &cfg_clone, hash, &mut state, slow_apply).await.unwrap();
         });
 
         // Give dispatch time to enter `apply_fn` (holding apply_lock).

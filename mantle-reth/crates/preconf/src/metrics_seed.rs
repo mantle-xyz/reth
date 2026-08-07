@@ -18,6 +18,7 @@ const COUNTERS: &[&str] = &[
     "preconf.api.timeout_total",
     "preconf.tx.success_total",
     "preconf.tx.failure_total",
+    "preconf.tx.fatal_total",
     "preconf.fifo.da_rejected_total",
     "preconf.fifo.replay_deferred_total",
     "preconf.dispatch.deadline_skipped_total",
