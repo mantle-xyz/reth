@@ -138,7 +138,18 @@ pub struct PreconfJournal {
     /// path. `notify_one` coalesces a burst of appends into a single
     /// pending permit.
     rotate_notify: Notify,
+    /// Age after which `rotate` abandons an **unsealed** entry (drops it even
+    /// though it never landed). `None` disables it — only sealed entries drop.
+    /// Set via [`Self::with_abandon_after`]; left `None` in most tests.
+    abandon_unsealed_after: Option<Duration>,
 }
+
+/// Rotation intervals an **unsealed** commitment survives before `rotate`
+/// abandons it as permanently un-landable (a promised tx re-lands within the
+/// reorg/replay window — seconds — so outliving many cadences means it never
+/// will). Abandon age = `rejournal_interval ×` this, so keep the cadence well
+/// below `abandon window / this`.
+pub const UNSEALED_ABANDON_ROTATIONS: u32 = 30;
 
 impl PreconfJournal {
     /// Open (or create) the journal file at `path` in append mode.
@@ -173,6 +184,7 @@ impl PreconfJournal {
             max_size,
             size_bytes: AtomicU64::new(init_size),
             rotate_notify: Notify::new(),
+            abandon_unsealed_after: None,
         };
         // Seed `promised` from the existing file so post-restart `mark_sealed`
         // recognises commitments already on disk; without this they'd never be
@@ -192,6 +204,15 @@ impl PreconfJournal {
     /// instance.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Enable age-based abandonment: `rotate` drops an **unsealed** entry once
+    /// its `committed_at_ms` is older than `ttl`. Fluent so production can chain
+    /// it after [`Self::open`] without touching the test call sites.
+    #[must_use]
+    pub const fn with_abandon_after(mut self, ttl: Duration) -> Self {
+        self.abandon_unsealed_after = Some(ttl);
+        self
     }
 
     /// Append one commitment to the journal. Performs an explicit
@@ -342,8 +363,19 @@ impl PreconfJournal {
         let sealed_snapshot: HashSet<TxHash> = self.sealed.lock().await.clone();
         metrics::gauge!("preconf.journal.sealed_len").set(sealed_snapshot.len() as f64);
 
+        // Age-based abandonment: drop an unsealed entry older than the TTL —
+        // promised but permanently un-landable, else it replays every restart.
+        // `committed_at_ms == 0` (broken clock) is only ever dropped by sealing.
+        let abandon_ttl_ms = self.abandon_unsealed_after.map(|d| d.as_millis() as u64);
+        let now_ms = now_unix_ms();
+        let expired = |e: &JournalEntry| -> bool {
+            abandon_ttl_ms
+                .is_some_and(|ttl| e.committed_at_ms != 0 && now_ms.saturating_sub(e.committed_at_ms) > ttl)
+        };
+
         let mut kept = 0usize;
         let mut dropped = 0usize;
+        let mut abandoned = 0usize;
         let mut kept_bytes = 0u64;
         let tmp_path = tmp_path_for(&self.path);
 
@@ -353,6 +385,11 @@ impl PreconfJournal {
             for entry in &entries {
                 if sealed_snapshot.contains(&entry.hash) {
                     dropped += 1;
+                    continue;
+                }
+                if expired(entry) {
+                    dropped += 1;
+                    abandoned += 1;
                     continue;
                 }
                 let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
@@ -387,10 +424,18 @@ impl PreconfJournal {
                 if sealed_snapshot.contains(&entry.hash) {
                     sealed.remove(&entry.hash);
                     promised.remove(&entry.hash);
+                } else if expired(entry) {
+                    // Abandoned ⇒ not in `sealed`; drop from `promised` to keep
+                    // `promised ⊆ file`.
+                    promised.remove(&entry.hash);
                 }
             }
             metrics::gauge!("preconf.journal.sealed_len").set(sealed.len() as f64);
             metrics::gauge!("preconf.journal.promised_len").set(promised.len() as f64);
+        }
+
+        if abandoned > 0 {
+            metrics::counter!("preconf.journal.abandoned_total").increment(abandoned as u64);
         }
 
         Ok(RotateStats { kept, dropped, bad_lines_skipped: bad_before })
@@ -416,6 +461,13 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     PathBuf::from(tmp)
+}
+
+/// Wall-clock ms since the Unix epoch, `0` if the clock predates 1970 (mirrors
+/// [`JournalEntry::committed_at_ms`]'s fallback so `rotate`'s age check is safe).
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Records `preconf.journal.rotate_duration_ms` on drop, so every exit path
@@ -515,6 +567,16 @@ pub async fn restore_preconf_state<P: RestorePool>(
     pool: &P,
     fifo: &Arc<PreconfTxSet>,
 ) {
+    // Prune before replay: one rotate drops sealed + age-abandoned entries so we
+    // neither re-inject them into the fifo nor re-`add_envelope` them every
+    // restart. Best-effort — on failure we just replay the un-pruned file.
+    if let Err(e) = journal.rotate().await {
+        warn!(
+            target: "mantle::preconf::journal",
+            ?e,
+            "pre-restore rotate failed; restoring against un-pruned journal"
+        );
+    }
     let (entries, bad_lines) = match journal.load().await {
         Ok(v) => v,
         Err(e) => {
@@ -738,6 +800,51 @@ mod tests {
         (dir, j)
     }
 
+    /// A `JournalEntry` with an explicit commit timestamp.
+    fn entry_at(byte: u8, height: u64, committed_at_ms: u64) -> JournalEntry {
+        JournalEntry {
+            hash: TxHash::from([byte; 32]),
+            tx_rlp: Bytes::from(vec![byte; 4]),
+            block_height: height,
+            committed_at_ms,
+        }
+    }
+
+    /// With abandonment enabled, `rotate` drops an unsealed entry older than the
+    /// TTL and keeps a fresh one (sealed entries are dropped regardless of age).
+    #[tokio::test]
+    async fn rotate_abandons_stale_unsealed_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = PreconfJournal::open(&path, 0).await.unwrap().with_abandon_after(Duration::from_secs(60));
+
+        let now = now_unix_ms();
+        let stale = entry_at(1, 10, 1_000); // ~epoch ⇒ far older than 60s
+        let fresh = entry_at(2, 11, now); // just committed
+        j.append_promised(&stale).await.unwrap();
+        j.append_promised(&fresh).await.unwrap();
+
+        let stats = j.rotate().await.unwrap();
+        assert_eq!(stats.dropped, 1, "only the stale unsealed entry is abandoned");
+
+        let (survivors, _) = j.load().await.unwrap();
+        assert_eq!(survivors, vec![fresh], "fresh unsealed entry survives; stale one abandoned");
+    }
+
+    /// Default (abandonment disabled) preserves the old behaviour: a stale
+    /// unsealed entry is kept, no matter how old.
+    #[tokio::test]
+    async fn rotate_without_abandon_keeps_stale_unsealed() {
+        let (_dir, j) = fresh_journal().await;
+        let stale = entry_at(1, 10, 1_000);
+        j.append_promised(&stale).await.unwrap();
+
+        let stats = j.rotate().await.unwrap();
+        assert_eq!(stats.dropped, 0);
+        let (survivors, _) = j.load().await.unwrap();
+        assert_eq!(survivors, vec![stale], "no abandonment configured ⇒ survivor kept");
+    }
+
     #[tokio::test]
     async fn open_creates_parent_directory() {
         let dir = TempDir::new().unwrap();
@@ -772,6 +879,7 @@ mod tests {
             max_size: 0,
             size_bytes: AtomicU64::new(0),
             rotate_notify: Notify::new(),
+            abandon_unsealed_after: None,
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());

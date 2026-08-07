@@ -39,7 +39,7 @@ use reth_transaction_pool::TransactionPool;
 use crate::{
     PreconfCanonHandler, PreconfConfig, PreconfJournal, PreconfRpcHandler, PreconfTxSet,
     config::PreconfConfigError,
-    journal::{JournalError, RestorePool, restore_preconf_state},
+    journal::{JournalError, RestorePool, UNSEALED_ABANDON_ROTATIONS, restore_preconf_state},
 };
 use thiserror::Error;
 
@@ -121,7 +121,12 @@ impl PreconfServiceBuilder {
     /// opened in append mode; existing contents are preserved and
     /// replayed into the fifo when [`Self::start`] runs.
     pub async fn with_journal(mut self, path: impl AsRef<Path>) -> Result<Self, JournalError> {
-        let journal = PreconfJournal::open(path, self.cfg.journal_max_size).await?;
+        // Abandon an unsealed commitment after `UNSEALED_ABANDON_ROTATIONS`
+        // rotation cadences without sealing (bounds the journal vs zombies).
+        let abandon_after = self.cfg.rejournal_interval * UNSEALED_ABANDON_ROTATIONS;
+        let journal = PreconfJournal::open(path, self.cfg.journal_max_size)
+            .await?
+            .with_abandon_after(abandon_after);
         self.journal = Some(Arc::new(journal));
         Ok(self)
     }
@@ -400,13 +405,20 @@ mod tests {
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
+        // Fresh commit timestamps so `start`'s pre-restore rotate does not
+        // age-abandon them before they can be replayed (see
+        // `journal::UNSEALED_ABANDON_ROTATIONS`).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let journal = svc.journal().expect("journal on");
         journal
             .append_promised(&JournalEntry {
                 hash: TxHash::from([0xA1; 32]),
                 tx_rlp: Bytes::from(vec![0xA1; 4]),
                 block_height: 10,
-                committed_at_ms: 1,
+                committed_at_ms: now_ms,
             })
             .await
             .unwrap();
@@ -415,7 +427,7 @@ mod tests {
                 hash: TxHash::from([0xA2; 32]),
                 tx_rlp: Bytes::from(vec![0xA2; 4]),
                 block_height: 11,
-                committed_at_ms: 2,
+                committed_at_ms: now_ms,
             })
             .await
             .unwrap();
@@ -428,5 +440,38 @@ mod tests {
         // Fifo contains both restored envelopes.
         let snapshot = svc.fifo().snapshot().await;
         assert_eq!(snapshot.len(), 2);
+    }
+
+    /// An age-abandoned journal entry is pruned by `start`'s pre-restore rotate,
+    /// so it is never replayed into the pool/fifo. `UnreachablePool` panics if
+    /// `add_envelope` is reached, so a passing run proves the entry was dropped
+    /// before restore rather than re-injected.
+    #[tokio::test]
+    async fn start_prunes_age_abandoned_entry_before_restore() {
+        use crate::journal::JournalEntry;
+        use alloy_primitives::{Bytes, TxHash};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
+        let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
+
+        // Ancient commit timestamp ⇒ far older than the abandon window.
+        svc.journal()
+            .expect("journal on")
+            .append_promised(&JournalEntry {
+                hash: TxHash::from([0xB1; 32]),
+                tx_rlp: Bytes::from(vec![0xB1; 4]),
+                block_height: 5,
+                committed_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        svc.start(&UnreachablePool).await.unwrap();
+        assert!(
+            svc.fifo().snapshot().await.is_empty(),
+            "age-abandoned entry must be pruned, not restored",
+        );
     }
 }
