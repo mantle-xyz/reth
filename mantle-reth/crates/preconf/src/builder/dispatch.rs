@@ -574,11 +574,7 @@ mod tests {
 
     /// Test apply closure that reports a per-tx REJECTION — exercises the
     /// `ApplyError::Rejected` → `mark_failed` + `take_responder(Err)` branch.
-    fn synthetic_err(
-        _: Arc<TxEnvelope>,
-        _: TxHash,
-        _: u64,
-    ) -> Result<PreconfReceipt, ApplyError> {
+    fn synthetic_err(_: Arc<TxEnvelope>, _: TxHash, _: u64) -> Result<PreconfReceipt, ApplyError> {
         Err(ApplyError::Rejected(PreconfError::BuilderRejected("synthetic error for test".into())))
     }
 
@@ -825,8 +821,8 @@ mod tests {
         assert_eq!(state.committed_len(), 0);
         assert_eq!(state.excluded_len(), 0, "fatal must not record the tx as excluded");
 
-        // 4. Responder still attached (not consumed) so the client keeps
-        //    waiting for the retry rather than receiving a spurious error.
+        // 4. Responder still attached (not consumed) so the client keeps waiting for the retry
+        //    rather than receiving a spurious error.
         assert!(
             fifo.take_responder(&hash).await.is_some(),
             "fatal must leave the responder attached for the retry"
@@ -972,7 +968,9 @@ mod tests {
         };
 
         // hash never seen — no push_if_absent, no attach_responder.
-        apply_one_preconf(&fifo, &cfg, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn)
+            .await
+            .unwrap();
 
         assert_eq!(call_count.get(), 0, "apply_fn must not be invoked when entry missing");
         assert_eq!(state.committed_len(), 0);

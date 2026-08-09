@@ -400,7 +400,10 @@ mod tests {
         // (`None` just means "use the datadir default").
         let mut cfg = PreconfConfig::default();
         cfg.rejournal_interval = Duration::ZERO;
-        assert!(matches!(cfg.clone().validate(), Err(PreconfConfigError::InvalidRejournalInterval)));
+        assert!(matches!(
+            cfg.clone().validate(),
+            Err(PreconfConfigError::InvalidRejournalInterval)
+        ));
         cfg.journal_path = Some(PathBuf::from("/tmp/preconf"));
         assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidRejournalInterval)));
     }

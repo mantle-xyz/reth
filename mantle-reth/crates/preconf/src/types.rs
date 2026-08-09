@@ -373,11 +373,8 @@ mod tests {
             "preconf tx exceeds DA limit: tx DA 500 bytes, 1000 already used, limit 1200",
         );
         assert_eq!(
-            PreconfError::InsufficientFunds {
-                balance: U256::from(100),
-                required: U256::from(150),
-            }
-            .to_string(),
+            PreconfError::InsufficientFunds { balance: U256::from(100), required: U256::from(150) }
+                .to_string(),
             "insufficient funds: sender balance 100 < required 150 \
              (cumulative cost across the sender's pending txs)",
         );

@@ -10,8 +10,8 @@
 //!
 //! 1. Decode + recover the raw transaction.
 //! 2. Whitelist check via [`PreconfConfig::is_preconf_tx`].
-//! 3. Nonce-gap + cumulative-balance pre-checks against a single `latest`
-//!    snapshot and one pool scan (`get_pending_nonce_and_cumulative_cost`).
+//! 3. Nonce-gap + cumulative-balance pre-checks against a single `latest` snapshot and one pool
+//!    scan (`get_pending_nonce_and_cumulative_cost`).
 //! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
 //!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
 //!    builder could apply it before the responder is registered, dropping the receipt.

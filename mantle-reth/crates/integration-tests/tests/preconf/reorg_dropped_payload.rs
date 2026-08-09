@@ -13,12 +13,15 @@
 //! Engine calls exercised (the full op-node → reth request sequence):
 //!   1. `engine_forkchoiceUpdatedV3(attrs)` on H   -> build#1 opened (`payload_id_1`)
 //!   2. `eth_sendRawTransactionWithPreconf`         -> preconf enters the FIFO (Success)
-//!   3. `engine_forkchoiceUpdatedV3(attrs`') on H   -> build#2 opened; `ensure_only_one_payload` cancels build#1 (never getPayload'd)
+//!   3. `engine_forkchoiceUpdatedV3(attrs`') on H   -> build#2 opened; `ensure_only_one_payload`
+//!      cancels build#1 (never getPayload'd)
 //!   4. `engine_getPayloadV5(payload_id_2)`         -> carryover re-dispatches the preconf
 //!   5. `engine_newPayloadV4` + forkchoiceUpdated   -> commit build#2
 
 use super::helpers::{PreconfCfgBuilder, fresh_journal, send_preconf};
-use crate::{fcu_v3_commit, fcu_v3_start, get_payload_v5, launch_preconf_node, new_payload_v4, op_node_slot};
+use crate::{
+    fcu_v3_commit, fcu_v3_start, get_payload_v5, launch_preconf_node, new_payload_v4, op_node_slot,
+};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -57,15 +60,14 @@ async fn dropped_payload_relands_via_carryover_in_fresh_build() {
 
     let parent = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
 
-    // 1. op-node opens build#1 on `parent` (FCU + attrs). No getPayload — it will
-    //    be dropped.
+    // 1. op-node opens build#1 on `parent` (FCU + attrs). No getPayload — it will be dropped.
     let attrs1 = node.payload.next_attributes();
     let pid1 = fcu_v3_start!(node, parent, attrs1);
     // Let build#1 subscribe to the preconf broadcast before we submit.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 2. Submit the preconf; it registers a Success FIFO entry. `send_preconf`
-    //    blocks until the tx lands (in build#2 below), so spawn it.
+    // 2. Submit the preconf; it registers a Success FIFO entry. `send_preconf` blocks until the tx
+    //    lands (in build#2 below), so spawn it.
     let tx = signed_transfer(chain_id, &wallet, 0).await;
     let hash = keccak256(&tx);
     let http_c = http.clone();
@@ -79,9 +81,9 @@ async fn dropped_payload_relands_via_carryover_in_fresh_build() {
         "dropped build#1 must not have advanced the head",
     );
 
-    // 3. op-node opens a FRESH build#2 on the SAME parent with new attrs. Distinct
-    //    attrs → distinct payload_id: a genuinely new build. Opening it triggers
-    //    `ensure_only_one_payload`, cancelling the lingering build#1.
+    // 3. op-node opens a FRESH build#2 on the SAME parent with new attrs. Distinct attrs → distinct
+    //    payload_id: a genuinely new build. Opening it triggers `ensure_only_one_payload`,
+    //    cancelling the lingering build#1.
     let attrs2 = node.payload.next_attributes();
     let pid2 = fcu_v3_start!(node, parent, attrs2);
     assert_ne!(pid1, pid2, "build#2 must be a genuinely new build, not the cached build#1");
@@ -89,12 +91,8 @@ async fn dropped_payload_relands_via_carryover_in_fresh_build() {
     // 4./5. getPayload build#2 → carryover re-dispatches the surviving Success
     //       entry; then commit build#2.
     let payload2 = get_payload_v5!(node, pid2);
-    let sealed: Vec<B256> = payload2
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| keccak256(tx.encoded_2718()))
-        .collect();
+    let sealed: Vec<B256> =
+        payload2.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     let head2 = new_payload_v4!(node, payload2);
     fcu_v3_commit!(node, head2);
 

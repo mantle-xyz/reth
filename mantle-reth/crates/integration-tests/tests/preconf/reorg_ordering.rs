@@ -101,7 +101,10 @@ async fn preconf_carryover_orders_ahead_of_higher_tip_after_reorg() {
     let (ip, in_) = (index_of(&sealed, &hash_p), index_of(&sealed, &hash_n));
     eprintln!("[ordering] pre-reorg  P idx={ip:?}  N idx={in_:?}  sealed_len={}", sealed.len());
     assert!(ip.is_some() && in_.is_some(), "both P and N must land in block 2; sealed={sealed:?}");
-    assert!(ip < in_, "low-tip preconf P must precede high-tip normal N pre-reorg; sealed={sealed:?}");
+    assert!(
+        ip < in_,
+        "low-tip preconf P must precede high-tip normal N pre-reorg; sealed={sealed:?}"
+    );
 
     // ── Reorg (same height n=1, NEW L1 origin 200), then assert P re-lands
     //    through the carryover preamble: it must be the FIRST user tx (index 1,
@@ -110,7 +113,10 @@ async fn preconf_carryover_orders_ahead_of_higher_tip_after_reorg() {
     //    block — so we only assert the ordering when the two co-locate.
     let (_relanded_head, sealed_re) = reorg_to!(node, base, n = 1, l1 = 200);
     let (ip_re, in_re) = (index_of(&sealed_re, &hash_p), index_of(&sealed_re, &hash_n));
-    eprintln!("[ordering] post-reorg P idx={ip_re:?}  N idx={in_re:?}  sealed_len={}", sealed_re.len());
+    eprintln!(
+        "[ordering] post-reorg P idx={ip_re:?}  N idx={in_re:?}  sealed_len={}",
+        sealed_re.len()
+    );
     assert_eq!(
         ip_re,
         Some(1),
@@ -118,6 +124,9 @@ async fn preconf_carryover_orders_ahead_of_higher_tip_after_reorg() {
          not tip-ordered pool; sealed={sealed_re:?}",
     );
     if let (Some(ip), Some(inx)) = (ip_re, in_re) {
-        assert!(ip < inx, "when co-located, low-tip P must precede high-tip N; sealed={sealed_re:?}");
+        assert!(
+            ip < inx,
+            "when co-located, low-tip P must precede high-tip N; sealed={sealed_re:?}"
+        );
     }
 }

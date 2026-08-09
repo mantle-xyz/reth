@@ -369,8 +369,9 @@ impl PreconfJournal {
         let abandon_ttl_ms = self.abandon_unsealed_after.map(|d| d.as_millis() as u64);
         let now_ms = now_unix_ms();
         let expired = |e: &JournalEntry| -> bool {
-            abandon_ttl_ms
-                .is_some_and(|ttl| e.committed_at_ms != 0 && now_ms.saturating_sub(e.committed_at_ms) > ttl)
+            abandon_ttl_ms.is_some_and(|ttl| {
+                e.committed_at_ms != 0 && now_ms.saturating_sub(e.committed_at_ms) > ttl
+            })
         };
 
         let mut kept = 0usize;
@@ -816,7 +817,10 @@ mod tests {
     async fn rotate_abandons_stale_unsealed_entries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
-        let j = PreconfJournal::open(&path, 0).await.unwrap().with_abandon_after(Duration::from_secs(60));
+        let j = PreconfJournal::open(&path, 0)
+            .await
+            .unwrap()
+            .with_abandon_after(Duration::from_secs(60));
 
         let now = now_unix_ms();
         let stale = entry_at(1, 10, 1_000); // ~epoch ⇒ far older than 60s

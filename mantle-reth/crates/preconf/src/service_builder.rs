@@ -383,10 +383,9 @@ mod tests {
         // Fresh commit timestamps so `start`'s pre-restore rotate does not
         // age-abandon them before they can be replayed (see
         // `journal::UNSEALED_ABANDON_ROTATIONS`).
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now_ms =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as u64;
         let journal = svc.journal();
         journal
             .append_promised(&JournalEntry {

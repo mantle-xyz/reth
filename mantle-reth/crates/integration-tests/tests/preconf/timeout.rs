@@ -17,9 +17,9 @@
 //!   with `final_status == None` and hits `mark_timeout`'s `NotFound` fallback, but must still
 //!   clear `pending_responders` so a same- hash resubmit is not permanently wedged with
 //!   `AlreadyInProgress`.
-//! - `basefee_orphan_evicted_from_pool_on_timeout` — same `BaseFee`-orphan path, but pins the
-//!   SLA half the other test omits: because no fifo entry exists, `mark_timeout` returns `NotFound`
-//!   and its pool-eviction callback never fires, so the RPC handler must remove the tx from the pool
+//! - `basefee_orphan_evicted_from_pool_on_timeout` — same `BaseFee`-orphan path, but pins the SLA
+//!   half the other test omits: because no fifo entry exists, `mark_timeout` returns `NotFound` and
+//!   its pool-eviction callback never fires, so the RPC handler must remove the tx from the pool
 //!   itself. Otherwise the orphan lingers in `BaseFee` and gets mined once the base fee drops —
 //!   after the client already saw `Timeout`.
 //!

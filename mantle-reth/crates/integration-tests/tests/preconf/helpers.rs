@@ -248,7 +248,10 @@ pub async fn send_preconf(
 /// Submit a plain tx via `eth_sendRawTransaction` (the tip-ordered pool path).
 /// Returns immediately with the tx hash — unlike preconf it does not wait for
 /// inclusion. Use for the "normal high-tip" tx in ordering tests.
-pub async fn send_normal(http: &HttpClient, tx_rlp: Bytes) -> Result<B256, jsonrpsee::core::ClientError> {
+pub async fn send_normal(
+    http: &HttpClient,
+    tx_rlp: Bytes,
+) -> Result<B256, jsonrpsee::core::ClientError> {
     http.request("eth_sendRawTransaction", vec![tx_rlp.to_string()]).await
 }
 
@@ -580,9 +583,7 @@ macro_rules! get_payload_v5 {
 /// Here:       `beacon_engine_handle.new_payload(..)` via `submit_payload`
 #[macro_export]
 macro_rules! new_payload_v4 {
-    ($node:expr, $payload:expr) => {{
-        $node.submit_payload($payload).await.expect("engine_newPayloadV4 submit")
-    }};
+    ($node:expr, $payload:expr) => {{ $node.submit_payload($payload).await.expect("engine_newPayloadV4 submit") }};
 }
 
 /// == the post-insert `engine_forkchoiceUpdatedV3` **without** attributes:
@@ -684,7 +685,7 @@ macro_rules! canonize_built {
 /// Returns `(new_head, sealed_tx_hashes)`.
 #[macro_export]
 macro_rules! op_node_slot {
-    ($node:expr, on = $on:expr) => {{
+    ($node:expr,on = $on:expr) => {{
         // NOTE: simplified attributes (shared with the rest of the suite). To
         // match op-node byte-for-byte, align these with real op-node attrs —
         // esp. `no_tx_pool`, the leading L1-info deposit tx, gas_limit,
@@ -696,9 +697,11 @@ macro_rules! op_node_slot {
             .block()
             .body()
             .transactions()
-            .map(|tx| ::alloy_primitives::keccak256(
-                ::alloy_network::eip2718::Encodable2718::encoded_2718(tx),
-            ))
+            .map(|tx| {
+                ::alloy_primitives::keccak256(
+                    ::alloy_network::eip2718::Encodable2718::encoded_2718(tx),
+                )
+            })
             .collect();
         let head = $crate::canonize_built!($node, payload);
         (head, sealed)
@@ -713,7 +716,7 @@ macro_rules! op_node_slot {
 /// Returns `(new_head, sealed_tx_hashes)`; `sealed[0]` is the L1-info deposit.
 #[macro_export]
 macro_rules! op_node_slot_l1 {
-    ($node:expr, on = $on:expr, n = $n:expr, l1 = $l1:expr) => {{
+    ($node:expr,on = $on:expr,n = $n:expr,l1 = $l1:expr) => {{
         let attrs = $crate::helpers::l1_attrs($n, $l1);
         let pid = $crate::fcu_v3_start!($node, $on, attrs);
         let payload = $crate::get_payload_v5!($node, pid);
@@ -721,9 +724,11 @@ macro_rules! op_node_slot_l1 {
             .block()
             .body()
             .transactions()
-            .map(|tx| ::alloy_primitives::keccak256(
-                ::alloy_network::eip2718::Encodable2718::encoded_2718(tx),
-            ))
+            .map(|tx| {
+                ::alloy_primitives::keccak256(
+                    ::alloy_network::eip2718::Encodable2718::encoded_2718(tx),
+                )
+            })
             .collect();
         let head = $crate::canonize_built!($node, payload);
         (head, sealed)
@@ -738,7 +743,5 @@ macro_rules! op_node_slot_l1 {
 #[macro_export]
 macro_rules! reorg_to {
     ($node:expr, $ancestor:expr) => {{ $crate::op_node_slot!($node, on = $ancestor) }};
-    ($node:expr, $ancestor:expr, n = $n:expr, l1 = $l1:expr) => {{
-        $crate::op_node_slot_l1!($node, on = $ancestor, n = $n, l1 = $l1)
-    }};
+    ($node:expr, $ancestor:expr,n = $n:expr,l1 = $l1:expr) => {{ $crate::op_node_slot_l1!($node, on = $ancestor, n = $n, l1 = $l1) }};
 }

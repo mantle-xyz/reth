@@ -880,10 +880,7 @@ mod tests {
             set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await,
             PushResult::Revived
         );
-        assert!(
-            !set.remove_reclaimable(tx.tx_hash()).await,
-            "revived Waiting must not be removed"
-        );
+        assert!(!set.remove_reclaimable(tx.tx_hash()).await, "revived Waiting must not be removed");
         assert!(set.contains(tx.tx_hash()).await);
     }
 

@@ -197,7 +197,9 @@ where
         ))
     })?;
     let recovered: Recovered<N::SignedTx> = signed.try_into_recovered().map_err(|_| {
-        ApplyError::Rejected(PreconfError::BuilderRejected("ec-recover failed for preconf tx".into()))
+        ApplyError::Rejected(PreconfError::BuilderRejected(
+            "ec-recover failed for preconf tx".into(),
+        ))
     })?;
     apply_preconf_tx(builder, recovered, hash, height)
 }
