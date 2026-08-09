@@ -31,8 +31,21 @@ fn main() {
             let preconf_cfg = args.preconf.into_config();
             let preconf_enabled = preconf_cfg.is_some();
             match preconf_cfg {
-                Some(cfg) => {
+                Some(mut cfg) => {
                     let all = cfg.all_preconfs;
+                    // The journal is mandatory. When the operator did not pass
+                    // `--preconf.journal-path`, default to a datadir-relative
+                    // path resolved via reth's own datadir resolver.
+                    if cfg.journal_path.is_none() {
+                        cfg.journal_path = Some(
+                            builder
+                                .config()
+                                .datadir()
+                                .data_dir()
+                                .join("mantle-preconf")
+                                .join("journal.jsonl"),
+                        );
+                    }
                     let journal = cfg.journal_path.clone();
                     let svc = PreconfServiceBuilder::from_config(cfg)
                         .await

@@ -31,7 +31,6 @@ mod replacement;
 mod replay_da;
 mod replay_nonce_consumed;
 mod reorg_dropped_payload;
-mod reorg_journal_off;
 mod reorg_multi_block_relands;
 mod reorg_no_duplicate;
 mod reorg_ordering;

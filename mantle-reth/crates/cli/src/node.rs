@@ -96,11 +96,6 @@ pub struct PreconfWiring {
     pub cfg: Arc<PreconfConfig>,
     /// Commitment fifo shared between validator, RPC handler, and builder.
     pub fifo: Arc<PreconfTxSet>,
-    /// Optional journal — persists commitments across restart (RPC
-    /// appends on Success, startup replays into fifo). Also consulted
-    /// by the pool listener to tag reorg-reinjected txs as
-    /// `PreconfSource::Replay`. `None` disables both.
-    pub journal: Option<Arc<mantle_reth_preconf::PreconfJournal>>,
     /// Handle to the application-level service builder — used by
     /// [`MantlePoolBuilder::build_pool`] to run [`PreconfServiceBuilder::start`]
     /// immediately after the pool is up, replaying any journaled commitments
@@ -137,20 +132,17 @@ impl<T> MantlePoolBuilder<T> {
         self
     }
 
-    /// Enable preconfirmation: thread `cfg`, `fifo`, `journal`, and the
-    /// service builder handle into the validator decoration chain +
-    /// startup restore + pool listener spawn. `journal` may be `None`
-    /// when persistence is disabled — the listener then falls back to
-    /// the pre-journal behavior (every push uses `PreconfSource::Rpc`,
-    /// which does not distinguish reorg reinjects).
+    /// Enable preconfirmation: thread `cfg`, `fifo`, and the service builder
+    /// handle into the validator decoration chain + startup restore + pool
+    /// listener spawn. The journal is mandatory and carried by `svc` (read
+    /// via [`PreconfServiceBuilder::journal`] where the listener needs it).
     pub fn with_preconf(
         mut self,
         cfg: Arc<PreconfConfig>,
         fifo: Arc<PreconfTxSet>,
-        journal: Option<Arc<mantle_reth_preconf::PreconfJournal>>,
         svc: Arc<PreconfServiceBuilder>,
     ) -> Self {
-        self.preconf = Some(PreconfWiring { cfg, fifo, journal, svc: Some(svc) });
+        self.preconf = Some(PreconfWiring { cfg, fifo, svc: Some(svc) });
         self
     }
 }
@@ -181,12 +173,12 @@ where
         // up preconf (`with_preconf` not invoked), supply default-disabled
         // handles so the `PreconfAwareValidator` layer becomes a cheap
         // pass-through (empty fifo + disabled cfg).
-        let (preconf_cfg, preconf_fifo, preconf_journal, preconf_svc) = match self.preconf.clone() {
-            Some(p) => (p.cfg, p.fifo, p.journal, p.svc),
+        let (preconf_cfg, preconf_fifo, preconf_svc) = match self.preconf.clone() {
+            Some(p) => (p.cfg, p.fifo, p.svc),
             None => {
                 let cfg = Arc::new(PreconfConfig::default());
                 let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
-                (cfg, fifo, None, None)
+                (cfg, fifo, None)
             }
         };
         // Clones moved into the validator-build closure. The listener
@@ -260,11 +252,18 @@ where
         // false and the listener would just sit idle filtering every tx
         // against empty whitelists. Skipping the spawn saves a task.
         if preconf_cfg.enabled {
+            // Enabled ⇒ `with_preconf` was called ⇒ svc (and its mandatory
+            // journal) is present.
+            let journal = preconf_svc
+                .as_ref()
+                .expect("preconf enabled implies a service builder")
+                .journal()
+                .clone();
             let listener = PreconfPoolListener::new(
                 transaction_pool.clone(),
                 preconf_cfg.clone(),
                 preconf_fifo.clone(),
-                preconf_journal.clone(),
+                journal,
             );
             ctx.task_executor().spawn_critical_task("mantle-preconf-pool-listener", listener.run());
             info!(target: "reth::cli", "Mantle preconf pool listener spawned");
@@ -374,12 +373,7 @@ impl MantleNode {
         let mut pool_builder =
             MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional);
         if let Some(p) = &self.preconf {
-            pool_builder = pool_builder.with_preconf(
-                p.cfg().clone(),
-                p.fifo().clone(),
-                p.journal().cloned(),
-                p.clone(),
-            );
+            pool_builder = pool_builder.with_preconf(p.cfg().clone(), p.fifo().clone(), p.clone());
         }
 
         // Construct the preconf-aware payload service. When
@@ -395,9 +389,12 @@ impl MantleNode {
         let (cfg, fifo) = if let Some(p) = &self.preconf {
             (p.cfg().clone(), p.fifo().clone())
         } else {
-            let default_svc = PreconfServiceBuilder::new(PreconfConfig::default())
-                .expect("default PreconfConfig validates");
-            (default_svc.cfg().clone(), default_svc.fifo().clone())
+            // Disabled path: a default-empty cfg/fifo (no whitelist, no
+            // events). No service builder — the journal is only opened when
+            // preconf is enabled.
+            let cfg = Arc::new(PreconfConfig::default());
+            let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
+            (cfg, fifo)
         };
         let payload_service =
             MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, fifo, builder_config);
@@ -483,34 +480,31 @@ where
                     // sealed hashes reported by the canon handler on the
                     // way down are dropped from the journal file before
                     // the node exits.
-                    if let Some(journal) = svc.journal() {
-                        let journal = journal.clone();
-                        let interval = svc.cfg().rejournal_interval;
-                        ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(
-                            "mantle-preconf-rejournal-loop",
-                            move |signal| async move {
-                                // `signal` (`GracefulShutdown`) resolves to
-                                // a `GracefulShutdownGuard` when the reth
-                                // `TaskManager` begins shutdown. Passing it
-                                // as the shutdown future to
-                                // `run_rejournal_loop` — whose `T` type
-                                // parameter carries the guard through the
-                                // final-rotate step — keeps the guard alive
-                                // until the last on-disk write finishes,
-                                // so the process only exits after the
-                                // journal file has been closed cleanly.
-                                let guard = mantle_reth_preconf::run_rejournal_loop(
-                                    journal, interval, signal,
-                                )
-                                .await;
-                                // Explicit drop for clarity; the guard is
-                                // released here, letting `TaskManager`'s
-                                // outstanding-tasks counter reach zero.
-                                drop(guard);
-                            },
-                        );
-                        info!(target: "reth::cli", "Mantle preconf journal rotation loop spawned");
-                    }
+                    let journal = svc.journal().clone();
+                    let interval = svc.cfg().rejournal_interval;
+                    ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(
+                        "mantle-preconf-rejournal-loop",
+                        move |signal| async move {
+                            // `signal` (`GracefulShutdown`) resolves to
+                            // a `GracefulShutdownGuard` when the reth
+                            // `TaskManager` begins shutdown. Passing it
+                            // as the shutdown future to
+                            // `run_rejournal_loop` — whose `T` type
+                            // parameter carries the guard through the
+                            // final-rotate step — keeps the guard alive
+                            // until the last on-disk write finishes,
+                            // so the process only exits after the
+                            // journal file has been closed cleanly.
+                            let guard =
+                                mantle_reth_preconf::run_rejournal_loop(journal, interval, signal)
+                                    .await;
+                            // Explicit drop for clarity; the guard is
+                            // released here, letting `TaskManager`'s
+                            // outstanding-tasks counter reach zero.
+                            drop(guard);
+                        },
+                    );
+                    info!(target: "reth::cli", "Mantle preconf journal rotation loop spawned");
 
                     let handler =
                         svc.rpc_handler(ctx.node().pool().clone(), ctx.node().provider().clone());
@@ -551,12 +545,23 @@ mod tests {
         assert!(node.preconf.is_none());
     }
 
-    #[test]
-    fn with_preconf_attaches_service_builder() {
+    /// Build a service builder with a fresh journal under a temp dir.
+    /// The journal is mandatory, so construction opens a real file.
+    async fn test_svc(dir: &tempfile::TempDir) -> PreconfServiceBuilder {
+        let cfg = PreconfConfig {
+            journal_path: Some(dir.path().join("preconf.jsonl")),
+            ..PreconfConfig::default()
+        };
+        PreconfServiceBuilder::from_config(cfg).await.expect("default validates + journal opens")
+    }
+
+    #[tokio::test]
+    async fn with_preconf_attaches_service_builder() {
         // `with_preconf` must store the service builder reachable through
         // `self.preconf` so that `components()` / `add_ons()` can thread the
         // same Arc<cfg, fifo, journal> handles into all consumers.
-        let svc = PreconfServiceBuilder::new(PreconfConfig::default()).expect("default validates");
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_svc(&dir).await;
         let cfg_ptr = svc.cfg().clone();
         let fifo_ptr = svc.fifo().clone();
 
@@ -567,13 +572,15 @@ mod tests {
         assert!(Arc::ptr_eq(stored.fifo(), &fifo_ptr));
     }
 
-    #[test]
-    fn with_preconf_replaces_previous_builder() {
+    #[tokio::test]
+    async fn with_preconf_replaces_previous_builder() {
         // Last-wins semantics. Documents the builder contract — important
         // because the call site in main.rs writes `node = node.with_preconf(...)`
         // unconditionally within the `Some(cfg)` branch.
-        let svc1 = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
-        let svc2 = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
+        let dir1 = tempfile::TempDir::new().unwrap();
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let svc1 = test_svc(&dir1).await;
+        let svc2 = test_svc(&dir2).await;
         let fifo2 = svc2.fifo().clone();
 
         let node = MantleNode::new(default_args()).with_preconf(svc1).with_preconf(svc2);

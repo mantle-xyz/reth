@@ -47,16 +47,14 @@ pub struct PreconfPoolListener<P, Tx, Cons> {
     pool: P,
     cfg: Arc<PreconfConfig>,
     fifo: Arc<PreconfTxSet>,
-    /// Optional journal handle used to distinguish reorg-reinjected txs
-    /// from fresh RPC submissions. When `Some`, every incoming pool event
-    /// is checked against `journal.sealed`; a hit means the tx was
-    /// previously promised to a client (`mark_sealed` fired on an earlier
-    /// canon commit) and must bypass the deadline / block-gas-budget
-    /// gates — so we push with [`PreconfSource::Replay`] to align
-    /// with the SLA "receipt returned → tx must land" contract. `None`
-    /// (journal feature disabled) falls back to the pre-journal behavior
-    /// where every push uses [`PreconfSource::Rpc`].
-    journal: Option<Arc<PreconfJournal>>,
+    /// Journal handle (mandatory) used to distinguish reorg-reinjected txs
+    /// from fresh RPC submissions. Every incoming pool event is checked
+    /// against `journal.sealed`; a hit means the tx was previously promised
+    /// to a client (`mark_sealed` fired on an earlier canon commit) and must
+    /// bypass the deadline / block-gas-budget gates — so we push with
+    /// [`PreconfSource::Replay`] to align with the SLA "receipt returned → tx
+    /// must land" contract.
+    journal: Arc<PreconfJournal>,
     _tx: PhantomData<fn() -> Tx>,
     _cons: PhantomData<fn() -> Cons>,
 }
@@ -79,14 +77,14 @@ where
     Tx: PoolTransaction<Consensus = Cons> + 'static,
     Cons: Clone + Into<OpTxEnvelope>,
 {
-    /// Construct a listener bound to `pool`. `journal` is optional; when
-    /// `Some`, the listener consults its sealed set to detect reorg
-    /// reinjects and route them through the SLA-bypass source.
+    /// Construct a listener bound to `pool`. The `journal` is mandatory; the
+    /// listener consults its sealed set to detect reorg reinjects and route
+    /// them through the SLA-bypass source.
     pub const fn new(
         pool: P,
         cfg: Arc<PreconfConfig>,
         fifo: Arc<PreconfTxSet>,
-        journal: Option<Arc<PreconfJournal>>,
+        journal: Arc<PreconfJournal>,
     ) -> Self {
         Self { pool, cfg, fifo, journal, _tx: PhantomData, _cons: PhantomData }
     }
@@ -133,12 +131,8 @@ where
             // is the pool's reorg re-inject path returning a
             // previously-promised tx. Bypass the deadline / gas budget
             // gates by pushing with `Replay` source.
-            let source = if let Some(journal) = self.journal.as_ref() {
-                if journal.contains(&hash).await {
-                    crate::types::PreconfSource::Replay
-                } else {
-                    crate::types::PreconfSource::Rpc
-                }
+            let source = if self.journal.contains(&hash).await {
+                crate::types::PreconfSource::Replay
             } else {
                 crate::types::PreconfSource::Rpc
             };

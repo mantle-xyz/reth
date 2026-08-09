@@ -60,9 +60,10 @@ pub struct PreconfArgs {
 
     /// Path to the preconf commitment journal for restart-safety.
     ///
-    /// Omit to disable persistence — promised but unsealed commitments are
-    /// lost on crash. When set, the journal file is opened in append mode;
-    /// existing contents are preserved (restart-replay is a separate step).
+    /// The journal is always on when preconf is enabled. Omit to use the
+    /// datadir-relative default (`<datadir>/mantle-preconf/journal.jsonl`).
+    /// The file is opened in append mode; existing contents are preserved
+    /// (restart-replay is a separate step).
     #[arg(long = "preconf.journal-path")]
     pub journal_path: Option<PathBuf>,
 

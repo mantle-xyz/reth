@@ -136,16 +136,16 @@ pub struct PreconfConfig {
     pub preconf_max_gas_per_block: u64,
 
     // ===== Journal persistence =====
-    /// Journal path. `None` disables the journal subsystem entirely;
-    /// `rejournal_interval` and `journal_max_size` are ignored in that case.
+    /// Journal path. `None` ⇒ use the datadir-relative default
+    /// (`<datadir>/mantle-preconf/journal.jsonl`), resolved at the CLI layer
+    /// before the service builder opens it. The journal is always on when
+    /// preconf is enabled — there is no "disabled" mode.
     pub journal_path: Option<PathBuf>,
 
-    /// Journal rotation cadence — default 60s.
-    /// Must be > 0 if `journal_path` is `Some`.
+    /// Journal rotation cadence — default 60s. Must be > 0.
     pub rejournal_interval: Duration,
 
-    /// Journal file size ceiling — default 1 GiB.
-    /// Must be > 0 if `journal_path` is `Some`.
+    /// Journal file size ceiling — default 1 GiB. Must be > 0.
     pub journal_max_size: u64,
 
     // ===== Internal channel capacity =====
@@ -183,11 +183,11 @@ impl Default for PreconfConfig {
 /// Errors surfaced by [`PreconfConfig::validate`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PreconfConfigError {
-    /// `journal_path` set but `rejournal_interval == 0`.
-    #[error("rejournal_interval must be > 0 when journal_path is set")]
+    /// `rejournal_interval == 0`.
+    #[error("rejournal_interval must be > 0")]
     InvalidRejournalInterval,
-    /// `journal_path` set but `journal_max_size == 0`.
-    #[error("journal_max_size must be > 0 when journal_path is set")]
+    /// `journal_max_size == 0`.
+    #[error("journal_max_size must be > 0")]
     InvalidJournalMaxSize,
     /// `broadcast_cap == 0` — tokio broadcast requires capacity > 0.
     #[error("broadcast_cap must be > 0")]
@@ -294,13 +294,14 @@ impl PreconfConfig {
                 per_tx: self.preconf_max_gas_per_tx,
             });
         }
-        if self.journal_path.is_some() {
-            if self.rejournal_interval.is_zero() {
-                return Err(PreconfConfigError::InvalidRejournalInterval);
-            }
-            if self.journal_max_size == 0 {
-                return Err(PreconfConfigError::InvalidJournalMaxSize);
-            }
+        // The journal is always on when preconf is enabled (no disabled mode),
+        // so these bounds are unconditional — `journal_path == None` just means
+        // "use the datadir default", not "skip validation".
+        if self.rejournal_interval.is_zero() {
+            return Err(PreconfConfigError::InvalidRejournalInterval);
+        }
+        if self.journal_max_size == 0 {
+            return Err(PreconfConfigError::InvalidJournalMaxSize);
         }
         // `enabled` is only meaningful if some eligibility rule lets at least
         // one tx through `is_preconf_tx`. Without `all_preconfs`, both whitelist
@@ -393,12 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_rejournal_only_when_journal_enabled() {
+    fn validate_rejects_zero_rejournal_unconditionally() {
+        // The journal is always on when preconf is enabled, so a zero rejournal
+        // interval is invalid regardless of whether `journal_path` is set
+        // (`None` just means "use the datadir default").
         let mut cfg = PreconfConfig::default();
         cfg.rejournal_interval = Duration::ZERO;
-        // Journal disabled — zero rejournal is ignored.
-        assert!(cfg.clone().validate().is_ok());
-        // Journal enabled — zero rejournal must fail.
+        assert!(matches!(cfg.clone().validate(), Err(PreconfConfigError::InvalidRejournalInterval)));
         cfg.journal_path = Some(PathBuf::from("/tmp/preconf"));
         assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidRejournalInterval)));
     }
@@ -430,7 +432,7 @@ mod tests {
 
     #[test]
     fn validate_passes_default() {
-        // Default config (journal disabled, sane defaults) must validate.
+        // Default config (sane journal defaults, path resolved later) must validate.
         assert!(PreconfConfig::default().validate().is_ok());
     }
 
@@ -492,15 +494,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_journal_max_size_when_enabled() {
-        // Companion to `validate_rejects_zero_rejournal_only_when_journal_enabled`
-        // — the other journal-gated field has its own variant; verify it fires
-        // only when journal_path is Some.
+    fn validate_rejects_zero_journal_max_size_unconditionally() {
+        // Companion to `validate_rejects_zero_rejournal_unconditionally` — the
+        // other journal field has its own variant; verify it fires regardless of
+        // whether `journal_path` is set.
         let mut cfg = PreconfConfig::default();
         cfg.journal_max_size = 0;
-        // Journal disabled — zero max_size is ignored.
-        assert!(cfg.clone().validate().is_ok());
-        // Journal enabled — zero max_size must fail.
+        assert!(matches!(cfg.clone().validate(), Err(PreconfConfigError::InvalidJournalMaxSize)));
         cfg.journal_path = Some(PathBuf::from("/tmp/preconf"));
         assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidJournalMaxSize)));
     }

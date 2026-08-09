@@ -381,7 +381,15 @@ macro_rules! launch_preconf_node {
                     .db(),
             );
 
-            let svc = PreconfServiceBuilder::from_config($cfg)
+            // The journal is mandatory; fill a temp default path when the test
+            // didn't set one (mirrors production's datadir-relative default).
+            let mut preconf_cfg = $cfg;
+            if preconf_cfg.journal_path.is_none() {
+                preconf_cfg.journal_path = Some(
+                    reth_db::test_utils::tempdir_path().join("mantle-preconf-journal.jsonl"),
+                );
+            }
+            let svc = PreconfServiceBuilder::from_config(preconf_cfg)
                 .await
                 .expect("preconf svc init");
             let make_node = $make_node;

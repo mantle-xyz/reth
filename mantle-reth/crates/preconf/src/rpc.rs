@@ -55,13 +55,12 @@ pub struct PreconfRpcHandler<P, Pr> {
     provider: Pr,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
-    /// Optional persistence sink — when `Some`, every successful
-    /// preconf commitment is appended to the journal before the
-    /// `PreconfTxEvent` is returned to the client. Append failures
-    /// are logged but do not block the response (best-effort
-    /// durability; a crash before the next disk flush loses at most
-    /// the most recent commitment).
-    journal: Option<Arc<PreconfJournal>>,
+    /// Persistence sink (mandatory) — every successful preconf commitment
+    /// is appended to the journal before the `PreconfTxEvent` is returned
+    /// to the client. Append failures are logged but do not block the
+    /// response (best-effort durability; a crash before the next disk
+    /// flush loses at most the most recent commitment).
+    journal: Arc<PreconfJournal>,
 }
 
 // Manual Debug — `P` (TransactionPool) and `Pr` (StateProviderFactory) do
@@ -79,14 +78,13 @@ impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
 
 impl<P, Pr> PreconfRpcHandler<P, Pr> {
     /// Construct a handler bound to the given pool + provider + fifo.
-    /// `journal` is optional; when `None`, persistence of successful
-    /// commitments is silently skipped.
+    /// The `journal` is mandatory — every successful commitment is persisted.
     pub const fn new(
         pool: P,
         provider: Pr,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
-        journal: Option<Arc<PreconfJournal>>,
+        journal: Arc<PreconfJournal>,
     ) -> Self {
         Self { pool, provider, fifo, cfg, journal }
     }
@@ -237,22 +235,20 @@ where
                 let event = PreconfTxEvent::from(receipt);
                 // Receipt path ⇒ the tx is on chain (`From` maps it to
                 // Success, or Failed for an EVM revert — a receipt exists
-                // either way), so always journal when persistence is on.
-                if let Some(journal) = self.journal.as_ref() {
-                    let entry = JournalEntry {
-                        hash,
-                        tx_rlp: bytes.clone(),
-                        block_height: event.block_height,
-                        committed_at_ms: now_unix_ms(),
-                    };
-                    if let Err(e) = journal.append_promised(&entry).await {
-                        warn!(
-                            target: "mantle::preconf::rpc",
-                            ?hash,
-                            ?e,
-                            "journal append failed; commitment may be lost on restart"
-                        );
-                    }
+                // either way), so always journal.
+                let entry = JournalEntry {
+                    hash,
+                    tx_rlp: bytes.clone(),
+                    block_height: event.block_height,
+                    committed_at_ms: now_unix_ms(),
+                };
+                if let Err(e) = self.journal.append_promised(&entry).await {
+                    warn!(
+                        target: "mantle::preconf::rpc",
+                        ?hash,
+                        ?e,
+                        "journal append failed; commitment may be lost on restart"
+                    );
                 }
                 Ok(event)
             }
@@ -318,20 +314,18 @@ where
                                 let event = PreconfTxEvent::from(receipt);
                                 // Receipt path ⇒ on chain (Success or an
                                 // EVM-revert Failed), so always journal.
-                                if let Some(journal) = self.journal.as_ref() {
-                                    let entry = JournalEntry {
-                                        hash,
-                                        tx_rlp: bytes.clone(),
-                                        block_height: event.block_height,
-                                        committed_at_ms: now_unix_ms(),
-                                    };
-                                    if let Err(e) = journal.append_promised(&entry).await {
-                                        warn!(
-                                            target: "mantle::preconf::rpc",
-                                            ?hash, ?e,
-                                            "journal append failed; commitment may be lost on restart"
-                                        );
-                                    }
+                                let entry = JournalEntry {
+                                    hash,
+                                    tx_rlp: bytes.clone(),
+                                    block_height: event.block_height,
+                                    committed_at_ms: now_unix_ms(),
+                                };
+                                if let Err(e) = self.journal.append_promised(&entry).await {
+                                    warn!(
+                                        target: "mantle::preconf::rpc",
+                                        ?hash, ?e,
+                                        "journal append failed; commitment may be lost on restart"
+                                    );
                                 }
                                 Ok(event)
                             }

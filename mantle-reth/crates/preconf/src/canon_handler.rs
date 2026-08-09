@@ -68,14 +68,11 @@ pub struct PreconfCanonHandler<Pr, P, N> {
     /// loop).
     pool: P,
     fifo: Arc<PreconfTxSet>,
-    /// Optional commitment journal. When `Some`, every sealed tx is
-    /// marked via [`PreconfJournal::mark_sealed`] so periodic rotation
-    /// can drop the entry; the reverted-chain observer also keys the
-    /// `reorg_drift` warning off [`PreconfJournal::contains`] instead
-    /// of the noisier fifo-membership proxy. `None` ⇒ persistence
-    /// disabled; reverted-chain observation falls back to the fifo
-    /// proxy as before.
-    journal: Option<Arc<PreconfJournal>>,
+    /// Commitment journal (mandatory). Every sealed tx is marked via
+    /// [`PreconfJournal::mark_sealed`] so periodic rotation can drop the
+    /// entry; the reverted-chain observer keys the `reorg_drift` warning
+    /// off [`PreconfJournal::contains`].
+    journal: Arc<PreconfJournal>,
     _n: PhantomData<fn() -> N>,
 }
 
@@ -95,14 +92,13 @@ where
     N::SignedTx: Transaction + TxHashRef,
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
-    /// `journal` is optional; when `None`, the handler degrades to
-    /// the pre-journal behaviour (fifo-membership proxy for reorg
-    /// signal, no sealed-set bookkeeping).
+    /// The `journal` is mandatory — it drives sealed-set bookkeeping and
+    /// the reverted-chain `reorg_drift` signal.
     pub const fn new(
         provider: Pr,
         pool: P,
         fifo: Arc<PreconfTxSet>,
-        journal: Option<Arc<PreconfJournal>>,
+        journal: Arc<PreconfJournal>,
     ) -> Self {
         Self { provider, pool, fifo, journal, _n: PhantomData }
     }
@@ -142,11 +138,8 @@ where
             drop(committed);
 
             // Mark sealed hashes in the journal so the rotation loop
-            // can drop them on its next tick. No-op when persistence
-            // is disabled.
-            if let Some(journal) = self.journal.as_ref() {
-                journal.mark_sealed_batch(sealed_hashes.iter().copied()).await;
-            }
+            // can drop them on its next tick.
+            self.journal.mark_sealed_batch(sealed_hashes.iter().copied()).await;
 
             // Housekeeping: evict `Timeout` / `Canceled` / `Failed`
             // entries in one pass — all three are "not on chain,
@@ -212,18 +205,10 @@ where
         let block_number = old.tip().number();
         for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
             let hash = *recovered.inner().tx_hash();
-            // When the journal is enabled, query it — every preconf
-            // commitment that survived to a sealed block is tracked
-            // there, so `contains` is a precise reorg-drift signal.
-            // When persistence is disabled, fall back to fifo
-            // membership; that proxy undercounts (entries already
-            // forward-cleaned drop out) but never overcounts, so the
-            // resulting signal remains operationally safe.
-            let tracked = if let Some(journal) = self.journal.as_ref() {
-                journal.contains(&hash).await
-            } else {
-                self.fifo.contains(&hash).await
-            };
+            // Every preconf commitment that survived to a sealed block is
+            // tracked in the journal, so `contains` is a precise reorg-drift
+            // signal.
+            let tracked = self.journal.contains(&hash).await;
             if tracked {
                 warn!(
                     target: "mantle::preconf::canon",
