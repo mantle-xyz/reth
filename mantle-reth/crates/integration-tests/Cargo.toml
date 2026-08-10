@@ -36,6 +36,7 @@ harness = true
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }
 mantle-reth-cli = { workspace = true }
+reth-optimism-trie.workspace = true
 mantle-reth-eth-api = { workspace = true }
 mantle-reth-preconf = { workspace = true }
 mantle-reth-rpc-ext = { workspace = true }
@@ -82,4 +83,5 @@ op-revm = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["full"] }
 eyre = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client", "server"] }
