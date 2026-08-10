@@ -156,10 +156,10 @@ pub struct PreconfConfig {
 }
 
 impl Default for PreconfConfig {
-    /// Constructs a disabled-by-default config. Operator opts in by setting
-    /// the `MANTLE_PRECONF_ENABLE` env var (consumed by `mantle-reth-cli`'s
-    /// `main.rs`); a proper clap-derived `--preconf.enable` CLI flag is
-    /// planned but not yet wired (see review followups).
+    /// Constructs a disabled-by-default config. Operator opts in via the
+    /// clap-derived `--preconf.enable` CLI flag (see
+    /// `mantle-reth-cli`'s `args.rs`), which builds the enabled config
+    /// through `PreconfArgs::into_config`.
     fn default() -> Self {
         Self {
             enabled: false,

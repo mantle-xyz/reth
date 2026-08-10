@@ -146,7 +146,7 @@ pub struct PreconfReceipt {
     pub status: bool,
     /// EVM logs emitted by the transaction.
     pub logs: Vec<Log>,
-    /// Cumulative gas used by the transaction.
+    /// Gas used by this transaction alone (`ResultGas::tx_gas_used`).
     pub gas_used: u64,
     /// Optional revert / halt reason — empty on success.
     pub reason: String,
