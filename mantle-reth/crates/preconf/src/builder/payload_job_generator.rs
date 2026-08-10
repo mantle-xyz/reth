@@ -303,6 +303,23 @@ where
             }
         });
 
+        // CL-stall backstop: if nothing (getPayload / Drop / next FCU) ends this
+        // job within 3× slot, cancel it so the parked build releases its thread.
+        // Runs concurrently with the build; already-applied preconf txs replay.
+        let watchdog_window = self.builder.cfg().slot_duration.saturating_mul(STALL_WATCHDOG_SLOTS);
+        let watchdog_cancel = cancel.clone();
+        tokio::spawn(async move {
+            if run_stall_watchdog(watchdog_cancel, watchdog_window).await {
+                metrics::counter!("preconf.build.watchdog_cancel_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::payload_job_generator",
+                    %id,
+                    window_ms = watchdog_window.as_millis() as u64,
+                    "preconf build unresolved within stall watchdog window; cancelling (CL stall?)"
+                );
+            }
+        });
+
         Ok(PreconfPayloadJob::new(attributes_for_job, payload_rx, cancel, handle))
     }
 
@@ -310,6 +327,22 @@ where
     // pre-warming via canonical-state notifications is deferred to a
     // follow-up step (Base does this; mantle can copy if/when we
     // observe pool-side cache misses dominating slot latency).
+}
+
+/// Stall-watchdog window = this × `slot_duration`. 3× clears a single missed
+/// slot so it only fires on a genuine CL stall.
+const STALL_WATCHDOG_SLOTS: u32 = 3;
+
+/// Cancel `cancel` if `window` elapses first; returns whether it fired.
+/// `cancel.wait()` resolves the instant a normal terminator signals, so the
+/// common case returns `false` at once.
+async fn run_stall_watchdog(cancel: JobCancel, window: std::time::Duration) -> bool {
+    if tokio::time::timeout(window, cancel.wait()).await.is_err() {
+        cancel.signal();
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -328,11 +361,28 @@ mod tests {
     //! the e2e suite lands.
 
     use super::*;
-    use std::marker::PhantomData;
+    use std::{marker::PhantomData, time::Duration};
 
     // Compile-time witness that the generator can name its types.
     #[allow(dead_code)]
     fn _witness_name<Pool, Client, Evm, N>(_: &PreconfPayloadJobGenerator<Pool, Client, Evm, N>) {
         let _phantom: PhantomData<N> = PhantomData;
+    }
+
+    // Time is paused so the timeout elapses in test time without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn stall_watchdog_fires_and_cancels_when_never_resolved() {
+        let cancel = JobCancel::new();
+        let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
+        assert!(fired, "window elapsed with no cancel ⇒ watchdog fires");
+        assert!(cancel.is_cancelled(), "watchdog must signal cancel on fire");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_watchdog_does_not_fire_when_cancelled_early() {
+        let cancel = JobCancel::new();
+        cancel.signal(); // normal terminator (getPayload / Drop / next FCU)
+        let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
+        assert!(!fired, "cancel before the window ⇒ watchdog is a no-op");
     }
 }
