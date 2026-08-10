@@ -23,7 +23,7 @@
 //!   reappears via pool re-admission was previously promised — see
 //!   `pool_ext::preconf_pool_listener`).
 //!
-//! The journal exposes `append_promised` / `load` / `mark_sealed` /
+//! The journal exposes `append_promised` / `load` / `mark_sealed_batch` /
 //! `contains` / `rotate` for the durability path, plus the startup
 //! helper [`restore_preconf_state`] and the background rotation loop
 //! [`spawn_rejournal_loop`].
@@ -113,10 +113,18 @@ pub struct PreconfJournal {
     /// Append handle protected by a `Mutex` because the trait
     /// `tokio::io::AsyncWriteExt::write_all` takes `&mut self`.
     writer: Mutex<File>,
-    /// In-memory set of hashes whose commitments have been observed
-    /// on a sealed block. Updated by the canonical-state handler;
-    /// consulted by rotation to skip "already on chain" entries.
+    /// In-memory set of hashes observed on a sealed block **that we also
+    /// promised** (i.e. are present in `promised` / the journal file).
+    /// Consulted by rotation to drop already-on-chain entries. Bounded by
+    /// `promised`: the canon handler reports every committed tx, but
+    /// `mark_sealed` admits only promised hashes, so this can't grow without
+    /// bound.
     sealed: Mutex<HashSet<TxHash>>,
+    /// Hashes currently recorded in the journal file — the preconf
+    /// commitments we've promised. Inserted by `append_promised`, removed by
+    /// `rotate` when the entry leaves the file, seeded from disk in `open`.
+    /// Admission filter for `sealed`, keeping `sealed ⊆ promised ⊆ file`.
+    promised: Mutex<HashSet<TxHash>>,
     /// On-disk size cap in bytes that arms size-triggered rotation.
     /// Config validation guarantees a positive value whenever the journal
     /// is enabled (see [`crate::PreconfConfig`]).
@@ -130,7 +138,18 @@ pub struct PreconfJournal {
     /// path. `notify_one` coalesces a burst of appends into a single
     /// pending permit.
     rotate_notify: Notify,
+    /// Age after which `rotate` abandons an **unsealed** entry (drops it even
+    /// though it never landed). `None` disables it — only sealed entries drop.
+    /// Set via [`Self::with_abandon_after`]; left `None` in most tests.
+    abandon_unsealed_after: Option<Duration>,
 }
+
+/// Rotation intervals an **unsealed** commitment survives before `rotate`
+/// abandons it as permanently un-landable (a promised tx re-lands within the
+/// reorg/replay window — seconds — so outliving many cadences means it never
+/// will). Abandon age = `rejournal_interval ×` this, so keep the cadence well
+/// below `abandon window / this`.
+pub const UNSEALED_ABANDON_ROTATIONS: u32 = 30;
 
 impl PreconfJournal {
     /// Open (or create) the journal file at `path` in append mode.
@@ -155,20 +174,45 @@ impl PreconfJournal {
         }
         let file = OpenOptions::new().create(true).append(true).open(&path).await?;
         let init_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-        Ok(Self {
+        // Seed the gauge from the on-disk size (carried across restarts).
+        metrics::gauge!("preconf.journal.size_bytes").set(init_size as f64);
+        let journal = Self {
             path,
             writer: Mutex::new(file),
             sealed: Mutex::new(HashSet::new()),
+            promised: Mutex::new(HashSet::new()),
             max_size,
             size_bytes: AtomicU64::new(init_size),
             rotate_notify: Notify::new(),
-        })
+            abandon_unsealed_after: None,
+        };
+        // Seed `promised` from the existing file so post-restart `mark_sealed`
+        // recognises commitments already on disk; without this they'd never be
+        // admitted to `sealed` and thus never dropped by `rotate`.
+        let (existing, _bad) = journal.load().await?;
+        {
+            let mut promised = journal.promised.lock().await;
+            for e in &existing {
+                promised.insert(e.hash);
+            }
+            metrics::gauge!("preconf.journal.promised_len").set(promised.len() as f64);
+        }
+        Ok(journal)
     }
 
     /// Path the journal is bound to. Stable for the lifetime of the
     /// instance.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Enable age-based abandonment: `rotate` drops an **unsealed** entry once
+    /// its `committed_at_ms` is older than `ttl`. Fluent so production can chain
+    /// it after [`Self::open`] without touching the test call sites.
+    #[must_use]
+    pub const fn with_abandon_after(mut self, ttl: Duration) -> Self {
+        self.abandon_unsealed_after = Some(ttl);
+        self
     }
 
     /// Append one commitment to the journal. Performs an explicit
@@ -189,8 +233,12 @@ impl PreconfJournal {
             let mut writer = self.writer.lock().await;
             writer.write_all(&line).await?;
             writer.flush().await?;
+            // Record as promised (writer > promised lock order) so a later
+            // `mark_sealed` for this hash is admitted into `sealed`.
+            self.promised.lock().await.insert(entry.hash);
             self.size_bytes.fetch_add(len, Ordering::Relaxed) + len
         };
+        metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
         // Size-triggered rotation: wake the rejournal loop when the file
         // crosses the cap. The heavy `rotate()` runs off this hot path;
         // the loop rate-limits repeated triggers (see `run_rejournal_loop`).
@@ -249,10 +297,23 @@ impl PreconfJournal {
         Ok((out, bad))
     }
 
-    /// Mark a transaction as observed in a sealed block. Idempotent —
-    /// a second call with the same hash is a no-op.
-    pub async fn mark_sealed(&self, hash: TxHash) {
-        self.sealed.lock().await.insert(hash);
+    /// Mark transactions observed in a sealed block. **Only hashes we
+    /// actually promised** (present in `promised` / the journal file) are
+    /// admitted into `sealed`; the canon handler reports every committed tx,
+    /// and this filter is what keeps `sealed` bounded to outstanding preconf
+    /// commitments rather than the whole chain. Idempotent.
+    ///
+    /// Batched so the canon hot path takes each lock once per block. Lock
+    /// order: `sealed` then `promised` (global `writer > sealed > promised`).
+    pub async fn mark_sealed_batch(&self, hashes: impl IntoIterator<Item = TxHash>) {
+        let mut sealed = self.sealed.lock().await;
+        let promised = self.promised.lock().await;
+        for h in hashes {
+            if promised.contains(&h) {
+                sealed.insert(h);
+            }
+        }
+        metrics::gauge!("preconf.journal.sealed_len").set(sealed.len() as f64);
     }
 
     /// `true` when `hash` has been seen on chain. The canonical-state
@@ -282,6 +343,16 @@ impl PreconfJournal {
     /// behind the same writer `Mutex` — typically a few ms even at
     /// 100 TPS.
     pub async fn rotate(&self) -> Result<RotateStats, JournalError> {
+        // Records `preconf.journal.rotate_duration_ms` on every exit path
+        // (including the `?` early returns below).
+        let _timer = RotateTimer(std::time::Instant::now());
+
+        // Hold the writer lock for the WHOLE rotate (load → rename → reset),
+        // not just the swap: an `append_promised` landing between `load()` and
+        // the rename would otherwise be silently discarded by it. Appends
+        // block until the new file is in place, then land in it.
+        let mut writer = self.writer.lock().await;
+
         let (entries, bad_before) = self.load().await?;
         // Snapshot the sealed set once here. Any `mark_sealed` firing
         // during the rewrite is intentionally not observed by this
@@ -290,9 +361,22 @@ impl PreconfJournal {
         // by this rotate AND missing from the sealed set on the same
         // pass.
         let sealed_snapshot: HashSet<TxHash> = self.sealed.lock().await.clone();
+        metrics::gauge!("preconf.journal.sealed_len").set(sealed_snapshot.len() as f64);
+
+        // Age-based abandonment: drop an unsealed entry older than the TTL —
+        // promised but permanently un-landable, else it replays every restart.
+        // `committed_at_ms == 0` (broken clock) is only ever dropped by sealing.
+        let abandon_ttl_ms = self.abandon_unsealed_after.map(|d| d.as_millis() as u64);
+        let now_ms = now_unix_ms();
+        let expired = |e: &JournalEntry| -> bool {
+            abandon_ttl_ms.is_some_and(|ttl| {
+                e.committed_at_ms != 0 && now_ms.saturating_sub(e.committed_at_ms) > ttl
+            })
+        };
 
         let mut kept = 0usize;
         let mut dropped = 0usize;
+        let mut abandoned = 0usize;
         let mut kept_bytes = 0u64;
         let tmp_path = tmp_path_for(&self.path);
 
@@ -304,6 +388,11 @@ impl PreconfJournal {
                     dropped += 1;
                     continue;
                 }
+                if expired(entry) {
+                    dropped += 1;
+                    abandoned += 1;
+                    continue;
+                }
                 let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
                 line.push(b'\n');
                 tmp.write_all(&line).await?;
@@ -313,27 +402,41 @@ impl PreconfJournal {
             tmp.flush().await?;
         }
 
-        // Atomic swap. Hold the writer lock so any concurrent
-        // `append_promised` waits until the new file is in place,
-        // then re-opens against the new inode.
-        let mut writer = self.writer.lock().await;
+        // Atomic swap (writer lock held since the top): rename into place,
+        // then re-open the writer against the new inode.
         tokio::fs::rename(&tmp_path, &self.path).await?;
         *writer = OpenOptions::new().create(true).append(true).open(&self.path).await?;
         // Reset the byte counter to the new file's true size while still
         // holding the writer lock, so it stays consistent with any
         // `append_promised` that serialises before/after this swap.
         self.size_bytes.store(kept_bytes, Ordering::Relaxed);
+        metrics::gauge!("preconf.journal.size_bytes").set(kept_bytes as f64);
 
         // Sealed entries that just left the file are also redundant
         // in memory now: rotate is the point at which a commitment
         // can stop being tracked entirely.
         if dropped > 0 {
+            // Drop the just-removed commitments from both in-memory sets: out
+            // of the file ⇒ out of `promised`, and no longer needed in
+            // `sealed`. Lock order: `sealed` then `promised`.
             let mut sealed = self.sealed.lock().await;
+            let mut promised = self.promised.lock().await;
             for entry in &entries {
                 if sealed_snapshot.contains(&entry.hash) {
                     sealed.remove(&entry.hash);
+                    promised.remove(&entry.hash);
+                } else if expired(entry) {
+                    // Abandoned ⇒ not in `sealed`; drop from `promised` to keep
+                    // `promised ⊆ file`.
+                    promised.remove(&entry.hash);
                 }
             }
+            metrics::gauge!("preconf.journal.sealed_len").set(sealed.len() as f64);
+            metrics::gauge!("preconf.journal.promised_len").set(promised.len() as f64);
+        }
+
+        if abandoned > 0 {
+            metrics::counter!("preconf.journal.abandoned_total").increment(abandoned as u64);
         }
 
         Ok(RotateStats { kept, dropped, bad_lines_skipped: bad_before })
@@ -359,6 +462,24 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     PathBuf::from(tmp)
+}
+
+/// Wall-clock ms since the Unix epoch, `0` if the clock predates 1970 (mirrors
+/// [`JournalEntry::committed_at_ms`]'s fallback so `rotate`'s age check is safe).
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Records `preconf.journal.rotate_duration_ms` on drop, so every exit path
+/// of [`PreconfJournal::rotate`] (including the `?` early returns) is timed.
+struct RotateTimer(std::time::Instant);
+
+impl Drop for RotateTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("preconf.journal.rotate_duration_ms")
+            .record(self.0.elapsed().as_millis() as f64);
+    }
 }
 
 // ─── Pool interaction trait ─────────────────────────────────────────────────
@@ -403,7 +524,7 @@ pub trait RestorePool: Send + Sync {
     /// callback path — every transition to a non-on-chain terminal
     /// state (`Timeout` / `Canceled` / `Failed`) triggers a same-hash
     /// eviction to close the "client saw failure but tx later lands"
-    /// SLA gap (R3/SLA-1).
+    /// SLA gap.
     ///
     /// Idempotent — absent hashes are silently ignored (reth's
     /// `pool.remove_transactions` returns an empty `Vec` in that
@@ -447,6 +568,16 @@ pub async fn restore_preconf_state<P: RestorePool>(
     pool: &P,
     fifo: &Arc<PreconfTxSet>,
 ) {
+    // Prune before replay: one rotate drops sealed + age-abandoned entries so we
+    // neither re-inject them into the fifo nor re-`add_envelope` them every
+    // restart. Best-effort — on failure we just replay the un-pruned file.
+    if let Err(e) = journal.rotate().await {
+        warn!(
+            target: "mantle::preconf::journal",
+            ?e,
+            "pre-restore rotate failed; restoring against un-pruned journal"
+        );
+    }
     let (entries, bad_lines) = match journal.load().await {
         Ok(v) => v,
         Err(e) => {
@@ -670,6 +801,54 @@ mod tests {
         (dir, j)
     }
 
+    /// A `JournalEntry` with an explicit commit timestamp.
+    fn entry_at(byte: u8, height: u64, committed_at_ms: u64) -> JournalEntry {
+        JournalEntry {
+            hash: TxHash::from([byte; 32]),
+            tx_rlp: Bytes::from(vec![byte; 4]),
+            block_height: height,
+            committed_at_ms,
+        }
+    }
+
+    /// With abandonment enabled, `rotate` drops an unsealed entry older than the
+    /// TTL and keeps a fresh one (sealed entries are dropped regardless of age).
+    #[tokio::test]
+    async fn rotate_abandons_stale_unsealed_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = PreconfJournal::open(&path, 0)
+            .await
+            .unwrap()
+            .with_abandon_after(Duration::from_secs(60));
+
+        let now = now_unix_ms();
+        let stale = entry_at(1, 10, 1_000); // ~epoch ⇒ far older than 60s
+        let fresh = entry_at(2, 11, now); // just committed
+        j.append_promised(&stale).await.unwrap();
+        j.append_promised(&fresh).await.unwrap();
+
+        let stats = j.rotate().await.unwrap();
+        assert_eq!(stats.dropped, 1, "only the stale unsealed entry is abandoned");
+
+        let (survivors, _) = j.load().await.unwrap();
+        assert_eq!(survivors, vec![fresh], "fresh unsealed entry survives; stale one abandoned");
+    }
+
+    /// Default (abandonment disabled) preserves the old behaviour: a stale
+    /// unsealed entry is kept, no matter how old.
+    #[tokio::test]
+    async fn rotate_without_abandon_keeps_stale_unsealed() {
+        let (_dir, j) = fresh_journal().await;
+        let stale = entry_at(1, 10, 1_000);
+        j.append_promised(&stale).await.unwrap();
+
+        let stats = j.rotate().await.unwrap();
+        assert_eq!(stats.dropped, 0);
+        let (survivors, _) = j.load().await.unwrap();
+        assert_eq!(survivors, vec![stale], "no abandonment configured ⇒ survivor kept");
+    }
+
     #[tokio::test]
     async fn open_creates_parent_directory() {
         let dir = TempDir::new().unwrap();
@@ -700,9 +879,11 @@ mod tests {
             path: path.clone(),
             writer: Mutex::new(File::create(dir.path().join("dummy")).await.unwrap()),
             sealed: Mutex::new(HashSet::new()),
+            promised: Mutex::new(HashSet::new()),
             max_size: 0,
             size_bytes: AtomicU64::new(0),
             rotate_notify: Notify::new(),
+            abandon_unsealed_after: None,
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());
@@ -740,12 +921,114 @@ mod tests {
     #[tokio::test]
     async fn mark_sealed_is_idempotent() {
         let (_dir, j) = fresh_journal().await;
-        let h = TxHash::from([5; 32]);
-        j.mark_sealed(h).await;
-        j.mark_sealed(h).await;
-        j.mark_sealed(h).await;
-        assert!(j.contains(&h).await);
+        // Must be promised first — `mark_sealed` only admits promised hashes.
+        let e = entry(5, 50);
+        j.append_promised(&e).await.unwrap();
+        j.mark_sealed_batch([e.hash]).await;
+        j.mark_sealed_batch([e.hash]).await;
+        j.mark_sealed_batch([e.hash]).await;
+        assert!(j.contains(&e.hash).await);
         assert_eq!(j.sealed_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_sealed_ignores_unpromised_hash() {
+        // The canon handler reports every committed tx; a hash we never
+        // journaled (non-preconf, or already rotated out) must not enter
+        // `sealed` — this is what bounds the set.
+        let (_dir, j) = fresh_journal().await;
+        let unpromised = TxHash::from([9; 32]);
+        j.mark_sealed_batch([unpromised]).await;
+        assert!(!j.contains(&unpromised).await);
+        assert_eq!(j.sealed_len().await, 0);
+
+        // Once promised, the same hash is admitted.
+        let e = entry(9, 90);
+        j.append_promised(&e).await.unwrap();
+        j.mark_sealed_batch([e.hash]).await;
+        assert!(j.contains(&e.hash).await);
+        assert_eq!(j.sealed_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn rotate_drops_hash_from_promised_too() {
+        // After rotate evicts a sealed entry from the file, its hash must
+        // also leave `promised`; a subsequent stray `mark_sealed` for it is
+        // then correctly ignored (no longer a live commitment).
+        let (_dir, j) = fresh_journal().await;
+        let e = entry(1, 10);
+        j.append_promised(&e).await.unwrap();
+        j.mark_sealed_batch([e.hash]).await;
+
+        let stats = j.rotate().await.unwrap();
+        assert_eq!((stats.kept, stats.dropped), (0, 1));
+        assert!(!j.contains(&e.hash).await, "sealed cleared on rotate");
+
+        // Not promised anymore ⇒ a stray re-seal is a no-op.
+        j.mark_sealed_batch([e.hash]).await;
+        assert_eq!(j.sealed_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn open_seeds_promised_from_existing_file() {
+        // A commitment surviving a restart (still on disk) must be
+        // re-admitted by `mark_sealed` after reopen, else it could never be
+        // dropped by rotate.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let e = entry(3, 30);
+        {
+            let seed = PreconfJournal::open(&path, 0).await.unwrap();
+            seed.append_promised(&e).await.unwrap();
+        }
+        // Reopen: `promised` is seeded from the file.
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
+        j.mark_sealed_batch([e.hash]).await;
+        assert!(j.contains(&e.hash).await, "reopened journal must admit on-disk commitment");
+    }
+
+    #[tokio::test]
+    async fn rotate_does_not_lose_concurrent_appends() {
+        // Regression: an append racing a rotate must not be lost (nothing is
+        // sealed here, so every appended entry must survive). Deterministic
+        // post-fix; pre-fix it drops entries landing in the load→rename window.
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = Arc::new(PreconfJournal::open(&path, 0).await.unwrap());
+
+        // Unsealed survivors widen rotate's tmp-write window.
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, i as u64)).await.unwrap();
+        }
+
+        // Race a burst of appends against one rotate.
+        let n: u8 = 30;
+        let rot = {
+            let j = j.clone();
+            tokio::spawn(async move { j.rotate().await.unwrap() })
+        };
+        let mut appends = Vec::new();
+        for i in 5..n {
+            let j = j.clone();
+            appends.push(tokio::spawn(async move {
+                j.append_promised(&entry(i, i as u64)).await.unwrap()
+            }));
+        }
+        rot.await.unwrap();
+        for a in appends {
+            a.await.unwrap();
+        }
+
+        // Nothing was sealed ⇒ every appended hash must still be on disk.
+        let (after, _) = j.load().await.unwrap();
+        let on_disk: HashSet<TxHash> = after.iter().map(|e| e.hash).collect();
+        for i in 0..n {
+            assert!(
+                on_disk.contains(&TxHash::from([i; 32])),
+                "entry {i} lost across concurrent rotate"
+            );
+        }
     }
 
     #[tokio::test]
@@ -763,7 +1046,7 @@ mod tests {
         j.append_promised(&e_a).await.unwrap();
         j.append_promised(&e_b).await.unwrap();
         j.append_promised(&e_c).await.unwrap();
-        j.mark_sealed(e_b.hash).await;
+        j.mark_sealed_batch([e_b.hash]).await;
 
         let stats = j.rotate().await.unwrap();
         assert_eq!(stats.kept, 2);
@@ -785,7 +1068,7 @@ mod tests {
         let (_dir, j) = fresh_journal().await;
         let e_a = entry(1, 10);
         j.append_promised(&e_a).await.unwrap();
-        j.mark_sealed(e_a.hash).await;
+        j.mark_sealed_batch([e_a.hash]).await;
         j.rotate().await.unwrap();
 
         let e_b = entry(2, 11);
@@ -926,7 +1209,7 @@ mod tests {
         let (_dir, j) = fresh_journal().await;
         let e_a = entry(1, 10);
         j.append_promised(&e_a).await.unwrap();
-        j.mark_sealed(e_a.hash).await;
+        j.mark_sealed_batch([e_a.hash]).await;
 
         let j = Arc::new(j);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -967,8 +1250,8 @@ mod tests {
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
         j.append_promised(&e3).await.unwrap();
-        j.mark_sealed(e1.hash).await;
-        j.mark_sealed(e2.hash).await;
+        j.mark_sealed_batch([e1.hash]).await;
+        j.mark_sealed_batch([e2.hash]).await;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
@@ -1049,7 +1332,7 @@ mod tests {
 
         // Mark sealed AFTER the loop starts but BEFORE shutdown — the
         // sealed hash lives only in memory until a rotate flushes it.
-        j.mark_sealed(TxHash::from([1; 32])).await;
+        j.mark_sealed_batch([TxHash::from([1; 32])]).await;
 
         // Trigger shutdown; the loop's final rotate must drop the sealed entry.
         shutdown_tx.send(()).unwrap();
@@ -1103,7 +1386,7 @@ mod tests {
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
         j.append_promised(&e3).await.unwrap();
-        j.mark_sealed(e1.hash).await;
+        j.mark_sealed_batch([e1.hash]).await;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
@@ -1115,7 +1398,7 @@ mod tests {
 
         // Seal e2 and fire a *second* trigger well within `min_gap`
         // (~150ms elapsed ≪ 2s). It must be rate-limited — e2 stays on disk.
-        j.mark_sealed(e2.hash).await;
+        j.mark_sealed_batch([e2.hash]).await;
         j.append_promised(&entry(4, 13)).await.unwrap(); // re-notifies (over cap)
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (after_second, _) = j.load().await.unwrap();
@@ -1148,7 +1431,7 @@ mod tests {
         let e2 = entry(2, 11);
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
-        j.mark_sealed(e1.hash).await;
+        j.mark_sealed_batch([e1.hash]).await;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
@@ -1161,7 +1444,7 @@ mod tests {
 
         // Seal e2 but issue NO further append. Wait past `min_gap` (2s) so a
         // self-retrigger, if it existed, would be free to fire.
-        j.mark_sealed(e2.hash).await;
+        j.mark_sealed_batch([e2.hash]).await;
         tokio::time::sleep(Duration::from_millis(2200)).await;
 
         let (after_wait, _) = j.load().await.unwrap();
@@ -1208,8 +1491,8 @@ mod tests {
 
         // Drop two sealed entries; the counter must reset to the kept-bytes
         // total, which equals the rewritten file's true size.
-        j.mark_sealed(e1.hash).await;
-        j.mark_sealed(e3.hash).await;
+        j.mark_sealed_batch([e1.hash]).await;
+        j.mark_sealed_batch([e3.hash]).await;
         let stats = j.rotate().await.unwrap();
         assert_eq!((stats.kept, stats.dropped), (1, 2));
 

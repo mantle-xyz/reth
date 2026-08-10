@@ -82,6 +82,18 @@ impl reth_transaction_pool::error::PoolTransactionError for PreconfGasLimitExcee
     }
 }
 
+/// Records `preconf.validate.duration_ms` on drop so all early-return paths
+/// of [`PreconfAwareValidator::validate_transaction`] are covered. Spans the
+/// inner (OP / Mantle) validator too — op-geth `preconf/txpool/filter` analogue.
+struct ValidateTimer(std::time::Instant);
+
+impl Drop for ValidateTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("preconf.validate.duration_ms")
+            .record(self.0.elapsed().as_millis() as f64);
+    }
+}
+
 /// Validator decorator that enforces preconf-specific rules before delegating.
 ///
 /// Constructed via [`Self::new`] and threaded into the pool validation chain.
@@ -120,6 +132,8 @@ where
         origin: TransactionOrigin,
         transaction: Self::Transaction,
     ) -> TransactionValidationOutcome<Self::Transaction> {
+        let _timer = ValidateTimer(std::time::Instant::now());
+
         let sender = transaction.sender();
         let nonce = transaction.nonce();
         let tx_hash = *transaction.hash();
@@ -128,7 +142,7 @@ where
 
         // Replacement guard: only reclaimable terminal states release
         // the (sender, nonce) slot — `Timeout` (client deadline),
-        // `Canceled` (F1 pre-apply reject), and `Failed` (reth builder
+        // `Canceled` (block-gas-budget pre-apply reject), and `Failed` (reth builder
         // pre-execute reject; tx NOT on chain). `Waiting` / `Success`
         // block replacement (`Success` is on-chain or in-flight, so
         // replacement would double-apply).
@@ -144,12 +158,12 @@ where
                     InvalidPoolTransactionError::Other(Box::new(ReplaceActivePreconf)),
                 );
             }
-            // Slot is Timeout / Canceled / Failed — drop the stale fifo
-            // entry so the new tx can occupy the slot cleanly. The
-            // replacement only proceeds via the rest of the validator
-            // chain; we do not re-push here — the pool listener will
-            // pick up the new tx once it lands in the pool.
-            self.fifo.remove(&existing.hash).await;
+            // Slot is reclaimable — evict the stale entry. `remove_reclaimable`
+            // re-checks under lock: if it was revived to `Waiting` or is
+            // mid-apply since the read above, it's left intact and the later
+            // `push_if_absent` returns `ConflictActive`. We don't re-push; the
+            // listener picks the new tx up from the pool.
+            self.fifo.remove_reclaimable(&existing.hash).await;
         }
 
         // Per-tx gas ceiling: applies only to preconf-eligible txs.

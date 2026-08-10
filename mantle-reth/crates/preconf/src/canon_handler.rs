@@ -34,7 +34,7 @@
 //! Returns when the broadcast subscription's sender side closes (typically
 //! at node shutdown).
 
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
 use futures::StreamExt;
@@ -45,6 +45,12 @@ use reth_transaction_pool::TransactionPool;
 use tracing::{debug, warn};
 
 use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
+
+/// Max age for an unconsumed `pending_responders` slot before the canon sweep
+/// drops it. Well beyond any realistic `preconf_timeout` so an in-flight
+/// responder is never evicted early (see
+/// [`PreconfTxSet::expire_pending_responders`]).
+const PENDING_RESPONDER_TTL: Duration = Duration::from_secs(60);
 
 /// Long-running async task bridging `CanonStateNotification` events to
 /// [`PreconfTxSet`] cleanup.
@@ -62,14 +68,11 @@ pub struct PreconfCanonHandler<Pr, P, N> {
     /// loop).
     pool: P,
     fifo: Arc<PreconfTxSet>,
-    /// Optional commitment journal. When `Some`, every sealed tx is
-    /// marked via [`PreconfJournal::mark_sealed`] so periodic rotation
-    /// can drop the entry; the reverted-chain observer also keys the
-    /// `reorg_drift` warning off [`PreconfJournal::contains`] instead
-    /// of the noisier fifo-membership proxy. `None` ⇒ persistence
-    /// disabled; reverted-chain observation falls back to the fifo
-    /// proxy as before.
-    journal: Option<Arc<PreconfJournal>>,
+    /// Commitment journal (mandatory). Every sealed tx is marked via
+    /// [`PreconfJournal::mark_sealed`] so periodic rotation can drop the
+    /// entry; the reverted-chain observer keys the `reorg_drift` warning
+    /// off [`PreconfJournal::contains`].
+    journal: Arc<PreconfJournal>,
     _n: PhantomData<fn() -> N>,
 }
 
@@ -89,14 +92,13 @@ where
     N::SignedTx: Transaction + TxHashRef,
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
-    /// `journal` is optional; when `None`, the handler degrades to
-    /// the pre-journal behaviour (fifo-membership proxy for reorg
-    /// signal, no sealed-set bookkeeping).
+    /// The `journal` is mandatory — it drives sealed-set bookkeeping and
+    /// the reverted-chain `reorg_drift` signal.
     pub const fn new(
         provider: Pr,
         pool: P,
         fifo: Arc<PreconfTxSet>,
-        journal: Option<Arc<PreconfJournal>>,
+        journal: Arc<PreconfJournal>,
     ) -> Self {
         Self { provider, pool, fifo, journal, _n: PhantomData }
     }
@@ -136,13 +138,8 @@ where
             drop(committed);
 
             // Mark sealed hashes in the journal so the rotation loop
-            // can drop them on its next tick. No-op when persistence
-            // is disabled.
-            if let Some(journal) = self.journal.as_ref() {
-                for hash in &sealed_hashes {
-                    journal.mark_sealed(*hash).await;
-                }
-            }
+            // can drop them on its next tick.
+            self.journal.mark_sealed_batch(sealed_hashes.iter().copied()).await;
 
             // Housekeeping: evict `Timeout` / `Canceled` / `Failed`
             // entries in one pass — all three are "not on chain,
@@ -168,7 +165,7 @@ where
             // pick up an evicted tx from the pool iterator. The window
             // is µs-scale (both are same-task sequential calls, no await
             // between them beyond mutex acquisition) and has not been
-            // observed in devnet — see R7/C1 for the followup.
+            // observed in devnet — a followup tracks it.
             let evicted = self.fifo.clean_reclaimable().await;
             if !evicted.is_empty() {
                 let pool_removed = self.pool.remove_transactions(evicted.clone());
@@ -179,6 +176,17 @@ where
                     "clean_reclaimable evicted {} fifo entries; removed {} from pool",
                     evicted.len(),
                     pool_removed.len(),
+                );
+            }
+
+            // Backstop GC for orphaned RPC responders (see
+            // `PreconfTxSet::expire_pending_responders`).
+            let expired = self.fifo.expire_pending_responders(PENDING_RESPONDER_TTL).await;
+            if expired > 0 {
+                debug!(
+                    target: "mantle::preconf::canon",
+                    expired,
+                    "swept orphaned pending preconf responders",
                 );
             }
         }
@@ -197,18 +205,10 @@ where
         let block_number = old.tip().number();
         for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
             let hash = *recovered.inner().tx_hash();
-            // When the journal is enabled, query it — every preconf
-            // commitment that survived to a sealed block is tracked
-            // there, so `contains` is a precise reorg-drift signal.
-            // When persistence is disabled, fall back to fifo
-            // membership; that proxy undercounts (entries already
-            // forward-cleaned drop out) but never overcounts, so the
-            // resulting signal remains operationally safe.
-            let tracked = if let Some(journal) = self.journal.as_ref() {
-                journal.contains(&hash).await
-            } else {
-                self.fifo.contains(&hash).await
-            };
+            // Every preconf commitment that survived to a sealed block is
+            // tracked in the journal, so `contains` is a precise reorg-drift
+            // signal.
+            let tracked = self.journal.contains(&hash).await;
             if tracked {
                 warn!(
                     target: "mantle::preconf::canon",

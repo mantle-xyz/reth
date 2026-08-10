@@ -16,8 +16,35 @@ use crate::types::{PreconfError, PreconfReceipt};
 use alloy_evm::block::TxResult;
 use alloy_primitives::{Bytes, TxHash};
 use alloy_sol_types::{Revert, SolError};
-use reth_evm::execute::{BlockBuilder, ExecutorTx};
-use reth_revm::context::result::ExecutionResult;
+use core::any::Any;
+use op_revm::OpHaltReason;
+use reth_evm::execute::{BlockBuilder, BlockExecutionError, BlockValidationError, ExecutorTx};
+use reth_payload_builder_primitives::PayloadBuilderError;
+use reth_revm::context::result::{ExecutionResult, HaltReason, OutOfGasError};
+
+/// Outcome of a failed preconf apply, classified so the caller can decide
+/// between rejecting a single commitment and aborting the whole build.
+///
+/// This split is the whole point of routing the raw [`BlockExecutionError`]
+/// (rather than a stringified message) out of [`apply_preconf_tx`]: the
+/// preconf arm must treat a genuinely-invalid tx differently from a fatal
+/// execution-environment error, exactly as the pool arm does
+/// (`payload_builder::apply_one_best_tx`).
+#[derive(Debug)]
+pub enum ApplyError {
+    /// The transaction itself is invalid — `Validation(InvalidTx)` from the
+    /// executor (bad signature / nonce / balance / etc.). Builder state is
+    /// left unchanged. The caller rejects **just this commitment**
+    /// (`mark_failed` + pool eviction + client error) and keeps building.
+    Rejected(PreconfError),
+    /// A fatal, non-tx-specific execution error — anything that is **not**
+    /// `Validation(InvalidTx)` (DB / header / fatal precompile, or the
+    /// executor closure was never invoked). The execution environment has
+    /// proven untrustworthy, so the caller aborts the **entire build**
+    /// (mirroring the pool arm) and leaves the commitment `Waiting` for a
+    /// retry on the next build cycle rather than reneging on it.
+    Fatal(PayloadBuilderError),
+}
 
 /// Apply a single transaction via the supplied [`BlockBuilder`] and produce a
 /// [`PreconfReceipt`] from the EVM execution result.
@@ -26,18 +53,21 @@ use reth_revm::context::result::ExecutionResult;
 /// success (`BlockBuilder::execute_transaction_with_result_closure` always
 /// commits — see reth-evm `crates/evm/evm/src/execute.rs:334-344`).
 ///
-/// Errors:
-/// - [`PreconfError::BuilderRejected`] — the EVM rejected the transaction (signature / nonce /
-///   balance / etc.). State is left unchanged.
-/// - [`PreconfError::Internal`] — the closure was somehow never invoked. This should not happen
-///   with a correctly-implemented `BlockBuilder`, but the trait signature does not guarantee
-///   single-shot invocation, so we defensively surface this as `Internal` rather than `panic!`.
+/// Errors ([`ApplyError`]):
+/// - [`ApplyError::Rejected`] — the EVM rejected the transaction as invalid
+///   (`Validation(InvalidTx)`: signature / nonce / balance / etc.). State is left unchanged; the
+///   caller rejects just this commitment and keeps building.
+/// - [`ApplyError::Fatal`] — a non-tx-specific execution error (DB / header / fatal precompile), or
+///   the closure was somehow never invoked. The trait signature does not guarantee single-shot
+///   invocation, so we defensively surface the missing-closure case as `Fatal` rather than
+///   `panic!`. Either way the execution environment is untrustworthy, so the caller aborts the
+///   whole build (mirroring the pool arm) and leaves the commitment for retry.
 pub fn apply_preconf_tx<B>(
     builder: &mut B,
     tx: impl ExecutorTx<B::Executor>,
     tx_hash: TxHash,
     block_height: u64,
-) -> Result<PreconfReceipt, PreconfError>
+) -> Result<PreconfReceipt, ApplyError>
 where
     B: BlockBuilder,
 {
@@ -46,27 +76,46 @@ where
         let ras = res.result();
         captured = Some(build_receipt(tx_hash, block_height, &ras.result));
     });
-    interpret_apply_result(exec_result.map(|_| ()).map_err(|e| e.to_string()), captured)
+    // Route the raw `BlockExecutionError` (variant intact) into the
+    // classifier — stringifying here would erase the InvalidTx-vs-fatal
+    // distinction the caller needs.
+    interpret_apply_result(exec_result.map(|_| ()), captured)
 }
 
 /// Pure interpretation of the `(execute_result, captured_receipt)` pair —
 /// the untestable-directly `apply_preconf_tx` wrapper's decision matrix
-/// extracted so all three outcomes get unit coverage without a full
+/// extracted so all outcomes get unit coverage without a full
 /// `BlockBuilder` mock.
 ///
-/// | execute result       | captured   | outcome                                        |
-/// |----------------------|------------|------------------------------------------------|
-/// | `Ok(())`             | `Some(r)`  | `Ok(r)` — happy path                           |
-/// | `Ok(())`             | `None`     | `Err(Internal)` — upstream trait contract bug  |
-/// | `Err(e)`             | anything   | `Err(BuilderRejected(e))` — EVM rejected tx    |
+/// | execute result                       | captured  | outcome                                     |
+/// |--------------------------------------|-----------|---------------------------------------------|
+/// | `Ok(())`                             | `Some(r)` | `Ok(r)` — happy path                        |
+/// | `Ok(())`                             | `None`    | `Err(Fatal)` — upstream trait contract bug  |
+/// | `Err(Validation(InvalidTx))`         | anything  | `Err(Rejected)` — tx invalid, reject it     |
+/// | `Err(_ /* DB/header/precompile */)`  | anything  | `Err(Fatal)` — abort the build              |
+///
+/// The `Validation(InvalidTx)`-vs-everything-else split mirrors the pool
+/// arm (`payload_builder::apply_one_best_tx`): only a genuinely-invalid tx
+/// is a per-tx rejection; any other executor error is a fatal, non-tx
+/// fault that must abort the build rather than silently drop a commitment.
 fn interpret_apply_result(
-    exec_result: Result<(), String>,
+    exec_result: Result<(), BlockExecutionError>,
     captured: Option<PreconfReceipt>,
-) -> Result<PreconfReceipt, PreconfError> {
+) -> Result<PreconfReceipt, ApplyError> {
     match exec_result {
-        Ok(()) => captured
-            .ok_or_else(|| PreconfError::Internal("BlockBuilder closure not invoked".into())),
-        Err(e) => Err(PreconfError::BuilderRejected(e)),
+        Ok(()) => captured.ok_or_else(|| {
+            // Executor returned Ok but never ran the closure → we have no
+            // receipt yet the tx may have been committed. State is now
+            // inconsistent; treat as fatal (abort) rather than reject.
+            ApplyError::Fatal(BlockExecutionError::msg("BlockBuilder closure not invoked").into())
+        }),
+        Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { error, .. })) => {
+            Err(ApplyError::Rejected(PreconfError::BuilderRejected(error.to_string())))
+        }
+        // DB / header / fatal precompile / any other executor error — the
+        // execution environment is untrustworthy. Surface as fatal so the
+        // caller aborts the build (and leaves the commitment Waiting).
+        Err(other) => Err(ApplyError::Fatal(PayloadBuilderError::from(other))),
     }
 }
 
@@ -74,9 +123,10 @@ fn interpret_apply_result(
 ///
 /// Pure function — no side effects. Generic over the halt-reason type so
 /// callers can pass either the stock revm `HaltReason` or the OP-stack
-/// `OpHaltReason`; we format the reason via `Debug` (matching the wire-layer
-/// `reason: String` shape exposed by `PreconfTxEvent`).
-pub fn build_receipt<H: core::fmt::Debug>(
+/// `OpHaltReason`; the halt reason is mapped to op-geth-compatible text via
+/// [`GethHaltReason`] (e.g. out-of-gas → "out of gas") when the concrete type
+/// is recognized, else rendered via `Debug`.
+pub fn build_receipt<H: core::fmt::Debug + 'static>(
     tx_hash: TxHash,
     block_height: u64,
     result: &ExecutionResult<H>,
@@ -116,15 +166,73 @@ pub fn build_receipt<H: core::fmt::Debug>(
                 revert_data: output.clone(),
             }
         }
-        ExecutionResult::Halt { reason, gas, .. } => PreconfReceipt {
-            tx_hash,
-            block_height,
-            status: false,
-            logs: Vec::new(),
-            gas_used: gas.tx_gas_used(),
-            reason: format!("{reason:?}"),
-            revert_data: Bytes::new(),
-        },
+        ExecutionResult::Halt { reason, gas, .. } => {
+            // Map to op-geth's vm-error text when the concrete halt type is
+            // known (production: OpHaltReason). build_receipt is generic over
+            // the EVM's abstract HaltReason, so we downcast rather than thread
+            // a new trait bound through the (deliberately generic) builder
+            // path; unknown halt types keep their opaque Debug form.
+            let any = reason as &dyn Any;
+            let reason = any
+                .downcast_ref::<OpHaltReason>()
+                .map(|h| h.geth_halt_reason())
+                .or_else(|| any.downcast_ref::<HaltReason>().map(|h| h.geth_halt_reason()))
+                .unwrap_or_else(|| format!("{reason:?}"));
+            PreconfReceipt {
+                tx_hash,
+                block_height,
+                status: false,
+                logs: Vec::new(),
+                gas_used: gas.tx_gas_used(),
+                reason,
+                revert_data: Bytes::new(),
+            }
+        }
+    }
+}
+
+/// Renders a halt reason as an op-geth-compatible `reason` string.
+///
+/// Mirrors revm-inspectors' callTracer text (`tracing::utils::fmt_error_msg`),
+/// which is how op-geth's `vm.Err*` messages read — so a preconf `reason` for
+/// e.g. an out-of-gas halt is "out of gas", matching op-geth. Variants that
+/// `fmt_error_msg` doesn't special-case fall back to `Debug`, exactly as the
+/// callTracer does.
+pub trait GethHaltReason {
+    /// The op-geth-style reason string for this halt.
+    fn geth_halt_reason(&self) -> String;
+}
+
+impl GethHaltReason for HaltReason {
+    fn geth_halt_reason(&self) -> String {
+        match self {
+            Self::OutOfGas(OutOfGasError::Basic | OutOfGasError::Precompile) => "out of gas",
+            Self::OutOfGas(OutOfGasError::Memory) => "out of gas: out of memory",
+            Self::OutOfGas(OutOfGasError::MemoryLimit) => "out of gas: reach memory limit",
+            Self::OutOfGas(OutOfGasError::InvalidOperand) => "out of gas: invalid operand",
+            Self::OutOfGas(OutOfGasError::ReentrancySentry) => {
+                "out of gas: not enough gas for reentrancy sentry"
+            }
+            Self::OpcodeNotFound => "invalid opcode",
+            Self::InvalidFEOpcode => "invalid opcode: INVALID",
+            Self::InvalidJump => "invalid jump destination",
+            Self::StackOverflow => "Out of stack",
+            Self::PrecompileError => "precompiled failed",
+            Self::OutOfFunds => "insufficient balance for transfer",
+            // Not special-cased by op-geth's callTracer either → opaque Debug.
+            other => return format!("{other:?}"),
+        }
+        .to_string()
+    }
+}
+
+impl GethHaltReason for OpHaltReason {
+    fn geth_halt_reason(&self) -> String {
+        match self {
+            Self::Base(inner) => inner.geth_halt_reason(),
+            // OP-specific; no op-geth vm-error equivalent — keep the Debug form.
+            Self::FailedDeposit => format!("{self:?}"),
+        }
     }
 }
 
@@ -132,7 +240,16 @@ pub fn build_receipt<H: core::fmt::Debug>(
 mod tests {
     use super::*;
     use alloy_primitives::{B256, Bytes, Log, LogData, address, b256, hex, keccak256};
-    use reth_revm::context::result::{HaltReason, OutOfGasError, Output, ResultGas, SuccessReason};
+    use reth_revm::context::result::{
+        EVMError, HaltReason, InvalidTransaction, OutOfGasError, Output, ResultGas, SuccessReason,
+    };
+
+    /// Dummy DB-error type for constructing `EVMError<DBError, _>` values in
+    /// the `interpret_apply_result` classification tests. Mirrors alloy-evm's
+    /// own `block::error` unit tests.
+    #[derive(Debug, thiserror::Error)]
+    #[error("dummy db error")]
+    struct DummyDbErr;
 
     fn h(byte: u8) -> TxHash {
         TxHash::from([byte; 32])
@@ -222,11 +339,29 @@ mod tests {
         assert!(!r.status);
         assert_eq!(r.gas_used, 50_000);
         assert!(r.logs.is_empty());
-        // Halt reason rendered via Debug — exact format isn't fixed, but it
-        // must be non-empty and mention the variant.
-        assert!(!r.reason.is_empty());
-        assert!(r.reason.contains("OutOfGas") || r.reason.contains("Basic"));
+        // OOG halt reason is mapped to op-geth's text.
+        assert_eq!(r.reason, "out of gas");
         assert!(r.revert_data.is_empty());
+    }
+
+    #[test]
+    fn geth_halt_reason_maps_variants_like_op_geth() {
+        assert_eq!(HaltReason::OutOfGas(OutOfGasError::Basic).geth_halt_reason(), "out of gas");
+        assert_eq!(
+            HaltReason::OutOfGas(OutOfGasError::Memory).geth_halt_reason(),
+            "out of gas: out of memory"
+        );
+        assert_eq!(HaltReason::OpcodeNotFound.geth_halt_reason(), "invalid opcode");
+        assert_eq!(HaltReason::InvalidJump.geth_halt_reason(), "invalid jump destination");
+        assert_eq!(HaltReason::PrecompileError.geth_halt_reason(), "precompiled failed");
+        // Not special-cased → opaque Debug, same as op-geth's callTracer.
+        assert_eq!(HaltReason::StackUnderflow.geth_halt_reason(), "StackUnderflow");
+        // OP wrapper: Base delegates; FailedDeposit keeps its Debug form.
+        assert_eq!(
+            OpHaltReason::Base(HaltReason::OutOfGas(OutOfGasError::Basic)).geth_halt_reason(),
+            "out of gas"
+        );
+        assert_eq!(OpHaltReason::FailedDeposit.geth_halt_reason(), "FailedDeposit");
     }
 
     #[test]
@@ -322,52 +457,93 @@ mod tests {
     fn interpret_apply_result_ok_with_captured_returns_receipt() {
         let receipt = sample_receipt();
         let out = interpret_apply_result(Ok(()), Some(receipt.clone()));
-        assert_eq!(out, Ok(receipt));
+        assert_eq!(out.expect("ok path returns the captured receipt"), receipt);
     }
 
     /// Upstream trait bug: reth returned `Ok` but never invoked the closure.
-    /// interpret must surface this as `PreconfError::Internal` with an
-    /// actionable message pointing to the upstream contract.
+    /// We have no receipt yet the tx may have committed → state is
+    /// inconsistent, so interpret must surface this as `Fatal` (abort the
+    /// build) rather than a per-tx rejection based on our own bug.
     #[test]
-    fn interpret_apply_result_ok_without_captured_returns_internal() {
-        let out = interpret_apply_result(Ok(()), None);
-        match out {
-            Err(PreconfError::Internal(msg)) => {
-                assert_eq!(msg, "BlockBuilder closure not invoked");
-            }
-            other => panic!("expected Internal, got {other:?}"),
+    fn interpret_apply_result_ok_without_captured_returns_fatal() {
+        match interpret_apply_result(Ok(()), None) {
+            Err(ApplyError::Fatal(_)) => {}
+            other => panic!("expected Fatal, got {other:?}"),
         }
     }
 
-    /// EVM rejected the tx (e.g. nonce mismatch, insufficient balance). The
-    /// error string from reth is passed through as `BuilderRejected(text)`
-    /// so client-facing error messages carry the concrete cause.
+    /// A genuine tx-validation failure (`Validation(InvalidTx)`, e.g. nonce
+    /// too low / insufficient balance) maps to a per-tx
+    /// `Rejected(BuilderRejected)` — the build keeps going and the concrete
+    /// cause is carried to the client.
     #[test]
-    fn interpret_apply_result_err_returns_builder_rejected_with_message() {
-        let out = interpret_apply_result(Err("nonce mismatch".to_string()), None);
-        match out {
-            Err(PreconfError::BuilderRejected(msg)) => {
-                assert_eq!(msg, "nonce mismatch");
+    fn interpret_apply_result_invalid_tx_is_rejected_with_message() {
+        let err = BlockExecutionError::evm(
+            EVMError::<DummyDbErr, InvalidTransaction>::Transaction(
+                InvalidTransaction::NonceTooLow { tx: 1, state: 2 },
+            ),
+            B256::ZERO,
+        );
+        match interpret_apply_result(Err(err), None) {
+            Err(ApplyError::Rejected(PreconfError::BuilderRejected(msg))) => {
+                assert!(!msg.is_empty(), "rejection must carry the concrete cause");
             }
-            other => panic!("expected BuilderRejected, got {other:?}"),
+            other => panic!("expected Rejected(BuilderRejected), got {other:?}"),
         }
     }
 
     /// The `Err` branch shadows any captured receipt — even if the closure
     /// happened to have written to `captured` before the executor errored
     /// out, we must NOT return that partial receipt as a success. Locks
-    /// the precedence of the two branches in `interpret_apply_result`.
+    /// the precedence of the branches in `interpret_apply_result`.
     #[test]
-    fn interpret_apply_result_err_takes_precedence_over_captured() {
+    fn interpret_apply_result_invalid_tx_takes_precedence_over_captured() {
         let receipt = sample_receipt();
-        let out = interpret_apply_result(Err("post-capture failure".to_string()), Some(receipt));
+        let err = BlockExecutionError::evm(
+            EVMError::<DummyDbErr, InvalidTransaction>::Transaction(
+                InvalidTransaction::NonceTooLow { tx: 1, state: 2 },
+            ),
+            B256::ZERO,
+        );
+        let out = interpret_apply_result(Err(err), Some(receipt));
         assert!(
-            matches!(out, Err(PreconfError::BuilderRejected(_))),
+            matches!(out, Err(ApplyError::Rejected(_))),
             "Err path must ignore captured receipt, got {out:?}"
         );
     }
 
-    /// R7 D — `revert_data`'s first 4 bytes are the ABI selector. The
+    /// A fatal, non-tx-specific executor error — here `EVMError::Custom`
+    /// (which alloy-evm routes into `Internal(EVM)`, the bucket for
+    /// database / header / fatal-precompile failures) — must classify as
+    /// `Fatal` so the caller aborts the whole build instead of silently
+    /// dropping the commitment. This is the core of the bug fix: the pool
+    /// arm already aborts on this class; the preconf arm previously
+    /// collapsed it into `BuilderRejected`.
+    #[test]
+    fn interpret_apply_result_internal_evm_error_is_fatal() {
+        let err = BlockExecutionError::evm(
+            EVMError::<DummyDbErr, InvalidTransaction>::Custom("db unavailable".into()),
+            B256::ZERO,
+        );
+        assert!(
+            matches!(interpret_apply_result(Err(err), None), Err(ApplyError::Fatal(_))),
+            "Internal(EVM) executor error must be Fatal"
+        );
+    }
+
+    /// A non-validation `Internal(Other)` executor error is likewise fatal.
+    #[test]
+    fn interpret_apply_result_other_internal_error_is_fatal() {
+        assert!(
+            matches!(
+                interpret_apply_result(Err(BlockExecutionError::msg("boom")), None),
+                Err(ApplyError::Fatal(_))
+            ),
+            "Internal(Other) executor error must be Fatal"
+        );
+    }
+
+    /// `revert_data`'s first 4 bytes are the ABI selector. The
     /// canonical `Error(string)` selector is `0x08c379a0` (see solc
     /// docs / EIP-838). SDKs downstream (op-geth compat) unpack via
     /// this selector; ensuring `build_receipt` preserves the selector
@@ -401,7 +577,7 @@ mod tests {
         );
     }
 
-    /// R7 D — `build_receipt`'s `Halt` branch renders `HaltReason` via
+    /// `build_receipt`'s `Halt` branch renders `HaltReason` via
     /// its `Debug` impl. Existing coverage only checks
     /// `OutOfGas::Basic`; a Debug-format shift on other variants would
     /// silently degrade log messages. Spot-check a few common variants

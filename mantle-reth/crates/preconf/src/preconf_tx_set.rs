@@ -34,7 +34,7 @@ use alloy_primitives::{
 use std::{
     collections::VecDeque,
     sync::{Arc, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
 use tracing::error;
@@ -215,7 +215,19 @@ impl PreconfTxSet {
     /// validated upstream via `PreconfConfig::validate`.
     pub fn new(broadcast_cap: usize) -> Self {
         let (notifier, _) = broadcast::channel(broadcast_cap);
+        // Register the gauge at 0 so it has a baseline from startup.
+        metrics::gauge!("preconf.fifo.pending").set(0.0);
         Self { inner: Mutex::new(PreconfTxSetInner::new()), notifier, pool_evict: OnceLock::new() }
+    }
+
+    /// Sample the current `Waiting` backlog into the `preconf.fifo.pending`
+    /// gauge. Called once per payload build job (~per slot) rather than at
+    /// every fifo mutation — the gauge is a sampled quantity, so slot-level
+    /// granularity is enough and keeps the mutation paths free of the scan.
+    pub async fn publish_pending_gauge(&self) {
+        let inner = self.inner.lock().await;
+        let pending = inner.entries.values().filter(|e| e.status == PreconfStatus::Waiting).count();
+        metrics::gauge!("preconf.fifo.pending").set(pending as f64);
     }
 
     /// Register the pool-eviction callback fired after any transition
@@ -300,7 +312,7 @@ impl PreconfTxSet {
 
         // Replacement check: same `(sender, nonce)` but a different hash.
         // Reclaimable terminal states release the slot — `Timeout`
-        // (client deadline), `Canceled` (F1 pre-apply reject), and
+        // (client deadline), `Canceled` (block-gas-budget pre-apply reject), and
         // `Failed` (reth builder pre-execute reject; tx NOT on chain,
         // same "safe to replace" property as the other two).
         // `Waiting` / `Success` block replacement (`Success` is either
@@ -378,14 +390,27 @@ impl PreconfTxSet {
         PushResult::Inserted
     }
 
-    /// Removes an entry by hash. Returns true if removed, false if absent.
-    ///
-    /// Idempotent. Also removes the `by_sender` index entry and any pending
-    /// responder. Does NOT signal the responder — callers that want to
-    /// fail-fast the RPC client should use `cancel_responder` instead.
-    pub async fn remove(&self, hash: &TxHash) -> bool {
+    /// Removes `hash` only if safe to evict: a reclaimable terminal state
+    /// (`Timeout` / `Canceled` / `Failed`) and not mid-apply. Returns true iff
+    /// removed. Status check and removal share one `inner` lock, so a
+    /// concurrent `Timeout → Waiting` revival can't be evicted; the `try_lock`
+    /// on `apply_lock` (non-blocking — a blocking acquire under `inner` would
+    /// invert the `inner → apply_lock` order and deadlock) skips an entry
+    /// dispatch is still finalizing, so its receipt is never stranded.
+    /// Idempotent; the only public eviction path (unconditional removal stays
+    /// internal to `drop_hash`).
+    pub async fn remove_reclaimable(&self, hash: &TxHash) -> bool {
         let mut inner = self.inner.lock().await;
-        inner.drop_hash(hash).is_some()
+        let safe_to_drop = match inner.entries.get(hash) {
+            Some(e) => {
+                matches!(
+                    e.status,
+                    PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
+                ) && e.apply_lock.try_lock().is_ok()
+            }
+            None => false,
+        };
+        if safe_to_drop { inner.drop_hash(hash).is_some() } else { false }
     }
 
     /// Returns true if the hash is currently present in `entries`.
@@ -456,7 +481,7 @@ impl PreconfTxSet {
     }
 
     /// Evicts every entry in a reclaimable terminal state —
-    /// `Timeout` (client deadline elapsed), `Canceled` (F1 pre-apply
+    /// `Timeout` (client deadline elapsed), `Canceled` (block-gas-budget pre-apply
     /// reject, e.g. block gas budget), and `Failed` (reth builder
     /// pre-execute reject; tx NOT on chain). Broader than op-geth's
     /// `FIFOTxSet::CleanTimeout` which only clears the timeout case;
@@ -480,6 +505,35 @@ impl PreconfTxSet {
             inner.drop_hash(h);
         }
         to_drop
+    }
+
+    /// Evict `pending_responders` slots older than `max_age`; returns the
+    /// count dropped.
+    ///
+    /// Backstop for an orphaned responder: if the tx never reaches
+    /// `SubPool::Pending` (so the Pending-only listener never pushes) **and**
+    /// the RPC future is cancelled before Step 5's cleanup runs, the responder
+    /// has no other GC path — `drop_hash` only runs for `entries`-backed
+    /// hashes, never a lone pending responder. Past `max_age` (well beyond
+    /// `preconf_timeout`) it can't deliver anything useful, so dropping its
+    /// `oneshot::Sender` is safe (a live receiver just sees `RecvError`).
+    pub async fn expire_pending_responders(&self, max_age: Duration) -> usize {
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        let expired: Vec<TxHash> = inner
+            .pending_responders
+            .iter()
+            .filter(|(_, (origin, _))| now.saturating_duration_since(*origin) > max_age)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &expired {
+            inner.pending_responders.remove(hash);
+        }
+        if !expired.is_empty() {
+            metrics::counter!("preconf.pending_responders.expired_total")
+                .increment(expired.len() as u64);
+        }
+        expired.len()
     }
 
     /// Builder subscribes the broadcast notifier here.
@@ -506,7 +560,7 @@ impl PreconfTxSet {
     /// level). **tx NOT on chain**.
     ///
     /// Reclaim rationale: all three "not on chain" causes are typically
-    /// transient (deadline overreach, F1 budget resets next slot, or
+    /// transient (deadline overreach, block gas budget resets next slot, or
     /// in-flight state race that clears when the next slot's fresh
     /// block state comes in). SDKs retry all three the same way.
     ///
@@ -651,7 +705,7 @@ impl PreconfTxSet {
                     return Ok(());
                 }
                 // Reclaimable — this is a same-hash retry after a
-                // `Timeout` (client deadline), `Canceled` (F1 pre-apply
+                // `Timeout` (client deadline), `Canceled` (block-gas-budget pre-apply
                 // reject), or `Failed` (reth builder pre-execute reject;
                 // tx NOT on chain). Install the fresh responder and
                 // refresh `inserted_at` so `builder::dispatch`'s
@@ -788,9 +842,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_returns_false_when_absent() {
+    async fn remove_reclaimable_returns_false_when_absent() {
         let set = PreconfTxSet::new(16);
-        assert!(!set.remove(&h(1)).await);
+        assert!(!set.remove_reclaimable(&h(1)).await);
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_refuses_waiting_entry() {
+        // A `Waiting` entry (an in-apply entry's state) must never be evicted.
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        assert!(!set.remove_reclaimable(tx.tx_hash()).await, "Waiting must not be removed");
+        assert!(set.contains(tx.tx_hash()).await, "entry must survive");
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_removes_terminal_entry() {
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_timeout(tx.tx_hash()).await.unwrap();
+        assert!(set.remove_reclaimable(tx.tx_hash()).await, "Timeout is reclaimable");
+        assert!(!set.contains(tx.tx_hash()).await);
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_refuses_revived_entry() {
+        // Same-hash resubmit revives `Timeout` → `Waiting`; the atomic status
+        // re-read must catch the flip and decline (else a landing tx's
+        // receipt is stranded).
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_timeout(tx.tx_hash()).await.unwrap();
+        assert_eq!(
+            set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await,
+            PushResult::Revived
+        );
+        assert!(!set.remove_reclaimable(tx.tx_hash()).await, "revived Waiting must not be removed");
+        assert!(set.contains(tx.tx_hash()).await);
+    }
+
+    #[tokio::test]
+    async fn remove_reclaimable_declines_while_apply_lock_held() {
+        // Terminal status but dispatch still holds `apply_lock` through
+        // `take_responder`: `try_lock` must decline, not snatch the responder.
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_failed(tx.tx_hash()).await.unwrap();
+
+        let guard = set.lock_for_apply(tx.tx_hash()).await.expect("entry present");
+        assert!(
+            !set.remove_reclaimable(tx.tx_hash()).await,
+            "must decline while apply_lock is held"
+        );
+        assert!(set.contains(tx.tx_hash()).await);
+
+        drop(guard);
+        assert!(set.remove_reclaimable(tx.tx_hash()).await, "removable once lock released");
+        assert!(!set.contains(tx.tx_hash()).await);
     }
 
     // ============ push_if_absent ============
@@ -1249,7 +1361,7 @@ mod tests {
     /// `debug_assert!` (intentional dev-time signal), so this test runs
     /// only in release mode. `cargo test --release` executes it.
     ///
-    /// TODO(R6): replace with `tracing-test` capture to also verify the
+    /// TODO: replace with `tracing-test` capture to also verify the
     /// `error!()` line fires. For now assert observable side effects only.
     #[tokio::test]
     #[cfg(not(debug_assertions))]
@@ -1284,7 +1396,7 @@ mod tests {
 
     /// `drop_hash` must be tolerant of partially-populated index state: if
     /// `entries[hash]` is missing, it should still clean `order` /
-    /// `by_sender` / `pending_responders`. Non-self-heal companion to R6's
+    /// `by_sender` / `pending_responders`. Non-self-heal companion to the
     /// "dangling `by_sender`" case — here the direction is opposite: entry
     /// gone first, aux indices need scrubbing.
     #[tokio::test]
@@ -1311,6 +1423,39 @@ mod tests {
             assert!(inner.by_sender.is_empty());
             assert!(inner.pending_responders.is_empty());
         }
+    }
+
+    /// `expire_pending_responders` drops aged slots, keeps fresh ones, and
+    /// releases the evicted slot's `oneshot::Sender` (receiver sees `RecvError`).
+    #[tokio::test]
+    async fn expire_pending_responders_drops_only_aged_slots() {
+        let set = PreconfTxSet::new(4);
+        let aged = h(1);
+        let fresh = h(2);
+
+        let (aged_tx, aged_rx) = oneshot::channel::<Result<PreconfReceipt, PreconfError>>();
+        let (fresh_tx, _fresh_rx) = oneshot::channel::<Result<PreconfReceipt, PreconfError>>();
+        {
+            let mut inner = set.inner.lock().await;
+            // `aged` stamped 10s in the past; `fresh` at ~now.
+            inner
+                .pending_responders
+                .insert(aged, (Instant::now() - Duration::from_secs(10), aged_tx));
+            inner.pending_responders.insert(fresh, (Instant::now(), fresh_tx));
+        }
+
+        // Sweep with a 5s TTL: `aged` (10s) evicted, `fresh` (~0s) retained.
+        let dropped = set.expire_pending_responders(Duration::from_secs(5)).await;
+        assert_eq!(dropped, 1, "only the aged slot should be swept");
+
+        {
+            let inner = set.inner.lock().await;
+            assert!(!inner.pending_responders.contains_key(&aged), "aged slot removed");
+            assert!(inner.pending_responders.contains_key(&fresh), "fresh slot retained");
+        }
+
+        // Evicted slot's sender was dropped → receiver observes RecvError.
+        assert!(aged_rx.await.is_err(), "orphaned responder's receiver must observe RecvError");
     }
 
     /// `cancel_responder` belt-and-braces cleanup: even if invariant #2 is
@@ -1447,7 +1592,7 @@ mod tests {
         );
     }
 
-    /// R7 D — `PushResult::ConflictActive(hash)` carries the **old**
+    /// `PushResult::ConflictActive(hash)` carries the **old**
     /// (colliding) hash so `PreconfPoolListener` can log both the new
     /// and existing hash on a slot collision. Doc-only assertion until
     /// now; this test locks the payload semantic.
@@ -1476,7 +1621,7 @@ mod tests {
         }
     }
 
-    /// R7 D — `PreconfTxSet::new(broadcast_cap = 0)` must panic. The
+    /// `PreconfTxSet::new(broadcast_cap = 0)` must panic. The
     /// broadcast channel needs at least capacity 1 (subscribers must
     /// be able to hold one buffered event before falling behind);
     /// tokio panics on `broadcast::channel(0)`, so this test also

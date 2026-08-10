@@ -1,6 +1,6 @@
 //! Common types shared across preconf modules.
 
-use alloy_primitives::{Bytes, Log, TxHash};
+use alloy_primitives::{Bytes, Log, TxHash, U256};
 use serde::{Deserialize, Serialize};
 
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 /// a subsequent same-hash resubmit is revived back to `Waiting` by
 /// `push_if_absent`. This mirrors the "typically transient" nature of
 /// each cause: `Timeout` (client just gave up too early), `Canceled`
-/// (F1 budget resets next slot), `Failed` (in-flight state race that
+/// (block gas budget resets next slot), `Failed` (in-flight state race that
 /// the next slot's fresh block state usually resolves).
 ///
 /// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — they
@@ -70,8 +70,8 @@ use serde::{Deserialize, Serialize};
 /// reclaimable" but signal different causes to the client:
 /// - `Timeout` — the RPC handler's deadline elapsed. Client's request was accepted; server may or
 ///   may not have run apply.
-/// - `Canceled` — the F1 pre-apply gate rejected the tx (e.g. block gas budget). Server explicitly
-///   declined; no EVM state change.
+/// - `Canceled` — the block-gas-budget pre-apply gate rejected the tx (e.g. block gas budget).
+///   Server explicitly declined; no EVM state change.
 /// - `Failed` — reth's block builder rejected pre-execute (in-flight nonce / balance race, block
 ///   gas exhausted at builder level). tx NOT on chain; typically resolves on next slot.
 ///
@@ -117,13 +117,10 @@ pub enum PreconfStatus {
 ///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
 ///       crash.
 ///     - **Reorg reinject** — the pool re-admits a previously sealed tx after reorg; the pool
-///       listener detects the case via `journal.sealed` membership.
-///
-///   In both cases the Mantle preconf SLA (*"once a receipt has been
-///   returned to the client, the tx must land on chain"*) requires
-///   these entries to **bypass** the deadline and per-block gas budget
-///   gates. They remain subject to the status / dedup gates and the
-///   underlying block gas limit.
+///       listener detects the case via `journal.sealed` membership. In both cases the Mantle
+///       preconf SLA (*"once a receipt has been returned to the client, the tx must land on
+///       chain"*) requires these entries to **bypass** the deadline and per-block gas budget gates.
+///       They remain subject to the status / dedup gates and the underlying block gas limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
     /// Live RPC submission — subject to all pre-apply gates.
@@ -149,7 +146,7 @@ pub struct PreconfReceipt {
     pub status: bool,
     /// EVM logs emitted by the transaction.
     pub logs: Vec<Log>,
-    /// Cumulative gas used by the transaction.
+    /// Gas used by this transaction alone (`ResultGas::tx_gas_used`).
     pub gas_used: u64,
     /// Optional revert / halt reason — empty on success.
     pub reason: String,
@@ -246,6 +243,23 @@ pub enum PreconfError {
         /// Pool's reported pending nonce for the sender.
         pending_nonce: u64,
     },
+    /// Cumulative cost across the sender's pending txs exceeds its balance, so
+    /// the pool parks this tx (`!ENOUGH_BALANCE`) instead of promoting it —
+    /// rejected synchronously to avoid a full-timeout block, same as
+    /// [`Self::NonceGap`]. Best-effort: the builder's gates are the final
+    /// authority.
+    #[error(
+        "insufficient funds: sender balance {balance} < required {required} \
+         (cumulative cost across the sender's pending txs)"
+    )]
+    InsufficientFunds {
+        /// Sender's on-chain balance.
+        balance: U256,
+        /// Cumulative cost required to promote this tx: the sum of
+        /// `cost + extra_balance_cost` over the sender's gapless pending
+        /// chain, including this tx.
+        required: U256,
+    },
     /// Pool rejected the transaction (validator error / underpriced / etc.).
     #[error("pool rejected: {0}")]
     PoolRejected(String),
@@ -271,7 +285,7 @@ pub enum PreconfError {
     /// per-block, or the post-Jovian footprint-gas bound). Rejected
     /// **before** touching the builder — a preconf tx over the DA budget
     /// would make the sealed block DA-invalid and get rejected by op-node,
-    /// silently breaking the commitment (design §5.5.1, H3).
+    /// silently breaking the commitment (a DA consensus constraint).
     ///
     /// Unlike [`Self::BlockGasBudgetExceeded`] (an operator-hardening
     /// budget bypassed by `Replay`-sourced entries), the DA limit is a
@@ -358,9 +372,15 @@ mod tests {
             PreconfError::DaLimitExceeded { used: 1_000, tx_da: 500, limit: 1_200 }.to_string(),
             "preconf tx exceeds DA limit: tx DA 500 bytes, 1000 already used, limit 1200",
         );
+        assert_eq!(
+            PreconfError::InsufficientFunds { balance: U256::from(100), required: U256::from(150) }
+                .to_string(),
+            "insufficient funds: sender balance 100 < required 150 \
+             (cumulative cost across the sender's pending txs)",
+        );
     }
 
-    /// R7 D — `PreconfReceipt`'s `PartialEq` is byte-equal at the field
+    /// `PreconfReceipt`'s `PartialEq` is byte-equal at the field
     /// level, not derived semantically. This test locks the field set
     /// so a future field addition without updating the wire mapper
     /// surfaces as a compile error (missing field literal below), and

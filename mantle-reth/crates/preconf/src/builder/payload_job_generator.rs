@@ -12,28 +12,40 @@
 //! 3. A fresh [`JobCancel`] and a `watch::channel(None)` are created. A tokio task is spawned that
 //!    drives [`PreconfPayloadBuilder::build_payload`] to completion, then sends the final
 //!    `Option<OpBuiltPayload<N>>` into the watch sender. On error the sender is dropped (without
-//!    sending).
+//!    sending). A panic inside the build is caught (`catch_unwind`), logged at `error!`, counted
+//!    via `preconf.build.panic_total`, and then degrades the same way (sender dropped →
+//!    `MissingPayload`) rather than being silently swallowed by the never-awaited join handle.
 //! 4. The [`PreconfPayloadJob`] returned to the payload service holds the watch receiver + cancel
 //!    handle + join handle. Subsequent `best_payload()` / `resolve_kind()` calls read through
 //!    those.
+//!
+//! ## `ensure_only_one_payload`
+//!
+//! [`Self::new_payload_job`] signal-cancels the previously spawned build, keeping **at most one
+//! live**. Otherwise a build that is never resolved (`getPayload`) nor evicted (reorg `Drop`) would
+//! linger forever — still subscribed to the shared [`PreconfTxSet`] broadcast — and could apply
+//! preconf txs into a block that never commits, stealing them from the job that will. It is a no-op
+//! in steady state (the previous job was already cancelled by its own `resolve_kind`); it only
+//! matters for abandoned / superseded jobs. Upstream [`BasicPayloadJobGenerator`] instead bounds
+//! job lifetime with a per-job deadline, which we avoid — it would cut a slow build short and break
+//! the preconf must-land SLA.
 //!
 //! ## What this generator does NOT do (yet)
 //!
 //! - **`on_new_state`**: no cached-reads pre-warming. Default no-op trait impl in place; the
 //!   cached-reads optimisation is a follow-up if pool-side cache misses dominate slot latency.
-//! - **`ensure_only_one_payload`**: `BasicPayloadJobGenerator` cancels existing payload jobs before
-//!   spawning a new one (see `basic-payload-builder/src/generator.rs`). This generator does not —
-//!   `last_payload` cancel-on-drop semantics are not needed until production rollout, and skipping
-//!   it keeps the trait wiring focused. The [`PayloadJob`]'s own `Drop` impl handles spawned-task
-//!   cleanup.
-//! - **Deadlines**: no auto-cancel on slot deadline; the payload service drives cancel via
-//!   `resolve_kind` instead.
+//!
+//! [`PreconfTxSet`]: crate::preconf_tx_set::PreconfTxSet
+//! [`BasicPayloadJobGenerator`]: reth_basic_payload_builder::BasicPayloadJobGenerator
 //!
 //! [`PayloadJobGenerator`]: reth_payload_builder::PayloadJobGenerator
 //! [`PreconfPayloadBuilder::build_payload`]: crate::builder::payload_builder::PreconfPayloadBuilder::build_payload
 //! [`BlockReaderIdExt::sealed_header_by_hash`]: reth_storage_api::BlockReaderIdExt::sealed_header_by_hash
 
-use std::{marker::PhantomData, sync::Arc};
+use std::{
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 
 use alloy_consensus::TxEnvelope;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
@@ -49,7 +61,7 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_revm::cancelled::CancelOnDrop;
 use reth_storage_api::BlockReaderIdExt;
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::builder::{
     cancel::JobCancel, payload_builder::PreconfPayloadBuilder, payload_job::PreconfPayloadJob,
@@ -77,6 +89,10 @@ pub struct PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
     /// `Arc<PreconfConfig>` / `Arc<PreconfTxSet>` and the OP builder
     /// config (DA / gas / SDM-enable).
     builder: PreconfPayloadBuilder<Pool, Client, Evm>,
+    /// `ensure_only_one_payload`: cancel handle of the most-recently
+    /// spawned build. Signalled when the next job is created so at most
+    /// one build task is ever live — see [`Self::new_payload_job`].
+    last_cancel: Arc<Mutex<Option<JobCancel>>>,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
     /// constraining `N` itself.
     _pd: PhantomData<fn() -> N>,
@@ -84,8 +100,9 @@ pub struct PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
 
 impl<Pool, Client, Evm, N> PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
     /// Wrap a template builder so each `new_payload_job` call clones it.
-    pub const fn new(builder: PreconfPayloadBuilder<Pool, Client, Evm>) -> Self {
-        Self { builder, _pd: PhantomData }
+    // Not `const` — `Arc::new`/`Mutex::new` are not const-constructible.
+    pub fn new(builder: PreconfPayloadBuilder<Pool, Client, Evm>) -> Self {
+        Self { builder, last_cancel: Arc::new(Mutex::new(None)), _pd: PhantomData }
     }
 
     /// Borrow the inner template builder. Useful in tests / assertions.
@@ -193,35 +210,33 @@ where
         // Wire up the (cancel, payload-result) channels shared with
         // the spawned build task.
         let cancel = JobCancel::new();
+
+        // `ensure_only_one_payload`: cancel the previously spawned build so at
+        // most one is ever live (rationale in the module docs). Idempotent in
+        // steady state — the previous job was already cancelled by `resolve_kind`.
+        if let Some(prev) = self
+            .last_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(cancel.clone())
+        {
+            prev.signal();
+        }
+
         let cancel_for_build = cancel.clone();
         let (payload_tx, payload_rx) = watch::channel::<Option<OpBuiltPayload<N>>>(None);
 
         let builder_clone = self.builder.clone();
 
-        // Why `spawn_blocking + current_thread runtime + block_on`
-        // instead of plain `tokio::spawn`:
+        // The build future is `!Send` (upstream's block builder holds a
+        // non-`Sync` `State<DB>` across the select! `.await`), so
+        // `tokio::spawn` rejects it. Instead run it to completion on a local
+        // `current_thread` runtime inside `spawn_blocking`, where it never
+        // crosses threads and `Send` is not required.
         //
-        // Upstream's `OpPayloadBuilderCtx::block_builder(&mut state)`
-        // returns `impl BlockBuilder + '_`, and the concrete type is
-        // not `Send` (its State<DB> path holds `Box<dyn StateProvider
-        // + Send>` which is not `Sync`, so `&State<DB>` is not Send).
-        // Holding that builder across the select! `.await` makes the
-        // whole build future non-`Send`, so `tokio::spawn(future)`
-        // rejects it at the trait-bound level.
-        //
-        // `spawn_blocking` accepts a `FnOnce() -> R + Send + 'static`
-        // closure (not a future), runs it on tokio's blocking-thread
-        // pool, and returns a `JoinHandle<R>`. Inside that closure we
-        // build a single-threaded tokio runtime (`new_current_thread`)
-        // and `block_on` the !Send future on it. The future never
-        // crosses thread boundaries (it runs to completion on the
-        // blocking-pool thread), so Send is not needed.
-        //
-        // Cost: one OS thread from the blocking pool per active
-        // payload job. The pool defaults to 512 threads; the worst
-        // case (slot duration × concurrent payload requests) is well
-        // under that. Production hardening (e.g. a bounded pool of
-        // worker threads we own) is a follow-up if observed needed.
+        // Cost: one blocking-pool thread per active job (pool default 512, far
+        // above our concurrent-jobs worst case); a bounded owned pool is a
+        // follow-up if ever needed.
         let handle = tokio::task::spawn_blocking(move || {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -237,34 +252,72 @@ where
                     return;
                 }
             };
-            rt.block_on(async move {
-                match builder_clone.build_payload(args, cancel_for_build).await {
-                    Ok(payload) => {
-                        // `send` only fails when the receiver has been
-                        // dropped, which means the job was torn down
-                        // before we finished. Nothing we can do — log
-                        // and exit.
-                        if payload_tx.send(Some(payload)).is_err() {
-                            tracing::trace!(
-                                target: "mantle::preconf::payload_job_generator",
-                                "payload receiver dropped before build completed"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
+            // The join handle is never awaited (`PreconfPayloadJob::_join_handle`
+            // is RAII-only), so a `build_payload` panic would be swallowed
+            // silently; catch it here to log + count + degrade to `MissingPayload`.
+            let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                rt.block_on(builder_clone.build_payload(args, cancel_for_build))
+            }));
+
+            match build_result {
+                Ok(Ok(payload)) => {
+                    // `send` only fails when the receiver has been dropped,
+                    // which means the job was torn down before we finished.
+                    // Nothing we can do — log and exit.
+                    if payload_tx.send(Some(payload)).is_err() {
+                        tracing::trace!(
                             target: "mantle::preconf::payload_job_generator",
-                            ?err,
-                            "preconf payload build failed"
+                            "payload receiver dropped before build completed"
                         );
-                        // Drop `payload_tx` without sending → the watch
-                        // receiver's `changed()` returns Err, which
-                        // `ResolvePayloadFuture` surfaces as
-                        // `MissingPayload`.
-                        drop(payload_tx);
                     }
                 }
-            });
+                Ok(Err(err)) => {
+                    warn!(
+                        target: "mantle::preconf::payload_job_generator",
+                        ?err,
+                        %id,
+                        "preconf payload build failed"
+                    );
+                    // Drop `payload_tx` without sending → the watch
+                    // receiver's `changed()` returns Err, which
+                    // `ResolvePayloadFuture` surfaces as `MissingPayload`.
+                    drop(payload_tx);
+                }
+                Err(panic) => {
+                    // Panic payloads are `&str` (from `expect`) or `String`.
+                    let panic_msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    metrics::counter!("preconf.build.panic_total").increment(1);
+                    error!(
+                        target: "mantle::preconf::payload_job_generator",
+                        %id,
+                        panic = %panic_msg,
+                        "preconf payload build panicked; degrading to MissingPayload"
+                    );
+                    // Drop the sender → `MissingPayload`, same as the error arm.
+                    drop(payload_tx);
+                }
+            }
+        });
+
+        // CL-stall backstop: if nothing (getPayload / Drop / next FCU) ends this
+        // job within 3× slot, cancel it so the parked build releases its thread.
+        // Runs concurrently with the build; already-applied preconf txs replay.
+        let watchdog_window = self.builder.cfg().slot_duration.saturating_mul(STALL_WATCHDOG_SLOTS);
+        let watchdog_cancel = cancel.clone();
+        tokio::spawn(async move {
+            if run_stall_watchdog(watchdog_cancel, watchdog_window).await {
+                metrics::counter!("preconf.build.watchdog_cancel_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::payload_job_generator",
+                    %id,
+                    window_ms = watchdog_window.as_millis() as u64,
+                    "preconf build unresolved within stall watchdog window; cancelling (CL stall?)"
+                );
+            }
         });
 
         Ok(PreconfPayloadJob::new(attributes_for_job, payload_rx, cancel, handle))
@@ -274,6 +327,22 @@ where
     // pre-warming via canonical-state notifications is deferred to a
     // follow-up step (Base does this; mantle can copy if/when we
     // observe pool-side cache misses dominating slot latency).
+}
+
+/// Stall-watchdog window = this × `slot_duration`. 3× clears a single missed
+/// slot so it only fires on a genuine CL stall.
+const STALL_WATCHDOG_SLOTS: u32 = 3;
+
+/// Cancel `cancel` if `window` elapses first; returns whether it fired.
+/// `cancel.wait()` resolves the instant a normal terminator signals, so the
+/// common case returns `false` at once.
+async fn run_stall_watchdog(cancel: JobCancel, window: std::time::Duration) -> bool {
+    if tokio::time::timeout(window, cancel.wait()).await.is_err() {
+        cancel.signal();
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -292,11 +361,28 @@ mod tests {
     //! the e2e suite lands.
 
     use super::*;
-    use std::marker::PhantomData;
+    use std::{marker::PhantomData, time::Duration};
 
     // Compile-time witness that the generator can name its types.
     #[allow(dead_code)]
     fn _witness_name<Pool, Client, Evm, N>(_: &PreconfPayloadJobGenerator<Pool, Client, Evm, N>) {
         let _phantom: PhantomData<N> = PhantomData;
+    }
+
+    // Time is paused so the timeout elapses in test time without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn stall_watchdog_fires_and_cancels_when_never_resolved() {
+        let cancel = JobCancel::new();
+        let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
+        assert!(fired, "window elapsed with no cancel ⇒ watchdog fires");
+        assert!(cancel.is_cancelled(), "watchdog must signal cancel on fire");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_watchdog_does_not_fire_when_cancelled_early() {
+        let cancel = JobCancel::new();
+        cancel.signal(); // normal terminator (getPayload / Drop / next FCU)
+        let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
+        assert!(!fired, "cancel before the window ⇒ watchdog is a no-op");
     }
 }

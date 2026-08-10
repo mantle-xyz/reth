@@ -60,9 +60,10 @@ pub struct PreconfArgs {
 
     /// Path to the preconf commitment journal for restart-safety.
     ///
-    /// Omit to disable persistence — promised but unsealed commitments are
-    /// lost on crash. When set, the journal file is opened in append mode;
-    /// existing contents are preserved (restart-replay is a separate step).
+    /// The journal is always on when preconf is enabled. Omit to use the
+    /// datadir-relative default (`<datadir>/mantle-preconf/journal.jsonl`).
+    /// The file is opened in append mode; existing contents are preserved
+    /// (restart-replay is a separate step).
     #[arg(long = "preconf.journal-path")]
     pub journal_path: Option<PathBuf>,
 
@@ -87,7 +88,7 @@ pub struct PreconfArgs {
     pub to: Vec<Address>,
 
     /// Client-visible RPC oneshot timeout, in milliseconds. Default matches
-    /// [`mantle_reth_preconf::config::DEFAULT_PRECONF_TIMEOUT`] (200ms).
+    /// [`mantle_reth_preconf::config::DEFAULT_PRECONF_TIMEOUT`] (1s).
     #[arg(long = "preconf.timeout-ms")]
     pub timeout_ms: Option<u64>,
 
@@ -125,10 +126,9 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.journal-max-size")]
     pub journal_max_size: Option<u64>,
 
-    /// Broadcast channel capacity. Default 65536. Advanced tuning knob — the
-    /// broadcast serves both `newPreconfTransaction` subscription and the
-    /// fifo notifier; consumers see `Lagged(n)` and fall back to snapshot
-    /// reconcile when full.
+    /// Broadcast channel capacity. Default 65536. Advanced tuning knob — sizes
+    /// the fifo notifier broadcast channel; consumers see `Lagged(n)` and fall
+    /// back to snapshot reconcile when full.
     #[arg(long = "preconf.broadcast-cap")]
     pub broadcast_cap: Option<usize>,
 }

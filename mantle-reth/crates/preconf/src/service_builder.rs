@@ -2,8 +2,8 @@
 //!
 //! [`PreconfServiceBuilder`] is the **application-level owner** of the
 //! preconf subsystem's cross-component shared state — a validated
-//! [`Arc<PreconfConfig>`], a single [`Arc<PreconfTxSet>`], and an
-//! optional [`Arc<PreconfJournal>`] — and exposes typed factories for
+//! [`Arc<PreconfConfig>`], a single [`Arc<PreconfTxSet>`], and a
+//! mandatory [`Arc<PreconfJournal>`] — and exposes typed factories for
 //! the per-task handlers that consume them:
 //!
 //! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical- state notifications and
@@ -29,7 +29,7 @@
 //! it consumes the same `cfg` and `fifo` handles via
 //! [`PreconfServiceBuilder::cfg`] / [`PreconfServiceBuilder::fifo`].
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::NodePrimitives;
@@ -39,7 +39,7 @@ use reth_transaction_pool::TransactionPool;
 use crate::{
     PreconfCanonHandler, PreconfConfig, PreconfJournal, PreconfRpcHandler, PreconfTxSet,
     config::PreconfConfigError,
-    journal::{JournalError, RestorePool, restore_preconf_state},
+    journal::{JournalError, RestorePool, UNSEALED_ABANDON_ROTATIONS, restore_preconf_state},
 };
 use thiserror::Error;
 
@@ -53,6 +53,11 @@ pub enum PreconfServiceError {
     /// Journal file could not be opened or created.
     #[error(transparent)]
     Journal(#[from] JournalError),
+    /// `cfg.journal_path` was `None` at construction time. The journal is
+    /// mandatory; the CLI layer must resolve the datadir-relative default
+    /// into `Some(..)` before calling [`PreconfServiceBuilder::from_config`].
+    #[error("journal_path must be resolved before building the preconf service")]
+    MissingJournalPath,
 }
 
 /// Errors surfaced by [`PreconfServiceBuilder::start`] — the restore
@@ -66,64 +71,47 @@ pub enum PreconfStartError {}
 /// Owns and hands out the shared preconf handles for a single node
 /// instance. Construct once at startup; wrap in `Arc` at the CLI layer
 /// to distribute to consumers (pool builder, canon handler, RPC).
+///
+/// The commitment journal is **mandatory**: it is opened eagerly in
+/// [`Self::from_config`] and every produced handler gets a real
+/// [`Arc<PreconfJournal>`]. There is no persistence-disabled mode.
 #[derive(Debug)]
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
     fifo: Arc<PreconfTxSet>,
-    /// Optional commitment journal. `None` ⇒ restart safety is off —
-    /// promised but unsealed commitments are lost on crash. Enable
-    /// via [`PreconfServiceBuilder::with_journal`] before installing
-    /// the service builder in the node.
-    journal: Option<Arc<PreconfJournal>>,
+    /// Commitment journal — always present. Opened at construction from
+    /// `cfg.journal_path` (which the CLI layer resolves to the
+    /// datadir-relative default when unset).
+    journal: Arc<PreconfJournal>,
 }
 
 impl PreconfServiceBuilder {
-    /// Convenience: validate the config and, if `cfg.journal_path` is
-    /// `Some`, open the journal file in one step.
+    /// Validate `cfg`, build the shared fifo, and open the commitment
+    /// journal in one step.
     ///
-    /// Equivalent to chaining [`Self::new`] + [`Self::with_journal`]
-    /// manually, but driven entirely off the config so production
-    /// callers do not need to know whether persistence is on. The
-    /// `journal_path` field is the single source of truth — set it to
-    /// enable persistence, leave it `None` to disable.
+    /// `cfg.journal_path` must be resolved to `Some(..)` by the caller —
+    /// the CLI layer fills the datadir-relative default when the operator
+    /// did not pass `--preconf.journal-path`. The journal is mandatory when
+    /// preconf is enabled, so a `None` path here is a wiring bug and returns
+    /// [`PreconfServiceError::MissingJournalPath`].
+    ///
+    /// The journal file is opened in append mode; existing contents are
+    /// preserved and replayed into the fifo when [`Self::start`] runs.
     pub async fn from_config(cfg: PreconfConfig) -> Result<Self, PreconfServiceError> {
-        let path = cfg.journal_path.clone();
-        let builder = Self::new(cfg)?;
-        match path {
-            Some(p) => Ok(builder.with_journal(p).await?),
-            None => Ok(builder),
-        }
-    }
-
-    /// Validate `cfg` and construct the shared fifo with the
-    /// configured broadcast capacity. Persistence is disabled —
-    /// chain [`Self::with_journal`] (or use [`Self::from_config`]) to
-    /// enable it.
-    ///
-    /// Returns [`PreconfConfigError`] if any field is out of range
-    /// (zero timeouts, zero gas limits, ...). The config is not stored
-    /// until validation succeeds, so a failed call leaves no
-    /// partially-initialised state.
-    pub fn new(cfg: PreconfConfig) -> Result<Self, PreconfConfigError> {
-        // `validate` takes ownership and returns the validated config back
-        // on success — destructure the broadcast cap before wrapping in Arc.
+        // `validate` takes ownership and returns the validated config back.
         let cfg = cfg.validate()?;
         let broadcast_cap = cfg.broadcast_cap;
+        let journal_path =
+            cfg.journal_path.clone().ok_or(PreconfServiceError::MissingJournalPath)?;
+        // Abandon an unsealed commitment after `UNSEALED_ABANDON_ROTATIONS`
+        // rotation cadences without sealing (bounds the journal vs zombies).
+        let abandon_after = cfg.rejournal_interval * UNSEALED_ABANDON_ROTATIONS;
+        let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size)
+            .await?
+            .with_abandon_after(abandon_after);
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
-        Ok(Self { cfg, fifo, journal: None })
-    }
-
-    /// Open or create the on-disk commitment journal at `path` and
-    /// install it on this builder. Subsequent calls to
-    /// [`Self::rpc_handler`] / [`Self::canon_handler`] will thread the
-    /// journal handle into the produced handlers. The journal file is
-    /// opened in append mode; existing contents are preserved and
-    /// replayed into the fifo when [`Self::start`] runs.
-    pub async fn with_journal(mut self, path: impl AsRef<Path>) -> Result<Self, JournalError> {
-        let journal = PreconfJournal::open(path, self.cfg.journal_max_size).await?;
-        self.journal = Some(Arc::new(journal));
-        Ok(self)
+        Ok(Self { cfg, fifo, journal: Arc::new(journal) })
     }
 
     /// Shared config handle. Cheap to clone — internally an `Arc`.
@@ -136,14 +124,13 @@ impl PreconfServiceBuilder {
         &self.fifo
     }
 
-    /// Journal handle if persistence is enabled. `None` when the
-    /// builder was constructed without [`Self::with_journal`].
-    pub fn journal(&self) -> Option<&Arc<PreconfJournal>> {
-        self.journal.as_ref()
+    /// Shared journal handle. Always present (see type-level docs).
+    pub fn journal(&self) -> &Arc<PreconfJournal> {
+        &self.journal
     }
 
-    /// Startup hook: replay the journal into the fifo (if persistence
-    /// is on) and register the fifo → pool eviction callback.
+    /// Startup hook: replay the journal into the fifo and register the
+    /// fifo → pool eviction callback.
     ///
     /// Call once from the pool builder after the pool is up, **before**
     /// the pool listener + canon handler are spawned so the fifo state
@@ -152,9 +139,7 @@ impl PreconfServiceBuilder {
     where
         P: RestorePool + Clone + 'static,
     {
-        if let Some(journal) = self.journal.as_ref() {
-            restore_preconf_state(journal, pool, &self.fifo).await;
-        }
+        restore_preconf_state(&self.journal, pool, &self.fifo).await;
 
         // Every non-on-chain terminal transition (mark_timeout /
         // mark_canceled / mark_failed) synchronously removes the tx
@@ -186,7 +171,7 @@ impl PreconfServiceBuilder {
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
     {
-        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.journal.clone())
+        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.journal().clone())
     }
 
     /// Construct the local-sequencer RPC handler. Returned by value so
@@ -202,7 +187,7 @@ impl PreconfServiceBuilder {
             provider,
             self.fifo.clone(),
             self.cfg.clone(),
-            self.journal.clone(),
+            self.journal().clone(),
         )
     }
 }
@@ -211,37 +196,49 @@ impl PreconfServiceBuilder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_rejects_invalid_config() {
-        let cfg = PreconfConfig { broadcast_cap: 0, ..PreconfConfig::default() };
-        assert!(PreconfServiceBuilder::new(cfg).is_err());
+    /// Build a service builder with a fresh journal under a temp dir.
+    /// Returns the `TempDir` so the caller keeps it alive for the test.
+    async fn svc_with_temp_journal() -> (tempfile::TempDir, PreconfServiceBuilder) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = PreconfConfig {
+            journal_path: Some(dir.path().join("preconf.jsonl")),
+            ..PreconfConfig::default()
+        };
+        let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
+        (dir, svc)
     }
 
-    #[test]
-    fn new_accepts_default_and_arc_shares_handles() {
-        let svc = Arc::new(
-            PreconfServiceBuilder::new(PreconfConfig::default()).expect("default config validates"),
-        );
+    #[tokio::test]
+    async fn from_config_arc_shares_handles() {
+        let (_dir, svc) = svc_with_temp_journal().await;
+        let svc = Arc::new(svc);
         let svc2 = Arc::clone(&svc);
         // Arc-shared instance: both refs see the same fifo / cfg.
         assert!(Arc::ptr_eq(svc.cfg(), svc2.cfg()));
         assert!(Arc::ptr_eq(svc.fifo(), svc2.fifo()));
     }
 
-    #[test]
-    fn fifo_broadcast_capacity_matches_config() {
-        let cfg = PreconfConfig { broadcast_cap: 7, ..PreconfConfig::default() };
-        let svc = PreconfServiceBuilder::new(cfg).unwrap();
+    #[tokio::test]
+    async fn fifo_broadcast_capacity_matches_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = PreconfConfig {
+            broadcast_cap: 7,
+            journal_path: Some(dir.path().join("preconf.jsonl")),
+            ..PreconfConfig::default()
+        };
+        let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
         // No direct getter for the cap; subscribe to assert non-panic.
         let _rx = svc.fifo().subscribe();
     }
 
     #[tokio::test]
-    async fn from_config_without_journal_path_disables_persistence() {
+    async fn from_config_without_journal_path_errors() {
+        // The journal is mandatory — an unresolved (`None`) path is a wiring
+        // bug (the CLI layer must fill the datadir default first).
         let cfg = PreconfConfig::default();
-        assert!(cfg.journal_path.is_none(), "default config should disable journal");
-        let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
-        assert!(svc.journal().is_none(), "journal must be off when path is None");
+        assert!(cfg.journal_path.is_none(), "default config leaves path unresolved");
+        let err = PreconfServiceBuilder::from_config(cfg).await.unwrap_err();
+        assert!(matches!(err, PreconfServiceError::MissingJournalPath), "got {err:?}");
     }
 
     #[tokio::test]
@@ -250,8 +247,7 @@ mod tests {
         let path = dir.path().join("preconf.jsonl");
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
-        let journal = svc.journal().expect("journal must be opened when path is set");
-        assert_eq!(journal.path(), path);
+        assert_eq!(svc.journal().path(), path);
         // File must exist on disk.
         assert!(path.exists());
     }
@@ -285,22 +281,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn new_then_with_journal_two_step_chain() {
-        // The two-step `new()` + `with_journal()` chain is documented as a
-        // first-class API alternative to `from_config`. Without this test the
-        // chain can silently break (e.g. if journal handle wiring through
-        // `with_journal` ever regressed).
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("preconf.jsonl");
-        let svc = PreconfServiceBuilder::new(PreconfConfig::default())
-            .expect("default validates")
-            .with_journal(&path)
-            .await
-            .expect("journal opens at fresh path");
-        assert_eq!(svc.journal().expect("journal set").path(), path);
-    }
-
     // ── start() lifecycle ────────────────────────────────────────
 
     /// Stub pool used to exercise `PreconfServiceBuilder::start` without
@@ -330,22 +310,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_without_journal_is_noop_on_fifo() {
-        let svc = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
+    async fn start_with_empty_journal_is_noop_on_fifo() {
+        let (_dir, svc) = svc_with_temp_journal().await;
         svc.start(&UnreachablePool).await.unwrap();
-        // No journal ⇒ nothing was replayed into the fifo.
+        // Empty journal ⇒ nothing was replayed into the fifo.
         assert_eq!(svc.fifo().snapshot().await.len(), 0);
     }
 
     #[tokio::test]
     async fn start_is_idempotent() {
-        let svc = PreconfServiceBuilder::new(PreconfConfig::default()).unwrap();
+        let (_dir, svc) = svc_with_temp_journal().await;
         // Calling twice must not panic; both calls succeed.
         svc.start(&UnreachablePool).await.unwrap();
         svc.start(&UnreachablePool).await.unwrap();
     }
 
-    /// R6/T5 — `start()` reads the journal from disk and pushes each
+    /// `start()` reads the journal from disk and pushes each
     /// promised entry into the fifo via the adapter. Covers the
     /// journal-enabled end-to-end wiring that
     /// `start_without_journal_...` cannot exercise.
@@ -400,13 +380,19 @@ mod tests {
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
-        let journal = svc.journal().expect("journal on");
+        // Fresh commit timestamps so `start`'s pre-restore rotate does not
+        // age-abandon them before they can be replayed (see
+        // `journal::UNSEALED_ABANDON_ROTATIONS`).
+        let now_ms =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as u64;
+        let journal = svc.journal();
         journal
             .append_promised(&JournalEntry {
                 hash: TxHash::from([0xA1; 32]),
                 tx_rlp: Bytes::from(vec![0xA1; 4]),
                 block_height: 10,
-                committed_at_ms: 1,
+                committed_at_ms: now_ms,
             })
             .await
             .unwrap();
@@ -415,7 +401,7 @@ mod tests {
                 hash: TxHash::from([0xA2; 32]),
                 tx_rlp: Bytes::from(vec![0xA2; 4]),
                 block_height: 11,
-                committed_at_ms: 2,
+                committed_at_ms: now_ms,
             })
             .await
             .unwrap();
@@ -428,5 +414,37 @@ mod tests {
         // Fifo contains both restored envelopes.
         let snapshot = svc.fifo().snapshot().await;
         assert_eq!(snapshot.len(), 2);
+    }
+
+    /// An age-abandoned journal entry is pruned by `start`'s pre-restore rotate,
+    /// so it is never replayed into the pool/fifo. `UnreachablePool` panics if
+    /// `add_envelope` is reached, so a passing run proves the entry was dropped
+    /// before restore rather than re-injected.
+    #[tokio::test]
+    async fn start_prunes_age_abandoned_entry_before_restore() {
+        use crate::journal::JournalEntry;
+        use alloy_primitives::{Bytes, TxHash};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
+        let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
+
+        // Ancient commit timestamp ⇒ far older than the abandon window.
+        svc.journal()
+            .append_promised(&JournalEntry {
+                hash: TxHash::from([0xB1; 32]),
+                tx_rlp: Bytes::from(vec![0xB1; 4]),
+                block_height: 5,
+                committed_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        svc.start(&UnreachablePool).await.unwrap();
+        assert!(
+            svc.fifo().snapshot().await.is_empty(),
+            "age-abandoned entry must be pruned, not restored",
+        );
     }
 }

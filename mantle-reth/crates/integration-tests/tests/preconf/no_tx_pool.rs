@@ -40,7 +40,7 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 }
 
 /// Replay-sourced fifo entry (journal-restored, promised commitment) is
-/// the **strongest** carrier of the "must-land" SLA — deadline and F1
+/// the **strongest** carrier of the "must-land" SLA — deadline and the block-gas-budget gate
 /// gas-budget gates both bypass it. Verifying it is NOT applied during
 /// a `no_tx_pool=true` build proves the gate wraps the entire preconf
 /// pipeline (not just the RPC-sourced arm).

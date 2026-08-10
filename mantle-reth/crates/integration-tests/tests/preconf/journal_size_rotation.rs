@@ -16,7 +16,7 @@
 //!   loop rotates, dropping the sealed tx0 and keeping the still-unsealed tx1.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
-use crate::launch_preconf_node;
+use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -134,8 +134,7 @@ async fn size_triggered_rotation_drops_sealed_entry() {
     let hash0 = event0.tx_hash;
 
     // Commit to canonical → the canon handler marks tx0 sealed.
-    let new_head = node.submit_payload(payload).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("finalize block 1");
+    canonize_built!(node, payload);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Under the cap: nothing has rotated tx0 away yet.

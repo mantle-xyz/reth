@@ -100,7 +100,7 @@ async fn rotate_drops_sealed_then_relaunch_replays_only_survivors() {
         journal.append_promised(&journal_entry(&tx_c)).await.expect("append C");
 
         // A has been observed on chain → sealed. Rotation must drop it.
-        journal.mark_sealed(hash_a).await;
+        journal.mark_sealed_batch([hash_a]).await;
 
         let stats = journal.rotate().await.expect("rotate");
         assert_eq!(stats.kept, 2, "B + C survive rotation");

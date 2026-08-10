@@ -90,7 +90,7 @@ use crate::{
 
 use alloy_primitives::{
     map::{AddressSet, HashSet},
-    Address, TxHash, B256,
+    Address, TxHash, B256, U256,
 };
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use reth_eth_wire_types::HandleMempoolData;
@@ -1194,6 +1194,22 @@ where
         self.get_pool_data().get_highest_consecutive_transaction_by_sender(
             sender_id.into_transaction_id(on_chain_nonce),
         )
+    }
+
+    /// Single-scan `(pending_nonce, cumulative_cost)`; `(on_chain_nonce,
+    /// U256::ZERO)` when the sender has no pooled txs. See
+    /// [`TxPool::get_pending_nonce_and_cumulative_cost`].
+    pub fn get_pending_nonce_and_cumulative_cost(
+        &self,
+        sender: Address,
+        on_chain_nonce: u64,
+    ) -> (u64, U256) {
+        match self.sender_id(&sender) {
+            Some(sender_id) => self.get_pool_data().get_pending_nonce_and_cumulative_cost(
+                sender_id.into_transaction_id(on_chain_nonce),
+            ),
+            None => (on_chain_nonce, U256::ZERO),
+        }
     }
 
     /// Returns the transaction given a [`TransactionId`]

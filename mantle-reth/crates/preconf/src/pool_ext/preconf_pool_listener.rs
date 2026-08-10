@@ -28,10 +28,13 @@ use alloy_primitives::Address;
 use futures::StreamExt;
 use op_alloy_consensus::OpTxEnvelope;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::{
-    PreconfJournal, config::PreconfConfig, preconf_tx_set::PreconfTxSet, types::PushResult,
+    PreconfJournal,
+    config::PreconfConfig,
+    preconf_tx_set::PreconfTxSet,
+    types::{PreconfError, PushResult},
 };
 
 /// Long-running async task that bridges a [`TransactionPool`] event stream to
@@ -44,16 +47,14 @@ pub struct PreconfPoolListener<P, Tx, Cons> {
     pool: P,
     cfg: Arc<PreconfConfig>,
     fifo: Arc<PreconfTxSet>,
-    /// Optional journal handle used to distinguish reorg-reinjected txs
-    /// from fresh RPC submissions. When `Some`, every incoming pool event
-    /// is checked against `journal.sealed`; a hit means the tx was
-    /// previously promised to a client (`mark_sealed` fired on an earlier
-    /// canon commit) and must bypass the deadline / block-gas-budget
-    /// gates — so we push with [`PreconfSource::Replay`] to align
-    /// with the SLA "receipt returned → tx must land" contract. `None`
-    /// (journal feature disabled) falls back to the pre-journal behavior
-    /// where every push uses [`PreconfSource::Rpc`].
-    journal: Option<Arc<PreconfJournal>>,
+    /// Journal handle (mandatory) used to distinguish reorg-reinjected txs
+    /// from fresh RPC submissions. Every incoming pool event is checked
+    /// against `journal.sealed`; a hit means the tx was previously promised
+    /// to a client (`mark_sealed` fired on an earlier canon commit) and must
+    /// bypass the deadline / block-gas-budget gates — so we push with
+    /// [`PreconfSource::Replay`] to align with the SLA "receipt returned → tx
+    /// must land" contract.
+    journal: Arc<PreconfJournal>,
     _tx: PhantomData<fn() -> Tx>,
     _cons: PhantomData<fn() -> Cons>,
 }
@@ -76,14 +77,14 @@ where
     Tx: PoolTransaction<Consensus = Cons> + 'static,
     Cons: Clone + Into<OpTxEnvelope>,
 {
-    /// Construct a listener bound to `pool`. `journal` is optional; when
-    /// `Some`, the listener consults its sealed set to detect reorg
-    /// reinjects and route them through the SLA-bypass source.
+    /// Construct a listener bound to `pool`. The `journal` is mandatory; the
+    /// listener consults its sealed set to detect reorg reinjects and route
+    /// them through the SLA-bypass source.
     pub const fn new(
         pool: P,
         cfg: Arc<PreconfConfig>,
         fifo: Arc<PreconfTxSet>,
-        journal: Option<Arc<PreconfJournal>>,
+        journal: Arc<PreconfJournal>,
     ) -> Self {
         Self { pool, cfg, fifo, journal, _tx: PhantomData, _cons: PhantomData }
     }
@@ -130,12 +131,8 @@ where
             // is the pool's reorg re-inject path returning a
             // previously-promised tx. Bypass the deadline / gas budget
             // gates by pushing with `Replay` source.
-            let source = if let Some(journal) = self.journal.as_ref() {
-                if journal.contains(&hash).await {
-                    crate::types::PreconfSource::Replay
-                } else {
-                    crate::types::PreconfSource::Rpc
-                }
+            let source = if self.journal.contains(&hash).await {
+                crate::types::PreconfSource::Replay
             } else {
                 crate::types::PreconfSource::Rpc
             };
@@ -163,12 +160,24 @@ where
                     );
                 }
                 PushResult::ConflictActive(existing) => {
-                    debug!(
+                    // `hash` shares its `(sender, nonce)` with an active commitment
+                    // (`existing`) of a different hash: the replacement guard was
+                    // raced (validated before `existing` hit the fifo), so `hash`
+                    // entered the pool and evicted `existing` from it. `existing`
+                    // still lands from the fifo, so `hash` can never execute — left
+                    // in the pool it is a ghost that silently vanishes on the next
+                    // canon update. Reject it: drop from the pool and fail its
+                    // responder (immediate error rather than a deadline hang).
+                    warn!(
                         target: "mantle::preconf::listener",
                         ?hash,
                         existing_hash = ?existing,
-                        "fifo (sender, nonce) slot occupied by another active commitment"
+                        "replacement of active preconf commitment bypassed the validator guard; \
+                         rejecting and evicting from pool"
                     );
+                    metrics::counter!("preconf.listener.replacement_rejected_total").increment(1);
+                    let _ = self.pool.remove_transactions(vec![hash]);
+                    self.fifo.cancel_responder(&hash, PreconfError::AlreadyInProgress).await;
                 }
             }
         }

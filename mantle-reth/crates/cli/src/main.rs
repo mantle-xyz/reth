@@ -6,7 +6,7 @@ use mantle_reth_cli::{
     MantleArgs, MantleChainSpecParser, MantleNode, proofs_history::with_proofs_history_launch_ctx,
     seed_blockchain_tree_metrics, spawn_proofs_db_metrics,
 };
-use mantle_reth_preconf::PreconfServiceBuilder;
+use mantle_reth_preconf::{PreconfServiceBuilder, seed_preconf_metrics};
 use reth_db::DatabaseEnv;
 use reth_db_api::database_metrics::DatabaseMetrics;
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
@@ -40,9 +40,24 @@ fn main() {
         async move |builder, args| {
             info!(target: "reth::cli", "Launching Mantle node");
             let mut node = MantleNode::new(args.rollup.clone());
-            match args.preconf.into_config() {
-                Some(cfg) => {
+            let preconf_cfg = args.preconf.into_config();
+            let preconf_enabled = preconf_cfg.is_some();
+            match preconf_cfg {
+                Some(mut cfg) => {
                     let all = cfg.all_preconfs;
+                    // The journal is mandatory. When the operator did not pass
+                    // `--preconf.journal-path`, default to a datadir-relative
+                    // path resolved via reth's own datadir resolver.
+                    if cfg.journal_path.is_none() {
+                        cfg.journal_path = Some(
+                            builder
+                                .config()
+                                .datadir()
+                                .data_dir()
+                                .join("mantle-preconf")
+                                .join("journal.jsonl"),
+                        );
+                    }
                     let journal = cfg.journal_path.clone();
                     let svc = PreconfServiceBuilder::from_config(cfg)
                         .await
@@ -60,7 +75,7 @@ fn main() {
                     );
                 }
             }
-            launch_node(builder, node, args.rollup).await
+            launch_node(builder, node, args.rollup, preconf_enabled).await
         },
     ) {
         eprintln!("Error: {err:?}");
@@ -77,12 +92,17 @@ async fn launch_node(
     builder: WithLaunchContext<NodeBuilder<DatabaseEnv, OpChainSpec>>,
     node: MantleNode,
     args: RollupArgs,
+    preconf_enabled: bool,
 ) -> eyre::Result<(), ErrReport> {
     if !args.proofs_history {
         let handle = builder
             .node(node)
-            .on_node_started(|full_node| {
+            .on_node_started(move |full_node| {
                 seed_blockchain_tree_metrics(&full_node.provider);
+                // Pre-register preconf metric series (0 baseline). Preconf-only.
+                if preconf_enabled {
+                    seed_preconf_metrics();
+                }
                 Ok(())
             })
             .launch()
@@ -102,7 +122,7 @@ async fn launch_node(
                 MdbxProofsStorage::new(&path)
                     .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
             );
-            launch_with_proof_history(builder, node, args, mdbx).await
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled).await
         }
         ProofsStorageVersion::V2 => {
             info!(target: "reth::cli", "Using on-disk storage for proofs history (v2)");
@@ -110,7 +130,7 @@ async fn launch_node(
                 MdbxProofsStorageV2::new(&path)
                     .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorageV2: {e}"))?,
             );
-            launch_with_proof_history(builder, node, args, mdbx).await
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled).await
         }
     }
 }
@@ -121,6 +141,7 @@ async fn launch_with_proof_history<S>(
     node: MantleNode,
     args: RollupArgs,
     mdbx: Arc<S>,
+    preconf_enabled: bool,
 ) -> eyre::Result<(), ErrReport>
 where
     S: OpProofsStore + DatabaseMetrics + Send + Sync + 'static,
@@ -129,6 +150,10 @@ where
 
     let builder = builder.node(node).on_node_started(move |full_node| {
         seed_blockchain_tree_metrics(&full_node.provider);
+        // Pre-register preconf metric series (0 baseline). Preconf-only.
+        if preconf_enabled {
+            seed_preconf_metrics();
+        }
         spawn_proofs_db_metrics(
             full_node.task_executor,
             metrics_mdbx,

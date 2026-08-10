@@ -10,19 +10,20 @@
 //!
 //! 1. Decode + recover the raw transaction.
 //! 2. Whitelist check via [`PreconfConfig::is_preconf_tx`].
-//! 3. Nonce-gap pre-check against `pending_nonce = max(on_chain_nonce,
-//!    pool.highest_consecutive(sender).nonce() + 1)`.
+//! 3. Nonce-gap + cumulative-balance pre-checks against a single `latest` snapshot and one pool
+//!    scan (`get_pending_nonce_and_cumulative_cost`).
 //! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
 //!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
 //!    builder could apply it before the responder is registered, dropping the receipt.
 //! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if the fifo
 //!    entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the builder.
 //! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return `Ok(Timeout
-//!    event)` (op-geth-aligned) and clean both the fifo entry CAS (`mark_timeout`) **and** any
-//!    stale responder (`cancel_responder`). The second call is mandatory because the pool listener
-//!    filters to `SubPool::Pending` — txs routed to `BaseFee`/`Queued` never produce a fifo entry,
-//!    so `mark_timeout` returns `NotFound` and the responder would otherwise be stuck in
-//!    `pending_responders`.
+//!    event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
+//!    (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
+//!    fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
+//!    and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
+//!    (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
+//!    `pending_responders`).
 
 use std::sync::Arc;
 
@@ -54,13 +55,12 @@ pub struct PreconfRpcHandler<P, Pr> {
     provider: Pr,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
-    /// Optional persistence sink — when `Some`, every successful
-    /// preconf commitment is appended to the journal before the
-    /// `PreconfTxEvent` is returned to the client. Append failures
-    /// are logged but do not block the response (best-effort
-    /// durability; a crash before the next disk flush loses at most
-    /// the most recent commitment).
-    journal: Option<Arc<PreconfJournal>>,
+    /// Persistence sink (mandatory) — every successful preconf commitment
+    /// is appended to the journal before the `PreconfTxEvent` is returned
+    /// to the client. Append failures are logged but do not block the
+    /// response (best-effort durability; a crash before the next disk
+    /// flush loses at most the most recent commitment).
+    journal: Arc<PreconfJournal>,
 }
 
 // Manual Debug — `P` (TransactionPool) and `Pr` (StateProviderFactory) do
@@ -78,14 +78,13 @@ impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
 
 impl<P, Pr> PreconfRpcHandler<P, Pr> {
     /// Construct a handler bound to the given pool + provider + fifo.
-    /// `journal` is optional; when `None`, persistence of successful
-    /// commitments is silently skipped.
+    /// The `journal` is mandatory — every successful commitment is persisted.
     pub const fn new(
         pool: P,
         provider: Pr,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
-        journal: Option<Arc<PreconfJournal>>,
+        journal: Arc<PreconfJournal>,
     ) -> Self {
         Self { pool, provider, fifo, cfg, journal }
     }
@@ -126,46 +125,50 @@ where
             return Err(preconf_error_to_rpc(&PreconfError::NotPreconfEligible));
         }
 
-        // Step 2 — nonce-gap pre-check (synchronous rejection).
-        //
-        // Without this check, a gap-up tx would land in the pool's
-        // `Queued` sub-pool; the pool listener filters to `Pending` only,
-        // so no fifo entry is ever created, the client waits the full
-        // `preconf_timeout` for nothing, and — worse — once the missing
-        // prior-nonce tx eventually arrives, the queued tx gets promoted
-        // and silently sealed without a preconf commitment. Surfacing
-        // the gap here keeps the client's view and the chain's view in
-        // sync; the cost is that SDKs must explicitly handle
-        // `PreconfError::NonceGap` by resending in nonce order. See the
-        // doc-comment on `PreconfError::NonceGap` for the full
-        // rationale.
-        let on_chain_nonce = self
-            .provider
-            .latest()
-            .map_err(|e| internal_err(&e))?
-            .account_nonce(&sender)
-            .map_err(|e| internal_err(&e))?
-            .unwrap_or(0);
-        // `get_highest_consecutive_transaction_by_sender` returns the
-        // highest non-nonce-gapped pending tx given the on-chain nonce;
-        // if `None`, the pool has nothing executable from this sender,
-        // so the next expected nonce is the on-chain nonce itself.
-        // `nonce < on_chain_nonce` (stale) is intentionally not checked
-        // here — the inner pool validator catches it with a precise
-        // `NonceTooLow` error during `add_transaction` (step 4),
-        // surfaced to the client through the catch-all `PoolRejected`
-        // branch.
-        let pending_nonce = self
-            .pool
-            .get_highest_consecutive_transaction_by_sender(sender, on_chain_nonce)
-            .map(|tx| tx.nonce() + 1)
-            .unwrap_or(on_chain_nonce);
+        // Step 2 — nonce-gap + balance pre-checks. A tx that is valid per-tx
+        // but parked (nonce gap → `Queued`; cumulative funds short →
+        // `!ENOUGH_BALANCE`) never reaches `Pending`, so it gets no fifo entry
+        // and the client blocks the full timeout. Reject both synchronously.
+        // One snapshot + one scan yield nonce, balance, `pending_nonce`, and
+        // `committed_cost` (Σ over the gapless chain below `pending_nonce`).
+        // Stale (`nonce < on_chain_nonce`) is left to the inner validator.
+        let state = self.provider.latest().map_err(|e| internal_err(&e))?;
+        let on_chain_nonce =
+            state.account_nonce(&sender).map_err(|e| internal_err(&e))?.unwrap_or(0);
+        let on_chain_balance =
+            state.account_balance(&sender).map_err(|e| internal_err(&e))?.unwrap_or_default();
+        let (pending_nonce, committed_cost) =
+            self.pool.get_pending_nonce_and_cumulative_cost(sender, on_chain_nonce);
         if nonce > pending_nonce {
             debug!(target: "mantle::preconf::rpc", ?sender, ?nonce, ?pending_nonce, "nonce gap rejected");
             return Err(preconf_error_to_rpc(&PreconfError::NonceGap {
                 tx_nonce: nonce,
                 pending_nonce,
             }));
+        }
+
+        // Append case only, and only the *cumulative* shortfall the pool would
+        // silently park: a tx that is individually affordable (so the inner
+        // validator admits it) but whose running total across the sender's
+        // pending chain exceeds the balance (`!ENOUGH_BALANCE` → non-pending).
+        // A tx that alone exceeds the balance, or a replacement
+        // (`nonce < pending_nonce`), is left to the inner validator / pool —
+        // reth already rejects those synchronously. `saturating_add` guards the
+        // `value == U256::MAX` edge. Replacements are left to the pool.
+        if nonce == pending_nonce {
+            let own_cost = pool_tx.cost().saturating_add(pool_tx.extra_balance_cost());
+            let required = committed_cost.saturating_add(own_cost);
+            if own_cost <= on_chain_balance && required > on_chain_balance {
+                debug!(
+                    target: "mantle::preconf::rpc",
+                    ?sender, ?nonce, %required, %on_chain_balance,
+                    "insufficient funds rejected"
+                );
+                return Err(preconf_error_to_rpc(&PreconfError::InsufficientFunds {
+                    balance: on_chain_balance,
+                    required,
+                }));
+            }
         }
 
         // Step 3 — attach responder BEFORE pool.add. See module-level docs.
@@ -230,29 +233,37 @@ where
             // single record).
             Some(Ok(Ok(receipt))) => {
                 let event = PreconfTxEvent::from(receipt);
-                if matches!(event.status, WireStatus::Success) &&
-                    let Some(journal) = self.journal.as_ref()
-                {
-                    let entry = JournalEntry {
-                        hash,
-                        tx_rlp: bytes.clone(),
-                        block_height: event.block_height,
-                        committed_at_ms: now_unix_ms(),
-                    };
-                    if let Err(e) = journal.append_promised(&entry).await {
-                        warn!(
-                            target: "mantle::preconf::rpc",
-                            ?hash,
-                            ?e,
-                            "journal append failed; commitment may be lost on restart"
-                        );
-                    }
+                // Receipt path ⇒ the tx is on chain (`From` maps it to
+                // Success, or Failed for an EVM revert — a receipt exists
+                // either way), so always journal.
+                let entry = JournalEntry {
+                    hash,
+                    tx_rlp: bytes.clone(),
+                    block_height: event.block_height,
+                    committed_at_ms: now_unix_ms(),
+                };
+                if let Err(e) = self.journal.append_promised(&entry).await {
+                    warn!(
+                        target: "mantle::preconf::rpc",
+                        ?hash,
+                        ?e,
+                        "journal append failed; commitment may be lost on restart"
+                    );
                 }
                 Ok(event)
             }
 
-            // Builder signalled an error through the responder.
-            Some(Ok(Err(err))) => Err(preconf_error_to_rpc(&err)),
+            // Builder signalled an error through the responder. A
+            // `Timeout` error is surfaced as an `Ok(Timeout event)`
+            // (op-geth-aligned wire shape), never a JSON-RPC error —
+            // matching the deadline branch's own timeout handling.
+            Some(Ok(Err(err))) => {
+                if matches!(err, PreconfError::Timeout { .. }) {
+                    Ok(build_timeout_event(hash, preconf_timeout))
+                } else {
+                    Err(preconf_error_to_rpc(&err))
+                }
+            }
 
             // Builder dropped the responder without sending — should not
             // happen on healthy paths. Mark the entry `Canceled`
@@ -301,22 +312,20 @@ where
                         match resp_rx.try_recv() {
                             Ok(Ok(receipt)) => {
                                 let event = PreconfTxEvent::from(receipt);
-                                if matches!(event.status, WireStatus::Success) &&
-                                    let Some(journal) = self.journal.as_ref()
-                                {
-                                    let entry = JournalEntry {
-                                        hash,
-                                        tx_rlp: bytes.clone(),
-                                        block_height: event.block_height,
-                                        committed_at_ms: now_unix_ms(),
-                                    };
-                                    if let Err(e) = journal.append_promised(&entry).await {
-                                        warn!(
-                                            target: "mantle::preconf::rpc",
-                                            ?hash, ?e,
-                                            "journal append failed; commitment may be lost on restart"
-                                        );
-                                    }
+                                // Receipt path ⇒ on chain (Success or an
+                                // EVM-revert Failed), so always journal.
+                                let entry = JournalEntry {
+                                    hash,
+                                    tx_rlp: bytes.clone(),
+                                    block_height: event.block_height,
+                                    committed_at_ms: now_unix_ms(),
+                                };
+                                if let Err(e) = self.journal.append_promised(&entry).await {
+                                    warn!(
+                                        target: "mantle::preconf::rpc",
+                                        ?hash, ?e,
+                                        "journal append failed; commitment may be lost on restart"
+                                    );
                                 }
                                 Ok(event)
                             }
@@ -344,11 +353,17 @@ where
                         }
                     }
                     Some(PreconfStatus::Waiting) | None => {
-                        // Apply never committed. Transition to Timeout
-                        // under the still-held lock (or without any
-                        // lock if entry was absent — mark_timeout will
-                        // return `NotFound`, which is fine).
-                        let _ = self.fifo.mark_timeout(&hash).await;
+                        // Apply never committed. `mark_timeout`'s `Waiting →
+                        // Timeout` CAS evicts the tx from the pool via its
+                        // callback — but a pool-admitted tx with no fifo entry
+                        // (parked in `BaseFee`/`Queued`, so the `Pending`-only
+                        // listener never pushed it) returns `NotFound` and skips
+                        // that callback. Evict it directly, else the orphan
+                        // lingers and is mined once eligible — after the client
+                        // saw `Timeout`.
+                        if self.fifo.mark_timeout(&hash).await.is_err() {
+                            self.pool.remove_transactions(vec![hash]);
+                        }
                         drop(apply_guard);
                         self.fifo
                             .cancel_responder(
@@ -362,7 +377,7 @@ where
                     }
                     Some(PreconfStatus::Timeout | PreconfStatus::Canceled) => {
                         // Some other path beat us (e.g. dispatch's
-                        // deadline gate or F1 block-gas-budget gate
+                        // deadline gate or block-gas-budget gate
                         // ran mark_* concurrently). The tx is not on
                         // chain; return Timeout to the client.
                         drop(apply_guard);
@@ -408,7 +423,13 @@ where
     Pr: StateProviderFactory + 'static,
 {
     async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
-        self.handle_inner(bytes).await
+        // Preconf-handling latency, measured around `handle_inner` to cover
+        // every early-return path (reject / timeout / success).
+        let started = std::time::Instant::now();
+        let out = self.handle_inner(bytes).await;
+        metrics::histogram!("preconf.api.handle_duration_ms")
+            .record(started.elapsed().as_millis() as f64);
+        out
     }
 }
 
@@ -429,7 +450,7 @@ where
 ///
 /// `Waiting` / `Timeout` are constructed directly by the RPC handler's
 /// other arms and never routed through this `From` impl. There is no
-/// wire `Canceled` variant — server pre-apply rejections (F1 gas
+/// wire `Canceled` variant — server pre-apply rejections (the block-gas-budget gate gas
 /// budget, admin action) are surfaced as wire `Failed` with the
 /// specific reason in `PreconfTxEvent::reason`; the underlying fifo
 /// `PreconfStatus::Canceled` is an internal-only distinction.

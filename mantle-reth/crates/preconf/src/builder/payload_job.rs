@@ -59,6 +59,11 @@ pub struct PreconfPayloadJob<Attrs, Payload> {
     /// `_build_task_handle` was considered but the `_` prefix already
     /// signals "field held for RAII, not read".
     _join_handle: JoinHandle<()>,
+    /// Stored `cancel.wait()` future driven by `Future::poll` so the job's
+    /// waker is registered on the cancel channel. Must persist across polls: a
+    /// fresh `wait()`/`changed()` built per poll would unregister its waker on
+    /// drop. Owns a `JobCancel` clone, so it is self-contained.
+    cancel_wait: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 impl<Attrs, Payload> PreconfPayloadJob<Attrs, Payload> {
@@ -68,13 +73,18 @@ impl<Attrs, Payload> PreconfPayloadJob<Attrs, Payload> {
     /// [`PreconfPayloadJobGenerator::new_payload_job`](crate::builder::payload_job_generator::PreconfPayloadJobGenerator::new_payload_job)
     /// after spawning the build future. Tests can call this directly
     /// to inject a pre-filled `watch::Receiver`.
-    pub const fn new(
+    pub fn new(
         attributes: Attrs,
         payload_rx: watch::Receiver<Option<Payload>>,
         cancel: JobCancel,
         join_handle: JoinHandle<()>,
     ) -> Self {
-        Self { attributes, payload_rx, cancel, _join_handle: join_handle }
+        // Stored future owns its own `JobCancel` clone (self-contained, 'static).
+        let cancel_wait = Box::pin({
+            let cancel = cancel.clone();
+            async move { cancel.wait().await }
+        });
+        Self { attributes, payload_rx, cancel, _join_handle: join_handle, cancel_wait }
     }
 
     /// Read-only access to the cancel handle. Tests use this to flip
@@ -117,7 +127,10 @@ where
 //
 // Idempotent with respect to `resolve_kind`'s own `cancel.signal()` —
 // `JobCancel::signal` is a single `watch::Sender::send(true)` and a
-// second call is a no-op.
+// second call is a no-op. It is also complementary to the generator's
+// `ensure_only_one_payload` (see `payload_job_generator.rs`), which cancels the
+// *previous* job when a *new* one is spawned: Drop covers the eviction path,
+// `ensure_only_one_payload` the supersede path; both funnel to the same signal.
 impl<Attrs, Payload> Drop for PreconfPayloadJob<Attrs, Payload> {
     fn drop(&mut self) {
         self.cancel.signal();
@@ -133,16 +146,12 @@ where
 {
     type Output = Result<(), PayloadBuilderError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // The job future resolves on cancel — the payload itself is
-        // delivered through `best_payload` / `resolve_kind`. Spinning
-        // here is fine because the payload service only polls us when
-        // its own deadline timer fires; in practice we'll see cancel
-        // before re-poll arrives.
-        if self.cancel.is_cancelled() {
-            return Poll::Ready(Ok(()));
-        }
-        Poll::Pending
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Resolve on cancel (payload itself is delivered via `resolve_kind`).
+        // Driving the stored future registers our waker on the cancel channel,
+        // so we're woken the instant cancel fires — no reliance on the service
+        // re-polling us for other reasons.
+        self.get_mut().cancel_wait.as_mut().poll(cx).map(|()| Ok(()))
     }
 }
 
@@ -290,6 +299,30 @@ mod tests {
         timeout(Duration::from_millis(50), job)
             .await
             .expect("job did not resolve after cancel")
+            .expect("job returned error");
+    }
+
+    /// Cancel fired **after** the future parked must still wake it. `tokio::spawn`
+    /// drives it purely by wakeups, so a `Pending` that never registered
+    /// `cx.waker()` would park forever — the regression guard for that.
+    #[tokio::test]
+    async fn cancel_after_park_wakes_the_job_future() {
+        let (_tx, rx) = watch::channel::<Option<()>>(None);
+        let cancel = JobCancel::new();
+        let handle = tokio::spawn(async {});
+        let job = PreconfPayloadJob::new((), rx, cancel.clone(), handle);
+
+        // First poll parks the future (not yet cancelled); no re-poll happens
+        // unless the job registered its waker on the cancel channel.
+        let task = tokio::spawn(job);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished(), "job must still be pending before cancel");
+
+        cancel.signal();
+        timeout(Duration::from_millis(500), task)
+            .await
+            .expect("cancel must wake the parked job future via its waker")
+            .expect("join")
             .expect("job returned error");
     }
 

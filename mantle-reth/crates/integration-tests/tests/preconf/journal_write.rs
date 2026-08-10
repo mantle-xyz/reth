@@ -3,7 +3,7 @@
 //! `restart_replay.rs` covers the *read* half of durability (hand-written
 //! journal → restore → land). This module covers the *write* half — the
 //! part the RPC handler owns — plus the op-geth-aligned persistence scope
-//! (design §5.9.1):
+//! (only RPC-path + `Success` commitments are journaled):
 //!
 //! - `rpc_success_appends_to_journal_file` — a live `eth_sendRawTransactionWithPreconf` that
 //!   returns `Success` must leave a matching `JournalEntry` on disk. Guards `rpc.rs`'s

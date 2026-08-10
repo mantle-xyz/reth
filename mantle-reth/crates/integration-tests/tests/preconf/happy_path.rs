@@ -9,8 +9,9 @@
 
 use super::helpers::{
     PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, mantle_test_chain_spec, send_preconf,
+    wait_pending_nonce,
 };
-use crate::launch_preconf_node;
+use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -107,6 +108,80 @@ async fn success_returns_receipt_and_lands_on_chain() {
     );
 }
 
+/// A preconf tx's priority fee must be folded into the built payload's block
+/// value (`ExecutionInfo::total_fees`), exactly as the pool best-tx path does.
+/// Otherwise `engine_getPayload`'s `blockValue` and `ctx.is_better_payload`
+/// underestimate any payload whose value comes from preconf txs — a
+/// preconf-heavy block can then be judged "not better" and discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preconf_tx_fee_counts_toward_block_value() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let sender = Wallet::default().with_chain_id(1).inner.address();
+
+    let cfg = PreconfCfgBuilder::new().whitelist_from(sender).whitelist_to(recipient).build();
+    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+
+    // tip = 2 gwei. Mantle L2 base fee is 0, so the effective miner tip equals
+    // the priority-fee cap; a plain transfer burns exactly 21_000 gas. Deposits
+    // / system txs pay no tip and no pool tx is sent, so the whole block value
+    // must equal this one tx's tip × gas.
+    let tip: u128 = 2_000_000_000;
+    let raw_tx: alloy_primitives::Bytes = {
+        let request = TransactionRequest {
+            chain_id: Some(chain_id),
+            nonce: Some(0),
+            to: Some(RECIPIENT.parse::<Address>().unwrap().into()),
+            gas: Some(21_000),
+            max_fee_per_gas: Some(20e9 as u128),
+            max_priority_fee_per_gas: Some(tip),
+            value: Some(U256::from(1u64)),
+            input: alloy_rpc_types_eth::TransactionInput::default(),
+            ..Default::default()
+        };
+        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
+    };
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    let http_clone = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let event = rpc_task.await.expect("rpc join").expect("preconf RPC must succeed");
+    assert!(
+        matches!(event.status, PreconfStatus::Success),
+        "expected Success, got {:?} (reason={:?})",
+        event.status,
+        event.reason,
+    );
+
+    assert_eq!(
+        payload.fees(),
+        U256::from(tip) * U256::from(21_000u64),
+        "preconf tx tip ({tip} × 21k gas) must be counted in the payload block value; \
+         got {}",
+        payload.fees(),
+    );
+}
+
 /// One sender submits three preconf txs with sequential nonces (0/1/2)
 /// against the same slot; every tx must land in that slot and their
 /// indices in the sealed block body must reflect **EVM nonce order**.
@@ -152,10 +227,10 @@ async fn multi_nonce_same_sender_land_in_one_block() {
     // dictates the sealed-block index order asserted below.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 1).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_pending_nonce(&http, wallet_addr, 2).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2).await });
 
@@ -469,8 +544,7 @@ async fn weth_transfer_over_balance_lands_as_reverted() {
     // Canonicalise the block so the state provider serves post-execution
     // state, then confirm the failed transfer left `balanceOf[recipient]`
     // untouched at 0 — the revert must have rolled back EVM state.
-    let new_head = node.submit_payload(payload).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("canonicalise reverted block");
+    canonize_built!(node, payload);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let state = node.inner.provider.latest().expect("state provider");
     let recipient_balance = state
@@ -593,8 +667,7 @@ async fn weth_deposit_carries_log_through_to_receipt() {
     // WETH9's `balanceOf[wallet_addr]` must now equal the deposited wad.
     // This guards against a hypothetical regression where the receipt
     // reports success but the state write was silently dropped.
-    let new_head = node.submit_payload(payload).await.expect("submit_payload");
-    node.update_forkchoice(new_head, new_head).await.expect("canonicalise deposit block");
+    canonize_built!(node, payload);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let state = node.inner.provider.latest().expect("state provider");
     let wallet_weth = state
