@@ -1723,3 +1723,586 @@ mod tests {
         assert!(second_evicted.lock().unwrap().is_empty());
     }
 }
+
+/// Stateful property model for [`PreconfTxSet`].
+///
+/// Replays random push / mark / remove / clean / forward sequences against the
+/// real fifo and an independent reference model, checking after every step that
+/// they agree and that structural invariants hold (slot uniqueness, index
+/// consistency). Explores same-`(sender, nonce)` / same-hash collisions that
+/// hand-written cases hit only sparsely. Deterministic: all mutations serialise
+/// behind one lock, so one run per sequence is representative.
+#[cfg(test)]
+mod proptest_model {
+    use super::*;
+    use alloy_consensus::{Signed, TxEip1559};
+    use alloy_primitives::{B256, Signature};
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, HashSet};
+
+    // Small domains so slot/hash collisions are frequent.
+    const SENDERS: u8 = 2;
+    const NONCES: u8 = 3;
+    const VARIANTS: u8 = 2;
+
+    fn addr(byte: u8) -> Address {
+        Address::from([byte; 20])
+    }
+    fn h(byte: u8) -> TxHash {
+        TxHash::from([byte; 32])
+    }
+    fn make_tx(nonce: u64, hash_byte: u8) -> Arc<TxEnvelope> {
+        let inner = TxEip1559 { nonce, ..Default::default() };
+        let sig = Signature::test_signature();
+        Arc::new(TxEnvelope::Eip1559(Signed::new_unchecked(
+            inner,
+            sig,
+            B256::from([hash_byte; 32]),
+        )))
+    }
+
+    /// A synthetic tx identity. Maps 1:1 to a hash byte, so a given hash
+    /// always carries the same `(sender, nonce)` — matching reality, where a
+    /// signed tx's hash is derived from its content. `variant` lets two txs
+    /// share a `(sender, nonce)` slot with different hashes (the replacement
+    /// case).
+    #[derive(Clone, Copy, Debug)]
+    struct TxId {
+        sender: u8,
+        nonce: u8,
+        variant: u8,
+    }
+
+    impl TxId {
+        /// Unique in `0..(SENDERS * NONCES * VARIANTS)`.
+        fn hash_byte(self) -> u8 {
+            (self.sender * NONCES + self.nonce) * VARIANTS + self.variant
+        }
+        fn tx(self) -> Arc<TxEnvelope> {
+            make_tx(self.nonce as u64, self.hash_byte())
+        }
+        fn addr(self) -> Address {
+            addr(self.sender)
+        }
+        fn hash(self) -> TxHash {
+            h(self.hash_byte())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Push(TxId),
+        MarkSucceeded(TxId),
+        MarkFailed(TxId),
+        MarkTimeout(TxId),
+        MarkCanceled(TxId),
+        RemoveReclaimable(TxId),
+        CleanReclaimable,
+        Forward { sender: u8, new_nonce: u8 },
+    }
+
+    fn txid() -> impl Strategy<Value = TxId> {
+        (0..SENDERS, 0..NONCES, 0..VARIANTS).prop_map(|(sender, nonce, variant)| TxId {
+            sender,
+            nonce,
+            variant,
+        })
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            txid().prop_map(Op::Push),
+            txid().prop_map(Op::MarkSucceeded),
+            txid().prop_map(Op::MarkFailed),
+            txid().prop_map(Op::MarkTimeout),
+            txid().prop_map(Op::MarkCanceled),
+            txid().prop_map(Op::RemoveReclaimable),
+            Just(Op::CleanReclaimable),
+            // `new_nonce` up to NONCES+1 so a forward can clear the whole sender.
+            (0..SENDERS, 0..(NONCES + 1))
+                .prop_map(|(sender, new_nonce)| Op::Forward { sender, new_nonce }),
+        ]
+    }
+
+    /// Reference model: `hash_byte -> (sender, nonce, status)`. Maintains "at
+    /// most one entry per `(sender, nonce)`" by construction — the property
+    /// the real fifo must also hold.
+    type Model = BTreeMap<u8, (u8, u8, PreconfStatus)>;
+
+    fn reclaimable(s: PreconfStatus) -> bool {
+        matches!(s, PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed)
+    }
+
+    fn model_mark(model: &mut Model, hb: u8, target: PreconfStatus) {
+        // `transition_from_waiting`: only Waiting moves; anything else is a no-op.
+        if let Some((_, _, st)) = model.get_mut(&hb) &&
+            *st == PreconfStatus::Waiting
+        {
+            *st = target;
+        }
+    }
+
+    fn model_apply(model: &mut Model, op: &Op) {
+        match op {
+            Op::Push(id) => {
+                let hb = id.hash_byte();
+                if let Some((_, _, st)) = model.get_mut(&hb) {
+                    // Same hash: reclaimable revives to Waiting; active is a no-op.
+                    if reclaimable(*st) {
+                        *st = PreconfStatus::Waiting;
+                    }
+                    return;
+                }
+                // Same (sender, nonce), different hash?
+                let slot = model
+                    .iter()
+                    .find(|(_, (s, n, _))| *s == id.sender && *n == id.nonce)
+                    .map(|(hb, (_, _, st))| (*hb, *st));
+                match slot {
+                    // Active slot blocks the replacement (ConflictActive) — no insert.
+                    Some((_, st)) if !reclaimable(st) => {}
+                    // Reclaimable slot is evicted, then the new tx takes it.
+                    Some((old, _)) => {
+                        model.remove(&old);
+                        model.insert(hb, (id.sender, id.nonce, PreconfStatus::Waiting));
+                    }
+                    None => {
+                        model.insert(hb, (id.sender, id.nonce, PreconfStatus::Waiting));
+                    }
+                }
+            }
+            Op::MarkSucceeded(id) => model_mark(model, id.hash_byte(), PreconfStatus::Success),
+            Op::MarkFailed(id) => model_mark(model, id.hash_byte(), PreconfStatus::Failed),
+            Op::MarkTimeout(id) => model_mark(model, id.hash_byte(), PreconfStatus::Timeout),
+            Op::MarkCanceled(id) => model_mark(model, id.hash_byte(), PreconfStatus::Canceled),
+            Op::RemoveReclaimable(id) => {
+                let hb = id.hash_byte();
+                if matches!(model.get(&hb), Some((_, _, st)) if reclaimable(*st)) {
+                    model.remove(&hb);
+                }
+            }
+            Op::CleanReclaimable => model.retain(|_, (_, _, st)| !reclaimable(*st)),
+            Op::Forward { sender, new_nonce } => {
+                model.retain(|_, (s, n, _)| !(*s == *sender && *n < *new_nonce))
+            }
+        }
+    }
+
+    async fn apply_real(set: &PreconfTxSet, op: &Op) {
+        match op {
+            Op::Push(id) => {
+                set.push_if_absent(id.tx(), id.addr(), PreconfSource::Rpc).await;
+            }
+            Op::MarkSucceeded(id) => {
+                let _ = set.mark_succeeded(&id.hash()).await;
+            }
+            Op::MarkFailed(id) => {
+                let _ = set.mark_failed(&id.hash()).await;
+            }
+            Op::MarkTimeout(id) => {
+                let _ = set.mark_timeout(&id.hash()).await;
+            }
+            Op::MarkCanceled(id) => {
+                let _ = set.mark_canceled(&id.hash()).await;
+            }
+            Op::RemoveReclaimable(id) => {
+                set.remove_reclaimable(&id.hash()).await;
+            }
+            Op::CleanReclaimable => {
+                set.clean_reclaimable().await;
+            }
+            Op::Forward { sender, new_nonce } => {
+                set.forward(&addr(*sender), *new_nonce as u64).await;
+            }
+        }
+    }
+
+    async fn run_and_check(ops: &[Op]) {
+        let set = PreconfTxSet::new(64);
+        let mut model = Model::new();
+
+        for (i, op) in ops.iter().enumerate() {
+            apply_real(&set, op).await;
+            model_apply(&mut model, op);
+
+            let views = set.entries().await;
+
+            // (A) Real fifo agrees with the reference model, hash by hash.
+            assert_eq!(views.len(), model.len(), "step {i}: entry count diverged after {op:?}");
+            for v in &views {
+                let hb = v.hash.0[0]; // h(byte) has every byte == byte
+                let (s, n, st) = *model.get(&hb).unwrap_or_else(|| {
+                    panic!("step {i}: real has hash {hb} not in model ({op:?})")
+                });
+                assert_eq!(v.from, addr(s), "step {i}: sender mismatch for hash {hb}");
+                assert_eq!(v.nonce, u64::from(n), "step {i}: nonce mismatch for hash {hb}");
+                assert_eq!(v.status, st, "step {i}: status mismatch for hash {hb}");
+            }
+
+            // (B) Slot uniqueness — at most one entry per (sender, nonce);
+            // a duplicate is the "pool ghost" that breaks replacement safety.
+            let mut slots = HashSet::new();
+            for v in &views {
+                assert!(
+                    slots.insert((v.from, v.nonce)),
+                    "step {i}: duplicate (sender, nonce) slot after {op:?}"
+                );
+            }
+
+            // (C) Index consistency: `order` (snapshot) and `entries` hold the
+            // exact same hash set with no duplicates, and every entry is
+            // reachable via both by-hash and by-(sender,nonce) lookups.
+            let snap = set.snapshot().await;
+            assert_eq!(snap.len(), views.len(), "step {i}: snapshot/entries length diverged");
+            let snap_set: HashSet<_> = snap.iter().copied().collect();
+            assert_eq!(snap_set.len(), snap.len(), "step {i}: duplicate hash in order");
+            for v in &views {
+                assert!(snap_set.contains(&v.hash), "step {i}: entry missing from order index");
+                assert_eq!(
+                    set.find_by_sender_nonce(&v.from, v.nonce).await.map(|x| x.hash),
+                    Some(v.hash),
+                    "step {i}: by_sender index disagrees for {:?}",
+                    v.hash
+                );
+                assert!(
+                    set.find_by_hash(&v.hash).await.is_some(),
+                    "step {i}: find_by_hash missing"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// Any sequence of fifo operations keeps the real `PreconfTxSet` in
+        /// lock-step with the reference model and never violates slot
+        /// uniqueness or index consistency.
+        #[test]
+        fn preconf_tx_set_matches_reference_model(ops in prop::collection::vec(op(), 1..40)) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(run_and_check(&ops));
+        }
+    }
+}
+
+/// Stateful property model for [`PreconfTxSet`]'s **responder** machine — the
+/// half the fifo model skips.
+///
+/// Holds a real `oneshot::Receiver` per attached responder and checks, after
+/// each op, that a hash has at most one responder (in `entry.responder` xor
+/// `pending_responders`), that `push` migrates a pending responder onto its
+/// entry, and that a responder leaving the set resolves its receiver exactly
+/// once (Ok via `take`, Err via `cancel`, `RecvError` when dropped) — never
+/// silently leaked. A final `expire_pending_responders` must GC every pending
+/// slot. Each hash owns its slot, isolating this from the replacement logic.
+#[cfg(test)]
+mod proptest_responder_model {
+    use super::*;
+    use alloy_consensus::{Signed, TxEip1559};
+    use alloy_primitives::{B256, Bytes, Log, Signature};
+    use proptest::prelude::*;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    const HASHES: u8 = 4;
+
+    fn h(byte: u8) -> TxHash {
+        TxHash::from([byte; 32])
+    }
+    fn make_tx(nonce: u64, hash_byte: u8) -> Arc<TxEnvelope> {
+        let inner = TxEip1559 { nonce, ..Default::default() };
+        let sig = Signature::test_signature();
+        Arc::new(TxEnvelope::Eip1559(Signed::new_unchecked(
+            inner,
+            sig,
+            B256::from([hash_byte; 32]),
+        )))
+    }
+    fn receipt(hash_byte: u8) -> PreconfReceipt {
+        PreconfReceipt {
+            tx_hash: h(hash_byte),
+            block_height: 0,
+            status: true,
+            logs: Vec::<Log>::new(),
+            gas_used: 0,
+            reason: String::new(),
+            revert_data: Bytes::new(),
+        }
+    }
+    fn some_err() -> PreconfError {
+        PreconfError::Internal("model".into())
+    }
+
+    type Rx = oneshot::Receiver<Result<PreconfReceipt, PreconfError>>;
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Loc {
+        Pending,
+        Entry,
+    }
+
+    /// Per-hash model: entry status (if any) and the currently-held responder
+    /// (location + its receiver, so we can observe the receiver's fate).
+    #[derive(Default)]
+    struct HashState {
+        entry: Option<PreconfStatus>,
+        held: Option<(Loc, Rx)>,
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Attach(u8),
+        Push(u8),
+        MarkTimeout(u8),
+        MarkFailed(u8),
+        MarkCanceled(u8),
+        MarkSucceeded(u8),
+        Take(u8),
+        Cancel(u8),
+        Forward(u8),
+        CleanReclaimable,
+    }
+
+    fn hb() -> impl Strategy<Value = u8> {
+        0..HASHES
+    }
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            hb().prop_map(Op::Attach),
+            hb().prop_map(Op::Push),
+            hb().prop_map(Op::MarkTimeout),
+            hb().prop_map(Op::MarkFailed),
+            hb().prop_map(Op::MarkCanceled),
+            hb().prop_map(Op::MarkSucceeded),
+            hb().prop_map(Op::Take),
+            hb().prop_map(Op::Cancel),
+            (0..=HASHES).prop_map(Op::Forward),
+            Just(Op::CleanReclaimable),
+        ]
+    }
+
+    fn reclaimable(s: PreconfStatus) -> bool {
+        matches!(s, PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed)
+    }
+    fn assert_closed(mut rx: Rx, ctx: &str) {
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Closed)),
+            "{ctx}: receiver must be Closed"
+        );
+    }
+    fn assert_value(mut rx: Rx, ctx: &str) {
+        assert!(rx.try_recv().is_ok(), "{ctx}: receiver must have a value");
+    }
+
+    async fn run_and_check(ops: &[Op]) {
+        let set = PreconfTxSet::new(64);
+        let sender = Address::from([0u8; 20]);
+        let mut model: Vec<HashState> = (0..HASHES).map(|_| HashState::default()).collect();
+
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                Op::Attach(b) => {
+                    let b = *b;
+                    let (tx, rx) = oneshot::channel();
+                    let r = set.attach_responder(h(b), Instant::now(), tx).await;
+                    let st = &mut model[b as usize];
+                    match st.entry {
+                        Some(PreconfStatus::Success) => {
+                            assert!(r.is_err(), "step {i}: attach on Success must reject");
+                            assert_closed(rx, &format!("step {i}: rejected attach"));
+                        }
+                        Some(PreconfStatus::Waiting) => {
+                            if st.held.is_some() {
+                                assert!(
+                                    r.is_err(),
+                                    "step {i}: attach over live responder must reject"
+                                );
+                                assert_closed(rx, &format!("step {i}: rejected attach"));
+                            } else {
+                                assert!(r.is_ok(), "step {i}: attach on bare Waiting must succeed");
+                                st.held = Some((Loc::Entry, rx));
+                            }
+                        }
+                        Some(_) => {
+                            // Reclaimable: installs onto the entry, overwriting any prior
+                            // responder.
+                            assert!(r.is_ok(), "step {i}: attach on reclaimable must succeed");
+                            if let Some((_, old)) = st.held.take() {
+                                assert_closed(old, &format!("step {i}: overwritten responder"));
+                            }
+                            st.held = Some((Loc::Entry, rx));
+                        }
+                        None => {
+                            if st.held.is_some() {
+                                assert!(r.is_err(), "step {i}: attach over pending must reject");
+                                assert_closed(rx, &format!("step {i}: rejected attach"));
+                            } else {
+                                assert!(r.is_ok(), "step {i}: first attach must succeed");
+                                st.held = Some((Loc::Pending, rx));
+                            }
+                        }
+                    }
+                }
+                Op::Push(b) => {
+                    let b = *b;
+                    set.push_if_absent(make_tx(u64::from(b), b), sender, PreconfSource::Rpc).await;
+                    let st = &mut model[b as usize];
+                    match st.entry {
+                        None => {
+                            st.entry = Some(PreconfStatus::Waiting);
+                            // A pending responder migrates onto the fresh entry.
+                            if let Some((Loc::Pending, rx)) = st.held.take() {
+                                st.held = Some((Loc::Entry, rx));
+                            }
+                        }
+                        Some(s) if reclaimable(s) => {
+                            st.entry = Some(PreconfStatus::Waiting); // revived; responder unchanged
+                        }
+                        Some(_) => { /* Waiting/Success: AlreadyExists, no change */ }
+                    }
+                }
+                Op::MarkTimeout(b) => mark(&set, &mut model, *b, PreconfStatus::Timeout).await,
+                Op::MarkFailed(b) => mark(&set, &mut model, *b, PreconfStatus::Failed).await,
+                Op::MarkCanceled(b) => mark(&set, &mut model, *b, PreconfStatus::Canceled).await,
+                Op::MarkSucceeded(b) => mark(&set, &mut model, *b, PreconfStatus::Success).await,
+                Op::Take(b) => {
+                    let b = *b;
+                    let r = set.take_responder(&h(b)).await;
+                    let st = &mut model[b as usize];
+                    if let Some((_, rx)) = st.held.take() {
+                        let s = r.unwrap_or_else(|| {
+                            panic!("step {i}: take must return the held responder")
+                        });
+                        let _ = s.send(Ok(receipt(b)));
+                        assert_value(rx, &format!("step {i}: taken responder delivered"));
+                    } else {
+                        assert!(r.is_none(), "step {i}: take with no responder must be None");
+                    }
+                }
+                Op::Cancel(b) => {
+                    let b = *b;
+                    set.cancel_responder(&h(b), some_err()).await;
+                    let st = &mut model[b as usize];
+                    if let Some((_, rx)) = st.held.take() {
+                        assert_value(rx, &format!("step {i}: canceled responder got error"));
+                    }
+                }
+                Op::Forward(new_nonce) => {
+                    set.forward(&sender, u64::from(*new_nonce)).await;
+                    for b in 0..HASHES {
+                        let st = &mut model[b as usize];
+                        // forward only drops *entries* (nonce == b) below new_nonce.
+                        if st.entry.is_some() && u64::from(b) < u64::from(*new_nonce) {
+                            st.entry = None;
+                            if let Some((_, rx)) = st.held.take() {
+                                assert_closed(rx, &format!("step {i}: forward-dropped responder"));
+                            }
+                        }
+                    }
+                }
+                Op::CleanReclaimable => {
+                    set.clean_reclaimable().await;
+                    for b in 0..HASHES {
+                        let st = &mut model[b as usize];
+                        if matches!(st.entry, Some(s) if reclaimable(s)) {
+                            st.entry = None;
+                            if let Some((_, rx)) = st.held.take() {
+                                assert_closed(rx, &format!("step {i}: clean-dropped responder"));
+                            }
+                        }
+                    }
+                }
+            }
+
+            check_invariants(&set, &mut model, i).await;
+        }
+
+        // Final GC: every lingering *pending* responder must be expired (its
+        // receiver Closed); entry-held responders are untouched.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let expired = set.expire_pending_responders(Duration::ZERO).await;
+        let mut expected = 0usize;
+        for st in &mut model {
+            if let Some((Loc::Pending, rx)) = st.held.take() {
+                expected += 1;
+                assert_closed(rx, "final expire");
+            }
+        }
+        assert_eq!(expired, expected, "expire count must match lingering pending responders");
+        assert!(
+            set.inner.lock().await.pending_responders.is_empty(),
+            "no pending responder may survive expire"
+        );
+    }
+
+    async fn mark(set: &PreconfTxSet, model: &mut [HashState], b: u8, target: PreconfStatus) {
+        let _ = match target {
+            PreconfStatus::Success => set.mark_succeeded(&h(b)).await,
+            PreconfStatus::Failed => set.mark_failed(&h(b)).await,
+            PreconfStatus::Timeout => set.mark_timeout(&h(b)).await,
+            PreconfStatus::Canceled => set.mark_canceled(&h(b)).await,
+            PreconfStatus::Waiting => unreachable!(),
+        };
+        let st = &mut model[b as usize];
+        if st.entry == Some(PreconfStatus::Waiting) {
+            st.entry = Some(target); // responder untouched by mark_*
+        }
+    }
+
+    async fn check_invariants(set: &PreconfTxSet, model: &mut [HashState], step: usize) {
+        {
+            let inner = set.inner.lock().await;
+            for hash in inner.pending_responders.keys() {
+                assert!(
+                    !inner.entries.contains_key(hash),
+                    "step {step}: hash in both pending_responders and entries"
+                );
+            }
+            for b in 0..model.len() as u8 {
+                let hash = h(b);
+                let has_pending = inner.pending_responders.contains_key(&hash);
+                let entry_resp = inner.entries.get(&hash).is_some_and(|e| e.responder.is_some());
+                // Invariant #2 within one hash: at most one responder location.
+                assert!(!(has_pending && entry_resp), "step {step}: two responders for {b}");
+                let expect = match model[b as usize].held {
+                    None => (false, false),
+                    Some((Loc::Pending, _)) => (true, false),
+                    Some((Loc::Entry, _)) => (false, true),
+                };
+                assert_eq!(
+                    (has_pending, entry_resp),
+                    expect,
+                    "step {step}: responder location mismatch for {b}"
+                );
+                assert_eq!(
+                    inner.entries.get(&hash).map(|e| e.status),
+                    model[b as usize].entry,
+                    "step {step}: entry status mismatch for {b}"
+                );
+            }
+        }
+        // Held responders must not have resolved yet (no premature send/drop).
+        for (b, st) in model.iter_mut().enumerate() {
+            if let Some((_, rx)) = st.held.as_mut() {
+                assert!(
+                    matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                    "step {step}: held responder for {b} resolved prematurely"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 192, ..ProptestConfig::default() })]
+
+        /// Any sequence of responder operations keeps every `oneshot` responder
+        /// singly-located, correctly migrated on push, and delivered/dropped
+        /// exactly once — no responder is silently leaked, and every pending
+        /// slot is GC-able.
+        #[test]
+        fn preconf_tx_set_responder_lifecycle(ops in prop::collection::vec(op(), 1..40)) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(run_and_check(&ops));
+        }
+    }
+}

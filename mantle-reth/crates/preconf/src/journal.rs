@@ -1029,6 +1029,20 @@ mod tests {
                 "entry {i} lost across concurrent rotate"
             );
         }
+
+        // Same race, second failure mode: the in-memory `size_bytes` counter
+        // must not be clobbered by a rotate that raced an append — it must
+        // still equal the file's true length. If rotate's
+        // `size_bytes.store(kept_bytes)` (computed from the pre-append
+        // snapshot) dropped the racing append's byte contribution, the counter
+        // would sit short of the real file and silently mistune the
+        // size-rotation trigger even though the entry itself survived on disk.
+        let on_disk_bytes = tokio::fs::metadata(&path).await.unwrap().len();
+        assert_eq!(
+            j.size_bytes.load(Ordering::Relaxed),
+            on_disk_bytes,
+            "size_bytes counter drifted from true on-disk size across concurrent rotate"
+        );
     }
 
     #[tokio::test]
@@ -1564,6 +1578,180 @@ mod tests {
                 .await
                 .is_ok();
             assert!(!armed, "a file one byte under the cap must NOT arm the size trigger");
+        }
+    }
+}
+
+/// Stateful property model for [`PreconfJournal`].
+///
+/// Replays random `append` / `mark_sealed` / `rotate` sequences against the
+/// real journal and an independent reference model, checking after every step
+/// that the on-disk file, the `size_bytes` counter, and the in-memory
+/// `sealed` / `promised` sets all agree. Exercises the rotate retention rules
+/// (drop sealed, keep the rest) and the `sealed ⊆ promised == set(file)` shrink
+/// invariant — guarding against retention / accounting changes that leak
+/// entries or drift the counter. Deterministic behind the writer lock.
+#[cfg(test)]
+mod proptest_journal_model {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    // Small identity space so seal/rotate collisions are frequent.
+    const IDS: u8 = 6;
+
+    fn hash(byte: u8) -> TxHash {
+        TxHash::from([byte; 32])
+    }
+
+    /// Fixed 1:1 identity per byte — a signed tx's hash derives from its
+    /// content, so a given hash always carries the same entry bytes.
+    fn entry_for(byte: u8) -> JournalEntry {
+        JournalEntry {
+            hash: hash(byte),
+            tx_rlp: Bytes::from(vec![byte; 4]),
+            block_height: u64::from(byte),
+            committed_at_ms: 1_000 + u64::from(byte),
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Append(u8),
+        MarkSealed(Vec<u8>),
+        Rotate,
+    }
+
+    fn byte() -> impl Strategy<Value = u8> {
+        0..IDS
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            byte().prop_map(Op::Append),
+            prop::collection::vec(byte(), 0..4).prop_map(Op::MarkSealed),
+            Just(Op::Rotate),
+        ]
+    }
+
+    /// Reference model. `file` mirrors the on-disk line sequence (by identity
+    /// byte); `promised` / `sealed` mirror the in-memory sets.
+    #[derive(Default)]
+    struct Model {
+        file: Vec<u8>,
+        promised: BTreeSet<u8>,
+        sealed: BTreeSet<u8>,
+    }
+
+    impl Model {
+        fn apply(&mut self, op: &Op) {
+            match op {
+                Op::Append(b) => {
+                    self.file.push(*b);
+                    self.promised.insert(*b);
+                }
+                Op::MarkSealed(bytes) => {
+                    for b in bytes {
+                        // `mark_sealed` only admits already-promised hashes.
+                        if self.promised.contains(b) {
+                            self.sealed.insert(*b);
+                        }
+                    }
+                }
+                Op::Rotate => {
+                    // Drop every file line whose hash is sealed; the dropped
+                    // hashes leave both `sealed` and `promised` (no abandon
+                    // TTL is configured, so that is the only drop rule).
+                    let sealed = self.sealed.clone();
+                    self.file.retain(|b| !sealed.contains(b));
+                    for b in &sealed {
+                        self.sealed.remove(b);
+                        self.promised.remove(b);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn fresh() -> (TempDir, PreconfJournal) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // Large cap so appends never auto-arm the size trigger during replay.
+        let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
+        (dir, j)
+    }
+
+    async fn run_and_check(ops: &[Op]) {
+        let (dir, j) = fresh().await;
+        let path = dir.path().join("preconf.jsonl");
+        let mut model = Model::default();
+
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                Op::Append(b) => j.append_promised(&entry_for(*b)).await.unwrap(),
+                Op::MarkSealed(bytes) => j.mark_sealed_batch(bytes.iter().map(|b| hash(*b))).await,
+                Op::Rotate => {
+                    // Stats computed from the pre-rotate model.
+                    let before = model.file.len();
+                    let kept_expected =
+                        model.file.iter().filter(|b| !model.sealed.contains(b)).count();
+                    let stats = j.rotate().await.unwrap();
+                    assert_eq!(stats.kept, kept_expected, "step {i}: rotate kept mismatch");
+                    assert_eq!(
+                        stats.dropped,
+                        before - kept_expected,
+                        "step {i}: rotate dropped mismatch"
+                    );
+                }
+            }
+            model.apply(op);
+
+            // (A) On-disk contents match the model's file, in order.
+            let (loaded, bad) = j.load().await.unwrap();
+            assert_eq!(bad, 0, "step {i}: unexpected corrupt lines");
+            let expected: Vec<JournalEntry> = model.file.iter().map(|b| entry_for(*b)).collect();
+            assert_eq!(loaded, expected, "step {i}: journal file diverged after {op:?}");
+
+            // (B) `size_bytes` equals the true on-disk file size.
+            let disk = tokio::fs::metadata(&path).await.unwrap().len();
+            assert_eq!(
+                j.size_bytes.load(Ordering::Relaxed),
+                disk,
+                "step {i}: size_bytes drifted from disk after {op:?}"
+            );
+
+            // (C) `sealed` matches (public API).
+            assert_eq!(j.sealed_len().await, model.sealed.len(), "step {i}: sealed_len mismatch");
+            for b in 0..IDS {
+                assert_eq!(
+                    j.contains(&hash(b)).await,
+                    model.sealed.contains(&b),
+                    "step {i}: sealed membership mismatch for {b}"
+                );
+            }
+
+            // (D) `promised == set(file)` — the shrink invariant: rotate must
+            // evict dropped commitments from `promised`, not leak them forever.
+            let real_promised: BTreeSet<TxHash> = j.promised.lock().await.iter().copied().collect();
+            let model_promised: BTreeSet<TxHash> =
+                model.promised.iter().map(|b| hash(*b)).collect();
+            assert_eq!(real_promised, model_promised, "step {i}: promised set diverged");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 192, ..ProptestConfig::default() })]
+
+        /// Any sequence of append / mark_sealed / rotate keeps the on-disk
+        /// journal, the `size_bytes` counter, and the in-memory
+        /// `sealed` / `promised` sets in lock-step with the reference model —
+        /// in particular rotate drops exactly the sealed commitments and
+        /// shrinks `promised` / `sealed` (no unbounded growth).
+        #[test]
+        fn preconf_journal_matches_reference_model(ops in prop::collection::vec(op(), 1..30)) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(run_and_check(&ops));
         }
     }
 }
