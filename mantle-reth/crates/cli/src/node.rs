@@ -6,8 +6,9 @@
 
 use crate::txpool::MantleTransactionValidator;
 use mantle_reth_preconf::{
-    MantlePreconfServiceBuilder, PreconfAwareValidator, PreconfConfig, PreconfPoolListener,
-    PreconfServiceBuilder, PreconfTxSet,
+    MantlePreconfServiceBuilder, PreconfAwareValidator, PreconfClassifier, PreconfConfig,
+    PreconfPoolListener, PreconfServiceBuilder, PreconfTxSet, bootstrap_whitelist,
+    run_whitelist_watcher,
 };
 use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
 use op_alloy_consensus::OpTxEnvelope;
@@ -94,6 +95,10 @@ pub struct MantlePoolBuilder<T = OpPooledTransaction> {
 pub struct PreconfWiring {
     /// Runtime preconf configuration; cloned into the validator.
     pub cfg: Arc<PreconfConfig>,
+    /// Owns the allowlists; the single decider of preconf eligibility.
+    /// Shared with the RPC handler and the payload builder — a second
+    /// instance would let two components disagree about the same tx.
+    pub classifier: Arc<PreconfClassifier>,
     /// Commitment fifo shared between validator, RPC handler, and builder.
     pub fifo: Arc<PreconfTxSet>,
     /// Handle to the application-level service builder — used by
@@ -139,10 +144,11 @@ impl<T> MantlePoolBuilder<T> {
     pub fn with_preconf(
         mut self,
         cfg: Arc<PreconfConfig>,
+        classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
         svc: Arc<PreconfServiceBuilder>,
     ) -> Self {
-        self.preconf = Some(PreconfWiring { cfg, fifo, svc: Some(svc) });
+        self.preconf = Some(PreconfWiring { cfg, classifier, fifo, svc: Some(svc) });
         self
     }
 }
@@ -173,17 +179,24 @@ where
         // up preconf (`with_preconf` not invoked), supply default-disabled
         // handles so the `PreconfAwareValidator` layer becomes a cheap
         // pass-through (empty fifo + disabled cfg).
-        let (preconf_cfg, preconf_fifo, preconf_svc) = match self.preconf.clone() {
-            Some(p) => (p.cfg, p.fifo, p.svc),
-            None => {
-                let cfg = Arc::new(PreconfConfig::default());
-                let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
-                (cfg, fifo, None)
-            }
-        };
+        // The journal handle is deliberately not pulled out here: nothing in
+        // this scope needs it any more. The pool listener asks the classifier
+        // (`is_promised`) instead of the journal's sealed set, and rotation
+        // reaches the journal through `svc.journal()` below.
+        let (preconf_cfg, preconf_classifier, preconf_fifo, preconf_svc) =
+            match self.preconf.clone() {
+                Some(p) => (p.cfg, p.classifier, p.fifo, p.svc),
+                None => {
+                    let cfg = PreconfConfig::default();
+                    let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
+                    let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
+                    (Arc::new(cfg), classifier, fifo, None)
+                }
+            };
         // Clones moved into the validator-build closure. The listener
         // (spawned later) takes a separate clone of the same Arcs.
         let validator_cfg = preconf_cfg.clone();
+        let validator_classifier = preconf_classifier.clone();
         let validator_fifo = preconf_fifo.clone();
 
         let validator =
@@ -215,6 +228,7 @@ where
                     PreconfAwareValidator::new(
                         mantle_validator,
                         validator_cfg.clone(),
+                        validator_classifier.clone(),
                         validator_fifo.clone(),
                     )
                 });
@@ -228,6 +242,46 @@ where
         // Mantle does not use OP interop — filter is always disabled
         let transaction_pool = OpPool::new(inner_pool, false);
 
+        // Load the on-chain allowlists BEFORE anything can classify a
+        // transaction, and start tracking updates.
+        //
+        // This has to happen here rather than in the binary's
+        // `on_node_started` hook, which runs *after* the RPC server, the
+        // payload builder and the consensus engine are up. With eligibility
+        // decided per-lookup that ordering was merely a short fail-closed
+        // window that healed itself; now that a verdict is frozen at admission,
+        // anything admitted inside the window would be frozen `NotEligible`
+        // against empty allowlists and stay that way for the rest of the tx's
+        // life. Cold-starting here closes the window entirely — the pool
+        // listener (below), the RPC server and the builder all come up later.
+        //
+        // It also has to precede journal restore: restore pushes promised
+        // envelopes through the validator, which classifies them.
+        //
+        // Fatal on a code-less address, exactly as before: `build_pool` returns
+        // `eyre::Result`, so the launch aborts. An *empty* allowlist is not an
+        // error — it is a legitimate governance state (see the whitelist
+        // module's "whose decision is it").
+        //
+        // Gated on `enabled` for the same reason the pool listener below is:
+        // preconf is a sequencer-only mechanism, and a node that did not opt in
+        // must not run any of its machinery. Both entry points also gate
+        // themselves (`wants_whitelist`), which is what covers `--preconf.all`;
+        // the check here additionally keeps a verifier from spawning a critical
+        // task that would only return immediately.
+        if preconf_cfg.enabled {
+            bootstrap_whitelist(ctx.provider(), &preconf_cfg, &preconf_classifier)
+                .map_err(|e| eyre::eyre!("preconf whitelist bootstrap: {e}"))?;
+
+            let watcher_cfg = preconf_cfg.clone();
+            let watcher_classifier = preconf_classifier.clone();
+            let watcher_provider = ctx.provider().clone();
+            ctx.task_executor().spawn_critical_task(
+                "mantle-preconf-whitelist-watcher",
+                run_whitelist_watcher(watcher_provider, watcher_cfg, watcher_classifier),
+            );
+        }
+
         // Run journal restore before any background pool task starts consuming
         // events. Two ordering constraints:
         // - Must run before `spawn_maintenance_tasks` (which spawns reth's local-tx backup loader)
@@ -235,9 +289,16 @@ where
         // - Must run before the pool listener is spawned so the restore helper's fifo pushes are
         //   attributed to the restart path, not to a fresh RPC submission.
         if let Some(svc) = preconf_svc.as_ref() {
-            use mantle_reth_preconf::RestorePoolAdapter;
+            use mantle_reth_preconf::{ProviderChainView, RestorePoolAdapter};
             let adapter = RestorePoolAdapter::<_, T, TxTy<N::Types>>::new(transaction_pool.clone());
-            svc.start(&adapter).await.map_err(|e| eyre::eyre!("preconf service start: {e:?}"))?;
+            // The provider answers restore's chain question — whether a
+            // commitment whose nonce is gone is the transaction that consumed it.
+            // The pool cannot: its only chain-derived signal is the account
+            // nonce. See `CommitmentChainView`.
+            let chain_view = ProviderChainView::new(ctx.provider().clone());
+            svc.start(&adapter, &chain_view)
+                .await
+                .map_err(|e| eyre::eyre!("preconf service start: {e:?}"))?;
             info!(target: "reth::cli", "Mantle preconf service builder started (restore + wire)");
         }
 
@@ -252,18 +313,16 @@ where
         // false and the listener would just sit idle filtering every tx
         // against empty whitelists. Skipping the spawn saves a task.
         if preconf_cfg.enabled {
-            // Enabled ⇒ `with_preconf` was called ⇒ svc (and its mandatory
-            // journal) is present.
-            let journal = preconf_svc
-                .as_ref()
-                .expect("preconf enabled implies a service builder")
-                .journal()
-                .clone();
+            // No journal handle is threaded in: reorg-reinject detection asks
+            // the classifier (`is_promised`) rather than the journal's sealed
+            // set. The journal stays mandatory and owned by `svc`; the listener
+            // simply has no need of it, and asking the classifier keeps a hot
+            // path off the journal's async lock.
             let listener = PreconfPoolListener::new(
                 transaction_pool.clone(),
                 preconf_cfg.clone(),
+                preconf_classifier.clone(),
                 preconf_fifo.clone(),
-                journal,
             );
             ctx.task_executor().spawn_critical_task("mantle-preconf-pool-listener", listener.run());
             info!(target: "reth::cli", "Mantle preconf pool listener spawned");
@@ -373,7 +432,12 @@ impl MantleNode {
         let mut pool_builder =
             MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional);
         if let Some(p) = &self.preconf {
-            pool_builder = pool_builder.with_preconf(p.cfg().clone(), p.fifo().clone(), p.clone());
+            pool_builder = pool_builder.with_preconf(
+                p.cfg().clone(),
+                p.classifier().clone(),
+                p.fifo().clone(),
+                p.clone(),
+            );
         }
 
         // Construct the preconf-aware payload service. When
@@ -386,18 +450,24 @@ impl MantleNode {
             self.op_node.gas_limit_config.clone(),
             args.sdm_enabled,
         );
-        let (cfg, fifo) = if let Some(p) = &self.preconf {
-            (p.cfg().clone(), p.fifo().clone())
+        let (cfg, classifier, fifo) = if let Some(p) = &self.preconf {
+            (p.cfg().clone(), p.classifier().clone(), p.fifo().clone())
         } else {
-            // Disabled path: a default-empty cfg/fifo (no whitelist, no
-            // events). No service builder — the journal is only opened when
-            // preconf is enabled.
-            let cfg = Arc::new(PreconfConfig::default());
+            // Disabled path: default-empty cfg / classifier / fifo (no
+            // allowlists, no events).
+            //
+            // Built by hand rather than through a `PreconfServiceBuilder`,
+            // which must **not** be constructed here: it requires a resolved
+            // `journal_path` and opens the journal file, and the default config
+            // deliberately leaves that path unresolved. Same shape as the
+            // disabled path in `build_pool` above.
+            let cfg = PreconfConfig::default();
+            let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
             let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
-            (cfg, fifo)
+            (Arc::new(cfg), classifier, fifo)
         };
         let payload_service =
-            MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, fifo, builder_config);
+            MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, classifier, fifo, builder_config);
 
         ComponentsBuilder::default()
             .node_types::<N>()
@@ -480,7 +550,12 @@ where
                     // sealed hashes reported by the canon handler on the
                     // way down are dropped from the journal file before
                     // the node exits.
+                    // Journal is mandatory (stage2), so no `Option` dance here.
                     let journal = svc.journal().clone();
+                    // Rotation asks the classifier which commitments are still
+                    // tracked — it owns that answer now, the journal no longer
+                    // keeps its own sealed set.
+                    let rotate_classifier = svc.classifier().clone();
                     let interval = svc.cfg().rejournal_interval;
                     ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(
                         "mantle-preconf-rejournal-loop",
@@ -495,9 +570,13 @@ where
                             // until the last on-disk write finishes,
                             // so the process only exits after the
                             // journal file has been closed cleanly.
-                            let guard =
-                                mantle_reth_preconf::run_rejournal_loop(journal, interval, signal)
-                                    .await;
+                            let guard = mantle_reth_preconf::run_rejournal_loop(
+                                journal,
+                                rotate_classifier,
+                                interval,
+                                signal,
+                            )
+                            .await;
                             // Explicit drop for clarity; the guard is
                             // released here, letting `TaskManager`'s
                             // outstanding-tasks counter reach zero.
@@ -564,12 +643,14 @@ mod tests {
         let svc = test_svc(&dir).await;
         let cfg_ptr = svc.cfg().clone();
         let fifo_ptr = svc.fifo().clone();
+        let classifier_ptr = svc.classifier().clone();
 
         let node = MantleNode::new(default_args()).with_preconf(svc);
         let stored = node.preconf.as_ref().expect("with_preconf must attach handle");
         // Pointer-equal: no clone-and-rebuild — same Arc instance.
         assert!(Arc::ptr_eq(stored.cfg(), &cfg_ptr));
         assert!(Arc::ptr_eq(stored.fifo(), &fifo_ptr));
+        assert!(Arc::ptr_eq(stored.classifier(), &classifier_ptr));
     }
 
     #[tokio::test]

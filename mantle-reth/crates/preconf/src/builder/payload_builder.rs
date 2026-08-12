@@ -20,7 +20,7 @@ use alloy_consensus::{
 };
 use alloy_eips::eip2718::Encodable2718;
 use alloy_evm::Evm;
-use alloy_primitives::{Address, Sealed, TxHash, TxKind, U256};
+use alloy_primitives::{Address, Sealed, TxHash, U256};
 use op_alloy_consensus::{SDMGasEntry, TxPostExec, build_post_exec_tx};
 use op_revm::{L1BlockInfo, constants::L1_BLOCK_CONTRACT};
 use reth_basic_payload_builder::BuildArguments;
@@ -55,9 +55,10 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::{
-    PreconfConfig, PreconfTxSet,
+    PreconfClassifier, PreconfConfig, PreconfTxSet,
     apply::{ApplyError, apply_preconf_tx},
     builder::{cancel::JobCancel, dispatch},
+    classifier::Verdict,
     types::{PreconfError, PreconfReceipt, PreconfSource},
 };
 
@@ -116,6 +117,9 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     /// / SDM-enable settings.
     builder_config: OpBuilderConfig,
     cfg: Arc<PreconfConfig>,
+    /// Decides which arm owns a transaction. Read synchronously from the
+    /// pool best-tx step, which is why it cannot be the (async) fifo.
+    classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
 }
 
@@ -132,9 +136,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         evm_config: Evm,
         builder_config: OpBuilderConfig,
         cfg: Arc<PreconfConfig>,
+        classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
     ) -> Self {
-        Self { pool, client, evm_config, builder_config, cfg, fifo }
+        Self { pool, client, evm_config, builder_config, cfg, classifier, fifo }
     }
 
     /// Borrow the underlying transaction pool.
@@ -160,6 +165,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     /// Borrow the shared preconf config handle.
     pub const fn cfg(&self) -> &Arc<PreconfConfig> {
         &self.cfg
+    }
+
+    /// Borrow the shared classifier handle.
+    pub const fn classifier(&self) -> &Arc<PreconfClassifier> {
+        &self.classifier
     }
 
     /// Borrow the shared preconf fifo handle.
@@ -546,7 +556,14 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
                     carryover_hashes.push(view.hash);
                 }
             }
-            PreconfStatus::Failed | PreconfStatus::Timeout | PreconfStatus::Canceled => {}
+            // Terminal for carryover purposes. `Broken` is here because dispatch
+            // has already exhausted `preconf_max_apply_attempts` on it —
+            // retrying it every subsequent job would spin forever. Only a
+            // same-hash resubmit revives it (`push_if_absent`).
+            PreconfStatus::Failed |
+            PreconfStatus::Timeout |
+            PreconfStatus::Canceled |
+            PreconfStatus::Broken => {}
         }
     }
     carryover_hashes
@@ -667,7 +684,7 @@ enum BestTxStep {
 /// commitment application.
 #[allow(clippy::too_many_arguments)]
 fn apply_one_best_tx<N, Builder>(
-    cfg: &PreconfConfig,
+    classifier: &PreconfClassifier,
     best_txs: &mut impl PayloadTransactions<
         Transaction: PoolTransaction<Consensus = N::SignedTx> + OpPooledTx,
     >,
@@ -687,17 +704,34 @@ where
     // that was just admitted to the pool but whose fifo entry hasn't
     // been pushed yet by the async pool listener — the tx would land on
     // chain via the pool path while the client sees a Timeout/Failed
-    // response (responder never called). The preconf listener creates a
-    // fifo entry for every preconf-eligible tx entering the pool, so
-    // skipping here does not drop the tx — it merely constrains it to
-    // the preconf ordering.
-    let sender = tx.sender();
-    let to = match tx.kind() {
-        TxKind::Call(addr) => Some(addr),
-        TxKind::Create => None,
-    };
-    if cfg.is_preconf_tx(&sender, to.as_ref()) {
-        best_txs.mark_invalid(sender, tx.nonce());
+    // response (responder never called).
+    //
+    // Skipping here does not drop the tx — it merely constrains it to the
+    // preconf ordering. That rests on "the listener creates a fifo entry for
+    // every preconf-eligible tx entering the pool", which is **not**
+    // unconditional: `push_if_absent` answers `ConflictActive` when a different
+    // hash already holds the tx's `(sender, nonce)`, and such an entry gets no
+    // fifo record at all. What rules that out is a precondition enforced
+    // elsewhere — `PreconfAwareValidator`'s replacement guard refuses a second
+    // preconf tx for a `(sender, nonce)` that one already occupies, so a tx the
+    // pool accepted cannot collide. Before that guard covered the pool→fifo
+    // window the claim was simply false, and the colliding tx was skipped by
+    // *both* arms: silently never applied, with no error to its client.
+    //
+    // One deliberate exception survives: a `Verdict::Promised` tx is exempt from
+    // that guard (journal restore must re-admit an acknowledged commitment
+    // unconditionally), so it can reach the pool on an occupied nonce and be
+    // refused a fifo entry. Losing is the intended outcome there — the fifo's
+    // documented policy is to keep the fresher entry — and the restored tx is
+    // dropped by the pool itself once the winner's nonce lands.
+    //
+    // The predicate is the **frozen verdict**, never a live allowlist read: the
+    // fifo entry the preconf arm will apply was created by the listener from
+    // that same record, so re-deriving eligibility here would let an allowlist
+    // update between the two decisions strand the tx with neither arm applying
+    // it (Case A / Case B of the classifier design).
+    if classifier.verdict(tx.hash()).is_some_and(Verdict::is_preconf) {
+        best_txs.mark_invalid(tx.sender(), tx.nonce());
         return Ok(BestTxStep::Continue);
     }
     let interop = tx.interop_deadline();
@@ -1082,7 +1116,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     let iter = best_txs_iter.as_mut().expect("guard verified Some");
                     let before = info.cumulative_gas_used;
                     match apply_one_best_tx::<N, _>(
-                        &self.cfg,
+                        &self.classifier,
                         iter,
                         &mut builder,
                         &mut info,
@@ -1166,6 +1200,7 @@ mod tests {
     #[test]
     fn constructor_threads_shared_handles() {
         let cfg = Arc::new(PreconfConfig::default());
+        let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
         let fifo = Arc::new(PreconfTxSet::new(8));
         let builder_config = OpBuilderConfig::default();
         let builder = PreconfPayloadBuilder::new(
@@ -1174,9 +1209,11 @@ mod tests {
             DummyEvm,
             builder_config,
             cfg.clone(),
+            classifier.clone(),
             fifo.clone(),
         );
         assert!(Arc::ptr_eq(builder.cfg(), &cfg));
+        assert!(Arc::ptr_eq(builder.classifier(), &classifier));
         assert!(Arc::ptr_eq(builder.fifo(), &fifo));
         // Arc counts: outer + inside builder = 2 each.
         assert_eq!(Arc::strong_count(&cfg), 2);

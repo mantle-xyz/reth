@@ -14,8 +14,8 @@
 //! `validation_reject.rs` — it's a pre-fifo rejection path, not part
 //! of the dispatch-time budget accounting.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf, wait_latest_nonce, wait_pending_nonce};
-use crate::{canonize_built, launch_preconf_node};
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_pending_nonce};
+use crate::{canonicalize_payload, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -275,11 +275,9 @@ async fn canceled_tx_recoverable_in_next_slot() {
         other => panic!("expected Call error, got {other:?}"),
     }
 
-    // Canonicalise slot 1 so the block-gas-budget resets and the still-`Success`
-    // tx0/tx1 are dropped (else the slot-2 job re-applies them and exhausts the
-    // budget before tx2's retry). `wait_latest_nonce` confirms canon settled.
-    canonize_built!(node, payload_1);
-    wait_latest_nonce(&http, wallet_addr, 2).await;
+    // Canonicalise slot 1 so on-chain nonce advances to 2 and the F1
+    // budget resets for slot 2.
+    let _new_head = canonicalize_payload!(node, payload_1).await;
 
     // ── Slot 2: same-hash tx2 must succeed ───────────────────────────
     let attrs_2 = node.payload.next_attributes();

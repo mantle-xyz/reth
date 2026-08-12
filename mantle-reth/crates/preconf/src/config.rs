@@ -3,7 +3,7 @@
 //! Default values match op-geth's `--txpool.*` semantics where applicable;
 //! intentional differences are noted inline.
 
-use alloy_primitives::{Address, map::foldhash::HashSet};
+use alloy_primitives::Address;
 use std::{path::PathBuf, time::Duration};
 
 /// Default client-side RPC oneshot wait — 1s.
@@ -58,6 +58,23 @@ pub const DEFAULT_SAFETY_MARGIN: Duration = Duration::from_millis(40);
 /// Matches op-geth `--txpool.rejournal` default.
 pub const DEFAULT_REJOURNAL_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Default replay-apply attempt budget for an already-acknowledged
+/// commitment — 3.
+///
+/// Once a receipt has been returned, a failed apply must not turn the entry
+/// into a replaceable terminal state, which would let an acknowledged
+/// commitment be displaced. Dispatch
+/// instead keeps the entry `Waiting` so the next payload job retries it
+/// against fresh block state, and only after this many consecutive failures
+/// gives up into `PreconfStatus::Broken`.
+///
+/// One attempt per payload job, so 3 spans roughly `3 × slot_duration` (~6s
+/// at OP defaults) — long enough for a transient in-flight state race to
+/// clear, short enough that a genuinely inapplicable tx surfaces as a broken
+/// commitment instead of retrying forever. op-geth has no equivalent: it has
+/// no replay path at all.
+pub const DEFAULT_MAX_APPLY_ATTEMPTS: u8 = 3;
+
 /// Default journal max disk size — 1 GiB.
 ///
 /// Above this, rotation forces rename + new file.
@@ -78,9 +95,11 @@ pub const DEFAULT_BROADCAST_CAP: usize = 65536;
 /// Runtime preconf configuration; distributed as `Arc<PreconfConfig>` after
 /// construction.
 ///
-/// Lifecycle: build → [`Self::validate`] → `Arc::new`. Once wrapped in `Arc`,
-/// downstream readers (validator / pool listener / RPC handler / payload
-/// builder) cannot mutate it.
+/// Lifecycle: build → [`Self::validate`] → `Arc::new`. Every field is immutable
+/// afterwards. The mutable runtime state that used to live here — the
+/// allowlists — belongs to
+/// [`PreconfClassifier`](crate::classifier::PreconfClassifier), which owns them
+/// privately so eligibility can only be decided in one place.
 #[derive(Debug, Clone)]
 pub struct PreconfConfig {
     /// Master switch: false → entire preconf subsystem stays inactive
@@ -88,17 +107,14 @@ pub struct PreconfConfig {
     /// task does not spawn).
     pub enabled: bool,
 
-    /// Whitelist of "from" addresses. A tx is preconf-eligible if its sender
-    /// is in this set **and** its destination is in `to_preconfs`
-    /// (see [`Self::is_preconf_tx`]) — or [`Self::all_preconfs`] is `true`.
-    pub from_preconfs: HashSet<Address>,
-
-    /// Whitelist of "to" addresses; see `from_preconfs`.
-    pub to_preconfs: HashSet<Address>,
+    /// Address of the L2 `PreconfWhitelist` contract — the sole source of
+    /// truth for the allowlists. Required when `enabled && !all_preconfs`
+    /// (enforced by [`Self::validate`]); ignored otherwise.
+    pub whitelist_contract: Option<Address>,
 
     /// If true, all transactions are treated as preconf-eligible regardless
-    /// of `from_preconfs` / `to_preconfs`. Aligns with op-geth's
-    /// `tx_pool_config::AllPreconfs`.
+    /// of the allowlists, and the whitelist contract is never read. Aligns
+    /// with op-geth's `tx_pool_config::AllPreconfs`.
     pub all_preconfs: bool,
 
     /// Client-side oneshot wait — default 1s (see [`DEFAULT_PRECONF_TIMEOUT`]).
@@ -123,6 +139,17 @@ pub struct PreconfConfig {
     /// quota schedule: `pool_cumulative_quota(t) = (t / slot_duration)
     /// × block_gas_limit`. Default 2s (OP-stack block time).
     pub slot_duration: Duration,
+
+    /// How many consecutive replay applies may fail before an
+    /// already-acknowledged commitment is given up on and moved to
+    /// [`crate::types::PreconfStatus::Broken`]. Default 3 (see
+    /// [`DEFAULT_MAX_APPLY_ATTEMPTS`]).
+    ///
+    /// Only affects entries whose receipt has already been returned
+    /// (`PreconfSource::Replay`); a live RPC submission still fails fast on the
+    /// first apply error. Must be ≥ 1 (enforced by [`Self::validate`]) — 0 would
+    /// break the commitment on a failure that had never even been retried.
+    pub preconf_max_apply_attempts: u8,
 
     // ===== Operator hardening =====
     /// Per-tx gas limit for preconf-eligible transactions.
@@ -156,20 +183,19 @@ pub struct PreconfConfig {
 }
 
 impl Default for PreconfConfig {
-    /// Constructs a disabled-by-default config. Operator opts in via the
-    /// clap-derived `--preconf.enable` CLI flag (see
-    /// `mantle-reth-cli`'s `args.rs`), which builds the enabled config
-    /// through `PreconfArgs::into_config`.
+    /// Constructs a disabled-by-default config. Operator opts in with the
+    /// `--preconf.enable` CLI flag, which `mantle-reth-cli`'s `PreconfArgs`
+    /// turns into a populated config via `into_config`.
     fn default() -> Self {
         Self {
             enabled: false,
-            from_preconfs: HashSet::default(),
-            to_preconfs: HashSet::default(),
+            whitelist_contract: None,
             all_preconfs: false,
             preconf_timeout: DEFAULT_PRECONF_TIMEOUT,
             safety_margin: DEFAULT_SAFETY_MARGIN,
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             slot_duration: DEFAULT_SLOT_DURATION,
+            preconf_max_apply_attempts: DEFAULT_MAX_APPLY_ATTEMPTS,
             preconf_max_gas_per_tx: DEFAULT_PRECONF_MAX_GAS_PER_TX,
             preconf_max_gas_per_block: DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
             journal_path: None,
@@ -195,6 +221,10 @@ pub enum PreconfConfigError {
     /// `preconf_timeout == 0`.
     #[error("preconf_timeout must be > 0")]
     InvalidPreconfTimeout,
+    /// `preconf_max_apply_attempts == 0` — a commitment would be declared
+    /// broken on a failure it was never retried after.
+    #[error("preconf_max_apply_attempts must be > 0")]
+    InvalidMaxApplyAttempts,
     /// `sweep_interval == 0`.
     #[error("sweep_interval must be > 0")]
     InvalidSweepInterval,
@@ -225,42 +255,22 @@ pub enum PreconfConfigError {
         /// Configured per-tx limit.
         per_tx: u64,
     },
-    /// `enabled = true` but no eligibility rules configured — `all_preconfs`
-    /// is false and `from_preconfs` is empty, meaning [`PreconfConfig::is_preconf_tx`]
-    /// would return false for every tx. Spawning the pool listener / journal
-    /// / canon handler in this state burns resources for no functional effect.
+    /// `enabled = true`, `all_preconfs = false`, but no whitelist contract
+    /// address was given. The allowlists are read from that contract, so
+    /// without it no tx could ever be classified eligible (see
+    /// [`PreconfClassifier`](crate::classifier::PreconfClassifier)) and the
+    /// subsystem would burn resources for no functional effect.
     #[error(
-        "preconf enabled but no eligibility rules: set all_preconfs=true or populate from_preconfs"
+        "--preconf.whitelist-contract is required when preconf is enabled and --preconf.all is not set"
     )]
-    EnabledWithoutEligibility,
+    MissingWhitelistContract,
+    /// `whitelist_contract` was given as the zero address, which cannot hold a
+    /// contract.
+    #[error("--preconf.whitelist-contract must be a non-zero address")]
+    ZeroWhitelistContract,
 }
 
 impl PreconfConfig {
-    /// Whitelist check for "from" only.
-    ///
-    /// Returns true when `all_preconfs` is set or `from` is in `from_preconfs`.
-    /// Mirrors op-geth `tx_pool_config::IsPreconfTxFrom`.
-    #[inline]
-    pub fn is_preconf_from(&self, from: &Address) -> bool {
-        self.all_preconfs || self.from_preconfs.contains(from)
-    }
-
-    /// Whitelist check for the full (from, to) pair.
-    ///
-    /// Returns true if `all_preconfs` is set OR (`from` ∈ `from_preconfs` AND
-    /// `to` is `Some(addr)` with `addr` ∈ `to_preconfs`).
-    ///
-    /// Returns false for contract creations (`to == None`) when not in
-    /// `all_preconfs` mode — matches op-geth `IsPreconfTx` behavior.
-    #[inline]
-    pub fn is_preconf_tx(&self, from: &Address, to: Option<&Address>) -> bool {
-        if self.all_preconfs {
-            return true;
-        }
-        let Some(to) = to else { return false };
-        self.from_preconfs.contains(from) && self.to_preconfs.contains(to)
-    }
-
     /// Validates config invariants. Returns the original config on success
     /// for ergonomic chaining (`config.validate()?`).
     pub fn validate(self) -> Result<Self, PreconfConfigError> {
@@ -269,6 +279,9 @@ impl PreconfConfig {
         }
         if self.preconf_timeout.is_zero() {
             return Err(PreconfConfigError::InvalidPreconfTimeout);
+        }
+        if self.preconf_max_apply_attempts == 0 {
+            return Err(PreconfConfigError::InvalidMaxApplyAttempts);
         }
         if self.sweep_interval.is_zero() {
             return Err(PreconfConfigError::InvalidSweepInterval);
@@ -303,18 +316,19 @@ impl PreconfConfig {
         if self.journal_max_size == 0 {
             return Err(PreconfConfigError::InvalidJournalMaxSize);
         }
-        // `enabled` is only meaningful if some eligibility rule lets at least
-        // one tx through `is_preconf_tx`. Without `all_preconfs`, both whitelist
-        // sets must be non-empty: `is_preconf_tx` requires
-        // `from_preconfs.contains(from) && to_preconfs.contains(to)`, so an empty
-        // set on either side makes every tx fail the check. `enabled=true` in
-        // that state would spawn pool listener / journal / canon handler for
-        // zero functional effect.
-        if self.enabled &&
-            !self.all_preconfs &&
-            (self.from_preconfs.is_empty() || self.to_preconfs.is_empty())
-        {
-            return Err(PreconfConfigError::EnabledWithoutEligibility);
+        // `enabled` is only meaningful if some eligibility rule can classify a
+        // tx as eligible: either `all_preconfs`, or a whitelist contract to
+        // read the allowlists from. The allowlists themselves are legitimately
+        // empty at this point — they live on the classifier and are populated
+        // from L2 state after the node starts — so nothing here inspects them.
+        if self.enabled && !self.all_preconfs {
+            match self.whitelist_contract {
+                None => return Err(PreconfConfigError::MissingWhitelistContract),
+                Some(addr) if addr.is_zero() => {
+                    return Err(PreconfConfigError::ZeroWhitelistContract);
+                }
+                Some(_) => {}
+            }
         }
         Ok(self)
     }
@@ -337,47 +351,12 @@ mod tests {
         let cfg = PreconfConfig::default();
         assert!(!cfg.enabled);
         assert!(!cfg.all_preconfs);
-        assert!(cfg.from_preconfs.is_empty());
-        assert!(cfg.to_preconfs.is_empty());
+        assert_eq!(cfg.whitelist_contract, None);
     }
 
-    #[test]
-    fn is_preconf_from_with_whitelist() {
-        let mut cfg = PreconfConfig::default();
-        cfg.from_preconfs.insert(addr(1));
-        assert!(cfg.is_preconf_from(&addr(1)));
-        assert!(!cfg.is_preconf_from(&addr(2)));
-    }
-
-    #[test]
-    fn is_preconf_from_with_all() {
-        let mut cfg = PreconfConfig::default();
-        cfg.all_preconfs = true;
-        assert!(cfg.is_preconf_from(&addr(99)));
-    }
-
-    #[test]
-    fn is_preconf_tx_requires_both_from_and_to() {
-        let mut cfg = PreconfConfig::default();
-        cfg.from_preconfs.insert(addr(1));
-        cfg.to_preconfs.insert(addr(2));
-        // Both match
-        assert!(cfg.is_preconf_tx(&addr(1), Some(&addr(2))));
-        // Only `from` matches
-        assert!(!cfg.is_preconf_tx(&addr(1), Some(&addr(3))));
-        // Only `to` matches
-        assert!(!cfg.is_preconf_tx(&addr(5), Some(&addr(2))));
-        // Contract creation — never eligible without all_preconfs
-        assert!(!cfg.is_preconf_tx(&addr(1), None));
-    }
-
-    #[test]
-    fn is_preconf_tx_all_mode_includes_contract_creation() {
-        let mut cfg = PreconfConfig::default();
-        cfg.all_preconfs = true;
-        assert!(cfg.is_preconf_tx(&addr(99), None));
-        assert!(cfg.is_preconf_tx(&addr(99), Some(&addr(77))));
-    }
+    // The eligibility rule itself (`all_preconfs` short-circuit, "both lists
+    // must hit", contract creations) is tested in `crate::classifier`, which
+    // now owns the allowlists.
 
     #[test]
     fn validate_rejects_zero_broadcast_cap() {
@@ -509,59 +488,49 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_enabled_without_eligibility_rules() {
-        // enabled=true with no all_preconfs and both whitelists empty — would
-        // spawn background tasks for zero functional effect.
+    fn validate_rejects_enabled_without_whitelist_contract() {
+        // enabled=true, all_preconfs=false, but nowhere to read the allowlists
+        // from — every tx would fail eligibility and the subsystem would spawn
+        // background tasks for zero functional effect.
         let mut cfg = PreconfConfig::default();
         cfg.enabled = true;
-        assert!(matches!(cfg.validate(), Err(PreconfConfigError::EnabledWithoutEligibility)));
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::MissingWhitelistContract)));
     }
 
     #[test]
-    fn validate_rejects_enabled_with_only_from_whitelist() {
-        // from-only whitelist is a misconfig: is_preconf_tx requires both from
-        // AND to to be in their respective sets (op-geth-aligned semantics),
-        // so empty to_preconfs makes every tx fail eligibility.
+    fn validate_rejects_zero_whitelist_contract() {
         let mut cfg = PreconfConfig::default();
         cfg.enabled = true;
-        cfg.from_preconfs.insert(addr(1));
-        // to_preconfs left empty.
-        assert!(matches!(cfg.validate(), Err(PreconfConfigError::EnabledWithoutEligibility)));
+        cfg.whitelist_contract = Some(Address::ZERO);
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::ZeroWhitelistContract)));
     }
 
     #[test]
-    fn validate_rejects_enabled_with_only_to_whitelist() {
-        // Symmetric to the from-only case.
+    fn validate_passes_enabled_with_whitelist_contract_and_empty_sets() {
+        // The allowlists are legitimately empty until cold start reads them out
+        // of L2 state, so emptiness must not be an error. Regression guard for
+        // the on-chain whitelist mode.
         let mut cfg = PreconfConfig::default();
         cfg.enabled = true;
-        cfg.to_preconfs.insert(addr(2));
-        assert!(matches!(cfg.validate(), Err(PreconfConfigError::EnabledWithoutEligibility)));
+        cfg.whitelist_contract = Some(addr(7));
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn validate_passes_enabled_with_all_preconfs() {
-        // enabled=true + all_preconfs=true is the smallest valid eligible config.
+        // all_preconfs bypasses the contract entirely, so no address is needed.
         let mut cfg = PreconfConfig::default();
         cfg.enabled = true;
         cfg.all_preconfs = true;
+        assert_eq!(cfg.whitelist_contract, None);
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
-    fn validate_passes_enabled_with_both_whitelists_populated() {
-        // enabled=true + non-empty (from, to) whitelists is valid.
-        let mut cfg = PreconfConfig::default();
-        cfg.enabled = true;
-        cfg.from_preconfs.insert(addr(1));
-        cfg.to_preconfs.insert(addr(2));
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_passes_disabled_with_empty_whitelists() {
-        // enabled=false bypasses the eligibility check entirely — default
-        // config (all empty) must remain valid. Regression guard for the
-        // default-disabled wiring path used when MantleNode.preconf == None.
+    fn validate_passes_disabled_without_whitelist_contract() {
+        // enabled=false bypasses the whitelist check entirely — the default
+        // config must remain valid. Regression guard for the default-disabled
+        // wiring path used when MantleNode.preconf == None.
         let cfg = PreconfConfig::default();
         assert!(!cfg.enabled);
         assert!(cfg.validate().is_ok());

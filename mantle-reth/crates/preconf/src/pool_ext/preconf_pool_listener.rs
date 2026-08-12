@@ -2,7 +2,7 @@
 //!
 //! Subscribes to a [`TransactionPool`] via
 //! [`new_pending_pool_transactions_listener`] and forwards every
-//! preconf-eligible tx (per [`PreconfConfig::is_preconf_tx`]) into the fifo.
+//! preconf-eligible tx (per [`PreconfClassifier`]) into the fifo.
 //! Non-whitelisted txs and OP `Deposit` / `PostExec` variants are silently
 //! dropped.
 //!
@@ -31,7 +31,7 @@ use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use tracing::{debug, trace, warn};
 
 use crate::{
-    PreconfJournal,
+    classifier::{PreconfClassifier, Verdict},
     config::PreconfConfig,
     preconf_tx_set::PreconfTxSet,
     types::{PreconfError, PushResult},
@@ -46,15 +46,8 @@ use crate::{
 pub struct PreconfPoolListener<P, Tx, Cons> {
     pool: P,
     cfg: Arc<PreconfConfig>,
+    classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
-    /// Journal handle (mandatory) used to distinguish reorg-reinjected txs
-    /// from fresh RPC submissions. Every incoming pool event is checked
-    /// against `journal.sealed`; a hit means the tx was previously promised
-    /// to a client (`mark_sealed` fired on an earlier canon commit) and must
-    /// bypass the deadline / block-gas-budget gates — so we push with
-    /// [`PreconfSource::Replay`] to align with the SLA "receipt returned → tx
-    /// must land" contract.
-    journal: Arc<PreconfJournal>,
     _tx: PhantomData<fn() -> Tx>,
     _cons: PhantomData<fn() -> Cons>,
 }
@@ -77,16 +70,19 @@ where
     Tx: PoolTransaction<Consensus = Cons> + 'static,
     Cons: Clone + Into<OpTxEnvelope>,
 {
-    /// Construct a listener bound to `pool`. The `journal` is mandatory; the
-    /// listener consults its sealed set to detect reorg reinjects and route
-    /// them through the SLA-bypass source.
+    /// Construct a listener bound to `pool`.
+    ///
+    /// Takes no journal handle: reorg-reinject detection asks the classifier
+    /// (`is_promised`, synchronous) instead of the journal's sealed set. The
+    /// classifier is the one owner of "is this commitment still ours", and
+    /// asking it keeps this event-loop step off the journal's async lock.
     pub const fn new(
         pool: P,
         cfg: Arc<PreconfConfig>,
+        classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
-        journal: Arc<PreconfJournal>,
     ) -> Self {
-        Self { pool, cfg, fifo, journal, _tx: PhantomData, _cons: PhantomData }
+        Self { pool, cfg, classifier, fifo, _tx: PhantomData, _cons: PhantomData }
     }
 
     /// Run the listener loop. Returns when the pool's listener stream closes.
@@ -101,7 +97,16 @@ where
             let sender = valid.transaction.sender();
             let to = valid.transaction.to();
 
-            if !self.cfg.is_preconf_tx(&sender, to.as_ref()) {
+            // Read the verdict frozen at admission — never the allowlists.
+            // This is what makes the listener and the payload builder agree:
+            // both ask the same frozen record, so an allowlist update landing
+            // between the two cannot split a tx's classification.
+            //
+            // `None` (no record) means the preconf arm makes no claim, so skip.
+            // It cannot legitimately happen for a tx we are seeing as `Pending`
+            // — the validator classifies synchronously before admission — but
+            // skipping is the safe default either way: the pool arm takes it.
+            if !self.classifier.verdict(valid.transaction.hash()).is_some_and(Verdict::is_preconf) {
                 trace!(
                     target: "mantle::preconf::listener",
                     ?sender, ?to,
@@ -126,12 +131,18 @@ where
             // Copy the hash out before moving the envelope into Arc.
             let hash = *envelope.tx_hash();
 
-            // Reorg reinject detection: if the hash has ever been
-            // `mark_sealed`-ed on a prior canon commit, this pool event
-            // is the pool's reorg re-inject path returning a
-            // previously-promised tx. Bypass the deadline / gas budget
-            // gates by pushing with `Replay` source.
-            let source = if self.journal.contains(&hash).await {
+            // Reorg reinject detection: if a receipt for this hash has already
+            // gone out to a client, this pool event is the pool's reorg
+            // re-inject path returning a previously-promised tx. Bypass the
+            // deadline / gas budget gates by pushing with `Replay` source.
+            //
+            // Asked of the classifier, synchronously. It used to be
+            // `journal.contains(&hash).await`: an async lock on a different
+            // structure, for a question the classifier already owns the answer
+            // to. Two trackers of "this commitment is over" also disagreed —
+            // the journal's notion was "canonical once", which a reorg undoes,
+            // and this is precisely the reorg path.
+            let source = if self.classifier.is_promised(&hash) {
                 crate::types::PreconfSource::Replay
             } else {
                 crate::types::PreconfSource::Rpc

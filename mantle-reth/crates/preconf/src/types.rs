@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// ```text
 ///                     ┌──→ Success   (applied to an in-flight builder;
-///                     │              dropped by `forward()` on canon commit;
+///                     │              dropped by `forward()` once the sender's
+///                     │              nonce moves past it (PayloadJob
+///                     │              prologue, not the canon handler);
 ///                     │              if still present after canon → stale
 ///                     │              in-flight, reset via
 ///                     │              `reset_success_to_waiting` → Waiting.
@@ -19,67 +21,61 @@ use serde::{Deserialize, Serialize};
 ///                     │              status — the receipt carries
 ///                     │              `status = false`, but the tx does land
 ///                     │              on chain, matching op-geth semantics.)
-///                     ├──→ Failed    (NOT on chain — reth builder rejected
-///                     │              the tx pre-execute: nonce-too-low /
-///                     │              gas-over-block-limit / other
-///                     │              `BlockExecutionError::Validation`.
-///                     │              Distinct from EVM revert / halt, which
-///                     │              flow through the Success arm above.
-///                     │              Reclaimable: same-hash retry revives
-///                     │              via `push_if_absent` → Waiting.)
+///                     ├──→ Failed    (reth builder rejected the tx
+///                     │              pre-execute, e.g. nonce-too-low /
+///                     │              gas-over-block-limit. Distinct from EVM
+///                     │              revert / halt, which flow through the
+///                     │              Success arm above.)
 /// [push] → Waiting ──┤
-///                     ├──→ Timeout   (NOT on chain — client's deadline hit;
-///                     │               same-hash retry revives via
-///                     │               `push_if_absent` → Waiting)
-///                     └──→ Canceled  (NOT on chain — server pre-apply reject:
-///                                      block gas budget, admin kick, etc.;
-///                                      same-hash retry revives via
-///                                      `push_if_absent` → Waiting)
+///                     ├──→ Timeout   (the client's deadline elapsed)
+///                     ├──→ Canceled  (server pre-apply reject: block gas
+///                     │               budget, admin kick, etc.)
+///                     └──→ Broken    (commitment owed but abandoned after
+///                                      `preconf_max_apply_attempts` failed
+///                                      replays)
 /// ```
 ///
-/// All three "not on chain" states (`Failed` / `Timeout` / `Canceled`)
-/// are **reclaimable** — the pool eviction hook fires from `mark_*`, and
-/// a subsequent same-hash resubmit is revived back to `Waiting` by
-/// `push_if_absent`. This mirrors the "typically transient" nature of
-/// each cause: `Timeout` (client just gave up too early), `Canceled`
-/// (block gas budget resets next slot), `Failed` (in-flight state race that
-/// the next slot's fresh block state usually resolves).
+/// `Timeout` / `Canceled` / `Failed` form the "not on chain, reclaimable" set:
+/// a same-hash resubmit revives them to `Waiting` via `push_if_absent`, and
+/// every cause is typically transient (deadline too tight, budget resets next
+/// slot, in-flight state race). `Broken` is revivable by the same hash too, but
+/// **not** replaceable by a different one — its receipt already went to a
+/// client, so its nonce stays pinned.
 ///
-/// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — they
-/// mean different things and are NOT connected by a direct mapping:
-/// - Fifo `Failed` = builder rejected pre-execute, tx NOT on chain
-/// - Wire `Failed` (see `mantle-reth-rpc-ext::PreconfStatus`) = `receipt.status == false` (revert /
-///   halt), tx IS on chain
+/// Use [`PreconfStatus::is_active`] / [`PreconfStatus::is_replaceable`] /
+/// [`PreconfStatus::is_revivable_by_same_hash`] rather than open-coding
+/// `matches!` over the terminal set — the three questions have **different**
+/// answers for `Broken`, and each open-coded site is a place to get it wrong.
 ///
-/// The wire-layer status is derived by the RPC handler from the
-/// returned `PreconfReceipt.status` field, not from this enum.
+/// **How far "not on chain" goes** — the surrounding code maintains it; this
+/// enum does not enforce it. The transitions are a plain CAS on
+/// `status == Waiting` and never consult the chain. What holds the property up
+/// is that every caller runs before `apply_fn` or on its `Err` path, and that
+/// the pool-eviction hook the `mark_*` methods fire drops the hash so it cannot
+/// land later. That hook is **best-effort, not atomic** — `canon_handler` evicts
+/// from the fifo and the pool in two separate calls — so re-check the callers
+/// before relying on it. In particular a tx that already returned a `Success`
+/// receipt can still reach `Failed`: the receipt is sent as soon as the apply
+/// commits to the *in-flight* builder, long before any block is canonical.
+///
+/// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — different
+/// things, and not connected by a direct mapping:
+/// - Fifo `Failed` = builder rejected pre-execute, tx not on chain (with the caveat above)
+/// - Wire `Failed` (`mantle-reth-rpc-ext::PreconfStatus`) = `receipt.status == false` (revert /
+///   halt), tx **is** on chain. Derived by the RPC handler from `PreconfReceipt.status`, not from
+///   this enum.
+///
+/// **`Success` is not strictly terminal**: an entry still in the fifo means
+/// "applied to an in-flight builder whose block was never canon'd" — the
+/// `PayloadJob` prologue's canon-forward (`sync_fifo_forward_to_head` →
+/// `PreconfTxSet::forward`) drops it once the sender's nonce moves past. Stale
+/// `Success` entries are reset to `Waiting` and replayed against the new
+/// builder, honouring the SLA "receipt returned → tx must land on chain". The
+/// presence of the entry is the "in-flight, not canon" flag; no separate
+/// variant is needed.
 ///
 /// All forward transitions are CAS: they require current status == Waiting,
 /// otherwise `MarkError::IllegalTransition(current)` is returned.
-///
-/// **Success is not strictly terminal**: a `Success` entry that still exists
-/// in the fifo means "applied to an in-flight builder but that builder's
-/// block was never canon'd" — because `canon_handler::forward()` drops the
-/// entry entirely on canon commit. On a new payload job start, such stale
-/// `Success` entries are reset to `Waiting` and re-applied against the new
-/// builder to honor the mantle preconf SLA ("receipt returned → tx must
-/// land on chain"). The presence-of-entry acts as the "in-flight, not
-/// canon" flag; no separate `InFlight` variant is needed.
-///
-/// **Timeout vs Canceled vs Failed** — all three are "not on chain,
-/// reclaimable" but signal different causes to the client:
-/// - `Timeout` — the RPC handler's deadline elapsed. Client's request was accepted; server may or
-///   may not have run apply.
-/// - `Canceled` — the block-gas-budget pre-apply gate rejected the tx (e.g. block gas budget).
-///   Server explicitly declined; no EVM state change.
-/// - `Failed` — reth's block builder rejected pre-execute (in-flight nonce / balance race, block
-///   gas exhausted at builder level). tx NOT on chain; typically resolves on next slot.
-///
-/// SDKs retry all three the same way: same-hash resubmit is safe;
-/// `push_if_absent` revives the fifo entry back to `Waiting` and the
-/// dispatch loop picks it up. Client-visible fast Err (same-slot dedup
-/// forwards the stored reason) or Ok(Timeout) (RPC deadline) both
-/// signal "try next slot".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PreconfStatus {
     /// Awaiting builder apply.
@@ -88,12 +84,10 @@ pub enum PreconfStatus {
     /// Builder apply succeeded; receipt available.
     #[serde(rename = "success")]
     Success,
-    /// Reth builder rejected pre-execute (in-flight nonce/balance race,
-    /// block gas exhausted at builder level, or other
-    /// `BlockExecutionError::Validation`). tx NOT on chain. Reclaimable
-    /// via same-hash resubmit (`push_if_absent` Timeout/Canceled/Failed →
-    /// Waiting revive branch). Distinct from wire-layer `Failed`, which
-    /// means EVM revert with tx on chain.
+    /// Reth builder rejected pre-execute (in-flight nonce/balance race, block
+    /// gas exhausted at builder level, or other
+    /// `BlockExecutionError::Validation`) — see the enum-level notes for how far
+    /// "not on chain" reaches, and for why this is not the wire-layer `Failed`.
     #[serde(rename = "failed")]
     Failed,
     /// Server-side timeout — only Waiting can transition here (CAS).
@@ -104,6 +98,50 @@ pub enum PreconfStatus {
     /// `recover_from_canceled`.
     #[serde(rename = "canceled")]
     Canceled,
+    /// **Commitment owed but abandoned.** The receipt already went out to the
+    /// client, then `preconf_max_apply_attempts` consecutive replay applies all
+    /// failed. Reached only from `Waiting` via
+    /// [`PreconfTxSet::record_apply_failure`](crate::PreconfTxSet::record_apply_failure).
+    ///
+    /// Unlike the three reclaimable states this one is **not replaceable**: a
+    /// different hash must never take the `(sender, nonce)` this commitment was
+    /// acknowledged for, and `clean_reclaimable` must not sweep it. It is also
+    /// **not** evicted from the pool — leaving the tx there keeps a chance of it
+    /// landing. A *same-hash* resubmit does revive it (no nonce changes hands),
+    /// resetting the attempt counter.
+    ///
+    /// Its existence is the one signal that a commitment was broken; dispatch
+    /// logs `error!` and bumps `preconf.tx.commitment_broken_total` on entry.
+    #[serde(rename = "broken")]
+    Broken,
+}
+
+impl PreconfStatus {
+    /// Live: the entry is either awaiting apply or applied to an in-flight
+    /// builder. A **different** hash must not take its `(sender, nonce)`.
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Waiting | Self::Success)
+    }
+
+    /// The entry may be displaced by a **different** hash on the same
+    /// `(sender, nonce)`, and may be swept by `clean_reclaimable`.
+    ///
+    /// [`Self::Broken`] is deliberately **excluded** — a commitment whose receipt
+    /// already went to a client keeps its nonce, which is the whole point of the
+    /// variant. Do not use this predicate to answer "can a same-hash resubmit
+    /// revive it": use [`Self::is_revivable_by_same_hash`].
+    pub const fn is_replaceable(self) -> bool {
+        matches!(self, Self::Timeout | Self::Canceled | Self::Failed)
+    }
+
+    /// A resubmit of the **same hash** may flip the entry back to `Waiting`.
+    ///
+    /// Includes [`Self::Broken`]: reviving the same hash cannot hand the nonce
+    /// to anyone else, so it is safe, and it gives an owed commitment another
+    /// chance to land.
+    pub const fn is_revivable_by_same_hash(self) -> bool {
+        matches!(self, Self::Timeout | Self::Canceled | Self::Failed | Self::Broken)
+    }
 }
 
 /// Origin of a preconf entry in the fifo. Determines which pre-apply
@@ -136,6 +174,15 @@ pub enum PreconfSource {
 ///
 /// Conversion to the public wire format happens at the RPC handler boundary
 /// to keep this crate free of jsonrpsee dependencies.
+///
+/// **This is a snapshot of one particular in-flight build, not a record of what
+/// landed.** `block_height` is the *predicted* height (`parent + 1`, computed at
+/// build start), and `status` / `gas_used` / `logs` come from executing against
+/// that build's state. If the block is discarded, the replay path re-executes
+/// the tx against a later block — every field except `tx_hash` can differ, and
+/// no corrected receipt reaches the client because the responder is
+/// single-use. The chosen resolution is to document the semantics — here and on
+/// the `rpc-ext` wire types — rather than add a correction channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreconfReceipt {
     /// Transaction hash.
@@ -163,11 +210,12 @@ pub struct PreconfReceipt {
 pub enum PushResult {
     /// New entry created and broadcast notified.
     Inserted,
-    /// Same hash already present and in an active status
-    /// (`Waiting` / `Success` / `Failed`) — idempotent no-op.
+    /// Same hash already present and [`PreconfStatus::is_active`]
+    /// (`Waiting` / `Success`) — idempotent no-op.
     AlreadyExists,
-    /// Same hash was in a **reclaimable** terminal state
-    /// (`Timeout` / `Canceled`) and has been revived back to `Waiting`.
+    /// Same hash was in a status that [`PreconfStatus::is_revivable_by_same_hash`]
+    /// (`Timeout` / `Canceled` / `Failed` / `Broken`) and has been revived back
+    /// to `Waiting`, with its replay-failure budget reset.
     /// Any fresh responder that the RPC handler attached to
     /// `pending_responders` is now installed on the entry, and the
     /// entry's insertion clock is refreshed to the fresh submission
@@ -182,10 +230,33 @@ pub enum PushResult {
     /// listener still ends up calling `push_if_absent`, which now
     /// revives the reclaimable entry here and broadcasts.
     Revived,
-    /// Different hash but same (sender, nonce) in an active status —
-    /// blocks the replacement attempt (carrying the existing hash so callers
-    /// can inspect / log it).
+    /// Different hash but same (sender, nonce) in a status that is **not**
+    /// [`PreconfStatus::is_replaceable`] — blocks the replacement attempt
+    /// (carrying the existing hash so callers can inspect / log it).
     ConflictActive(TxHash),
+}
+
+/// Outcome of [`crate::preconf_tx_set::PreconfTxSet::record_apply_failure`] —
+/// an apply failure on a commitment whose receipt already went out.
+///
+/// The decision is made inside the fifo (under its lock) rather than by the
+/// caller, so the give-up rule lives in one place and cannot be raced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyFailure {
+    /// Still under `preconf_max_apply_attempts`. The entry was left `Waiting`
+    /// and stays in the pool, so the next payload job's carryover preamble
+    /// retries it against fresh block state.
+    Retrying {
+        /// Failures recorded so far, including this one.
+        attempts: u8,
+    },
+    /// Budget exhausted — the entry moved to [`PreconfStatus::Broken`]. The
+    /// commitment is broken; this is the only moment that fact becomes
+    /// observable, so callers must log it loudly and count it.
+    Broken {
+        /// Failures recorded, i.e. `preconf_max_apply_attempts`.
+        attempts: u8,
+    },
 }
 
 /// Errors returned by [`crate::preconf_tx_set::PreconfTxSet::attach_responder`].
@@ -266,6 +337,20 @@ pub enum PreconfError {
     /// Builder apply returned a terminal `Failed` status.
     #[error("builder rejected: {0}")]
     BuilderRejected(String),
+    /// A commitment whose receipt was already returned could not be landed:
+    /// `attempts` consecutive replay applies failed and the entry moved to
+    /// [`PreconfStatus::Broken`].
+    ///
+    /// Distinct from [`Self::BuilderRejected`], which reports a *single* apply
+    /// failure on a live RPC submission that the client can still retry. This
+    /// one says the sequencer has stopped retrying a promise it already made.
+    #[error(
+        "preconf commitment cannot be honored: {attempts} apply attempts failed after the receipt was returned"
+    )]
+    CommitmentBroken {
+        /// Number of failed apply attempts before giving up.
+        attempts: u8,
+    },
     /// Cumulative preconf gas budget for the current block has been
     /// exhausted — caller may retry once the next block opens.
     #[error(
@@ -306,6 +391,42 @@ pub enum PreconfError {
     /// Maps to `AttachError::AlreadyAttached` at the fifo layer.
     #[error("a preconf request is already in progress for this hash")]
     AlreadyInProgress,
+    /// The transaction's own `gas_limit` exceeds `preconf_max_gas_per_tx`, the
+    /// operator's per-transaction ceiling for the preconf fast path.
+    ///
+    /// Reported from the RPC handler, before the pool is touched. The validator
+    /// enforces the same ceiling on the way in — that is the actual gate, and it
+    /// covers every route into the pool — but a request rejected there would
+    /// reach the client as an opaque `PoolRejected`, and would have spent a pool
+    /// round-trip to say something the handler already knew.
+    #[error(
+        "preconf gas limit exceeded: tx gas limit {gas_limit} exceeds preconf_max_gas_per_tx {max}"
+    )]
+    PreconfGasLimitExceeded {
+        /// Configured `preconf_max_gas_per_tx`.
+        max: u64,
+        /// The transaction's own gas limit.
+        gas_limit: u64,
+    },
+    /// The same raw transaction is already in the pool as an ordinary one — it
+    /// was submitted through plain `eth_sendRawTransaction`, or arrived over
+    /// p2p, before this request.
+    ///
+    /// Distinct from [`Self::NotPreconfEligible`] on purpose. The sender may be
+    /// perfectly well allowlisted; what blocks the request is that the
+    /// transaction's classification was already frozen as non-preconf, and a
+    /// verdict is immutable for the life of the transaction (see
+    /// `PreconfClassifier`). Reporting a whitelist miss here would send the
+    /// operator hunting through governance for a rule that is already in place.
+    ///
+    /// Also distinct from [`Self::AlreadyInProgress`], which means a preconf
+    /// request for this hash is live and the client should await *that* one.
+    /// Here there is no preconf request to await: the transaction will land by
+    /// the ordinary route, with no preconfirmation.
+    #[error(
+        "transaction is already pooled as an ordinary transaction; no preconfirmation is possible for it"
+    )]
+    AlreadyPooledWithoutPreconf,
     /// Server-side timeout — receipt did not arrive within `preconf_timeout`.
     #[error("preconf timeout after {timeout_ms}ms")]
     Timeout {

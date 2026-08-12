@@ -1,6 +1,18 @@
 //! Replacement / resubmission semantics for preconf-eligible txs.
 //!
-//! Full 2×2 coverage of {existing fifo state} × {new submission kind}:
+//! Three axes, because the first two alone left a real gap (see the third):
+//!
+//! 1. {existing fifo state} × {new submission kind} — the 2×2 below.
+//! 2. **{incumbent has a fifo entry} × {incumbent has only a frozen verdict}** —
+//!    `queued_tx_without_fifo_entry_still_owns_its_slot`. The guard keys on the classifier's slot
+//!    index, not on fifo membership, because the fifo entry is created asynchronously.
+//! 3. **{sender's eligibility unchanged} × {sender de-allowlisted mid-flight}** —
+//!    `replacement_is_refused_after_sender_leaves_the_allowlist`. The newcomer's *own* verdict must
+//!    not gate the guard, or the two arms end up holding one tx each for the same nonce.
+//!
+//! ---
+//!
+//! Axis 1, {existing fifo state} × {new submission kind}:
 //!
 //! **Same-hash resubmit**:
 //!
@@ -29,8 +41,8 @@
 //!   arm applies nonce=0, so reth's builder sees `tx.nonce=1 > expected 0` and rejects → fifo
 //!   `Failed`.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf, wait_latest_nonce, wait_pending_nonce};
-use crate::{canonize, launch_preconf_node};
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_pending_nonce};
+use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_classifier};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -41,14 +53,37 @@ use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 const RECIPIENT: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
 async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_primitives::Bytes {
+    signed_transfer_with(chain_id, wallet, nonce, U256::from(1u64)).await
+}
+
+/// `signed_transfer` with an explicit value, so two txs can share
+/// `(sender, nonce)` while hashing differently.
+async fn signed_transfer_with(
+    chain_id: u64,
+    wallet: &Wallet,
+    nonce: u64,
+    value: U256,
+) -> alloy_primitives::Bytes {
+    signed_transfer_bumped(chain_id, wallet, nonce, value, 20e9 as u128).await
+}
+
+/// `signed_transfer_with` plus an explicit gas price, so a replacement can
+/// clear reth's own price-bump rule and actually reach the preconf guard.
+async fn signed_transfer_bumped(
+    chain_id: u64,
+    wallet: &Wallet,
+    nonce: u64,
+    value: U256,
+    fee: u128,
+) -> alloy_primitives::Bytes {
     let request = TransactionRequest {
         chain_id: Some(chain_id),
         nonce: Some(nonce),
         to: Some(TxKind::Call(RECIPIENT.parse().unwrap())),
         gas: Some(21_000),
-        max_fee_per_gas: Some(20e9 as u128),
-        max_priority_fee_per_gas: Some(20e9 as u128),
-        value: Some(U256::from(1u64)),
+        max_fee_per_gas: Some(fee),
+        max_priority_fee_per_gas: Some(fee),
+        value: Some(value),
         input: TransactionInput::default(),
         ..Default::default()
     };
@@ -370,10 +405,12 @@ async fn canceled_slot_replaceable_by_different_hash() {
         "expected BlockGasBudgetExceeded to produce fifo Canceled state; got {err_2:?}",
     );
 
-    // Canonicalise slot 1 so the budget resets. tx2's `Canceled` fifo entry
-    // survives (nonce 2 is at the frontier head; `forward` clears only nonce < 2).
-    let _new_head = canonize!(node, http, payload_1, 1);
-    wait_latest_nonce(&http, wallet_addr, 2).await;
+    // Canonicalise slot 1 so on-chain nonce advances to 2 and the F1
+    // budget resets. tx2's fifo entry stays in `Canceled` state
+    // (nonce=2 is at the head of the sender's frontier; `forward` at
+    // slot-2 prologue would clear entries with nonce < 2, leaving tx2
+    // intact).
+    let _new_head = canonicalize_payload!(node, payload_1).await;
 
     // ── Slot 2: submit tx2_replacement — same sender + same nonce=2,
     //    different `value` (⇒ different hash). Must replace the
@@ -615,9 +652,7 @@ async fn failed_slot_replaceable_by_different_hash() {
     // at slot 2's PayloadJob prologue may still return the pre-block-1
     // snapshot, and the replacement tx's `nonce=1` would then be seen
     // as too high (expected=0).
-    let new_head = node.submit_payload(payload_1).await.expect("submit slot 1");
-    node.update_forkchoice(new_head, new_head).await.expect("canon slot 1");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let _new_head = canonicalize_payload!(node, payload_1).await;
 
     // ── Slot 2: submit replacement — same (sender, nonce=1),
     //    different value ⇒ different hash. Must replace the Failed
@@ -689,87 +724,43 @@ async fn failed_slot_replaceable_by_different_hash() {
     );
 }
 
-/// Same-`(sender, nonce)` replacement **race** — the listener-side safety net for
-/// the guard bypass. A valid higher-fee replacement validated before the async
-/// listener pushes the original commitment into the fifo races past the validator
-/// guard and evicts the commitment from the pool. The commitment still lands (from
-/// the fifo), so the replacement can never execute; without the listener-side
-/// reject it lingers as a silent pool ghost. Asserts the invariant the fix
-/// restores: every tx still in the pool landed in the block it built into.
+/// **The state the fifo cannot see**: a transaction that owns its
+/// `(sender, nonce)` while having no fifo entry at all.
 ///
-/// **Quarantined (`#[ignore]`)**: the guard-bypass window is rarely hit through
-/// the RPC — the listener usually pushes the commitment into the fifo first, so
-/// the replacement is cleanly guard-rejected and the `ConflictActive` branch this
-/// targets isn't reached. Deterministic triggering needs a listener-timing hook
-/// unavailable at the integration layer; kept as documentation + a stress check.
-#[ignore = "timing-dependent guard-bypass race; the listener usually wins through the RPC. \
-            Run on demand as a stress check; not integration-deterministic."]
+/// Reaching it is the whole reason the guard's occupancy check is the
+/// classifier's slot index rather than the fifo. The window the index exists for
+/// — between `validate_transaction` claiming the slot and the pool listener
+/// pushing the entry — is sub-millisecond and not reachable from a test. The
+/// **retention window** is the same state held open deterministically: once a
+/// commitment lands, `forward()` removes its fifo entry the moment its nonce
+/// advances, but the slot is kept for `SEAL_DEPTH` persisted blocks so a reorg
+/// cannot hand the nonce away (see
+/// `docs/preconf-commitment-retention-until-irrevocable.md`).
+///
+/// So: get a commitment on chain, then try to take its nonce. The guard runs
+/// **before** the inner validator, so a refusal here says `ReplaceActivePreconf`
+/// rather than nonce-too-low — which is what makes the assertion discriminating
+/// rather than merely true.
+///
+/// This replaces an earlier construction that parked a **nonce-gapped plain
+/// `eth_sendRawTransaction`** in the `Queued` sub-pool, where the listener
+/// (which only observes `Pending`) would never create an entry. That is no
+/// longer constructible: a plain submission is never preconf-eligible now, so it
+/// claims no slot, and the preconf RPC rejects nonce gaps at its own Step 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn same_nonce_replacement_race_leaves_no_pool_ghost() {
-    use alloy_primitives::{B256, keccak256};
-    use std::collections::HashSet;
-
-    const N: usize = 8;
+async fn a_landed_commitment_still_owns_its_nonce_with_no_fifo_entry() {
     let recipient: Address = RECIPIENT.parse().unwrap();
+    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    // `all_preconfs` makes every sender's txs preconf-eligible without listing
-    // each; a long deadline keeps the parked commitments alive through the build.
-    let cfg = PreconfCfgBuilder::new().all_preconfs().preconf_timeout_ms(3_000).build();
-    let (mut node, http, _wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(5_000)
+        .build();
 
-    let signers = Wallet::new(N).with_chain_id(chain_id).wallet_gen();
+    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
-    // Per sender: race a low-fee `a` against a valid higher-fee replacement `b` at
-    // the same nonce 0, submitted concurrently so both may validate before the
-    // listener pushes `a` into the fifo (the guard-bypass window).
-    let mut submitted: Vec<B256> = Vec::new();
-    let mut tasks = Vec::new();
-    for signer in signers {
-        let mk = |max_fee: u128, tip: u128| TransactionRequest {
-            chain_id: Some(chain_id),
-            nonce: Some(0),
-            to: Some(TxKind::Call(recipient)),
-            gas: Some(21_000),
-            max_fee_per_gas: Some(max_fee),
-            max_priority_fee_per_gas: Some(tip),
-            value: Some(U256::from(1u64)),
-            input: TransactionInput::default(),
-            ..Default::default()
-        };
-        // `b` must be a valid pool replacement of `a`: reth requires BOTH
-        // `max_fee_per_gas` AND `max_priority_fee_per_gas` to rise by the
-        // price-bump threshold (default 10%), so bump both far past it.
-        let a: alloy_primitives::Bytes =
-            TransactionTestContext::sign_tx(signer.clone(), mk(10e9 as u128, 1e9 as u128))
-                .await
-                .encoded_2718()
-                .into();
-        let b: alloy_primitives::Bytes =
-            TransactionTestContext::sign_tx(signer, mk(40e9 as u128, 20e9 as u128))
-                .await
-                .encoded_2718()
-                .into();
-        submitted.push(keccak256(&a));
-        submitted.push(keccak256(&b));
-
-        let http_a = http.clone();
-        let http_b = http.clone();
-        tasks.push(tokio::spawn(async move {
-            let _ = super::helpers::send_normal(&http_a, a).await;
-        }));
-        tasks.push(tokio::spawn(async move {
-            let _ = super::helpers::send_normal(&http_b, b).await;
-        }));
-    }
-    for t in tasks {
-        let _ = t.await;
-    }
-
-    // Let the listener drain every `a`/`b` pending event (push + conflict-reject).
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // Build but DO NOT canonicalize: canon would drop nonce-too-low ghosts and
-    // hide the bug. We compare pool membership against this un-committed block.
+    // ── Slot 1: a preconf commitment at nonce 0, applied and sealed.
     let attrs = node.payload.next_attributes();
     let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
     let payload_id = node
@@ -780,28 +771,213 @@ async fn same_nonce_replacement_race_leaves_no_pool_ghost() {
         .await
         .expect("FCU must succeed")
         .payload_id
-        .expect("payload_id present");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        .expect("payload_id must be present when attributes are supplied");
+
+    let tx = signed_transfer(chain_id, &wallet, 0).await;
+    let http_c = http.clone();
+    let committed = tokio::spawn(async move { send_preconf(&http_c, tx).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let payload = node
         .inner
         .payload_builder_handle
         .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
         .await
         .expect("resolve_kind")
-        .expect("payload build");
-    let in_block: HashSet<B256> =
-        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+        .expect("payload");
+    let _ = committed.await.expect("join").expect("the commitment must succeed");
 
-    // Invariant: any submitted tx still in the pool must be one that landed in the
-    // block. A ghost (evicted-then-orphaned replacement) sits in the pool yet is
-    // absent from every block it could execute in.
-    for h in submitted {
-        if reth_transaction_pool::TransactionPool::contains(&node.inner.pool, &h) {
-            assert!(
-                in_block.contains(&h),
-                "ghost tx {h:?} lingers in the pool but is absent from the block it should \
-                 have built into — a same-nonce replacement was silently orphaned",
-            );
-        }
-    }
+    // Canonicalise it. The on-chain nonce advances to 1, so the next payload
+    // job's `sync_fifo_forward_to_head` drops the entry for nonce 0 — while the
+    // classifier keeps the slot for the retention window.
+    let _new_head = canonicalize_payload!(node, payload).await;
+
+    // Open the next job, which is what runs the forward.
+    let attrs_2 = node.payload.next_attributes();
+    let fcu_state_2 = node.current_forkchoice_state().expect("forkchoice state 2");
+    let _ = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state_2, Some(attrs_2))
+        .await
+        .expect("FCU 2 must succeed");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // ── Now take the nonce. Different hash, and a fee bump so reth's own
+    //    price rule cannot be the thing that refuses it.
+    let replacement =
+        signed_transfer_bumped(chain_id, &wallet, 0, U256::from(2u64), 40e9 as u128).await;
+    let err = ClientT::request::<alloy_primitives::B256, _>(
+        &http,
+        "eth_sendRawTransaction",
+        vec![replacement.to_string()],
+    )
+    .await
+    .expect_err("a nonce held through the retention window must not be handed away");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot replace active preconf commitment"),
+        "expected ReplaceActivePreconf — nonce-too-low would mean the guard never ran; got: {msg}",
+    );
+}
+
+/// **Eligibility can change mid-flight, and the guard must not care.**
+///
+/// The sequence a user can actually produce:
+///
+/// 1. `A` submits `a` through the preconf RPC while allowlisted — `a` is frozen `Eligible`, owns
+///    `(A, nonce)`, and gets a fifo entry.
+/// 2. Governance revokes the rule that covered `A`.
+/// 3. `A` submits `b`: same nonce, higher fee. It is judged against the *new* allowlist, so its own
+///    verdict is `NotEligible`.
+///
+/// If the guard only ran for preconf-eligible newcomers, `b` would be admitted
+/// as an ordinary transaction: `a` would sit on the preconf arm (the fifo holds
+/// its envelope, so it executes even though the pool evicted it) while `b` sat
+/// on the pool arm, for the same nonce. Whichever arm ran first would silently
+/// kill the other — `a`'s client seeing `Failed`, or `b` never landing with no
+/// error at all. Which one loses depends on the builder's internal arm ordering,
+/// which is not a guarantee.
+///
+/// op-geth cannot reach this state: its guard reads only the incumbent's preconf
+/// status (`legacypool.go`, `ErrPreconfInProcess`), never the newcomer's
+/// eligibility. This test pins reth to the same rule.
+///
+/// Discriminating power was verified by restoring the `verdict.is_preconf()`
+/// gate around the slot check: `b` is then accepted and this test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_is_refused_after_sender_leaves_the_allowlist() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(5_000)
+        .build();
+
+    let (_node, http, wallet, chain_id, classifier) =
+        launch_preconf_node_with_classifier!(cfg, crate::helpers::mantle_test_chain_spec()).await;
+
+    // 1. `a` parks a responder and takes the slot.
+    let tx_a = signed_transfer(chain_id, &wallet, 0).await;
+    let http_a = http.clone();
+    let a = tokio::spawn(async move { send_preconf(&http_a, tx_a).await });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 2. Governance revokes the rule covering `A`; `a`'s verdict stays frozen `Eligible`. A rule
+    //    for a *different* sender is left in place on purpose: refusing `b` must follow from the
+    //    allowlist no longer covering this sender, not from the allowlist being empty. (Under the
+    //    previous cross-product shape the same distinction was drawn by emptying the `from` list
+    //    while leaving `to` populated.)
+    classifier.update_whitelist(
+        [(Address::from([0xA1; 20]), recipient)].into_iter().collect(),
+        Default::default(),
+        Default::default(),
+    );
+
+    // 3. `b`: same nonce, higher fee, and now judged NotEligible.
+    let tx_b = signed_transfer_bumped(chain_id, &wallet, 0, U256::from(2u64), 40e9 as u128).await;
+    let err = ClientT::request::<alloy_primitives::B256, _>(
+        &http,
+        "eth_sendRawTransaction",
+        vec![tx_b.to_string()],
+    )
+    .await
+    .expect_err("a de-whitelisted replacement must not be able to evict an in-flight commitment");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot replace active preconf commitment"),
+        "expected ReplaceActivePreconf, got: {msg}",
+    );
+
+    a.abort();
+}
+
+/// **A replacement that is itself rejected must not destroy the holder it was
+/// allowed to reclaim.**
+///
+/// The guard decides "this holder is reclaimable" before the per-tx gas ceiling
+/// and the inner validator have had their say. If the teardown ran at that
+/// point, a replacement that then fails its own checks would leave the sender
+/// with neither transaction: the holder's fifo entry gone (so its same-hash
+/// retry can no longer revive it) and the replacement not admitted either.
+///
+/// Setup: `a` times out (a reclaimable state, so the guard would let `b`
+/// through), then `b` arrives for the same `(sender, nonce)` with a gas limit
+/// above `--preconf.max-gas-per-tx`, so it is rejected *after* that decision.
+///
+/// Asserted through the classifier rather than the wire, because that is where
+/// the difference is visible: with an eager teardown `a`'s verdict is forgotten
+/// and its slot handed to `b` (then released again when `b` is rejected);
+/// deferred, `a` keeps both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_replacement_leaves_the_reclaimable_holder_intact() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(150)
+        // `b` below asks for 500k, so it trips this ceiling.
+        .max_gas_per_tx(100_000)
+        .max_gas_per_block(6_000_000)
+        .build();
+
+    let (_node, http, wallet, chain_id, classifier) =
+        launch_preconf_node_with_classifier!(cfg, crate::helpers::mantle_test_chain_spec()).await;
+
+    // `a` parks and times out — reclaimable, and still owns the slot.
+    let tx_a = signed_transfer(chain_id, &wallet, 0).await;
+    let a_hash = alloy_primitives::keccak256(&tx_a);
+    let first = send_preconf(&http, tx_a).await.expect("first call Ok");
+    assert!(
+        matches!(first.status, PreconfStatus::Timeout),
+        "setup: `a` must reach a reclaimable state; got {:?}",
+        first.status,
+    );
+    assert_eq!(
+        classifier.slot_owner(&wallet_addr, 0),
+        Some(a_hash),
+        "setup: `a` must still own the slot",
+    );
+
+    // `b`: same (sender, nonce), reclaim would be allowed — but its gas limit
+    // trips the per-tx ceiling, so it is rejected after that point.
+    let tx_b: alloy_primitives::Bytes = {
+        let request = TransactionRequest {
+            chain_id: Some(chain_id),
+            nonce: Some(0),
+            to: Some(TxKind::Call(recipient)),
+            gas: Some(500_000),
+            max_fee_per_gas: Some(40e9 as u128),
+            max_priority_fee_per_gas: Some(40e9 as u128),
+            value: Some(U256::from(7u64)),
+            input: TransactionInput::default(),
+            ..Default::default()
+        };
+        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
+    };
+    let err = send_preconf(&http, tx_b).await.expect_err("`b` must trip the per-tx gas ceiling");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("preconf_max_gas_per_tx"),
+        "expected the gas ceiling to be what rejects `b`, got: {msg}",
+    );
+
+    // The holder must be untouched.
+    assert_eq!(
+        classifier.verdict(&a_hash),
+        Some(mantle_reth_preconf::Verdict::Eligible),
+        "`a`'s frozen verdict must survive a failed replacement attempt",
+    );
+    assert_eq!(
+        classifier.slot_owner(&wallet_addr, 0),
+        Some(a_hash),
+        "`a` must still own its slot after a failed replacement attempt",
+    );
 }
