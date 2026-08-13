@@ -333,10 +333,12 @@ where
         // for either. The three states above are all provably not-on-chain.
         //
         // A restored commitment skips **every** preconf gate in this function,
-        // so it leaves here rather than being exempted at each one. That is the
-        // rule `Verdict::Promised` states in the first place: the receipt went
-        // out to its client before the restart, so the transaction must come
-        // back regardless of what current policy says. Any preconf-layer gate
+        // so it leaves here rather than being exempted at each one. The
+        // predicate is the `promised` flag, not the `Verdict::Promised` variant
+        // — see `CachedVerdict` for why those are different questions. What it
+        // records is that the receipt went out to its client before the
+        // restart, so the transaction must come back regardless of what current
+        // policy says. Any preconf-layer gate
         // that rejected it would, by construction, be breaking an
         // already-published commitment — the one outcome this subsystem exists
         // to prevent. Stating the exemption once also means a gate added below
@@ -355,13 +357,13 @@ where
         //   * the reclaimed-holder teardown, which only runs for a transaction that passed the
         //     guard.
         //
-        // The slot claim is *not* among them, because it does not happen here:
-        // `admit_and_claim` back-fills a `Promised` entry's reverse link
-        // itself (`admit_promised` inserts with `slot: None`, having neither
-        // sender nor nonce at journal-restore time). Should `take_slot` below
-        // ever be hoisted out of the reclaim branch, this early return has to be
-        // revisited — `Promised::is_preconf()` is true, so a hoisted call would
-        // cover it.
+        // The slot claim is *not* among them, because it has already happened:
+        // journal restore's pre-pass calls `mark_promised`, which claims the
+        // `(sender, nonce)` in the same breath as it records the promise
+        // (`journal.rs`, restore pre-pass). Nothing is left for this function to
+        // claim. Should `replace_slot` below ever be hoisted out of the reclaim
+        // branch, this early return has to be revisited — a restored record's
+        // verdict is preconf, so a hoisted call would cover it.
         if self.classifier.is_promised(&tx_hash) {
             return self.inner.validate_transaction(origin, transaction).await;
         }

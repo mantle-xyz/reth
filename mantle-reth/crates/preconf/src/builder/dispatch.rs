@@ -208,8 +208,9 @@ impl LoopState {
 /// closure so this module stays free of EVM-builder generics.
 /// Per call, `apply_fn` is invoked at most once — on success-path
 /// reach. If a dedup / status / deadline / gas-budget guard fires
-/// earlier, `apply_fn` is not called. (The type stays `FnMut` because
-/// [`reconcile_lagged`] reuses the same closure across many hashes.)
+/// earlier, `apply_fn` is not called. (The bound is `FnMut` rather than `Fn`
+/// because the closure the caller builds borrows the in-flight `BlockBuilder`
+/// and `ExecutionInfo` mutably — see `admit_and_dispatch` in `payload_builder`.)
 ///
 /// All terminal paths invoke `take_responder` or `cancel_responder`
 /// exactly once.
@@ -445,7 +446,7 @@ where
             loop_state.preconf_gas_used =
                 loop_state.preconf_gas_used.saturating_add(receipt.gas_used);
             if let Err(e) = fifo.mark_succeeded(&hash).await {
-                // Lost a race with clean_timeout / cancel — entry already
+                // Lost a race with `clean_reclaimable` / cancel — entry already
                 // gone or in a non-Waiting state. Log and continue; the
                 // responder still gets the receipt if it exists.
                 trace!(
@@ -519,10 +520,10 @@ where
         Err(ApplyError::Rejected(err)) => {
             metrics::counter!("preconf.tx.failure_total").increment(1);
             // Recording the exclusion is load-bearing, not cosmetic: `loop_state`
-            // is per-build, and without it a later broadcast event (or
-            // `reconcile_lagged`) in *this same block* would apply the entry
-            // again and burn the whole retry budget inside one slot. The budget
-            // is meant to span slots.
+            // is per-build, and without it a later broadcast event (or the
+            // snapshot re-scan the `Lagged` arm runs) in *this same block* would
+            // apply the entry again and burn the whole retry budget inside one
+            // slot. The budget is meant to span slots.
             match fifo.record_apply_failure(&hash, cfg.preconf_max_apply_attempts).await {
                 Ok(ApplyFailure::Retrying { attempts }) => {
                     warn!(

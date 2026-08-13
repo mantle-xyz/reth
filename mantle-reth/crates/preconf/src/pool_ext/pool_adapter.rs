@@ -4,7 +4,7 @@
 //!
 //! The adapter is generic over the same three type parameters as
 //! [`crate::pool_ext::preconf_pool_listener::PreconfPoolListener`] and
-//! shares its [`op_envelope_to_alloy`](super::preconf_pool_listener::op_envelope_to_alloy)
+//! shares its `op_envelope_to_alloy`
 //! helper so the "which OP tx variants are preconf-eligible" decision
 //! stays in one place.
 //!

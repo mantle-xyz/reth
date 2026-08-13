@@ -641,7 +641,7 @@ fn read_all(state: &StateProviderBox, contract: Address) -> Result<AllowlistSets
 ///   the watcher does not repeat it.
 /// * **Empty allowlists** — governance's current policy, faithfully reported by a contract that is
 ///   working exactly as intended. The node has no business overriding it, so it loads the empty
-///   lists, warns, and runs (see [`apply_whitelist`]).
+///   lists, warns, and runs (see `apply_whitelist`).
 pub fn bootstrap_whitelist<P: WhitelistState>(
     provider: &P,
     cfg: &PreconfConfig,

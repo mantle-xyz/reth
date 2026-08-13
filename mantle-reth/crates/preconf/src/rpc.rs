@@ -198,10 +198,15 @@ where
         let to_opt = tx_kind_to_address(pool_tx.kind());
         let gas_limit = alloy_consensus::Transaction::gas_limit(&pool_tx);
 
-        // Step 1 — whitelist. Non-authoritative by design: it is a fast
-        // rejection ahead of the pool, and the authoritative verdict is frozen
-        // by the validator during `add_transaction` below (the
-        // post-admission check that closes the gap).
+        // Step 1 — whitelist. Non-authoritative by design: a fast rejection
+        // ahead of the state snapshot, the fifo entry and the pool, recording
+        // nothing. The binding decision is Step 3b's `claim_preconf`, which
+        // consults the same allowlists again and freezes the verdict it
+        // derives; an allowlist update landing in between is caught there.
+        // Keeping the two in the same order matters — reaching Step 3b with a
+        // sender that was never allowlisted would still be refused, but only
+        // after a `latest()` snapshot, a pool scan and a responder attached
+        // and cancelled again.
         if !self.classifier.preview_eligibility(&sender, to_opt.as_ref()) {
             trace!(target: "mantle::preconf::rpc", ?sender, ?to_opt, ?hash, "non-whitelisted preconf submission");
             return Err(preconf_error_to_rpc(&PreconfError::NotPreconfEligible));
@@ -367,34 +372,6 @@ where
                 self.fifo.cancel_responder(&hash, err.clone()).await;
                 return Err(preconf_error_to_rpc(&err));
             }
-        }
-
-        // Step 4b — the authoritative eligibility answer.
-        //
-        // Step 1 was a preview against the live allowlists; the binding verdict
-        // is the one the validator froze inside `add_transaction` just now. The
-        // two can disagree when an allowlist update lands in between, or when
-        // this hash was already in the pool with an older verdict
-        // (`AlreadyImported`). Without this check such a tx would sit here for
-        // the full `preconf_timeout` and then report `Timeout` — even though we
-        // already know, right now, that no preconf arm will ever apply it.
-        //
-        // Only a verdict that positively says "not preconf" rejects. A missing
-        // record is *not* treated as a rejection: it means the validator did
-        // not run for this submission and nothing has been frozen, so falling
-        // through to the wait (today's behaviour) is correct — inventing a
-        // rejection here could deny a genuinely eligible tx.
-        if let Some(verdict) = self.classifier.verdict(&hash) &&
-            !verdict.is_preconf()
-        {
-            trace!(
-                target: "mantle::preconf::rpc",
-                ?hash, ?verdict,
-                "frozen verdict is not preconf-eligible; failing fast instead of awaiting timeout"
-            );
-            let err = PreconfError::NotPreconfEligible;
-            self.fifo.cancel_responder(&hash, err.clone()).await;
-            return Err(preconf_error_to_rpc(&err));
         }
 
         // Step 5 — await receipt or deadline, with race-safe handling.

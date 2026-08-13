@@ -94,8 +94,9 @@ pub enum PreconfStatus {
     #[serde(rename = "timeout")]
     Timeout,
     /// Server pre-apply rejection (block gas budget, admin action, ...) —
-    /// only Waiting can transition here (CAS). Recoverable via
-    /// `recover_from_canceled`.
+    /// only Waiting can transition here (CAS). Recovered by a same-hash
+    /// resubmit, which `push_if_absent` revives back to `Waiting` (see
+    /// [`Self::is_revivable_by_same_hash`]).
     #[serde(rename = "canceled")]
     Canceled,
     /// **Commitment owed but abandoned.** The receipt already went out to the

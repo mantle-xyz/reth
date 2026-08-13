@@ -810,14 +810,14 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///    - **Level-triggered pool arm** (`ready(()) if PoolPacer::can_admit()`) — each fire admits
     ///      exactly one pool best-tx, then returns to `select!`. Cancel and preconf get preempt
     ///      chances between every pool tx via biased priority.
-    ///    - `sweep_ticker.tick()` — edge-triggered ticker. Raises the [`PoolPacer`] ceiling by
-    ///      [`PoolQuotaSchedule::gas_per_batch`] on each tick (adaptive-N derivation adapts `N` to
+    ///    - `sweep_ticker.tick()` — edge-triggered ticker. Raises the `PoolPacer` ceiling by
+    ///      `PoolQuotaSchedule::gas_per_batch` on each tick (adaptive-N derivation adapts `N` to
     ///      remaining slot time so pool aims to fill the block regardless of build delay —
     ///      op-rbuilder flashblocks pattern). Doesn't apply directly; the level-triggered pool arm
     ///      consumes the new headroom.
     ///
     ///    Before the loop, a **carryover replay preamble**
-    ///    ([`replay_fifo_carryover`]) applies any stale in-flight or
+    ///    (`replay_fifo_carryover`) applies any stale in-flight or
     ///    journal-restored entries directly (bypassing the broadcast
     ///    queue) so they land ahead of concurrently-queued RPC pushes.
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).

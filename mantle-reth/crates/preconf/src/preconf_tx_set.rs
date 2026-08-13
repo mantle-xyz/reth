@@ -26,7 +26,7 @@
 
 use alloy_consensus::{Transaction, TxEnvelope};
 // foldhash HashMap: faster than SipHash on high-entropy keys (TxHash /
-// Address); matches `PreconfConfig::from_preconfs` in `config.rs`.
+// Address); matches the allowlist sets in `whitelist.rs`.
 // `HashMapExt` brings `::new()` / `::with_capacity()` into scope.
 use alloy_primitives::{
     Address, TxHash,
@@ -97,7 +97,7 @@ pub struct TxEntry {
     /// the entry to `Timeout`. Held only across the "point of no
     /// return" (from just before `apply_fn` to just after
     /// `resp.send(receipt)` in dispatch). Never held while acquiring
-    /// [`PreconfTxSet::inner`] — that direction would deadlock.
+    /// `PreconfTxSet::inner` — that direction would deadlock.
     pub apply_lock: Arc<Mutex<()>>,
 }
 
@@ -348,12 +348,17 @@ impl PreconfTxSet {
     ///
     /// Returns:
     /// - [`PushResult::Inserted`] — new entry created and broadcast notified.
-    /// - [`PushResult::AlreadyExists`] — same hash already present (no-op).
-    /// - [`PushResult::ConflictActive(existing_hash)`] — same `(from, nonce)` but different hash,
-    ///   and the existing entry is not `Timeout`.
+    /// - [`PushResult::AlreadyExists`] — same hash already present and [`PreconfStatus::is_active`]
+    ///   (`Waiting` / `Success`); a no-op.
+    /// - [`PushResult::Revived`] — same hash in a state that is
+    ///   [`PreconfStatus::is_revivable_by_same_hash`] (`Timeout` / `Canceled` / `Failed` /
+    ///   `Broken`), flipped back to `Waiting` and broadcast.
+    /// - [`PushResult::ConflictActive`] — same `(from, nonce)` but a different hash, and the
+    ///   incumbent is not [`PreconfStatus::is_replaceable`]. Carries the incumbent's hash.
     ///
-    /// When the existing entry IS `Timeout`, it is evicted and the new tx
-    /// is inserted in its place.
+    /// When the incumbent IS replaceable (`Timeout` / `Canceled` / `Failed` — note this is a
+    /// *different* set from the revivable one above, `Broken` being the difference), it is evicted
+    /// and the new tx inserted in its place.
     pub async fn push_if_absent(
         &self,
         tx: Arc<TxEnvelope>,
@@ -646,9 +651,15 @@ impl PreconfTxSet {
 
     // ============ Status transitions ============
 
-    /// `Waiting → Success`. Truly terminal — once set, only `forward` or
-    /// `remove` can drop the entry; the status itself never moves again.
-    /// Called by builder after a successful EVM apply.
+    /// `Waiting → Success`. Called by the builder after a successful EVM apply.
+    ///
+    /// Terminal for the build that set it — no `mark_*` moves it again, and only
+    /// `forward` or `remove` drops the entry. The one way out is
+    /// [`Self::reset_success_to_waiting`], which the *next* payload job's
+    /// carryover preamble uses on a `Success` entry that outlived the block it
+    /// was applied to (`replay_fifo_carryover` in `payload_builder`): the client
+    /// already holds a receipt, so the commitment still has to land, in a block
+    /// that will actually commit.
     ///
     /// Also clears [`TxEntry::apply_failures`]: the apply worked, so whatever
     /// replay budget had been consumed is no longer owed. Matters when a
@@ -671,9 +682,14 @@ impl PreconfTxSet {
     /// branch). Called by builder when `apply_fn` returned Err
     /// (in-flight nonce / balance race, block gas exhausted at builder
     /// level). The tx is not on chain as of this transition — see
-    /// [`crate::types::PreconfStatus`] for how far that reaches, and note
-    /// that dispatch calls this **regardless of `source`**, so an entry whose
-    /// receipt has already gone out can land here.
+    /// [`crate::types::PreconfStatus`] for how far that reaches.
+    ///
+    /// Dispatch reaches this **only for `Rpc`-source entries**: a client is
+    /// still waiting and has been told nothing yet. An entry whose receipt has
+    /// already gone out (`Replay`) takes the other arm and goes to
+    /// [`Self::record_apply_failure`] instead, because `Failed` would make its
+    /// nonce replaceable, let `clean_reclaimable` sweep it, and evict it from
+    /// the pool — destroying what the retry needs.
     ///
     /// Reclaim rationale: all three "not on chain" causes are typically
     /// transient (deadline overreach, block gas budget resets next slot, or

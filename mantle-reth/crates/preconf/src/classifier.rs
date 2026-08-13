@@ -92,7 +92,7 @@ pub struct Whitelist {
 /// Safety bound on the verdict cache — 100k entries (≈16MB worst case).
 ///
 /// Measured: a `by_hash` entry is 96 bytes (32-byte key + 64-byte
-/// [`CachedVerdict`]) and a preconf verdict additionally owns a 64-byte
+/// `CachedVerdict`) and a preconf verdict additionally owns a 64-byte
 /// `by_slot` entry, so the ceiling assumes every entry is preconf. Hash-map
 /// overhead is on top of that.
 ///
@@ -136,11 +136,13 @@ pub enum Verdict {
     Eligible,
     /// Did not match the allowlists at admission time.
     NotEligible,
-    /// A commitment restored from the journal: eligible, and **exempt from
-    /// admission-time policy gates**.
+    /// The verdict a commitment restored from the journal gets: eligible, and in
+    /// practice **exempt from admission-time policy gates**.
     ///
-    /// The receipt went out to the client before the restart, so the
-    /// transaction must come back regardless of what the current policy says —
+    /// The exemption is not granted by this variant — it keys on the `promised`
+    /// flag, which restore sets on the same record. The receipt went out to the
+    /// client before the restart, so the transaction must come back regardless
+    /// of what the current policy says —
     /// the same reasoning that makes journal restore skip re-deriving
     /// eligibility in the first place. Without this variant, lowering
     /// `--preconf.max-gas-per-tx` and restarting would silently drop an
@@ -162,25 +164,31 @@ impl Verdict {
 /// `slot` is the reverse link into [`VerdictStore::by_slot`], so every removal
 /// path can release the claim without scanning the index.
 ///
-/// It is `Option` for two reasons. A non-preconf verdict never claims a slot at
-/// all. And the two ways a verdict comes into existence differ:
-/// [`PreconfClassifier::admit_and_claim`] has the recovered sender and the
-/// nonce and claims in the same breath, while [`PreconfClassifier::admit_promised`]
-/// runs during journal restore *before* the envelope is decoded and has neither,
-/// so a `Promised` entry starts with `slot: None` and is completed a moment later
-/// by [`PreconfClassifier::claim_slot`] — still inside restore's pre-pass, before
-/// any entry is offered to the pool, because a gap there is a gap in which the
-/// commitment can lose its nonce.
+/// It is `Option` for two reasons, and neither is "the claim happens later".
+/// Both writers — [`PreconfClassifier::admit_and_claim`] and
+/// [`PreconfClassifier::mark_promised`] — insert the record and then call
+/// `VerdictStore::claim` under the same lock, which back-fills this field.
+/// What leaves it `None` is that the claim may not be *ours*: a non-preconf
+/// verdict never claims a slot at all, and a claim that loses to an incumbent
+/// returns `Err(owner)` while the record itself stays (see
+/// `mark_promised_does_not_displace_an_existing_owner`).
 ///
 /// The invariant is exact: **`slot` is `Some(key)` iff this hash may own
 /// `by_slot[key]`.**
 ///
-/// `promised` / `committed_height` carry the commitment-tracking state. They are
-/// fields rather than [`Verdict`] variants on purpose: [`Verdict::Promised`]
-/// means "restored from the journal", which is what the validator's early return
-/// keys on, and folding "a receipt went out for this" into it would silently
-/// widen that exemption to every preconfirmed transaction. The two questions are
-/// related but not the same, so they get separate storage.
+/// `promised` / `committed_height` carry commitment-tracking state as fields
+/// rather than [`Verdict`] variants, because the three have different lifetimes:
+/// `verdict` is written once and never rewritten, `promised` is set once when a
+/// receipt goes out, and `committed_height` is the only reversible one —
+/// `uncommit` clears it on a reorg while the promise stands.
+///
+/// [`Verdict::Promised`] is the verdict a **restored** record gets, because
+/// restore never saw its admission. It is not the "a receipt went out" marker:
+/// that is `promised`, and it is what the validator's exemption and
+/// [`PreconfClassifier::release_preconf_claim`] both key on. Collapsing the two
+/// is representationally possible — nothing reads the variant as such — but it
+/// would make `verdict` mutable mid-life, which every consumer currently relies
+/// on it not being.
 #[derive(Debug, Clone, Copy)]
 struct CachedVerdict {
     verdict: Verdict,
@@ -254,7 +262,7 @@ impl VerdictStore {
     /// link so every removal path can release it again.
     ///
     /// The two callers — [`PreconfClassifier::admit_and_claim`] and
-    /// [`PreconfClassifier::claim_slot`] — share this body deliberately. They
+    /// [`PreconfClassifier::mark_promised`] — share this body deliberately. They
     /// reach it from different directions (a live admission versus a journal
     /// restore that has just decoded the sender and nonce), and this predicate
     /// has already been got wrong twice by being narrowed in one place; having
@@ -281,8 +289,9 @@ impl VerdictStore {
         };
 
         // Record the reverse link exactly when the claim is ours, so
-        // `release_slot_of` can find it later. This also back-fills the
-        // `Promised` entries that `admit_promised` inserted with `slot: None`.
+        // `release_slot_of` can find it later. Both callers insert their record
+        // with `slot: None` and rely on this back-fill; neither ever writes the
+        // field itself.
         if claim.is_ok() &&
             is_preconf &&
             let Some(cached) = self.by_hash.get_mut(&hash)
@@ -599,7 +608,7 @@ impl PreconfClassifier {
             .verdict;
 
         // Checking and claiming are decoupled — see `VerdictStore::claim`, which
-        // both this and `claim_slot` go through. In particular the check does
+        // both this and `mark_promised` go through. In particular the check does
         // **not** depend on the incoming transaction's own verdict: a plain
         // submission arriving on a nonce an in-flight commitment owns is
         // `NotEligible`, and gating on that would let exactly that case through,
@@ -636,9 +645,9 @@ impl PreconfClassifier {
     /// In practice `Err(NotEligible)` means the same raw transaction was already
     /// submitted through plain `eth_sendRawTransaction` (or arrived over p2p).
     /// The caller should surface that as
-    /// [`PreconfError::AlreadyPooledWithoutPreconf`], not as "not eligible" —
-    /// the sender may well be allowlisted; the transaction is simply already in
-    /// motion by the ordinary route.
+    /// [`PreconfError::AlreadyPooledWithoutPreconf`](crate::types::PreconfError::AlreadyPooledWithoutPreconf),
+    /// not as "not eligible" — the sender may well be allowlisted; the
+    /// transaction is simply already in motion by the ordinary route.
     ///
     /// `Ok(())` on an existing `Eligible` verdict is deliberate: that is the
     /// documented same-hash retry after `Timeout` / `Canceled` / `Failed`, and
@@ -781,7 +790,7 @@ impl PreconfClassifier {
 
         // Get-or-insert, then set `promised`. The insert case is journal restore
         // (this process has never seen the hash); the update case is the RPC
-        // handler, where `admit_and_claim` froze a verdict on the way in.
+        // handler, where `claim_preconf` froze `Eligible` on the way in.
         // Either way the verdict itself is left alone: `Promised` is about
         // journal restore, not about receipts (see `CachedVerdict`).
         let cached = store
@@ -888,7 +897,7 @@ impl PreconfClassifier {
     /// its fifo entry and verdict): exactly one replacement gets to do that.
     ///
     /// No-op returning `Ok(())` when `hash` has no verdict, or has one that is
-    /// not [`Verdict::is_preconf`] — as with [`Self::claim_slot`], there would be
+    /// not [`Verdict::is_preconf`] — as in `VerdictStore::claim`, there would be
     /// nothing to hang the reverse link on. The CAS is still performed in the
     /// non-preconf case: such a transaction does not want the nonce, but it does
     /// need to know it is the one entitled to evict the holder.
@@ -1719,18 +1728,20 @@ mod tests {
         assert_eq!(c.slot_count(), 0);
     }
 
-    /// **Behaviour deliberately changed from the old `admit_promised`**, which
-    /// overwrote whatever verdict was cached with `Promised`.
+    /// **`mark_promised` must not overwrite an existing verdict with
+    /// `Promised`**, and this pins that.
     ///
-    /// `Verdict::Promised` means "restored from the journal", and the validator
-    /// waves those past the replacement guard and the per-tx gas ceiling. A
-    /// receipt going out is a different fact, recorded on `promised` — folding it
-    /// into the verdict would hand that exemption to every preconfirmed
-    /// transaction on any later re-validation.
+    /// `Verdict::Promised` is the verdict a *restored* record gets; the
+    /// exemption from the replacement guard and the per-tx gas ceiling keys on
+    /// the `promised` flag, not on the variant. Overwriting would therefore not
+    /// change which transactions are exempt — it would only make a value the
+    /// rest of the code treats as frozen start changing mid-life.
     ///
-    /// The overwrite it replaces was unreachable anyway: restore runs before
-    /// anything in the process can classify, so the entry it writes is always a
-    /// fresh insert (asserted in `mark_promised_claims_the_slot_*`).
+    /// On the restore path the distinction never fires: restore runs before
+    /// anything in the process can classify, so the record it writes is always a
+    /// fresh insert (asserted in `mark_promised_claims_the_slot_*`). The state
+    /// this test constructs is reached only from the RPC path, where
+    /// `claim_preconf` froze `Eligible` on the way in.
     #[test]
     fn mark_promised_records_the_promise_without_rewriting_the_verdict() {
         let c = classifier(LONG_GRACE);

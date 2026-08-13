@@ -466,7 +466,7 @@ pub trait RestorePool: Send + Sync {
     ///
     /// Exists so [`restore_preconf_state`]'s pre-pass can claim each
     /// commitment's slot before *any* entry is admitted; see
-    /// [`PreconfClassifier::claim_slot`](crate::PreconfClassifier::claim_slot)
+    /// [`PreconfClassifier::mark_promised`](crate::PreconfClassifier::mark_promised)
     /// for why that has to happen before `add_envelope`.
     ///
     /// `None` for anything that does not decode or whose signature does not
@@ -671,22 +671,19 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
     // Marking the whole set up front closes that in one step; marking each entry
     // just before its own admission would leave the tail exposed.
     //
-    // **The slot.** `admit_promised` has only a hash — it runs before the
-    // envelope is decoded — so it cannot record `(sender, nonce)`, and the claim
-    // would otherwise be back-filled only when this entry reaches the validator.
-    // In between, the nonce reads as free to the replacement guard, so a
-    // same-nonce transaction admitted in that interval takes the slot and the
-    // commitment loses the nonce it was already acknowledged for. Nothing can
-    // admit in that interval as the node is wired today — `cli::node` runs this
-    // before `spawn_maintenance_tasks` (reth's local-tx backup loader), the RPC
-    // server and the network — but that is a guarantee held by startup *ordering*,
-    // which a later refactor can silently move. Claiming here makes it structural.
-    // One call now does both: `mark_promised` records "a receipt for this went
-    // out" (in the previous process, which is why nothing in this one would
-    // otherwise know) **and** claims the slot. They were two steps —
-    // `admit_promised` then `claim_slot` — only because the first ran before the
-    // envelope was decoded and so had no sender/nonce to claim with; `recover_slot`
-    // below produces exactly those, so the split bought nothing.
+    // **The slot.** `mark_promised` records "a receipt for this went out" (in the
+    // previous process, which is why nothing in this one would otherwise know)
+    // **and** claims the `(sender, nonce)` — `recover_slot` below hands it both.
+    // Doing the claim here rather than leaving it to be back-filled when the
+    // entry reaches the validator is the point of the pre-pass: in between, the
+    // nonce would read as free to the replacement guard, so a same-nonce
+    // transaction admitted in that interval takes the slot and the commitment
+    // loses the nonce it was already acknowledged for. Nothing can admit in that
+    // interval as the node is wired today — `cli::node` runs this before
+    // `spawn_maintenance_tasks` (reth's local-tx backup loader), the RPC server
+    // and the network — but that is a
+    // guarantee held by startup *ordering*, which a later refactor can silently
+    // move. Claiming here makes it structural.
     for entry in &entries {
         match pool.recover_slot(&entry.tx_rlp) {
             Some((from, nonce)) => {
@@ -1528,19 +1525,19 @@ mod tests {
     /// The same ordering invariant for the **slot**: every commitment must own
     /// its `(sender, nonce)` before the first entry is offered to the pool.
     ///
-    /// `admit_promised` has only a hash — it runs before the envelope is decoded
-    /// — so without an explicit claim the nonce reads as *free* from then until
-    /// `add_envelope` drives that entry through the validator. A same-nonce
-    /// transaction admitted in that interval takes the slot, and the commitment
-    /// loses a nonce its client was already told it had. Nothing can admit in
-    /// that interval as the node is wired today (`cli::node` runs restore before
-    /// reth's local-tx backup loader, the RPC server and the network), so this
-    /// pins the property that the *index* enforces it rather than startup order.
+    /// Without the pre-pass claiming it, the nonce would read as *free* from
+    /// restore until `add_envelope` drives that entry through the validator. A
+    /// same-nonce transaction admitted in that interval takes the slot, and the
+    /// commitment loses a nonce its client was already told it had. Nothing can
+    /// admit in that interval as the node is wired today (`cli::node` runs
+    /// restore before reth's local-tx backup loader, the RPC server and the
+    /// network), so this pins the property that the *index* enforces it rather
+    /// than startup order.
     ///
     /// NB the classifier here is **enabled** with empty allowlists, not
     /// `empty_classifier()` (which is built from a default config, i.e. disabled).
-    /// `admit_promised` writes regardless of that flag but every slot API is
-    /// gated on it, so a disabled classifier would make this test vacuous.
+    /// `mark_promised` returns early on a disabled classifier and records
+    /// nothing at all, which would make this test vacuous.
     #[tokio::test]
     async fn restore_claims_every_slot_before_admitting_any() {
         /// Pool that, on each tx it is handed, snapshots the owner of **all** the
