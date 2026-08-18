@@ -5260,6 +5260,7 @@ dependencies = [
  "op-alloy-flz",
  "op-revm",
  "parking_lot",
+ "proptest",
  "reth-basic-payload-builder",
  "reth-chain-state",
  "reth-chainspec",

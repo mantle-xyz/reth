@@ -240,6 +240,26 @@ pub fn storage_writer_bytecode(writes: &[(B256, B256)], topic: B256) -> Bytes {
     code.into()
 }
 
+/// Like [`mantle_chain_spec_for`] but with an **always-reverting** contract at
+/// `addr` (runtime code `0x60006000fd` = `PUSH1 0; PUSH1 0; REVERT`). A tx to
+/// `addr` is valid but its execution reverts, so it still lands with an EIP-658
+/// `status = 0` receipt — the shape needed to exercise journaling of a
+/// reverted-but-sealed tx (a plain transfer always succeeds, so the happy-path
+/// helpers can't produce it).
+pub fn mantle_chain_spec_with_reverting_contract(chain_id: u64, addr: Address) -> Arc<OpChainSpec> {
+    let raw = include_str!("../assets/genesis.json");
+    let mut value: serde_json::Value = serde_json::from_str(raw).expect("valid genesis JSON");
+    value["config"]["chainId"] = serde_json::Value::from(chain_id);
+    let alloc = value["alloc"].as_object_mut().expect("genesis.json `alloc` must be an object");
+    // Runtime bytecode only (genesis `code` is the deployed code, not initcode).
+    alloc.insert(
+        format!("{addr:#x}"),
+        serde_json::json!({ "code": "0x60006000fd", "balance": "0x0" }),
+    );
+    let genesis: Genesis = serde_json::from_value(value).expect("patched genesis deserialises");
+    Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
+}
+
 /// Payload attributes generator for Mantle test chains — matches the
 /// shared helper in `tests/helpers.rs` but scoped to this test binary.
 pub fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {

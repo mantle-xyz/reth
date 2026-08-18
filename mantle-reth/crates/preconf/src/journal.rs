@@ -1228,6 +1228,66 @@ mod tests {
         assert_eq!(after, vec![e_a, e_b]);
     }
 
+    /// An append racing a rotate must not be lost. `retain` accepts everything
+    /// here, so every appended entry has to survive — any absence is the race,
+    /// not the retention rule.
+    ///
+    /// Two distinct failure modes, and the second outlives the first: an entry
+    /// landing in rotate's load → rename window can be dropped outright, and
+    /// even when it survives on disk, rotate's `size_bytes.store(kept_bytes)`
+    /// is computed from the pre-append snapshot — storing it would erase the
+    /// racing append's contribution and leave the counter short of the real
+    /// file, silently mistuning the size-rotation trigger.
+    ///
+    /// Deterministic because rotate holds the writer lock end to end; the
+    /// assertions are what keep that property from being refactored away.
+    #[tokio::test]
+    async fn rotate_does_not_lose_concurrent_appends() {
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = Arc::new(PreconfJournal::open(&path, 0).await.unwrap());
+
+        // Survivors widen rotate's tmp-write window, so the race has something
+        // to land in.
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
+        }
+
+        let n: u8 = 30;
+        let rot = {
+            let j = j.clone();
+            tokio::spawn(async move { j.rotate(|_| true).await.unwrap() })
+        };
+        let mut appends = Vec::new();
+        for i in 5..n {
+            let j = j.clone();
+            appends.push(tokio::spawn(async move {
+                j.append_promised(&entry(i, u64::from(i))).await.unwrap()
+            }));
+        }
+        rot.await.unwrap();
+        for a in appends {
+            a.await.unwrap();
+        }
+
+        let (after, _) = j.load().await.unwrap();
+        let on_disk: HashSet<TxHash> = after.iter().map(|e| e.hash).collect();
+        for i in 0..n {
+            assert!(
+                on_disk.contains(&TxHash::from([i; 32])),
+                "entry {i} lost across concurrent rotate"
+            );
+        }
+
+        let on_disk_bytes = tokio::fs::metadata(&path).await.unwrap().len();
+        assert_eq!(
+            j.size_bytes.load(Ordering::Relaxed),
+            on_disk_bytes,
+            "size_bytes counter drifted from true on-disk size across concurrent rotate"
+        );
+    }
+
     #[tokio::test]
     async fn rotate_then_append_writes_to_new_file_handle() {
         // Verify the writer is re-opened against the new inode after
@@ -2251,6 +2311,170 @@ mod tests {
                 .await
                 .is_ok();
             assert!(!armed, "a file one byte under the cap must NOT arm the size trigger");
+        }
+    }
+}
+
+/// Stateful property model for [`PreconfJournal`].
+///
+/// Replays random `append` / `rotate` sequences against the real journal and an
+/// independent reference model, checking after every step that the on-disk file
+/// and the `size_bytes` counter agree with it. Guards the retention accounting
+/// against changes that leak entries or drift the counter.
+///
+/// **Ported from the `mantle-stage2` model, which drove `mark_sealed` against a
+/// set the journal owned.** That set is gone: which records may be dropped is
+/// now the caller's decision, expressed through `rotate`'s `retain` predicate
+/// (production passes "the classifier is still tracking this"). `Op::Untrack`
+/// takes its place, mutating a tracking set the *test* owns, so the model still
+/// exercises the same question — does rotate drop exactly what it was told to,
+/// and does the file stay in lock-step — against the current interface.
+///
+/// The two invariants the old model checked on the in-memory `sealed` /
+/// `promised` sets have no counterpart and are dropped; in exchange this one
+/// asserts something the old one could not, that `abandoned` stays empty while
+/// no TTL is configured.
+#[cfg(test)]
+mod proptest_journal_model {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    /// Small identity space so untrack/rotate collisions are frequent.
+    const IDS: u8 = 6;
+
+    fn hash(byte: u8) -> TxHash {
+        TxHash::from([byte; 32])
+    }
+
+    /// Fixed 1:1 identity per byte — a signed tx's hash derives from its
+    /// content, so a given hash always carries the same entry bytes.
+    fn entry_for(byte: u8) -> JournalEntry {
+        JournalEntry {
+            hash: hash(byte),
+            tx_rlp: Bytes::from(vec![byte; 4]),
+            block_height: u64::from(byte),
+            committed_at_ms: 1_000 + u64::from(byte),
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Append(u8),
+        /// The caller stops tracking these hashes, so the next `rotate` drops
+        /// them. Replaces the old model's `MarkSealed`.
+        Untrack(Vec<u8>),
+        Rotate,
+    }
+
+    fn byte() -> impl Strategy<Value = u8> {
+        0..IDS
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            byte().prop_map(Op::Append),
+            prop::collection::vec(byte(), 0..4).prop_map(Op::Untrack),
+            Just(Op::Rotate),
+        ]
+    }
+
+    /// Reference model. `file` mirrors the on-disk line sequence (by identity
+    /// byte); `untracked` mirrors what the caller's `retain` will reject.
+    #[derive(Default)]
+    struct Model {
+        file: Vec<u8>,
+        untracked: BTreeSet<u8>,
+    }
+
+    impl Model {
+        fn apply(&mut self, op: &Op) {
+            match op {
+                Op::Append(b) => self.file.push(*b),
+                Op::Untrack(bytes) => self.untracked.extend(bytes.iter().copied()),
+                // No TTL is configured, so `retain` is the only drop rule.
+                // Unlike the old model, an untracked hash *stays* untracked:
+                // the set lives outside the journal, so re-appending the same
+                // hash and rotating again drops it again.
+                Op::Rotate => {
+                    let untracked = self.untracked.clone();
+                    self.file.retain(|b| !untracked.contains(b));
+                }
+            }
+        }
+    }
+
+    async fn fresh() -> (TempDir, PreconfJournal) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // Large cap so appends never auto-arm the size trigger during replay.
+        let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
+        (dir, j)
+    }
+
+    async fn run_and_check(ops: &[Op]) {
+        let (dir, j) = fresh().await;
+        let path = dir.path().join("preconf.jsonl");
+        let mut model = Model::default();
+
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                Op::Append(b) => j.append_promised(&entry_for(*b)).await.unwrap(),
+                Op::Untrack(_) => {}
+                Op::Rotate => {
+                    // Stats computed from the pre-rotate model.
+                    let before = model.file.len();
+                    let kept_expected =
+                        model.file.iter().filter(|b| !model.untracked.contains(b)).count();
+                    let untracked = model.untracked.clone();
+                    let stats =
+                        j.rotate(|h| !untracked.iter().any(|b| hash(*b) == *h)).await.unwrap();
+
+                    assert_eq!(stats.kept, kept_expected, "step {i}: rotate kept mismatch");
+                    assert_eq!(
+                        stats.dropped,
+                        before - kept_expected,
+                        "step {i}: rotate dropped mismatch"
+                    );
+                    assert!(
+                        stats.abandoned.is_empty(),
+                        "step {i}: no TTL configured, so nothing may be dropped by age"
+                    );
+                }
+            }
+            model.apply(op);
+
+            // (A) On-disk contents match the model's file, in order.
+            let (loaded, bad) = j.load().await.unwrap();
+            assert_eq!(bad, 0, "step {i}: unexpected corrupt lines");
+            let expected: Vec<JournalEntry> = model.file.iter().map(|b| entry_for(*b)).collect();
+            assert_eq!(loaded, expected, "step {i}: journal file diverged after {op:?}");
+
+            // (B) `size_bytes` equals the true on-disk file size.
+            let disk = tokio::fs::metadata(&path).await.unwrap().len();
+            assert_eq!(
+                j.size_bytes.load(Ordering::Relaxed),
+                disk,
+                "step {i}: size_bytes drifted from disk after {op:?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// Any sequence of append / untrack / rotate keeps the on-disk file and
+        /// the `size_bytes` counter in lock-step with the reference model — in
+        /// particular rotate drops exactly the entries `retain` rejects, and no
+        /// more.
+        #[test]
+        fn journal_matches_reference_model(ops in prop::collection::vec(op(), 1..24)) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_and_check(&ops));
         }
     }
 }
