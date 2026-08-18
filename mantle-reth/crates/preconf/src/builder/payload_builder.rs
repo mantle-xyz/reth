@@ -19,7 +19,7 @@ use alloy_consensus::{
     BlockHeader, Sealable, Transaction, TxEnvelope, Typed2718, transaction::Recovered,
 };
 use alloy_eips::eip2718::Encodable2718;
-use alloy_evm::Evm;
+use alloy_evm::{Evm, block::TxResult};
 use alloy_primitives::{Address, Sealed, TxHash, U256};
 use op_alloy_consensus::{SDMGasEntry, TxPostExec, build_post_exec_tx};
 use op_revm::{L1BlockInfo, constants::L1_BLOCK_CONTRACT};
@@ -35,6 +35,7 @@ use reth_optimism_payload_builder::{
     OpAttributes, OpPayloadPrimitives,
     builder::{ExecutionInfo, OpPayloadBuilderCtx},
     config::OpBuilderConfig,
+    error::OpPayloadBuilderError,
 };
 use reth_optimism_primitives::OpTransaction;
 use reth_optimism_txpool::{
@@ -45,7 +46,7 @@ use reth_optimism_txpool::{
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuildNextEnv, BuiltPayloadExecutedBlock};
 use reth_payload_util::{BestPayloadTransactions, PayloadTransactions};
-use reth_primitives_traits::{HeaderTy, SignedTransaction, TxTy};
+use reth_primitives_traits::{HeaderTy, SignedTransaction, TxTy, WithEncoded};
 use reth_revm::{
     State, cancelled::CancelOnDrop, context::Block as RevmBlockTrait,
     database::StateProviderDatabase,
@@ -58,9 +59,126 @@ use crate::{
     PreconfClassifier, PreconfConfig, PreconfTxSet,
     apply::{ApplyError, apply_preconf_tx},
     builder::{cancel::JobCancel, dispatch},
-    classifier::Verdict,
+    classifier::{Verdict, Whitelist},
     types::{PreconfError, PreconfReceipt, PreconfSource},
+    whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
 };
+
+/// Stage 2 — the sequencer transactions (deposits, L1 info, system txs), plus
+/// the whitelist updates any of them carried.
+///
+/// **Replicated from `OpPayloadBuilderCtx::execute_sequencer_transactions`**
+/// (`op-reth/crates/payload/src/builder.rs:724-765` as of this fork). The
+/// execution half is a line-for-line copy; the only change is
+/// `execute_transaction` → `execute_transaction_with_result_closure`, so the
+/// per-transaction `ExecutionResult` becomes visible. Upstream changes to that
+/// function will **not** reach this copy — that is the cost of the seam, and it
+/// is taken deliberately because the alternative sources of the same
+/// information are worse (see below).
+///
+/// # Why the execution result is needed
+///
+/// A governance whitelist update arrives as a deposit whose calldata targets the
+/// cross-domain messenger, with the real `updatePreconfs` buried inside (see
+/// [`crate::whitelist`]). To let it bind the *current* block's preconf
+/// transactions, the update has to be recognised here — after Stage 2 has run
+/// it, before Stage 3 dispatches anything.
+///
+/// Recognising it from calldata alone would be wrong twice over: the deposit
+/// succeeds as a transaction even when the inner message reverts (the messenger
+/// records failed messages rather than propagating them), and calldata says
+/// nothing about the contract's own `onlyL1Gov` check. The emitted
+/// [`WHITELIST_UPDATED_TOPIC0`] answers both — the contract only reaches the
+/// `emit` after authorisation passed and every rule applied. So the log decides
+/// *whether* an update happened, and the calldata is decoded only afterwards, to
+/// learn *what* it was.
+///
+/// Returns the deltas in block order; applying them out of order would let an
+/// add-then-remove of the same rule resolve backwards.
+fn execute_sequencer_transactions_watching_whitelist<N, B>(
+    sequencer_txs: &[WithEncoded<TxTy<N>>],
+    builder: &mut B,
+    whitelist_contract: Option<Address>,
+) -> Result<(ExecutionInfo, Vec<WhitelistDelta>), PayloadBuilderError>
+where
+    N: OpPayloadPrimitives,
+    B: BlockBuilder<Primitives = N>,
+{
+    let mut info = ExecutionInfo::new();
+    let mut deltas = Vec::new();
+
+    for sequencer_tx in sequencer_txs {
+        // A sequencer's block should never contain blob transactions.
+        if sequencer_tx.value().is_eip4844() {
+            return Err(PayloadBuilderError::other(OpPayloadBuilderError::BlobTransactionRejected));
+        }
+
+        // Deposit transactions have no signature, so this pulls in `from`
+        // rather than recovering it.
+        let recovered = sequencer_tx.value().try_clone_into_recovered().map_err(|_| {
+            PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
+        })?;
+
+        let mut emitted_whitelist_update = false;
+        let gas_used =
+            match builder.execute_transaction_with_result_closure(recovered.clone(), |res| {
+                let Some(contract) = whitelist_contract else { return };
+                let result = &res.result().result;
+                // A reverted or halted transaction wrote nothing, and its logs
+                // are discarded on chain — so neither is trusted here.
+                if !result.is_success() {
+                    return;
+                }
+                emitted_whitelist_update = result.logs().iter().any(|log| {
+                    log.address == contract &&
+                        log.topics().first() == Some(&WHITELIST_UPDATED_TOPIC0)
+                });
+            }) {
+                Ok(gas_used) => gas_used,
+                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                    error,
+                    ..
+                })) => {
+                    debug!(
+                        target: "mantle::preconf::payload_builder",
+                        %error, ?recovered,
+                        "error in sequencer transaction, skipping"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(PayloadBuilderError::EvmExecutionError(Box::new(err))),
+            };
+
+        if emitted_whitelist_update && let Some(contract) = whitelist_contract {
+            match decode_whitelist_update(sequencer_tx.value().input(), contract) {
+                Some(delta) if !delta.is_empty() => {
+                    debug!(
+                        target: "mantle::preconf::payload_builder",
+                        add = delta.add.len(), remove = delta.remove.len(),
+                        "whitelist update in this block; applying to the build-scoped allowlist"
+                    );
+                    deltas.push(delta);
+                }
+                // The contract emitted, so an update certainly happened — we
+                // just could not read it. Loud, because the effect is that this
+                // block judges its preconf transactions against the pre-update
+                // policy while the chain has already moved on. Not fatal: the
+                // canonical watcher re-reads the real lists once the block
+                // lands, so the divergence lasts one block.
+                _ => warn!(
+                    target: "mantle::preconf::payload_builder",
+                    %contract,
+                    "whitelist update emitted but its calldata did not decode; \
+                     this block keeps the previous allowlist"
+                ),
+            }
+        }
+
+        info.cumulative_gas_used += gas_used.tx_gas_used();
+    }
+
+    Ok((info, deltas))
+}
 
 // Replicated from upstream private helper
 // `reth_optimism_payload_builder::builder::try_include_post_exec_tx`.
@@ -388,6 +506,41 @@ where
     Ok(receipt)
 }
 
+/// Whether the allowlist in force for this block bars `from -> to` from the
+/// preconf path.
+///
+/// Asked of **every** entry, against the allowlist pinned when this block's
+/// build began plus whatever governance update the block itself carried. The
+/// frozen verdict cannot answer this: it records which RPC the transaction
+/// arrived on — a fact that no longer exists below the RPC boundary — and says
+/// nothing about whether policy still authorizes it. Policy may have moved at
+/// any point between admission and build, not only inside this block.
+///
+/// `all_preconfs` short-circuits ahead of the lists, in the same order
+/// `PreconfClassifier::evaluate_whitelist` uses, and the order is load-bearing:
+/// that mode never reads the contract (`whitelist::wants_whitelist` returns
+/// `None`), so all three sets stay empty and consulting them would reject every
+/// transaction on the node.
+///
+/// Only revocations can bind a block. The asymmetry is structural rather than an
+/// omission: a newly-authorized sender's transaction was refused at the RPC door
+/// and never entered the fifo, so there is nothing here for the new policy to
+/// admit. It becomes eligible on its next submission.
+///
+/// [`PreconfSource::Replay`] is exempt because its receipt has already gone out
+/// — the fifo's own encoding of that fact, and the same predicate `rpc.rs`'s
+/// deadline branch uses to refuse to time such an entry out. A commitment
+/// already acknowledged to a client is owed whatever governance later decides.
+fn barred_by_allowlist(
+    cfg: &PreconfConfig,
+    whitelist: &Whitelist,
+    source: PreconfSource,
+    from: &Address,
+    to: Option<&Address>,
+) -> bool {
+    !cfg.all_preconfs && source != PreconfSource::Replay && !whitelist.is_eligible(from, to)
+}
+
 /// Block-capacity admission + same-sender cascade for a single preconf hash,
 /// run **before** dispatching to [`dispatch::apply_one_preconf`] (which drives
 /// the [`PreconfTxSet`] entry status machine). This is the one funnel all
@@ -396,6 +549,8 @@ where
 /// "execute an admitted tx + record result".
 ///
 /// Decision:
+/// - **[`barred_by_allowlist`]**: policy no longer authorizes this sender → `mark_canceled` +
+///   responder error, before anything is charged against the block.
 /// - **same-sender cascade** (Replay only): if a lower-nonce entry from this sender was already
 ///   deferred / rejected this slot, inherit that outcome (a successor cannot land before its
 ///   predecessor). Prevents a deferred tx1's successor tx2 from being admitted and then
@@ -415,6 +570,7 @@ async fn admit_and_dispatch<N, B>(
     builder: &mut B,
     info: &mut ExecutionInfo,
     limits: BuildConstraints,
+    whitelist: &Whitelist,
 ) -> Result<(), PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
@@ -423,11 +579,32 @@ where
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
+    let to = crate::rpc::tx_kind_to_address(entry.tx.kind());
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     drop(entry);
 
-    // (1) Same-sender cascade — Replay entries only. A successor inherits the
+    // (1) Policy no longer authorizes this sender.
+    if barred_by_allowlist(cfg, whitelist, source, &sender, to.as_ref()) {
+        metrics::counter!("preconf.whitelist.revoked_total").increment(1);
+        debug!(
+            target: "mantle::preconf::dispatch",
+            ?hash, ?sender, ?to,
+            "allowlist no longer authorizes this sender; rejecting before the commitment is applied"
+        );
+        // `Canceled`, not `Failed`: the builder never saw it, which is the same
+        // shape as the capacity rejection below. It also stays revivable by a
+        // same-hash resubmit, so a client whose authorization is restored can
+        // retry without a new transaction.
+        let _ = fifo.mark_canceled(&hash).await;
+        if let Some(resp) = fifo.take_responder(&hash).await {
+            let _ = resp.send(Err(PreconfError::NotPreconfEligible));
+        }
+        loop_state.record_excluded(hash, PreconfError::NotPreconfEligible);
+        return Ok(());
+    }
+
+    // (2) Same-sender cascade — Replay entries only. A successor inherits the
     // predecessor's non-admission outcome; it cannot execute before the
     // predecessor lands.
     if source == PreconfSource::Replay &&
@@ -459,7 +636,7 @@ where
         }
     }
 
-    // (2) Block-capacity admission. Reads are `u64` copies → the immutable
+    // (3) Block-capacity admission. Reads are `u64` copies → the immutable
     // borrow of `*info` ends before the `&mut info` closure below.
     let da_used = info.cumulative_da_bytes_used;
     let gas_used = info.cumulative_gas_used;
@@ -926,7 +1103,43 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         })?;
 
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
-        let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
+        //
+        // Not `ctx.execute_sequencer_transactions` — see the replicated
+        // function for why the per-transaction execution result is needed here.
+        let (mut info, whitelist_deltas) = execute_sequencer_transactions_watching_whitelist::<N, _>(
+            ctx.attributes().sequencer_transactions(),
+            &mut builder,
+            crate::whitelist::wants_whitelist(&self.cfg),
+        )?;
+
+        // The allowlist this block is judged against, pinned for the whole
+        // build. Taken unconditionally: every preconf transaction is checked
+        // against policy at dispatch, not only in blocks that carry a governance
+        // update, because policy can move at any point between a transaction's
+        // admission and the block that would apply it.
+        //
+        // Pinning matters as much as the value. `update_whitelist` swaps the
+        // shared `Arc` wholesale, so reading the live lists per transaction
+        // would let the watcher land mid-build and judge two transactions in one
+        // block against different policies. The snapshot is a refcount bump.
+        //
+        // A governance update carried by *this* block is layered on top, and
+        // only that case pays for a copy. It stays on this stack frame and is
+        // never written back: a build that is superseded or never sealed
+        // produces no canonical notification, and the watcher's triggers are
+        // exactly "a `WhitelistUpdated` log became canonical" and "a reorg
+        // landed" (`whitelist::should_reload`) — so nothing would undo it, and
+        // the RPC admission path would keep judging against a policy that never
+        // reached the chain. Discarding is the default here, and costs no
+        // rollback logic.
+        let mut whitelist = self.classifier.whitelist_snapshot();
+        if !whitelist_deltas.is_empty() {
+            let mut updated = (*whitelist).clone();
+            for delta in &whitelist_deltas {
+                crate::whitelist::apply_delta(&mut updated, delta);
+            }
+            whitelist = Arc::new(updated);
+        }
 
         // ── Stage 3: unified select! loop (see method rustdoc) ────────
 
@@ -1057,6 +1270,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     &mut builder,
                     &mut info,
                     constraints,
+                    &whitelist,
                 )
                 .await?;
             }
@@ -1078,6 +1292,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             admit_and_dispatch::<N, _>(
                                 &self.fifo, &self.cfg, hash, &mut loop_state,
                                 &mut builder, &mut info, constraints,
+                                &whitelist,
                             )
                             .await?;
                         }
@@ -1095,6 +1310,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                 admit_and_dispatch::<N, _>(
                                     &self.fifo, &self.cfg, hash, &mut loop_state,
                                     &mut builder, &mut info, constraints,
+                                    &whitelist,
                                 )
                                 .await?;
                             }
@@ -1679,5 +1895,119 @@ mod tests {
         p.record(u64::MAX);
         p.record(u64::MAX);
         assert_eq!(p.used, u64::MAX);
+    }
+
+    // ============ dispatch-time allowlist gate ============
+
+    mod allowlist_gate {
+        use super::*;
+        use alloy_primitives::map::foldhash::HashSet;
+
+        fn a(byte: u8) -> Address {
+            Address::from([byte; 20])
+        }
+
+        /// Allowlist holding exactly the pair `(1, 2)`.
+        fn only_pair_1_2() -> Whitelist {
+            Whitelist {
+                pairs: HashSet::from_iter([(a(1), a(2))]),
+                from_wildcards: HashSet::default(),
+                to_wildcards: HashSet::default(),
+            }
+        }
+
+        /// On-chain allowlist mode — the configuration the gate is written for.
+        fn cfg() -> PreconfConfig {
+            PreconfConfig { enabled: true, ..Default::default() }
+        }
+
+        #[test]
+        fn a_sender_the_allowlist_still_authorizes_passes() {
+            let wl = only_pair_1_2();
+            assert!(!barred_by_allowlist(&cfg(), &wl, PreconfSource::Rpc, &a(1), Some(&a(2))));
+        }
+
+        /// The gate is unconditional: an entry admitted under an earlier policy
+        /// is barred as soon as the allowlist in force stops authorizing it,
+        /// whether that update landed in this block or several blocks ago.
+        #[test]
+        fn a_sender_the_allowlist_no_longer_authorizes_is_barred() {
+            let wl = only_pair_1_2();
+            assert!(barred_by_allowlist(&cfg(), &wl, PreconfSource::Rpc, &a(3), Some(&a(4))));
+        }
+
+        /// The exemption that keeps a published commitment honoured: a receipt
+        /// for this hash already reached its client, so policy no longer gets a
+        /// say. Same sender/recipient as the barred case above.
+        #[test]
+        fn a_replayed_commitment_is_exempt() {
+            let wl = only_pair_1_2();
+            assert!(!barred_by_allowlist(&cfg(), &wl, PreconfSource::Replay, &a(3), Some(&a(4))));
+        }
+
+        /// `--preconf.all` bypasses the lists, and it has to be checked *before*
+        /// them: that mode never reads the contract (`wants_whitelist` returns
+        /// `None`), so all three sets are empty and consulting them would bar
+        /// every transaction on the node.
+        #[test]
+        fn all_preconfs_bypasses_the_lists() {
+            let c = PreconfConfig { all_preconfs: true, ..cfg() };
+            let empty = Whitelist::default();
+            assert!(!barred_by_allowlist(&c, &empty, PreconfSource::Rpc, &a(9), Some(&a(9))));
+        }
+
+        /// A creation has no recipient, so only a from-wildcard can authorize
+        /// it — this pins that the gate asks the allowlist the same `to: None`
+        /// question the RPC entry does.
+        #[test]
+        fn a_creation_falls_back_to_the_from_wildcard() {
+            let barred = only_pair_1_2();
+            assert!(barred_by_allowlist(&cfg(), &barred, PreconfSource::Rpc, &a(1), None));
+
+            let allowed =
+                Whitelist { from_wildcards: HashSet::from_iter([a(1)]), ..only_pair_1_2() };
+            assert!(!barred_by_allowlist(&cfg(), &allowed, PreconfSource::Rpc, &a(1), None));
+        }
+
+        /// An empty allowlist bars everything — the contract accepts that state
+        /// (see `whitelist::apply_whitelist`), so the gate must not read "empty"
+        /// as "no policy". Distinct from `all_preconfs`, which is empty *and*
+        /// authorizes everything.
+        #[test]
+        fn an_empty_allowlist_bars_every_non_replay_entry() {
+            let wl = Whitelist::default();
+            assert!(barred_by_allowlist(&cfg(), &wl, PreconfSource::Rpc, &a(1), Some(&a(2))));
+        }
+    }
+
+    // ============ per-block allowlist pinning ============
+
+    /// The snapshot must not follow a later `update_whitelist`: every
+    /// transaction in one block is judged against the policy in force when that
+    /// block's build began, even if governance lands mid-build.
+    #[test]
+    fn a_whitelist_snapshot_is_pinned_against_a_mid_build_refresh() {
+        use alloy_primitives::map::foldhash::HashSet;
+
+        let c = PreconfClassifier::new(false, std::time::Duration::from_secs(4), 128);
+        let sender = Address::from([1u8; 20]);
+        let to = Address::from([2u8; 20]);
+        c.update_whitelist(
+            HashSet::from_iter([(sender, to)]),
+            HashSet::default(),
+            HashSet::default(),
+        );
+
+        let pinned = c.whitelist_snapshot();
+        assert!(pinned.is_eligible(&sender, Some(&to)));
+
+        // Governance revokes while the build is still running.
+        c.update_whitelist(HashSet::default(), HashSet::default(), HashSet::default());
+
+        assert!(pinned.is_eligible(&sender, Some(&to)), "the pinned view keeps its lists");
+        assert!(
+            !c.whitelist_snapshot().is_eligible(&sender, Some(&to)),
+            "while a fresh snapshot sees the revocation"
+        );
     }
 }

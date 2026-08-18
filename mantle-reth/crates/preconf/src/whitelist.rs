@@ -40,6 +40,7 @@
 
 use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::foldhash::HashSet};
+use alloy_sol_types::{SolCall, sol};
 use futures::StreamExt;
 use reth_chain_state::{CanonStateNotification, CanonStateSubscriptions};
 use reth_execution_types::Chain;
@@ -51,26 +52,29 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{classifier::PreconfClassifier, config::PreconfConfig};
+use crate::{
+    classifier::{PreconfClassifier, Whitelist},
+    config::PreconfConfig,
+};
 
-/// Slot of `Pair[] pairs` — the exact `(from, to)` rules.
+/// Slot of the contract's `Rule[] exactPairs` — the exact `(from, to)` rules.
 ///
-/// **Elements span two slots**, not one: a `Pair` is two `address` fields, 40
-/// bytes, which cannot share a 32-byte slot. `pairs[i].from` is at
-/// `keccak256(0) + 2i` and `pairs[i].to` at `keccak256(0) + 2i + 1`. Pinned at
-/// runtime by `test_storageLayout_matchesRethExpectations_succeeds` in
+/// **Elements span two slots**, not one: a `Rule` is two `address` fields, 40
+/// bytes, which cannot share a 32-byte slot. `exactPairs[i].from` is at
+/// `keccak256(0) + 2i` and `exactPairs[i].to` at `keccak256(0) + 2i + 1`. Pinned
+/// at runtime by `test_storageLayout_matchesRethExpectations_succeeds` in
 /// `test/PreconfWhitelist.t.sol`, which reads all four of those slots with
 /// `vm.load`.
 pub const PAIRS_SLOT: u64 = 0;
 
-/// Slot of `address[] fromWildcards` — senders whose every transaction is
-/// eligible.
+/// Slot of the contract's `address[] fromWildcards` — senders whose every
+/// transaction is eligible.
 ///
-/// Slot 1 is `pairIndex`, the membership mapping for `pairs`.
+/// Slot 1 is `exactPairIndex`, the membership mapping for `exactPairs`.
 pub const FROM_WILDCARDS_SLOT: u64 = 2;
 
-/// Slot of `address[] toWildcards` — recipients that make any transaction to
-/// them eligible.
+/// Slot of the contract's `address[] toWildcards` — recipients that make any
+/// transaction to them eligible.
 ///
 /// Slot 3 is `fromWildcardIndex`.
 pub const TO_WILDCARDS_SLOT: u64 = 4;
@@ -141,9 +145,9 @@ pub const WHITELIST_UPDATED_TOPIC0: B256 = B256::new([
 /// | **1M (this threshold)** | **1.1 s** | **~11 s** |
 /// | 10M | 11 s | ~110 s |
 ///
-/// For scale: the contract caps one update at `MAX_BATCH = 500` entries and 500
-/// adds measure ~23M gas, i.e. a full L2 block per governance message — so
-/// reaching 1M takes ~2000 such messages.
+/// For scale: the contract caps one update at `MAX_BATCH = 330` entries, and 330
+/// pair adds measure ~22.4M gas — a full L2 block per governance message, so
+/// reaching 1M takes ~3000 of them.
 pub const WHITELIST_WARN_THRESHOLD: usize = 1_000_000;
 
 /// How long one full list read may block before it is abandoned.
@@ -183,7 +187,7 @@ const BUDGET_CHECK_STRIDE: u64 = 4096;
 ///
 /// Counts **storage reads**, not array elements. The distinction is load-bearing
 /// now that one reader walks `address[]` (one read per element) and another
-/// walks `Pair[]` (two): counting elements would silently halve the check
+/// walks `Rule[]` (two): counting elements would silently halve the check
 /// frequency for pairs and double the overshoot, while the constant above claims
 /// to bound both. Charging what is actually spent keeps one budget meaningful
 /// for both.
@@ -374,16 +378,16 @@ pub(crate) fn read_preconf_set_within(
     Ok(out)
 }
 
-/// Reads the `Pair[]` at `list_slot` out of `contract`'s storage.
+/// Reads the contract's `Rule[]` at `list_slot` out of its storage.
 ///
 /// Same budget and same zero handling as [`read_preconf_set`]; the difference is
-/// the **stride**. A `Pair` is two `address` fields and cannot pack into one
+/// the **stride**. A `Rule` is two `address` fields and cannot pack into one
 /// slot, so element `i` occupies `base + 2i` (`from`) and `base + 2i + 1`
 /// (`to`) — see [`PAIRS_SLOT`], and the `vm.load` assertions that pin it.
 ///
 /// A pair with either half zero is discarded whole. In the new allowlist the
 /// zero address is a **calldata-only marker** that routes a rule to one of the
-/// wildcard sets; the contract never stores it in `pairs`. So a zero half here
+/// wildcard sets; the contract never stores it in `exactPairs`. So a zero half here
 /// is not a wildcard and not an empty slot — it means we are reading the wrong
 /// layout, and taking half of it would invent a rule nobody wrote.
 pub fn read_preconf_pairs(
@@ -491,7 +495,12 @@ fn report_zero_entries(contract: Address, list_slot: u64, zeros: u64) {
 ///
 /// `all_preconfs` short-circuits the allowlist rule, so the contract is never
 /// read in that mode; when preconf is off there is nothing to read for either.
-fn wants_whitelist(cfg: &PreconfConfig) -> Option<Address> {
+///
+/// Shared with the payload builder, which asks the same question to decide
+/// whether a block's sequencer transactions are worth watching for a governance
+/// update — open-coding it there would let the two drift over what
+/// `all_preconfs` means.
+pub fn wants_whitelist(cfg: &PreconfConfig) -> Option<Address> {
     if !cfg.enabled || cfg.all_preconfs {
         return None;
     }
@@ -530,8 +539,8 @@ fn apply_whitelist(
     // out loud, because the cost lands on node startup where it is easy to
     // mistake for a hang. See `WHITELIST_WARN_THRESHOLD`.
     //
-    // Counted in entries, but note a `pairs` entry costs *two* storage reads, so
-    // the same count there takes about twice as long to load.
+    // Counted in entries, but note an `exactPairs` entry costs *two* storage
+    // reads, so the same count there takes about twice as long to load.
     if pair_len >= WHITELIST_WARN_THRESHOLD ||
         from_len >= WHITELIST_WARN_THRESHOLD ||
         to_len >= WHITELIST_WARN_THRESHOLD
@@ -800,6 +809,116 @@ pub async fn run_whitelist_watcher<Pr, N>(
     debug!(target: "mantle::preconf::whitelist", "whitelist watcher stopped");
 }
 
+sol! {
+    /// Mantle's messenger takes **seven** parameters, not upstream OP's six:
+    /// `mntValue` sits before `value` (`CrossDomainMessenger.sol:277-285`).
+    /// Decoding with the upstream shape silently misreads every field after
+    /// `target`, and `target` is what routes the message — so the mistake would
+    /// look like "governance updates are simply never seen".
+    function relayMessage(
+        uint256 nonce,
+        address sender,
+        address target,
+        uint256 mntValue,
+        uint256 value,
+        uint256 minGasLimit,
+        bytes message
+    );
+
+    #[derive(Debug)]
+    struct SolRule {
+        address from;
+        address to;
+    }
+
+    function updatePreconfs(SolRule[] add, SolRule[] remove);
+}
+
+/// One governance update, as it was *called* — the add and remove lists from
+/// `updatePreconfs`.
+///
+/// Deliberately the cause, not the effect. Everywhere else this module watches
+/// the effect (see [`run_whitelist_watcher`]), because state cannot lie about
+/// what happened. This one place reads the calldata instead, and only because
+/// the effect is unaffordable here: applying a delta is `O(add + remove)` while
+/// re-reading the lists out of the in-flight block state is `O(allowlist)`, at
+/// roughly a microsecond a slot, inside the build of a two-second block.
+///
+/// The trade is made safe by two things. Nothing is decoded unless the
+/// transaction *succeeded and emitted* [`WHITELIST_UPDATED_TOPIC0`] from the
+/// configured contract, so a reverted, misrouted or unauthorised call is never
+/// applied — the contract's `onlyL1Gov` has already passed by the time the event
+/// exists. And the result is scoped to one block build; the canonical watcher
+/// re-reads the real lists a moment later, so any decode that disagrees with the
+/// contract is corrected rather than compounded.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WhitelistDelta {
+    /// Rules authorised by this call, in call order.
+    pub add: Vec<(Address, Address)>,
+    /// Rules revoked by this call, in call order.
+    pub remove: Vec<(Address, Address)>,
+}
+
+impl WhitelistDelta {
+    /// Nothing to apply — the call carried two empty lists.
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
+}
+
+/// Decodes a sequencer transaction's calldata into the whitelist update it
+/// carries, or `None` if it does not carry one for `contract`.
+///
+/// The update arrives wrapped: a deposit calls the messenger's `relayMessage`,
+/// whose `message` argument is the real `updatePreconfs` calldata. Both layers
+/// are checked — a `relayMessage` aimed at some other `target` is not ours, and
+/// a `message` that does not decode as `updatePreconfs` is not either.
+///
+/// `target` is checked rather than the deposit's `to`, because the deposit is
+/// addressed to the messenger; the whitelist contract only appears inside.
+pub fn decode_whitelist_update(input: &[u8], contract: Address) -> Option<WhitelistDelta> {
+    let relay = relayMessageCall::abi_decode(input).ok()?;
+    if relay.target != contract {
+        return None;
+    }
+    let update = updatePreconfsCall::abi_decode(&relay.message).ok()?;
+    let pairs = |v: Vec<SolRule>| v.into_iter().map(|p| (p.from, p.to)).collect();
+    Some(WhitelistDelta { add: pairs(update.add), remove: pairs(update.remove) })
+}
+
+/// Applies `delta` to `wl`, mirroring the contract's `_apply`
+/// (`PreconfWhitelist.sol:303-315`).
+///
+/// Three properties are copied from it deliberately, and all three are load
+/// bearing:
+///
+/// * **Adds first, then removes.** The contract runs the two loops in that order, so a rule present
+///   in both lists ends up revoked. Reversing it would leave it authorised.
+/// * **The zero address is a routing marker, not an address.** `from == 0` means the rule is a `to`
+///   wildcard, `to == 0` a `from` wildcard, and only a pair with both halves set is an exact rule.
+///   An all-zero pair reverts on chain, which means no event, which means this function never sees
+///   one — it is skipped rather than trusted.
+/// * **Set semantics.** Adding twice, or removing what is absent, is a no-op on chain (`_addPair` /
+///   `_rmPair` return early), and `HashSet` gives the same for free.
+pub fn apply_delta(wl: &mut Whitelist, delta: &WhitelistDelta) {
+    for &(from, to) in &delta.add {
+        match (from == Address::ZERO, to == Address::ZERO) {
+            (true, true) => continue,
+            (true, false) => wl.to_wildcards.insert(to),
+            (false, true) => wl.from_wildcards.insert(from),
+            (false, false) => wl.pairs.insert((from, to)),
+        };
+    }
+    for &(from, to) in &delta.remove {
+        match (from == Address::ZERO, to == Address::ZERO) {
+            (true, true) => continue,
+            (true, false) => wl.to_wildcards.remove(&to),
+            (false, true) => wl.from_wildcards.remove(&from),
+            (false, false) => wl.pairs.remove(&(from, to)),
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,7 +945,7 @@ mod tests {
         out
     }
 
-    /// Storage words for a `Pair[]` at `slot`. Element `i` occupies **two**
+    /// Storage words for a `Rule[]` at `slot`. Element `i` occupies **two**
     /// slots — `from` at `base + 2i`, `to` at `base + 2i + 1` — which is the
     /// layout `test_storageLayout_matchesRethExpectations_succeeds` pins with
     /// `vm.load` on the Solidity side.
@@ -925,9 +1044,9 @@ mod tests {
 
     #[test]
     fn list_slots_match_contract_layout() {
-        // Declaration order in PreconfWhitelist.sol: pairs(0), pairIndex(1),
-        // fromWildcards(2), fromWildcardIndex(3), toWildcards(4),
-        // toWildcardIndex(5).
+        // Declaration order in PreconfWhitelist.sol: exactPairs(0),
+        // exactPairIndex(1), fromWildcards(2), fromWildcardIndex(3),
+        // toWildcards(4), toWildcardIndex(5).
         assert_eq!(PAIRS_SLOT, 0);
         assert_eq!(FROM_WILDCARDS_SLOT, 2);
         assert_eq!(TO_WILDCARDS_SLOT, 4);
@@ -1123,7 +1242,7 @@ mod tests {
     /// a stride, and a zero budget does no work at all.
     ///
     /// This is where the counting unit is pinned. What it does *not* pin is that
-    /// the `Pair[]` loop charges twice per element — see the note there. That
+    /// the `Rule[]` loop charges twice per element — see the note there. That
     /// wiring is arithmetic rather than behaviour: getting it wrong only doubles
     /// the stride, i.e. moves the check from every ~4ms to every ~8ms, which no
     /// deterministic test can observe without a fake clock.
@@ -1480,6 +1599,250 @@ mod tests {
                 new: Arc::new(Chain::<OpPrimitives>::default()),
             };
             assert!(should_reload(&notif, WL));
+        }
+    }
+
+    mod delta {
+        use super::*;
+
+        /// The cross-repo seam, pinned from this side.
+        ///
+        /// `decode_whitelist_update` matches the inner call by its four-byte
+        /// selector, which is derived from the parameter *types* — the Solidity
+        /// struct's name is not part of it, so renaming `Pair`/`Rule` on the
+        /// contract side cannot break decoding, while changing a parameter type
+        /// silently can. The literal is
+        /// `forge inspect PreconfWhitelist methodIdentifiers`'s entry for
+        /// `updatePreconfs((address,address)[],(address,address)[])`.
+        ///
+        /// Same reasoning as [`WHITELIST_UPDATED_TOPIC0`], and the same failure
+        /// mode if it drifts: governance updates stop being seen, silently.
+        #[test]
+        fn the_update_preconfs_selector_matches_the_contract() {
+            assert_eq!(
+                alloy_primitives::hex::encode(updatePreconfsCall::SELECTOR),
+                "141ffdab",
+                "selector drifted from the deployed `updatePreconfs` signature"
+            );
+        }
+
+        /// The calldata a governance deposit actually carries: `relayMessage`
+        /// wrapping the real `updatePreconfs` call.
+        fn relay(
+            target: Address,
+            add: &[(Address, Address)],
+            remove: &[(Address, Address)],
+        ) -> Vec<u8> {
+            let sol = |v: &[(Address, Address)]| {
+                v.iter().map(|&(from, to)| SolRule { from, to }).collect::<Vec<_>>()
+            };
+            let inner = updatePreconfsCall { add: sol(add), remove: sol(remove) }.abi_encode();
+            relayMessageCall {
+                nonce: U256::ZERO,
+                sender: addr(1),
+                target,
+                mntValue: U256::ZERO,
+                value: U256::ZERO,
+                minGasLimit: U256::ZERO,
+                message: inner.into(),
+            }
+            .abi_encode()
+        }
+
+        #[test]
+        fn decode_reads_through_both_layers() {
+            let input = relay(WL, &[(addr(1), addr(2))], &[(addr(3), Address::ZERO)]);
+
+            assert_eq!(
+                decode_whitelist_update(&input, WL),
+                Some(WhitelistDelta {
+                    add: vec![(addr(1), addr(2))],
+                    remove: vec![(addr(3), Address::ZERO)],
+                })
+            );
+        }
+
+        /// The deposit is addressed to the messenger, so the only thing that
+        /// says "this is our contract" is `relayMessage`'s `target`.
+        #[test]
+        fn decode_ignores_a_message_aimed_elsewhere() {
+            let input = relay(addr(9), &[(addr(1), addr(2))], &[]);
+            assert_eq!(decode_whitelist_update(&input, WL), None);
+        }
+
+        #[test]
+        fn decode_ignores_calldata_that_is_not_a_relay() {
+            assert_eq!(decode_whitelist_update(&[0xde, 0xad, 0xbe, 0xef], WL), None);
+        }
+
+        /// A `relayMessage` for our contract whose payload is something else
+        /// entirely — the outer layer matching is not enough.
+        #[test]
+        fn decode_ignores_an_inner_call_that_is_not_update_preconfs() {
+            let input = relayMessageCall {
+                nonce: U256::ZERO,
+                sender: addr(1),
+                target: WL,
+                mntValue: U256::ZERO,
+                value: U256::ZERO,
+                minGasLimit: U256::ZERO,
+                message: vec![0xde, 0xad, 0xbe, 0xef].into(),
+            }
+            .abi_encode();
+
+            assert_eq!(decode_whitelist_update(&input, WL), None);
+        }
+
+        /// Pins the seven-parameter Mantle shape. The two signatures hash to
+        /// different selectors, so this is caught at the first four bytes rather
+        /// than by any field-level check — which is exactly the guard worth
+        /// having: a binary built against upstream OP's six-parameter
+        /// `relayMessage` would decode *nothing*, and the symptom would be
+        /// "governance updates are silently never seen" rather than a wrong
+        /// allowlist.
+        #[test]
+        fn decode_rejects_the_upstream_six_parameter_shape() {
+            sol! {
+                function relayMessage(
+                    uint256 nonce,
+                    address sender,
+                    address target,
+                    uint256 value,
+                    uint256 minGasLimit,
+                    bytes message
+                );
+            }
+            let inner = updatePreconfsCall {
+                add: vec![SolRule { from: addr(1), to: addr(2) }],
+                remove: vec![],
+            }
+            .abi_encode();
+            let input = relayMessageCall {
+                nonce: U256::ZERO,
+                sender: addr(1),
+                target: WL,
+                value: U256::ZERO,
+                minGasLimit: U256::ZERO,
+                message: inner.into(),
+            }
+            .abi_encode();
+
+            assert_eq!(decode_whitelist_update(&input, WL), None);
+        }
+
+        #[test]
+        fn apply_routes_the_zero_address_to_the_wildcard_sets() {
+            let mut wl = Whitelist::default();
+
+            apply_delta(
+                &mut wl,
+                &WhitelistDelta {
+                    add: vec![
+                        (addr(1), addr(2)),             // exact pair
+                        (addr(3), Address::ZERO),       // from wildcard
+                        (Address::ZERO, addr(4)),       // to wildcard
+                        (Address::ZERO, Address::ZERO), // reverts on chain; skipped here
+                    ],
+                    remove: vec![],
+                },
+            );
+
+            assert_eq!(wl.pairs, HashSet::from_iter([(addr(1), addr(2))]));
+            assert_eq!(wl.from_wildcards, HashSet::from_iter([addr(3)]));
+            assert_eq!(wl.to_wildcards, HashSet::from_iter([addr(4)]));
+        }
+
+        /// The contract runs its add loop to completion before its remove loop
+        /// (`updatePreconfs`), so a rule in both lists ends up revoked.
+        #[test]
+        fn apply_runs_adds_before_removes() {
+            let mut wl = Whitelist::default();
+
+            apply_delta(
+                &mut wl,
+                &WhitelistDelta { add: vec![(addr(1), addr(2))], remove: vec![(addr(1), addr(2))] },
+            );
+
+            assert!(wl.pairs.is_empty(), "the remove must win, not the add");
+        }
+
+        /// `_addPair` / `_rmPair` return early on a duplicate add or an absent
+        /// remove; set semantics give the same answer.
+        #[test]
+        fn apply_is_idempotent_in_both_directions() {
+            let mut wl = Whitelist::default();
+            let d = WhitelistDelta { add: vec![(addr(1), addr(2))], remove: vec![] };
+
+            apply_delta(&mut wl, &d);
+            apply_delta(&mut wl, &d);
+            assert_eq!(wl.pairs, HashSet::from_iter([(addr(1), addr(2))]));
+
+            let rm = WhitelistDelta { add: vec![], remove: vec![(addr(8), addr(9))] };
+            apply_delta(&mut wl, &rm);
+            apply_delta(&mut wl, &rm);
+            assert_eq!(wl.pairs, HashSet::from_iter([(addr(1), addr(2))]));
+        }
+
+        /// **The equivalence the delta path rests on.** Applying an update as a
+        /// delta must land on exactly the allowlist a full read of the
+        /// post-update contract would produce — otherwise the block being built
+        /// judges its preconf transactions against a policy that differs from
+        /// the one the canonical watcher installs a moment later.
+        ///
+        /// The two sides are genuinely independent: the left is
+        /// [`apply_delta`], the right is [`read_all`] over storage laid out the
+        /// way Solidity does. What it cannot cover is the contract's own
+        /// behaviour — that this delta really produces that storage is asserted
+        /// on the Solidity side, and the full L1→L2 governance path needs an L1
+        /// and op-node (see the integration suite's module docs).
+        #[test]
+        fn a_delta_lands_where_a_full_read_of_the_updated_contract_would() {
+            // Before: two pairs, one from-wildcard.
+            let mut delta_side = Whitelist {
+                pairs: HashSet::from_iter([(addr(1), addr(2)), (addr(5), addr(6))]),
+                from_wildcards: HashSet::from_iter([addr(7)]),
+                to_wildcards: HashSet::default(),
+            };
+
+            // Governance revokes one pair and the from-wildcard, and authorizes
+            // a new pair plus a to-wildcard — one call touching all three sets.
+            apply_delta(
+                &mut delta_side,
+                &decode_whitelist_update(
+                    &relay(
+                        WL,
+                        &[(addr(3), addr(4)), (Address::ZERO, addr(8))],
+                        &[(addr(1), addr(2)), (addr(7), Address::ZERO)],
+                    ),
+                    WL,
+                )
+                .expect("calldata decodes"),
+            );
+
+            // The same end state, read out of contract storage.
+            let provider =
+                provider_with(&[(addr(5), addr(6)), (addr(3), addr(4))], &[], &[addr(8)], true);
+            let state = provider.latest_state().unwrap();
+            let (pairs, from_wildcards, to_wildcards) = read_all(&state, WL).unwrap();
+
+            assert_eq!(delta_side, Whitelist { pairs, from_wildcards, to_wildcards });
+        }
+
+        /// The whole point of the delta path: it edits an existing allowlist in
+        /// place rather than replacing it, so entries governance did not touch
+        /// survive.
+        #[test]
+        fn apply_leaves_untouched_entries_alone() {
+            let mut wl = Whitelist {
+                pairs: HashSet::from_iter([(addr(1), addr(2)), (addr(5), addr(6))]),
+                from_wildcards: HashSet::from_iter([addr(7)]),
+                to_wildcards: HashSet::default(),
+            };
+
+            apply_delta(&mut wl, &WhitelistDelta { add: vec![], remove: vec![(addr(1), addr(2))] });
+
+            assert_eq!(wl.pairs, HashSet::from_iter([(addr(5), addr(6))]));
+            assert_eq!(wl.from_wildcards, HashSet::from_iter([addr(7)]));
         }
     }
 }

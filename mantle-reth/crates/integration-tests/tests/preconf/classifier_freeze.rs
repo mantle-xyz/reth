@@ -93,34 +93,36 @@ async fn signed_transfer_from(
 /// 2. `wallet` (allowlisted) submits through the preconf RPC with **no payload job open** → the
 ///    fifo entry parks in `Waiting`, verdict frozen `Eligible`.
 /// 3. Flip the allowlists as above.
-/// 4. FCU to start the job, build, assert both txs landed and the commitment was honoured.
+/// 4. FCU to start the job, build, and read both outcomes off one block.
 ///
-/// ## What each half proves — measured, not assumed
+/// ## What each half proves
 ///
-/// **Case B half is the discriminating one.** Reverting `apply_one_best_tx` to a
-/// live allowlist lookup makes the `other` assertion fail with `sealed = []`:
-/// the pool arm re-derives "eligible" from the widened list and skips the tx,
-/// while the preconf arm has no fifo entry for it, so no arm builds it. That is
-/// the silent liveness failure the freeze exists to prevent.
+/// **Case B — the frozen verdict keeps the plain tx alive.** Reverting
+/// `apply_one_best_tx` to a live allowlist lookup makes the `other` assertion
+/// fail with `sealed = []`: the pool arm re-derives "eligible" from the widened
+/// list and skips the tx, while the preconf arm has no fifo entry for it, so no
+/// arm builds it. That is the silent liveness failure the freeze exists to
+/// prevent, and widening the allowlist must never cause it.
 ///
-/// **Case A half does not discriminate**, and that was verified the same way:
-/// under the live lookup the commitment still came back `Success`. The reason is
-/// structural — `build_payload`'s prologue replays fifo carryover *before* the
-/// `select!` loop pulls its first pool tx, and the loop is biased towards the
-/// preconf arm, so a parked commitment is always applied by the preconf arm
-/// whatever the pool arm's predicate says. The window where Case A can really
-/// bite is the sub-millisecond gap between `add_transaction` returning and the
-/// listener creating the fifo entry (the gap the skip guard exists for), which a
-/// test cannot enter without instrumentation hooks. Case A's regression
-/// coverage is therefore the classifier unit test
-/// `verdict_is_frozen_when_allowlist_shrinks`, plus the type-level fact that no
-/// consumer can reach the allowlists any more.
+/// **Case A — policy binds at dispatch, and the freeze does not shield it.**
+/// `barred_by_allowlist` is asked of every entry against the allowlist pinned
+/// for the block, so a commitment admitted under the old lists is refused once
+/// governance revokes its sender, whether that revocation arrived in this block
+/// or several blocks earlier. The client is told `NotPreconfEligible` rather
+/// than being left to time out, and the transaction reaches neither arm — the
+/// pool arm still skips it, because its frozen verdict is still `Eligible`. A
+/// transaction submitted through the preconf RPC is a preconf request; if policy
+/// will not authorize it, it fails rather than silently degrading into an
+/// ordinary transaction.
 ///
-/// The half is still worth asserting: it is the only end-to-end evidence that a
-/// mid-run `update_whitelist` — what the on-chain watcher does in production —
-/// leaves an outstanding commitment intact.
+/// The two halves are not in tension. The verdict stays frozen throughout —
+/// nothing rewrites it, and the classifier unit test
+/// `verdict_is_frozen_when_allowlist_shrinks` pins that. What the verdict
+/// records is *which RPC the transaction arrived on*, a fact no allowlist can
+/// supply. Whether policy still authorizes it is a separate question, asked
+/// separately, and only Case A's subject fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn frozen_verdicts_survive_an_allowlist_flip_in_both_directions() {
+async fn an_allowlist_flip_bars_the_outstanding_commitment_and_spares_the_plain_tx() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
@@ -203,21 +205,23 @@ async fn frozen_verdicts_survive_an_allowlist_flip_in_both_directions() {
         .expect("resolve_kind")
         .expect("payload build");
 
-    let event = rpc_task.await.expect("rpc join").expect("preconf submission must not error");
+    let err = rpc_task
+        .await
+        .expect("rpc join")
+        .expect_err("a revoked sender's commitment must be refused, not honoured");
+    let msg = err.to_string();
     assert!(
-        matches!(event.status, mantle_reth_rpc_ext::PreconfStatus::Success),
-        "a commitment made before the allowlist flip must still be honoured; \
-         got {:?} reason={:?}",
-        event.status,
-        event.reason,
+        msg.contains("not preconf eligible"),
+        "the client must be told why, immediately, rather than waiting out preconf_timeout; \
+         got {msg}",
     );
-    assert_eq!(event.tx_hash, preconf_hash);
 
     let sealed: Vec<B256> =
         payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
-        sealed.contains(&preconf_hash),
-        "the preconfirmed tx must be in the block; sealed = {sealed:?}",
+        !sealed.contains(&preconf_hash),
+        "a refused commitment must reach neither arm — the preconf arm barred it and the pool \
+         arm skips it for holding a preconf verdict. sealed = {sealed:?}",
     );
     assert!(
         sealed.contains(&other_hash),

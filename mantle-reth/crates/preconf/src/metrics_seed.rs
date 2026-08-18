@@ -37,6 +37,7 @@ const COUNTERS: &[&str] = &[
     "preconf.journal.restore_undecodable",
     "preconf.journal.restore_unknown",
     "preconf.whitelist.zero_entry_skipped",
+    "preconf.whitelist.revoked_total",
 ];
 
 /// Gauge series. Registered **non-destructively** via `increment(0.0)`: the

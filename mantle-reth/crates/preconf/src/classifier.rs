@@ -65,7 +65,10 @@ use alloy_primitives::{
 };
 use parking_lot::RwLock;
 use std::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tracing::warn;
@@ -87,6 +90,29 @@ pub struct Whitelist {
     /// Recipients that make any transaction to them eligible, whatever the
     /// sender.
     pub to_wildcards: HashSet<Address>,
+}
+
+impl Whitelist {
+    /// The three-way OR that decides eligibility, on **this** set of lists.
+    ///
+    /// A method rather than inline code in `PreconfClassifier::evaluate_whitelist`
+    /// because the payload builder evaluates the same question against a
+    /// different `Whitelist` — the build-scoped snapshot that carries a
+    /// governance update landing in the block being built. Two copies of the
+    /// predicate would be two places for the wildcard rules to drift apart.
+    ///
+    /// Says nothing about `enabled` / `all_preconfs`; those are classifier
+    /// state, and the caller applies them.
+    pub fn is_eligible(&self, from: &Address, to: Option<&Address>) -> bool {
+        match to {
+            None => self.from_wildcards.contains(from),
+            Some(to) => {
+                self.pairs.contains(&(*from, *to)) ||
+                    self.from_wildcards.contains(from) ||
+                    self.to_wildcards.contains(to)
+            }
+        }
+    }
 }
 
 /// Safety bound on the verdict cache — 100k entries (≈16MB worst case).
@@ -435,10 +461,16 @@ pub struct PreconfClassifier {
     all_preconfs: bool,
 
     /// The allowlists, mirrored from the on-chain contract. **Private** — this
-    /// is the point of the module. Both lists share one lock so a refresh swaps
-    /// them together; with two locks a reader could pair a new `from` against a
-    /// stale `to`.
-    whitelist: RwLock<Whitelist>,
+    /// is the point of the module. All three sets share one lock so a refresh
+    /// swaps them together; with separate locks a reader could pair a new `from`
+    /// against a stale `to`.
+    ///
+    /// Behind an `Arc` so [`Self::whitelist_snapshot`] can pin the current lists
+    /// without copying them. The payload builder takes one snapshot per block
+    /// and judges every preconf transaction in that block against it, so the
+    /// cost of that guarantee has to be a refcount bump rather than three
+    /// `HashSet` clones.
+    whitelist: RwLock<Arc<Whitelist>>,
 
     /// The frozen verdicts and the `(sender, nonce)` slot index.
     /// `parking_lot` ⇒ synchronous reads, usable from the builder's sync apply
@@ -480,7 +512,7 @@ impl PreconfClassifier {
         Self {
             enabled: true,
             all_preconfs,
-            whitelist: RwLock::new(Whitelist::default()),
+            whitelist: RwLock::new(Arc::new(Whitelist::default())),
             verdicts: RwLock::new(VerdictStore::default()),
             grace,
             capacity,
@@ -1124,7 +1156,7 @@ impl PreconfClassifier {
         from_wildcards: HashSet<Address>,
         to_wildcards: HashSet<Address>,
     ) {
-        *self.whitelist.write() = Whitelist { pairs, from_wildcards, to_wildcards };
+        *self.whitelist.write() = Arc::new(Whitelist { pairs, from_wildcards, to_wildcards });
     }
 
     /// Current allowlist sizes as `(pairs, from_wildcards, to_wildcards)` — for
@@ -1134,8 +1166,14 @@ impl PreconfClassifier {
         (wl.pairs.len(), wl.from_wildcards.len(), wl.to_wildcards.len())
     }
 
-    /// Snapshot of the whole allowlist. Clones; not for hot paths.
-    pub fn whitelist_snapshot(&self) -> Whitelist {
+    /// Pins the current allowlist so a reader can hold one fixed view of it.
+    ///
+    /// A refcount bump, not a copy — which is what makes it affordable for the
+    /// payload builder to take one per block. [`Self::update_whitelist`] swaps
+    /// the `Arc` wholesale, so a snapshot taken before a refresh keeps the lists
+    /// it was taken with, and every transaction in one block is judged against
+    /// the same policy even if governance lands mid-build.
+    pub fn whitelist_snapshot(&self) -> Arc<Whitelist> {
         self.whitelist.read().clone()
     }
 
@@ -1199,15 +1237,7 @@ impl PreconfClassifier {
         if self.all_preconfs {
             return Verdict::Eligible;
         }
-        let wl = self.whitelist.read();
-        let hit = match to {
-            None => wl.from_wildcards.contains(from),
-            Some(to) => {
-                wl.pairs.contains(&(*from, *to)) ||
-                    wl.from_wildcards.contains(from) ||
-                    wl.to_wildcards.contains(to)
-            }
-        };
+        let hit = self.whitelist.read().is_eligible(from, to);
         if hit { Verdict::Eligible } else { Verdict::NotEligible }
     }
 

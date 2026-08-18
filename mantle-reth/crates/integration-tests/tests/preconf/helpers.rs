@@ -167,9 +167,9 @@ pub fn address_array_storage(slot: u64, entries: &[Address]) -> Vec<(B256, B256)
     out
 }
 
-/// Storage words laying out `entries` as a Solidity `Pair[]` declared at `slot`.
+/// Storage words laying out `entries` as a Solidity `Rule[]` declared at `slot`.
 ///
-/// A `Pair` is two `address` fields — 40 bytes — so it cannot pack into one
+/// A `Rule` is two `address` fields — 40 bytes — so it cannot pack into one
 /// slot: element `i` occupies `keccak256(slot) + 2i` (`from`) and
 /// `keccak256(slot) + 2i + 1` (`to`). That stride is pinned from both sides
 /// (`whitelist::tests::read_preconf_pairs_decodes_the_two_slot_stride` and

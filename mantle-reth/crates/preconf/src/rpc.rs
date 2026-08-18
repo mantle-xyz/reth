@@ -681,7 +681,11 @@ fn internal_err<E: std::fmt::Display>(e: &E) -> ErrorObject<'static> {
     ErrorObject::owned(PRECONF_RPC_ERR_CODE, format!("internal: {e}"), None::<()>)
 }
 
-fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Address> {
+/// A creation has no recipient at all, which is not the same as a call to the
+/// zero address — see `PreconfClassifier::evaluate_whitelist`'s docs for why
+/// only a from-wildcard can authorize one. Shared with the payload builder so
+/// the two ask the allowlist the same question.
+pub(crate) fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Address> {
     match kind {
         TxKind::Call(addr) => Some(addr),
         TxKind::Create => None,
