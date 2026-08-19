@@ -309,7 +309,21 @@ fn estimate_total_fee_gas_price(
 /// Default spacing between simulated blocks when a request does not override `time`.
 ///
 /// Must track `OpNextBlockEnvAttributes::build_pending_env`, which derives a simulated block's
-/// timestamp as `parent.timestamp() + 12`.
+/// timestamp as `parent.timestamp() + 12`. The value comes from `eth_simulateV1`'s original
+/// definition in go-ethereum (`timestampIncrement`, `internal/ethapi/simulate.go`) and is a plain
+/// constant on both clients today, so 12 is what op-geth and this reth actually produce — verified
+/// on devnet.
+///
+/// It is nonetheless *wrong for Mantle*, whose blocks are 2s apart, and upstream reth has already
+/// replaced the constant with a per-chain lookup (`Chain::average_blocktime_hint()`), keeping 12
+/// only as the fallback for unregistered chains. Mantle is **not** unregistered: `alloy-chains`
+/// records `average_blocktime_millis = 2000` for both chain 5000 and 5003
+/// (`CHAIN_DATA[95]`/`[96]` in `alloy-chains/src/generated/named.rs`).
+///
+/// So bumping to a rev that includes that change will switch the real increment from 12 to 2, and
+/// this constant will silently disagree with it — the crossing check would compute timestamps ~6x
+/// too far ahead and could reject a request that never crosses the fork. See
+/// [`simulated_block_timestamps`] for the fix to apply at bump time.
 const SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT: u64 = 12;
 
 /// Parses a JSON-RPC quantity into a `u64`, accepting both the canonical `"0x2a"` hex string and a
@@ -332,13 +346,20 @@ fn parse_quantity_u64(value: &serde_json::Value) -> Option<u64> {
 /// `time` override wins. Each block's parent is the *previous simulated block*, not the base block,
 /// so the timestamps must be walked forward rather than computed against the base.
 ///
-/// This assumes one simulated block per `blockStateCalls` entry, which holds today because this
-/// reth does not gap-fill skipped `blockOverrides.number` values. Upstream added gap-filling in
-/// paradigmxyz/reth#24388: once that lands here, a number gap also inserts filler blocks that
-/// consume timestamps, so the entry's real timestamp is later than computed here and a crossing
-/// could be missed. When bumping to a rev that includes #24388, derive the timestamps from
-/// `sanitize_chain`'s output (which materializes an explicit `time` for every block, fillers
-/// included) instead of recomputing them.
+/// This assumes one simulated block per `blockStateCalls` entry, and that consecutive blocks are
+/// [`SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT`] apart. Both hold today but both break on the same
+/// upstream bump:
+///
+/// - paradigmxyz/reth#24388 adds gap-filling, so a skipped `blockOverrides.number` inserts filler
+///   blocks that also consume timestamps — the entry's real timestamp then lands *later* than
+///   computed here, and a crossing could be missed.
+/// - the same tree replaces the fixed increment with `Chain::average_blocktime_hint()`, which
+///   returns 2s for Mantle (registered in `alloy-chains`), so timestamps computed at 12s would run
+///   ~6x too far ahead and a non-crossing request could be rejected.
+///
+/// The single fix for both: once on such a rev, derive the timestamps from `sanitize_chain`'s
+/// output — it materializes an explicit `time` for every block, fillers included, at the chain's
+/// real block time — instead of recomputing them here.
 fn simulated_block_timestamps(base_timestamp: u64, time_overrides: &[Option<u64>]) -> Vec<u64> {
     let mut previous = base_timestamp;
     time_overrides
