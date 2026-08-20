@@ -45,7 +45,7 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 use crate::{
     PreconfConfig, PreconfTxSet,
     apply::ApplyError,
-    types::{ApplyFailure, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
+    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
 /// How a sender's preconf chain is blocked for the rest of the current slot
@@ -290,8 +290,10 @@ where
             PreconfStatus::Timeout => {
                 PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
             }
-            PreconfStatus::Broken => {
-                PreconfError::CommitmentBroken { attempts: entry.apply_failures }
+            // A broken commitment ends in `Failed` like any other apply
+            // rejection; the `Replay` source is what tells them apart.
+            PreconfStatus::Failed if entry.source == PreconfSource::Replay => {
+                PreconfError::CommitmentBroken
             }
             other => PreconfError::Internal(format!(
                 "preconf entry already terminal ({other:?}) at dispatch entry"
@@ -418,8 +420,10 @@ where
             PreconfStatus::Timeout => {
                 PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
             }
-            PreconfStatus::Broken => {
-                PreconfError::CommitmentBroken { attempts: re_entry.apply_failures }
+            // See the same split at dispatch entry: a `Replay`-source `Failed`
+            // is a broken commitment, not an RPC rejection.
+            PreconfStatus::Failed if re_entry.source == PreconfSource::Replay => {
+                PreconfError::CommitmentBroken
             }
             other => PreconfError::Internal(format!(
                 "preconf entry flipped to {other:?} before apply_lock"
@@ -504,57 +508,62 @@ where
         }
         // This entry's receipt has already gone out (`Replay` covers journal
         // restore, reorg reinject, and stale-in-flight replay; all three imply a
-        // Success receipt was returned).
+        // Success receipt was returned). Reaching here means the commitment is
+        // **broken**, and this is the only moment that fact is observable.
         //
-        // `mark_failed` would make it replaceable by another hash, let
-        // `clean_reclaimable` sweep it, AND evict it from the pool — which
-        // destroys the very thing a retry needs. So instead: keep it `Waiting`
-        // and in the pool, and let the next payload job's carryover preamble
-        // apply it against fresh block state. Give up only after
-        // `preconf_max_apply_attempts`, and give up into `Broken`, which is not
-        // replaceable.
+        // # Why there is no retry
         //
-        // Only `Rejected` reaches here: `Fatal` returned above, because an
-        // untrustworthy execution environment says nothing about this
-        // commitment and must not burn one of its retry attempts.
+        // Every transient cause has already been filtered out upstream, so a
+        // second attempt would re-run against the same verdict:
+        //
+        // - Block / DA capacity — `preconf_admission` separates "does not fit an empty block"
+        //   (permanent, `Reject`) from "does not fit *this* block" (transient) and returns `Defer`
+        //   for `Replay`, which keeps the entry `Waiting` for the next slot without ever reaching
+        //   apply. Deferring is unbounded; it is not a retry budget.
+        // - Same-sender ordering — the cascade above defers a successor whose predecessor was
+        //   deferred or rejected this slot, again without reaching apply.
+        // - `Fatal` — returned above, because an untrustworthy execution environment says nothing
+        //   about this commitment.
+        //
+        // What is left is `Validation(InvalidTx)` from the EVM on a transaction
+        // that already applied cleanly once: nonce taken by another transaction,
+        // balance since spent. Those do not heal. A missing predecessor does not
+        // either — the pool is in-memory, so a crash loses any plain predecessor
+        // outright, and only preconf transactions are journaled.
+        //
+        // So this is terminal on the first failure, and it is an ordinary
+        // `Failed`: the `(sender, nonce)` is **released** and the tx leaves the
+        // pool. Holding the nonce would protect the commitment from nobody —
+        // only the sender can produce a transaction on it — while wedging the
+        // promisee's own account, with nothing able to clear it.
         Err(ApplyError::Rejected(err)) => {
-            metrics::counter!("preconf.tx.failure_total").increment(1);
+            // The breach record. There is no channel to tell the client (this
+            // entry's responder was consumed when its receipt went out, and the
+            // node exposes no status query), the slot is released here and the
+            // entry will be swept — so this line and the counter below are the
+            // only trace a broken commitment leaves. Keep both.
+            error!(
+                target: "mantle::preconf::dispatch",
+                ?hash, ?err,
+                "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
+            );
+            metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
             // Recording the exclusion is load-bearing, not cosmetic: `loop_state`
             // is per-build, and without it a later broadcast event (or the
             // snapshot re-scan the `Lagged` arm runs) in *this same block* would
-            // apply the entry again and burn the whole retry budget inside one
-            // slot. The budget is meant to span slots.
-            match fifo.record_apply_failure(&hash, cfg.preconf_max_apply_attempts).await {
-                Ok(ApplyFailure::Retrying { attempts }) => {
-                    warn!(
-                        target: "mantle::preconf::dispatch",
-                        ?hash, ?err, attempts,
-                        max = cfg.preconf_max_apply_attempts,
-                        "apply failed for an already-acknowledged commitment; keeping it Waiting to retry next slot"
-                    );
-                    metrics::counter!("preconf.tx.replay_retry_total").increment(1);
-                    loop_state.record_excluded(hash, err);
-                }
-                Ok(ApplyFailure::Broken { attempts }) => {
-                    // The only moment a broken commitment becomes observable.
-                    error!(
-                        target: "mantle::preconf::dispatch",
-                        ?hash, ?err, attempts,
-                        "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; giving up and pinning its nonce"
-                    );
-                    metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
-                    loop_state.record_excluded(hash, PreconfError::CommitmentBroken { attempts });
-                }
-                Err(e) => trace!(
+            // try to apply the entry again.
+            loop_state.record_excluded(hash, PreconfError::CommitmentBroken);
+            if let Err(e) = fifo.mark_failed(&hash).await {
+                trace!(
                     target: "mantle::preconf::dispatch",
                     ?hash, ?e,
-                    "record_apply_failure lost race"
-                ),
+                    "mark_failed lost race"
+                );
             }
             // Deliberately no `take_responder` / `send(Err)`: a `Replay` entry
-            // normally has no responder, and if a client did resubmit the same
-            // hash it should keep waiting — the tx it is waiting for is still
-            // being retried.
+            // normally has no responder. A client that did resubmit the same
+            // hash learns the outcome through `rpc.rs`'s deadline path, which
+            // reads the terminal status.
         }
     }
     Ok(())
@@ -845,18 +854,18 @@ mod tests {
 
         // Fifo entry transitioned to Failed (not Success).
         //
-        // This is also the `Rpc` half of the D4 split: a *live* submission must
-        // keep failing fast, so the entry ends up in the replaceable `Failed`
-        // and its client learns immediately. Only `Replay` entries get the
-        // retry treatment — see `a_replayed_commitment_is_not_marked_failed_*`.
+        // Both sources land in `Failed`; the difference is only how it is
+        // reported. An `Rpc` entry's client is handed the error directly (above)
+        // and it is counted as a routine failure. A `Replay` entry has no
+        // responder and is counted as a breach — see
+        // `a_broken_commitment_is_marked_failed_and_releases_its_slot`.
         let entry = fifo.find_by_hash(&hash).await.unwrap();
         assert_eq!(entry.status, PreconfStatus::Failed);
-        assert_eq!(entry.source, PreconfSource::Rpc, "the fail-fast half is Rpc-only");
-        assert_eq!(entry.apply_failures, 0, "Rpc path must not touch the replay budget");
+        assert_eq!(entry.source, PreconfSource::Rpc);
     }
 
-    // ===== D4: an already-acknowledged commitment must not become replaceable
-    // ===== (docs/preconf-commitment-retention-until-irrevocable.md §4.10)
+    // ===== An already-acknowledged commitment that cannot be applied: broken,
+    // ===== reported loudly, and its `(sender, nonce)` released
 
     /// Push an entry that is already in the "receipt has gone out" shape: a
     /// `Replay`-sourced `Waiting` entry with no responder, which is what
@@ -871,12 +880,23 @@ mod tests {
         hash
     }
 
-    /// The core of D4. Before the fix this landed in `Failed`, which is
-    /// replaceable by any same-nonce tx, swept by `clean_reclaimable`, and
-    /// evicted from the pool — silently breaking a commitment the client already
-    /// holds a receipt for.
+    /// A commitment whose receipt already went out is marked `Failed` on the
+    /// first apply rejection, releasing its `(sender, nonce)`.
+    ///
+    /// There is deliberately no retry: every transient cause is filtered out
+    /// before apply — `preconf_admission` returns `Defer` for a `Replay` entry
+    /// that only fails to fit *this* block, and the same-sender cascade defers a
+    /// successor whose predecessor was held back. What reaches apply is the EVM
+    /// calling the transaction invalid, on a transaction that already applied
+    /// cleanly once: a nonce another transaction has taken, or a balance since
+    /// spent. Neither heals, so retrying would only re-derive the same verdict
+    /// while holding the sender's nonce.
+    ///
+    /// And the nonce must be released: only the sender can produce a transaction
+    /// on it, so pinning it protects the commitment from nobody while wedging
+    /// the very party the promise was made to.
     #[tokio::test]
-    async fn a_replayed_commitment_is_not_marked_failed_on_apply_error() {
+    async fn a_broken_commitment_is_marked_failed_and_releases_its_slot() {
         let fifo = PreconfTxSet::new(8);
         let cfg = PreconfConfig::default();
         let hash = push_replayed(&fifo, make_tx(0x91)).await;
@@ -886,34 +906,31 @@ mod tests {
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
-        let entry = fifo.find_by_hash(&hash).await.expect("entry must survive the failure");
-        assert_eq!(
-            entry.status,
-            PreconfStatus::Waiting,
-            "an acknowledged commitment stays Waiting so the next job retries it",
-        );
-        assert_eq!(entry.apply_failures, 1);
-        // Recorded as excluded so a second broadcast in *this* block cannot burn
-        // another attempt — the budget is meant to span slots, not events.
+        let entry = fifo.find_by_hash(&hash).await.expect("entry survives until the sweep");
+        assert_eq!(entry.status, PreconfStatus::Failed, "terminal on the first failure");
+        assert!(entry.status.is_replaceable(), "and the nonce is released");
+        assert_eq!(entry.source, PreconfSource::Replay, "the source is what marks it a breach");
+        // Recorded as excluded so a second broadcast in *this* block cannot try
+        // to apply it again.
         assert_eq!(state.excluded_len(), 1);
         assert_eq!(state.committed_len(), 0);
+        assert!(matches!(state.excluded_reason(&hash), Some(PreconfError::CommitmentBroken)));
     }
 
-    /// A `Fatal` apply error must **not** spend one of the retry attempts.
+    /// A `Fatal` apply error must **not** break the commitment.
     ///
     /// This pins the arm ordering rather than any one arm. The two error axes
     /// are independent: the error's *kind* (`Rejected` — this transaction is
     /// invalid — versus `Fatal` — the execution environment is untrustworthy)
     /// and the entry's *source* (`Rpc` versus an already-acknowledged replay).
-    /// `Fatal` returns before the D4 budget is touched, because a DB / header /
+    /// `Fatal` must return before the breach arm, because a DB / header /
     /// fatal-precompile error says nothing whatsoever about this transaction;
-    /// charging it an attempt would march an otherwise-applicable commitment
-    /// toward `Broken` for reasons entirely outside it, and `Broken` is the one
-    /// state there is no way back from.
+    /// treating it as a breach would declare an otherwise-applicable commitment
+    /// broken — and release its nonce — for reasons entirely outside it.
     ///
     /// Move the catch-all above the `Fatal` arm and this goes red.
     #[tokio::test]
-    async fn a_fatal_apply_error_does_not_charge_the_replay_budget() {
+    async fn a_fatal_apply_error_does_not_break_the_commitment() {
         let fifo = PreconfTxSet::new(8);
         let cfg = PreconfConfig::default();
         let hash = push_replayed(&fifo, make_tx(0x92)).await;
@@ -929,9 +946,9 @@ mod tests {
             PreconfStatus::Waiting,
             "left Waiting, responder still attached, for the next build cycle",
         );
-        assert_eq!(
-            entry.apply_failures, 0,
-            "a fatal environment error must not count against the commitment",
+        assert!(
+            entry.status.is_active(),
+            "a fatal environment error must leave the commitment live, not broken",
         );
         assert_eq!(
             state.excluded_len(),
@@ -940,10 +957,11 @@ mod tests {
         );
     }
 
-    /// `mark_failed` fires the pool-eviction hook, which would remove the very
-    /// tx the retry needs. The retry path must not.
+    /// A broken commitment is evicted from the pool, like every other terminal
+    /// transition. Leaving it there would let it land later, after the slot was
+    /// already released and possibly taken by a different transaction.
     #[tokio::test]
-    async fn a_replayed_commitment_stays_in_the_pool_after_an_apply_error() {
+    async fn a_broken_commitment_is_evicted_from_the_pool() {
         use std::sync::Mutex as StdMutex;
 
         let fifo = PreconfTxSet::new(8);
@@ -958,66 +976,28 @@ mod tests {
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
-        assert!(
-            evicted.lock().unwrap().is_empty(),
-            "retrying a commitment must not evict it from the pool",
+        assert_eq!(
+            evicted.lock().unwrap().as_slice(),
+            &[hash],
+            "a broken commitment must leave the pool",
         );
     }
 
-    /// The `max_attempts`-th failure gives up — but into `Broken`, which is not
-    /// replaceable, rather than into `Failed`, which is.
-    #[tokio::test]
-    async fn the_third_apply_failure_moves_the_commitment_to_broken() {
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig { preconf_max_apply_attempts: 3, ..PreconfConfig::default() };
-        let hash = push_replayed(&fifo, make_tx(0x93)).await;
-
-        for attempt in 1..=2u8 {
-            // Fresh LoopState each round: one attempt per payload job.
-            let mut state = LoopState::new(7);
-            apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
-                .await
-                .expect("a per-tx rejection keeps the build going; no Fatal here");
-            let entry = fifo.find_by_hash(&hash).await.unwrap();
-            assert_eq!(
-                entry.status,
-                PreconfStatus::Waiting,
-                "attempt {attempt} of 3 must still be retrying",
-            );
-            assert_eq!(entry.apply_failures, attempt);
-        }
-
-        let mut state = LoopState::new(7);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
-            .await
-            .expect("a per-tx rejection keeps the build going; no Fatal here");
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Broken, "the 3rd failure gives up");
-        assert_eq!(entry.apply_failures, 3);
-        // The give-up reason must be the dedicated variant, not a generic
-        // builder error — it is what the RPC layer surfaces to a resubmitting
-        // client.
-        assert!(matches!(
-            state.excluded_reason(&hash),
-            Some(PreconfError::CommitmentBroken { attempts: 3 })
-        ));
-    }
-
-    /// A `Broken` entry must not be retried by later jobs — dispatch's status
-    /// gate treats it as terminal and reports the give-up reason.
+    /// A broken commitment must not be applied by later jobs — dispatch's
+    /// status gate treats it as terminal and reports the breach reason.
     #[tokio::test]
     async fn a_broken_commitment_is_not_applied_again() {
         use std::cell::Cell;
 
         let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig { preconf_max_apply_attempts: 1, ..PreconfConfig::default() };
+        let cfg = PreconfConfig::default();
         let hash = push_replayed(&fifo, make_tx(0x94)).await;
 
         let mut state = LoopState::new(7);
         apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
-        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Broken);
+        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Failed);
 
         // A later job: the apply closure must not run at all.
         let calls = Cell::new(0u32);
@@ -1031,43 +1011,7 @@ mod tests {
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
         assert_eq!(calls.get(), 0, "a broken commitment must not be re-applied");
-        assert!(matches!(
-            next_state.excluded_reason(&hash),
-            Some(PreconfError::CommitmentBroken { attempts: 1 }),
-        ));
-    }
-
-    /// A success in between clears the budget: a commitment that bounces across
-    /// several discarded in-flight blocks must not accumulate failures from
-    /// rounds it actually survived.
-    #[tokio::test]
-    async fn a_successful_apply_resets_the_replay_failure_budget() {
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig { preconf_max_apply_attempts: 2, ..PreconfConfig::default() };
-        let hash = push_replayed(&fifo, make_tx(0x95)).await;
-
-        let mut state = LoopState::new(7);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
-            .await
-            .expect("a per-tx rejection keeps the build going; no Fatal here");
-        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().apply_failures, 1);
-
-        // Next job succeeds, then that block is discarded too.
-        let mut state = LoopState::new(8);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok)
-            .await
-            .expect("a per-tx rejection keeps the build going; no Fatal here");
-        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().apply_failures, 0);
-        fifo.reset_success_to_waiting(&hash).await.unwrap();
-
-        // With the budget reset, one more failure is a retry — not a give-up.
-        let mut state = LoopState::new(9);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
-            .await
-            .expect("a per-tx rejection keeps the build going; no Fatal here");
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Waiting);
-        assert_eq!(entry.apply_failures, 1);
+        assert!(matches!(next_state.excluded_reason(&hash), Some(PreconfError::CommitmentBroken),));
     }
 
     /// A FATAL apply error (DB / header / fatal precompile) must abort the

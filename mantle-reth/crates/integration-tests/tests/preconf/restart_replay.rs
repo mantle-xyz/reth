@@ -232,11 +232,11 @@ fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::Pa
 /// accepts a same-hash resubmit onto it (see
 /// `preconf_tx_set::tests::attach_responder_accepts_a_resubmit_onto_a_replaying_entry`),
 /// and that resubmit's `handle_inner` reaches the deadline branch with
-/// `final_status == Some(Waiting)`. Before D4 that branch ran `mark_timeout`
+/// `final_status == Some(Waiting)`. That branch used to run `mark_timeout`
 /// unconditionally, which makes the commitment replaceable by any same-nonce tx,
 /// sweepable by `clean_reclaimable`, **and** evicts it from the pool — so a
 /// promise whose receipt went out in the previous process would silently never
-/// land. See `docs/preconf-commitment-retention-until-irrevocable.md` §4.10.
+/// land.
 ///
 /// No payload build is driven until after the deadline, so the RPC call is
 /// guaranteed to hit the deadline path. Two observables, either of which the

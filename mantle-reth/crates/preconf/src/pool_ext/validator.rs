@@ -1074,33 +1074,39 @@ mod tests {
         }
     }
 
-    /// **D4's core invariant at the guard.** `Broken` is a terminal state whose
-    /// tx is *not* on chain, so it looks exactly like the three reclaimable
-    /// states from here — but its receipt has already been handed to a client,
-    /// so handing its nonce to a different transaction would break that
-    /// commitment. `PreconfStatus::is_replaceable` excludes it; this pins that
-    /// the guard honours the exclusion.
-    ///
-    /// See `docs/preconf-commitment-retention-until-irrevocable.md` §4.10.
+    /// **The guard must let a sender past a broken commitment.** Once the apply
+    /// has been rejected the entry is an ordinary `Failed`: its tx is not on
+    /// chain and its `(sender, nonce)` is released. Refusing the replacement here
+    /// would wedge the account on that nonce — with nothing to clear it, since
+    /// no sweep and no operator call can — and would do so to protect a
+    /// commitment from the only party able to use that nonce: its promisee.
     #[tokio::test]
-    async fn a_broken_commitment_cannot_be_replaced_by_a_same_nonce_tx() {
+    async fn a_broken_commitment_does_not_block_a_same_nonce_tx() {
         let f = fixture(Inner::Valid, 1_000_000);
 
         f.seat_incumbent(1, 5);
         f.fifo.push_if_absent(fifo_tx(1, 5), sender(), PreconfSource::Replay).await;
-        // One failure with a budget of one ⇒ straight to Broken.
-        f.fifo.record_apply_failure(&h(1), 1).await.unwrap();
-        assert_eq!(f.fifo.find_by_hash(&h(1)).await.unwrap().status, PreconfStatus::Broken);
+        // The first apply rejection is terminal for a replayed commitment.
+        f.fifo.mark_failed(&h(1)).await.unwrap();
+        let e = f.fifo.find_by_hash(&h(1)).await.unwrap();
+        assert_eq!(e.status, PreconfStatus::Failed);
+        assert_eq!(e.source, PreconfSource::Replay, "still marked as a breach");
 
         let replacement = f.validate(op_tx(2, sender(), 5, 21_000)).await;
 
-        assert_refused::<ReplaceActivePreconf>(&replacement);
-        assert_eq!(f.inner_calls(), 0, "refused before the inner validator");
-        assert!(f.fifo.contains(&h(1)).await, "the broken commitment keeps its fifo entry");
+        assert!(
+            matches!(replacement, TransactionValidationOutcome::Valid { .. }),
+            "the replacement must be admitted, not refused: {replacement:?}",
+        );
+        assert_eq!(f.inner_calls(), 1, "and it reached the inner validator");
+        assert!(!f.fifo.contains(&h(1)).await, "the broken entry was torn down");
+        // A plain (`NotEligible`) replacement does not itself claim the slot —
+        // `VerdictStore::claim` only writes `by_slot` for preconf verdicts — so
+        // the slot reads as free. That is the point: it is no longer pinned.
         assert_eq!(
             f.classifier.slot_owner(&sender(), 5),
-            Some(h(1)),
-            "and keeps the (sender, nonce) slot its receipt was issued against",
+            None,
+            "the (sender, nonce) is released, not handed to the replacement",
         );
     }
 

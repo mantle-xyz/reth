@@ -461,6 +461,27 @@ where
                 let final_status = final_entry.as_ref().map(|e| e.status);
 
                 match final_status {
+                    // **Must precede the `Success | Failed` arm below.** A broken
+                    // commitment ends in `Failed` like any other apply rejection;
+                    // the `Replay` source is what tells them apart. That arm
+                    // assumes dispatch queued a message on `resp_rx`, but the
+                    // breach path deliberately sends nothing, so falling into it
+                    // would report a `Timeout` the client retries forever.
+                    //
+                    // This is also the **only** channel through which a client
+                    // can learn its commitment was broken: a `Replay` entry's
+                    // responder was consumed when the receipt went out, and the
+                    // node exposes no status-query RPC.
+                    Some(PreconfStatus::Failed)
+                        if final_entry
+                            .as_ref()
+                            .is_some_and(|e| e.source == PreconfSource::Replay) =>
+                    {
+                        drop(apply_guard);
+                        let err = PreconfError::CommitmentBroken;
+                        self.fifo.cancel_responder(&hash, err.clone()).await;
+                        Err(preconf_error_to_rpc(&err))
+                    }
                     Some(PreconfStatus::Success | PreconfStatus::Failed) => {
                         // Apply committed to builder state between our
                         // deadline firing and lock acquisition. The
@@ -563,19 +584,6 @@ where
                             )
                             .await;
                         Ok(build_timeout_event(hash, preconf_timeout))
-                    }
-                    Some(PreconfStatus::Broken) => {
-                        // This commitment was already given up on — the
-                        // receipt went out in an earlier session and
-                        // `preconf_max_apply_attempts` applies all failed. Tell
-                        // this client the truth rather than a timeout it would
-                        // retry forever.
-                        let attempts =
-                            final_entry.as_ref().map(|e| e.apply_failures).unwrap_or_default();
-                        drop(apply_guard);
-                        let err = PreconfError::CommitmentBroken { attempts };
-                        self.fifo.cancel_responder(&hash, err.clone()).await;
-                        Err(preconf_error_to_rpc(&err))
                     }
                 }
             }

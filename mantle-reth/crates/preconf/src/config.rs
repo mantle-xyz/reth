@@ -58,23 +58,6 @@ pub const DEFAULT_SAFETY_MARGIN: Duration = Duration::from_millis(40);
 /// Matches op-geth `--txpool.rejournal` default.
 pub const DEFAULT_REJOURNAL_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Default replay-apply attempt budget for an already-acknowledged
-/// commitment — 3.
-///
-/// Once a receipt has been returned, a failed apply must not turn the entry
-/// into a replaceable terminal state, which would let an acknowledged
-/// commitment be displaced. Dispatch
-/// instead keeps the entry `Waiting` so the next payload job retries it
-/// against fresh block state, and only after this many consecutive failures
-/// gives up into `PreconfStatus::Broken`.
-///
-/// One attempt per payload job, so 3 spans roughly `3 × slot_duration` (~6s
-/// at OP defaults) — long enough for a transient in-flight state race to
-/// clear, short enough that a genuinely inapplicable tx surfaces as a broken
-/// commitment instead of retrying forever. op-geth has no equivalent: it has
-/// no replay path at all.
-pub const DEFAULT_MAX_APPLY_ATTEMPTS: u8 = 3;
-
 /// Default journal max disk size — 1 GiB.
 ///
 /// Above this, rotation forces rename + new file.
@@ -140,17 +123,6 @@ pub struct PreconfConfig {
     /// × block_gas_limit`. Default 2s (OP-stack block time).
     pub slot_duration: Duration,
 
-    /// How many consecutive replay applies may fail before an
-    /// already-acknowledged commitment is given up on and moved to
-    /// [`crate::types::PreconfStatus::Broken`]. Default 3 (see
-    /// [`DEFAULT_MAX_APPLY_ATTEMPTS`]).
-    ///
-    /// Only affects entries whose receipt has already been returned
-    /// (`PreconfSource::Replay`); a live RPC submission still fails fast on the
-    /// first apply error. Must be ≥ 1 (enforced by [`Self::validate`]) — 0 would
-    /// break the commitment on a failure that had never even been retried.
-    pub preconf_max_apply_attempts: u8,
-
     // ===== Operator hardening =====
     /// Per-tx gas limit for preconf-eligible transactions.
     /// Default `2_000_000` (see [`DEFAULT_PRECONF_MAX_GAS_PER_TX`]).
@@ -195,7 +167,6 @@ impl Default for PreconfConfig {
             safety_margin: DEFAULT_SAFETY_MARGIN,
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             slot_duration: DEFAULT_SLOT_DURATION,
-            preconf_max_apply_attempts: DEFAULT_MAX_APPLY_ATTEMPTS,
             preconf_max_gas_per_tx: DEFAULT_PRECONF_MAX_GAS_PER_TX,
             preconf_max_gas_per_block: DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
             journal_path: None,
@@ -221,10 +192,6 @@ pub enum PreconfConfigError {
     /// `preconf_timeout == 0`.
     #[error("preconf_timeout must be > 0")]
     InvalidPreconfTimeout,
-    /// `preconf_max_apply_attempts == 0` — a commitment would be declared
-    /// broken on a failure it was never retried after.
-    #[error("preconf_max_apply_attempts must be > 0")]
-    InvalidMaxApplyAttempts,
     /// `sweep_interval == 0`.
     #[error("sweep_interval must be > 0")]
     InvalidSweepInterval,
@@ -279,9 +246,6 @@ impl PreconfConfig {
         }
         if self.preconf_timeout.is_zero() {
             return Err(PreconfConfigError::InvalidPreconfTimeout);
-        }
-        if self.preconf_max_apply_attempts == 0 {
-            return Err(PreconfConfigError::InvalidMaxApplyAttempts);
         }
         if self.sweep_interval.is_zero() {
             return Err(PreconfConfigError::InvalidSweepInterval);

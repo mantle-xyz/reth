@@ -734,8 +734,7 @@ async fn failed_slot_replaceable_by_different_hash() {
 /// **retention window** is the same state held open deterministically: once a
 /// commitment lands, `forward()` removes its fifo entry the moment its nonce
 /// advances, but the slot is kept for `SEAL_DEPTH` persisted blocks so a reorg
-/// cannot hand the nonce away (see
-/// `docs/preconf-commitment-retention-until-irrevocable.md`).
+/// cannot hand the nonce away.
 ///
 /// So: get a commitment on chain, then try to take its nonce. The guard runs
 /// **before** the inner validator, so a refusal here says `ReplaceActivePreconf`

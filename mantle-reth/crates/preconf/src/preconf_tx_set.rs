@@ -41,8 +41,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
 use tracing::error;
 
 use crate::types::{
-    ApplyFailure, AttachError, MarkError, PreconfError, PreconfReceipt, PreconfSource,
-    PreconfStatus, PushResult,
+    AttachError, MarkError, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus, PushResult,
 };
 
 /// A single fifo entry.
@@ -70,18 +69,6 @@ pub struct TxEntry {
     /// Origin of the entry — see [`PreconfSource`]. Determines which
     /// pre-apply gates `builder::dispatch::apply_one_preconf` enforces.
     pub source: PreconfSource,
-    /// Consecutive apply failures on a commitment whose receipt already went
-    /// out (`source == Replay`). Bumped by
-    /// [`PreconfTxSet::record_apply_failure`]; when it reaches
-    /// `preconf_max_apply_attempts` the entry moves to
-    /// [`PreconfStatus::Broken`] instead of the replaceable `Failed`.
-    ///
-    /// Reset by [`PreconfTxSet::mark_succeeded`] (it worked, so the budget is
-    /// no longer owed) and by a same-hash revive in
-    /// [`PreconfTxSet::push_if_absent`] (the client is asking for a fresh
-    /// attempt). Deliberately **not** reset by `reset_success_to_waiting` —
-    /// that starts a replay cycle, it is not evidence the tx is applicable.
-    pub apply_failures: u8,
     /// RPC handler responder — `Some` when the RPC path attached one before
     /// pool.add succeeded; `None` for listener-pushed entries.
     /// Take-once: `take_responder` moves it out.
@@ -115,7 +102,6 @@ impl TxEntry {
             inserted_at: self.inserted_at,
             status: self.status,
             source: self.source,
-            apply_failures: self.apply_failures,
         }
     }
 }
@@ -137,13 +123,6 @@ pub struct TxEntryView {
     pub status: PreconfStatus,
     /// Origin of the entry — see [`PreconfSource`].
     pub source: PreconfSource,
-    /// Consecutive replay apply failures — see [`TxEntry::apply_failures`].
-    ///
-    /// Exposed for logging and assertions only. The retry / give-up decision is
-    /// made inside [`PreconfTxSet::record_apply_failure`] under the fifo lock;
-    /// reading this and deciding at the call site would be a read-modify-write
-    /// race.
-    pub apply_failures: u8,
 }
 
 /// A hash-keyed eviction callback: `PreconfTxSet` fires these outward at
@@ -351,14 +330,13 @@ impl PreconfTxSet {
     /// - [`PushResult::AlreadyExists`] — same hash already present and [`PreconfStatus::is_active`]
     ///   (`Waiting` / `Success`); a no-op.
     /// - [`PushResult::Revived`] — same hash in a state that is
-    ///   [`PreconfStatus::is_revivable_by_same_hash`] (`Timeout` / `Canceled` / `Failed` /
-    ///   `Broken`), flipped back to `Waiting` and broadcast.
+    ///   [`PreconfStatus::is_revivable_by_same_hash`] (`Timeout` / `Canceled` / `Failed`), flipped
+    ///   back to `Waiting` and broadcast.
     /// - [`PushResult::ConflictActive`] — same `(from, nonce)` but a different hash, and the
     ///   incumbent is not [`PreconfStatus::is_replaceable`]. Carries the incumbent's hash.
     ///
-    /// When the incumbent IS replaceable (`Timeout` / `Canceled` / `Failed` — note this is a
-    /// *different* set from the revivable one above, `Broken` being the difference), it is evicted
-    /// and the new tx inserted in its place.
+    /// When the incumbent IS replaceable (`Timeout` / `Canceled` / `Failed` — currently the same
+    /// set as the revivable one above), it is evicted and the new tx inserted in its place.
     pub async fn push_if_absent(
         &self,
         tx: Arc<TxEnvelope>,
@@ -380,9 +358,9 @@ impl PreconfTxSet {
         //   would otherwise wedge under the pool-eviction callback. `Failed` is included because
         //   its trigger — reth builder pre-execute reject (in-flight nonce / balance race, block
         //   gas exhausted at builder level) — is typically a within-slot state race, not an
-        //   intrinsic tx defect; next-slot retry naturally resolves it. `Broken` is included for a
-        //   different reason: reviving the *same hash* cannot hand its nonce to anyone else, so it
-        //   is safe, and it gives an owed commitment another chance to land.
+        //   intrinsic tx defect; next-slot retry naturally resolves it. An abandoned commitment is
+        //   in this same set: reviving the *same hash* cannot hand its nonce to anyone else, so it
+        //   is safe, and it gives a commitment we owe another chance to land.
         // - active (`Waiting` / `Success`) → idempotent no-op; callers should treat this as
         //   "someone else already owns the slot" (the RPC handler surfaces it as
         //   `AlreadyInProgress`).
@@ -394,13 +372,7 @@ impl PreconfTxSet {
                 // here is the status flip + broadcast that turns the
                 // entry back into a live dispatch candidate.
                 //
-                // The resubmit is an explicit request for a fresh attempt, so
-                // the replay-failure budget starts over (matters only when
-                // reviving from `Broken`, where the budget is exhausted by
-                // definition — without the reset the next single failure would
-                // immediately re-break it).
                 existing.status = PreconfStatus::Waiting;
-                existing.apply_failures = 0;
                 drop(inner);
                 let _ = self.notifier.send(hash);
                 return PushResult::Revived;
@@ -415,10 +387,11 @@ impl PreconfTxSet {
         // "safe to replace" property as the other two).
         //
         // `Waiting` / `Success` block replacement (`Success` is either on chain
-        // or in-flight, replacement would double-apply). `Broken` blocks it too,
-        // and for a stronger reason: its receipt has already been handed to a
-        // client, so this `(sender, nonce)` must never be given to another
-        // hash. That is exactly why `Broken` is not in `is_replaceable`.
+        // or in-flight, replacement would double-apply). An abandoned commitment
+        // does **not** block it: once we have stopped retrying, holding the
+        // `(sender, nonce)` protects the commitment from nobody — only the
+        // sender can use that nonce — while wedging the very party the promise
+        // was made to. See `builder::dispatch::apply_one_preconf`.
         if let Some(existing_hash) = inner.by_sender.get(&(from, nonce)).copied() {
             let existing_status = inner.entries.get(&existing_hash).map(|e| e.status);
             match existing_status {
@@ -474,7 +447,6 @@ impl PreconfTxSet {
             inserted_at,
             status: PreconfStatus::Waiting,
             source,
-            apply_failures: 0,
             responder,
             apply_lock: Arc::new(Mutex::new(())),
         };
@@ -596,9 +568,10 @@ impl PreconfTxSet {
     /// together to avoid stale entries pinning the (sender, nonce) slot
     /// forever. Returns evicted hashes.
     ///
-    /// [`PreconfStatus::Broken`] is **not** swept: its `(sender, nonce)` must
-    /// stay pinned precisely because a receipt for it already went out.
-    /// Pinning is the intended cost there, not a leak.
+    /// An abandoned commitment is swept like the rest — it ends in `Failed`.
+    /// Keeping its `(sender, nonce)` would protect the commitment from nobody
+    /// (only the sender can use that nonce) while wedging the promisee's account
+    /// without bound, since nothing else would ever clear such an entry.
     pub async fn clean_reclaimable(&self) -> Vec<TxHash> {
         let mut inner = self.inner.lock().await;
         let to_drop: Vec<TxHash> = inner
@@ -660,11 +633,6 @@ impl PreconfTxSet {
     /// was applied to (`replay_fifo_carryover` in `payload_builder`): the client
     /// already holds a receipt, so the commitment still has to land, in a block
     /// that will actually commit.
-    ///
-    /// Also clears [`TxEntry::apply_failures`]: the apply worked, so whatever
-    /// replay budget had been consumed is no longer owed. Matters when a
-    /// commitment bounces across several discarded in-flight blocks — a success
-    /// in between must not leave it one failure away from `Broken`.
     pub async fn mark_succeeded(&self, hash: &TxHash) -> Result<(), MarkError> {
         let mut inner = self.inner.lock().await;
         let entry = inner.entries.get_mut(hash).ok_or(MarkError::NotFound)?;
@@ -672,7 +640,6 @@ impl PreconfTxSet {
             return Err(MarkError::IllegalTransition(entry.status));
         }
         entry.status = PreconfStatus::Success;
-        entry.apply_failures = 0;
         Ok(())
     }
 
@@ -684,12 +651,13 @@ impl PreconfTxSet {
     /// level). The tx is not on chain as of this transition — see
     /// [`crate::types::PreconfStatus`] for how far that reaches.
     ///
-    /// Dispatch reaches this **only for `Rpc`-source entries**: a client is
-    /// still waiting and has been told nothing yet. An entry whose receipt has
-    /// already gone out (`Replay`) takes the other arm and goes to
-    /// [`Self::record_apply_failure`] instead, because `Failed` would make its
-    /// nonce replaceable, let `clean_reclaimable` sweep it, and evict it from
-    /// the pool — destroying what the retry needs.
+    /// Dispatch reaches this from **both** sources, and the difference is only
+    /// in how loudly it is reported: an `Rpc` entry is a routine rejection the
+    /// waiting client is handed directly, while a `Replay` entry means an
+    /// already-published commitment cannot be kept — a breach, logged `error!`
+    /// and counted. Both release the `(sender, nonce)`: once the apply has been
+    /// rejected there is nothing left to protect by holding it, and only the
+    /// sender could ever use that nonce anyway.
     ///
     /// Reclaim rationale: all three "not on chain" causes are typically
     /// transient (deadline overreach, block gas budget resets next slot, or
@@ -704,47 +672,6 @@ impl PreconfTxSet {
         self.transition_from_waiting(hash, PreconfStatus::Failed).await?;
         self.evict_from_pool(*hash);
         Ok(())
-    }
-
-    /// Records one apply failure on a commitment **whose receipt already went
-    /// out**, and decides whether to keep retrying or give up. The `Replay`-side
-    /// counterpart of [`Self::mark_failed`].
-    ///
-    /// `Waiting → Waiting` while `apply_failures < max_attempts`, so the next
-    /// payload job's carryover preamble picks the entry up and applies it
-    /// against fresh block state. `Waiting → Broken` on the `max_attempts`-th
-    /// failure.
-    ///
-    /// Two properties this must not lose:
-    ///
-    /// - **No pool eviction, either way.** `mark_failed` removes the tx from the pool, which would
-    ///   destroy the very thing the retry needs. That is why this is a separate method rather than
-    ///   a flag on `mark_failed`.
-    /// - **Increment, compare and transition happen under one lock acquisition.** A caller that
-    ///   read the count, decided, then called a setter would be a read-modify-write race, and would
-    ///   put the give-up rule in the caller instead of here.
-    ///
-    /// Requires `status == Waiting` (same CAS discipline as the `mark_*`
-    /// family); any other status returns `IllegalTransition`, a missing entry
-    /// `NotFound`. Both are benign races the caller logs and ignores.
-    pub async fn record_apply_failure(
-        &self,
-        hash: &TxHash,
-        max_attempts: u8,
-    ) -> Result<ApplyFailure, MarkError> {
-        let mut inner = self.inner.lock().await;
-        let entry = inner.entries.get_mut(hash).ok_or(MarkError::NotFound)?;
-        if entry.status != PreconfStatus::Waiting {
-            return Err(MarkError::IllegalTransition(entry.status));
-        }
-        let attempts = entry.apply_failures.saturating_add(1);
-        entry.apply_failures = attempts;
-        if attempts >= max_attempts {
-            entry.status = PreconfStatus::Broken;
-            Ok(ApplyFailure::Broken { attempts })
-        } else {
-            Ok(ApplyFailure::Retrying { attempts })
-        }
     }
 
     /// `Waiting → Timeout`. **Soft terminal** — a `Timeout` entry is
@@ -831,11 +758,9 @@ impl PreconfTxSet {
 
         // One replay round for a commitment whose block never became canonical.
         //
-        // This is the only signal that path emits. Nothing else counts it: the
-        // retry budget is charged by `record_apply_failure`, which only fires on
-        // an apply *failure*, and a commitment that applies cleanly every round
-        // resets that budget on each success — so it can loop indefinitely
-        // without ever reaching `Broken` or bumping
+        // This is the only signal that path emits. Nothing else counts it: a
+        // commitment that applies cleanly every round never fails, so it can
+        // loop indefinitely without ever bumping
         // `preconf.tx.commitment_broken_total`. Worse, each round bumps
         // `preconf.tx.success_total`, so a stuck commitment reads as throughput.
         //
@@ -896,9 +821,9 @@ impl PreconfTxSet {
                     return Ok(());
                 }
                 // Same-hash retry after a `Timeout` (client deadline),
-                // `Canceled` (block-gas-budget pre-apply reject), `Failed`
-                // (reth builder pre-execute reject), or `Broken` (replay budget
-                // exhausted; the retry is a fresh chance to honor a
+                // `Canceled` (block-gas-budget pre-apply reject) or `Failed`
+                // (reth builder pre-execute reject, or a replay budget
+                // exhausted — the retry is a fresh chance to honor a
                 // commitment we still owe). Install the fresh responder and
                 // refresh `inserted_at` so `builder::dispatch`'s
                 // deadline gate measures against the second submission
@@ -913,10 +838,7 @@ impl PreconfTxSet {
                 // property we want. (The predicate earns its keep at the
                 // `matches!` sites, where no such check exists.) Keep the two in
                 // sync — this arm must equal that predicate's set.
-                PreconfStatus::Timeout |
-                PreconfStatus::Canceled |
-                PreconfStatus::Failed |
-                PreconfStatus::Broken => {
+                PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed => {
                     entry.responder = Some(responder);
                     entry.inserted_at = origin_instant;
                     return Ok(());
@@ -1455,132 +1377,76 @@ mod tests {
         assert!(!set.contains(t_cancel.tx_hash()).await);
     }
 
-    // ===== D4 (docs/preconf-commitment-retention-until-irrevocable.md §4.10)
+    // ===== A broken commitment: terminal, and its slot released
 
-    /// Drive a `Replay` entry to `Broken` through the public API.
-    async fn broken_entry(set: &PreconfTxSet, nonce: u64, hash_byte: u8, sender: Address) {
+    /// Drive a `Replay` entry to the broken state through the public API. A
+    /// broken commitment lands in `Failed`; its `Replay` source is what
+    /// distinguishes it from an RPC-side rejection.
+    async fn broken_commitment(set: &PreconfTxSet, nonce: u64, hash_byte: u8, sender: Address) {
         let tx = make_tx(nonce, hash_byte);
         set.push_if_absent(tx.clone(), sender, PreconfSource::Replay).await;
-        assert!(matches!(
-            set.record_apply_failure(tx.tx_hash(), 1).await,
-            Ok(ApplyFailure::Broken { attempts: 1 })
-        ));
-        assert_eq!(set.find_by_hash(tx.tx_hash()).await.unwrap().status, PreconfStatus::Broken);
+        set.mark_failed(tx.tx_hash()).await.unwrap();
+        let e = set.find_by_hash(tx.tx_hash()).await.unwrap();
+        assert_eq!(e.status, PreconfStatus::Failed);
+        assert_eq!(e.source, PreconfSource::Replay, "the source is the breach marker");
+        assert!(e.status.is_replaceable(), "and the nonce is released");
     }
 
-    /// Both sides of the K boundary in one walk. The retry rounds must leave the
-    /// entry `Waiting` (so the next payload job picks it up); only the K-th
-    /// failure gives up, and it gives up into `Broken`.
+    /// A broken commitment is swept like any other reclaimable entry, and its
+    /// `(sender, nonce)` is released. Pinning it would protect the commitment
+    /// from nobody (only the sender can use that nonce) while wedging the
+    /// promisee's account with nothing left to clear it.
     #[tokio::test]
-    async fn record_apply_failure_retries_below_the_budget_and_breaks_at_it() {
+    async fn clean_reclaimable_sweeps_broken_commitments() {
         let set = PreconfTxSet::new(16);
-        let tx = make_tx(0, 1);
-        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Replay).await;
-
-        for attempt in 1..=2u8 {
-            assert_eq!(
-                set.record_apply_failure(tx.tx_hash(), 3).await,
-                Ok(ApplyFailure::Retrying { attempts: attempt }),
-            );
-            let e = set.find_by_hash(tx.tx_hash()).await.unwrap();
-            assert_eq!(e.status, PreconfStatus::Waiting, "below budget ⇒ still retrying");
-            assert_eq!(e.apply_failures, attempt);
-        }
-
-        assert_eq!(
-            set.record_apply_failure(tx.tx_hash(), 3).await,
-            Ok(ApplyFailure::Broken { attempts: 3 }),
-        );
-        assert_eq!(set.find_by_hash(tx.tx_hash()).await.unwrap().status, PreconfStatus::Broken);
-    }
-
-    /// `mark_failed` fires the pool-eviction hook; `record_apply_failure` must
-    /// not, on either branch — evicting the tx destroys the thing a retry needs,
-    /// and for `Broken` we deliberately leave it in the pool so it still has a
-    /// chance of landing.
-    #[tokio::test]
-    async fn record_apply_failure_never_evicts_from_the_pool() {
-        let set = PreconfTxSet::new(16);
-        let seen: Arc<std::sync::Mutex<Vec<TxHash>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        set.set_pool_eviction_callback(Arc::new(move |h| sink.lock().unwrap().push(h)));
-
-        let tx = make_tx(0, 1);
-        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Replay).await;
-        // Retry branch.
-        set.record_apply_failure(tx.tx_hash(), 2).await.unwrap();
-        assert!(seen.lock().unwrap().is_empty(), "retry must not evict");
-        // Give-up branch.
-        set.record_apply_failure(tx.tx_hash(), 2).await.unwrap();
-        assert!(seen.lock().unwrap().is_empty(), "Broken must not evict either");
-    }
-
-    /// Same CAS discipline as the `mark_*` family: only `Waiting` may record a
-    /// failure. In particular a second call after `Broken` must not keep
-    /// incrementing.
-    #[tokio::test]
-    async fn record_apply_failure_rejects_non_waiting_states() {
-        let set = PreconfTxSet::new(16);
-        broken_entry(&set, 0, 1, addr(1)).await;
-        assert_eq!(
-            set.record_apply_failure(&h(1), 3).await,
-            Err(MarkError::IllegalTransition(PreconfStatus::Broken)),
-        );
-        assert_eq!(
-            set.record_apply_failure(&h(99), 3).await,
-            Err(MarkError::NotFound),
-            "unknown hash is a benign race, not a panic",
-        );
-    }
-
-    /// The point of the variant: a `Broken` entry keeps its `(sender, nonce)`.
-    /// If `clean_reclaimable` swept it, the nonce would free up and a different
-    /// tx could take the slot a client already holds a receipt for.
-    #[tokio::test]
-    async fn clean_reclaimable_keeps_broken_entries() {
-        let set = PreconfTxSet::new(16);
-        broken_entry(&set, 0, 1, addr(1)).await;
+        broken_commitment(&set, 0, 1, addr(1)).await;
         // A genuinely reclaimable neighbour, to prove the sweep still runs.
         let t_to = make_tx(0, 2);
         set.push_if_absent(t_to.clone(), addr(2), PreconfSource::Rpc).await;
         set.mark_timeout(t_to.tx_hash()).await.unwrap();
 
-        let evicted = set.clean_reclaimable().await;
-
-        assert_eq!(evicted, vec![*t_to.tx_hash()], "only the Timeout entry is swept");
-        assert!(set.contains(&h(1)).await, "Broken must survive the sweep");
-        assert_eq!(
-            set.find_by_sender_nonce(&addr(1), 0).await.map(|e| e.hash),
-            Some(h(1)),
-            "and must still own its (sender, nonce)",
+        let mut evicted = set.clean_reclaimable().await;
+        evicted.sort();
+        let mut want = vec![h(1), *t_to.tx_hash()];
+        want.sort();
+        assert_eq!(evicted, want, "the broken commitment is swept alongside the Timeout");
+        assert!(!set.contains(&h(1)).await, "its entry is gone");
+        assert!(
+            set.find_by_sender_nonce(&addr(1), 0).await.is_none(),
+            "and its (sender, nonce) is free again",
         );
     }
 
-    /// A **different** hash must not take a `Broken` entry's nonce — that is the
-    /// difference between `Broken` and the three reclaimable states.
+    /// A **different** hash may take a broken commitment's nonce. This is the
+    /// whole point of releasing the slot: the sender — the party the promise was
+    /// made to — can move on. Pinning it would leave the account with no way out
+    /// but resubmitting the very transaction the EVM had just rejected, and
+    /// nothing would ever clear the entry.
     #[tokio::test]
-    async fn a_different_hash_cannot_replace_a_broken_entry() {
+    async fn a_different_hash_may_replace_a_broken_commitment() {
         let set = PreconfTxSet::new(16);
-        broken_entry(&set, 0, 1, addr(1)).await;
+        broken_commitment(&set, 0, 1, addr(1)).await;
 
         // Same (sender, nonce), different hash — e.g. a fee-bumped replacement.
         let bump = make_tx(0, 2);
         assert_eq!(
             set.push_if_absent(bump, addr(1), PreconfSource::Rpc).await,
-            PushResult::ConflictActive(h(1)),
+            PushResult::Inserted,
         );
-        assert!(set.contains(&h(1)).await, "the broken commitment keeps its entry");
-        assert!(!set.contains(&h(2)).await, "and the replacement is refused");
+        assert!(!set.contains(&h(1)).await, "the broken entry is displaced");
+        assert_eq!(
+            set.find_by_sender_nonce(&addr(1), 0).await.map(|e| e.hash),
+            Some(h(2)),
+            "and the replacement owns the slot",
+        );
     }
 
-    /// A **same-hash** resubmit does revive it: no nonce changes hands, and it
-    /// gives an owed commitment another chance to land. The attempt counter must
-    /// reset, otherwise the very next failure would immediately re-break it.
+    /// A **same-hash** resubmit still revives it: no nonce changes hands, and it
+    /// gives a commitment we owe another chance to land.
     #[tokio::test]
-    async fn a_same_hash_resubmit_revives_a_broken_commitment_and_resets_the_counter() {
+    async fn a_same_hash_resubmit_revives_a_broken_commitment() {
         let set = PreconfTxSet::new(16);
-        broken_entry(&set, 0, 1, addr(1)).await;
-        assert_eq!(set.find_by_hash(&h(1)).await.unwrap().apply_failures, 1);
+        broken_commitment(&set, 0, 1, addr(1)).await;
 
         assert_eq!(
             set.push_if_absent(make_tx(0, 1), addr(1), PreconfSource::Rpc).await,
@@ -1589,7 +1455,6 @@ mod tests {
 
         let e = set.find_by_hash(&h(1)).await.unwrap();
         assert_eq!(e.status, PreconfStatus::Waiting);
-        assert_eq!(e.apply_failures, 0, "a fresh submission gets a fresh budget");
     }
 
     /// Reachability premise of D4's *second* door (`rpc.rs`'s deadline branch):
@@ -1751,7 +1616,6 @@ mod tests {
             inserted_at: Instant::now(),
             status: PreconfStatus::Waiting,
             source: PreconfSource::Rpc,
-            apply_failures: 0,
             responder: Some(resp_tx),
             apply_lock: Arc::new(Mutex::new(())),
         };
@@ -2654,7 +2518,7 @@ mod proptest_responder_model {
             // `Broken` only by `record_apply_failure` exhausting the replay
             // budget. Spelled out rather than caught by a wildcard so that
             // adding a status forces this decision again.
-            PreconfStatus::Waiting | PreconfStatus::Broken => unreachable!(),
+            PreconfStatus::Waiting => unreachable!(),
         };
         let st = &mut model[b as usize];
         if st.entry == Some(PreconfStatus::Waiting) {

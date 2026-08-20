@@ -104,16 +104,6 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.slot-duration-ms")]
     pub slot_duration_ms: Option<u64>,
 
-    /// How many consecutive replay applies may fail before a commitment whose
-    /// receipt has already been returned is given up on. Default 3.
-    ///
-    /// One attempt per payload job, so the default spans roughly
-    /// `3 × slot-duration`. Raising it keeps retrying an inapplicable tx (and
-    /// keeps its nonce pinned) for longer; lowering it declares commitments
-    /// broken sooner. Must be `>= 1`.
-    #[arg(long = "preconf.max-apply-attempts")]
-    pub max_apply_attempts: Option<u8>,
-
     /// Per-tx gas cap for preconf-eligible txs. Default `2_000_000`.
     #[arg(long = "preconf.max-gas-per-tx")]
     pub max_gas_per_tx: Option<u64>,
@@ -163,9 +153,6 @@ impl PreconfArgs {
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_PRECONF_TIMEOUT),
             safety_margin: mantle_reth_preconf::DEFAULT_SAFETY_MARGIN,
-            preconf_max_apply_attempts: self
-                .max_apply_attempts
-                .unwrap_or(mantle_reth_preconf::DEFAULT_MAX_APPLY_ATTEMPTS),
             sweep_interval: self
                 .sweep_interval_ms
                 .map(Duration::from_millis)

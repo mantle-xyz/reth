@@ -28,24 +28,32 @@ use serde::{Deserialize, Serialize};
 ///                     │              Success arm above.)
 /// [push] → Waiting ──┤
 ///                     ├──→ Timeout   (the client's deadline elapsed)
-///                     ├──→ Canceled  (server pre-apply reject: block gas
-///                     │               budget, admin kick, etc.)
-///                     └──→ Broken    (commitment owed but abandoned after
-///                                      `preconf_max_apply_attempts` failed
-///                                      replays)
+///                     └──→ Canceled  (server pre-apply reject: block gas
+///                                     budget, admin kick, etc.)
 /// ```
 ///
 /// `Timeout` / `Canceled` / `Failed` form the "not on chain, reclaimable" set:
-/// a same-hash resubmit revives them to `Waiting` via `push_if_absent`, and
-/// every cause is typically transient (deadline too tight, budget resets next
-/// slot, in-flight state race). `Broken` is revivable by the same hash too, but
-/// **not** replaceable by a different one — its receipt already went to a
-/// client, so its nonce stays pinned.
+/// a same-hash resubmit revives them to `Waiting` via `push_if_absent`, a
+/// different hash may take the `(sender, nonce)`, and `clean_reclaimable` may
+/// sweep them.
+///
+/// **A broken commitment lands in `Failed` like any other apply rejection, and
+/// releases its nonce.** There is deliberately no state that keeps a
+/// `(sender, nonce)` after the apply was rejected: that nonce belongs to the
+/// sender, only the sender can produce a transaction on it, and so pinning it
+/// protects the commitment from nobody while wedging — without bound, since
+/// nothing would sweep such an entry — the very party the promise was made to.
+/// What records the breach is dispatch's `error!` plus
+/// `preconf.tx.commitment_broken_total`, not a retained slot. Which `Failed`
+/// entries are breaches is read off [`PreconfSource::Replay`]; see
+/// `builder::dispatch::apply_one_preconf` for why there is no retry.
 ///
 /// Use [`PreconfStatus::is_active`] / [`PreconfStatus::is_replaceable`] /
 /// [`PreconfStatus::is_revivable_by_same_hash`] rather than open-coding
-/// `matches!` over the terminal set — the three questions have **different**
-/// answers for `Broken`, and each open-coded site is a place to get it wrong.
+/// `matches!` over the terminal set. The latter two currently coincide; they are
+/// kept apart because they answer different questions ("may another hash take
+/// this nonce" vs "may this hash come back"), and a future state that answers
+/// them differently must not have to hunt down open-coded `matches!` sites.
 ///
 /// **How far "not on chain" goes** — the surrounding code maintains it; this
 /// enum does not enforce it. The transitions are a plain CAS on
@@ -99,22 +107,6 @@ pub enum PreconfStatus {
     /// [`Self::is_revivable_by_same_hash`]).
     #[serde(rename = "canceled")]
     Canceled,
-    /// **Commitment owed but abandoned.** The receipt already went out to the
-    /// client, then `preconf_max_apply_attempts` consecutive replay applies all
-    /// failed. Reached only from `Waiting` via
-    /// [`PreconfTxSet::record_apply_failure`](crate::PreconfTxSet::record_apply_failure).
-    ///
-    /// Unlike the three reclaimable states this one is **not replaceable**: a
-    /// different hash must never take the `(sender, nonce)` this commitment was
-    /// acknowledged for, and `clean_reclaimable` must not sweep it. It is also
-    /// **not** evicted from the pool — leaving the tx there keeps a chance of it
-    /// landing. A *same-hash* resubmit does revive it (no nonce changes hands),
-    /// resetting the attempt counter.
-    ///
-    /// Its existence is the one signal that a commitment was broken; dispatch
-    /// logs `error!` and bumps `preconf.tx.commitment_broken_total` on entry.
-    #[serde(rename = "broken")]
-    Broken,
 }
 
 impl PreconfStatus {
@@ -127,21 +119,21 @@ impl PreconfStatus {
     /// The entry may be displaced by a **different** hash on the same
     /// `(sender, nonce)`, and may be swept by `clean_reclaimable`.
     ///
-    /// [`Self::Broken`] is deliberately **excluded** — a commitment whose receipt
-    /// already went to a client keeps its nonce, which is the whole point of the
-    /// variant. Do not use this predicate to answer "can a same-hash resubmit
-    /// revive it": use [`Self::is_revivable_by_same_hash`].
+    /// All three terminal "not on chain" states qualify, including an abandoned
+    /// commitment (which ends in `Failed`). Do not use this predicate to answer
+    /// "can a same-hash resubmit revive it": use
+    /// [`Self::is_revivable_by_same_hash`].
     pub const fn is_replaceable(self) -> bool {
         matches!(self, Self::Timeout | Self::Canceled | Self::Failed)
     }
 
     /// A resubmit of the **same hash** may flip the entry back to `Waiting`.
     ///
-    /// Includes [`Self::Broken`]: reviving the same hash cannot hand the nonce
-    /// to anyone else, so it is safe, and it gives an owed commitment another
-    /// chance to land.
+    /// Reviving the same hash cannot hand the nonce to anyone else, so it is
+    /// always safe — including for a commitment we abandoned, which it gives
+    /// another chance to land.
     pub const fn is_revivable_by_same_hash(self) -> bool {
-        matches!(self, Self::Timeout | Self::Canceled | Self::Failed | Self::Broken)
+        matches!(self, Self::Timeout | Self::Canceled | Self::Failed)
     }
 }
 
@@ -215,7 +207,7 @@ pub enum PushResult {
     /// (`Waiting` / `Success`) — idempotent no-op.
     AlreadyExists,
     /// Same hash was in a status that [`PreconfStatus::is_revivable_by_same_hash`]
-    /// (`Timeout` / `Canceled` / `Failed` / `Broken`) and has been revived back
+    /// (`Timeout` / `Canceled` / `Failed`) and has been revived back
     /// to `Waiting`, with its replay-failure budget reset.
     /// Any fresh responder that the RPC handler attached to
     /// `pending_responders` is now installed on the entry, and the
@@ -235,29 +227,6 @@ pub enum PushResult {
     /// [`PreconfStatus::is_replaceable`] — blocks the replacement attempt
     /// (carrying the existing hash so callers can inspect / log it).
     ConflictActive(TxHash),
-}
-
-/// Outcome of [`crate::preconf_tx_set::PreconfTxSet::record_apply_failure`] —
-/// an apply failure on a commitment whose receipt already went out.
-///
-/// The decision is made inside the fifo (under its lock) rather than by the
-/// caller, so the give-up rule lives in one place and cannot be raced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApplyFailure {
-    /// Still under `preconf_max_apply_attempts`. The entry was left `Waiting`
-    /// and stays in the pool, so the next payload job's carryover preamble
-    /// retries it against fresh block state.
-    Retrying {
-        /// Failures recorded so far, including this one.
-        attempts: u8,
-    },
-    /// Budget exhausted — the entry moved to [`PreconfStatus::Broken`]. The
-    /// commitment is broken; this is the only moment that fact becomes
-    /// observable, so callers must log it loudly and count it.
-    Broken {
-        /// Failures recorded, i.e. `preconf_max_apply_attempts`.
-        attempts: u8,
-    },
 }
 
 /// Errors returned by [`crate::preconf_tx_set::PreconfTxSet::attach_responder`].
@@ -338,20 +307,18 @@ pub enum PreconfError {
     /// Builder apply returned a terminal `Failed` status.
     #[error("builder rejected: {0}")]
     BuilderRejected(String),
-    /// A commitment whose receipt was already returned could not be landed:
-    /// `attempts` consecutive replay applies failed and the entry moved to
-    /// [`PreconfStatus::Broken`].
+    /// A commitment whose receipt was already returned could not be landed: the
+    /// apply was rejected by the EVM, so the `(sender, nonce)` was released.
     ///
-    /// Distinct from [`Self::BuilderRejected`], which reports a *single* apply
-    /// failure on a live RPC submission that the client can still retry. This
-    /// one says the sequencer has stopped retrying a promise it already made.
+    /// Distinct from [`Self::BuilderRejected`], which reports the same class of
+    /// apply failure on a live RPC submission — one the client is still waiting
+    /// on and can simply retry. This one says a promise already made cannot be
+    /// kept. There is no retry: every transient cause is filtered out before
+    /// apply (see `builder::dispatch::apply_one_preconf`).
     #[error(
-        "preconf commitment cannot be honored: {attempts} apply attempts failed after the receipt was returned"
+        "preconf commitment cannot be honored: apply was rejected after the receipt was returned"
     )]
-    CommitmentBroken {
-        /// Number of failed apply attempts before giving up.
-        attempts: u8,
-    },
+    CommitmentBroken,
     /// Cumulative preconf gas budget for the current block has been
     /// exhausted — caller may retry once the next block opens.
     #[error(

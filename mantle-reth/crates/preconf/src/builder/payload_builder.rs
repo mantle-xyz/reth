@@ -733,14 +733,12 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
                     carryover_hashes.push(view.hash);
                 }
             }
-            // Terminal for carryover purposes. `Broken` is here because dispatch
-            // has already exhausted `preconf_max_apply_attempts` on it —
-            // retrying it every subsequent job would spin forever. Only a
-            // same-hash resubmit revives it (`push_if_absent`).
-            PreconfStatus::Failed |
-            PreconfStatus::Timeout |
-            PreconfStatus::Canceled |
-            PreconfStatus::Broken => {}
+            // Terminal for carryover purposes. An abandoned commitment is
+            // `Failed` too — dispatch has already exhausted
+            // `preconf_max_apply_attempts` on it, so retrying it every
+            // subsequent job would spin forever. Only a same-hash resubmit
+            // revives any of these (`push_if_absent`).
+            PreconfStatus::Failed | PreconfStatus::Timeout | PreconfStatus::Canceled => {}
         }
     }
     carryover_hashes
