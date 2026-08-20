@@ -177,6 +177,26 @@ pub trait MantleEthApiExt {
         request: TransactionRequest,
         block_number: Option<BlockId>,
     ) -> RpcResult<U256>;
+
+    /// Overrides `eth_simulateV1` to reject simulations that cross the Mantle Arsia activation
+    /// boundary, then delegates to the standard implementation.
+    ///
+    /// A simulated block that crosses the boundary would be assembled from the pre-Arsia parent's
+    /// empty `extraData` (so the EIP-1559 denominator/elasticity/minBaseFee silently fall back to
+    /// chain-spec defaults) and a pre-Arsia DA-footprint basis, while its own timestamp is
+    /// post-activation. The resulting block is internally inconsistent, so refuse it rather than
+    /// return a plausible-looking wrong answer. Matches op-geth, which rejects the same case in
+    /// `processBlock` (`internal/ethapi/simulate.go`).
+    ///
+    /// Payload and result cross the RPC boundary as `serde_json::Value` to avoid carrying the
+    /// network-specific `RpcTxReq`/`RpcBlock` generics through the trait, matching
+    /// `eth_getBlockRange` above.
+    #[method(name = "simulateV1")]
+    async fn simulate_v1(
+        &self,
+        payload: serde_json::Value,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<serde_json::Value>;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -286,6 +306,98 @@ fn estimate_total_fee_gas_price(
     }
 }
 
+/// Default spacing between simulated blocks when a request does not override `time`.
+///
+/// Must track `OpNextBlockEnvAttributes::build_pending_env`, which derives a simulated block's
+/// timestamp as `parent.timestamp() + 12`. The value comes from `eth_simulateV1`'s original
+/// definition in go-ethereum (`timestampIncrement`, `internal/ethapi/simulate.go`) and is a plain
+/// constant on both clients today, so 12 is what op-geth and this reth actually produce — verified
+/// on devnet.
+///
+/// It is nonetheless *wrong for Mantle*, whose blocks are 2s apart, and upstream reth has already
+/// replaced the constant with a per-chain lookup (`Chain::average_blocktime_hint()`), keeping 12
+/// only as the fallback for unregistered chains. Mantle is **not** unregistered: `alloy-chains`
+/// records `average_blocktime_millis = 2000` for both chain 5000 and 5003
+/// (`CHAIN_DATA[95]`/`[96]` in `alloy-chains/src/generated/named.rs`).
+///
+/// So bumping to a rev that includes that change will switch the real increment from 12 to 2, and
+/// this constant will silently disagree with it — the crossing check would compute timestamps ~6x
+/// too far ahead and could reject a request that never crosses the fork. See
+/// [`simulated_block_timestamps`] for the fix to apply at bump time.
+const SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT: u64 = 12;
+
+/// Parses a JSON-RPC quantity into a `u64`, accepting both the canonical `"0x2a"` hex string and a
+/// bare JSON number.
+fn parse_quantity_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::String(raw) => {
+            let raw = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))?;
+            u64::from_str_radix(raw, 16).ok()
+        }
+        serde_json::Value::Number(raw) => raw.as_u64(),
+        _ => None,
+    }
+}
+
+/// Returns the timestamp of each simulated block, in order, given the base block's timestamp and
+/// each entry's optional `blockOverrides.time`.
+///
+/// Mirrors how `eth_simulateV1` derives timestamps: default to `previous + 12`, but an explicit
+/// `time` override wins. Each block's parent is the *previous simulated block*, not the base block,
+/// so the timestamps must be walked forward rather than computed against the base.
+///
+/// This assumes one simulated block per `blockStateCalls` entry, and that consecutive blocks are
+/// [`SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT`] apart. Both hold today but both break on the same
+/// upstream bump:
+///
+/// - paradigmxyz/reth#24388 adds gap-filling, so a skipped `blockOverrides.number` inserts filler
+///   blocks that also consume timestamps — the entry's real timestamp then lands *later* than
+///   computed here, and a crossing could be missed.
+/// - the same tree replaces the fixed increment with `Chain::average_blocktime_hint()`, which
+///   returns 2s for Mantle (registered in `alloy-chains`), so timestamps computed at 12s would run
+///   ~6x too far ahead and a non-crossing request could be rejected.
+///
+/// The single fix for both: once on such a rev, derive the timestamps from `sanitize_chain`'s
+/// output — it materializes an explicit `time` for every block, fillers included, at the chain's
+/// real block time — instead of recomputing them here.
+fn simulated_block_timestamps(base_timestamp: u64, time_overrides: &[Option<u64>]) -> Vec<u64> {
+    let mut previous = base_timestamp;
+    time_overrides
+        .iter()
+        .map(|override_time| {
+            let timestamp = override_time
+                .unwrap_or_else(|| previous.saturating_add(SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT));
+            previous = timestamp;
+            timestamp
+        })
+        .collect()
+}
+
+/// Returns the 0-based index of the first simulated block that crosses the Arsia activation
+/// boundary, i.e. whose parent is pre-Arsia while the block itself is post-Arsia.
+///
+/// `is_arsia` reports whether Arsia is active at a given timestamp.
+///
+/// The parent is the previous *simulated* block rather than the base block. For finding the *first*
+/// crossing the two are equivalent (timestamps increase and `is_arsia` is a monotonic threshold, so
+/// every block before the first post-activation one has a pre-Arsia parent either way), but keeping
+/// the real parent makes the check mean what it says and stays correct if this is ever reused to
+/// report more than the first crossing.
+fn first_arsia_boundary_crossing(
+    base_timestamp: u64,
+    timestamps: &[u64],
+    is_arsia: impl Fn(u64) -> bool,
+) -> Option<usize> {
+    let mut parent_timestamp = base_timestamp;
+    for (index, &timestamp) in timestamps.iter().enumerate() {
+        if !is_arsia(parent_timestamp) && is_arsia(timestamp) {
+            return Some(index);
+        }
+        parent_timestamp = timestamp;
+    }
+    None
+}
+
 #[async_trait]
 impl<Provider, EthApi> MantleEthApiExtServer for MantleRpcExt<Provider, EthApi>
 where
@@ -298,6 +410,9 @@ where
         + Sync
         + 'static,
     EthApi: EthBlocks + EthCall + EthFees + FullEthApiTypes + Send + Sync + 'static,
+    // Lets `eth_simulateV1` surface the standard implementation's error verbatim, preserving the
+    // spec-defined codes (-38010..-38026) instead of collapsing them into a generic -32000.
+    ErrorObject<'static>: From<EthApi::Error>,
 {
     async fn get_block_range(
         &self,
@@ -554,6 +669,87 @@ where
         };
 
         Ok(l2_fee.saturating_add(l1_data_fee).saturating_add(operator_fee))
+    }
+
+    async fn simulate_v1(
+        &self,
+        payload: serde_json::Value,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<serde_json::Value> {
+        let chain_spec = self.provider().chain_spec();
+
+        // Only Mantle chains have an Arsia fork; leave every other chain on the standard path.
+        if chain_spec.is_mantle() {
+            let block_id = block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
+
+            // Read only the `time` overrides. Everything else is the standard implementation's
+            // concern, and deserializing the full typed payload here would drag the
+            // network-specific `RpcTxReq` generic through the trait boundary.
+            let time_overrides = payload
+                .get("blockStateCalls")
+                .and_then(serde_json::Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|call| {
+                            call.get("blockOverrides")
+                                .and_then(|overrides| overrides.get("time"))
+                                .and_then(parse_quantity_u64)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            // An empty/absent `blockStateCalls` is the standard implementation's error to report,
+            // so skip the check and let it produce the canonical message.
+            if !time_overrides.is_empty() {
+                let base_timestamp = self
+                    .provider()
+                    .block_by_id(block_id)
+                    .map_err(|e| {
+                        ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
+                    })?
+                    .ok_or_else(|| invalid_params_rpc_err("block not found"))?
+                    .header()
+                    .timestamp();
+
+                let timestamps = simulated_block_timestamps(base_timestamp, &time_overrides);
+                if let Some(index) =
+                    first_arsia_boundary_crossing(base_timestamp, &timestamps, |timestamp| {
+                        chain_spec.is_mantle_arsia_active_at_timestamp(timestamp)
+                    })
+                {
+                    debug!(
+                        target: "rpc::eth",
+                        base_timestamp,
+                        crossing_block_index = index,
+                        crossing_block_timestamp = timestamps[index],
+                        "rejecting eth_simulateV1 crossing the Mantle Arsia activation boundary"
+                    );
+                    return Err(ErrorObject::owned(
+                        -32000,
+                        "eth_simulateV1 does not support crossing the Mantle Arsia activation \
+                         boundary",
+                        None::<()>,
+                    ));
+                }
+            }
+        }
+
+        // Not a boundary-crossing simulation: hand off to the standard implementation. Round-trip
+        // through JSON so the network-specific payload/result generics stay behind `EthApi`.
+        let typed_payload = serde_json::from_value(payload)
+            .map_err(|e| invalid_params_rpc_err(format!("invalid eth_simulateV1 payload: {e}")))?;
+        let blocks = EthCall::simulate_v1(self.eth_api(), typed_payload, block_number)
+            .await
+            .map_err(ErrorObject::from)?;
+        serde_json::to_value(blocks).map_err(|e| {
+            ErrorObject::owned(
+                -32000,
+                format!("failed to serialise eth_simulateV1 result: {e}"),
+                None::<()>,
+            )
+        })
     }
 }
 
@@ -970,5 +1166,99 @@ mod tests {
         }] }"#;
         let populated: PreconfTxReceipt = serde_json::from_str(json).unwrap();
         assert_eq!(populated.logs.as_ref().map(Vec::len), Some(1));
+    }
+
+    // ─── eth_simulateV1 Arsia boundary ───────────────────────────────────────
+
+    /// Activation timestamp used by the boundary tests below.
+    const ARSIA_TIME: u64 = 1_000;
+
+    fn is_arsia(timestamp: u64) -> bool {
+        timestamp >= ARSIA_TIME
+    }
+
+    #[test]
+    fn simulated_timestamps_default_to_parent_plus_increment() {
+        // Each block's parent is the previous simulated block, so the increments compound.
+        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![112, 124, 136]);
+    }
+
+    #[test]
+    fn simulated_timestamps_honour_time_overrides() {
+        // An explicit override wins, and subsequent defaults build on it — not on the base block.
+        assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![112, 500, 512]);
+    }
+
+    /// Path 1 from the cross-client report: the base block is the last pre-Arsia block, so the very
+    /// first simulated block (base + 12) already crosses the activation boundary.
+    #[test]
+    fn detects_crossing_when_base_block_is_pre_arsia() {
+        let base = ARSIA_TIME - 2;
+        let timestamps = simulated_block_timestamps(base, &[None]);
+        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
+    }
+
+    /// Path 2 from the report: the first simulated block stays pre-Arsia and only the second one
+    /// crosses, via an explicit `blockOverrides.time`. The parent for that comparison is the
+    /// previous *simulated* block, which is why the walk cannot be done against the base block.
+    #[test]
+    fn detects_crossing_introduced_by_a_later_time_override() {
+        let base = ARSIA_TIME - 20;
+        let timestamps = simulated_block_timestamps(base, &[None, Some(ARSIA_TIME)]);
+        assert_eq!(timestamps, vec![ARSIA_TIME - 8, ARSIA_TIME]);
+        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(1));
+    }
+
+    #[test]
+    fn allows_simulation_entirely_before_activation() {
+        let base = 0;
+        let timestamps = simulated_block_timestamps(base, &[None, None]);
+        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), None);
+    }
+
+    /// The boundary is crossed by the *first* simulated block when the base block is the last
+    /// pre-Arsia block, even though every later block is also post-activation: only the transition
+    /// counts, and it is reported once.
+    #[test]
+    fn reports_the_first_crossing_block_not_a_later_one() {
+        let base = ARSIA_TIME - 2;
+        let timestamps = simulated_block_timestamps(base, &[None, None, None]);
+        // base is pre-Arsia; all three simulated blocks land after activation.
+        assert!(timestamps.iter().all(|&ts| is_arsia(ts)));
+        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
+    }
+
+    /// Once activation is reached, a chain whose base is already post-activation has no transition
+    /// left to report.
+    #[test]
+    fn does_not_re_report_crossing_after_activation_is_reached() {
+        let base = ARSIA_TIME - 20;
+        // Block 0 jumps past activation, block 1 defaults to block 0 + 12 (also post-activation).
+        let timestamps = simulated_block_timestamps(base, &[Some(ARSIA_TIME), None]);
+        assert_eq!(timestamps, vec![ARSIA_TIME, ARSIA_TIME + 12]);
+        // The crossing is at index 0 only — index 1's parent is already post-activation.
+        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
+        // And with the crossing block removed, the remaining chain is entirely post-activation.
+        assert_eq!(first_arsia_boundary_crossing(ARSIA_TIME, &timestamps[1..], is_arsia), None);
+    }
+
+    /// The common case on a live chain: activation is already in the past, so nothing crosses.
+    #[test]
+    fn allows_simulation_entirely_after_activation() {
+        let base = ARSIA_TIME + 100;
+        let timestamps = simulated_block_timestamps(base, &[None, None]);
+        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), None);
+    }
+
+    #[test]
+    fn parses_quantity_from_hex_string_and_number() {
+        assert_eq!(parse_quantity_u64(&serde_json::json!("0x6a82e880")), Some(1_786_964_096));
+        assert_eq!(parse_quantity_u64(&serde_json::json!("0X2a")), Some(42));
+        assert_eq!(parse_quantity_u64(&serde_json::json!(42)), Some(42));
+        // Malformed values must not be silently read as 0 — that would fake a pre-Arsia timestamp
+        // and skip the boundary check.
+        assert_eq!(parse_quantity_u64(&serde_json::json!("2a")), None);
+        assert_eq!(parse_quantity_u64(&serde_json::json!("0xzz")), None);
+        assert_eq!(parse_quantity_u64(&serde_json::Value::Null), None);
     }
 }

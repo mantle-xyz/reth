@@ -517,7 +517,11 @@ where
                 sequencer_client,
                 preconf_handler,
             );
-            ctx.modules.merge_configured(mantle_ext.into_rpc())?;
+            // `replace_configured`, not `merge_configured`: this module now also serves
+            // `eth_simulateV1`, which the standard `eth_` namespace already registers. Merging a
+            // duplicate method name fails, so remove-then-add to override it. The other methods in
+            // this module are new names and are unaffected by the choice.
+            ctx.modules.replace_configured(mantle_ext.into_rpc())?;
             info!(target: "reth::cli", "Mantle RPC extensions registered");
 
             Ok(())
