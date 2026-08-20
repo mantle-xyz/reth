@@ -37,6 +37,12 @@
 //! at the bottom of this file pin the derived slot bases. Changing the contract's
 //! state-variable order without updating [`FROM_WILDCARDS_SLOT`] / [`TO_WILDCARDS_SLOT`]
 //! would make the sequencer read garbage — or, worse, an empty list.
+//!
+//! The contract occupies slots 0..=7; this module reads 0, 2, 4 and 6. Slots 1, 3
+//! and 5 are the membership mappings, and slot 7 is `localNonce`, the replay
+//! guard on `updatePreconfs` — governance's business, never read here. A variable
+//! appended past slot 7 disturbs none of this, which is why adding one is not a
+//! layout-version change; touching slots 0..=6 is.
 
 use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::foldhash::HashSet};
@@ -84,6 +90,10 @@ pub const TO_WILDCARDS_SLOT: u64 = 4;
 ///
 /// Appended after every array on the Solidity side on purpose, so bumping the
 /// version can never shift the slots above.
+///
+/// It is no longer the contract's last variable: slot 7 holds `localNonce`, the
+/// replay guard on `updatePreconfs`. This side never reads it, but the slot is
+/// spoken for, and the space past it is where any further variable has to go.
 pub const LAYOUT_VERSION_SLOT: u64 = 6;
 
 /// The layout this binary knows how to read.
@@ -99,8 +109,10 @@ pub const EXPECTED_LAYOUT_VERSION: u64 = 2;
 /// `keccak256("WhitelistUpdated(uint256,uint256,uint256)")` — topic0 of the
 /// contract's only event.
 ///
-/// Asserted against the same literal by `test_whitelistUpdatedTopic0_isStable`
-/// in `test/PreconfWhitelist.t.sol`. If the event signature changes and this
+/// Asserted against the same literal by
+/// `test_whitelistUpdatedTopic0_matchesTheEmittedLog_succeeds` in
+/// `test/PreconfWhitelist.t.sol`, which reads it off an emitted log rather than
+/// hashing the signature as a string. If the event signature changes and this
 /// constant does not, the watcher stops firing and the sequencer runs forever on
 /// a stale allowlist — silently.
 ///
@@ -145,9 +157,12 @@ pub const WHITELIST_UPDATED_TOPIC0: B256 = B256::new([
 /// | **1M (this threshold)** | **1.1 s** | **~11 s** |
 /// | 10M | 11 s | ~110 s |
 ///
-/// For scale: the contract caps one update at `MAX_BATCH = 330` entries, and 330
-/// pair adds measure ~22.4M gas — a full L2 block per governance message, so
-/// reaching 1M takes ~3000 of them.
+/// For scale: the contract caps one update at `MAX_BATCH = 256` entries, and 256
+/// pair adds measure ~17.7M gas. That ceiling is not the L2 block — it is set on
+/// L1, by the ~19M of `_minGasLimit` left after the deposit gas cap
+/// (`ResourceMetering`'s `maxResourceLimit`, 20M shared per L1 block) pays for
+/// `baseGas`'s overhead. So one governance message per L1 block is the realistic
+/// rate, and reaching 1M entries takes ~3900 of them.
 pub const WHITELIST_WARN_THRESHOLD: usize = 1_000_000;
 
 /// How long one full list read may block before it is abandoned.
@@ -831,7 +846,13 @@ sol! {
         address to;
     }
 
-    function updatePreconfs(SolRule[] add, SolRule[] remove);
+    // `nonce` is the contract's replay guard (`PreconfWhitelist.localNonce`) and means nothing on
+    // this side — but it is part of the signature, so the selector depends on it. If the two ever
+    // disagree, `decode_whitelist_update` stops matching, this block keeps the previous allowlist
+    // (with the warning logged at the call site), and the canonical watcher corrects it once the
+    // block lands. A stale-nonce revert needs no handling here: the caller only decodes calldata
+    // for a transaction that succeeded *and* emitted `WhitelistUpdated`.
+    function updatePreconfs(uint256 nonce, SolRule[] add, SolRule[] remove);
 }
 
 /// One governance update, as it was *called* — the add and remove lists from
@@ -1613,7 +1634,7 @@ mod tests {
         /// contract side cannot break decoding, while changing a parameter type
         /// silently can. The literal is
         /// `forge inspect PreconfWhitelist methodIdentifiers`'s entry for
-        /// `updatePreconfs((address,address)[],(address,address)[])`.
+        /// `updatePreconfs(uint256,(address,address)[],(address,address)[])`.
         ///
         /// Same reasoning as [`WHITELIST_UPDATED_TOPIC0`], and the same failure
         /// mode if it drifts: governance updates stop being seen, silently.
@@ -1621,7 +1642,7 @@ mod tests {
         fn the_update_preconfs_selector_matches_the_contract() {
             assert_eq!(
                 alloy_primitives::hex::encode(updatePreconfsCall::SELECTOR),
-                "141ffdab",
+                "fd86b420",
                 "selector drifted from the deployed `updatePreconfs` signature"
             );
         }
@@ -1636,7 +1657,9 @@ mod tests {
             let sol = |v: &[(Address, Address)]| {
                 v.iter().map(|&(from, to)| SolRule { from, to }).collect::<Vec<_>>()
             };
-            let inner = updatePreconfsCall { add: sol(add), remove: sol(remove) }.abi_encode();
+            let inner =
+                updatePreconfsCall { nonce: U256::from(1), add: sol(add), remove: sol(remove) }
+                    .abi_encode();
             relayMessageCall {
                 nonce: U256::ZERO,
                 sender: addr(1),
@@ -1713,6 +1736,7 @@ mod tests {
                 );
             }
             let inner = updatePreconfsCall {
+                nonce: U256::from(1),
                 add: vec![SolRule { from: addr(1), to: addr(2) }],
                 remove: vec![],
             }
