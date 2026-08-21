@@ -43,10 +43,6 @@ const COUNTERS: &[&str] = &[
 /// journal already publishes a real value for `size_bytes` at `open()`, so
 /// `set(0.0)` here could clobber it back to `0` depending on call ordering; a
 /// zero increment only registers the series, leaving any existing value intact.
-///
-/// `journal.sealed_len` / `journal.promised_len` are gone: the journal no longer
-/// keeps either set — the classifier owns commitment tracking, and
-/// `classifier.verdicts` / `classifier.slots` are the replacement signals.
 const GAUGES: &[&str] = &[
     "preconf.fifo.pending",
     "preconf.journal.size_bytes",
@@ -148,12 +144,10 @@ mod tests {
                      in metrics_seed.rs — add it so its series is pre-registered",
                 );
             }
-            // And the reverse. Without it a deleted emit site is invisible: the
-            // series keeps being pre-registered, so it still shows up in a
-            // scrape — flat at zero, indistinguishable from "this never
-            // happened". That is exactly the failure mode seeding exists to
-            // prevent, reintroduced from the other end. Deleting a metric is
-            // fine; deleting it from *both* lists is what this asks for.
+            // And the reverse: a deleted emit site would otherwise leave its
+            // series pre-registered and flat at zero — indistinguishable from
+            // "this never happened", the very failure mode seeding exists to
+            // prevent.
             for name in &seeded {
                 assert!(
                     emitted.contains(*name),

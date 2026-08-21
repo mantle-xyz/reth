@@ -9,26 +9,24 @@
 //!    listener creates a fifo entry. Only [`PreconfStatus::is_replaceable`] holders release it, and
 //!    the reclaimed holder is torn down only once the replacement is actually admitted.
 //!
-//! The occupancy check used to be the **union** of that index and the fifo, on
-//! the grounds that the index could miss a holder the fifo knew about. It no
-//! longer can: every route to a fifo entry claims the slot first. And once
-//! commitments are retained past their block, the fifo is the *wrong* source —
-//! a commitment inside its retention window owns its nonce with no fifo entry
-//! at all, because `forward()` removed the entry as soon as its nonce advanced.
-//! Both halves are pinned by tests; see
-//! `the_violating_state_cannot_be_constructed`.
+//! Occupancy is the index alone, never the fifo: a commitment inside its
+//! retention window owns its nonce with no fifo entry at all. See the holder
+//! read in `guarded_validate`.
 //!
 //! 2. **Per-tx gas ceiling (operator hardening)**: preconf-eligible txs whose `gas_limit` exceeds
 //!    `cfg.preconf_max_gas_per_tx` are rejected. Non-preconf txs pass through unaffected.
 //!
-//! Both run before the inner validator, and every rejection path releases the
-//! verdict frozen on the way in.
+//! Both gates run before the inner validator. A rejection releases the verdict
+//! frozen on the way in only when *this* call froze it (`Admission::Fresh`) —
+//! see `validate_transaction`. The replacement guard also has two late
+//! rejections, after the inner validator, where the slot handover CAS is lost.
 //!
-//! A [`Verdict::Promised`] transaction is exempt from **both**, and from
-//! anything added alongside them: it is a commitment already acknowledged to its
-//! client, so it returns straight to the inner validator before any preconf gate
-//! runs. The exemption is stated once, at the top of `guarded_validate`, rather
-//! than repeated per gate — see there for why.
+//! A transaction whose receipt already went out is exempt from **both**, and
+//! from anything added alongside them: it returns straight to the inner
+//! validator before any preconf gate runs. The predicate is
+//! [`PreconfClassifier::is_promised`], not the [`Verdict::Promised`] variant —
+//! a reorg-reinjected commitment keeps `Verdict::Eligible` and must be exempt
+//! too. Stated once, at the top of `guarded_validate`, rather than per gate.
 //!
 //! All other concerns (signature, balance, basefee, EIP-155, `MetaTx`, ...)
 //! are delegated to the inner validator unchanged.
@@ -213,50 +211,35 @@ where
         // verdict's timestamp means "the moment this entered the pool", and a
         // stranded claim would block that nonce until the next sweep.
         //
-        // **Only release what this call created.**
-        //
-        // The obvious rule — "not admitted ⇒ drop the record" — is wrong, because
-        // this is not necessarily the admission that created it. `add_transaction`
-        // awaits `validate` unconditionally, and the hash-dedup that answers
+        // **Only release what this call created.** The obvious rule — "not
+        // admitted ⇒ drop the record" — is wrong, because this is not
+        // necessarily the admission that created it. `add_transaction` awaits
+        // `validate` unconditionally, and the hash-dedup that answers
         // `AlreadyImported` sits *behind* it: that check lives in
-        // `TxPool::add_transaction` and takes a `ValidPoolTransaction`, so it only
-        // ever runs on the path where validation already succeeded. A failing
-        // re-validation never consults it.
+        // `TxPool::add_transaction` and takes a `ValidPoolTransaction`, so a
+        // failing re-validation never consults it. An ordinary
+        // `eth_sendRawTransaction` resubmit applies no hash dedup of its own,
+        // and the pool listener gives a fifo entry to every preconf-eligible
+        // transaction whatever RPC admitted it, so a wallet retry or a
+        // load-balancer replay re-runs this whole path against a record
+        // belonging to an **earlier, successful** admission. (A p2p
+        // re-announcement does *not* reach here — `retain_unknown` drops
+        // already-pooled hashes before validation.) Such a re-run can fail for
+        // reasons that say nothing about that record: `NonceNotConsistent` once
+        // the transaction has landed, or `InsufficientFunds`, which on Mantle
+        // flips with no act of the sender.
         //
-        // The route in is an ordinary `eth_sendRawTransaction` resubmit, which
-        // applies no hash dedup of its own; the pool listener then gives a fifo
-        // entry to every preconf-eligible transaction whatever RPC admitted it.
-        // So a wallet retry or a load-balancer replay re-runs this whole path
-        // against a record belonging to an **earlier, successful** admission. (A
-        // p2p re-announcement does *not* reach here — `retain_unknown` drops
-        // already-pooled hashes before validation, `net/network/src/transactions`.)
+        // Releasing there would either strand a **live fifo entry** without its
+        // `(sender, nonce)`, or hand back the nonce of a commitment that is **on
+        // chain inside its retention window** — exactly what that window exists
+        // to prevent. `Admission::Fresh` is the precise condition: this call
+        // inserted the record, so nothing else can be relying on it.
         //
-        // Such a re-run can fail for reasons that say nothing about that record —
-        // `NonceNotConsistent` once the transaction has landed, or
-        // `InsufficientFunds`, which on Mantle flips with no act of the sender
-        // (see `PreconfClassifier::release_preconf_claim`). Not the basefee: the
-        // inner validator has no fee-cap-versus-basefee check, which only decides
-        // sub-pool placement.
-        //
-        // Releasing there would do one of two damaging things:
-        //
-        // * strand a **live fifo entry** without its `(sender, nonce)` — the state the guard's
-        //   occupancy check no longer keeps a fifo fallback for;
-        // * hand back the nonce of a commitment that is **on chain inside its retention window**,
-        //   which is exactly what that window exists to prevent.
-        //
-        // `Admission::Fresh` is the precise condition: this call inserted the
-        // record, so nothing else can be relying on it.
-        //
-        // The promise exemption is **not** subsumed by it, despite the
-        // sequential argument that a promise implies a pre-existing record.
-        // `mark_promised` is a get-or-insert, and it can run on another task
-        // during the `await` above: a `Fresh` admission can come back to find
-        // its own hash promised, because a concurrent submission of the same
-        // transaction was applied and its receipt returned while we sat inside
-        // the inner validator. That exemption — and the reason it cannot key on
-        // `Verdict::Promised` — lives in `release_preconf_claim`, which the RPC
-        // handler's own failure path calls too. Do not re-derive it here.
+        // It does not subsume the promise exemption. `mark_promised` is a
+        // get-or-insert and can run on another task during the `await` above, so
+        // a `Fresh` admission can come back to find its own hash promised. That
+        // exemption lives in `release_preconf_claim`, which the RPC handler's
+        // own failure path calls too. Do not re-derive it here.
         //
         // Pinned by `a_landed_commitment_survives_a_failed_rebroadcast` and
         // `a_repooled_tx_that_fails_revalidation_keeps_its_slot`.
@@ -294,27 +277,9 @@ where
     ) -> TransactionValidationOutcome<V::Transaction> {
         // Replacement guard. Two questions, answered by two different sources.
         //
-        // **Does anything already hold this `(sender, nonce)`?** — the **union**
-        // of the classifier's slot index and the fifo. Either saying "occupied"
-        // is enough to refuse, and both are needed:
-        //
-        //   * the index catches a transaction that was classified but whose fifo entry the listener
-        //     has not created yet. That window is the whole reason the index exists — asking only
-        //     the fifo lets a same-nonce replacement slip through it.
-        //   * the fifo catches anything the index can miss. Today that is the restored-commitment
-        //     path below: a `Promised` transaction is exempt from this guard, so it can end up
-        //     holding a fifo entry while the index still records someone else. Without the
-        //     fallback, once that other verdict is swept the nonce would read as free and both arms
-        //     could end up holding a transaction for it — the very bug this guard exists to
-        //     prevent.
-        //
-        // The fallback is defence in depth: it costs one fifo lookup on the path
-        // where the index says "free", which is exactly what this guard did on
-        // *every* admission before the index was introduced. Two independent
-        // errors have already been made in this predicate by narrowing it
-        // (gating on the newcomer's own verdict, and forgetting the `Promised`
-        // exemption), so the union is deliberately kept redundant rather than
-        // minimal.
+        // **Does anything already hold this `(sender, nonce)`?** — the
+        // classifier's slot index; see the read below for why it, and not the
+        // fifo, is the right source.
         //
         // **May the holder be replaced?** — the fifo, which owns the state
         // machine. Only reclaimable terminal states release it: `Timeout`
@@ -324,69 +289,39 @@ where
         // `Failed` differs from the wire-layer one. `Waiting` and `Success`
         // block replacement (`Success` is on chain or in flight, so replacing
         // would double-apply). A holder with no fifo entry at all is likewise
-        // not replaceable — it is mid-window, not terminal.
+        // not replaceable — it is mid-window, not terminal. (The three-state set
+        // diverges from op-geth; see the module's cross-client note.)
         //
-        // NB op-geth accepts only `Timeout` here (`legacypool.go`, "only timeout
-        // preconf tx can be replaced"). That is not a stricter policy but a
-        // narrower vocabulary: its single `failed` status covers both "reverted,
-        // on chain" and "never executed", so it cannot safely release the slot
-        // for either. The three states above are all provably not-on-chain.
+        // A commitment whose receipt already went out skips **every** preconf
+        // gate in this function, so it leaves here rather than being exempted at
+        // each one — a gate added below cannot then quietly forget it. Any
+        // preconf-layer gate that rejected it would, by construction, be
+        // breaking an already-published commitment. The predicate is the
+        // `promised` flag, not the `Verdict::Promised` variant — see
+        // `CachedVerdict` for why those are different questions.
         //
-        // A restored commitment skips **every** preconf gate in this function,
-        // so it leaves here rather than being exempted at each one. The
-        // predicate is the `promised` flag, not the `Verdict::Promised` variant
-        // — see `CachedVerdict` for why those are different questions. What it
-        // records is that the receipt went out to its client before the
-        // restart, so the transaction must come back regardless of what current
-        // policy says. Any preconf-layer gate
-        // that rejected it would, by construction, be breaking an
-        // already-published commitment — the one outcome this subsystem exists
-        // to prevent. Stating the exemption once also means a gate added below
-        // cannot quietly forget it, which is a regression this code has already
-        // suffered once.
-        //
-        // What it skips would be a no-op regardless:
-        //
-        //   * the replacement guard — which of two same-nonce transactions actually gets applied is
-        //     decided one layer down by `push_if_absent`, whose documented policy is to keep the
-        //     fresher entry rather than let a stale journaled one shove it out (`journal.rs`,
-        //     restore loop). Rejecting here would override that decision *and* turn a kept promise
-        //     into "commitment cannot be honoured".
-        //   * the per-tx gas ceiling — a commitment must not be re-judged against a cap the
-        //     operator has since lowered.
-        //   * the reclaimed-holder teardown, which only runs for a transaction that passed the
-        //     guard.
-        //
-        // The slot claim is *not* among them, because it has already happened:
+        // The slot claim is *not* skipped, because it has already happened:
         // journal restore's pre-pass calls `mark_promised`, which claims the
-        // `(sender, nonce)` in the same breath as it records the promise
-        // (`journal.rs`, restore pre-pass). Nothing is left for this function to
-        // claim. Should `replace_slot` below ever be hoisted out of the reclaim
-        // branch, this early return has to be revisited — a restored record's
-        // verdict is preconf, so a hoisted call would cover it.
+        // `(sender, nonce)` in the same breath as it records the promise. Should
+        // `replace_slot` below ever be hoisted out of the reclaim branch, this
+        // early return has to be revisited — a restored record's verdict is
+        // preconf, so a hoisted call would cover it.
         if self.classifier.is_promised(&tx_hash) {
             return self.inner.validate_transaction(origin, transaction).await;
         }
 
-        // Occupancy is the slot index, and only the slot index.
-        //
-        // It used to be the union of the index and the fifo, because the index
-        // could miss a holder the fifo knew about. That is no longer reachable:
-        // the only way to hold a fifo entry is to have been admitted here (which
-        // claims the slot) or to come from journal restore (whose pre-pass claims
-        // it, and whose loser is refused an entry by `push_if_absent`). Both are
-        // pinned by tests — `the_violating_state_cannot_be_constructed` here and
+        // Occupancy is the slot index, and only the slot index. Every route to a
+        // fifo entry claims the slot first: admission here claims it, and
+        // journal restore's pre-pass claims it (its loser being refused an entry
+        // by `push_if_absent`). Pinned by
+        // `the_violating_state_cannot_be_constructed` here and
         // `journal::tests::restore_never_leaves_a_fifo_entry_without_its_slot`.
         //
-        // Asking the fifo as well is not merely redundant, it reads the *wrong*
-        // thing now: a commitment inside its retention window owns its nonce
-        // with no fifo entry at all (`forward()` removed it), so the two sources
-        // disagree by design for a whole `SEAL_DEPTH` window.
-        //
-        // `None` status ⇒ the slot is held by a hash with no fifo entry: either
-        // the microsecond gap before the listener's push, or a commitment in
-        // retention. Neither is replaceable, which is what the `is_some_and`
-        // below gives.
+        // Asking the fifo as well would read the *wrong* thing: a commitment
+        // inside its retention window owns its nonce with no fifo entry at all
+        // (`forward()` removed it), so the two sources disagree by design for a
+        // whole `SEAL_DEPTH` window. The fifo is consulted only for the named
+        // owner's status — a `None` there is handled below.
         let holder: Option<(alloy_primitives::TxHash, Option<PreconfStatus>)> = match slot_claim {
             Err(owner) => Some((owner, self.fifo.find_by_hash(&owner).await.map(|e| e.status))),
             Ok(()) => None,
@@ -396,11 +331,20 @@ where
         // actually admitted, so the decision has to outlive the gas gate below.
         let mut reclaim: Option<alloy_primitives::TxHash> = None;
         if let Some((owner, status)) = holder {
-            // `None` (mid-window, no fifo entry) is not replaceable, and neither
-            // is `Broken`: a commitment we already acknowledged to a client must
-            // keep its `(sender, nonce)` even after we stopped retrying it.
-            // That exclusion lives in `is_replaceable` — do not re-derive the
-            // terminal set here.
+            // `None` is the only non-replaceable holder here: the slot is held by
+            // a hash with no fifo entry — the microsecond gap before the
+            // listener's push, or a commitment inside its retention window.
+            //
+            // Every terminal state is replaceable, `Failed` among them — which
+            // covers a commitment whose receipt already went out and which the
+            // builder then could not apply (dispatch's `ApplyError::Rejected`
+            // arm). Handing its nonce away is the intended outcome: only this
+            // sender can produce a transaction on that nonce, so holding it
+            // would wedge the sender's own account with nothing able to clear
+            // it. The breach is recorded there
+            // (`preconf.tx.commitment_broken_total`), not prevented here.
+            //
+            // The terminal set lives in `is_replaceable` — do not re-derive it.
             let replaceable = status.is_some_and(PreconfStatus::is_replaceable);
             if !replaceable {
                 return TransactionValidationOutcome::Invalid(
@@ -416,23 +360,13 @@ where
         // Non-preconf txs are intentionally left to the upstream (reth /
         // OP) validator's own gas-limit checks.
         //
-        // **Defence in depth, not the operative check.** Since eligibility moved
-        // to the RPC boundary, the only writer of `Verdict::Eligible` is
-        // `claim_preconf`, and the RPC applies this same ceiling — read off the
-        // same `Arc<PreconfConfig>`, `node.rs` wires one instance into both —
-        // *before* it writes the verdict. So no transaction can arrive here
-        // `Eligible` and over the cap: this gate is unreachable through
-        // `eth_sendRawTransactionWithPreconf` today. It is kept because it is
-        // the enforcement point for any *future* writer of an eligible verdict,
-        // and because the cost of keeping it is a comparison.
-        //
-        // The unit tests below drive it directly and so document the gate's
-        // behaviour, not a reachable production scenario. Do not read them as
-        // evidence that the state they construct can occur.
-        //
-        // `Verdict::Promised` needs no exemption here — it has already returned
-        // above. That is deliberate: were this gate to carry its own exemption,
-        // the next gate added would need one too, and the one after that.
+        // **Defence in depth, not the operative check.** The only writer of
+        // `Verdict::Eligible` is `claim_preconf`, and the RPC applies this same
+        // ceiling off the same `Arc<PreconfConfig>` (`node.rs` wires one
+        // instance into both) *before* writing the verdict, so nothing can reach
+        // here `Eligible` and over the cap. Kept as the enforcement point for
+        // any future writer of an eligible verdict; the tests below drive it
+        // directly rather than through a reachable production scenario.
         if verdict.is_preconf() && transaction.gas_limit() > self.cfg.preconf_max_gas_per_tx {
             return TransactionValidationOutcome::Invalid(
                 transaction,
@@ -449,26 +383,19 @@ where
         // no longer revive it) and the replacement not admitted either.
         //
         // The handover is a **compare-and-swap**, and it comes first. "The holder
-        // is reclaimable, so I may take its nonce" was decided above, before the
-        // `await` on the inner validator, so two same-nonce transactions can both
-        // have reached that conclusion about the same holder. Whoever wins the
-        // CAS is the one — and the only one — that tears the holder down and owns
-        // the nonce.
+        // is reclaimable, so I may take its nonce" was decided above the `await`
+        // on the inner validator, so two same-nonce transactions can both have
+        // reached that conclusion about the same holder. Whoever wins the CAS is
+        // the only one that tears the holder down and owns the nonce.
         //
-        // The loser is refused. It has passed validation, but `Valid` is not
-        // admission: the pool inserts under its own lock afterwards and applies
-        // its own price-bump rule, so returning `Valid` here would leave the
-        // index, the pool and the fifo each picking a winner by a different rule
-        // (validation-completion order, price, event order). The transaction the
-        // *pool* accepted could then be skipped by both build arms — precisely
-        // the bug the slot index exists to prevent. Refusing here keeps all three
-        // in agreement and, unlike the silent version, tells the client why.
-        //
-        // First-come-first-served is the intended semantics, not a tiebreak of
-        // convenience: it is what the guard already does sequentially (a later
-        // same-nonce transaction is refused however much it pays, since a
-        // `Waiting` preconf commitment must not be displaceable — see the
-        // cross-client note above).
+        // The loser is refused, not admitted. `Valid` is not admission: the pool
+        // inserts under its own lock afterwards and applies its own price-bump
+        // rule, so returning `Valid` here would leave the index, the pool and the
+        // fifo each picking a winner by a different rule (validation-completion
+        // order, price, event order), and the transaction the *pool* accepted
+        // could then be skipped by both build arms. First-come-first-served is
+        // the intended semantics, matching what the guard does sequentially: a
+        // later same-nonce transaction is refused however much it pays.
         if matches!(outcome, TransactionValidationOutcome::Valid { .. }) &&
             let Some(owner) = reclaim
         {
@@ -495,16 +422,13 @@ where
             // entry and — after the release below — no verdict record. The pool
             // arm's skip predicate reads exactly that record, so it would treat
             // a live commitment as an ordinary pool transaction while the
-            // preconf arm still holds it in the fifo. That is the one state the
-            // slot index exists to prevent. Deleting the entry instead would
-            // destroy a commitment a client is right now waiting on.
+            // preconf arm still holds it in the fifo. Deleting the entry instead
+            // would destroy a commitment a client is right now waiting on.
             //
-            // So neither: give the nonce back and refuse. The holder is live
-            // again, which is precisely what the guard above would have
-            // concluded had it read the status a moment later, and refusing is
-            // what it would have done. The undo must precede the release, since
-            // `replace_slot` reads the holder's verdict to decide the claim is
-            // a preconf one.
+            // So neither: give the nonce back and refuse, which is what the
+            // guard above would have done had it read the status a moment later.
+            // The undo must precede the release, since `replace_slot` reads the
+            // holder's verdict to decide the claim is a preconf one.
             if !self.fifo.remove_reclaimable(&owner).await {
                 let undone = self.classifier.replace_slot(&tx_hash, sender, nonce, owner);
                 warn!(
@@ -583,11 +507,9 @@ mod tests {
     // ---------------------------------------------------------------------
     // `validate_transaction` scaffolding.
     //
-    // The replacement guard has four branches — index hit, fifo fallback hit,
-    // reclaimable holder, `Promised` exemption — and it is a predicate that has
-    // already been got wrong twice by narrowing it (see the module docs). The
-    // integration suite exercises it through a real pool, but two of the four
-    // branches are unreachable from there, so it is pinned here as well.
+    // The replacement guard has three branches — index hit, reclaimable holder,
+    // promise exemption. The integration suite exercises it through a real pool,
+    // but some of those are unreachable from there, so it is pinned here too.
     //
     // Everything below needs three things: a concrete `OpPooledTransaction`, an
     // inner validator whose outcome the test scripts, and a `PreconfTxSet` in a
@@ -623,33 +545,27 @@ mod tests {
     /// Inner validator stub that records how many times it was delegated to.
     ///
     /// The call count is load-bearing: "the guard refused *before* delegating"
-    /// is not observable from the outcome alone, and it is the property that
-    /// keeps a rejected replacement from touching pool state.
+    /// is not observable from the outcome alone.
     ///
-    /// `steal` turns the stub into a deterministic stand-in for a concurrent
-    /// same-nonce admission: the real race needs another transaction to take the
-    /// slot *while we are inside the inner validator*, and this is exactly that
-    /// moment, so the theft is performed here rather than from a second task.
+    /// This is the one instant at which a concurrent same-nonce transaction can
+    /// disturb us, so both injections happen here rather than from a second
+    /// task: `steal` takes the slot, `revive` flips the holder's fifo entry back
+    /// to `Waiting`.
     ///
-    /// `after_first` scripts the **second** delegation onward, which is what lets
-    /// a test drive a real admission through `validate_transaction` and then have
-    /// the re-validation of that same transaction fail. `None` keeps `outcome`
-    /// for every call.
+    /// `after_first` scripts the **second** delegation onward, which lets a test
+    /// drive a real admission through `validate_transaction` and then fail the
+    /// re-validation of that same transaction. `None` keeps `outcome` throughout.
     #[derive(Debug)]
     struct StubInner {
         calls: Arc<AtomicUsize>,
         outcome: Inner,
         after_first: Option<Inner>,
         steal: Option<Steal>,
-        /// Revives the slot holder's fifo entry to `Waiting` at the same instant
-        /// `steal` would have taken the slot — the other thing a concurrent
-        /// same-hash resubmit can do inside our `await`.
         revive: Option<Revive>,
     }
 
     /// A concurrent same-hash resubmit that revives the holder's fifo entry from
-    /// a reclaimable state back to `Waiting`, injected inside the inner
-    /// validator's `await`.
+    /// a reclaimable state back to `Waiting`.
     #[derive(Debug)]
     struct Revive {
         fifo: Arc<PreconfTxSet>,
@@ -657,8 +573,8 @@ mod tests {
         from: Address,
     }
 
-    /// A concurrent same-nonce admission, injected at the one instant where it
-    /// matters. `holder` is the slot's owner both racers observed.
+    /// A concurrent same-nonce admission. `holder` is the slot's owner both
+    /// racers observed.
     #[derive(Debug)]
     struct Steal {
         classifier: Arc<PreconfClassifier>,
@@ -679,14 +595,11 @@ mod tests {
             let scripted =
                 if call == 0 { self.outcome } else { self.after_first.unwrap_or(self.outcome) };
             if let Some(steal) = &self.steal {
-                // The thief walks the same path we did — it classified while the
-                // holder still owned the nonce, found it reclaimable, and now
-                // wins the CAS. Whatever our caller concluded a moment ago is
-                // stale from here on.
+                // The thief walks the same path we did — classified while the
+                // holder still owned the nonce, found it reclaimable, now wins
+                // the CAS. Only a preconf submission can take a slot, so it goes
+                // through the RPC boundary first, exactly as our caller did.
                 let (sender, nonce) = (transaction.sender(), transaction.nonce());
-                // The thief is a preconf submission too — only those can take a
-                // slot — so it comes through the RPC boundary first, exactly as
-                // our caller did.
                 let _ = steal.classifier.claim_preconf(steal.thief, &sender, Some(&recipient()));
                 let _ = steal.classifier.admit_and_claim(steal.thief, &sender, nonce);
                 assert_eq!(
@@ -797,14 +710,11 @@ mod tests {
             let hash = *tx.hash();
             let _ = self.classifier.claim_preconf(hash, &tx.sender(), Some(&recipient()));
             let outcome = self.validate(tx).await;
-            // What `rpc.rs` does on any pool refusal, and it has to be modelled
-            // here or the fixture would leave records production cleans up: the
-            // verdict now belongs to the RPC boundary, so the validator's own
-            // release branch sees `Admission::Existing` and leaves it alone.
-            //
-            // This models rpc.rs's *call site*, not its policy — the policy is
-            // the one `release_preconf_claim` implements for both. Asserting the
-            // real call site is `rpc::tests`' job; a fixture cannot do it.
+            // What `rpc.rs` does on any pool refusal, modelled here or the
+            // fixture would leave records production cleans up: the verdict now
+            // belongs to the RPC boundary, so the validator's own release branch
+            // sees `Admission::Existing` and leaves it alone. Asserting the real
+            // call site is `rpc::tests`' job.
             if !matches!(outcome, TransactionValidationOutcome::Valid { .. }) {
                 self.classifier.release_preconf_claim(&hash);
             }
@@ -841,16 +751,14 @@ mod tests {
     }
 
     /// As [`fixture`], but the **first** admission succeeds and every delegation
-    /// after it returns `later`. That is what lets a test produce its own
-    /// precondition through `validate_transaction` instead of installing it by
-    /// hand, and then re-validate the same transaction into a failure.
+    /// after it returns `later`, so a test can produce its own precondition
+    /// through `validate_transaction` rather than installing it by hand.
     fn fixture_admitting_then(later: Inner, max_gas: u64) -> Fixture {
         build_fixture(Inner::Valid, Some(later), max_gas, |_| None, |_| None)
     }
 
     /// As [`fixture`], but a concurrent **same-hash** resubmit revives the slot
-    /// holder's fifo entry to `Waiting` while our transaction is inside the
-    /// inner validator — the other thing that can happen in that window.
+    /// holder's fifo entry to `Waiting` inside the inner validator.
     fn fixture_with_revived_holder(max_gas: u64, holder: u8, nonce: u64) -> Fixture {
         build_fixture(
             Inner::Valid,
@@ -862,7 +770,7 @@ mod tests {
     }
 
     /// As [`fixture`], but a concurrent same-nonce transaction `thief` takes the
-    /// slot from `holder` while our transaction is inside the inner validator.
+    /// slot from `holder` inside the inner validator.
     fn fixture_with_thief(max_gas: u64, thief: u8, holder: u8) -> Fixture {
         build_fixture(
             Inner::Valid,
@@ -959,20 +867,19 @@ mod tests {
 
     // --- The occupancy index is sufficient on its own ---------------------
 
-    /// **The state the guard's occupancy check used to keep a fifo fallback
-    /// for**: a transaction holding a fifo entry whose `(sender, nonce)` is
-    /// owned by a *different* hash. Reaching it would mean the index alone reads
-    /// the nonce as free while a live entry for it exists, so both build arms
-    /// could end up holding a transaction for that nonce.
+    /// **The state the index alone must still catch**: a transaction holding a
+    /// fifo entry whose `(sender, nonce)` is owned by a *different* hash.
+    /// Reaching it would let both build arms end up holding a transaction for
+    /// that nonce.
     ///
-    /// This walks the route the retention period newly opens — an on-chain
-    /// commitment keeps its slot but, because `forward()` removed its entry the
-    /// moment its nonce advanced, has **no fifo entry** for a whole `SEAL_DEPTH`
-    /// window — and shows the index closes it unaided: the claim fails, and a
-    /// holder with no fifo entry reads as `None`, which is not replaceable.
+    /// This walks the route the retention period opens — an on-chain commitment
+    /// keeps its slot but, because `forward()` removed its entry the moment its
+    /// nonce advanced, has **no fifo entry** for a whole `SEAL_DEPTH` window —
+    /// and shows the index closes it unaided: the claim fails, and a holder with
+    /// no fifo entry reads as `None`, which is not replaceable.
     ///
-    /// The other route, a `Verdict::Promised` transaction admitted without a
-    /// slot, is closed one layer up — see
+    /// The other route, a promised transaction admitted without a slot, is closed
+    /// one layer up — see
     /// `journal::tests::restore_never_leaves_a_fifo_entry_without_its_slot`.
     #[tokio::test]
     async fn the_violating_state_cannot_be_constructed() {
@@ -992,11 +899,9 @@ mod tests {
         assert!(!f.fifo.contains(&h(2)).await);
     }
 
-    /// The guard's occupancy test must not depend on the *newcomer's* verdict.
-    /// Gating it on `is_preconf()` reopens the hole for a sender the allowlist
-    /// dropped between the two submissions — a regression that was written and
-    /// caught once already, and one op-geth does not have because its guard
-    /// inspects only the incumbent (`legacypool.go:821-830`).
+    /// The guard's occupancy test must not depend on the *newcomer's* verdict:
+    /// gating it on `is_preconf()` opens a hole for a sender the allowlist
+    /// dropped between the two submissions. Only the incumbent is inspected.
     #[tokio::test]
     async fn a_de_whitelisted_replacement_is_still_refused_the_slot() {
         let f = fixture(Inner::Valid, 1_000_000);
@@ -1018,9 +923,9 @@ mod tests {
     // --- Branch 3: a reclaimable holder -----------------------------------
 
     /// `Timeout` / `Canceled` / `Failed` are all provably not on chain, so the
-    /// nonce is free to be reused. Asserted for each of the three: the set is a
-    /// deliberate divergence from op-geth (which can only release `Timeout`),
-    /// so it is pinned rather than left to the fifo's own tests.
+    /// nonce is free to be reused. Asserted for each of the three: the set
+    /// diverges from op-geth (see the module's cross-client note), so it is
+    /// pinned here rather than left to the fifo's own tests.
     #[tokio::test]
     async fn a_reclaimable_holder_hands_the_slot_over() {
         for status in [PreconfStatus::Timeout, PreconfStatus::Canceled, PreconfStatus::Failed] {
@@ -1077,9 +982,9 @@ mod tests {
     /// **The guard must let a sender past a broken commitment.** Once the apply
     /// has been rejected the entry is an ordinary `Failed`: its tx is not on
     /// chain and its `(sender, nonce)` is released. Refusing the replacement here
-    /// would wedge the account on that nonce — with nothing to clear it, since
-    /// no sweep and no operator call can — and would do so to protect a
-    /// commitment from the only party able to use that nonce: its promisee.
+    /// would stall the account on that nonce until the classifier's grace-period
+    /// sweep cleared the claim, and would do so to protect a commitment from the
+    /// only party able to use that nonce: its promisee.
     #[tokio::test]
     async fn a_broken_commitment_does_not_block_a_same_nonce_tx() {
         let f = fixture(Inner::Valid, 1_000_000);
@@ -1125,23 +1030,17 @@ mod tests {
         let replacement = f.validate(op_tx(2, sender(), 5, 21_000)).await;
 
         assert!(matches!(replacement, TransactionValidationOutcome::Invalid(..)));
-        assert_eq!(f.inner_calls(), 1, "the guard let it through — the inner validator refused it");
+        assert_eq!(f.inner_calls(), 1, "the guard let it through; the inner validator refused");
         let holder = f.fifo.find_by_hash(&h(1)).await.expect("holder must survive");
         assert_eq!(holder.status, PreconfStatus::Timeout, "including its reclaimable status");
         assert_eq!(f.classifier.verdict(&h(1)), Some(Verdict::Eligible), "and its frozen verdict");
         assert_eq!(f.classifier.slot_owner(&sender(), 5), Some(h(1)), "and its claim");
     }
 
-    /// **The handover is a compare-and-swap.** "The holder is reclaimable, so I
-    /// may take its nonce" is decided before the `await` on the inner validator,
-    /// so two same-nonce transactions can both reach that conclusion about the
-    /// same holder. Whoever wins the CAS is the only one that may proceed.
-    ///
-    /// The loser must be *refused*, not admitted: `Valid` is not admission — the
-    /// pool inserts afterwards under its own lock and its own price rule — so
-    /// admitting both would leave the index (validation order), the pool (price)
-    /// and the fifo (event order) each picking a different winner, and the
-    /// transaction the pool accepted could then be skipped by both build arms.
+    /// Two same-nonce transactions can both conclude the same holder is
+    /// reclaimable, so the handover is a compare-and-swap and the loser must be
+    /// *refused*, not admitted. See the CAS comment in `guarded_validate` for
+    /// why admitting both is unsafe.
     #[tokio::test]
     async fn losing_the_handover_race_refuses_the_replacement() {
         // 3 steals the slot from holder 1 while our transaction (2) is inside
@@ -1181,22 +1080,11 @@ mod tests {
     /// replacement is refused.
     ///
     /// The guard read the holder as reclaimable, then a same-hash resubmit
-    /// revived it to `Waiting` while we were inside the inner validator. We win
-    /// the slot CAS — which only asks *who* owns the nonce, not what the fifo
-    /// says about it — and then find the teardown refused, because the entry is
-    /// live and a client is waiting on it.
-    ///
-    /// Proceeding would leave the holder with a live entry and no verdict
-    /// record, which is the state the pool arm reads as "ordinary pool
-    /// transaction" while the preconf arm still holds it; deleting the entry
-    /// would destroy an in-flight commitment. So the handover is undone and the
-    /// replacement is refused — the same answer the guard would have given had
-    /// it read the status a moment later.
-    ///
-    /// This test previously asserted the opposite (the replacement kept the
-    /// slot, the holder's entry outlived its claim). That was the merge's
-    /// interim state, recorded deliberately so the choice would be visible; it
-    /// flipped when the question was decided, rather than being deleted.
+    /// revived it to `Waiting`. We win the slot CAS — which only asks *who* owns
+    /// the nonce, not what the fifo says about it — and then find the teardown
+    /// refused, because the entry is live and a client is waiting on it. So the
+    /// handover is undone and the replacement refused; see the teardown comment
+    /// in `guarded_validate` for why neither alternative is safe.
     #[tokio::test]
     async fn a_holder_revived_mid_validation_keeps_its_nonce_and_refuses_the_replacement() {
         let f = fixture_with_revived_holder(1_000_000, 1, 5);
@@ -1223,12 +1111,13 @@ mod tests {
         assert_eq!(f.classifier.verdict(&h(2)), None, "the refused replacement leaves nothing");
     }
 
-    // --- Branch 4: the `Promised` exemption -------------------------------
+    // --- Branch 3: the promise exemption ----------------------------------
 
     /// A commitment restored from the journal was acknowledged to its client
     /// before the restart and must be re-admitted unconditionally. Refusing it
-    /// here would turn a kept promise into "commitment cannot be honoured" and
-    /// would override `push_if_absent`'s documented same-nonce policy.
+    /// here would turn a kept promise into "commitment cannot be honoured";
+    /// which of two same-nonce transactions actually gets applied is decided one
+    /// layer down, by `push_if_absent`.
     #[tokio::test]
     async fn promised_is_admitted_even_when_the_slot_is_taken() {
         let f = fixture(Inner::Valid, 1_000_000);
@@ -1381,31 +1270,16 @@ mod tests {
         }
     }
 
-    /// **The hole that made `Admission::Fresh` necessary**, and the one the
-    /// guard's occupancy check no longer keeps a fifo fallback for.
+    /// **The hole that makes `Admission::Fresh` necessary.** A wallet retry or a
+    /// load-balancer replay re-runs the whole validator against a transaction
+    /// that is already in the pool with a live fifo entry, and the re-run can
+    /// fail on state the inner validator re-reads. Dropping the record on any
+    /// non-`Valid` outcome would then strand that entry without its
+    /// `(sender, nonce)`. The full argument is on the release branch in
+    /// `validate_transaction`.
     ///
-    /// `add_transaction` awaits `validate` *unconditionally*, and the hash-dedup
-    /// that answers `AlreadyImported` sits behind it — in `TxPool::add_transaction`,
-    /// which takes a `ValidPoolTransaction`, so it only runs where validation
-    /// already succeeded. A failing re-validation never reaches it.
-    ///
-    /// The route in is an ordinary `eth_sendRawTransaction` resubmit: that path
-    /// applies no hash dedup of its own, and the pool listener gives a fifo entry
-    /// to every preconf-eligible transaction whatever RPC admitted it. So a wallet
-    /// retry or a load-balancer replay re-runs this whole path against a
-    /// transaction that is **already in the pool with a live fifo entry**. (A p2p
-    /// re-announcement does not: `retain_unknown` drops already-pooled hashes
-    /// before validation.)
-    ///
-    /// The re-run can then fail on state the inner validator re-reads —
-    /// `NonceNotConsistent`, or `InsufficientFunds`, which on Mantle flips with no
-    /// action by the sender because `extra_balance_cost` is recomputed from the
-    /// current `l1_block_info` every time. The old rule ("not admitted ⇒ drop the
-    /// record") released the slot out from under that entry, leaving a fifo entry
-    /// that does not own its `(sender, nonce)`.
-    ///
-    /// Its counterpart — so this rule cannot be satisfied by simply never
-    /// releasing anything — is `a_rejection_by_the_inner_validator_releases_the_verdict`,
+    /// Its counterpart — so the rule cannot be satisfied by never releasing
+    /// anything — is `a_rejection_by_the_inner_validator_releases_the_verdict`,
     /// which drives the same failure on a **first** admission and requires the
     /// record to be dropped.
     #[tokio::test]
@@ -1447,16 +1321,13 @@ mod tests {
         }
     }
 
-    /// **The asymmetry `is_promised()` fixes.** The exemption used to key on
-    /// `Verdict::Promised`, which only journal restore ever writes — so a
-    /// commitment coming back from a **restart** was waved past the per-tx gas
-    /// ceiling, while the same commitment coming back from a **reorg** was not.
-    ///
-    /// A reorg reinject is re-admitted by the pool, not by restore, so its record
-    /// already exists and keeps `Verdict::Eligible`. With the old predicate, an
-    /// operator who lowered `--preconf.max-gas-per-tx` in between would see the
-    /// reinject refused and the commitment broken — the exact C4 failure the
-    /// exemption was created to prevent, just through the other door.
+    /// **Why the exemption keys on `is_promised()` and not `Verdict::Promised`.**
+    /// Only journal restore writes that variant. A reorg reinject is re-admitted
+    /// by the pool, so its record already exists and keeps `Verdict::Eligible`;
+    /// keying on the variant would wave a commitment past the per-tx gas ceiling
+    /// after a **restart** but not after a **reorg**, and an operator who lowered
+    /// `--preconf.max-gas-per-tx` in between would see the reinject refused and
+    /// the commitment broken.
     #[tokio::test]
     async fn a_reorged_commitment_bypasses_a_lowered_gas_ceiling() {
         // Ceiling now lower than the tx asked for when it was promised.

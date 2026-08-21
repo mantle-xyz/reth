@@ -11,13 +11,10 @@
 //!   one and two journal entries. tx0 lands on chain while the file is still under the cap; tx1's
 //!   append then pushes it over, arming the size trigger for the *first* time (so the rate limit's
 //!   `min_gap` is irrelevant — the first trigger is always honoured). **Both entries must
-//!   survive**: landing starts tx0's retention clock, it does not end its tracking, and a two-block
-//!   chain is nowhere near `SEAL_DEPTH` deep. This is the retention period observed end-to-end.
-//!
-//! This test used to assert the opposite — that the size trigger dropped tx0 as
-//! soon as it was canon-sealed. That was the pre-retention model, in which
-//! "canonical once" ended a commitment; a reorg could then take the block back
-//! and leave the commitment with no record and no nonce.
+//!   survive**: landing only *starts* tx0's retention clock, it does not end its tracking, and a
+//!   two-block chain is nowhere near `SEAL_DEPTH` deep, so a reorg could still take tx0's block
+//!   back and it must keep both its record and its nonce. This is the retention period observed
+//!   end-to-end; a regression that released on "canonical once" drops tx0 here.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
 use crate::{canonicalize_payload, launch_preconf_node};
@@ -66,9 +63,9 @@ fn read_journal(path: &std::path::Path) -> Vec<JournalEntry> {
         .collect()
 }
 
-/// End-to-end size-triggered rotation: a sealed commitment is dropped from
-/// the on-disk journal by the node's own rejournal loop once a later append
-/// pushes the file past the configured `journal_max_size`.
+/// End-to-end size-triggered rotation: a later append pushes the file past the configured
+/// `journal_max_size`, the node's own rejournal loop rotates — and keeps a commitment that
+/// has landed but is not yet buried `SEAL_DEPTH` deep. See the module header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -190,15 +187,8 @@ async fn size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet() {
         event1.reason,
     );
 
-    // Both entries must survive the rotation.
-    //
-    // tx1 because it never landed. tx0 because landing only *starts* its
-    // retention clock: the chain here is two blocks deep, far short of
-    // `SEAL_DEPTH`, so a reorg could still take its block back and it must keep
-    // both its record and its nonce until that is impossible.
-    //
-    // A regression that released on "canonical once" — the model this replaced —
-    // drops tx0 here.
+    // Both entries must survive: tx1 because it never landed, tx0 because it is not yet
+    // buried `SEAL_DEPTH` deep (see the module header).
     let after = read_journal(&journal_file);
     assert!(
         after.iter().any(|e| e.hash == hash0),

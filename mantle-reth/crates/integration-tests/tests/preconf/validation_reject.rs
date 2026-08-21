@@ -11,8 +11,8 @@
 //!
 //! ### Preconf-specific rejections
 //!
-//! - **Whitelist gate** (`is_preconf_tx`, `rpc.rs`) — rejects non-whitelisted `(sender, to)` before
-//!   `attach_responder`.
+//! - **Whitelist gate** (`PreconfClassifier::preview_eligibility`, `rpc.rs`) — rejects
+//!   non-whitelisted `(sender, to)` before `attach_responder`.
 //! - **Nonce-gap gate** (`rpc.rs`) — rejects `tx.nonce > pending_nonce` before `attach_responder`
 //!   and before `pool.add_transaction`.
 //! - **Preconf per-tx gas ceiling** (`rpc.rs` Step 3b) — rejects `tx.gas_limit >
@@ -181,22 +181,10 @@ async fn nonce_gap_rejected_synchronously() {
 /// `pool.add_transaction`, so the client gets
 /// `PreconfError::PreconfGasLimitExceeded`.
 ///
-/// # This test used to assert the opposite, and stayed green
-///
-/// It was written when the ceiling was enforced only by
-/// `PreconfAwareValidator`, and asserted the `PreconfError::PoolRejected`
-/// wrapper around it. When eligibility moved to the RPC boundary the
-/// rejection moved with it — but the assertion was
-/// `contains("preconf-eligible") || contains("preconf_max_gas_per_tx")`,
-/// and the new error's Display *also* contains `preconf_max_gas_per_tx`.
-/// So the test kept passing while testing a different code path than the
-/// one it documented.
-///
-/// Hence the negative assertion below: matching the substring both arms
-/// share proves nothing, so the test must also state which arm did *not*
-/// produce it. The validator still carries its own copy of the ceiling as
-/// defence in depth (see `validator.rs`), which is exactly why the two are
-/// worth telling apart here.
+/// Hence the negative assertion below: `PreconfAwareValidator` carries its own copy of the
+/// ceiling as defence in depth (see `validator.rs`), and both Displays mention
+/// `preconf_max_gas_per_tx` — so matching the substring the two arms share proves nothing,
+/// and the test must also state which arm did *not* produce it.
 ///
 /// The failure is synchronous (well under `preconf_timeout`): no fifo entry
 /// is created, and the responder attached at Step 3 is cancelled on the way

@@ -140,8 +140,9 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
 ///
 /// This used to work by accident: cold start ran *after* restore, so the
 /// allowlists were still empty, every restored tx classified as ineligible, and
-/// the ceiling never applied. C3 moved cold start ahead of restore (it had to —
-/// see the classifier design doc §6), which removed the accident; `Promised`
+/// the ceiling never applied. Cold start now runs ahead of restore (it has to:
+/// restore must judge a commitment against the policy in force), which removed
+/// the accident; the receipt-already-sent exemption
 /// replaces it with something explicit. This test fails on a build that has the
 /// new ordering but not the exemption.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -100,41 +100,19 @@ where
     P: TransactionPool + 'static,
     Pr: StateProviderFactory + 'static,
 {
-    /// Records a returned receipt in **both** halves of commitment tracking:
-    /// the classifier (in memory, and the authority for slot retention) and the
-    /// journal (on disk, for restart).
+    /// Records a returned receipt in **both** halves of commitment tracking: the
+    /// classifier (in memory, the authority for slot retention) and the journal
+    /// (on disk, for restart). Both writes live here so the two cannot drift —
+    /// `mark_committed` needs the classifier's promise record to recognise our
+    /// transactions among a whole block's hashes, and journal restore rebuilds
+    /// that record from the file.
     ///
-    /// The two writes live in one function on purpose. Commitment tracking rests
-    /// on the two sets agreeing — the classifier's promise record is what lets
-    /// `mark_committed` recognise our transactions among a whole block's hashes,
-    /// and journal restore rebuilds that record from the file. Two call sites
-    /// each doing two writes would make that agreement a thing to remember;
-    /// here it is a thing that cannot be got wrong.
-    ///
-    /// # Every receipt counts, not only `Success`
-    ///
-    /// Both call sites are receipt arms, and a `Failed` event there is an **EVM
-    /// revert that produced a receipt** — not "never executed". Every
+    /// **Every receipt counts, not only `Success`.** A `Failed` event on a
+    /// receipt path is an EVM revert that *produced* a receipt; every
     /// not-on-chain outcome leaves through an `Err(..)` return and never reaches
-    /// this function.
-    ///
-    /// The receipt is handed to the client when the transaction is applied to
-    /// the **in-flight** payload, before the block is sealed. So a reverted
-    /// transaction sits in exactly the same position as a successful one: the
-    /// client holds a receipt naming a height, and a crash before sealing makes
-    /// that receipt a lie unless restore replays it. Gating on `Success` would
-    /// protect one and not the other for no reason either can be told apart by.
-    ///
-    /// The fifo already takes this view: `builder::dispatch`'s `Ok(receipt)` arm
-    /// calls `mark_succeeded` without consulting `receipt.status`, so a reverted
-    /// transaction is `PreconfStatus::Success` there. A `Success`-only gate here
-    /// would leave the two structures disagreeing about the same transaction —
-    /// fifo says committed, the classifier and the journal have never heard of
-    /// it. Two further things follow from that record existing: the pool
-    /// listener routes a reorg reinject as `Replay` rather than subjecting an
-    /// acknowledged commitment to the deadline and gas gates again, and
-    /// `mark_committed` can count it toward the reorg-drift signal.
-    ///
+    /// here. The receipt goes out before the block is sealed, so a reverted tx is
+    /// owed a replay exactly as a successful one is — and `builder::dispatch`
+    /// agrees, marking the fifo entry `Success` without reading `receipt.status`.
     /// Pinned by `a_reverted_receipt_is_still_recorded_as_a_commitment`.
     async fn record_commitment(
         &self,
@@ -269,30 +247,18 @@ where
         // Step 3b — claim the preconf verdict, before the pool ever sees the
         // transaction.
         //
-        // **This is where eligibility is decided**, because this is the only
-        // point at which the deciding fact exists: that the client called
-        // `eth_sendRawTransactionWithPreconf` rather than `eth_sendRawTransaction`.
-        // One layer down the two are indistinguishable — both reach the pool as
-        // `TransactionOrigin::External` — so the validator can only latch
-        // whatever it finds, and what it finds is what we write here.
+        // **This is where eligibility is decided**: the deciding fact — that the
+        // client called `eth_sendRawTransactionWithPreconf` and not
+        // `eth_sendRawTransaction` — exists only here. One layer down the two are
+        // indistinguishable (both reach the pool as `TransactionOrigin::External`),
+        // so the validator can only latch what it finds, and what it finds is
+        // what we write here.
         //
-        // The per-tx gas ceiling is checked here too, for the same reason: the
-        // verdict and the conditions it was granted under have to be decided
-        // together. It is what stops an `Eligible` verdict existing for a
-        // transaction that was never held to the ceiling.
-        //
-        // Because it runs *before* the verdict is written, this is in practice
-        // **the** enforcement point for this RPC: the validator's copy of the
-        // ceiling gates on `verdict.is_preconf()`, and no over-cap request gets
-        // as far as having a verdict. The validator keeps its copy as defence in
-        // depth for any future writer of an eligible verdict — see the comment
-        // there, and do not restore the earlier claim that this check is merely
-        // an optimisation ahead of the real one.
-        //
-        // Pinned by the integration test
-        // `per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool`, which asserts the
-        // error is *this* one and not a `PoolRejected` wrapper — the two Displays
-        // overlap enough that a substring match cannot tell them apart.
+        // The per-tx gas ceiling is checked here too, so no `Eligible` verdict
+        // can exist for a transaction that was never held to it. This is the
+        // operative check, not an optimisation ahead of one: the validator's copy
+        // gates on `verdict.is_preconf()`, which an over-cap request never gets.
+        // Pinned by `per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool`.
         //
         // `Err` means the hash already carries a frozen non-preconf verdict —
         // the same raw transaction went in through plain `eth_sendRawTransaction`
@@ -342,28 +308,20 @@ where
             Ok(_) => {}
             Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
             Err(e) => {
-                // Everything the pool refuses, for any reason, lands here.
-                // That includes **validator rejections** — `PoolInner::add_transaction`
-                // maps a `TransactionValidationOutcome::Invalid` to `Err` just
-                // as it does an insertion failure — so this branch covers the
-                // per-tx gas ceiling, `ReplaceActivePreconf`, a lost handover
-                // CAS and every inner-validator refusal, alongside pool limits
-                // and underpriced replacements. (An earlier version of this
-                // comment claimed validation had already passed by this point;
-                // it had not, and the release below is load-bearing for those
-                // paths.)
+                // Everything the pool refuses lands here, **including validator
+                // rejections** — `PoolInner::add_transaction` maps a
+                // `TransactionValidationOutcome::Invalid` to `Err` just as it does
+                // an insertion failure — so this covers the per-tx gas ceiling,
+                // `ReplaceActivePreconf`, a lost handover CAS and every
+                // inner-validator refusal alongside pool limits and underpriced
+                // replacements.
                 //
                 // Either way a verdict is frozen and the `(sender, nonce)` slot
-                // may be claimed for a transaction that is not in the pool.
-                // Release both: the slot would otherwise block that nonce until
-                // the next sweep. The verdict here is ours — Step 3b wrote it —
-                // so nothing else can be relying on it.
-                //
-                // A promised commitment is the exception, and the exemption is
-                // `release_preconf_claim`'s to make, not this call site's: the
-                // predicate is subtler than it looks (a promise does not change
-                // the verdict) and the validator has to make the identical
-                // judgement about the identical record. See that method.
+                // may be claimed for a transaction that is not in the pool;
+                // unreleased, the slot would block that nonce until the next
+                // sweep. The verdict is ours — Step 3b wrote it. The one
+                // exception, a promised commitment, is `release_preconf_claim`'s
+                // to judge, not this call site's; see that method.
                 //
                 // Pinned by `a_pool_refusal_releases_the_verdict_the_request_froze`
                 // and `a_pool_refusal_must_not_drop_a_promised_commitment`.
@@ -461,12 +419,13 @@ where
                 let final_status = final_entry.as_ref().map(|e| e.status);
 
                 match final_status {
-                    // **Must precede the `Success | Failed` arm below.** A broken
-                    // commitment ends in `Failed` like any other apply rejection;
-                    // the `Replay` source is what tells them apart. That arm
-                    // assumes dispatch queued a message on `resp_rx`, but the
-                    // breach path deliberately sends nothing, so falling into it
-                    // would report a `Timeout` the client retries forever.
+                    // **Must precede the `Success | Failed` arm below.** A
+                    // `Replay`-source `Failed` is a commitment we could not
+                    // honour; an `Rpc`-source one is an ordinary apply
+                    // rejection. That arm assumes dispatch queued a message on
+                    // `resp_rx`, but the breach path deliberately sends
+                    // nothing, so falling into it would report a `Timeout` the
+                    // client retries forever.
                     //
                     // This is also the **only** channel through which a client
                     // can learn its commitment was broken: a `Replay` entry's
@@ -834,26 +793,17 @@ mod tests {
 
     // --- `handle_inner`'s pool-refusal branch -----------------------------
     //
-    // An earlier note here deferred these to end-to-end coverage, calling a
-    // `TransactionPool` impl with a `recover_raw_transaction`-compatible
-    // `Pooled` type "heavyweight scaffolding". It is not: reth's
-    // `NoopTransactionPool<T>` is generic over any `EthPoolTransaction`, so
     // `NoopTransactionPool<OpPooledTransaction>` is a ready-made pool whose
-    // `add_transaction` **always** returns `Err` — which is precisely the
-    // branch that needs pinning — and `MockEthProvider` supplies the on-chain
-    // nonce Step 2 reads.
-    //
-    // Why it needs pinning here and cannot be delegated elsewhere: deleting
-    // the release at Step 4's `Err` arm left the entire suite green (319 unit
-    // + 90 integration). `validator::tests::validate_preconf` models the
-    // release by hand, so every test built on that fixture asserts against
+    // `add_transaction` **always** returns `Err` — precisely the branch that
+    // needs pinning — and `MockEthProvider` supplies the on-chain nonce Step 2
+    // reads. It has to be pinned here: `validator::tests::validate_preconf`
+    // models the release by hand, so tests built on that fixture assert against
     // the *copy*, never this call site.
     //
-    // One test is enough for all of it. Every preconf rejection — inner
-    // validator, `ReplaceActivePreconf`, a lost handover CAS, pool limits —
-    // arrives here as one `Err` and is released by one piece of code; which
-    // rejection produced it is a validator-side fact, covered by
-    // `validator::tests`.
+    // One test covers all of it: every preconf rejection — inner validator,
+    // `ReplaceActivePreconf`, a lost handover CAS, pool limits — arrives here as
+    // one `Err` and is released by one piece of code; which rejection produced it
+    // is a validator-side fact, covered by `validator::tests`.
 
     const RECIPIENT: Address = Address::new([0x42; 20]);
 
@@ -944,8 +894,7 @@ mod tests {
     ///
     /// The `(sender, nonce)` slot is deliberately **not** asserted: Step 3b
     /// claims no slot (that is `admit_and_claim`'s job, inside the pool's own
-    /// admission, which `NoopTransactionPool` never reaches). Asserting it
-    /// here would be an assertion that cannot fail.
+    /// admission, which `NoopTransactionPool` never reaches).
     #[tokio::test]
     async fn a_pool_refusal_releases_the_verdict_the_request_froze() {
         let h = harness().await;
@@ -970,24 +919,15 @@ mod tests {
     /// same-hash resubmit inside that window is re-validated (the transaction is
     /// still pooled, so nothing deduplicates it) and can be refused on account
     /// state alone: Mantle recomputes `extra_balance_cost` every validation.
-    /// See `release_preconf_claim` for why the later "nonce has advanced" story
-    /// is *not* the reachable one.
-    ///
     /// Both preconditions are established through the production calls in
     /// production order — Step 3b's `claim_preconf`, then `record_commitment`'s
-    /// `mark_promised` — with only the block application itself elided. The
-    /// refusal itself comes from the pool, not from a hand-set flag.
+    /// `mark_promised` — with only the block application elided; the refusal
+    /// comes from the pool, not a hand-set flag.
     ///
-    /// This is why the predicate is `is_promised()` and not
-    /// `verdict == Promised`: `mark_promised` sets the `promised` flag on an
-    /// existing record without rewriting its verdict (`classifier.rs:733-737`),
-    /// so the record left by the normal flow is `Eligible` + promised. Keying
-    /// on the verdict would release it here, and `release_unless_committed`
-    /// would not stop it — that guard reads `committed_height`, which only
-    /// `mark_committed` sets, and the canonical notification has not arrived
-    /// yet. Dropping it hands back the nonce of a commitment already
-    /// acknowledged to a client, inside the window the retention rule exists
-    /// to protect.
+    /// The assertions key on `is_promised()`, not `verdict == Promised`, because
+    /// `mark_promised` sets the flag without rewriting the verdict — so the
+    /// normal flow leaves `Eligible` + promised. See `release_preconf_claim` for
+    /// why that distinction is what keeps the record alive here.
     #[tokio::test]
     async fn a_pool_refusal_must_not_drop_a_promised_commitment() {
         let h = harness().await;
@@ -1012,19 +952,13 @@ mod tests {
         );
     }
 
-    /// An EVM revert that produced a receipt is a commitment like any other.
+    /// An EVM revert that produced a receipt is a commitment like any other —
+    /// see `record_commitment` for why the gate is not on `Success`.
     ///
-    /// `WireStatus::Failed` on a receipt path means "executed, reverted, receipt
-    /// handed to the client" — not "never executed", which leaves through an
-    /// `Err(..)` return and never reaches `record_commitment`. The block is not
-    /// sealed yet either way, so a crash owes this transaction a replay exactly
-    /// as it owes one to a successful transaction.
-    ///
-    /// Both halves are asserted, because the failure mode of gating on `Success`
-    /// is precisely that they disagree: `builder::dispatch` marks the fifo entry
-    /// `Success` without consulting `receipt.status`, so a gate here would leave
-    /// the fifo saying "committed" while the classifier and the journal had
-    /// never heard of the transaction.
+    /// Both halves are asserted because the failure mode of such a gate is
+    /// precisely that they disagree: `builder::dispatch` marks the fifo entry
+    /// `Success` regardless, so the fifo would say "committed" while the
+    /// classifier and the journal had never heard of the transaction.
     #[tokio::test]
     async fn a_reverted_receipt_is_still_recorded_as_a_commitment() {
         let h = harness().await;

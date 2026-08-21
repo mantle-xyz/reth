@@ -15,18 +15,19 @@
 //!
 //! ## What is deliberately not tested here
 //!
-//! * **The contract itself** (two auth gates, idempotence, `MAX_BATCH`) — covered by the 19 forge
+//! * **The contract itself** (two auth gates, idempotence, `MAX_BATCH`) — covered by the forge
 //!   tests in `mantle-v2/packages/contracts-bedrock/test/PreconfWhitelist.t.sol`. The seam between
 //!   the two repos is the storage layout and the event topic0, and both are asserted from both
 //!   sides.
 //! * **The full L1→L2 governance path** (governance Safe → `L1CrossDomainMessenger.sendMessage` →
 //!   deposit → `relayMessage` → the auth gates) — that needs an L1 and op-node, so it is a testnet
 //!   exercise; it has been run end-to-end on public Mantle Sepolia.
-//! * **The production wiring itself.** Cold start and the watcher now run inside `build_pool`,
-//!   which this harness does execute, so the T1 tests observe the real thing rather than calling
-//!   the entry points themselves. The T2 tests below still spawn their own watcher: the node's is
-//!   racing block production from the moment `build_pool` returns, and a test needs a handle it can
-//!   abort.
+//! * **The production wiring itself.** Cold start and the watcher run inside `build_pool`, which
+//!   this harness does execute — `cold_start_loads_genesis_whitelist_before_the_node_is_up` asserts
+//!   the allowlist is already loaded by the time launch returns. The other T1 tests then re-run
+//!   `bootstrap_whitelist` by hand, which is idempotent, so each stays readable on its own. The T2
+//!   tests spawn their own watcher: the node's is racing block production from the moment
+//!   `build_pool` returns, and a test needs a handle it can abort.
 
 use super::helpers::{
     PreconfCfgBuilder, PreconfSetup, address_array_storage, layout_version_storage,
@@ -59,10 +60,9 @@ const CHAIN_ID: u64 = 5000;
 /// Genesis storage for a whitelist authorizing exactly `from x to` as explicit
 /// pairs, with both wildcard sets empty.
 ///
-/// The cross product keeps the meaning these tests were written against — they
-/// predate the move from two independent lists to explicit pairs, and none of
-/// them is about the shape of the allowlist. [`wildcard_storage`] covers the
-/// arms this one never touches.
+/// No test here is about the shape of the allowlist, so the cross product is enough; the
+/// wildcard arms are covered by
+/// `happy_path::wildcards_load_from_genesis_and_carry_a_contract_creation`.
 fn whitelist_storage(from: &[Address], to: &[Address]) -> Vec<(B256, B256)> {
     let pairs: Vec<_> = from.iter().flat_map(|f| to.iter().map(move |t| (*f, *t))).collect();
     let mut storage = pair_array_storage(PAIRS_SLOT, &pairs);
@@ -107,7 +107,7 @@ async fn signed_stub_call(wallet: &Wallet, nonce: u64) -> Bytes {
         chain_id: Some(CHAIN_ID),
         nonce: Some(nonce),
         to: Some(TxKind::Call(WL)),
-        // Four SSTOREs into cold slots (~22k each) plus a LOG1.
+        // Up to six cold SSTOREs (~22k each) plus a LOG1.
         gas: Some(300_000),
         max_fee_per_gas: Some(20e9 as u128),
         max_priority_fee_per_gas: Some(20e9 as u128),
@@ -119,25 +119,17 @@ async fn signed_stub_call(wallet: &Wallet, nonce: u64) -> Bytes {
 
 /// How many event-carrying blocks a watcher test will produce before giving up.
 ///
-/// More than one is required, and the reason is a race in the *test*, not in the
-/// watcher: `tokio::spawn(run_whitelist_watcher(..))` returns before the task has
-/// run far enough to call `canonical_state_stream()`, so a block canonicalised
-/// immediately afterwards can be committed before the subscription exists — and a
-/// notification nobody is subscribed to is simply gone. Production never hits this
-/// because `build_pool` spawns the watcher long before the first block.
-///
-/// Re-emitting is sound because the stub's write is idempotent: every call stores
-/// the same values, so any single notification that does get observed converges the
-/// cache to the same place.
+/// More than one is needed because of a race in the *test*, not the watcher:
+/// `tokio::spawn(run_whitelist_watcher(..))` returns before the task reaches
+/// `canonical_state_stream()`, and a notification nobody is subscribed to yet is simply
+/// gone. Production spawns the watcher long before the first block. Retrying is sound
+/// because the stub's write is idempotent — every call stores the same values.
 const CONVERGENCE_ATTEMPTS: usize = 5;
 
 /// Polling budget for any "wait until it converges" loop, as 50 ms ticks.
 ///
-/// Generous on purpose: the whole suite runs seven node-spawning tests in
-/// parallel, and under that load block commit, state-provider refresh and the
-/// watcher's reload all take noticeably longer than when a test runs alone. A
-/// large budget costs nothing on the happy path (the loops exit as soon as the
-/// condition holds) and is what keeps these tests off the flaky list.
+/// Generous on purpose: seven node-spawning tests run in parallel here. It costs nothing
+/// on the happy path, since every loop exits as soon as its condition holds.
 const POLL_TICKS: usize = 200;
 
 // ===== T1: reading and admission on a real provider =====
@@ -331,30 +323,16 @@ async fn bootstrap_accepts_empty_onchain_whitelist() {
 
 // ===== T2: watcher end-to-end on real canonical notifications =====
 //
-// Both tests below are `#[ignore]`d, and it is worth being precise about why,
-// because they do pass — 5/5 when run serially:
+// Both tests below are `#[ignore]`d. Run serially they pass 5/5:
 //
 //     cargo test -p mantle-reth-integration-tests --test preconf \
 //         whitelist_onchain::watcher -- --ignored --test-threads=1
 //
-// Run as part of the parallel suite they fail roughly one time in five, always
-// with the same signature: the stub call is present in the resolved payload and
-// `submit_payload` + `update_forkchoice` both succeed, yet `best_block_number()`
-// stays at 0 and the storage write never becomes visible — the canonicalisation
-// simply does not take effect. That is a property of this harness under load, not
-// of the watcher: the pre-existing `happy_path::weth_deposit_carries_log_through_
-// to_receipt` fails with the identical symptom (it reads state after a fixed
-// 100 ms sleep following the same submit/FCU pair) and is flaky for the same
-// reason.
-//
-// Quarantining the individual tests follows the repo's own guidance in CLAUDE.md
-// ("quarantine that single test (#[ignore]) rather than moving the whole tier back
-// to nightly"). Un-ignore once block production in this harness is deterministic —
-// note that `NodeTestContext::advance_block()`, which does the proper engine
-// handshake, is not usable here: it waits on the payload-attributes / built-payload
-// event pair, which the preconf payload-builder fork does not drive, so it times
-// out "waiting for a non-empty payload". Every other preconf suite hand-rolls the
-// sequence for that same reason.
+// In the parallel suite they fail about one run in five, always the same way: the stub
+// call is in the resolved payload and submit + FCU both succeed, yet
+// `best_block_number()` stays at 0 and the storage write never becomes visible. That is
+// this harness's canonicalisation under load, not the watcher. Quarantined per CLAUDE.md;
+// un-ignore once block production here is deterministic.
 
 /// Produces and canonicalises one block that tries to include a stub call at
 /// `nonce`, which is what makes reth emit a real `CanonStateNotification`.
@@ -368,8 +346,7 @@ async fn bootstrap_accepts_empty_onchain_whitelist() {
 /// already carries the L1-attributes deposit as `tx[0]`, so a length check would
 /// pass even when the stub call was dropped.
 ///
-/// Declared as a macro rather than a function to avoid spelling out the harness's
-/// deeply generic node type at a call site.
+/// A macro, not a function: the harness's node type cannot be spelled at a call site.
 macro_rules! produce_stub_block {
     ($node:expr, $wallet:expr, $nonce:expr) => {{
         let raw_tx = signed_stub_call(&$wallet, $nonce).await;
@@ -431,8 +408,7 @@ fn onchain_slot<P: reth_provider::StateProviderFactory>(provider: &P, slot: B256
 ///
 /// Polls instead of reading once: `update_forkchoice` returning does not mean
 /// `latest()` already resolves to the new head, so a single read can legitimately
-/// observe pre-block state. (The pre-existing `happy_path` WETH test papers over
-/// the same race with a fixed 100 ms sleep, which is why it is flaky under load.)
+/// observe pre-block state.
 async fn await_onchain_slot<P: reth_provider::StateProviderFactory>(
     provider: &P,
     slot: B256,
@@ -452,6 +428,7 @@ async fn await_onchain_slot<P: reth_provider::StateProviderFactory>(
 /// `CanonStateNotification`, which is the one thing the unit tests structurally
 /// cannot exercise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "canonicalisation is non-deterministic in this harness under parallel load; see the T2 note above"]
 async fn watcher_refreshes_on_whitelist_updated_event() {
     let sender = wallet_address();
 
@@ -543,6 +520,7 @@ async fn watcher_refreshes_on_whitelist_updated_event() {
 /// Governance draining the allowlist at runtime must be applied faithfully — the
 /// sequencer stops fast-pathing rather than keeping the stale entries alive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "canonicalisation is non-deterministic in this harness under parallel load; see the T2 note above"]
 async fn watcher_applies_governance_draining_the_whitelist() {
     let sender = wallet_address();
 

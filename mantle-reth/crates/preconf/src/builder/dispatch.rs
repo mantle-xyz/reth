@@ -71,30 +71,21 @@ pub(super) enum BlockKind {
 pub(super) struct LoopState {
     /// Hashes already committed to the in-flight block.
     committed: HashSet<TxHash>,
-    /// Hashes excluded — terminal-non-success, deadline-skip, etc. The
-    /// stored [`PreconfError`] is the rejection reason from the first
-    /// time this hash was excluded; a subsequent same-slot resubmit
-    /// dedups against this map and forwards the same reason to any
-    /// newly-attached responder, so the client observes a consistent
-    /// error rather than a slow-Timeout on retry.
+    /// Hashes excluded — terminal-non-success, deadline-skip, etc., mapped to
+    /// the reason recorded the first time. Read by the dedup gate in
+    /// `apply_one_preconf`.
     excluded: HashMap<TxHash, PreconfError>,
     /// Predicted L2 block height for this slot. Stamped onto every
     /// receipt as `PreconfReceipt::block_height`.
     predicted_height: u64,
-    /// Cumulative preconf-path gas committed in this block. Compared
-    /// against `cfg.preconf_max_gas_per_block` before each apply; when
-    /// adding the next tx's `gas_limit` would exceed the budget, the
-    /// apply is aborted with `PreconfError::BlockGasBudgetExceeded`.
-    /// Incremented by the actual `receipt.gas_used` after a successful
-    /// apply — reserving `gas_limit` would over-count against later
-    /// txs that could still fit.
+    /// Cumulative preconf-path gas committed in this block, checked against
+    /// `cfg.preconf_max_gas_per_block` by the budget gate below. Incremented by
+    /// the actual `receipt.gas_used`, not `gas_limit` — reserving the limit
+    /// would over-count against later txs that could still fit.
     preconf_gas_used: u64,
     /// Senders whose preconf chain is blocked this slot: `sender → (lowest
-    /// blocked nonce, kind)`. Populated when a preconf tx is deferred or
-    /// permanently rejected by the block-capacity admission gate; consulted
-    /// before admitting any same-sender entry so nonce successors inherit the
-    /// predecessor's outcome instead of being applied out of order (which
-    /// would nonce-too-high fail). Slot-local — reset each build.
+    /// blocked nonce, kind)`. Slot-local, reset each build. See [`BlockKind`]
+    /// for why a successor inherits its predecessor's outcome.
     blocked_senders: HashMap<Address, (u64, BlockKind)>,
 }
 
@@ -153,12 +144,10 @@ impl LoopState {
         self.committed.contains(hash)
     }
 
-    /// If `hash` was previously excluded in this loop instance, return
-    /// the stored rejection reason. `None` when the hash is either
-    /// unseen or was committed. Callers forward the returned error to
-    /// any late-arriving responder so a same-slot resubmit sees the
-    /// same wire error as the first submission, rather than waiting the
-    /// full `preconf_timeout` and getting a generic `Ok(Timeout)`.
+    /// If `hash` was previously excluded in this loop instance, return the
+    /// stored rejection reason. `None` when the hash is unseen or was
+    /// committed. See `apply_one_preconf`'s dedup gate for what callers do
+    /// with it.
     pub(super) fn excluded_reason(&self, hash: &TxHash) -> Option<&PreconfError> {
         self.excluded.get(hash)
     }
@@ -168,19 +157,14 @@ impl LoopState {
         self.committed.insert(hash);
     }
 
-    /// Mark hash as excluded with the rejection reason. The first
-    /// exclusion wins — subsequent calls with the same hash keep the
-    /// original reason so re-submissions in the same slot observe the
-    /// wire error that fired on the initial gate.
+    /// Mark hash as excluded with the rejection reason. The first exclusion
+    /// wins, so the reason a client sees stays stable across the build.
     pub(super) fn record_excluded(&mut self, hash: TxHash, reason: PreconfError) {
         self.excluded.entry(hash).or_insert(reason);
     }
 
-    /// Drop a hash from the excluded map. Called by `apply_one_preconf`
-    /// when a prior `Timeout` exclusion needs to be re-evaluated
-    /// against a fresh `entry.inserted_at` (refreshed by
-    /// `attach_responder` on same-hash resubmit), so a stale exclusion
-    /// does not shadow a legitimately re-eligible tx.
+    /// Drop a hash from the excluded map — only for the stale-`Timeout` case
+    /// in `apply_one_preconf`'s dedup gate.
     pub(super) fn clear_excluded(&mut self, hash: &TxHash) {
         self.excluded.remove(hash);
     }
@@ -198,30 +182,22 @@ impl LoopState {
     }
 }
 
-/// Handle one preconf hash end-to-end: dedup → fetch → status gate →
-/// pre-apply deadline → caller-supplied apply → fifo mark + responder
-/// send.
+/// Handle one preconf hash end-to-end: dedup → fetch → status gate → pre-apply
+/// deadline → gas budget → caller-supplied apply → fifo mark + responder send.
+/// Enforces the four invariants listed in the module docs.
 ///
-/// `apply_fn` receives `(tx, hash, predicted_height)` and is responsible
-/// for executing the transaction against the in-flight `BlockBuilder` /
-/// `State<DB>` and producing the receipt. The caller injects the
-/// closure so this module stays free of EVM-builder generics.
-/// Per call, `apply_fn` is invoked at most once — on success-path
-/// reach. If a dedup / status / deadline / gas-budget guard fires
-/// earlier, `apply_fn` is not called. (The bound is `FnMut` rather than `Fn`
-/// because the closure the caller builds borrows the in-flight `BlockBuilder`
-/// and `ExecutionInfo` mutably — see `admit_and_dispatch` in `payload_builder`.)
-///
-/// All terminal paths invoke `take_responder` or `cancel_responder`
-/// exactly once.
+/// `apply_fn` receives `(tx, hash, predicted_height)` and is invoked at most
+/// once per call — never once an earlier guard has fired. The bound is `FnMut`
+/// rather than `Fn` because the caller's closure borrows the in-flight
+/// `BlockBuilder` and `ExecutionInfo` mutably (see
+/// `payload_builder::admit_and_dispatch`).
 ///
 /// Returns `Err(PayloadBuilderError)` **only** when `apply_fn` reports an
 /// [`ApplyError::Fatal`] — a non-tx-specific execution error (DB / header /
-/// fatal precompile). In that case the caller must abort the whole build
-/// (mirroring the pool arm); the fifo entry is left `Waiting` and its
-/// responder untouched so the commitment is retried on the next build cycle
-/// rather than reneged on. Every other path — success, per-tx
-/// [`ApplyError::Rejected`], and all pre-apply gates — returns `Ok(())`.
+/// fatal precompile). The caller must then abort the whole build (mirroring the
+/// pool arm); the fifo entry is left `Waiting` with its responder attached, so
+/// the commitment is retried next build cycle rather than reneged on. Every
+/// other path returns `Ok(())`.
 pub(super) async fn apply_one_preconf<F>(
     fifo: &PreconfTxSet,
     cfg: &PreconfConfig,
@@ -232,25 +208,17 @@ pub(super) async fn apply_one_preconf<F>(
 where
     F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, ApplyError>,
 {
-    // Dedup — short-circuit if we've already made a decision on this
-    // hash in this build. Committed hashes just return silently (the
-    // apply's responder was consumed by `take_responder` earlier);
-    // excluded hashes forward the stored rejection reason to any
-    // newly-attached responder so a same-slot resubmit sees the same
-    // error the first attempt fired, rather than waiting the full
-    // `preconf_timeout` for the RPC-layer deadline to elapse.
+    // Dedup — short-circuit if we've already decided on this hash in this
+    // build. Committed hashes return silently (their responder was consumed by
+    // `take_responder`); excluded hashes forward the stored reason so a
+    // same-slot resubmit sees the first attempt's error instead of waiting out
+    // `preconf_timeout`.
     //
-    // Exception: a prior `Timeout` exclusion is **re-evaluated** rather
-    // than forwarded. The deadline gate below checks
-    // `entry.inserted_at.elapsed()` against `cfg.preconf_timeout`, and
-    // `attach_responder`'s reclaimable-state branch refreshes
-    // `inserted_at` when the client resubmits after a Timeout. So the
-    // deadline that fired for the first submission does NOT apply to
-    // the fresh submission — forwarding the stale Timeout would deny
-    // service to a legitimately re-eligible tx. We drop the stale
-    // exclusion here and let the gate below fire against the refreshed
-    // clock; if the deadline is still exceeded, the gate will re-record
-    // exclusion with the fresh timeout.
+    // A prior `Timeout` is the exception: `attach_responder` refreshes
+    // `inserted_at` on a same-hash resubmit, so the deadline that fired for the
+    // first submission does not bind the second. Forwarding it would deny
+    // service to a legitimately re-eligible tx, so drop the stale exclusion and
+    // let the gate below re-decide against the fresh clock.
     if loop_state.is_committed(&hash) {
         trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; already committed");
         return Ok(());
@@ -290,8 +258,9 @@ where
             PreconfStatus::Timeout => {
                 PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
             }
-            // A broken commitment ends in `Failed` like any other apply
-            // rejection; the `Replay` source is what tells them apart.
+            // A `Replay`-source `Failed` is a commitment we could not honour;
+            // an `Rpc`-source one is a rejection its client is still waiting to
+            // hear about. The source is what tells the two apart.
             PreconfStatus::Failed if entry.source == PreconfSource::Replay => {
                 PreconfError::CommitmentBroken
             }
@@ -421,7 +390,7 @@ where
                 PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
             }
             // See the same split at dispatch entry: a `Replay`-source `Failed`
-            // is a broken commitment, not an RPC rejection.
+            // is a commitment we could not honour, not an RPC rejection.
             PreconfStatus::Failed if re_entry.source == PreconfSource::Replay => {
                 PreconfError::CommitmentBroken
             }
@@ -507,51 +476,33 @@ where
             return Err(e);
         }
         // This entry's receipt has already gone out (`Replay` covers journal
-        // restore, reorg reinject, and stale-in-flight replay; all three imply a
-        // Success receipt was returned). Reaching here means the commitment is
-        // **broken**, and this is the only moment that fact is observable.
+        // restore, reorg reinject, and stale-in-flight replay alike), so
+        // reaching here means the commitment is **broken** — and this is the
+        // only moment that fact is observable.
         //
-        // # Why there is no retry
-        //
-        // Every transient cause has already been filtered out upstream, so a
-        // second attempt would re-run against the same verdict:
-        //
-        // - Block / DA capacity — `preconf_admission` separates "does not fit an empty block"
-        //   (permanent, `Reject`) from "does not fit *this* block" (transient) and returns `Defer`
-        //   for `Replay`, which keeps the entry `Waiting` for the next slot without ever reaching
-        //   apply. Deferring is unbounded; it is not a retry budget.
-        // - Same-sender ordering — the cascade above defers a successor whose predecessor was
-        //   deferred or rejected this slot, again without reaching apply.
-        // - `Fatal` — returned above, because an untrustworthy execution environment says nothing
-        //   about this commitment.
-        //
-        // What is left is `Validation(InvalidTx)` from the EVM on a transaction
-        // that already applied cleanly once: nonce taken by another transaction,
-        // balance since spent. Those do not heal. A missing predecessor does not
-        // either — the pool is in-memory, so a crash loses any plain predecessor
-        // outright, and only preconf transactions are journaled.
-        //
-        // So this is terminal on the first failure, and it is an ordinary
-        // `Failed`: the `(sender, nonce)` is **released** and the tx leaves the
-        // pool. Holding the nonce would protect the commitment from nobody —
-        // only the sender can produce a transaction on it — while wedging the
-        // promisee's own account, with nothing able to clear it.
+        // No retry: every transient cause is already filtered out before apply,
+        // so a second attempt would only re-derive the same verdict. Transient
+        // capacity becomes `Defer` (unbounded, not a retry budget), and a
+        // successor of a blocked predecessor is deferred or canceled — both in
+        // `payload_builder::admit_and_dispatch`, neither reaching apply; `Fatal`
+        // returns above. What is left is permanent: a nonce or balance that
+        // moved since the tx last applied cleanly, an envelope this pipeline
+        // cannot convert, or a predecessor a crash lost for good (the pool is
+        // in-memory; only preconf txs are journaled). So this is terminal on the
+        // first failure, and an ordinary `Failed` releasing the
+        // `(sender, nonce)` — see [`crate::types::PreconfStatus`].
         Err(ApplyError::Rejected(err)) => {
-            // The breach record. There is no channel to tell the client (this
-            // entry's responder was consumed when its receipt went out, and the
-            // node exposes no status query), the slot is released here and the
-            // entry will be swept — so this line and the counter below are the
-            // only trace a broken commitment leaves. Keep both.
+            // This line and the counter below are the only trace a breach
+            // leaves: the responder went with the receipt, and the node exposes
+            // no status query. Keep both.
             error!(
                 target: "mantle::preconf::dispatch",
                 ?hash, ?err,
                 "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
             );
             metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
-            // Recording the exclusion is load-bearing, not cosmetic: `loop_state`
-            // is per-build, and without it a later broadcast event (or the
-            // snapshot re-scan the `Lagged` arm runs) in *this same block* would
-            // try to apply the entry again.
+            // Load-bearing: without it a later broadcast event — or the
+            // `Lagged` arm's snapshot re-scan — would re-apply it in this block.
             loop_state.record_excluded(hash, PreconfError::CommitmentBroken);
             if let Err(e) = fifo.mark_failed(&hash).await {
                 trace!(
@@ -561,9 +512,8 @@ where
                 );
             }
             // Deliberately no `take_responder` / `send(Err)`: a `Replay` entry
-            // normally has no responder. A client that did resubmit the same
-            // hash learns the outcome through `rpc.rs`'s deadline path, which
-            // reads the terminal status.
+            // normally has none, and a client that did resubmit this hash learns
+            // the outcome from `rpc.rs`'s deadline path.
         }
     }
     Ok(())
@@ -625,10 +575,9 @@ mod tests {
         assert_eq!(st.sender_blocked_at(&s, 4), Some(BlockKind::Reject));
     }
 
-    /// Test apply closure that fabricates an always-success receipt
-    /// using `tx.gas_limit()` as the reported `gas_used`. Mirrors the
-    /// semantics of the retired `PromiseApplier`, kept here to exercise
-    /// the dispatch state machine without standing up a real EVM.
+    /// Test apply closure that fabricates an always-success receipt using
+    /// `tx.gas_limit()` as the reported `gas_used`, so the dispatch state
+    /// machine can be exercised without standing up a real EVM.
     fn synthetic_ok(
         tx: Arc<TxEnvelope>,
         hash: TxHash,
@@ -769,18 +718,14 @@ mod tests {
         assert_eq!(entry.status, PreconfStatus::Timeout);
     }
 
-    /// Simulates a same-slot client resubmit after a Timeout:
-    /// 1. First dispatch: deadline gate fires, records `Timeout` excluded.
-    /// 2. Client resubmits: `attach_responder` refreshes `inserted_at`, `push_if_absent` revives
-    ///    fifo entry back to `Waiting`.
-    /// 3. Second dispatch: dedup finds the prior `Timeout` reason but **clears** it (since the
-    ///    deadline gate is tied to the entry's `inserted_at`, which is now fresh) and falls through
-    ///    to re-evaluate the gates. With fresh insertion time well under `preconf_timeout`, the
-    ///    gate does not fire and apply proceeds. The fresh responder observes the receipt.
+    /// Same-slot client resubmit after a Timeout: the deadline gate fires, the
+    /// client resubmits (refreshing `inserted_at`), and the second dispatch
+    /// clears the stale exclusion and applies successfully. Steps are marked in
+    /// the body.
     ///
-    /// Locks the "Timeout is not a stable exclusion" invariant: a
-    /// regression that forwards stored Timeout via `cancel_responder`
-    /// would deny service to a legitimately re-eligible tx.
+    /// Locks the "Timeout is not a stable exclusion" invariant — a regression
+    /// that forwarded the stored Timeout via `cancel_responder` would deny
+    /// service to a legitimately re-eligible tx.
     #[tokio::test]
     async fn dedup_timeout_re_evaluates_gate_on_fresh_inserted_at() {
         use std::time::Instant;
@@ -852,12 +797,8 @@ mod tests {
         assert_eq!(state.committed_len(), 0);
         assert_eq!(state.excluded_len(), 1);
 
-        // Fifo entry transitioned to Failed (not Success).
-        //
-        // Both sources land in `Failed`; the difference is only how it is
-        // reported. An `Rpc` entry's client is handed the error directly (above)
-        // and it is counted as a routine failure. A `Replay` entry has no
-        // responder and is counted as a breach — see
+        // Fifo entry transitioned to Failed (not Success). Both sources land
+        // there; only the reporting differs — see
         // `a_broken_commitment_is_marked_failed_and_releases_its_slot`.
         let entry = fifo.find_by_hash(&hash).await.unwrap();
         assert_eq!(entry.status, PreconfStatus::Failed);
@@ -881,20 +822,9 @@ mod tests {
     }
 
     /// A commitment whose receipt already went out is marked `Failed` on the
-    /// first apply rejection, releasing its `(sender, nonce)`.
-    ///
-    /// There is deliberately no retry: every transient cause is filtered out
-    /// before apply — `preconf_admission` returns `Defer` for a `Replay` entry
-    /// that only fails to fit *this* block, and the same-sender cascade defers a
-    /// successor whose predecessor was held back. What reaches apply is the EVM
-    /// calling the transaction invalid, on a transaction that already applied
-    /// cleanly once: a nonce another transaction has taken, or a balance since
-    /// spent. Neither heals, so retrying would only re-derive the same verdict
-    /// while holding the sender's nonce.
-    ///
-    /// And the nonce must be released: only the sender can produce a transaction
-    /// on it, so pinning it protects the commitment from nobody while wedging
-    /// the very party the promise was made to.
+    /// first apply rejection, releasing its `(sender, nonce)`. See the breach
+    /// arm in `apply_one_preconf` for why there is no retry, and
+    /// [`crate::types::PreconfStatus`] for why the nonce must be released.
     #[tokio::test]
     async fn a_broken_commitment_is_marked_failed_and_releases_its_slot() {
         let fifo = PreconfTxSet::new(8);
@@ -919,16 +849,17 @@ mod tests {
 
     /// A `Fatal` apply error must **not** break the commitment.
     ///
-    /// This pins the arm ordering rather than any one arm. The two error axes
-    /// are independent: the error's *kind* (`Rejected` — this transaction is
-    /// invalid — versus `Fatal` — the execution environment is untrustworthy)
-    /// and the entry's *source* (`Rpc` versus an already-acknowledged replay).
-    /// `Fatal` must return before the breach arm, because a DB / header /
-    /// fatal-precompile error says nothing whatsoever about this transaction;
-    /// treating it as a breach would declare an otherwise-applicable commitment
-    /// broken — and release its nonce — for reasons entirely outside it.
+    /// The two error axes are independent: the error's *kind* (`Rejected` — this
+    /// transaction is invalid — versus `Fatal` — the execution environment is
+    /// untrustworthy) and the entry's *source* (`Rpc` versus an
+    /// already-acknowledged replay). A DB / header / fatal-precompile error says
+    /// nothing about this transaction, so it must leave the commitment live: no
+    /// breach, no nonce released, responder still attached.
     ///
-    /// Move the catch-all above the `Fatal` arm and this goes red.
+    /// This pins the `Fatal` arm's behaviour, not its position — `Rejected` and
+    /// `Fatal` are disjoint patterns, so reordering them changes nothing. The
+    /// ordering that *is* load-bearing is the `is_rpc` guard ahead of the breach
+    /// arm; see there.
     #[tokio::test]
     async fn a_fatal_apply_error_does_not_break_the_commitment() {
         let fifo = PreconfTxSet::new(8);
@@ -957,9 +888,10 @@ mod tests {
         );
     }
 
-    /// A broken commitment is evicted from the pool, like every other terminal
-    /// transition. Leaving it there would let it land later, after the slot was
-    /// already released and possibly taken by a different transaction.
+    /// A broken commitment is evicted from the pool, like every other
+    /// non-on-chain terminal transition (`mark_succeeded` does not evict).
+    /// Leaving it there would let it land later, after the slot was already
+    /// released and possibly taken by a different transaction.
     #[tokio::test]
     async fn a_broken_commitment_is_evicted_from_the_pool() {
         use std::sync::Mutex as StdMutex;

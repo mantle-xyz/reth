@@ -1,14 +1,18 @@
 //! Replacement / resubmission semantics for preconf-eligible txs.
 //!
-//! Three axes, because the first two alone left a real gap (see the third):
+//! Four axes, because the first alone left real gaps:
 //!
 //! 1. {existing fifo state} × {new submission kind} — the 2×2 below.
 //! 2. **{incumbent has a fifo entry} × {incumbent has only a frozen verdict}** —
-//!    `queued_tx_without_fifo_entry_still_owns_its_slot`. The guard keys on the classifier's slot
-//!    index, not on fifo membership, because the fifo entry is created asynchronously.
+//!    `a_landed_commitment_still_owns_its_nonce_with_no_fifo_entry`. The guard keys on the
+//!    classifier's slot index, not on fifo membership, because the fifo entry is created
+//!    asynchronously.
 //! 3. **{sender's eligibility unchanged} × {sender de-allowlisted mid-flight}** —
 //!    `replacement_is_refused_after_sender_leaves_the_allowlist`. The newcomer's *own* verdict must
 //!    not gate the guard, or the two arms end up holding one tx each for the same nonce.
+//! 4. **{replacement passes its own checks} × {replacement is itself rejected}** —
+//!    `rejected_replacement_leaves_the_reclaimable_holder_intact`. Deciding a holder is reclaimable
+//!    must not tear it down before the newcomer has cleared its own gates.
 //!
 //! ---
 //!
@@ -488,8 +492,8 @@ async fn canceled_slot_replaceable_by_different_hash() {
 ///
 /// 1. Whitelist only `(wallet, RECIPIENT_A)`. A "shadow" non-preconf- eligible tx to `RECIPIENT_B`
 ///    is injected at nonce=0 via `inject_tx` (plain `eth_sendRawTransaction`). Pool admits it to
-///    `Pending`, but the preconf listener filters it out (`is_preconf_tx(_, RECIPIENT_B) = false`),
-///    so no fifo entry is created for nonce=0.
+///    `Pending`, but the preconf listener filters it out — a plain submission freezes no eligible
+///    verdict — so no fifo entry is created for nonce=0.
 ///
 /// 2. A preconf tx to `RECIPIENT_A` at nonce=1 is submitted via `send_preconf`. RPC's Step-2
 ///    nonce-gap gate reads `get_highest_consecutive_transaction_by_sender` → returns the pending
@@ -740,12 +744,6 @@ async fn failed_slot_replaceable_by_different_hash() {
 /// **before** the inner validator, so a refusal here says `ReplaceActivePreconf`
 /// rather than nonce-too-low — which is what makes the assertion discriminating
 /// rather than merely true.
-///
-/// This replaces an earlier construction that parked a **nonce-gapped plain
-/// `eth_sendRawTransaction`** in the `Queued` sub-pool, where the listener
-/// (which only observes `Pending`) would never create an entry. That is no
-/// longer constructible: a plain submission is never preconf-eligible now, so it
-/// claims no slot, and the preconf RPC rejects nonce gaps at its own Step 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_landed_commitment_still_owns_its_nonce_with_no_fifo_entry() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -868,9 +866,7 @@ async fn replacement_is_refused_after_sender_leaves_the_allowlist() {
 
     // 2. Governance revokes the rule covering `A`; `a`'s verdict stays frozen `Eligible`. A rule
     //    for a *different* sender is left in place on purpose: refusing `b` must follow from the
-    //    allowlist no longer covering this sender, not from the allowlist being empty. (Under the
-    //    previous cross-product shape the same distinction was drawn by emptying the `from` list
-    //    while leaving `to` populated.)
+    //    allowlist no longer covering this sender, not from the allowlist being empty.
     classifier.update_whitelist(
         [(Address::from([0xA1; 20]), recipient)].into_iter().collect(),
         Default::default(),

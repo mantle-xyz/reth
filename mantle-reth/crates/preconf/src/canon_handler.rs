@@ -11,22 +11,15 @@
 //!   the pool so a preconf tx that already surfaced a not-on-chain wire signal to the client cannot
 //!   silently land on chain later (which would corrupt off-chain reconciliation).
 //!
-//!   **Nonce-frontier `forward()` moved out**: the per-sender fifo
-//!   forward that used to run here now runs synchronously at
-//!   `PayloadJob` start (see
-//!   `builder::payload_builder::sync_fifo_forward_to_head`). Rationale:
-//!   the async fanout of `CanonStateNotification` raced with the next
-//!   FCU — a new `PayloadJob` could observe stale `Success` entries and
-//!   incorrectly replay them via `reset_success_to_waiting`, silently
-//!   double-counting `preconf_gas_used` in the fresh slot. Running the
-//!   forward from the `PayloadJob` prologue guarantees fifo consistency
-//!   with the parent block state before any dispatch decision.
+//!   The per-sender nonce-frontier `forward()` deliberately does **not** run here: it runs at
+//!   `PayloadJob` start (`builder::payload_builder::sync_fifo_forward_to_head`), because the async
+//!   fanout of `CanonStateNotification` races the next FCU — a new job could otherwise observe a
+//!   stale `Success` entry and replay it via `reset_success_to_waiting`.
 //! - **Reverted chain**: `classifier.uncommit` withdraws the "seen on chain" observation for every
 //!   reverted transaction, **keeping the promise record and the `(sender, nonce)` slot** — the
 //!   commitment is live again and must still refuse a same-nonce replacement. Its return value is
-//!   the `reorg_drift` signal (it replaces the old proxies: `journal.contains`, and fifo membership
-//!   when persistence was off). No recovery action is taken here: reorg reinject is delegated to
-//!   the reth pool's own reset flow (`transaction-pool/src/maintain.rs` re-admits pruned txs via
+//!   the `reorg_drift` signal. No recovery action is taken here: reorg reinject is delegated to the
+//!   reth pool's own reset flow (`transaction-pool/src/maintain.rs` re-admits pruned txs via
 //!   `add_external_transactions`), which the preconf pool listener picks up on the next new-pending
 //!   event and pushes into the fifo with `PreconfSource::Replay`. The client-observed
 //!   `block_height` may drift for reorged commitments; op-geth has the same behavior.
@@ -95,12 +88,9 @@ where
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
     ///
-    /// Takes no journal handle. Both of its former uses are gone: sealed hashes
-    /// are now recorded as `mark_committed` on the classifier (which owns the
-    /// retention decision), and the reorg-drift signal comes from `uncommit`'s
-    /// return value instead of `journal.contains`. That also removes the
-    /// behavioural split this handler used to have between persistence being on
-    /// and off.
+    /// Takes no journal handle: `mark_committed` on the classifier owns the
+    /// retention decision, and the reorg-drift signal is `uncommit`'s return
+    /// value.
     pub const fn new(
         provider: Pr,
         pool: P,
@@ -124,27 +114,19 @@ where
 
             // Committed chain — record every promised hash as committed at its
             // block height on the classifier. The owned-clone iter
-            // (`clone_transactions_recovered`) is used because the
-            // borrowed `&Tx` variants would require
-            // `&Tx: alloy_consensus::Transaction`, which is gated by
-            // `Transaction: 'static` and so does not fire for non-static
-            // references. Tx clones for canonical notifications are
-            // low-frequency (block cadence) and small (consensus tx with
-            // no sidecars).
+            // (`clone_transactions_recovered`) is needed because the borrowed
+            // `&Tx` variants require `&Tx: alloy_consensus::Transaction`, gated
+            // by `Transaction: 'static`, which does not fire for non-static
+            // references. The clones are block-cadence and small.
             //
-            // The sender-nonce frontier that used to drive per-sender
-            // `fifo.forward()` here now runs in `PayloadJob` prologue
-            // (`sync_fifo_forward_to_head`) — see module docs.
-            // Publish the ruler before anything reads it this round. This is
+            // Publish the ruler first, before anything reads it this round:
             // `last_block_number()` (**on disk**), deliberately not
-            // `best_block_number()`: the retention period and the journal's
-            // discard gate both mean "durable and buried", and an in-memory
-            // canonical block is lost on a non-graceful exit. See
-            // `classifier::SEAL_DEPTH`.
-            //
-            // A read error is logged and skipped rather than propagated: a stale
-            // watermark only delays releases, while tearing down this task would
-            // stop the fifo cleanup and the sweep as well.
+            // `best_block_number()` — retention means "durable and buried", and
+            // an in-memory canonical block is lost on a non-graceful exit (see
+            // `classifier::SEAL_DEPTH`). A read error is logged and skipped
+            // rather than propagated: a stale watermark only delays releases,
+            // while tearing down this task would stop the fifo cleanup and the
+            // sweep too.
             match self.provider.last_block_number() {
                 Ok(height) => self.classifier.observe_persisted(height),
                 Err(e) => warn!(
@@ -180,31 +162,19 @@ where
                 );
             }
 
-            // Housekeeping: evict `Timeout` / `Canceled` / `Failed`
-            // entries in one pass — all three are "not on chain,
-            // reclaimable" and must NOT linger, or the (sender, nonce)
-            // slot they hold would block future preconf submissions
-            // from the same sender. `sync_fifo_forward_to_head` at
-            // PayloadJob start only drops entries whose nonce trails
-            // the sealed frontier; reclaimable entries whose sender
-            // never posts another nonce would otherwise stay
-            // indefinitely. Running per-notification (~ per sealed
-            // block, so ~2s on OP L2) matches op-geth's cadence without
-            // requiring a separate background task.
+            // Housekeeping, per notification (~ per sealed block, ~2s on OP L2,
+            // matching op-geth's cadence without a separate task): sweep the
+            // reclaimable entries and drop the same hashes from the pool — see
+            // the module docs for why both halves are needed.
+            // `sync_fifo_forward_to_head` does not cover this: it only drops
+            // entries whose nonce trails the sealed frontier, so a reclaimable
+            // entry whose sender never posts another nonce would stay forever.
             //
-            // Pool-side removal mirrors op-geth: after fifo eviction we
-            // `remove_transactions` the same hashes from the pool so a
-            // preconf tx that already surfaced Timeout or Canceled to
-            // the client CANNOT quietly land on chain later. That silent
-            // late-inclusion would break off-chain reconciliation
-            // (client accounts it as "failed", chain shows "success").
-            //
-            // The two calls are not atomic: between fifo eviction and
-            // pool removal a concurrent build_payload could theoretically
-            // pick up an evicted tx from the pool iterator. The window
-            // is µs-scale (both are same-task sequential calls, no await
-            // between them beyond mutex acquisition) and has not been
-            // observed in devnet — a followup tracks it.
+            // The two calls are not atomic: between fifo eviction and pool
+            // removal a concurrent `build_payload` could pick the evicted tx up
+            // from the pool iterator. Accepted — the window is µs-scale
+            // (sequential calls in one task, no await beyond mutex acquisition)
+            // and the tx it could apply is one the fifo had already given up on.
             let evicted = self.fifo.clean_reclaimable().await;
             if !evicted.is_empty() {
                 let pool_removed = self.pool.remove_transactions(evicted.clone());
@@ -229,28 +199,19 @@ where
                 );
             }
 
-            // Verdict-cache sweep. Runs unconditionally (not only when
-            // `evicted` is non-empty): its target is the leak `drop_hash`
-            // cannot reach — a tx classified at admission that then sits in
-            // `Queued`, never emits a `Pending` event and so never gets a fifo
-            // entry at all. Criterion is fifo membership plus a grace period;
-            // see `PreconfClassifier::sweep` for why LRU would be wrong here.
+            // Verdict-cache sweep. Runs unconditionally: its target is the leak
+            // `drop_hash` cannot reach — a tx classified at admission that sits
+            // in `Queued`, never emits a `Pending` event, and so never gets a
+            // fifo entry at all. Criterion is fifo membership plus a grace
+            // period; see `PreconfClassifier::sweep`.
             //
-            // Independent of the responder sweep above: that one bounds the
-            // fifo's `pending_responders`, this one bounds the verdict cache.
-            // Neither subsumes the other.
-            //
-            // **Ordering invariant: this must stay below the `mark_committed`
-            // loop above.** `sweep` retains a record either because it is in
-            // `live`, or because it is young, or because `committed_height` puts
-            // it inside the reorg-retention depth — and nothing in it exempts a
-            // record merely for being `promised`. A commitment whose block just
-            // became canonical has by then usually lost its fifo entry (its
-            // nonce advanced, so `forward` dropped it), so `committed_height` is
-            // the only thing left holding it. `mark_committed` is what sets that
-            // field, and it is set from *this* notification. Hoist the sweep
-            // above that loop and a commitment can be swept in the very
-            // notification that was supposed to record it as on chain.
+            // **Must stay below the `mark_committed` loop above.** Nothing in
+            // `sweep` exempts a record for being `promised`, and a commitment
+            // whose block just became canonical has usually lost its fifo entry
+            // already — so `committed_height` is the only thing holding it, and
+            // `mark_committed` sets that from *this* notification. Hoisted above
+            // the loop, the sweep could drop a commitment in the very
+            // notification meant to record it as on chain.
             let live: alloy_primitives::map::foldhash::HashSet<_> =
                 self.fifo.snapshot().await.into_iter().collect();
             let dropped = self.classifier.sweep(&live);
@@ -270,29 +231,19 @@ where
         // `clone_transactions_recovered` for the same `Transaction: 'static`
         // reason as the committed-side iteration above.
         //
-        // `block_number` records the tip of the reverted chain, not the
-        // per-tx block. When a reorg spans multiple blocks every warn
-        // log tag under this tip — precise enough for reorg-drift
-        // metric aggregation; a per-tx block resolution would require
-        // walking `old.blocks_iter()` with an outer loop over blocks.
+        // `block_number` is the tip of the reverted chain, not the per-tx block:
+        // a multi-block reorg tags every warning with this tip, which is precise
+        // enough for reorg-drift aggregation and avoids an outer loop over
+        // blocks.
         let block_number = old.tip().number();
         for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
             let hash = *recovered.inner().tx_hash();
-            // One call does both jobs, and they are the same job seen twice.
-            //
-            // It withdraws the "seen on chain" observation — the commitment is
-            // live again, so the retention clock that was counting toward
-            // forgetting it must stop. The promise record and, crucially, the
-            // `(sender, nonce)` slot are **kept**: that is what refuses the
-            // same-nonce replacement a reorg invites, and it is why this handler
-            // no longer has to race anything. Nothing else happens here.
-            //
-            // And its return value is exactly the reorg-drift predicate: a
-            // reverted transaction we had recorded as committed is drift; one we
-            // never observed is not. The old proxies — `journal.contains` (an
-            // `.await` on a different lock) and, without persistence, fifo
-            // membership (which undercounts once `forward` has cleaned an entry)
-            // — are both replaced by the thing that actually knows.
+            // One call, two jobs. It withdraws the "seen on chain" observation,
+            // stopping the retention clock, while **keeping** the promise record
+            // and the `(sender, nonce)` slot — that is what refuses the
+            // same-nonce replacement a reorg invites. And its return value is
+            // exactly the reorg-drift predicate: a reverted transaction we had
+            // recorded as committed is drift, one we never observed is not.
             if self.classifier.uncommit(&hash) {
                 warn!(
                     target: "mantle::preconf::canon",
@@ -306,8 +257,3 @@ where
         }
     }
 }
-
-// Note: `aggregate_nonce_frontier` and its unit tests used to live here.
-// The per-sender fifo forward driven by that helper has moved to
-// `builder::payload_builder::sync_fifo_forward_to_head` (see module docs
-// for the rationale — eliminates the canon vs new-PayloadJob race).

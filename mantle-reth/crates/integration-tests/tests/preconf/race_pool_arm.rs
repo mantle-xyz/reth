@@ -12,10 +12,6 @@
 //! sender using plain `eth_sendRawTransaction` is latched `NotEligible` and
 //! lands through the ordinary pool arm.
 //!
-//! (This file previously documented the opposite — that such a transaction
-//! "must land via the preconf pipeline" — from when eligibility was a live
-//! `cfg.is_preconf_tx(sender, to)` lookup, a function that no longer exists.)
-//!
 //! Coverage:
 //!
 //! - `allowlisted_sender_via_plain_sendtx_lands_through_the_pool_arm` — on the allowlist, but
@@ -54,20 +50,12 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
 }
 
-/// A sender on the allowlist that submits the **ordinary** way is not preconf,
-/// and lands through the pool arm.
+/// A sender on the allowlist that submits the **ordinary** way is not preconf, and lands
+/// through the pool arm: the allowlist is a necessary condition, never a sufficient one.
 ///
-/// The allowlist is a necessary condition, never a sufficient one: only
-/// `eth_sendRawTransactionWithPreconf` writes an eligible verdict, and the pool
-/// arm's skip predicate reads that verdict. So this transaction is latched
-/// `NotEligible`, the pool arm does not skip it, and it is applied like any
-/// other pool transaction.
-///
-/// Discriminating in both directions, which is why the scenario is worth
-/// keeping: if a regression made plain submissions eligible again, the pool arm
-/// would skip this tx *and* nothing would have created a fifo entry for it (no
-/// preconf RPC call was made), so it would not land at all and the assertion
-/// below fails. It is not merely asserting "a transaction reaches a block".
+/// Discriminating in both directions — if a regression made plain submissions eligible
+/// again, the pool arm would skip this tx *and* no fifo entry would exist to apply it the
+/// other way, so it would not land at all and the assertion below fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn allowlisted_sender_via_plain_sendtx_lands_through_the_pool_arm() {
     let recipient: Address = RECIPIENT.parse().unwrap();

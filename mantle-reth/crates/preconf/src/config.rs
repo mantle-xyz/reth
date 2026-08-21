@@ -280,11 +280,10 @@ impl PreconfConfig {
         if self.journal_max_size == 0 {
             return Err(PreconfConfigError::InvalidJournalMaxSize);
         }
-        // `enabled` is only meaningful if some eligibility rule can classify a
-        // tx as eligible: either `all_preconfs`, or a whitelist contract to
-        // read the allowlists from. The allowlists themselves are legitimately
-        // empty at this point — they live on the classifier and are populated
-        // from L2 state after the node starts — so nothing here inspects them.
+        // Requires a rule that can classify a tx eligible (see
+        // `MissingWhitelistContract`). The allowlists themselves are legitimately
+        // empty here — they live on the classifier and are populated from L2
+        // state after the node starts — so nothing below inspects them.
         if self.enabled && !self.all_preconfs {
             match self.whitelist_contract {
                 None => return Err(PreconfConfigError::MissingWhitelistContract),
@@ -453,9 +452,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_enabled_without_whitelist_contract() {
-        // enabled=true, all_preconfs=false, but nowhere to read the allowlists
-        // from — every tx would fail eligibility and the subsystem would spawn
-        // background tasks for zero functional effect.
+        // enabled=true, all_preconfs=false, nowhere to read the allowlists from.
         let mut cfg = PreconfConfig::default();
         cfg.enabled = true;
         assert!(matches!(cfg.validate(), Err(PreconfConfigError::MissingWhitelistContract)));

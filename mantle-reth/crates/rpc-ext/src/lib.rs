@@ -49,8 +49,13 @@ use tracing::debug;
 /// block it is **currently building** — before that block is sealed, and long
 /// before it is canonical. So it is a prediction, not a record:
 ///
-/// - **`tx_hash` is binding.** The sequencer has committed to landing *this* transaction; the
-///   `(sender, nonce)` it occupies will not be given to a different transaction.
+/// - **`tx_hash` is binding.** The sequencer has committed to landing *this* transaction, and holds
+///   the `(sender, nonce)` it occupies against any other transaction for as long as the commitment
+///   stands. The one exception is a breach: if the transaction later proves un-appliable (its nonce
+///   was consumed elsewhere, its balance spent), the sequencer releases the nonce so the sender is
+///   not wedged, and logs `COMMITMENT BROKEN` / `preconf.tx.commitment_broken_total`. A client that
+///   re-submits the same hash then gets `CommitmentBroken` — the only channel through which the
+///   breach is reported.
 /// - **Everything else is a prediction of one particular build.** If that in-flight block is
 ///   discarded (a competing block takes the height, the payload job is superseded, the process
 ///   restarts), the sequencer re-applies the transaction to a *later* block — honouring the
@@ -132,10 +137,7 @@ pub struct PreconfTxReceipt {
     /// wire (`invalid type: null, expected a sequence`) *and* would re-serialize an empty result
     /// as `[]`, diverging from geth. `Option<Vec<_>>` deserializes null→None and re-serializes
     /// None→null, so a forwarding reth node returns byte-identical shape to the geth sequencer.
-    ///
-    /// (Internally the preconf handler also uses this: `None` ⇒ no EVM apply happened —
-    /// Timeout / server pre-apply reject — while `Some(vec![])` ⇒ apply happened but emitted
-    /// no logs.)
+    /// The `null` / `[]` distinction is the one described on the type above.
     ///
     /// Like every other field of [`PreconfTxEvent`] except `tx_hash`, these are
     /// the logs of one particular in-flight execution. A cross-block replay

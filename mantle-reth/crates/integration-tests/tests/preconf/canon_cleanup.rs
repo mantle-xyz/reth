@@ -15,6 +15,10 @@
 //! - `canon_across_sequential_slots_forwards_on_every_new_job` — nonce 0/1/2 across three separate
 //!   slots; each canon runs `sync_fifo_forward_to_head` afresh. Guards against a caching bug that
 //!   would skip forward after the first `PayloadJob`.
+//!
+//! Several tests here raise `preconf_timeout_ms` well above the 1.5s default: they assert
+//! *where* a tx is routed after a canon commit, never how fast, so under parallel load the
+//! default deadline is the only thing that fires — as a spurious `Timeout`.
 
 use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::{canonicalize_payload, launch_preconf_node};
@@ -49,9 +53,6 @@ async fn canon_commit_permits_next_nonce_from_same_sender() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    // Generous client deadline: these tests assert *where* a tx is routed after a
-    // canon commit, never how fast. Under parallel load the default 1.5s is the
-    // only thing that fires, as a spurious `Timeout`.
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(wallet_addr)
         .whitelist_to(recipient)
@@ -157,9 +158,6 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    // Generous client deadline: these tests assert *where* a tx is routed after a
-    // canon commit, never how fast. Under parallel load the default 1.5s is the
-    // only thing that fires, as a spurious `Timeout`.
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(wallet_addr)
         .whitelist_to(recipient)
@@ -420,9 +418,6 @@ async fn canon_across_sequential_slots_forwards_on_every_new_job() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    // Generous client deadline: these tests assert *where* a tx is routed after a
-    // canon commit, never how fast. Under parallel load the default 1.5s is the
-    // only thing that fires, as a spurious `Timeout`.
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(wallet_addr)
         .whitelist_to(recipient)

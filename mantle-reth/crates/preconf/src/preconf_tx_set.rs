@@ -15,10 +15,9 @@
 //!
 //! ## Invariants
 //!
-//! - At most one entry per `(sender, nonce)` in an **active** status (`Waiting` / `Success`); such
-//!   an entry blocks a push for a different hash on the same `(sender, nonce)`. A push with the
-//!   same `(sender, nonce)` evicts an existing entry in any **reclaimable** status (`Timeout` /
-//!   `Canceled` / `Failed`) — all three, see [`PreconfTxSet::push_if_absent`].
+//! - At most one entry per `(sender, nonce)` in an **active** status; such an entry blocks a push
+//!   for a different hash on that `(sender, nonce)`, while a **reclaimable** incumbent is evicted
+//!   in its favour. [`crate::types::PreconfStatus`] owns which states are which.
 //! - At most one responder per hash. Either lives inside an existing entry, or in
 //!   `pending_responders` until the matching `push_if_absent` consumes it.
 //! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and reconcile via
@@ -198,24 +197,17 @@ impl PreconfTxSetInner {
         }
         self.pending_responders.remove(hash);
 
-        // The fifo entry is gone, so the frozen verdict for this hash goes
-        // too: the danger the verdict guards against is the pool arm grabbing a
-        // tx that still has a live commitment, and on most removal paths there
-        // no longer is one.
+        // The frozen verdict goes with the entry: it exists to stop the pool arm
+        // grabbing a tx that still has a live commitment, and on most removal
+        // paths there no longer is one.
         //
-        // The exception is `forward`: its predicate is "the sender's nonce
-        // moved past this entry", which does not establish that *this* tx
-        // landed, and even if it did land that is revocable. So on that path
-        // the commitment can still be live when the verdict is dropped — the
-        // a known gap. Do not read this callback as proof that the commitment
-        // is over.
+        // `forward` is a known gap — its predicate is "the sender's nonce moved
+        // past this entry", which neither establishes that *this* tx landed nor
+        // that the landing is irrevocable, so the commitment can still be live
+        // here. Do not read this callback as proof that it is over.
         //
-        // Fired here because `drop_hash` is the single convergence point of
-        // every removal path.
-        //
-        // Runs while the inner mutex is held, so the callback must be cheap,
-        // non-blocking, and must never re-enter the fifo. The registered one
-        // takes a `parking_lot` write lock on the verdict map and returns.
+        // Runs under the inner mutex, so the callback must be cheap,
+        // non-blocking, and must never re-enter the fifo.
         if let Some(f) = self.verdict_evict.get() {
             f(*hash);
         }
@@ -295,16 +287,14 @@ impl PreconfTxSet {
     /// Register the verdict-cache eviction callback fired from `drop_hash`,
     /// i.e. on **every** fifo removal path. Called once by
     /// [`crate::PreconfServiceBuilder::start`] with a closure forwarding to
-    /// `PreconfClassifier::forget`.
+    /// `PreconfClassifier::release_unless_committed`.
     ///
     /// Direction matters: the fifo pushes removals *out* and never holds the
-    /// classifier, while the classifier's periodic sweep is driven from the
-    /// canonical-state handler, which already holds both. Neither type
-    /// references the other.
+    /// classifier. Neither type references the other.
     ///
     /// Idempotent (`OnceLock::set`, first registration wins). Leaving it
-    /// unregistered is valid — removals then simply don't touch the verdict
-    /// cache, which is what test / pass-through paths want.
+    /// unregistered is valid — removals then don't touch the verdict cache,
+    /// which is what test / pass-through paths want.
     pub fn set_verdict_eviction_callback(&self, f: EvictFn) {
         let _ = self.verdict_evict.set(f);
     }
@@ -327,16 +317,14 @@ impl PreconfTxSet {
     ///
     /// Returns:
     /// - [`PushResult::Inserted`] — new entry created and broadcast notified.
-    /// - [`PushResult::AlreadyExists`] — same hash already present and [`PreconfStatus::is_active`]
-    ///   (`Waiting` / `Success`); a no-op.
-    /// - [`PushResult::Revived`] — same hash in a state that is
-    ///   [`PreconfStatus::is_revivable_by_same_hash`] (`Timeout` / `Canceled` / `Failed`), flipped
+    /// - [`PushResult::AlreadyExists`] — same hash already present and
+    ///   [`PreconfStatus::is_active`]; a no-op.
+    /// - [`PushResult::Revived`] — same hash, [`PreconfStatus::is_revivable_by_same_hash`], flipped
     ///   back to `Waiting` and broadcast.
-    /// - [`PushResult::ConflictActive`] — same `(from, nonce)` but a different hash, and the
-    ///   incumbent is not [`PreconfStatus::is_replaceable`]. Carries the incumbent's hash.
+    /// - [`PushResult::ConflictActive`] — same `(from, nonce)`, different hash, incumbent not
+    ///   [`PreconfStatus::is_replaceable`]. Carries the incumbent's hash.
     ///
-    /// When the incumbent IS replaceable (`Timeout` / `Canceled` / `Failed` — currently the same
-    /// set as the revivable one above), it is evicted and the new tx inserted in its place.
+    /// A replaceable incumbent is evicted and the new tx inserted in its place.
     pub async fn push_if_absent(
         &self,
         tx: Arc<TxEnvelope>,
@@ -348,30 +336,17 @@ impl PreconfTxSet {
 
         let mut inner = self.inner.lock().await;
 
-        // Same-hash entry already present — two outcomes depending on
-        // its current status:
-        //
-        // - [`PreconfStatus::is_revivable_by_same_hash`] → revive to `Waiting`. Adopt the fresh
-        //   responder + origin_instant from `pending_responders` (if the RPC handler pre-attached
-        //   one for this resubmit) so dispatch's deadline gate measures against the new submission,
-        //   then broadcast. Closes the "same-hash resubmit after non-Success terminal" loop that
-        //   would otherwise wedge under the pool-eviction callback. `Failed` is included because
-        //   its trigger — reth builder pre-execute reject (in-flight nonce / balance race, block
-        //   gas exhausted at builder level) — is typically a within-slot state race, not an
-        //   intrinsic tx defect; next-slot retry naturally resolves it. An abandoned commitment is
-        //   in this same set: reviving the *same hash* cannot hand its nonce to anyone else, so it
-        //   is safe, and it gives a commitment we owe another chance to land.
-        // - active (`Waiting` / `Success`) → idempotent no-op; callers should treat this as
-        //   "someone else already owns the slot" (the RPC handler surfaces it as
-        //   `AlreadyInProgress`).
+        // Same-hash entry already present: revivable → flip back to `Waiting`
+        // and broadcast, making it a live dispatch candidate again; active →
+        // idempotent no-op, which the RPC handler surfaces as
+        // `AlreadyInProgress`. See [`crate::types::PreconfStatus`] for why
+        // reviving the same hash is always safe.
         if let Some(existing) = inner.entries.get_mut(&hash) {
             if existing.status.is_revivable_by_same_hash() {
-                // `attach_responder`'s reclaimable-state branch already
-                // installed the fresh responder + refreshed
-                // `inserted_at` before this push landed. All we need
-                // here is the status flip + broadcast that turns the
-                // entry back into a live dispatch candidate.
-                //
+                // `attach_responder`'s reclaimable-state branch already installed
+                // the fresh responder and refreshed `inserted_at`, so dispatch's
+                // deadline gate measures against this resubmit; only the status
+                // flip is left.
                 existing.status = PreconfStatus::Waiting;
                 drop(inner);
                 let _ = self.notifier.send(hash);
@@ -380,18 +355,11 @@ impl PreconfTxSet {
             return PushResult::AlreadyExists;
         }
 
-        // Replacement check: same `(sender, nonce)` but a different hash.
-        // Only [`PreconfStatus::is_replaceable`] states release the slot —
-        // `Timeout` (client deadline), `Canceled` (block-gas-budget pre-apply reject), and
-        // `Failed` (reth builder pre-execute reject; tx not on chain, same
-        // "safe to replace" property as the other two).
-        //
-        // `Waiting` / `Success` block replacement (`Success` is either on chain
-        // or in-flight, replacement would double-apply). An abandoned commitment
-        // does **not** block it: once we have stopped retrying, holding the
-        // `(sender, nonce)` protects the commitment from nobody — only the
-        // sender can use that nonce — while wedging the very party the promise
-        // was made to. See `builder::dispatch::apply_one_preconf`.
+        // Replacement check: same `(sender, nonce)`, different hash. Only
+        // [`PreconfStatus::is_replaceable`] states release the slot; `Waiting` /
+        // `Success` block it, since `Success` is on chain or in-flight and
+        // replacing it would double-apply. An abandoned commitment does not
+        // block it — see [`crate::types::PreconfStatus`].
         if let Some(existing_hash) = inner.by_sender.get(&(from, nonce)).copied() {
             let existing_status = inner.entries.get(&existing_hash).map(|e| e.status);
             match existing_status {
@@ -559,19 +527,12 @@ impl PreconfTxSet {
         }
     }
 
-    /// Evicts every entry in a [`PreconfStatus::is_replaceable`] state —
-    /// `Timeout` (client deadline elapsed), `Canceled` (block-gas-budget
-    /// pre-apply reject), and `Failed` (reth builder
-    /// pre-execute reject; tx not on chain). Broader than op-geth's
-    /// `FIFOTxSet::CleanTimeout` which only clears the timeout case;
-    /// the split into three states in this fifo means all must be swept
-    /// together to avoid stale entries pinning the (sender, nonce) slot
-    /// forever. Returns evicted hashes.
-    ///
-    /// An abandoned commitment is swept like the rest — it ends in `Failed`.
-    /// Keeping its `(sender, nonce)` would protect the commitment from nobody
-    /// (only the sender can use that nonce) while wedging the promisee's account
-    /// without bound, since nothing else would ever clear such an entry.
+    /// Evicts every entry in a [`PreconfStatus::is_replaceable`] state, returning
+    /// the evicted hashes. Broader than op-geth's `FIFOTxSet::CleanTimeout`,
+    /// which only clears the timeout case: this fifo splits "not on chain" into
+    /// three states and all must be swept, or a stale entry pins its
+    /// `(sender, nonce)` forever. An abandoned commitment is swept like the rest
+    /// — see [`crate::types::PreconfStatus`].
     pub async fn clean_reclaimable(&self) -> Vec<TxHash> {
         let mut inner = self.inner.lock().await;
         let to_drop: Vec<TxHash> = inner
@@ -626,8 +587,9 @@ impl PreconfTxSet {
 
     /// `Waiting → Success`. Called by the builder after a successful EVM apply.
     ///
-    /// Terminal for the build that set it — no `mark_*` moves it again, and only
-    /// `forward` or `remove` drops the entry. The one way out is
+    /// Terminal for the build that set it — no `mark_*` moves it again, and
+    /// [`Self::forward`] is the only path that drops it (a `Success` entry is
+    /// neither replaceable nor reclaimable). The one way out is
     /// [`Self::reset_success_to_waiting`], which the *next* payload job's
     /// carryover preamble uses on a `Success` entry that outlived the block it
     /// was applied to (`replay_fifo_carryover` in `payload_builder`): the client
@@ -643,44 +605,32 @@ impl PreconfTxSet {
         Ok(())
     }
 
-    /// `Waiting → Failed`. **Soft terminal** — like `Timeout` /
-    /// `Canceled`, a `Failed` entry is **revivable** via same-hash
-    /// resubmit (`push_if_absent`'s Timeout/Canceled/Failed → Waiting
-    /// branch). Called by builder when `apply_fn` returned Err
-    /// (in-flight nonce / balance race, block gas exhausted at builder
-    /// level). The tx is not on chain as of this transition — see
-    /// [`crate::types::PreconfStatus`] for how far that reaches.
+    /// `Waiting → Failed`. **Soft terminal** — revivable via same-hash resubmit,
+    /// and its `(sender, nonce)` is released; see
+    /// [`crate::types::PreconfStatus`], which also covers how far "not on chain"
+    /// reaches. Called by the builder when `apply_fn` returned Err (in-flight
+    /// nonce / balance race, block gas exhausted at builder level). Reclaimable
+    /// because all three causes are typically transient, and SDKs retry them
+    /// alike.
     ///
-    /// Dispatch reaches this from **both** sources, and the difference is only
-    /// in how loudly it is reported: an `Rpc` entry is a routine rejection the
-    /// waiting client is handed directly, while a `Replay` entry means an
-    /// already-published commitment cannot be kept — a breach, logged `error!`
-    /// and counted. Both release the `(sender, nonce)`: once the apply has been
-    /// rejected there is nothing left to protect by holding it, and only the
-    /// sender could ever use that nonce anyway.
+    /// Both sources land here; only the reporting differs — a `Replay` entry is a
+    /// breach, logged `error!` and counted by dispatch's breach arm.
     ///
-    /// Reclaim rationale: all three "not on chain" causes are typically
-    /// transient (deadline overreach, block gas budget resets next slot, or
-    /// in-flight state race that clears when the next slot's fresh
-    /// block state comes in). SDKs retry all three the same way.
-    ///
-    /// On success, invokes the pool-eviction callback (if registered)
-    /// to synchronously remove `hash` from the transaction pool. This
-    /// closes the SLA window where the client saw `Failed` but the tx
-    /// could still land later via the pool best-tx iterator.
+    /// On success, invokes the pool-eviction callback (if registered) to
+    /// synchronously remove `hash` from the transaction pool, closing the SLA
+    /// window where the client saw `Failed` but the tx could still land later
+    /// via the pool best-tx iterator.
     pub async fn mark_failed(&self, hash: &TxHash) -> Result<(), MarkError> {
         self.transition_from_waiting(hash, PreconfStatus::Failed).await?;
         self.evict_from_pool(*hash);
         Ok(())
     }
 
-    /// `Waiting → Timeout`. **Soft terminal** — a `Timeout` entry is
-    /// **revivable**: a same-hash retry from the client re-runs through
-    /// `attach_responder` (which refreshes the responder + `inserted_at`)
-    /// and the subsequent listener push through [`Self::push_if_absent`]
-    /// flips the entry back to `Waiting`. Called by the RPC handler when
-    /// the client-side `preconf_timeout` fires before a receipt is
-    /// delivered, or by dispatch's pre-apply deadline gate.
+    /// `Waiting → Timeout`. **Soft terminal**, revivable by a same-hash retry
+    /// (`attach_responder` refreshes `inserted_at`, then
+    /// [`Self::push_if_absent`] flips the entry back to `Waiting`). Called by
+    /// the RPC handler when the client-side `preconf_timeout` fires before a
+    /// receipt is delivered, or by dispatch's pre-apply deadline gate.
     ///
     /// Same pool-eviction hook as `mark_failed` / `mark_canceled`.
     pub async fn mark_timeout(&self, hash: &TxHash) -> Result<(), MarkError> {
@@ -756,18 +706,14 @@ impl PreconfTxSet {
         entry.source = PreconfSource::Replay;
         drop(inner);
 
-        // One replay round for a commitment whose block never became canonical.
-        //
-        // This is the only signal that path emits. Nothing else counts it: a
-        // commitment that applies cleanly every round never fails, so it can
-        // loop indefinitely without ever bumping
-        // `preconf.tx.commitment_broken_total`. Worse, each round bumps
-        // `preconf.tx.success_total`, so a stuck commitment reads as throughput.
-        //
-        // Steady state is ~0: a canonical block advances the sender's nonce and
-        // `forward` drops the entry before any replay is needed. A rising rate
-        // means blocks are being built and not adopted — pair it with
-        // `preconf.build.watchdog_cancel_total` to confirm a CL stall.
+        // The only signal this path emits, and it has to exist: a commitment that
+        // applies cleanly every round never fails, so it can loop indefinitely
+        // without touching `preconf.tx.commitment_broken_total` while each round
+        // bumps `preconf.tx.success_total` — a stuck commitment reading as
+        // throughput. Steady state is ~0 (a canonical block advances the nonce
+        // and `forward` drops the entry first); a rising rate means blocks are
+        // built and not adopted, so pair it with
+        // `preconf.build.watchdog_cancel_total`.
         metrics::counter!("preconf.tx.replay_round_total").increment(1);
 
         let _ = self.notifier.send(*hash);
@@ -820,24 +766,14 @@ impl PreconfTxSet {
                     entry.responder = Some(responder);
                     return Ok(());
                 }
-                // Same-hash retry after a `Timeout` (client deadline),
-                // `Canceled` (block-gas-budget pre-apply reject) or `Failed`
-                // (reth builder pre-execute reject, or a replay budget
-                // exhausted — the retry is a fresh chance to honor a
-                // commitment we still owe). Install the fresh responder and
-                // refresh `inserted_at` so `builder::dispatch`'s
-                // deadline gate measures against the second submission
-                // rather than the (already-expired) first. The
-                // subsequent `push_if_absent` from the pool listener
-                // flips the entry back to `Waiting` and broadcasts.
+                // Same-hash retry after a reclaimable terminal state. Install the
+                // fresh responder and refresh `inserted_at` so
+                // `builder::dispatch`'s deadline gate measures against this
+                // submission rather than the already-expired first; the
+                // subsequent `push_if_absent` flips the entry back to `Waiting`.
                 //
-                // Variants are listed explicitly rather than via
-                // [`PreconfStatus::is_revivable_by_same_hash`] because this is an
-                // exhaustive match: spelling them out is what makes the compiler
-                // demand a decision here when a variant is added, which is the
-                // property we want. (The predicate earns its keep at the
-                // `matches!` sites, where no such check exists.) Keep the two in
-                // sync — this arm must equal that predicate's set.
+                // Must stay in sync with
+                // [`PreconfStatus::is_revivable_by_same_hash`].
                 PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed => {
                     entry.responder = Some(responder);
                     entry.inserted_at = origin_instant;
@@ -1379,9 +1315,9 @@ mod tests {
 
     // ===== A broken commitment: terminal, and its slot released
 
-    /// Drive a `Replay` entry to the broken state through the public API. A
-    /// broken commitment lands in `Failed`; its `Replay` source is what
-    /// distinguishes it from an RPC-side rejection.
+    /// Drive a `Replay` entry to a breach through the public API: it lands in
+    /// `Failed`, and its `Replay` source is what distinguishes it from an
+    /// RPC-side rejection.
     async fn broken_commitment(set: &PreconfTxSet, nonce: u64, hash_byte: u8, sender: Address) {
         let tx = make_tx(nonce, hash_byte);
         set.push_if_absent(tx.clone(), sender, PreconfSource::Replay).await;
@@ -1392,10 +1328,8 @@ mod tests {
         assert!(e.status.is_replaceable(), "and the nonce is released");
     }
 
-    /// A broken commitment is swept like any other reclaimable entry, and its
-    /// `(sender, nonce)` is released. Pinning it would protect the commitment
-    /// from nobody (only the sender can use that nonce) while wedging the
-    /// promisee's account with nothing left to clear it.
+    /// A commitment we could not honour is swept by `clean_reclaimable`, and its
+    /// `(sender, nonce)` is released — see [`crate::types::PreconfStatus`].
     #[tokio::test]
     async fn clean_reclaimable_sweeps_broken_commitments() {
         let set = PreconfTxSet::new(16);
@@ -1417,11 +1351,11 @@ mod tests {
         );
     }
 
-    /// A **different** hash may take a broken commitment's nonce. This is the
-    /// whole point of releasing the slot: the sender — the party the promise was
-    /// made to — can move on. Pinning it would leave the account with no way out
-    /// but resubmitting the very transaction the EVM had just rejected, and
-    /// nothing would ever clear the entry.
+    /// A **different** hash may take the nonce of a commitment we could not
+    /// honour. That is the whole point of releasing the slot: the sender — the
+    /// party the promise was made to — can move on, rather than being left with
+    /// no way out but resubmitting the very transaction the EVM had just
+    /// rejected.
     #[tokio::test]
     async fn a_different_hash_may_replace_a_broken_commitment() {
         let set = PreconfTxSet::new(16);
@@ -2513,11 +2447,10 @@ mod proptest_responder_model {
             PreconfStatus::Failed => set.mark_failed(&h(b)).await,
             PreconfStatus::Timeout => set.mark_timeout(&h(b)).await,
             PreconfStatus::Canceled => set.mark_canceled(&h(b)).await,
-            // Neither is a `mark_*` target, and `op()` never proposes one:
-            // `Waiting` is entered only by `push_if_absent` (fresh or revived),
-            // `Broken` only by `record_apply_failure` exhausting the replay
-            // budget. Spelled out rather than caught by a wildcard so that
-            // adding a status forces this decision again.
+            // Not a `mark_*` target, and `op()` never proposes it: `Waiting` is
+            // entered only by `push_if_absent`, fresh or revived. Spelled out
+            // rather than caught by a wildcard so that adding a status forces
+            // this decision again.
             PreconfStatus::Waiting => unreachable!(),
         };
         let st = &mut model[b as usize];

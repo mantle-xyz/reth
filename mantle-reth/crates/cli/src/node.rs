@@ -95,9 +95,9 @@ pub struct MantlePoolBuilder<T = OpPooledTransaction> {
 pub struct PreconfWiring {
     /// Runtime preconf configuration; cloned into the validator.
     pub cfg: Arc<PreconfConfig>,
-    /// Owns the allowlists; the single decider of preconf eligibility.
-    /// Shared with the RPC handler and the payload builder — a second
-    /// instance would let two components disagree about the same tx.
+    /// Owns the allowlists; the single decider of preconf eligibility. Shared
+    /// with the RPC handler and the payload builder — see `PreconfServiceBuilder`
+    /// for why there is exactly one instance.
     pub classifier: Arc<PreconfClassifier>,
     /// Commitment fifo shared between validator, RPC handler, and builder.
     pub fifo: Arc<PreconfTxSet>,
@@ -179,10 +179,8 @@ where
         // up preconf (`with_preconf` not invoked), supply default-disabled
         // handles so the `PreconfAwareValidator` layer becomes a cheap
         // pass-through (empty fifo + disabled cfg).
-        // The journal handle is deliberately not pulled out here: nothing in
-        // this scope needs it any more. The pool listener asks the classifier
-        // (`is_promised`) instead of the journal's sealed set, and rotation
-        // reaches the journal through `svc.journal()` below.
+        // No journal handle is pulled out here: nothing in this scope needs one —
+        // rotation reaches it through `svc.journal()` below.
         let (preconf_cfg, preconf_classifier, preconf_fifo, preconf_svc) =
             match self.preconf.clone() {
                 Some(p) => (p.cfg, p.classifier, p.fifo, p.svc),
@@ -245,30 +243,22 @@ where
         // Load the on-chain allowlists BEFORE anything can classify a
         // transaction, and start tracking updates.
         //
-        // This has to happen here rather than in the binary's
-        // `on_node_started` hook, which runs *after* the RPC server, the
-        // payload builder and the consensus engine are up. With eligibility
-        // decided per-lookup that ordering was merely a short fail-closed
-        // window that healed itself; now that a verdict is frozen at admission,
-        // anything admitted inside the window would be frozen `NotEligible`
-        // against empty allowlists and stay that way for the rest of the tx's
-        // life. Cold-starting here closes the window entirely — the pool
-        // listener (below), the RPC server and the builder all come up later.
+        // Ordering is load-bearing twice over. This cannot live in the binary's
+        // `on_node_started` hook, which runs only once the RPC server, payload
+        // builder and consensus engine are up: a verdict is frozen at admission,
+        // so anything admitted against empty allowlists would stay `NotEligible`
+        // for the rest of that tx's life. It must also precede journal restore,
+        // which pushes promised envelopes through the validator.
         //
-        // It also has to precede journal restore: restore pushes promised
-        // envelopes through the validator, which classifies them.
+        // Fatal on a code-less address — `build_pool` returns `eyre::Result`, so
+        // the launch aborts. An *empty* allowlist is not an error; it is a
+        // legitimate governance state (see the whitelist module's "whose decision
+        // is it").
         //
-        // Fatal on a code-less address, exactly as before: `build_pool` returns
-        // `eyre::Result`, so the launch aborts. An *empty* allowlist is not an
-        // error — it is a legitimate governance state (see the whitelist
-        // module's "whose decision is it").
-        //
-        // Gated on `enabled` for the same reason the pool listener below is:
-        // preconf is a sequencer-only mechanism, and a node that did not opt in
-        // must not run any of its machinery. Both entry points also gate
-        // themselves (`wants_whitelist`), which is what covers `--preconf.all`;
-        // the check here additionally keeps a verifier from spawning a critical
-        // task that would only return immediately.
+        // Gated on `enabled` because preconf is sequencer-only. Both entry points
+        // also self-gate via `wants_whitelist` (which is what covers
+        // `--preconf.all`); the check here keeps a verifier from spawning a
+        // critical task that would only return immediately.
         if preconf_cfg.enabled {
             bootstrap_whitelist(ctx.provider(), &preconf_cfg, &preconf_classifier)
                 .map_err(|e| eyre::eyre!("preconf whitelist bootstrap: {e}"))?;
@@ -308,16 +298,13 @@ where
             &final_pool_config,
         )?;
 
-        // Spawn the pool listener only when preconf is actually enabled —
-        // when `with_preconf` was not called, `preconf_cfg.enabled` is
-        // false and the listener would just sit idle filtering every tx
-        // against empty whitelists. Skipping the spawn saves a task.
+        // Spawn the pool listener only when preconf is actually enabled — when
+        // `with_preconf` was not called, `preconf_cfg.enabled` is false and the
+        // listener would sit idle skipping every tx for want of a verdict.
+        // Skipping the spawn saves a task.
         if preconf_cfg.enabled {
-            // No journal handle is threaded in: reorg-reinject detection asks
-            // the classifier (`is_promised`) rather than the journal's sealed
-            // set. The journal stays mandatory and owned by `svc`; the listener
-            // simply has no need of it, and asking the classifier keeps a hot
-            // path off the journal's async lock.
+            // No journal handle: the listener asks the classifier instead — see
+            // `PreconfPoolListener::run`.
             let listener = PreconfPoolListener::new(
                 transaction_pool.clone(),
                 preconf_cfg.clone(),
@@ -453,14 +440,11 @@ impl MantleNode {
         let (cfg, classifier, fifo) = if let Some(p) = &self.preconf {
             (p.cfg().clone(), p.classifier().clone(), p.fifo().clone())
         } else {
-            // Disabled path: default-empty cfg / classifier / fifo (no
-            // allowlists, no events).
-            //
-            // Built by hand rather than through a `PreconfServiceBuilder`,
-            // which must **not** be constructed here: it requires a resolved
-            // `journal_path` and opens the journal file, and the default config
-            // deliberately leaves that path unresolved. Same shape as the
-            // disabled path in `build_pool` above.
+            // Disabled path: default-empty cfg / classifier / fifo (no allowlists,
+            // no events). Built by hand rather than via `PreconfServiceBuilder`,
+            // which would open the journal file and needs a resolved
+            // `journal_path` the default config deliberately leaves unset. Same
+            // shape as the disabled path in `build_pool` above.
             let cfg = PreconfConfig::default();
             let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
             let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
@@ -553,8 +537,7 @@ where
                     // Journal is mandatory (stage2), so no `Option` dance here.
                     let journal = svc.journal().clone();
                     // Rotation asks the classifier which commitments are still
-                    // tracked — it owns that answer now, the journal no longer
-                    // keeps its own sealed set.
+                    // tracked — it owns that answer.
                     let rotate_classifier = svc.classifier().clone();
                     let interval = svc.cfg().rejournal_interval;
                     ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(

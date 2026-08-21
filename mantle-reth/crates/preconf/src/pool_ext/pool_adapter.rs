@@ -120,28 +120,24 @@ where
             RestoreSkip::Rejected("non-preconf-eligible variant (Deposit / PostExec)".to_string())
         })?;
 
-        // Attempt to admit. `AlreadyImported` is treated as benign: the
-        // restore path needs the recovered envelope either way, and
-        // whether the pool already held the tx is orthogonal. (It cannot
-        // be reth's own local-tx backup loader that put it there —
-        // `cli::node` runs restore before `spawn_maintenance_tasks`
-        // spawns that loader — so this arm is defensive rather than
-        // expected.)
+        // Attempt to admit. `AlreadyImported` is benign: the restore path needs
+        // the recovered envelope either way. It is defensive rather than expected
+        // — `cli::node` runs restore before `spawn_maintenance_tasks` spawns
+        // reth's local-tx backup loader, so that loader cannot be what put the
+        // tx there.
         let pool_tx = <Tx as PoolTransaction>::from_pooled(recovered);
         match self.pool.add_transaction(TransactionOrigin::External, pool_tx).await {
             Ok(_) => {}
             Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
-            // The sender's nonce has moved past this transaction. That is
-            // **not** the same as "this transaction is on chain", which is what
-            // this arm used to conclude: `is_nonce_too_low` reduces to
-            // `NonceNotConsistent { tx, state } => tx < state`, and the check
-            // that produces it (`validate_sender_nonce`) compares the tx's nonce
-            // against the *account's* nonce and never looks at the hash. A
-            // different transaction on the same nonce yields a byte-identical
-            // error.
-            //
-            // So don't conclude — ask the chain. The caller does that; all this
-            // arm can honestly report is that the nonce is gone.
+            // The sender's nonce has moved past this transaction — which is
+            // **not** the same as "this transaction is on chain".
+            // `is_nonce_too_low` reduces to
+            // `NonceNotConsistent { tx, state } => tx < state`, and
+            // `validate_sender_nonce` compares the tx's nonce against the
+            // *account's* nonce, never the hash: a different transaction on the
+            // same nonce yields a byte-identical error. So don't conclude — the
+            // caller asks the chain; all this arm can report is that the nonce is
+            // gone.
             Err(e) if matches!(&e.kind, PoolErrorKind::InvalidTransaction(err) if err.is_nonce_too_low()) =>
             {
                 return Err(RestoreSkip::NonceConsumed(format!("{}", e.kind)));
@@ -163,14 +159,14 @@ type _ArcHint<P, Tx, Cons> = Arc<RestorePoolAdapter<P, Tx, Cons>>;
 /// Lets a node provider answer the restore path's chain question — whether a
 /// commitment whose nonce is gone is the transaction that consumed it.
 ///
-/// A wrapper rather than a blanket `impl<P: TransactionsProvider + ..>`: a
-/// blanket impl would forbid every other implementation of
-/// [`CommitmentChainView`], including the scripted stubs the restore tests need
-/// (Rust coherence cannot prove a local type does *not* implement the bounds).
+/// A wrapper rather than a blanket impl, which would forbid the scripted stubs
+/// the restore tests need (coherence cannot prove a local type does *not*
+/// implement the bounds).
 ///
 /// Both halves are plain provider reads and every node provider has them —
 /// `FullProvider` requires `BlockReaderIdExt` (⊃ `BlockReader` ⊃
-/// `TransactionsProvider`) and `PruneCheckpointReader`.
+/// `TransactionsProvider`) on the handle itself, and `PruneCheckpointReader` on
+/// its `DatabaseProviderFactory::Provider`; see the where-clause below.
 #[derive(Debug, Clone)]
 pub struct ProviderChainView<P>(P);
 
@@ -183,14 +179,9 @@ impl<P> ProviderChainView<P> {
 
 impl<P> CommitmentChainView for ProviderChainView<P>
 where
-    // Exactly what `FullProvider` already
-    // guarantees, so callers need no extra
-    // where-clause. In particular
-    // `PruneCheckpointReader` sits on the
-    // *database* provider, not on the outer
-    // handle — `BlockchainProvider` happens to
-    // implement it directly, but a generic
-    // `N::Provider` cannot rely on that.
+    // Exactly what `FullProvider` guarantees, so
+    // callers need no extra where-clause of
+    // their own. See the type docs.
     P: TransactionsProvider
         + DatabaseProviderFactory<Provider: PruneCheckpointReader>
         + Send

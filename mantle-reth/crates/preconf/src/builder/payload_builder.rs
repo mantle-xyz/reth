@@ -68,30 +68,21 @@ use crate::{
 /// the whitelist updates any of them carried.
 ///
 /// **Replicated from `OpPayloadBuilderCtx::execute_sequencer_transactions`**
-/// (`op-reth/crates/payload/src/builder.rs:724-765` as of this fork). The
-/// execution half is a line-for-line copy; the only change is
-/// `execute_transaction` → `execute_transaction_with_result_closure`, so the
+/// (`op-reth/crates/payload/src/builder.rs:724-765` as of this fork), with
+/// `execute_transaction` → `execute_transaction_with_result_closure` so the
 /// per-transaction `ExecutionResult` becomes visible. Upstream changes to that
-/// function will **not** reach this copy — that is the cost of the seam, and it
-/// is taken deliberately because the alternative sources of the same
-/// information are worse (see below).
+/// function will **not** reach this copy.
 ///
-/// # Why the execution result is needed
-///
-/// A governance whitelist update arrives as a deposit whose calldata targets the
-/// cross-domain messenger, with the real `updatePreconfs` buried inside (see
-/// [`crate::whitelist`]). To let it bind the *current* block's preconf
-/// transactions, the update has to be recognised here — after Stage 2 has run
-/// it, before Stage 3 dispatches anything.
-///
-/// Recognising it from calldata alone would be wrong twice over: the deposit
-/// succeeds as a transaction even when the inner message reverts (the messenger
-/// records failed messages rather than propagating them), and calldata says
-/// nothing about the contract's own `onlyL1Gov` check. The emitted
-/// [`WHITELIST_UPDATED_TOPIC0`] answers both — the contract only reaches the
-/// `emit` after authorisation passed and every rule applied. So the log decides
-/// *whether* an update happened, and the calldata is decoded only afterwards, to
-/// learn *what* it was.
+/// The result is needed because a governance whitelist update arrives as a
+/// deposit whose calldata targets the cross-domain messenger, with the real
+/// `updatePreconfs` buried inside (see [`crate::whitelist`]), and it has to be
+/// recognised here to bind *this* block's preconf transactions. Calldata alone
+/// would be wrong twice over: the deposit succeeds even when the inner message
+/// reverts (the messenger records failed messages rather than propagating them),
+/// and calldata says nothing about the contract's `onlyL1Gov` check. The emitted
+/// [`WHITELIST_UPDATED_TOPIC0`] answers both, since the contract only reaches
+/// the `emit` after authorisation passed and every rule applied — so the log
+/// decides *whether*, and the calldata is decoded afterwards to learn *what*.
 ///
 /// Returns the deltas in block order; applying them out of order would let an
 /// add-then-remove of the same rule resolve backwards.
@@ -510,27 +501,23 @@ where
 /// preconf path.
 ///
 /// Asked of **every** entry, against the allowlist pinned when this block's
-/// build began plus whatever governance update the block itself carried. The
-/// frozen verdict cannot answer this: it records which RPC the transaction
-/// arrived on — a fact that no longer exists below the RPC boundary — and says
-/// nothing about whether policy still authorizes it. Policy may have moved at
-/// any point between admission and build, not only inside this block.
+/// build began plus whatever governance update the block itself carried —
+/// policy may have moved at any point between admission and build, not only
+/// inside this block. The frozen verdict cannot answer it: that records
+/// eligibility as of admission, not whether policy still authorizes the tx.
 ///
-/// `all_preconfs` short-circuits ahead of the lists, in the same order
-/// `PreconfClassifier::evaluate_whitelist` uses, and the order is load-bearing:
-/// that mode never reads the contract (`whitelist::wants_whitelist` returns
-/// `None`), so all three sets stay empty and consulting them would reject every
-/// transaction on the node.
+/// `all_preconfs` must be checked **ahead of** the lists: that mode never reads
+/// the contract (`whitelist::wants_whitelist` returns `None`), so all three sets
+/// stay empty and consulting them would bar every transaction on the node.
 ///
-/// Only revocations can bind a block. The asymmetry is structural rather than an
-/// omission: a newly-authorized sender's transaction was refused at the RPC door
-/// and never entered the fifo, so there is nothing here for the new policy to
-/// admit. It becomes eligible on its next submission.
+/// Only revocations can bind a block, structurally rather than by omission: a
+/// newly-authorized sender's transaction was refused at the RPC door and never
+/// entered the fifo, so there is nothing here for the new policy to admit.
 ///
-/// [`PreconfSource::Replay`] is exempt because its receipt has already gone out
-/// — the fifo's own encoding of that fact, and the same predicate `rpc.rs`'s
-/// deadline branch uses to refuse to time such an entry out. A commitment
-/// already acknowledged to a client is owed whatever governance later decides.
+/// [`PreconfSource::Replay`] is exempt — its receipt has already gone out, and a
+/// commitment already acknowledged to a client is owed whatever governance later
+/// decides. Same predicate `rpc.rs`'s deadline branch uses to refuse to time
+/// such an entry out.
 fn barred_by_allowlist(
     cfg: &PreconfConfig,
     whitelist: &Whitelist,
@@ -548,16 +535,9 @@ fn barred_by_allowlist(
 /// admission policy is applied uniformly and `apply_one_preconf` stays purely
 /// "execute an admitted tx + record result".
 ///
-/// Decision:
-/// - **[`barred_by_allowlist`]**: policy no longer authorizes this sender → `mark_canceled` +
-///   responder error, before anything is charged against the block.
-/// - **same-sender cascade** (Replay only): if a lower-nonce entry from this sender was already
-///   deferred / rejected this slot, inherit that outcome (a successor cannot land before its
-///   predecessor). Prevents a deferred tx1's successor tx2 from being admitted and then
-///   nonce-too-high failing.
-/// - **[`preconf_admission`]**: `Admit` → dispatch; `Defer` (Replay, transient capacity) → keep
-///   `Waiting`, record the sender block, retry next slot; `Reject` (permanent, or RPC transient) →
-///   `mark_canceled` (server pre-apply rejection, not `mark_failed`) + responder error.
+/// Three gates in order — [`barred_by_allowlist`], the same-sender cascade
+/// (Replay only), then [`preconf_admission`]. Each is documented on its own
+/// branch in the body.
 ///
 /// The `info` cumulative reads happen *before* the `&mut info` apply closure
 /// is constructed (the values are `u64` copies), so there is no borrow clash.
@@ -733,11 +713,10 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
                     carryover_hashes.push(view.hash);
                 }
             }
-            // Terminal for carryover purposes. An abandoned commitment is
-            // `Failed` too — dispatch has already exhausted
-            // `preconf_max_apply_attempts` on it, so retrying it every
-            // subsequent job would spin forever. Only a same-hash resubmit
-            // revives any of these (`push_if_absent`).
+            // Terminal for carryover purposes: dispatch gave up on these after
+            // the apply was rejected, so retrying them every subsequent job
+            // would spin forever. Only a same-hash resubmit revives any of them
+            // (`push_if_absent`).
             PreconfStatus::Failed | PreconfStatus::Timeout | PreconfStatus::Canceled => {}
         }
     }
@@ -874,37 +853,26 @@ where
     let Some(tx) = best_txs.next(()) else {
         return Ok(BestTxStep::Done);
     };
-    // Preconf-eligible txs are applied EXCLUSIVELY via the preconf arm.
-    // Without this filter, the pool arm could grab a preconf-eligible tx
-    // that was just admitted to the pool but whose fifo entry hasn't
-    // been pushed yet by the async pool listener — the tx would land on
-    // chain via the pool path while the client sees a Timeout/Failed
-    // response (responder never called).
+    // Preconf-eligible txs are applied EXCLUSIVELY via the preconf arm. Without
+    // this filter the pool arm could grab one whose fifo entry the async
+    // listener has not pushed yet: the tx lands via the pool path while its
+    // client sees Timeout/Failed, responder never called.
     //
-    // Skipping here does not drop the tx — it merely constrains it to the
-    // preconf ordering. That rests on "the listener creates a fifo entry for
-    // every preconf-eligible tx entering the pool", which is **not**
-    // unconditional: `push_if_absent` answers `ConflictActive` when a different
-    // hash already holds the tx's `(sender, nonce)`, and such an entry gets no
-    // fifo record at all. What rules that out is a precondition enforced
-    // elsewhere — `PreconfAwareValidator`'s replacement guard refuses a second
-    // preconf tx for a `(sender, nonce)` that one already occupies, so a tx the
-    // pool accepted cannot collide. Before that guard covered the pool→fifo
-    // window the claim was simply false, and the colliding tx was skipped by
-    // *both* arms: silently never applied, with no error to its client.
+    // Skipping does not drop the tx, it only constrains it to the preconf
+    // ordering — which holds because `PreconfAwareValidator`'s replacement guard
+    // refuses a second preconf tx on a `(sender, nonce)` one already occupies,
+    // so a tx the pool accepted cannot collide and be refused a fifo entry
+    // (`push_if_absent` → `ConflictActive`).
     //
-    // One deliberate exception survives: a `Verdict::Promised` tx is exempt from
-    // that guard (journal restore must re-admit an acknowledged commitment
-    // unconditionally), so it can reach the pool on an occupied nonce and be
-    // refused a fifo entry. Losing is the intended outcome there — the fifo's
-    // documented policy is to keep the fresher entry — and the restored tx is
-    // dropped by the pool itself once the winner's nonce lands.
+    // One exception: a `Verdict::Promised` tx is exempt from that guard (journal
+    // restore re-admits an acknowledged commitment unconditionally), so it can
+    // lose the fifo slot. Intended — the fifo keeps the fresher entry, and the
+    // pool drops the restored tx once the winner's nonce lands.
     //
-    // The predicate is the **frozen verdict**, never a live allowlist read: the
-    // fifo entry the preconf arm will apply was created by the listener from
-    // that same record, so re-deriving eligibility here would let an allowlist
-    // update between the two decisions strand the tx with neither arm applying
-    // it (Case A / Case B of the classifier design).
+    // The predicate is the **frozen verdict**, never a live allowlist read:
+    // re-deriving eligibility here would let an allowlist update between the two
+    // decisions strand the tx with neither arm applying it (Case A / Case B of
+    // the classifier design).
     if classifier.verdict(tx.hash()).is_some_and(Verdict::is_preconf) {
         best_txs.mark_invalid(tx.sender(), tx.nonce());
         return Ok(BestTxStep::Continue);
@@ -972,12 +940,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///
     /// ## Execution stages
     ///
-    /// 1. **Prelude** — construct upstream [`OpPayloadBuilderCtx`], fetch the parent-block state
-    ///    provider twice (owned form; needed to keep the async future `Send`), preload the L1 block
-    ///    contract into the DB cache.
-    /// 2. **Stage 1** — `apply_pre_execution_changes` (EIP-2935 / 4788
-    ///    + OP-stack predeploys).
-    /// 3. **Stage 2** — `execute_sequencer_transactions` (deposits + L1 info + system txs).
+    /// 1. **Prelude** — upstream [`OpPayloadBuilderCtx`], parent-block state provider fetched twice
+    ///    (owned, to keep the async future `Send`), L1 block contract preloaded into the DB cache.
+    /// 2. **Stage 1** — `apply_pre_execution_changes`.
+    /// 3. **Stage 2** — `execute_sequencer_transactions_watching_whitelist` (deposits + L1 info +
+    ///    system txs, snapshotting any `WhitelistUpdated` delta they emit).
     /// 4. **Stage 3** — unified `select!` loop with four `biased` branches:
     ///    - `cancel.wait()` — exits the loop.
     ///    - `fifo_rx.recv()` — preconf-tx dispatch (`admit_and_dispatch` per hash on `Ok`; on
@@ -985,16 +952,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///    - **Level-triggered pool arm** (`ready(()) if PoolPacer::can_admit()`) — each fire admits
     ///      exactly one pool best-tx, then returns to `select!`. Cancel and preconf get preempt
     ///      chances between every pool tx via biased priority.
-    ///    - `sweep_ticker.tick()` — edge-triggered ticker. Raises the `PoolPacer` ceiling by
-    ///      `PoolQuotaSchedule::gas_per_batch` on each tick (adaptive-N derivation adapts `N` to
-    ///      remaining slot time so pool aims to fill the block regardless of build delay —
-    ///      op-rbuilder flashblocks pattern). Doesn't apply directly; the level-triggered pool arm
-    ///      consumes the new headroom.
+    ///    - `sweep_ticker.tick()` — raises the `PoolPacer` ceiling by
+    ///      `PoolQuotaSchedule::gas_per_batch`; the pool arm consumes the new headroom.
     ///
-    ///    Before the loop, a **carryover replay preamble**
-    ///    (`replay_fifo_carryover`) applies any stale in-flight or
-    ///    journal-restored entries directly (bypassing the broadcast
-    ///    queue) so they land ahead of concurrently-queued RPC pushes.
+    ///    Before the loop, a **carryover replay preamble** (`replay_fifo_carryover`) applies stale
+    ///    in-flight / journal-restored entries directly, bypassing the broadcast queue so they
+    ///    land ahead of concurrently-queued RPC pushes.
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).
     /// 6. **Stage 5** — `builder.finish` → seal + wrap into `OpBuiltPayload`.
     ///
@@ -1002,15 +965,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     /// `State<DB>`, which is what makes the RPC-returned receipt
     /// byte-equal to the sealed block's receipt.
     ///
-    /// ## Generic parameter placement
-    ///
-    /// `N` and `Attrs` are bound on the method (not the `impl`) because
-    /// this is an inherent async method rather than a
-    /// [`reth_basic_payload_builder::PayloadBuilder`] impl (whose sync
-    /// `try_build` is incompatible with our async select! loop). No
-    /// struct field depends on `N` / `Attrs`, so method-level binding
-    /// keeps the struct free of `PhantomData<(N, Attrs)>` and lets a
-    /// single builder serve multiple primitive sets.
+    /// `N` and `Attrs` are bound on the method, not the `impl`: this is an
+    /// inherent async method rather than a
+    /// [`reth_basic_payload_builder::PayloadBuilder`] impl, whose sync
+    /// `try_build` cannot host the async select! loop. No struct field depends
+    /// on them, so this keeps `PhantomData<(N, Attrs)>` off the struct.
     ///
     /// [`OpPayloadBuilderCtx`]: reth_optimism_payload_builder::builder::OpPayloadBuilderCtx
     #[allow(clippy::unused_async)]
@@ -1110,26 +1069,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             crate::whitelist::wants_whitelist(&self.cfg),
         )?;
 
-        // The allowlist this block is judged against, pinned for the whole
-        // build. Taken unconditionally: every preconf transaction is checked
-        // against policy at dispatch, not only in blocks that carry a governance
-        // update, because policy can move at any point between a transaction's
-        // admission and the block that would apply it.
+        // The allowlist this block is judged against — see `barred_by_allowlist`
+        // for why every entry is checked against it. Pinned rather than read
+        // live per transaction: `update_whitelist` swaps the shared `Arc`
+        // wholesale, so a watcher landing mid-build would otherwise judge two
+        // transactions in one block against different policies. The snapshot is
+        // a refcount bump.
         //
-        // Pinning matters as much as the value. `update_whitelist` swaps the
-        // shared `Arc` wholesale, so reading the live lists per transaction
-        // would let the watcher land mid-build and judge two transactions in one
-        // block against different policies. The snapshot is a refcount bump.
-        //
-        // A governance update carried by *this* block is layered on top, and
-        // only that case pays for a copy. It stays on this stack frame and is
-        // never written back: a build that is superseded or never sealed
-        // produces no canonical notification, and the watcher's triggers are
-        // exactly "a `WhitelistUpdated` log became canonical" and "a reorg
-        // landed" (`whitelist::should_reload`) — so nothing would undo it, and
-        // the RPC admission path would keep judging against a policy that never
-        // reached the chain. Discarding is the default here, and costs no
-        // rollback logic.
+        // A governance update carried by *this* block is layered on top (the
+        // only case that pays for a copy) and deliberately never written back:
+        // the watcher reloads from the chain (`whitelist::should_reload`), so a
+        // build that is superseded or never sealed must not leave its delta
+        // visible to the RPC admission path.
         let mut whitelist = self.classifier.whitelist_snapshot();
         if !whitelist_deltas.is_empty() {
             let mut updated = (*whitelist).clone();
@@ -1943,10 +1894,8 @@ mod tests {
             assert!(!barred_by_allowlist(&cfg(), &wl, PreconfSource::Replay, &a(3), Some(&a(4))));
         }
 
-        /// `--preconf.all` bypasses the lists, and it has to be checked *before*
-        /// them: that mode never reads the contract (`wants_whitelist` returns
-        /// `None`), so all three sets are empty and consulting them would bar
-        /// every transaction on the node.
+        /// `--preconf.all` bypasses the lists, and must be checked *before*
+        /// them — see `barred_by_allowlist` for why.
         #[test]
         fn all_preconfs_bypasses_the_lists() {
             let c = PreconfConfig { all_preconfs: true, ..cfg() };

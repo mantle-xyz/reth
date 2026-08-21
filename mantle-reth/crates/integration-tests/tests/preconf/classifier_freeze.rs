@@ -1,35 +1,24 @@
 //! Regression coverage for the two ways a runtime allowlist change used to
 //! split a transaction's classification.
 //!
-//! Eligibility is decided once, at pool admission, and frozen
-//! (`PreconfClassifier`). The reason that matters is that the pool arm and the
-//! preconf arm are a **partition**: the pool arm skips a tx precisely because
-//! the preconf arm is expected to apply it. Both arms therefore have to read
-//! the same record. When they each derived eligibility live from the
-//! allowlists, an update landing mid-flight broke the partition in both
-//! directions:
+//! Eligibility is decided once, at pool admission, and frozen (`PreconfClassifier`). That
+//! matters because the pool arm and the preconf arm are a **partition**: the pool arm skips
+//! a tx precisely because the preconf arm is expected to apply it, so both must read the
+//! same record. When each derived eligibility live from the allowlists, an update landing
+//! mid-flight broke the partition in both directions:
 //!
-//! * **Case A** (eligible → not eligible): the client already holds a preconfirmation receipt and a
-//!   fifo entry exists, but the pool arm stops skipping. The tx lands via the normal path, nobody
-//!   applies the fifo entry, the responder never fires — the client sees `Timeout` for a tx that is
-//!   on chain, and the commitment we handed out is broken.
+//! * **Case A** (eligible → not eligible): a fifo entry exists and the client holds a receipt, but
+//!   the pool arm stops skipping. The tx lands via the normal path, nobody applies the fifo entry,
+//!   the responder never fires — `Timeout` for a tx that is on chain, and a broken commitment.
 //! * **Case B** (not eligible → eligible): no fifo entry was ever created, yet the pool arm starts
 //!   skipping. Neither arm applies the tx, so it is silently excluded from block building until the
-//!   allowlist flips back. A liveness failure with no error anywhere, hitting a tx that was never
-//!   promised anything.
+//!   allowlist flips back — a liveness failure with no error anywhere.
 //!
-//! The test mutates the allowlist **after** both txs have been admitted, which
-//! is only possible because `launch_preconf_node_with_classifier!` hands back
-//! the node's own `Arc<PreconfClassifier>`.
-//!
-//! Asymmetry worth knowing before reading further: only the Case B half actually
-//! discriminates — reverting the pool arm to a live allowlist lookup makes it
-//! fail (`sealed = []`) while the Case A half stays green. The test's own doc
-//! comment explains why, and what covers Case A instead.
-//!
-//! The test does not depend on canonicalisation — it asserts on the resolved
-//! payload — so it stays clear of the harness's known parallel-load flakiness
-//! (see `docs/preconf-integration-test-harness-issues.md` problem 1).
+//! The single test mutates the allowlist **after** both txs are admitted, which is only
+//! possible because `launch_preconf_node_with_classifier!` hands back the node's own
+//! `Arc<PreconfClassifier>`. It asserts on the resolved payload rather than a canonical
+//! block, staying clear of the harness's parallel-load flakiness (see
+//! `docs/preconf-integration-test-harness-issues.md` problem 1).
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
 use crate::launch_preconf_node_with_classifier;
@@ -78,15 +67,11 @@ async fn signed_transfer_from(
 
 /// One node, one allowlist flip, both directions at once.
 ///
-/// The flip replaces `(wallet, RECIPIENT)` with `(other, RECIPIENT)`, so in a
-/// single `update_whitelist` it **removes** the sender of a parked commitment
-/// (Case A direction) and **adds** the sender of a tx that was already frozen as
-/// ineligible (Case B direction). Both assertions then read off one block.
-///
-/// Merged into a single test on purpose: every node-spawning test adds parallel
-/// load, and this suite's canonicalisation is load-sensitive (see
-/// `docs/preconf-integration-test-harness-issues.md` problem 1) — two launches
-/// measurably increased unrelated flakiness, one does not.
+/// The flip replaces `(wallet, RECIPIENT)` with `(other, RECIPIENT)`, so a single
+/// `update_whitelist` **removes** the sender of a parked commitment (Case A) and **adds**
+/// the sender of a tx already frozen as ineligible (Case B). Both assertions read off one
+/// block. Merged into one test because two node launches measurably raised this suite's
+/// unrelated flakiness and one does not.
 ///
 /// Sequence:
 /// 1. `other` (not allowlisted) submits a plain tx → validator freezes `NotEligible`.
@@ -97,30 +82,23 @@ async fn signed_transfer_from(
 ///
 /// ## What each half proves
 ///
-/// **Case B — the frozen verdict keeps the plain tx alive.** Reverting
-/// `apply_one_best_tx` to a live allowlist lookup makes the `other` assertion
-/// fail with `sealed = []`: the pool arm re-derives "eligible" from the widened
-/// list and skips the tx, while the preconf arm has no fifo entry for it, so no
-/// arm builds it. That is the silent liveness failure the freeze exists to
-/// prevent, and widening the allowlist must never cause it.
+/// **Case B — the frozen verdict keeps the plain tx alive.** This is the discriminating
+/// half: reverting `apply_one_best_tx` to a live allowlist lookup makes the `other`
+/// assertion fail with `sealed = []`, because the pool arm re-derives "eligible" from the
+/// widened list and skips a tx the preconf arm has no fifo entry for.
 ///
 /// **Case A — policy binds at dispatch, and the freeze does not shield it.**
-/// `barred_by_allowlist` is asked of every entry against the allowlist pinned
-/// for the block, so a commitment admitted under the old lists is refused once
-/// governance revokes its sender, whether that revocation arrived in this block
-/// or several blocks earlier. The client is told `NotPreconfEligible` rather
-/// than being left to time out, and the transaction reaches neither arm — the
-/// pool arm still skips it, because its frozen verdict is still `Eligible`. A
-/// transaction submitted through the preconf RPC is a preconf request; if policy
-/// will not authorize it, it fails rather than silently degrading into an
-/// ordinary transaction.
+/// `barred_by_allowlist` is asked of every entry against the allowlist pinned for the
+/// block, so a commitment admitted under the old lists is refused once governance revokes
+/// its sender. The client is told `NotPreconfEligible` instead of being left to time out,
+/// and the tx reaches neither arm — the pool arm still skips it, its frozen verdict still
+/// being `Eligible`. A preconf submission that policy will not authorize fails rather than
+/// silently degrading into an ordinary transaction.
 ///
-/// The two halves are not in tension. The verdict stays frozen throughout —
-/// nothing rewrites it, and the classifier unit test
-/// `verdict_is_frozen_when_allowlist_shrinks` pins that. What the verdict
-/// records is *which RPC the transaction arrived on*, a fact no allowlist can
-/// supply. Whether policy still authorizes it is a separate question, asked
-/// separately, and only Case A's subject fails it.
+/// The two are not in tension: the verdict records *which RPC the tx arrived on* — a fact
+/// no allowlist supplies, pinned by the classifier unit test
+/// `verdict_is_frozen_when_allowlist_shrinks` — while whether policy still authorizes it
+/// is a separate question that only Case A's subject fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_allowlist_flip_bars_the_outstanding_commitment_and_spares_the_plain_tx() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -133,13 +111,9 @@ async fn an_allowlist_flip_bars_the_outstanding_commitment_and_spares_the_plain_
         Wallet::new(3).with_chain_id(mantle_test_chain_spec().chain().id()).wallet_gen()[2].clone();
     let other_addr = other_signer.address();
 
-    // Generous client deadline: the commitment must survive the flip, the FCU
-    // round-trip and a sweep tick before dispatch runs, and dispatch
-    // pre-emptively skips entries whose `elapsed + safety_margin` has already
-    // reached the deadline.
-    // Stated as an explicit pair, because this test *is* about the allowlist:
-    // step 3 swaps this one rule for `(other_addr, recipient)`, and the two
-    // should be legible side by side as one-for-one.
+    // Generous client deadline: the commitment must survive the flip, the FCU round-trip
+    // and a sweep tick before dispatch runs, and dispatch pre-emptively skips entries whose
+    // `elapsed + safety_margin` has already reached the deadline.
     let setup = PreconfCfgBuilder::new()
         .whitelist_pair(wallet_addr, recipient)
         .preconf_timeout_ms(5_000)

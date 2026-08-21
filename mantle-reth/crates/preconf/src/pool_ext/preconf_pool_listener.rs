@@ -70,12 +70,9 @@ where
     Tx: PoolTransaction<Consensus = Cons> + 'static,
     Cons: Clone + Into<OpTxEnvelope>,
 {
-    /// Construct a listener bound to `pool`.
-    ///
-    /// Takes no journal handle: reorg-reinject detection asks the classifier
-    /// (`is_promised`, synchronous) instead of the journal's sealed set. The
-    /// classifier is the one owner of "is this commitment still ours", and
-    /// asking it keeps this event-loop step off the journal's async lock.
+    /// Construct a listener bound to `pool`. Takes no journal handle — see the
+    /// reorg-reinject detection in [`Self::run`] for why the classifier answers
+    /// that question instead.
     pub const fn new(
         pool: P,
         cfg: Arc<PreconfConfig>,
@@ -97,15 +94,12 @@ where
             let sender = valid.transaction.sender();
             let to = valid.transaction.to();
 
-            // Read the verdict frozen at admission — never the allowlists.
-            // This is what makes the listener and the payload builder agree:
-            // both ask the same frozen record, so an allowlist update landing
-            // between the two cannot split a tx's classification.
-            //
-            // `None` (no record) means the preconf arm makes no claim, so skip.
-            // It cannot legitimately happen for a tx we are seeing as `Pending`
-            // — the validator classifies synchronously before admission — but
-            // skipping is the safe default either way: the pool arm takes it.
+            // Read the verdict frozen at admission — never the allowlists — so
+            // the listener and the payload builder cannot disagree when an
+            // allowlist update lands between them. `None` cannot legitimately
+            // happen for a tx already `Pending` (the validator classifies
+            // synchronously before admission); skipping is the safe default
+            // anyway, since the pool arm then takes it.
             if !self.classifier.verdict(valid.transaction.hash()).is_some_and(Verdict::is_preconf) {
                 trace!(
                     target: "mantle::preconf::listener",
@@ -136,12 +130,10 @@ where
             // re-inject path returning a previously-promised tx. Bypass the
             // deadline / gas budget gates by pushing with `Replay` source.
             //
-            // Asked of the classifier, synchronously. It used to be
-            // `journal.contains(&hash).await`: an async lock on a different
-            // structure, for a question the classifier already owns the answer
-            // to. Two trackers of "this commitment is over" also disagreed —
-            // the journal's notion was "canonical once", which a reorg undoes,
-            // and this is precisely the reorg path.
+            // Asked of the classifier, synchronously — not of the journal, whose
+            // notion of "commitment is over" is "canonical once", which a reorg
+            // undoes, and this is precisely the reorg path. It also keeps this
+            // event-loop step off the journal's async lock.
             let source = if self.classifier.is_promised(&hash) {
                 crate::types::PreconfSource::Replay
             } else {

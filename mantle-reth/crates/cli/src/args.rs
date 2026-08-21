@@ -78,10 +78,8 @@ pub struct PreconfArgs {
     /// Required when `--preconf.enable` is set without `--preconf.all`
     /// (enforced by `PreconfConfig::validate`). The node reads both lists out
     /// of this contract's storage at startup and refreshes them whenever it
-    /// emits `WhitelistUpdated`, so the lists are governed on-chain rather than
-    /// configured here. There are deliberately no `--preconf.from` /
-    /// `--preconf.to` flags: a second, local source of truth would silently
-    /// lose to the contract on the first refresh.
+    /// emits `WhitelistUpdated`, so the lists are governed on-chain — this
+    /// address is the only allowlist input the CLI accepts.
     #[arg(long = "preconf.whitelist-contract", value_name = "ADDRESS")]
     pub whitelist_contract: Option<Address>,
 
@@ -233,8 +231,7 @@ mod tests {
     #[test]
     fn whitelist_contract_flag_lands_on_config() {
         // `--preconf.whitelist-contract` maps to
-        // `PreconfConfig::whitelist_contract`. This is the only allowlist input
-        // the CLI accepts — the lists themselves come from that contract.
+        // `PreconfConfig::whitelist_contract`.
         let a = parse(&[
             "--preconf.enable",
             "--preconf.whitelist-contract",
@@ -242,9 +239,7 @@ mod tests {
         ]);
         let cfg = a.into_config().expect("enabled");
         assert_eq!(cfg.whitelist_contract, Some(Address::from([0x11; 20])));
-        // The address is all the CLI carries — the lists themselves live on the
-        // classifier and are only populated once the node can read L2 state.
-        // ...and this shape passes validation, unlike the address-less one.
+        // And unlike the address-less shape above, this one passes validation.
         assert!(cfg.validate().is_ok());
     }
 

@@ -258,35 +258,22 @@ async fn timeout_recovered_by_same_hash_resubmit() {
 /// test sets `safety_margin=0`, letting dispatch complete apply right
 /// past the RPC deadline.
 ///
-/// **Quarantined (`#[ignore]`)**: it deliberately races a ~5ms window (build
-/// started 195ms into a 200ms deadline), so the outcome hinges on whether
-/// dispatch grabs the `apply_lock` before the deadline — a coin flip (~50%)
-/// under load that retries can't recover. Determinism needs an internal hook to
-/// pause dispatch mid-apply, unavailable at the integration layer. The SLA
-/// (a sealed tx must never report `Timeout`) belongs in a `rpc.rs` unit test
-/// that drives the deadline/apply interleaving directly.
+/// **Quarantined (`#[ignore]`)**, measured rather than assumed: it fails roughly 1 run in
+/// 3 even alone and serially, so this is not the suite's parallel-load problem. The test
+/// needs dispatch to be mid-apply at the instant the client deadline fires, and the only
+/// lever from outside the node is the 195 ms sleep below guessing that the following FCU
+/// round-trip lands inside the remaining 5 ms. When it does not, race resolution finds a
+/// `Waiting` entry and correctly reports `Timeout` for a tx that really had not been
+/// applied — the assertion fails with nothing actually wrong. Determinism would need a
+/// production hook to pause dispatch mid-apply; not worth it, because
+/// `builder::dispatch::tests::apply_lock_blocks_rpc_timeout_race_and_yields_success` pins
+/// the same lock ordering with no clock involved. Kept as a manual end-to-end check:
+///
+/// ```text
+/// cargo test -p mantle-reth-integration-tests --test preconf \
+///     timeout::race_resolution -- --ignored
+/// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// Quarantined per CLAUDE.md rather than left to flake. Measured, not assumed:
-// it fails roughly 1 run in 3 **even alone and serially**, so this is not the
-// suite's parallel-load problem — the scenario itself is a ~micro-second-wide
-// race and the only lever from outside the node is a wall-clock guess.
-//
-// The test needs dispatch to be *mid-apply* at the instant the client deadline
-// fires: only then does race resolution block on `lock_for_apply` and pick up the
-// receipt. The 195 ms sleep below assumes the following FCU round-trip lands
-// inside the remaining 5 ms. When it does not, dispatch has not started, race
-// resolution finds a `Waiting` entry, and the wire result is a perfectly correct
-// `Timeout` for a tx that really had not been applied — the assertion fails
-// without anything being wrong.
-//
-// Making it reliable needs a hook in production code to pause dispatch mid-apply.
-// Not worth it: the property is already pinned deterministically by
-// `builder::dispatch::tests::apply_lock_blocks_rpc_timeout_race_and_yields_success`,
-// which drives the same lock ordering with no clock involved. Kept here as a
-// manually-runnable end-to-end check (expect to repeat it a few times):
-//
-//     cargo test -p mantle-reth-integration-tests --test preconf \
-//         timeout::race_resolution -- --ignored
 #[ignore = "~us-wide race reproduced by a wall-clock guess; fails ~1/3 even alone. \
             Covered deterministically by dispatch's apply_lock unit test."]
 async fn race_resolution_returns_success_when_apply_completes_after_deadline() {

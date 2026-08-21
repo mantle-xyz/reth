@@ -23,20 +23,13 @@ pub fn mantle_test_chain_spec() -> Arc<OpChainSpec> {
 /// EIP-1559 parameters as the built blocks encode them: version 1, denominator
 /// 8, elasticity 2, then Mantle's trailing bytes.
 ///
-/// The shipped fixture has `extraData: 0x00`, which encodes no parameters at all.
-/// That is what made this suite flaky for so long: `newPayload` derives a block's
-/// expected base fee by decoding the parameters off its **parent**, so a block
-/// built on genesis was validated against a 1-byte parent, the decode failed,
-/// and the engine answered `Invalid { "base fee missing" }`. The follow-up
-/// forkchoice update then reported "links to previously rejected block" and the
-/// head silently stayed at 0 — every downstream assertion failed for reasons
-/// that looked nothing like the cause, and
-/// `NodeTestContext::submit_payload` discards the `PayloadStatus`, so the real
-/// verdict was never seen. See
-/// `docs/preconf-integration-test-harness-issues.md` problem 1.
-///
-/// Giving genesis the same encoding its children use makes the parent decode
-/// succeed, which is what [`canonicalize_payload!`] relies on.
+/// The shipped fixture has `extraData: 0x00`, which encodes no parameters at all. Since
+/// `newPayload` derives a block's expected base fee by decoding the parameters off its
+/// **parent**, anything built on genesis was rejected `Invalid { "base fee missing" }` and
+/// the head silently stayed at 0 — the root cause of this suite's long-running flakiness
+/// (see `docs/preconf-integration-test-harness-issues.md` problem 1). Giving genesis the
+/// same encoding its children use makes the parent decode succeed, which is what
+/// [`canonicalize_payload!`] relies on.
 const GENESIS_EIP1559_EXTRA_DATA: &str = "0x0100000008000000020000000000000000";
 
 /// The shared genesis fixture with `chainId` patched and
@@ -208,7 +201,7 @@ pub fn layout_version_storage() -> (B256, B256) {
 /// slots, and a log whose `address` and `topics[0]` match — so this is the whole
 /// surface reth cares about. Producing it here keeps the suite free of any
 /// cross-repo Solidity build step. The real contract's own behaviour (auth gates,
-/// idempotence, batch cap) is covered by the 19 forge tests in
+/// idempotence, batch cap) is covered by the forge tests in
 /// `mantle-v2/packages/contracts-bedrock/test/PreconfWhitelist.t.sol`.
 ///
 /// Emits, per write, `PUSH32 <value> PUSH32 <slot> SSTORE`, then
@@ -298,11 +291,8 @@ pub fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
 /// [`PreconfCfgBuilder::whitelist_contract`].
 pub const WHITELIST_CONTRACT_SENTINEL: Address = Address::new([0x77; 20]);
 
-/// Minimal bytecode for the sentinel: a single `STOP`.
-///
-/// Nothing ever calls it. It exists because `bootstrap_whitelist` refuses an
-/// address with no code — a deliberate check, since a wrong address otherwise
-/// reads back as "governance allows nobody", indistinguishable from a typo.
+/// Minimal bytecode for the sentinel: a single `STOP`. Nothing ever calls it; it exists
+/// only to satisfy the has-code check described on [`WHITELIST_CONTRACT_SENTINEL`].
 const SENTINEL_CODE: [u8; 1] = [0x00];
 
 /// Returns `spec` with the sentinel account allocated and holding the given
@@ -396,10 +386,9 @@ impl PreconfCfgBuilder {
 
     /// Allowlist exactly the rule `from -> to`. Repeatable.
     ///
-    /// Prefer this in tests that are *about* the allowlist. [`Self::whitelist_from`]
-    /// and [`Self::whitelist_to`] predate explicit pairs and survive only as a
-    /// cross-product shim (see [`Self::build`]), so a reader has to know that
-    /// expansion to see what rules a chain of them actually installs.
+    /// Prefer this in tests that are *about* the allowlist: [`Self::whitelist_from`] and
+    /// [`Self::whitelist_to`] expand to their cross product (see [`Self::build`]), so a
+    /// reader has to know that expansion to see what rules they actually install.
     pub fn whitelist_pair(mut self, from: Address, to: Address) -> Self {
         self.pairs.push((from, to));
         self
@@ -428,10 +417,10 @@ impl PreconfCfgBuilder {
     /// Point the config at a real on-chain `PreconfWhitelist` instead of relying on
     /// the in-memory seed.
     ///
-    /// Overrides the placeholder [`WHITELIST_CONTRACT_SENTINEL`]. Tests that use
-    /// this are expected to load the allowlist themselves via
-    /// `mantle_reth_preconf::bootstrap_whitelist`, since this harness installs no
-    /// `on_node_started` hook.
+    /// Overrides the placeholder [`WHITELIST_CONTRACT_SENTINEL`]. Cold start runs
+    /// inside `build_pool`, so it will read this address; tests that need a
+    /// specific post-boot state call `mantle_reth_preconf::bootstrap_whitelist`
+    /// again themselves after seeding storage.
     pub fn whitelist_contract(mut self, contract: Address) -> Self {
         self.whitelist_contract = contract;
         self
@@ -498,10 +487,8 @@ impl PreconfCfgBuilder {
             // `validate()` requires a non-zero whitelist address whenever
             // preconf is enabled without `all_preconfs`. These tests seed the
             // allowlists directly instead of reading them from a contract, so a
-            // sentinel satisfies the check. It needs no code at that address:
-            // cold start lives in the binary's `on_node_started` hook, which
-            // this harness's `launch_with_fn` does not run — so nothing
-            // overwrites the seeded lists.
+            // sentinel satisfies the check — see `WHITELIST_CONTRACT_SENTINEL`
+            // for why the address must still carry code.
             whitelist_contract: Some(self.whitelist_contract),
             all_preconfs: self.all_preconfs,
             preconf_timeout: std::time::Duration::from_millis(self.preconf_timeout_ms),
@@ -512,11 +499,8 @@ impl PreconfCfgBuilder {
             journal_max_size: self.journal_max_size,
             ..PreconfConfig::default()
         };
-        // `whitelist_from` / `whitelist_to` predate the move to explicit pairs,
-        // when eligibility was `from in F && to in T`. That is exactly the cross
-        // product of the two lists, so expanding it here keeps every existing
-        // test's meaning identical while the allowlist underneath changes shape.
-        // New tests that want a wildcard say so directly.
+        // `whitelist_from` / `whitelist_to` mean `from in F && to in T`, which is exactly
+        // the cross product of the two lists. Tests wanting a wildcard say so directly.
         let mut pairs = self.pairs;
         pairs.extend(self.from.iter().flat_map(|f| self.to.iter().map(move |t| (*f, *t))));
         PreconfSetup {
@@ -559,26 +543,18 @@ pub const CANON_POLL_TICKS: usize = 200;
 ///
 /// ## Why this exists
 ///
-/// `update_forkchoice` resolves as soon as the engine has accepted the
-/// forkchoice update; the provider starts serving the new head only once the
-/// canonical-chain update has been committed. Every preconf suite used to bridge
-/// that gap with a fixed `sleep` (100–500 ms depending on the file), which is a
-/// race: under parallel load the commit routinely takes longer, the test then
-/// reads pre-block state, and the failure surfaces as a wrong balance / stale
-/// nonce / "canon handler did not react" — never as "canonicalisation was slow".
-/// That is the mechanism behind the suite's long-standing flakiness (see
-/// `docs/preconf-integration-test-harness-issues.md` problem 1).
+/// `update_forkchoice` resolves as soon as the engine has accepted the forkchoice update;
+/// the provider starts serving the new head only once the canonical-chain update has been
+/// committed. Bridging that gap with a fixed `sleep`, as this suite used to, is a race:
+/// under parallel load the commit takes longer, the test reads pre-block state, and the
+/// failure surfaces as a wrong balance or a stale nonce rather than as "canonicalisation was
+/// slow" (see `docs/preconf-integration-test-harness-issues.md` problem 1). Polling on the
+/// observable condition removes the guess, and failing to converge panics with the block
+/// number and hash, so a real canonicalisation failure is distinguishable from a slow one.
 ///
-/// Polling on the observable condition removes the guess. Failure to converge
-/// panics with the block number and hash, so a genuine
-/// canonicalisation failure is no longer indistinguishable from a slow one.
-///
-/// A macro, not a function, for the same reason `launch_preconf_node!` is one:
-/// the `NodeTestContext<Node, AddOns>` type parameters cannot be spelled at a
-/// function boundary without 20+ lines of `where` clauses.
-///
-/// `reth`'s own `NodeTestContext::wait_block` does almost this, but loops
-/// forever — a hang instead of a failure — so it is not used here.
+/// A macro, not a function: the `NodeTestContext<Node, AddOns>` type parameters cannot be
+/// spelled at a function boundary. `reth`'s own `NodeTestContext::wait_block` does almost
+/// this, but loops forever — a hang instead of a failure — so it is not used here.
 #[macro_export]
 macro_rules! canonicalize_payload {
     ($node:expr, $payload:expr) => {{
