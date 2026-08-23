@@ -50,7 +50,7 @@ use reth_revm::{
     State, cancelled::CancelOnDrop, context::Block as RevmBlockTrait,
     database::StateProviderDatabase,
 };
-use reth_transaction_pool::PoolTransaction;
+use reth_transaction_pool::{BestTransactions, PoolTransaction};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -899,7 +899,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Pool iterator — one-shot snapshot at build start.
         let best_txs_iter_opt = (!ctx.attributes().no_tx_pool()).then(|| {
             let attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
-            BestPayloadTransactions::new(self.pool.best_transactions_with_attributes(attrs))
+            BestPayloadTransactions::new(
+                self.pool.best_transactions_with_attributes(attrs).without_updates(),
+            )
         });
 
         // Snapshot per-block limits (constant across the build).
