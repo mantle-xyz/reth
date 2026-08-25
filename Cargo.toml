@@ -10,9 +10,9 @@
 #   revm/op-revm   → mantle-xyz/revm tag v107-mantle-arsia.1 (Mantle fee model + op-geth parity)
 #   revm-inspectors → mantle-xyz/revm-inspectors tag v0.39.0-mantle-arsia.1
 #   alloy-evm      → crates.io 0.34.0 (upstream, no Mantle patches; see mantle-v2#359)
-#   alloy-op-evm   → mantle-xyz/mantle-v2 branch mantle-elysium
-#   alloy-op-hardforks → mantle-xyz/mantle-v2 branch mantle-elysium
-#   op-alloy       → mantle-xyz/mantle-v2 branch mantle-elysium
+#   alloy-op-evm   → mantle-xyz/mantle-v2 tag v1.6.0
+#   alloy-op-hardforks → mantle-xyz/mantle-v2 tag v1.6.0
+#   op-alloy       → mantle-xyz/mantle-v2 tag v1.6.0
 #   alloy base     → crates.io 2.0.4
 
 [workspace.package]
@@ -259,21 +259,21 @@ alloy-evm = { version = "0.34.0", default-features = false }
 
 # ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
 
 # ==================== OP-REVM (Mantle fork: mantle-xyz/revm, same repo as revm) ====================
 op-revm = { git = "https://github.com/mantle-xyz/revm", tag = "v107-mantle-arsia.1", default-features = false }
 
 # ==================== OP-ALLOY (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
-op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium", default-features = false }
+op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
+op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0", default-features = false }
 op-alloy-flz = { version = "0.13.1", default-features = false }
 
 # ==================== ALLOY ====================
@@ -447,11 +447,11 @@ revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", tag =
 # op-revm: mantle-xyz/revm (same as workspace dep)
 op-revm = { git = "https://github.com/mantle-xyz/revm", tag = "v107-mantle-arsia.1" }
 # alloy-op-evm / alloy-op-hardforks: mantle-xyz/mantle-v2 (Mantle version)
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0" }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0" }
 # op-alloy: mantle-xyz/mantle-v2 (Mantle version)
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "mantle-elysium" }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0" }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0" }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0" }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0" }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", tag = "v1.6.0" }
