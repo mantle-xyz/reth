@@ -126,7 +126,7 @@ where
         // precedes the block — is what makes it available to both later events
         // (`forward → release_unless_committed` and the canonical notification)
         // no matter which of them runs first.
-        if let Err(owner) = self.classifier.mark_promised(hash, sender, nonce) {
+        if let Err(owner) = self.classifier.mark_promised(hash, sender, nonce, event.block_height) {
             warn!(
                 target: "mantle::preconf::rpc",
                 ?hash, ?owner,
@@ -935,7 +935,7 @@ mod tests {
         let sender = h.signer.address();
 
         assert_eq!(h.classifier.claim_preconf(hash, &sender, Some(&RECIPIENT)), Ok(()));
-        assert_eq!(h.classifier.mark_promised(hash, &sender, 0), Ok(()));
+        assert_eq!(h.classifier.mark_promised(hash, &sender, 0, 0), Ok(()));
         assert_eq!(
             h.classifier.verdict(&hash),
             Some(Verdict::Eligible),

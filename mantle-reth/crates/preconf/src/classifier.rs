@@ -232,12 +232,23 @@ struct CachedVerdict {
     /// is released once [`SEAL_DEPTH`] persisted blocks sit on top. Cleared by
     /// [`PreconfClassifier::uncommit`] when a reorg takes that block back.
     committed_height: Option<u64>,
+    /// Height the commitment was promised for — the bound on a promise that never lands, since a
+    /// receipt already out must not be swept on age. Past `promised_height + SEAL_DEPTH` no reorg
+    /// can still land it there; a replaying one holds a fifo entry and is covered by `live`.
+    promised_height: Option<u64>,
 }
 
 impl CachedVerdict {
     /// A freshly frozen verdict: nothing promised, nothing committed yet.
     fn new(verdict: Verdict, slot: Option<(Address, u64)>) -> Self {
-        Self { verdict, at: Instant::now(), slot, promised: false, committed_height: None }
+        Self {
+            verdict,
+            at: Instant::now(),
+            slot,
+            promised: false,
+            committed_height: None,
+            promised_height: None,
+        }
     }
 }
 
@@ -782,7 +793,13 @@ impl PreconfClassifier {
     ///
     /// Returns the outcome of that claim so restore can log a commitment that
     /// arrives to find its nonce already spoken for.
-    pub fn mark_promised(&self, hash: TxHash, sender: &Address, nonce: u64) -> SlotClaim {
+    pub fn mark_promised(
+        &self,
+        hash: TxHash,
+        sender: &Address,
+        nonce: u64,
+        promised_height: u64,
+    ) -> SlotClaim {
         if !self.enabled {
             return Ok(());
         }
@@ -798,6 +815,7 @@ impl PreconfClassifier {
             .entry(hash)
             .or_insert_with(|| CachedVerdict::new(Verdict::Promised, None));
         cached.promised = true;
+        cached.promised_height = Some(promised_height);
         let is_preconf = cached.verdict.is_preconf();
 
         let claim = store.claim(key, hash, is_preconf);
@@ -870,13 +888,18 @@ impl PreconfClassifier {
     ///
     /// `false` for a hash with no record at all — a caller asking about an
     /// unknown hash gets "not releasable", never "go ahead".
-    pub fn is_retention_expired(&self, hash: &TxHash) -> bool {
-        self.verdicts
-            .read()
-            .by_hash
-            .get(hash)
-            .and_then(|cached| cached.committed_height)
-            .is_some_and(|height| self.is_deep_enough(height))
+    /// Whether this hash still has a record here at all — the journal's only
+    /// eviction question.
+    ///
+    /// The journal records commitments; it does not decide when to forget them.
+    /// A record disappears from this map exactly when the commitment stops being
+    /// owed: [`Self::sweep`] releases it once it has landed and been buried
+    /// [`SEAL_DEPTH`] deep, or once a promise can no longer reach the block it
+    /// was made for, and [`Self::release_unless_committed`] releases it when a
+    /// build gives the commitment up. Keying rotation on this makes the two
+    /// halves of commitment tracking unable to disagree.
+    pub fn is_tracked(&self, hash: &TxHash) -> bool {
+        self.verdicts.read().by_hash.contains_key(hash)
     }
 
     /// Hands the `(sender, nonce)` slot from `expected_owner` to `hash`, **only
@@ -1054,7 +1077,17 @@ impl PreconfClassifier {
             let retained_for_reorg = cached
                 .committed_height
                 .is_some_and(|height| height.saturating_add(SEAL_DEPTH) > persisted);
+            // A promise that has not landed is held by depth too. `grace` must
+            // not decide it: the receipt is out, and restore's "nonce taken" and
+            // "cannot tell" arms deliberately leave such a record without a fifo
+            // entry, so age alone would drop a commitment we still owe and strand
+            // its journal line with nothing tracking it.
+            let promise_recoverable = cached.committed_height.is_none() &&
+                cached
+                    .promised_height
+                    .is_some_and(|height| height.saturating_add(SEAL_DEPTH) > persisted);
             let keep = retained_for_reorg ||
+                promise_recoverable ||
                 live.contains(hash) ||
                 now.saturating_duration_since(cached.at) < self.grace;
             if !keep {
@@ -1314,7 +1347,7 @@ mod tests {
     /// receipt returned, observed in the canonical block at [`AT`].
     fn committed_commitment(c: &PreconfClassifier) {
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert_eq!(c.mark_promised(hash(1), &addr(1), 7), Ok(()));
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
         assert!(c.mark_committed(&hash(1), AT));
     }
 
@@ -1375,7 +1408,7 @@ mod tests {
     fn an_uncommitted_verdict_is_released_immediately() {
         let c = classifier(LONG_GRACE);
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert_eq!(c.mark_promised(hash(1), &addr(1), 7), Ok(()));
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
         c.observe_persisted(AT + SEAL_DEPTH);
 
         assert!(c.release_unless_committed(&hash(1)), "promised but never seen on chain");
@@ -1417,7 +1450,7 @@ mod tests {
         // Order 2: the fifo removal arrives before the canonical notification.
         let c = classifier(LONG_GRACE);
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert_eq!(c.mark_promised(hash(1), &addr(1), 7), Ok(()));
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
         c.observe_persisted(AT + 1);
         // Not yet observed on chain, so this one *does* release …
         assert!(c.release_unless_committed(&hash(1)));
@@ -1441,10 +1474,11 @@ mod tests {
         assert!(c.is_promised(&hash(1)), "still an owed commitment");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps its nonce");
 
-        // With the observation withdrawn, depth no longer matters: the entry is
-        // back to being an ordinary in-flight commitment.
+        // With the observation withdrawn, depth no longer holds the record: it is
+        // back to being an ordinary in-flight commitment, so the release
+        // `forward` attempts is no longer refused.
         c.observe_persisted(AT + SEAL_DEPTH);
-        assert!(!c.is_retention_expired(&hash(1)));
+        assert!(c.release_unless_committed(&hash(1)), "no observation ⇒ nothing holds it");
     }
 
     /// A transaction the node never promised is not drift, however deep the
@@ -1474,6 +1508,48 @@ mod tests {
         assert_eq!(c.slot_count(), 0);
     }
 
+    /// A promise that has **not** landed is held by depth too, not by `grace`.
+    ///
+    /// Restore's "nonce taken" and "cannot tell" arms leave exactly this state —
+    /// promised, no fifo entry, never observed on chain — and `grace` is seconds.
+    /// Were age allowed to decide it, the record would vanish while the
+    /// commitment was still owed, stranding its journal line with nothing
+    /// tracking it. That divergence is what the journal used to need its own
+    /// wall-clock rule to paper over.
+    #[test]
+    fn sweep_holds_an_unlanded_promise_until_its_block_is_out_of_reach() {
+        let c = classifier(Duration::ZERO);
+        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, AT), Ok(()));
+
+        c.observe_persisted(AT + SEAL_DEPTH - 1);
+        assert_eq!(c.sweep(&HashSet::default()), 0, "not in the fifo, past grace, still held");
+        assert!(c.is_tracked(&hash(1)));
+        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
+
+        // One more block and no reorg can put the transaction in the block it was
+        // promised for. A replay into a *later* block would hold a fifo entry and
+        // be protected by `live` instead.
+        c.observe_persisted(AT + SEAL_DEPTH);
+        assert_eq!(c.sweep(&HashSet::default()), 1, "unreachable ⇒ released");
+        assert!(!c.is_tracked(&hash(1)));
+        assert_eq!(c.slot_count(), 0);
+    }
+
+    /// The same promise, still being replayed: a fifo entry makes it `live`, and
+    /// `live` outranks the depth rule however far the chain has moved on.
+    #[test]
+    fn sweep_keeps_an_unreachable_promise_that_is_still_being_replayed() {
+        let c = classifier(Duration::ZERO);
+        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, AT), Ok(()));
+
+        c.observe_persisted(AT + SEAL_DEPTH * 10);
+        let live: HashSet<TxHash> = [hash(1)].into_iter().collect();
+        assert_eq!(c.sweep(&live), 0, "a commitment being replayed is never swept");
+        assert!(c.is_tracked(&hash(1)));
+    }
+
     /// The watermark starts at 0 and only moves forward. A provider that reports
     /// a lower height (or never reports at all) must not shorten a retention
     /// period — pinning a nonce too long is recoverable, releasing it too early
@@ -1483,11 +1559,11 @@ mod tests {
         let c = classifier(LONG_GRACE);
         committed_commitment(&c);
 
-        assert!(!c.is_retention_expired(&hash(1)), "nothing is deep enough at watermark 0");
+        assert!(!c.release_unless_committed(&hash(1)), "nothing is deep enough at watermark 0");
 
         c.observe_persisted(AT + SEAL_DEPTH);
         c.observe_persisted(AT); // a stale or regressed reading
-        assert!(c.is_retention_expired(&hash(1)), "the high-water mark stands");
+        assert!(c.release_unless_committed(&hash(1)), "the high-water mark stands");
     }
 
     /// **Preconf is a sequencer-only mechanism**, and a node that has not opted
@@ -1623,7 +1699,7 @@ mod tests {
     #[test]
     fn promised_survives_later_classification() {
         let c = classifier(LONG_GRACE);
-        assert_eq!(c.mark_promised(hash(1), &addr(1), 7), Ok(()));
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         // Restore pushes the envelope through the validator with an allowlist
         // that no longer contains the sender.
@@ -1641,7 +1717,7 @@ mod tests {
     #[test]
     fn mark_promised_claims_the_slot_and_records_the_reverse_link() {
         let c = classifier(LONG_GRACE);
-        assert_eq!(c.mark_promised(hash(1), &addr(1), 7), Ok(()));
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
         assert!(c.is_promised(&hash(1)));
@@ -1672,7 +1748,7 @@ mod tests {
         );
 
         assert_eq!(
-            c.mark_promised(hash(1), &addr(1), 7),
+            c.mark_promised(hash(1), &addr(1), 7, 0),
             Err(hash(2)),
             "reports the incumbent rather than evicting it"
         );
@@ -1688,7 +1764,7 @@ mod tests {
         let c = classifier(LONG_GRACE);
         assert_eq!(c.classify_verdict_via_preconf_rpc(hash(3), &addr(9)), Verdict::NotEligible);
 
-        assert_eq!(c.mark_promised(hash(3), &addr(9), 7), Ok(()));
+        assert_eq!(c.mark_promised(hash(3), &addr(9), 7, 0), Ok(()));
 
         assert_eq!(c.slot_owner(&addr(9), 7), None);
         assert_eq!(c.slot_count(), 0);
@@ -1709,7 +1785,7 @@ mod tests {
         let c = classifier(LONG_GRACE);
         assert_eq!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).0, Verdict::Eligible);
 
-        assert_eq!(c.mark_promised(hash(1), &addr(1), 7), Ok(()));
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible), "verdict untouched");
         assert!(c.is_promised(&hash(1)), "but the promise is recorded");
@@ -1752,7 +1828,7 @@ mod tests {
     fn sweep_keeps_live_entries_regardless_of_age() {
         let c = classifier(Duration::ZERO);
         c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
-        assert_eq!(c.mark_promised(hash(2), &addr(2), 0), Ok(()));
+        assert_eq!(c.mark_promised(hash(2), &addr(2), 0, 0), Ok(()));
 
         assert_eq!(c.sweep(&hashes(&[hash(1), hash(2)])), 0);
         assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible));
@@ -2066,7 +2142,7 @@ mod tests {
 
         // A journal entry for a *different* hash on the same (sender, nonce):
         // its claim loses, so it ends up Promised with no slot of its own.
-        assert_eq!(c.mark_promised(hash(2), &addr(1), 7), Err(hash(1)));
+        assert_eq!(c.mark_promised(hash(2), &addr(1), 7, 0), Err(hash(1)));
         let (verdict, claim, _) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
 
         assert_eq!(verdict, Verdict::Promised);
@@ -2171,7 +2247,7 @@ mod tests {
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(
-            c.mark_promised(hash(1), &addr(1), 7),
+            c.mark_promised(hash(1), &addr(1), 7, 0),
             Ok(()),
             "same hash re-claiming is idempotent"
         );

@@ -885,7 +885,7 @@ mod tests {
     async fn the_violating_state_cannot_be_constructed() {
         let f = fixture(Inner::Valid, 1_000_000);
 
-        assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5), Ok(()));
+        assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5, 0), Ok(()));
         assert!(f.classifier.mark_committed(&h(1), 100));
         f.classifier.release_unless_committed(&h(1)); // what `forward` fires
         assert_eq!(f.classifier.slot_owner(&sender(), 5), Some(h(1)), "still owns the nonce");
@@ -1127,7 +1127,7 @@ mod tests {
         f.seat_incumbent(1, 5);
         // Journal restore records the promise; its claim loses to the incumbent,
         // so it arrives with no slot of its own.
-        assert_eq!(f.classifier.mark_promised(h(2), &sender(), 5), Err(h(1)));
+        assert_eq!(f.classifier.mark_promised(h(2), &sender(), 5, 0), Err(h(1)));
 
         assert_admitted(&f.validate(op_tx(2, sender(), 5, 21_000)).await);
         assert_eq!(f.inner_calls(), 1);
@@ -1147,7 +1147,7 @@ mod tests {
     async fn promised_bypasses_the_per_tx_gas_ceiling() {
         let f = fixture(Inner::Valid, 21_000);
 
-        assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5), Ok(()));
+        assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5, 0), Ok(()));
 
         assert_admitted(&f.validate(op_tx(1, sender(), 5, 500_000)).await);
         assert_eq!(f.inner_calls(), 1);
@@ -1212,7 +1212,7 @@ mod tests {
     async fn a_rejected_promised_tx_keeps_its_verdict() {
         for outcome in [Inner::Invalid, Inner::Error] {
             let f = fixture(outcome, 1_000_000);
-            assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5), Ok(()));
+            assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5, 0), Ok(()));
 
             let result = f.validate(op_tx(1, sender(), 5, 21_000)).await;
 
@@ -1251,7 +1251,7 @@ mod tests {
             // Through the preconf RPC, which is the only door that yields `Eligible`.
             let _ = f.classifier.claim_preconf(h(1), &sender(), Some(&recipient()));
             let _ = f.classifier.admit_and_claim(h(1), &sender(), 5);
-            assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5), Ok(()));
+            assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5, 0), Ok(()));
             assert!(f.classifier.mark_committed(&h(1), 100));
             f.classifier.release_unless_committed(&h(1)); // what `forward` fires
             assert_eq!(f.classifier.slot_owner(&sender(), 5), Some(h(1)));
@@ -1338,7 +1338,7 @@ mod tests {
         // Through the preconf RPC, which is the only door that yields `Eligible`.
         let _ = f.classifier.claim_preconf(h(1), &sender(), Some(&recipient()));
         let _ = f.classifier.admit_and_claim(h(1), &sender(), 5);
-        assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5), Ok(()));
+        assert_eq!(f.classifier.mark_promised(h(1), &sender(), 5, 0), Ok(()));
         assert_eq!(f.classifier.verdict(&h(1)), Some(Verdict::Eligible), "not Promised");
 
         // The pool re-admits it after a reorg.

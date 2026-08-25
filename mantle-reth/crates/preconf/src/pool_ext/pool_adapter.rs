@@ -187,16 +187,9 @@ where
         + Send
         + Sync,
 {
-    /// `Unknown` on a miss whenever the transaction-lookup segment has **ever**
-    /// been pruned, without trying to relate the prune height to the
-    /// transaction's: `JournalEntry::block_height` is the height predicted when
-    /// the receipt went out and can drift, so it is not a sound basis for "the
-    /// prune did not reach my block". A pruned index therefore makes every miss
-    /// unknowable — which is why pruning it is incompatible with running preconf.
-    ///
-    /// Residue, stated rather than papered over: pruning that is *configured but
-    /// has not run yet* leaves no checkpoint, so a miss is reported as `No`. That
-    /// window closes the first time the pruner runs.
+    /// `Unknown` on any miss once the transaction-lookup segment has **ever** been pruned:
+    /// `JournalEntry::block_height` is only a prediction, so "the prune missed it" cannot be
+    /// decided. Pruning is thus incompatible with preconf; until it first runs, a miss reads `No`.
     fn commitment_on_chain(&self, hash: &alloy_primitives::TxHash) -> OnChain {
         // `_with_meta` rather than the plain lookup: the caller needs the block
         // number to start the retention clock, and it sits on the same trait, so

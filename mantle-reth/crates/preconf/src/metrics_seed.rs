@@ -26,7 +26,6 @@ const COUNTERS: &[&str] = &[
     "preconf.dispatch.deadline_skipped_total",
     "preconf.dispatch.gas_budget_skipped_total",
     "preconf.listener.replacement_rejected_total",
-    "preconf.journal.abandoned_total",
     "preconf.pending_responders.expired_total",
     // Commitment retention + on-chain allowlist governance.
     "preconf.canon.reorg_drift_total",

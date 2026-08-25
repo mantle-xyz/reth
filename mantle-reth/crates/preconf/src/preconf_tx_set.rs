@@ -2,7 +2,7 @@
 //!
 //! ## Responsibilities
 //!
-//! 1. Track unsealed preconf-eligible transactions in FIFO order
+//! 1. Track in-flight preconf-eligible transactions in FIFO order
 //! 2. Notify the builder via [`tokio::sync::broadcast`] (the single fifo event source)
 //! 3. Hold RPC `oneshot::Sender` responders attached by the RPC handler
 //! 4. Survive across slots — buffers requests during dead window

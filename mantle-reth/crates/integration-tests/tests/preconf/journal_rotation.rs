@@ -1,10 +1,10 @@
 //! Journal **rotation** lifecycle, end-to-end.
 //!
-//! `journal.rs` unit tests cover `rotate()` at the disk layer (sealed
-//! entries dropped, unsealed kept, atomic rename). This module chains
-//! `rotate()` with the *restore* path to pin the property operators
-//! actually care about: **a commitment that has been observed on chain
-//! (sealed) and rotated out is NOT replayed after a restart** — so a
+//! `journal.rs` unit tests cover `rotate()` at the disk layer (entries the
+//! `retain` predicate refuses are dropped, the rest kept, atomic rename). This
+//! module chains `rotate()` with the *restore* path to pin the property
+//! operators actually care about: **a commitment observed on chain and buried
+//! deep enough to be rotated out is NOT replayed after a restart** — so a
 //! rotated-then-restarted node never double-lands an already-canon tx.
 //!
 //! Rotation here is driven by calling `PreconfJournal::rotate()` directly

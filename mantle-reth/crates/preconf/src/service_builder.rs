@@ -40,7 +40,7 @@ use crate::{
     PreconfCanonHandler, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfRpcHandler,
     PreconfTxSet,
     config::PreconfConfigError,
-    journal::{JournalError, RestorePool, UNSEALED_ABANDON_ROTATIONS, restore_preconf_state},
+    journal::{JournalError, RestorePool, restore_preconf_state},
 };
 use thiserror::Error;
 
@@ -108,12 +108,7 @@ impl PreconfServiceBuilder {
         let broadcast_cap = cfg.broadcast_cap;
         let journal_path =
             cfg.journal_path.clone().ok_or(PreconfServiceError::MissingJournalPath)?;
-        // Abandon an unsealed commitment after `UNSEALED_ABANDON_ROTATIONS`
-        // rotation cadences without sealing (bounds the journal vs zombies).
-        let abandon_after = cfg.rejournal_interval * UNSEALED_ABANDON_ROTATIONS;
-        let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size)
-            .await?
-            .with_abandon_after(abandon_after);
+        let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size).await?;
         // Built from the validated config, before it is shared: the classifier
         // reads `all_preconfs` and the verdict grace period off it.
         let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
@@ -442,7 +437,7 @@ mod tests {
 
         // Fresh commit timestamps so `start`'s pre-restore rotate does not
         // age-abandon them before they can be replayed (see
-        // `journal::UNSEALED_ABANDON_ROTATIONS`).
+        // `journal::UNLANDED_ABANDON_ROTATIONS`).
         let now_ms =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
                 as u64;
@@ -477,21 +472,37 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
     }
 
-    /// An age-abandoned journal entry is pruned by `start`'s pre-restore rotate,
-    /// so it is never replayed into the pool/fifo. `UnreachablePool` panics if
-    /// `add_envelope` is reached, so a passing run proves the entry was dropped
-    /// before restore rather than re-injected.
+    /// A restore that cannot re-admit an entry gives the commitment up, and the
+    /// journal line goes with it — `start`'s prune runs *after* the replay pass,
+    /// keyed on the records that pass established, so there is no window in which
+    /// the file and the classifier disagree.
     #[tokio::test]
-    async fn start_prunes_age_abandoned_entry_before_restore() {
-        use crate::journal::JournalEntry;
-        use alloy_primitives::{Bytes, TxHash};
+    async fn start_prunes_an_entry_whose_commitment_cannot_be_honoured() {
+        use crate::journal::{JournalEntry, RestoreSkip, RestoredEnvelope};
+        use alloy_primitives::{Address, Bytes, TxHash};
+
+        #[derive(Clone)]
+        struct RejectingPool;
+
+        #[async_trait::async_trait]
+        impl RestorePool for RejectingPool {
+            async fn contains(&self, _hash: &TxHash) -> bool {
+                false
+            }
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+                Some((Address::from([0xB1; 20]), u64::from(tx_rlp[0])))
+            }
+            async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+                Err(RestoreSkip::Rejected("stub refuses to admit".into()))
+            }
+            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+        }
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
-        // Ancient commit timestamp ⇒ far older than the abandon window.
         svc.journal()
             .append_promised(&JournalEntry {
                 hash: TxHash::from([0xB1; 32]),
@@ -502,10 +513,15 @@ mod tests {
             .await
             .unwrap();
 
-        svc.start(&UnreachablePool, &UnreachableChain).await.unwrap();
+        // `RestoreSkip::Rejected` never consults the chain, so `UnreachableChain`
+        // is still the right stub here.
+        svc.start(&RejectingPool, &UnreachableChain).await.unwrap();
+
         assert!(
             svc.fifo().snapshot().await.is_empty(),
-            "age-abandoned entry must be pruned, not restored",
+            "a commitment the pool refuses reaches no fifo entry",
         );
+        let (remaining, _) = svc.journal().load().await.unwrap();
+        assert!(remaining.is_empty(), "and its journal line is pruned along with its record");
     }
 }

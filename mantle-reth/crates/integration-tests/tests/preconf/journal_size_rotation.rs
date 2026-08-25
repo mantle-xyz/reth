@@ -146,8 +146,8 @@ async fn size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet() {
 
     // ── Slot 2: submit tx1 (nonce=1). Its append pushes the file over the
     //    cap → the size trigger fires (first trigger, no rate-limit gap)
-    //    and the loop rotates, dropping the sealed tx0 and keeping the
-    //    still-unsealed tx1. ────────────────────────────────────────────
+    //    and the loop rotates, dropping the released tx0 and keeping the
+    //    still-owed tx1. ────────────────────────────────────────────────
     let tx1 = signed_transfer(chain_id, &wallet, 1).await;
     let hash1 = keccak256(&tx1);
 
