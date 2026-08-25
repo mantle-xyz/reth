@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-evm"
 version = "0.32.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -424,7 +424,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-hardforks"
 version = "0.5.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-chains",
  "alloy-hardforks",
@@ -5848,7 +5848,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "op-alloy"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "op-alloy-consensus",
  "op-alloy-network",
@@ -5860,7 +5860,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-consensus"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -5890,7 +5890,7 @@ checksum = "a79f352fc3893dcd670172e615afef993a41798a1d3fc0db88a3e60ef2e70ecc"
 [[package]]
 name = "op-alloy-network"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -5903,7 +5903,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-provider"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -5917,7 +5917,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-jsonrpsee"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-primitives",
  "jsonrpsee",
@@ -5926,7 +5926,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -5947,7 +5947,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types-engine"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=mantle-elysium#9eecb9e905adffb32aff26115cd108b801475be4"
+source = "git+https://github.com/mantle-xyz/mantle-v2?tag=v1.6.0#710dbc40b295a93e0c7eb474615faa1c3b8ae368"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
