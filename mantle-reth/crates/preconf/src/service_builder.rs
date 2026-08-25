@@ -435,9 +435,8 @@ mod tests {
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
-        // Fresh commit timestamps so `start`'s pre-restore rotate does not
-        // age-abandon them before they can be replayed (see
-        // `journal::UNLANDED_ABANDON_ROTATIONS`).
+        // Fresh commit timestamps, so the entries are ordinary in-flight
+        // commitments rather than anything a rotation would drop.
         let now_ms =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
                 as u64;
