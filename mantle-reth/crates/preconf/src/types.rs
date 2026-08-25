@@ -115,11 +115,17 @@ impl PreconfStatus {
 ///   Covers two triggers:
 ///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
 ///       crash.
-///     - **Reorg reinject** — the pool re-admits a previously sealed tx after reorg; the pool
-///       listener detects the case via `journal.sealed` membership. In both cases the Mantle
-///       preconf SLA (*"once a receipt has been returned to the client, the tx must land on
-///       chain"*) requires these entries to **bypass** the deadline and per-block gas budget gates.
-///       They remain subject to the status / dedup gates and the underlying block gas limit.
+///     - **Reorg reinject** — the pool re-admits a previously-promised tx after a reorg; the pool
+///       listener detects the case with `PreconfClassifier::is_promised`, i.e. "a `Success` receipt
+///       for this hash already went out to a client". Deliberately asked of the classifier rather
+///       than the journal: the journal's notion of a finished commitment is "canonical once", which
+///       is exactly what a reorg undoes, and the classifier answers synchronously so the listener's
+///       event loop never waits on the journal's async lock.
+///
+///   In both cases the Mantle preconf SLA (*"once a receipt has been returned to the client, the
+///   tx must land on chain"*) requires these entries to **bypass** the deadline and per-block gas
+///   budget gates. They remain subject to the status / dedup gates and the underlying block gas
+///   limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
     /// Live RPC submission — subject to all pre-apply gates.

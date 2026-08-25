@@ -34,9 +34,22 @@
 //!
 //! ## Why the allowlists live here and not on `PreconfConfig`
 //!
-//! The allowlists are private to [`PreconfClassifier`] on purpose: with no
-//! public `is_preconf_tx`, re-deriving eligibility somewhere new goes from
-//! "something you should not do" to "something you cannot do".
+//! The lists are private to [`PreconfClassifier`], and there is deliberately no
+//! public `is_preconf_tx` — no way to hand in a transaction and get back an
+//! answer derived from whatever the lists happen to say at that instant.
+//!
+//! That is **not** the same as "eligibility cannot be re-derived anywhere else".
+//! It can: [`PreconfClassifier::whitelist_snapshot`] hands out an
+//! `Arc<Whitelist>` and [`Whitelist::is_eligible`] evaluates the predicate
+//! against it, which is exactly what the payload builder does once per block to
+//! judge commitments against the allowlist in force at build time.
+//!
+//! What the shape buys is that re-deriving forces the caller to **name which
+//! allowlist it means**. A snapshot answers "who would be eligible under these
+//! lists"; it cannot answer the question this module owns — "what was this
+//! *already-admitted* transaction classified as" — because that answer is not a
+//! function of any list. It lives in the verdict cache, and every consumer that
+//! needs the partition to hold reads it from there.
 //!
 //! ## Locking
 //!

@@ -36,6 +36,13 @@ const COUNTERS: &[&str] = &[
     "preconf.journal.restore_unknown",
     "preconf.whitelist.zero_entry_skipped",
     "preconf.whitelist.revoked_total",
+    // The pair that says whether the in-memory allowlist is still tracking the
+    // contract. Seeding matters more than usual here: a refresh only ever runs on
+    // a governance update or a reorg, so on a quiet chain both series would stay
+    // unregistered for hours and "never refreshed" would be indistinguishable
+    // from "refreshing fine".
+    "preconf.whitelist.reload_ok",
+    "preconf.whitelist.reload_failed",
 ];
 
 /// Gauge series. Registered **non-destructively** via `increment(0.0)`: the
@@ -53,6 +60,7 @@ const GAUGES: &[&str] = &[
     "preconf.whitelist.from_wildcard_count",
     "preconf.whitelist.to_wildcard_count",
     "preconf.whitelist.warn_threshold",
+    "preconf.whitelist.consecutive_reload_failures",
 ];
 
 /// Histogram series. Registered only — never `record(0.0)`, which would inject

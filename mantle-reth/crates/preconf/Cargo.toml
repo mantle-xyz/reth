@@ -84,7 +84,7 @@ reth-payload-builder-primitives.workspace = true
 reth-payload-primitives.workspace = true
 
 # P5f fork dependencies — mantle's preconf payload builder is a fork of
-# `OpPayloadBuilder` (see `docs/design/preconf-dev-plan.md` §P5f).
+# `OpPayloadBuilder`.
 # We import upstream's `OpPayloadBuilderCtx` / `ExecutionInfo` /
 # `OpBuiltPayload` / `OpPayloadBuilderAttributes` directly, only the
 # build-loop body is forked.
@@ -148,8 +148,8 @@ tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "test-ut
 tempfile.workspace = true
 proptest.workspace = true
 
-# P6 e2e harness — in-process EVM tests for build_payload (see
-# `docs/design/preconf-dev-plan.md` §P6).
+# P6 e2e harness — in-process EVM tests for build_payload
+# (`tests/fork_builder.rs`).
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-optimism-chainspec.workspace = true
 reth-optimism-primitives.workspace = true

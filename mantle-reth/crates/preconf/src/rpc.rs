@@ -6,24 +6,35 @@
 //! handler that gets injected into `MantleRpcExt` when this node is acting
 //! as the sequencer with preconf enabled.
 //!
-//! Flow:
+//! Flow, labelled to match the `// Step N` markers in
+//! [`PreconfRpcHandler::handle_inner`] rather than renumbered — the steps are
+//! not contiguous, and 3b is the one most easily missed:
 //!
-//! 1. Decode + recover the raw transaction.
-//! 2. Whitelist check via [`PreconfClassifier::preview_eligibility`].
-//! 3. Nonce-gap + cumulative-balance pre-checks against a single `latest` snapshot and one pool
-//!    scan (`get_pending_nonce_and_cumulative_cost`).
-//! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
-//!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
-//!    builder could apply it before the responder is registered, dropping the receipt.
-//! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if the fifo
-//!    entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the builder.
-//! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return `Ok(Timeout
-//!    event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
-//!    (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
-//!    fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
-//!    and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
-//!    (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
-//!    `pending_responders`).
+//! * **Step 0** — Decode + recover the raw transaction.
+//! * **Step 1** — Whitelist *preview* via [`PreconfClassifier::preview_eligibility`]. A cheap
+//!   rejection for the common case and **non-authoritative by design**: it reads the allowlist
+//!   without claiming anything. Step 3b is what binds.
+//! * **Step 2** — Nonce-gap + cumulative-balance pre-checks against a single `latest` snapshot and
+//!   one pool scan (`get_pending_nonce_and_cumulative_cost`).
+//! * **Step 3** — Attach a oneshot responder to [`PreconfTxSet`] **before** calling
+//!   [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
+//!   builder could apply it before the responder is registered, dropping the receipt.
+//! * **Step 3b** — **Where eligibility is actually decided.** [`PreconfClassifier::claim_preconf`]
+//!   freezes the verdict, and the per-tx gas ceiling is enforced alongside it, both before the pool
+//!   ever sees the transaction. It has to happen here because the deciding fact — that the client
+//!   called `eth_sendRawTransactionWithPreconf` and not `eth_sendRawTransaction` — exists only at
+//!   this layer; one layer down the two are indistinguishable, since both reach the pool as
+//!   `TransactionOrigin::External`.
+//! * **Step 4** — Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if
+//!   the fifo entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the
+//!   builder.
+//! * **Step 5** — Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return
+//!   `Ok(Timeout event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
+//!   (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
+//!   fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
+//!   and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
+//!   (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
+//!   `pending_responders`).
 
 use std::sync::Arc;
 
@@ -359,9 +370,8 @@ where
         };
 
         match recv_result {
-            // Receipt arrived within the deadline. Persist on Success
-            // (best-effort — a crash before flush loses at most this
-            // single record).
+            // Receipt arrived within the deadline. Every receipt is recorded,
+            // reverts included — see `record_commitment`.
             Some(Ok(Ok(receipt))) => {
                 let event = PreconfTxEvent::from(receipt);
                 self.record_commitment(&event, hash, &sender, nonce, &bytes).await;

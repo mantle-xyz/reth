@@ -402,11 +402,14 @@ async fn insufficient_funds_pool_rejects() {
 /// NOT catch this first — the underlying pool validator's block-gas-limit
 /// check is what fires.
 ///
-/// Distinct from `per_tx_gas_ceiling_pool_rejects_before_fifo` (which
-/// tests the preconf-specific `PreconfGasLimitExceeded`); this test
-/// pins the wire surface for the reth-native `ExceedsGasLimit`-flavoured
-/// error, which SDKs cannot distinguish from other pool rejections
-/// without message parsing.
+/// Distinct from `per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool`, and the
+/// contrast is the point: there the preconf-specific ceiling fires at the RPC
+/// *before the pool is ever asked*, so the client gets
+/// `PreconfError::PreconfGasLimitExceeded`. Here both preconf caps are lifted
+/// out of the way on purpose, so the transaction reaches the pool and comes back
+/// wrapped in `PoolRejected` — the reth-native `ExceedsGasLimit` flavour, which
+/// SDKs cannot distinguish from any other pool rejection without parsing the
+/// message. The two tests pin the two sides of that boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn block_gas_limit_exceeded_pool_rejects() {
     let recipient: Address = RECIPIENT.parse().unwrap();

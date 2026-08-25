@@ -151,19 +151,28 @@ pub const WHITELIST_UPDATED_TOPIC0: B256 = B256::new([
 /// of them.
 pub const WHITELIST_WARN_THRESHOLD: usize = 1_000_000;
 
-/// How long one full list read may block before it is abandoned.
+/// How long reading the **whole allowlist** may block before it is abandoned.
+///
+/// One budget spans all three arrays, not one budget each: `read_all` builds a
+/// single `ReadBudget` and threads it through the three reads. What an operator
+/// cares about is how long a cold start or a refresh stalls, and three
+/// independent budgets would bound that at 3× the number written here — a
+/// discrepancy no reader of this constant would expect. (The standalone
+/// [`read_preconf_set`] / [`read_preconf_pairs`] entry points each still get a
+/// full fresh budget; they read one array by definition.)
 ///
 /// `read_preconf_set` takes the array length from **slot 0 of the configured
 /// address**, so a wrong-but-deployed contract supplies that number: the has-code
 /// check in [`bootstrap_whitelist`] proves *something* is deployed there, not
-/// that it is a `PreconfWhitelist`. Plausible slot-0 values, and what an
-/// unbounded loop would then do:
+/// that it is a `PreconfWhitelist`. A value that cannot be a length at all is
+/// refused in O(1) by [`WhitelistError::ImplausibleLength`] and never reaches
+/// this budget; what is left for it is the plausible-but-wrong middle, which is
+/// also where the nastiest case lives:
 ///
 /// | slot 0 happens to hold | value | blocked for (at 1.06 µs/entry) |
 /// |---|---|---|
 /// | a timestamp (`lastUpdated`, …) | ~1.77e9 | **~31 minutes** |
 /// | a wei amount / `totalSupply` | ~1e18 | ~34,000 years |
-/// | anything ≥ `u64::MAX` after saturation | 1.84e19 | ~620,000 years |
 ///
 /// Note the first row: it does not take an astronomical number, and the failure
 /// mode is the worst one available — no error, no progress, a node that has
@@ -174,12 +183,32 @@ pub const WHITELIST_WARN_THRESHOLD: usize = 1_000_000;
 /// force — the same split every read error takes.
 pub const WHITELIST_READ_BUDGET: Duration = Duration::from_secs(30);
 
-/// How often the budget is checked inside the read loop, in **storage reads**.
+/// How often the budget is checked inside the read loop, in **storage reads**,
+/// counted per array rather than across the whole allowlist.
 ///
 /// Large enough that the `Instant::now()` cost is noise against 4096 storage
 /// reads (~4ms at the measured rate), small enough to bound overshoot to well
 /// under a second.
+///
+/// Per array is load-bearing now that one budget spans three of them
+/// ([`read_all`]): a shared stride counter would leave the second array starting
+/// mid-stride, so a list shorter than the stride could run to completion without
+/// checking the budget even once — and the third could do the same after it. Per
+/// array, every list checks on its first charge whatever ran before it.
 const BUDGET_CHECK_STRIDE: u64 = 4096;
+
+/// What an exhausted budget reports: where the whole read stands, and how much
+/// of that the current array is responsible for.
+///
+/// Both figures, because with one budget spanning three arrays neither is
+/// enough alone — see [`WhitelistError::ReadBudgetExceeded`].
+struct BudgetSpent {
+    /// Since the budget was constructed, i.e. what [`WHITELIST_READ_BUDGET`]
+    /// bounds.
+    total: Duration,
+    /// Since the current array's [`ReadBudget::begin_array`].
+    on_this_array: Duration,
+}
 
 /// Enforces [`WHITELIST_READ_BUDGET`] across a read loop.
 ///
@@ -189,31 +218,61 @@ const BUDGET_CHECK_STRIDE: u64 = 4096;
 /// frequency for pairs and double the overshoot, while the constant above claims
 /// to bound both. Charging what is actually spent keeps one budget meaningful
 /// for both.
-struct ReadBudget {
+///
+/// The clock starts at construction, so **who constructs it decides what the
+/// budget covers**: [`read_all`] builds one for the whole allowlist, while the
+/// single-array entry points build their own. `pub(crate)` only because it
+/// appears in the `_within` signatures; nothing outside this module builds one.
+///
+/// Two counters and two clocks, because those two scopes both matter: the
+/// budget is enforced against the whole read, but an abort has to say *which
+/// list* it stopped in and how much of the spend happened there — otherwise a
+/// budget eaten by `exactPairs` is reported against `fromWildcards`, naming the
+/// innocent array.
+pub(crate) struct ReadBudget {
     started: Instant,
     budget: Duration,
+    /// Every read charged, across every array. The shared-budget property is
+    /// pinned through this.
     reads: u64,
+    /// Reads charged since [`Self::begin_array`] — what the stride counts, and
+    /// why every array checks on its first charge. See [`BUDGET_CHECK_STRIDE`].
+    reads_this_array: u64,
+    array_started: Instant,
 }
 
 impl ReadBudget {
     fn new(budget: Duration) -> Self {
-        Self { started: Instant::now(), budget, reads: 0 }
+        let started = Instant::now();
+        Self { started, budget, reads: 0, reads_this_array: 0, array_started: started }
     }
 
-    /// Charges one storage read. `Some(elapsed)` means the budget is spent and
-    /// the caller must abort **without** performing that read.
+    /// Marks the start of one array's read: restarts the stride so this array
+    /// checks the budget immediately, and the clock that attributes spend to it.
     ///
-    /// The first call always checks, so a zero budget does no work at all —
-    /// that is the intended contract of the test seam, not an edge case. The
-    /// comparison is `>=` rather than `>` because `elapsed` can legitimately
-    /// read back as 0ns and `> 0` would then let a whole stride through.
-    fn charge(&mut self) -> Option<Duration> {
-        let check = self.reads.is_multiple_of(BUDGET_CHECK_STRIDE);
+    /// Called by each `_within` reader on entry, so a fresh budget's first array
+    /// is a no-op and every later one gets a clean slate.
+    fn begin_array(&mut self) {
+        self.reads_this_array = 0;
+        self.array_started = Instant::now();
+    }
+
+    /// Charges one storage read. `Some(..)` means the budget is spent and the
+    /// caller must abort **without** performing that read.
+    ///
+    /// The first charge of **each array** always checks, so a zero budget does
+    /// no work at all — that is the intended contract of the test seam, not an
+    /// edge case. The comparison is `>=` rather than `>` because the elapsed
+    /// time can legitimately read back as 0ns and `> 0` would then let a whole
+    /// stride through.
+    fn charge(&mut self) -> Option<BudgetSpent> {
+        let check = self.reads_this_array.is_multiple_of(BUDGET_CHECK_STRIDE);
         self.reads += 1;
+        self.reads_this_array += 1;
         if check {
-            let elapsed = self.started.elapsed();
-            if elapsed >= self.budget {
-                return Some(elapsed);
+            let total = self.started.elapsed();
+            if total >= self.budget {
+                return Some(BudgetSpent { total, on_this_array: self.array_started.elapsed() });
             }
         }
         None
@@ -267,6 +326,34 @@ pub enum WhitelistError {
         found: u64,
     },
 
+    /// A dynamic array's length slot holds a number that cannot be a length.
+    ///
+    /// A Solidity array grows one `push` at a time, so its length is bounded by
+    /// the number of `SSTORE`s ever executed against the contract — it cannot
+    /// come near `u64::MAX`, let alone exceed it. A value that does is proof the
+    /// slot is not a length, and saying so costs one comparison instead of a
+    /// whole [`WHITELIST_READ_BUDGET`] spent proving it the slow way.
+    ///
+    /// The archetype is an **address** in the length slot: as a `U256` an address
+    /// is ~1.46e48, so every address but a freakishly small one lands here. That
+    /// is what pointing `--preconf.whitelist-contract` at some other contract's
+    /// storage tends to look like from this side.
+    ///
+    /// **Not a cap on the list.** Length is governance's decision (see
+    /// [`WHITELIST_WARN_THRESHOLD`]); this is a well-formedness check, and no
+    /// array a machine could ever finish reading is affected by it.
+    #[error(
+        "preconf whitelist contract {contract} slot {slot} holds {claimed}, which cannot be an array length — check that --preconf.whitelist-contract points at a PreconfWhitelist"
+    )]
+    ImplausibleLength {
+        /// Configured contract address.
+        contract: Address,
+        /// Array slot whose length was read.
+        slot: u64,
+        /// The raw value the slot held.
+        claimed: U256,
+    },
+
     /// The read did not finish within [`WHITELIST_READ_BUDGET`].
     ///
     /// Two very different causes, and this error cannot tell them apart — hence
@@ -275,19 +362,33 @@ pub enum WhitelistError {
     /// * the address does not point at a `PreconfWhitelist`, so slot 0 supplied a nonsense length
     ///   (by far the likelier cause — see [`WHITELIST_READ_BUDGET`]);
     /// * the list is genuine but larger than this machine can read inside the budget.
+    ///
+    /// **Two durations, because the budget spans three arrays and the abort
+    /// happens in one of them.** `elapsed` is what the budget bounds; `slot` /
+    /// `claimed_len` / `read` describe only where it ran out. Reporting one
+    /// without the other invites the worst misreading available: `exactPairs`
+    /// eats the whole budget, `fromWildcards` trips on its first charge, and the
+    /// message reads "slot 2 abandoned after 30s: read 0 of 5 entries" —
+    /// pointing the operator at a five-element list that cost nothing.
+    /// `on_this_array` is what settles it, and near-zero there means the culprit
+    /// is an earlier list.
     #[error(
-        "whitelist read at {contract} slot {slot} abandoned after {elapsed:?}: read {read} of {claimed_len} claimed entries — check that --preconf.whitelist-contract points at a PreconfWhitelist, or raise WHITELIST_READ_BUDGET if the list really is this large"
+        "whitelist read at {contract} abandoned after {elapsed:?} (one budget covers all three lists); it ran out in slot {slot} at {read} of {claimed_len} claimed entries, {on_this_array:?} of the spend on that list — check that --preconf.whitelist-contract points at a PreconfWhitelist, or raise WHITELIST_READ_BUDGET if the lists really are this large"
     )]
     ReadBudgetExceeded {
         /// Configured contract address.
         contract: Address,
-        /// Array slot being read.
+        /// Array slot being read when the budget ran out.
         slot: u64,
-        /// Length the slot claimed.
+        /// Length that slot claimed.
         claimed_len: u64,
-        /// How many entries were read before giving up.
+        /// How many of that array's entries were read before giving up.
         read: u64,
-        /// Time spent before giving up.
+        /// Time spent on that array alone. Near-zero means an earlier array
+        /// spent the budget.
+        on_this_array: Duration,
+        /// Time spent on the whole allowlist read — the figure
+        /// [`WHITELIST_READ_BUDGET`] bounds.
         elapsed: Duration,
     },
 }
@@ -316,7 +417,8 @@ fn array_data_base(slot: u64) -> U256 {
     U256::from_be_bytes(keccak256(B256::from(U256::from(slot))).0)
 }
 
-/// Reads the `address[]` at `list_slot` out of `contract`'s storage.
+/// Reads the `address[]` at `list_slot` out of `contract`'s storage, against a
+/// full fresh [`WHITELIST_READ_BUDGET`].
 ///
 /// The length is not capped, only the time spent reading it — see
 /// [`WHITELIST_READ_BUDGET`]. Zero entries are skipped; see `report_zero_entries`
@@ -326,33 +428,35 @@ pub fn read_preconf_set(
     contract: Address,
     list_slot: u64,
 ) -> Result<HashSet<Address>, WhitelistError> {
-    read_preconf_set_within(state, contract, list_slot, WHITELIST_READ_BUDGET)
+    read_preconf_set_within(state, contract, list_slot, &mut ReadBudget::new(WHITELIST_READ_BUDGET))
 }
 
-/// [`read_preconf_set`] with an explicit budget.
+/// [`read_preconf_set`] against a caller-owned budget.
 ///
-/// Injected rather than read from the constant so both sides of the budget check
-/// are testable without making a test actually spend 30 seconds.
+/// Taken by `&mut` rather than constructed here so [`read_all`] can spend **one**
+/// budget across all three arrays (see [`WHITELIST_READ_BUDGET`]), and so a test
+/// can drive both sides of the check without actually spending 30 seconds.
 pub(crate) fn read_preconf_set_within(
     state: &StateProviderBox,
     contract: Address,
     list_slot: u64,
-    budget: Duration,
+    budget: &mut ReadBudget,
 ) -> Result<HashSet<Address>, WhitelistError> {
+    budget.begin_array();
     let claimed_len = claimed_array_len(state, contract, list_slot)?;
     let base = array_data_base(list_slot);
-    let mut budget = ReadBudget::new(budget);
     let mut out = HashSet::default();
     let mut zeros = 0u64;
 
     for i in 0..claimed_len {
-        if let Some(elapsed) = budget.charge() {
+        if let Some(spent) = budget.charge() {
             return Err(WhitelistError::ReadBudgetExceeded {
                 contract,
                 slot: list_slot,
                 claimed_len,
                 read: i,
-                elapsed,
+                on_this_array: spent.on_this_array,
+                elapsed: spent.total,
             });
         }
         let addr = read_address(state, contract, base, i)?;
@@ -383,20 +487,25 @@ pub fn read_preconf_pairs(
     contract: Address,
     list_slot: u64,
 ) -> Result<HashSet<(Address, Address)>, WhitelistError> {
-    read_preconf_pairs_within(state, contract, list_slot, WHITELIST_READ_BUDGET)
+    read_preconf_pairs_within(
+        state,
+        contract,
+        list_slot,
+        &mut ReadBudget::new(WHITELIST_READ_BUDGET),
+    )
 }
 
-/// [`read_preconf_pairs`] with an explicit budget. Injected for the same reason
-/// as [`read_preconf_set_within`]'s.
+/// [`read_preconf_pairs`] against a caller-owned budget, for the same reasons as
+/// [`read_preconf_set_within`]'s.
 pub(crate) fn read_preconf_pairs_within(
     state: &StateProviderBox,
     contract: Address,
     list_slot: u64,
-    budget: Duration,
+    budget: &mut ReadBudget,
 ) -> Result<HashSet<(Address, Address)>, WhitelistError> {
+    budget.begin_array();
     let claimed_len = claimed_array_len(state, contract, list_slot)?;
     let base = array_data_base(list_slot);
-    let mut budget = ReadBudget::new(budget);
     let mut out = HashSet::default();
     let mut zeros = 0u64;
 
@@ -405,13 +514,14 @@ pub(crate) fn read_preconf_pairs_within(
         // element would make the effective stride 8192 reads while the constant
         // says 4096.
         for _ in 0..2 {
-            if let Some(elapsed) = budget.charge() {
+            if let Some(spent) = budget.charge() {
                 return Err(WhitelistError::ReadBudgetExceeded {
                     contract,
                     slot: list_slot,
                     claimed_len,
                     read: i,
-                    elapsed,
+                    on_this_array: spent.on_this_array,
+                    elapsed: spent.total,
                 });
             }
         }
@@ -430,16 +540,24 @@ pub(crate) fn read_preconf_pairs_within(
 
 /// The length a dynamic array claims, taken from its declaring slot.
 ///
-/// Saturating: a length beyond `u64` is nonsense anyway, and the read budget is
-/// what stops us acting on it. Keeping the claimed value for the error message
-/// is deliberate — "read 4096 of 18446744073709551615" is what tells an operator
-/// they have the wrong address.
+/// A value past `u64` is refused outright rather than saturated — see
+/// [`WhitelistError::ImplausibleLength`] for why that is a statement about the
+/// slot rather than a limit on the list. Anything below is taken at face value,
+/// with [`WHITELIST_READ_BUDGET`] left to stop us acting on a merely implausible
+/// one; carrying the claimed number into that error is deliberate, because
+/// "read 4096 of 1770000000" is what tells an operator they have the wrong
+/// address.
 fn claimed_array_len(
     state: &StateProviderBox,
     contract: Address,
     list_slot: u64,
 ) -> Result<u64, WhitelistError> {
     let raw = state.storage(contract, B256::from(U256::from(list_slot)))?.unwrap_or_default();
+    if raw > U256::from(u64::MAX) {
+        return Err(WhitelistError::ImplausibleLength { contract, slot: list_slot, claimed: raw });
+    }
+    // Exact after the bound above; `saturating_to` rather than `to` only so that
+    // editing that bound can never turn this into a panic.
     Ok(raw.saturating_to::<u64>())
 }
 
@@ -578,6 +696,29 @@ pub fn reload_whitelist<P: WhitelistState>(
 ) -> Result<(), WhitelistError> {
     let Some(contract) = wants_whitelist(cfg) else { return Ok(()) };
 
+    // Counted here rather than at the watcher's call site so the outcome is
+    // recorded however the reload was triggered. **A failed refresh is otherwise
+    // invisible to monitoring**: the lists stay as they were, so the three
+    // `preconf.whitelist.*_count` gauges keep publishing their last-good sizes
+    // and a node running indefinitely on a stale allowlist looks exactly like a
+    // healthy one. These two counters are the only continuous signal that the
+    // mirror is still tracking the contract; alert on `reload_failed` rising, or
+    // on the age of the last `reload_ok`.
+    let result = reload_from_state(provider, contract, classifier);
+    match &result {
+        Ok(()) => metrics::counter!("preconf.whitelist.reload_ok").increment(1),
+        Err(_) => metrics::counter!("preconf.whitelist.reload_failed").increment(1),
+    }
+    result
+}
+
+/// [`reload_whitelist`]'s body, split out so every exit is funnelled through the
+/// one place that records the outcome.
+fn reload_from_state<P: WhitelistState>(
+    provider: &P,
+    contract: Address,
+    classifier: &PreconfClassifier,
+) -> Result<(), WhitelistError> {
     let state = provider.latest_state()?;
     let (pairs, from_wildcards, to_wildcards) = read_all(&state, contract)?;
 
@@ -603,10 +744,24 @@ type AllowlistSets = (HashSet<(Address, Address)>, HashSet<Address>, HashSet<Add
 /// combination governance never wrote — a pair whose covering wildcard has
 /// already been revoked, say. `latest()` is taken once by the caller and shared
 /// here, so the three reads see the same state.
+///
+/// One [`ReadBudget`] for all three for a different reason: what it bounds is how
+/// long a caller stalls, and a caller stalls once for the whole allowlist. See
+/// [`WHITELIST_READ_BUDGET`].
 fn read_all(state: &StateProviderBox, contract: Address) -> Result<AllowlistSets, WhitelistError> {
-    let pairs = read_preconf_pairs(state, contract, PAIRS_SLOT)?;
-    let from_wildcards = read_preconf_set(state, contract, FROM_WILDCARDS_SLOT)?;
-    let to_wildcards = read_preconf_set(state, contract, TO_WILDCARDS_SLOT)?;
+    read_all_within(state, contract, &mut ReadBudget::new(WHITELIST_READ_BUDGET))
+}
+
+/// [`read_all`] against a caller-owned budget, so a test can observe that the
+/// three reads really do draw on the same one.
+fn read_all_within(
+    state: &StateProviderBox,
+    contract: Address,
+    budget: &mut ReadBudget,
+) -> Result<AllowlistSets, WhitelistError> {
+    let pairs = read_preconf_pairs_within(state, contract, PAIRS_SLOT, budget)?;
+    let from_wildcards = read_preconf_set_within(state, contract, FROM_WILDCARDS_SLOT, budget)?;
+    let to_wildcards = read_preconf_set_within(state, contract, TO_WILDCARDS_SLOT, budget)?;
     Ok((pairs, from_wildcards, to_wildcards))
 }
 
@@ -757,18 +912,41 @@ pub async fn run_whitelist_watcher<Pr, N>(
     let mut stream = provider.canonical_state_stream();
     info!(target: "mantle::preconf::whitelist", %contract, "whitelist watcher started");
 
+    // How many refreshes in a row have failed. Published as a gauge because the
+    // *streak* is what distinguishes a transient miss (self-healing, see below)
+    // from a node stuck on a stale allowlist — a raw failure counter alone cannot
+    // tell those apart, and neither can the size gauges, which happily keep
+    // reporting the last good read.
+    let mut consecutive_failures: u64 = 0;
+
     while let Some(notif) = stream.next().await {
         if !should_reload(&notif, contract) {
             continue;
         }
 
-        if let Err(err) = reload_whitelist(&provider, &cfg, &classifier) {
-            warn!(
-                target: "mantle::preconf::whitelist",
-                %err, %contract, reverted = notif.reverted().is_some(),
-                "whitelist refresh failed; keeping previous allowlists",
-            );
+        match reload_whitelist(&provider, &cfg, &classifier) {
+            Ok(()) => {
+                if consecutive_failures > 0 {
+                    info!(
+                        target: "mantle::preconf::whitelist",
+                        %contract, after_failures = consecutive_failures,
+                        "whitelist refresh recovered; the allowlist is tracking the contract again",
+                    );
+                }
+                consecutive_failures = 0;
+            }
+            Err(err) => {
+                consecutive_failures += 1;
+                warn!(
+                    target: "mantle::preconf::whitelist",
+                    %err, %contract, reverted = notif.reverted().is_some(),
+                    consecutive_failures,
+                    "whitelist refresh failed; keeping previous allowlists",
+                );
+            }
         }
+        metrics::gauge!("preconf.whitelist.consecutive_reload_failures")
+            .set(consecutive_failures as f64);
     }
 
     debug!(target: "mantle::preconf::whitelist", "whitelist watcher stopped");
@@ -1192,7 +1370,9 @@ mod tests {
         let provider = provider_with(&[(addr(1), addr(2))], &[], &[], true);
         let state = provider.latest_state().unwrap();
 
-        let err = read_preconf_pairs_within(&state, WL, PAIRS_SLOT, Duration::ZERO).unwrap_err();
+        let err =
+            read_preconf_pairs_within(&state, WL, PAIRS_SLOT, &mut ReadBudget::new(Duration::ZERO))
+                .unwrap_err();
         assert!(
             matches!(err, WhitelistError::ReadBudgetExceeded { read: 0, claimed_len: 1, .. }),
             "got {err:?}",
@@ -1216,6 +1396,39 @@ mod tests {
         assert_eq!(ample.reads, n, "every charge is one read");
     }
 
+    /// **The stride restarts with each array**, so a list reached after the
+    /// budget is already spent still aborts on its *first* charge.
+    ///
+    /// The regression this guards: with one stride counter shared across
+    /// [`read_all`]'s three reads, the second array would start mid-stride, and
+    /// any list shorter than [`BUDGET_CHECK_STRIDE`] could then run to
+    /// completion without checking the budget once — silently overshooting the
+    /// bound this whole type exists to enforce.
+    ///
+    /// The budget is shortened mid-test rather than waited out, because the
+    /// alternative is a timing-dependent test of a time-based guard.
+    #[test]
+    fn the_stride_restarts_with_each_array() {
+        let mut budget = ReadBudget::new(Duration::from_secs(3600));
+
+        // Leave the shared counter mid-stride, as a long first array would.
+        for _ in 0..(BUDGET_CHECK_STRIDE + 1) {
+            assert!(budget.charge().is_none());
+        }
+        assert_eq!(budget.reads, BUDGET_CHECK_STRIDE + 1);
+        assert!(
+            !budget.reads.is_multiple_of(BUDGET_CHECK_STRIDE),
+            "the shared counter must be mid-stride, or this proves nothing",
+        );
+
+        budget.budget = Duration::ZERO;
+        budget.begin_array();
+        assert!(
+            budget.charge().is_some(),
+            "each array must check its budget on its first charge, whatever ran before it",
+        );
+    }
+
     /// **The list length is not a limit** — see [`WHITELIST_WARN_THRESHOLD`].
     ///
     /// Reads 1.2M entries (20% past the warn threshold) from the mock. Costs
@@ -1232,14 +1445,95 @@ mod tests {
         let state = provider.latest_state().unwrap();
 
         // Generous budget: the point is that *length* does not reject.
-        let got =
-            read_preconf_set_within(&state, WL, FROM_WILDCARDS_SLOT, Duration::from_secs(3600));
+        let got = read_preconf_set_within(
+            &state,
+            WL,
+            FROM_WILDCARDS_SLOT,
+            &mut ReadBudget::new(Duration::from_secs(3600)),
+        );
         assert!(got.is_ok(), "an over-threshold list must still load, got {got:?}");
     }
 
-    /// A nonsense length — the signature of an address that is not a
-    /// `PreconfWhitelist` — must fail in **bounded** time rather than hang the
-    /// node — see [`WHITELIST_READ_BUDGET`] for how long unbounded would be.
+    /// **One budget covers the whole allowlist**, not one per array — see
+    /// [`WHITELIST_READ_BUDGET`]. Asserted through the read count, which is the
+    /// only deterministic window onto a shared budget: a per-array budget would
+    /// reset `reads` to 0 twice on the way through.
+    #[test]
+    fn read_all_spends_a_single_budget_across_all_three_arrays() {
+        let provider = provider_with(&[(addr(1), addr(2))], &[addr(3)], &[addr(4), addr(5)], true);
+        let state = provider.latest_state().unwrap();
+
+        let mut budget = ReadBudget::new(Duration::from_secs(3600));
+        read_all_within(&state, WL, &mut budget).unwrap();
+
+        // One pair costs two reads, each wildcard one: 2 + 1 + 2.
+        assert_eq!(budget.reads, 5, "every read across all three arrays draws on the same budget");
+    }
+
+    /// The other half of a shared budget: when it runs out, the error must not
+    /// blame the array that merely happened to be next.
+    ///
+    /// Here `exactPairs` reads fine and then the budget is spent, so the
+    /// `fromWildcards` read aborts immediately. `slot` / `read` / `claimed_len`
+    /// point at `fromWildcards` because that is where it stopped — but
+    /// `on_this_array` is near zero, which is what tells an operator the cost
+    /// was incurred earlier. Without that field the message reads "slot 2
+    /// abandoned after 30s: read 0 of 1 entries" and indicts a one-element list.
+    #[test]
+    fn a_budget_spent_by_an_earlier_array_is_not_blamed_on_the_next_one() {
+        let provider = provider_with(&[(addr(1), addr(2))], &[addr(3)], &[], true);
+        let state = provider.latest_state().unwrap();
+
+        const SPENT_EARLIER: Duration = Duration::from_millis(50);
+
+        let mut budget = ReadBudget::new(Duration::from_secs(3600));
+        let pairs = read_preconf_pairs_within(&state, WL, PAIRS_SLOT, &mut budget).unwrap();
+        assert_eq!(pairs.len(), 1, "the first array must succeed, or this proves nothing");
+
+        // Stand in for a pairs read that was genuinely slow. Real time, not a
+        // shortened budget: the two durations are only distinguishable if the
+        // earlier array actually occupied the clock, and separating them is the
+        // whole point of the test.
+        std::thread::sleep(SPENT_EARLIER);
+        budget.budget = Duration::ZERO;
+        let err =
+            read_preconf_set_within(&state, WL, FROM_WILDCARDS_SLOT, &mut budget).unwrap_err();
+
+        match err {
+            WhitelistError::ReadBudgetExceeded {
+                slot,
+                claimed_len,
+                read,
+                on_this_array,
+                elapsed,
+                ..
+            } => {
+                assert_eq!(slot, FROM_WILDCARDS_SLOT, "it stopped in the wildcard list");
+                assert_eq!((claimed_len, read), (1, 0), "having read none of it");
+                assert!(
+                    elapsed >= SPENT_EARLIER,
+                    "the total must cover the earlier array's time; got {elapsed:?}",
+                );
+                // The load-bearing assertion: wire `on_this_array` to the shared
+                // clock and this crosses 50ms and fails.
+                assert!(
+                    on_this_array < SPENT_EARLIER / 5,
+                    "this array cost nothing; the budget went earlier. got {on_this_array:?} \
+                     of {elapsed:?}",
+                );
+            }
+            other => panic!("expected ReadBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    /// A length that is *representable* but nonsense must still fail in
+    /// **bounded** time rather than hang the node — see [`WHITELIST_READ_BUDGET`]
+    /// for how long unbounded would be.
+    ///
+    /// `u64::MAX` doubles as the boundary of the O(1) check above: it is the
+    /// largest value [`WhitelistError::ImplausibleLength`] still lets through, so
+    /// this also pins that the two guards meet without a gap and without the
+    /// cheap one having grown into a policy cap.
     ///
     /// A zero budget is used so the test is deterministic and instant.
     #[test]
@@ -1250,8 +1544,13 @@ mod tests {
         provider.add_account(WL, account);
         let state = provider.latest_state().unwrap();
 
-        let err =
-            read_preconf_set_within(&state, WL, FROM_WILDCARDS_SLOT, Duration::ZERO).unwrap_err();
+        let err = read_preconf_set_within(
+            &state,
+            WL,
+            FROM_WILDCARDS_SLOT,
+            &mut ReadBudget::new(Duration::ZERO),
+        )
+        .unwrap_err();
         match err {
             WhitelistError::ReadBudgetExceeded { claimed_len, read, .. } => {
                 assert_eq!(claimed_len, u64::MAX, "the claimed length belongs in the error");
@@ -1261,23 +1560,52 @@ mod tests {
         }
     }
 
-    /// A U256 length beyond `u64` saturates rather than wrapping — wrapping could
-    /// turn an absurd length into a small plausible one and load garbage
-    /// addresses silently.
+    /// A length past `u64` is refused **before the loop and without a budget**:
+    /// no Solidity array can be that long, so the slot is not a length. Note the
+    /// generous budget — the point is that this costs no time at all, where the
+    /// old saturating behaviour spent the whole budget proving the same thing.
     #[test]
-    fn an_over_u64_length_saturates_and_is_abandoned() {
+    fn an_over_u64_length_is_refused_without_reading_anything() {
         let account = ExtendedAccount::new(0, U256::ZERO)
             .extend_storage([(B256::from(U256::from(FROM_WILDCARDS_SLOT)), U256::MAX)]);
         let provider = MockEthProvider::default();
         provider.add_account(WL, account);
         let state = provider.latest_state().unwrap();
 
+        let mut budget = ReadBudget::new(Duration::from_secs(3600));
         let err =
-            read_preconf_set_within(&state, WL, FROM_WILDCARDS_SLOT, Duration::ZERO).unwrap_err();
+            read_preconf_set_within(&state, WL, FROM_WILDCARDS_SLOT, &mut budget).unwrap_err();
         assert!(
-            matches!(err, WhitelistError::ReadBudgetExceeded { claimed_len: u64::MAX, .. }),
+            matches!(
+                err,
+                WhitelistError::ImplausibleLength { contract, slot: FROM_WILDCARDS_SLOT, claimed }
+                    if contract == WL && claimed == U256::MAX
+            ),
             "got {err:?}",
         );
+        assert_eq!(budget.reads, 0, "the refusal must not cost a single storage read");
+    }
+
+    /// **The case this check exists for**: an address in the length slot, which
+    /// is what a `--preconf.whitelist-contract` aimed at some other contract's
+    /// storage looks like from here. As a `U256` an address is ~1.46e48, so it
+    /// can never be mistaken for a length.
+    #[test]
+    fn an_address_in_the_length_slot_is_refused_rather_than_read() {
+        let planted = U256::from_be_bytes(addr(0xab).into_word().0);
+        let account = ExtendedAccount::new(0, U256::ZERO)
+            .extend_storage([(B256::from(U256::from(PAIRS_SLOT)), planted)]);
+        let provider = MockEthProvider::default();
+        provider.add_account(WL, account);
+        let state = provider.latest_state().unwrap();
+
+        let mut budget = ReadBudget::new(Duration::from_secs(3600));
+        let err = read_preconf_pairs_within(&state, WL, PAIRS_SLOT, &mut budget).unwrap_err();
+        assert!(
+            matches!(err, WhitelistError::ImplausibleLength { claimed, .. } if claimed == planted),
+            "got {err:?}",
+        );
+        assert_eq!(budget.reads, 0);
     }
 
     // ===== bootstrap =====

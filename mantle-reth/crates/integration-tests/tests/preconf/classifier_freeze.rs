@@ -17,8 +17,7 @@
 //! The single test mutates the allowlist **after** both txs are admitted, which is only
 //! possible because `launch_preconf_node_with_classifier!` hands back the node's own
 //! `Arc<PreconfClassifier>`. It asserts on the resolved payload rather than a canonical
-//! block, staying clear of the harness's parallel-load flakiness (see
-//! `docs/preconf-integration-test-harness-issues.md` problem 1).
+//! block, staying clear of the harness's parallel-load flakiness.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
 use crate::launch_preconf_node_with_classifier;

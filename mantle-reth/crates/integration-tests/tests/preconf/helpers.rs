@@ -26,10 +26,9 @@ pub fn mantle_test_chain_spec() -> Arc<OpChainSpec> {
 /// The shipped fixture has `extraData: 0x00`, which encodes no parameters at all. Since
 /// `newPayload` derives a block's expected base fee by decoding the parameters off its
 /// **parent**, anything built on genesis was rejected `Invalid { "base fee missing" }` and
-/// the head silently stayed at 0 — the root cause of this suite's long-running flakiness
-/// (see `docs/preconf-integration-test-harness-issues.md` problem 1). Giving genesis the
-/// same encoding its children use makes the parent decode succeed, which is what
-/// [`canonicalize_payload!`] relies on.
+/// the head silently stayed at 0 — the root cause of this suite's long-running flakiness.
+/// Giving genesis the same encoding its children use makes the parent decode succeed,
+/// which is what [`canonicalize_payload!`] relies on.
 const GENESIS_EIP1559_EXTRA_DATA: &str = "0x0100000008000000020000000000000000";
 
 /// The shared genesis fixture with `chainId` patched and
@@ -548,7 +547,7 @@ pub const CANON_POLL_TICKS: usize = 200;
 /// committed. Bridging that gap with a fixed `sleep`, as this suite used to, is a race:
 /// under parallel load the commit takes longer, the test reads pre-block state, and the
 /// failure surfaces as a wrong balance or a stale nonce rather than as "canonicalisation was
-/// slow" (see `docs/preconf-integration-test-harness-issues.md` problem 1). Polling on the
+/// slow". Polling on the
 /// observable condition removes the guess, and failing to converge panics with the block
 /// number and hash, so a real canonicalisation failure is distinguishable from a slow one.
 ///
