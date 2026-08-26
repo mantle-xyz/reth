@@ -5195,6 +5195,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-reth-flashblocks-types"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rpc-types-engine",
+ "brotli",
+ "op-alloy-consensus",
+ "op-alloy-rpc-types-engine",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mantle-reth-integration-tests"
 version = "0.1.0"
 dependencies = [
@@ -5210,6 +5224,7 @@ dependencies = [
  "mantle-reth-chainspec",
  "mantle-reth-cli",
  "mantle-reth-eth-api",
+ "mantle-reth-flashblocks-types",
  "mantle-reth-preconf",
  "mantle-reth-rpc-ext",
  "op-alloy-consensus",
