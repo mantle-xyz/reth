@@ -129,9 +129,14 @@ lint: fmt clippy
 # Doctests run here too, but with DEFAULT features so they reuse the codegen from the
 # `--lib` build above (~30s incremental). The exhaustive `--all-features` doctest pass
 # is a full from-scratch build (~11min) and stays in nightly (`just test-doc`).
+#
+# The node-spawning integration tests run under nextest with `--retries 2`: an
+# irreducible ~1-in-8 timing blip hits a different test each run (systematic
+# classes are already code-fixed), and retries absorb it while still reporting
+# any flaky-passed test. Doctests stay on `cargo test` (nextest can't run them).
 test-ci:
   cargo test --workspace --lib
-  cargo test -p mantle-reth-integration-tests --tests
+  cargo nextest run -p mantle-reth-integration-tests --tests --retries 2
   cargo test --doc --workspace
 
 # Run the full local test suite (examples + benches + all features)

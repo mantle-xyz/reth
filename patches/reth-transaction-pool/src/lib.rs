@@ -745,6 +745,14 @@ where
         self.pool.get_highest_consecutive_transaction_by_sender(sender, on_chain_nonce)
     }
 
+    fn get_pending_nonce_and_cumulative_cost(
+        &self,
+        sender: Address,
+        on_chain_nonce: u64,
+    ) -> (u64, U256) {
+        self.pool.get_pending_nonce_and_cumulative_cost(sender, on_chain_nonce)
+    }
+
     fn get_transaction_by_sender_and_nonce(
         &self,
         sender: Address,

@@ -25,6 +25,10 @@ reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-node-core.workspace = true
 reth-db.workspace = true
+reth-db-api.workspace = true
+reth-tasks.workspace = true
+reth-rpc-api.workspace = true
+reth-rpc-eth-api.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-transaction-pool.workspace = true
@@ -33,26 +37,32 @@ reth-transaction-pool.workspace = true
 reth-optimism-chainspec.workspace = true
 reth-optimism-cli.workspace = true
 reth-optimism-evm.workspace = true
+reth-optimism-exex.workspace = true
 reth-optimism-forks.workspace = true
 reth-optimism-node.workspace = true
 reth-optimism-payload-builder.workspace = true
 reth-optimism-primitives.workspace = true
 reth-optimism-rpc.workspace = true
 reth-optimism-storage.workspace = true
+reth-optimism-trie.workspace = true
 reth-optimism-txpool.workspace = true
 
 # mantle-reth
 mantle-reth-chainspec = { path = "../chainspec" }
+mantle-reth-preconf = { path = "../preconf" }
 mantle-reth-rpc-ext = { path = "../rpc-ext" }
 
 # ethereum
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-op-hardforks.workspace = true
+alloy-primitives = { workspace = true, features = ["std", "map-foldhash"] }
 op-alloy-consensus.workspace = true
 
 # async / misc
 eyre.workspace = true
+futures-util.workspace = true
+jsonrpsee-types.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 metrics.workspace = true
 tracing.workspace = true
@@ -60,6 +70,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 
 [features]
 default = ["jemalloc", "otlp", "reth-optimism-evm/portable", "js-tracer", "keccak-cache-global", "asm-keccak"]

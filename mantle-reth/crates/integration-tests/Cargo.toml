@@ -27,27 +27,37 @@ name = "token_ratio_midblock"
 path = "tests/token_ratio_midblock.rs"
 harness = true
 
+[[test]]
+name = "preconf"
+path = "tests/preconf/mod.rs"
+harness = true
+
 [dependencies]
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }
 mantle-reth-cli = { workspace = true }
+reth-optimism-trie.workspace = true
 mantle-reth-eth-api = { workspace = true }
+mantle-reth-preconf = { workspace = true }
 mantle-reth-rpc-ext = { workspace = true }
 
 # op-reth
 reth-optimism-chainspec = { workspace = true }
 reth-optimism-node = { workspace = true, features = ["test-utils"] }
 reth-optimism-rpc = { workspace = true }
+# OpDAConfig — DA-footprint (H3) integration test injects a tight DA limit.
+reth-optimism-payload-builder = { workspace = true }
 
 # reth
 reth-e2e-test-utils = { workspace = true }
-reth-node-builder = { workspace = true, features = ["test-utils"] }
 reth-node-api = { workspace = true }
+reth-node-builder = { workspace = true, features = ["test-utils"] }
 reth-node-core = { workspace = true }
 reth-payload-primitives = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true }
 reth-tasks = { workspace = true }
+reth-transaction-pool = { workspace = true }
 reth-rpc-api = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-tracing = { workspace = true }
@@ -59,6 +69,9 @@ alloy-rpc-types-eth = { workspace = true }
 alloy-rpc-types-engine = { workspace = true }
 alloy-network = { workspace = true }
 alloy-op-hardforks = { workspace = true }
+# alloy-signer-local — `PrivateKeySigner` type named by the journal-rotation
+# test's per-sender signing helper (`Wallet::wallet_gen()` element type).
+alloy-signer-local = { workspace = true }
 op-alloy-consensus = { workspace = true }
 op-alloy-rpc-types-engine = { workspace = true }
 
@@ -70,4 +83,5 @@ op-revm = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["full"] }
 eyre = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client", "server"] }

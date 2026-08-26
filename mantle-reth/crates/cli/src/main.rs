@@ -1,8 +1,22 @@
 #![allow(missing_docs, rustdoc::missing_crate_level_docs)]
 
 use clap::Parser;
-use mantle_reth_cli::{MantleChainSpecParser, MantleNode, seed_blockchain_tree_metrics};
-use reth_optimism_node::args::RollupArgs;
+use eyre::ErrReport;
+use mantle_reth_cli::{
+    MantleArgs, MantleChainSpecParser, MantleNode, proofs_history::with_proofs_history_launch_ctx,
+    seed_blockchain_tree_metrics, spawn_proofs_db_metrics,
+};
+use mantle_reth_preconf::{PreconfServiceBuilder, seed_preconf_metrics};
+use reth_db::DatabaseEnv;
+use reth_db_api::database_metrics::DatabaseMetrics;
+use reth_node_builder::{NodeBuilder, WithLaunchContext};
+use reth_optimism_chainspec::OpChainSpec;
+use reth_optimism_node::args::{ProofsStorageVersion, RollupArgs};
+use reth_optimism_trie::{
+    OpProofsStore,
+    db::{MdbxProofsStorage, MdbxProofsStorageV2},
+};
+use std::sync::Arc;
 use tracing::info;
 
 #[global_allocator]
@@ -22,21 +36,133 @@ fn main() {
         }
     }
 
-    if let Err(err) = reth_optimism_cli::Cli::<MantleChainSpecParser, RollupArgs>::parse().run(
+    if let Err(err) = reth_optimism_cli::Cli::<MantleChainSpecParser, MantleArgs>::parse().run(
         async move |builder, args| {
             info!(target: "reth::cli", "Launching Mantle node");
-            let handle = builder
-                .node(MantleNode::new(args))
-                .on_node_started(|full_node| {
-                    seed_blockchain_tree_metrics(&full_node.provider);
-                    Ok(())
-                })
-                .launch()
-                .await?;
-            handle.node_exit_future.await
+            let mut node = MantleNode::new(args.rollup.clone());
+            let preconf_cfg = args.preconf.into_config();
+            let preconf_enabled = preconf_cfg.is_some();
+            match preconf_cfg {
+                Some(mut cfg) => {
+                    let all = cfg.all_preconfs;
+                    // The journal is mandatory. When the operator did not pass
+                    // `--preconf.journal-path`, default to a datadir-relative
+                    // path resolved via reth's own datadir resolver.
+                    if cfg.journal_path.is_none() {
+                        cfg.journal_path = Some(
+                            builder
+                                .config()
+                                .datadir()
+                                .data_dir()
+                                .join("mantle-preconf")
+                                .join("journal.jsonl"),
+                        );
+                    }
+                    let journal = cfg.journal_path.clone();
+                    let svc = PreconfServiceBuilder::from_config(cfg)
+                        .await
+                        .map_err(|e| eyre::eyre!("preconf service init: {e}"))?;
+                    node = node.with_preconf(svc);
+                    info!(
+                        target: "reth::cli",
+                        "Mantle preconf ENABLED (all_preconfs={all}, journal={journal:?})",
+                    );
+                }
+                None => {
+                    info!(
+                        target: "reth::cli",
+                        "Mantle preconf DISABLED (pass --preconf.enable to opt in)",
+                    );
+                }
+            }
+            launch_node(builder, node, args.rollup, preconf_enabled).await
         },
     ) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }
+}
+
+/// Launches the node, installing the proofs-history sidecar when `--proofs-history` is set.
+///
+/// Without the flag this is the plain launch path. With it, the ExEx (write side), the
+/// `eth_getProof` / `debug_*` RPC overrides (read side), and the storage metrics task are
+/// wired up against a shared MDBX sidecar handle.
+async fn launch_node(
+    builder: WithLaunchContext<NodeBuilder<DatabaseEnv, OpChainSpec>>,
+    node: MantleNode,
+    args: RollupArgs,
+    preconf_enabled: bool,
+) -> eyre::Result<(), ErrReport> {
+    if !args.proofs_history {
+        let handle = builder
+            .node(node)
+            .on_node_started(move |full_node| {
+                seed_blockchain_tree_metrics(&full_node.provider);
+                // Pre-register preconf metric series (0 baseline). Preconf-only.
+                if preconf_enabled {
+                    seed_preconf_metrics();
+                }
+                Ok(())
+            })
+            .launch()
+            .await?;
+        return handle.node_exit_future.await;
+    }
+
+    let path = args
+        .proofs_history_storage_path
+        .clone()
+        .ok_or_else(|| eyre::eyre!("--proofs-history.storage-path is required"))?;
+
+    match args.proofs_history_storage_version {
+        ProofsStorageVersion::V1 => {
+            info!(target: "reth::cli", "Using on-disk storage for proofs history (v1)");
+            let mdbx = Arc::new(
+                MdbxProofsStorage::new(&path)
+                    .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
+            );
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled).await
+        }
+        ProofsStorageVersion::V2 => {
+            info!(target: "reth::cli", "Using on-disk storage for proofs history (v2)");
+            let mdbx = Arc::new(
+                MdbxProofsStorageV2::new(&path)
+                    .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorageV2: {e}"))?,
+            );
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled).await
+        }
+    }
+}
+
+/// Installs the ExEx, RPC overrides, and metrics hook for proof history, then launches the node.
+async fn launch_with_proof_history<S>(
+    builder: WithLaunchContext<NodeBuilder<DatabaseEnv, OpChainSpec>>,
+    node: MantleNode,
+    args: RollupArgs,
+    mdbx: Arc<S>,
+    preconf_enabled: bool,
+) -> eyre::Result<(), ErrReport>
+where
+    S: OpProofsStore + DatabaseMetrics + Send + Sync + 'static,
+{
+    let metrics_mdbx = mdbx.clone();
+
+    let builder = builder.node(node).on_node_started(move |full_node| {
+        seed_blockchain_tree_metrics(&full_node.provider);
+        // Pre-register preconf metric series (0 baseline). Preconf-only.
+        if preconf_enabled {
+            seed_preconf_metrics();
+        }
+        spawn_proofs_db_metrics(
+            full_node.task_executor,
+            metrics_mdbx,
+            full_node.config.metrics.push_gateway_interval,
+        );
+        Ok(())
+    });
+
+    let handle = with_proofs_history_launch_ctx(builder, &args, mdbx).launch().await?;
+
+    handle.node_exit_future.await
 }
