@@ -16,6 +16,7 @@ pub mod builder;
 pub mod canon_handler;
 pub mod classifier;
 pub mod config;
+pub mod flashblocks;
 pub mod journal;
 pub mod metrics_seed;
 pub mod payload_service_builder;
@@ -33,6 +34,7 @@ pub use builder::{
 pub use canon_handler::PreconfCanonHandler;
 pub use classifier::{DEFAULT_VERDICT_CACHE_CAP, PreconfClassifier, Verdict, Whitelist};
 pub use config::{DEFAULT_SAFETY_MARGIN, PreconfConfig};
+pub use flashblocks::{FlashblockProducerConfig, FlashblockProducerConfigError};
 pub use journal::{
     CommitmentChainView, JournalEntry, JournalError, OnChain, PreconfJournal, RestorePool,
     RestoreSkip, RestoredEnvelope, RotateStats, restore_preconf_state, run_rejournal_loop,

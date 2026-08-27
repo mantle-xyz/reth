@@ -17,16 +17,20 @@
 //! upstream `RollupArgs` convention — every configuration knob lives on the
 //! command line and is discoverable via `--help`.
 
-use std::{path::PathBuf, time::Duration};
+use std::{net::IpAddr, path::PathBuf, time::Duration};
 
 use alloy_primitives::Address;
 use clap::Args;
 use mantle_reth_preconf::{
-    PreconfConfig,
+    FlashblockProducerConfig, FlashblockProducerConfigError, PreconfConfig,
     config::{
         DEFAULT_BROADCAST_CAP, DEFAULT_JOURNAL_MAX_SIZE, DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
         DEFAULT_PRECONF_MAX_GAS_PER_TX, DEFAULT_PRECONF_TIMEOUT, DEFAULT_REJOURNAL_INTERVAL,
         DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
+    },
+    flashblocks::{
+        DEFAULT_FLASHBLOCK_ADDR, DEFAULT_FLASHBLOCK_BLOCK_TIME, DEFAULT_FLASHBLOCK_LEEWAY,
+        DEFAULT_FLASHBLOCK_PORT,
     },
 };
 use reth_optimism_node::args::RollupArgs;
@@ -42,6 +46,93 @@ pub struct MantleArgs {
     /// Mantle preconf subsystem arguments (`--preconf.*`).
     #[command(flatten)]
     pub preconf: PreconfArgs,
+
+    /// Mantle flashblocks publisher arguments (`--flashblocks.*`).
+    #[command(flatten)]
+    pub flashblocks: FlashblocksArgs,
+}
+
+impl MantleArgs {
+    /// Resolve both Mantle subsystem configs, rejecting combinations that
+    /// cannot work before the node starts.
+    ///
+    /// Either config is `None` when its subsystem is off.
+    pub fn into_configs(
+        self,
+    ) -> Result<
+        (Option<PreconfConfig>, Option<FlashblockProducerConfig>),
+        FlashblockProducerConfigError,
+    > {
+        let preconf = self.preconf.into_config();
+        let flashblocks =
+            self.flashblocks.into_config().map(|cfg| cfg.validate(preconf.as_ref())).transpose()?;
+
+        Ok((preconf, flashblocks))
+    }
+}
+
+/// Flashblocks publisher CLI flags.
+///
+/// Sequencer-side only. `--flashblocks.enable` requires `--preconf.enable`;
+/// the check lives in [`FlashblockProducerConfig::validate`] rather than in
+/// clap, because the two flags come from different flattened groups.
+///
+/// Every flag sets an explicit `id`: clap derives the id from the field
+/// name, and `enable` alone would collide with the preconf group.
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct FlashblocksArgs {
+    /// Slice each block as it is built and publish the slices.
+    ///
+    /// Off by default: leaving it off keeps the payload builder's
+    /// pre-flashblock behaviour byte for byte, which is the rollback path.
+    #[arg(id = "flashblocks.enable", long = "flashblocks.enable")]
+    pub enable: bool,
+
+    /// Address the flashblocks publisher binds. Default `127.0.0.1`.
+    #[arg(id = "flashblocks.addr", long = "flashblocks.addr")]
+    pub addr: Option<IpAddr>,
+
+    /// Port the flashblocks publisher binds. Default `1111`.
+    #[arg(id = "flashblocks.port", long = "flashblocks.port")]
+    pub port: Option<u16>,
+
+    /// Interval between slices, in milliseconds. Default 200ms.
+    ///
+    /// When flashblocks are enabled this also becomes the payload builder's
+    /// ticker cadence, superseding `--preconf.sweep-interval-ms`.
+    #[arg(id = "flashblocks.block-time", long = "flashblocks.block-time")]
+    pub block_time_ms: Option<u64>,
+
+    /// How far ahead of the slot deadline the budgeted slice grid finishes,
+    /// in milliseconds. Default 50ms.
+    #[arg(id = "flashblocks.leeway-time", long = "flashblocks.leeway-time")]
+    pub leeway_time_ms: Option<u64>,
+}
+
+impl FlashblocksArgs {
+    /// Convert CLI args into a [`FlashblockProducerConfig`] if
+    /// `--flashblocks.enable` was given; otherwise return `None`.
+    ///
+    /// Ring and broadcast capacities are not exposed on the CLI; they take
+    /// their defaults.
+    pub fn into_config(self) -> Option<FlashblockProducerConfig> {
+        if !self.enable {
+            return None;
+        }
+        Some(FlashblockProducerConfig {
+            addr: self.addr.unwrap_or(DEFAULT_FLASHBLOCK_ADDR),
+            port: self.port.unwrap_or(DEFAULT_FLASHBLOCK_PORT),
+            block_time: self
+                .block_time_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_FLASHBLOCK_BLOCK_TIME),
+            leeway_time: self
+                .leeway_time_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_FLASHBLOCK_LEEWAY),
+            ..Default::default()
+        })
+    }
 }
 
 /// Preconfirmation subsystem CLI flags.
@@ -286,6 +377,117 @@ mod tests {
         assert_eq!(cfg.rejournal_interval, Duration::from_secs(30));
         assert_eq!(cfg.journal_max_size, 2_147_483_648);
         assert_eq!(cfg.broadcast_cap, 8192);
+    }
+
+    /// Test helper mirroring [`parse`] for the flashblocks group.
+    #[derive(Parser, Debug)]
+    struct TestFlashblocksCli {
+        #[command(flatten)]
+        args: FlashblocksArgs,
+    }
+
+    fn parse_flashblocks(argv: &[&str]) -> FlashblocksArgs {
+        TestFlashblocksCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
+    }
+
+    #[test]
+    fn flashblocks_default_parse_yields_disabled() {
+        // No flags → into_config() returns None → flashblocks stay off,
+        // matching how the preconf group signals the same thing.
+        assert!(parse_flashblocks(&[]).into_config().is_none());
+    }
+
+    #[test]
+    fn flashblocks_numeric_overrides_replace_defaults() {
+        let cfg = parse_flashblocks(&[
+            "--flashblocks.enable",
+            "--flashblocks.addr",
+            "0.0.0.0",
+            "--flashblocks.port",
+            "2222",
+            "--flashblocks.block-time",
+            "250",
+            "--flashblocks.leeway-time",
+            "0",
+        ])
+        .into_config()
+        .expect("enabled");
+
+        assert_eq!(cfg.addr, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.port, 2222);
+        assert_eq!(cfg.block_time, Duration::from_millis(250));
+        assert_eq!(cfg.leeway_time, Duration::ZERO);
+    }
+
+    #[test]
+    fn flashblocks_omitted_flags_keep_defaults() {
+        let cfg = parse_flashblocks(&["--flashblocks.enable"]).into_config().expect("enabled");
+
+        assert_eq!(cfg.addr, DEFAULT_FLASHBLOCK_ADDR);
+        assert_eq!(cfg.port, DEFAULT_FLASHBLOCK_PORT);
+        assert_eq!(cfg.block_time, DEFAULT_FLASHBLOCK_BLOCK_TIME);
+        assert_eq!(cfg.leeway_time, DEFAULT_FLASHBLOCK_LEEWAY);
+    }
+
+    /// The two groups are validated against each other, and enabling
+    /// flashblocks without preconf is rejected before the node starts.
+    #[test]
+    fn flashblocks_without_preconf_is_rejected_at_startup() {
+        let flashblocks =
+            parse_flashblocks(&["--flashblocks.enable"]).into_config().expect("enabled");
+        let preconf = parse(&["--preconf.enable", "--preconf.all"]).into_config();
+
+        assert!(flashblocks.clone().validate(preconf.as_ref()).is_ok());
+        assert!(flashblocks.validate(None).is_err());
+    }
+
+    /// Test helper covering the whole arg surface, so the startup gate is
+    /// exercised the way `main` reaches it.
+    #[derive(Parser, Debug)]
+    struct TestMantleCli {
+        #[command(flatten)]
+        args: MantleArgs,
+    }
+
+    fn parse_mantle(argv: &[&str]) -> MantleArgs {
+        TestMantleCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
+    }
+
+    #[test]
+    fn enabling_flashblocks_alone_fails_the_startup_gate() {
+        let err = parse_mantle(&["--flashblocks.enable"]).into_configs().unwrap_err();
+
+        assert_eq!(err, FlashblockProducerConfigError::RequiresPreconfEnabled);
+    }
+
+    #[test]
+    fn enabling_both_passes_the_startup_gate() {
+        let (preconf, flashblocks) =
+            parse_mantle(&["--preconf.enable", "--preconf.all", "--flashblocks.enable"])
+                .into_configs()
+                .expect("both enabled is a valid combination");
+
+        assert!(preconf.is_some());
+        assert!(flashblocks.is_some());
+    }
+
+    /// Today's production shape: preconf on, flashblocks not yet rolled out.
+    #[test]
+    fn enabling_preconf_alone_leaves_flashblocks_absent() {
+        let (preconf, flashblocks) = parse_mantle(&["--preconf.enable", "--preconf.all"])
+            .into_configs()
+            .expect("preconf alone is a valid combination");
+
+        assert!(preconf.is_some());
+        assert!(flashblocks.is_none());
+    }
+
+    #[test]
+    fn enabling_neither_passes_the_startup_gate() {
+        let (preconf, flashblocks) = parse_mantle(&[]).into_configs().expect("defaults are valid");
+
+        assert!(preconf.is_none());
+        assert!(flashblocks.is_none());
     }
 
     #[test]
