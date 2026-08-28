@@ -12,6 +12,9 @@ description = "Mantle preconfirmation core types for op-reth"
 workspace = true
 
 [dependencies]
+# The flashblock wire format, shared with the RPC-side consumer.
+mantle-reth-flashblocks-types.workspace = true
+
 # Alloy
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
 alloy-consensus = { workspace = true, features = ["std"] }
@@ -118,7 +121,7 @@ async-trait.workspace = true
 reth-rpc-eth-types.workspace = true
 
 # Async runtime + sync primitives + async fs for the journal
-tokio = { workspace = true, features = ["sync", "macros", "time", "fs", "io-util", "rt"] }
+tokio = { workspace = true, features = ["sync", "macros", "time", "fs", "io-util", "rt", "net"] }
 
 # Sync RwLock for `PreconfClassifier`'s allowlists and verdict cache.
 # Deliberately NOT tokio's: both are read from the payload builder's
@@ -126,6 +129,13 @@ tokio = { workspace = true, features = ["sync", "macros", "time", "fs", "io-util
 # `blocking_read` would panic. parking_lot also has no poisoning, so a panicking
 # writer cannot wedge that hot read path.
 parking_lot.workspace = true
+
+# WebSocket publisher for flashblocks: `tokio-tungstenite` for the server-side
+# handshake and framing, `tokio-util` for the cancellation token that shuts the
+# listener and its per-client loops down together.
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
 
 # Error handling
 thiserror.workspace = true
@@ -144,7 +154,7 @@ metrics.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "test-util", "fs"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "test-util", "fs", "net"] }
 tempfile.workspace = true
 proptest.workspace = true
 
