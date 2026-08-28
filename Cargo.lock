@@ -5268,7 +5268,9 @@ dependencies = [
  "either",
  "eyre",
  "futures",
+ "futures-util",
  "jsonrpsee",
+ "mantle-reth-flashblocks-types",
  "mantle-reth-rpc-ext",
  "metrics",
  "op-alloy-consensus",
@@ -5306,6 +5308,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
  "tracing",
 ]
 
