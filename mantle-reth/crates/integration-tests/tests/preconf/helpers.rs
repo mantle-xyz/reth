@@ -905,6 +905,19 @@ pub fn l1_info_deposit(origin: u64) -> Bytes {
 /// Payload attributes for a block at height `n` referencing L1 origin `origin`:
 /// timestamp = `l2_ts(n)`, tx[0] = the L1-attributes deposit for `origin`.
 pub fn l1_attrs(n: u64, origin: u64) -> OpPayloadAttrs {
+    l1_attrs_with(n, origin, vec![])
+}
+
+/// [`l1_attrs`] with further sequencer transactions appended after the
+/// L1-attributes deposit, in the order given.
+///
+/// The L1-info deposit stays at tx[0] because the fee logic reads it, so `extra`
+/// is appended rather than substituted. These land in `sequencer_transactions()`
+/// and so are executed by the builder's stage 2 — which is the only stage that
+/// watches for a governance whitelist update.
+pub fn l1_attrs_with(n: u64, origin: u64, extra: Vec<Bytes>) -> OpPayloadAttrs {
+    let mut transactions = vec![l1_info_deposit(origin)];
+    transactions.extend(extra);
     OpPayloadAttrs(OpPayloadAttributes {
         payload_attributes: PayloadAttributes {
             timestamp: l2_ts(n),
@@ -914,12 +927,35 @@ pub fn l1_attrs(n: u64, origin: u64) -> OpPayloadAttrs {
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
         },
-        transactions: Some(vec![l1_info_deposit(origin)]),
+        transactions: Some(transactions),
         no_tx_pool: None,
         gas_limit: Some(30_000_000),
         eip_1559_params: Some(B64::ZERO),
         min_base_fee: Some(0),
     })
+}
+
+/// A user deposit from `from` to `to` carrying `input` — the shape
+/// `OptimismPortal.depositTransaction` produces once op-node derives it.
+///
+/// `from` is the value the portal already aliased on L1; nothing on L2 transforms
+/// it further, which is why a test supplies the aliased address directly.
+/// `is_system_transaction` is false: this is a user deposit, not an L1-attributes
+/// one.
+pub fn user_deposit(from: Address, to: Address, input: Bytes, gas_limit: u64) -> Bytes {
+    let dep = TxDeposit {
+        source_hash: keccak256(input.as_ref()),
+        from,
+        to: TxKind::Call(to),
+        mint: 0,
+        value: U256::ZERO,
+        gas_limit,
+        is_system_transaction: false,
+        input,
+        eth_value: 0,
+        eth_tx_value: None,
+    };
+    dep.encoded_2718().into()
 }
 
 // ─────────────────────────── engine-API façade ───────────────────────────

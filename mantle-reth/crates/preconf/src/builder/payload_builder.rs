@@ -74,15 +74,15 @@ use crate::{
 /// function will **not** reach this copy.
 ///
 /// The result is needed because a governance whitelist update arrives as a
-/// deposit whose calldata targets the cross-domain messenger, with the real
-/// `updatePreconfs` buried inside (see [`crate::whitelist`]), and it has to be
-/// recognised here to bind *this* block's preconf transactions. Calldata alone
-/// would be wrong twice over: the deposit succeeds even when the inner message
-/// reverts (the messenger records failed messages rather than propagating them),
-/// and calldata says nothing about the contract's `onlyL1Gov` check. The emitted
-/// [`WHITELIST_UPDATED_TOPIC0`] answers both, since the contract only reaches
-/// the `emit` after authorisation passed and every rule applied — so the log
-/// decides *whether*, and the calldata is decoded afterwards to learn *what*.
+/// deposit addressed straight at the whitelist contract (see
+/// [`crate::whitelist`]), and it has to be recognised here to bind *this*
+/// block's preconf transactions. Calldata alone would be wrong: it says nothing
+/// about whether the contract's `onlyL1Gov` gate passed, and a deposit whose L2
+/// execution reverted still sits in the block looking exactly like one that
+/// succeeded. The emitted [`WHITELIST_UPDATED_TOPIC0`] answers that, since the
+/// contract only reaches the `emit` after authorisation passed and every rule
+/// applied — so the log decides *whether*, and the calldata is decoded
+/// afterwards to learn *what*.
 ///
 /// Returns the deltas in block order; applying them out of order would let an
 /// add-then-remove of the same rule resolve backwards.
@@ -141,7 +141,8 @@ where
             };
 
         if emitted_whitelist_update && let Some(contract) = whitelist_contract {
-            match decode_whitelist_update(sequencer_tx.value().input(), contract) {
+            let tx = sequencer_tx.value();
+            match decode_whitelist_update(tx.to(), tx.input(), contract) {
                 Some(delta) if !delta.is_empty() => {
                     debug!(
                         target: "mantle::preconf::payload_builder",
