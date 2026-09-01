@@ -5,6 +5,11 @@
 //! validation on top of the OP stack checks.
 
 use crate::txpool::MantleTransactionValidator;
+use mantle_reth_flashblocks::{
+    EthApiExt as FlashblocksEthApiExt, EthApiOverrideServer as _,
+    EthPubSub as FlashblocksEthPubSub, EthPubSubApiServer as _, FlashblocksConfig,
+    FlashblocksState, FlashblocksSubscriber,
+};
 use mantle_reth_preconf::{
     MantlePreconfServiceBuilder, PreconfAwareValidator, PreconfClassifier, PreconfConfig,
     PreconfPoolListener, PreconfServiceBuilder, PreconfTxSet, bootstrap_whitelist,
@@ -374,12 +379,21 @@ pub struct MantleNode {
     /// canonical-state cleaner, and RPC handler all get wired up to
     /// the shared `cfg` / `fifo` held by the builder.
     pub preconf: Option<Arc<PreconfServiceBuilder>>,
+    /// Optional flashblock consumer configuration. `None` ⇒ the `pending` tag
+    /// keeps its standard local-mempool semantics.
+    pub flashblocks: Option<FlashblocksConfig>,
 }
 
 impl MantleNode {
     /// Creates a new [`MantleNode`] with the given rollup arguments.
     pub fn new(args: RollupArgs) -> Self {
-        Self { op_node: reth_optimism_node::OpNode::new(args), preconf: None }
+        Self { op_node: reth_optimism_node::OpNode::new(args), preconf: None, flashblocks: None }
+    }
+
+    /// Enables the flashblock consumer with the given configuration.
+    pub fn with_flashblocks(mut self, cfg: FlashblocksConfig) -> Self {
+        self.flashblocks = Some(cfg);
+        self
     }
 
     /// Configure the data availability configuration for the Mantle builder.
@@ -498,6 +512,7 @@ where
     fn add_ons(&self) -> Self::AddOns {
         let sequencer_url = self.op_node.args.sequencer.clone();
         let preconf = self.preconf.clone();
+        let flashblocks_cfg = self.flashblocks.clone();
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |ctx| {
             // Build SequencerClient if a sequencer URL is configured.
@@ -573,12 +588,68 @@ where
                     Arc::new(handler) as Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>
                 });
 
+            // Flashblock consumer: start the state processor, the websocket
+            // subscription and the canonical feed, then override the `pending`
+            // reads. Registered before `MantleRpcExt` so the latter can borrow
+            // the overlay for `eth_simulateV1`.
+            let flashblocks_state = flashblocks_cfg
+                .map(|cfg| -> eyre::Result<Arc<FlashblocksState>> {
+                    let state = Arc::new(FlashblocksState::new(
+                        cfg.max_trailing_depth,
+                        cfg.max_leading_depth,
+                        cfg.max_cache_ahead_blocks,
+                    ));
+                    state.start(ctx.node().provider().clone());
+
+                    let mut subscriber = FlashblocksSubscriber::new(
+                        Arc::clone(&state),
+                        cfg.websocket_url.clone(),
+                        cfg.subscriber_ping_interval,
+                    );
+                    subscriber.start();
+
+                    let state_for_canonical = Arc::clone(&state);
+                    let mut canonical_stream = tokio_stream::wrappers::BroadcastStream::new(
+                        ctx.node().provider().subscribe_to_canonical_state(),
+                    );
+                    tokio::spawn(async move {
+                        use tokio_stream::StreamExt as _;
+                        while let Some(Ok(notification)) = canonical_stream.next().await {
+                            for block in notification.committed().blocks_iter() {
+                                state_for_canonical
+                                    .on_canonical_block_received(block.clone());
+                            }
+                        }
+                    });
+
+                    let eth_api_ext = FlashblocksEthApiExt::new(
+                        ctx.registry.eth_api().clone(),
+                        ctx.registry.eth_handlers().filter.clone(),
+                        Arc::clone(&state),
+                    );
+                    ctx.modules.replace_configured(eth_api_ext.into_rpc())?;
+
+                    let pubsub = FlashblocksEthPubSub::new(
+                        ctx.registry.eth_api().clone(),
+                        ctx.node().task_executor().clone(),
+                        Arc::clone(&state),
+                    );
+                    ctx.modules.replace_configured(pubsub.into_rpc())?;
+
+                    info!(target: "reth::cli", url = %cfg.websocket_url, "Mantle flashblock consumer started");
+                    Ok(state)
+                })
+                .transpose()?;
+
             let mantle_ext = MantleRpcExt::new(
                 ctx.node().provider().clone(),
                 Arc::new(ctx.registry.eth_api().clone()),
                 sequencer_client,
                 preconf_handler,
-            );
+            )
+            .with_pending_overrides(flashblocks_state.map(|state| {
+                state as Arc<dyn mantle_reth_flashblocks::PendingStateOverrides>
+            }));
             // `replace_configured`, not `merge_configured`: this module now also serves
             // `eth_simulateV1`, which the standard `eth_` namespace already registers. Merging a
             // duplicate method name fails, so remove-then-add to override it. The other methods in

@@ -76,6 +76,24 @@ fn main() {
                     );
                 }
             }
+            match args.flashblocks.into_config(args.rollup.flashblocks_url.as_ref())? {
+                Some(cfg) => {
+                    info!(
+                        target: "reth::cli",
+                        url = %cfg.websocket_url,
+                        max_leading_depth = cfg.max_leading_depth,
+                        "Mantle flashblock consumer ENABLED",
+                    );
+                    node = node.with_flashblocks(cfg);
+                }
+                None => {
+                    info!(
+                        target: "reth::cli",
+                        "Mantle flashblock consumer DISABLED (pass --flashblocks.consumer-url to opt in)",
+                    );
+                }
+            }
+
             launch_node(builder, node, args.rollup, preconf_enabled).await
         },
     ) {

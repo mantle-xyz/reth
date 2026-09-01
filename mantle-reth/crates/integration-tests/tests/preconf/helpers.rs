@@ -754,16 +754,7 @@ macro_rules! launch_preconf_node {
     };
     (@build $cfg:expr, $chain_spec:expr, $make_node:expr) => {{
         async {
-            use $crate::helpers::mantle_payload_attributes;
-            use mantle_reth_cli::node::MantleNode;
             use mantle_reth_preconf::PreconfServiceBuilder;
-            use reth_chainspec::EthChainSpec;
-            use reth_db::test_utils::create_test_rw_db_with_path;
-            use reth_e2e_test_utils::{node::NodeTestContext, wallet::Wallet};
-            use reth_node_builder::{EngineNodeLauncher, Node, NodeBuilder, NodeConfig};
-            use reth_node_core::args::{DatadirArgs, RpcServerArgs};
-            use reth_provider::providers::BlockchainProvider;
-            use reth_tasks::Runtime;
 
             // Destructured before the spec is finalised: the allowlists have to
             // be written into genesis, not into memory, because cold start now
@@ -783,27 +774,6 @@ macro_rules! launch_preconf_node {
                     // address's genesis itself.
                     chain_spec
                 };
-            let chain_id = chain_spec.chain().id();
-            let wallet = Wallet::default().with_chain_id(chain_id);
-
-            let mut config: NodeConfig<reth_optimism_chainspec::OpChainSpec> =
-                NodeConfig::new(chain_spec)
-                    .with_unused_ports()
-                    .with_datadir_args(DatadirArgs {
-                        datadir: reth_db::test_utils::tempdir_path().into(),
-                        ..Default::default()
-                    })
-                    .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-            config.network.discovery.discv5_port = 0;
-            config.network.discovery.discv5_port_ipv6 = 0;
-
-            let db = create_test_rw_db_with_path(
-                config
-                    .datadir
-                    .datadir
-                    .unwrap_or_chain_default(config.chain.chain(), config.datadir.clone())
-                    .db(),
-            );
 
             // The journal is mandatory; fill a temp default path when the test
             // didn't set one (mirrors production's datadir-relative default).
@@ -818,35 +788,13 @@ macro_rules! launch_preconf_node {
                 .expect("preconf svc init");
             let classifier = svc.classifier().clone();
             let make_node = $make_node;
-            let node_type = make_node(svc);
 
-            let runtime = Runtime::test();
-            let node_handle = NodeBuilder::new(config)
-                .with_database(db)
-                .with_types_and_provider::<MantleNode, BlockchainProvider<_>>()
-                .with_components(node_type.components())
-                .with_add_ons(node_type.add_ons())
-                .launch_with_fn(|builder| {
-                    let launcher = EngineNodeLauncher::new(
-                        runtime.clone(),
-                        builder.config.datadir(),
-                        Default::default(),
-                    );
-                    builder.launch_with(launcher)
-                })
-                .await
-                .expect("MantleNode failed to launch");
-
-            let http = node_handle
-                .node
-                .rpc_server_handle()
-                .http_client()
-                .expect("HTTP RPC must be enabled");
-
-            let node_ctx =
-                NodeTestContext::new(node_handle.node, mantle_payload_attributes)
-                    .await
-                    .unwrap();
+            let (node_ctx, http, wallet, chain_id) = mantle_reth_integration_tests::launch_mantle_node!(
+                chain_spec,
+                make_node(svc),
+                $crate::helpers::mantle_payload_attributes
+            )
+            .await;
 
             (node_ctx, http, wallet, chain_id, classifier)
         }

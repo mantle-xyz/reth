@@ -21,6 +21,10 @@ use std::{path::PathBuf, time::Duration};
 
 use alloy_primitives::Address;
 use clap::Args;
+use mantle_reth_flashblocks::{
+    DEFAULT_MAX_CACHE_AHEAD_BLOCKS, DEFAULT_MAX_LEADING_DEPTH, DEFAULT_MAX_TRAILING_DEPTH,
+    DEFAULT_SUBSCRIBER_PING_INTERVAL, FlashblocksConfig,
+};
 use mantle_reth_preconf::{
     PreconfConfig,
     config::{
@@ -30,6 +34,7 @@ use mantle_reth_preconf::{
     },
 };
 use reth_optimism_node::args::RollupArgs;
+use url::Url;
 
 /// Top-level mantle CLI args — flattens upstream `RollupArgs` and mantle
 /// preconf options into a single `clap::Args`-derived struct.
@@ -42,6 +47,84 @@ pub struct MantleArgs {
     /// Mantle preconf subsystem arguments (`--preconf.*`).
     #[command(flatten)]
     pub preconf: PreconfArgs,
+
+    /// Mantle flashblock consumer arguments (`--flashblocks.*`).
+    #[command(flatten)]
+    pub flashblocks: FlashblocksArgs,
+}
+
+/// Flashblock consumer CLI flags.
+///
+/// Distinct from upstream's `--flashblocks-url`, which drives op-reth's own
+/// consumer. The two implementations are independent and must not both run.
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct FlashblocksArgs {
+    /// Websocket endpoint streaming flashblocks to the Mantle consumer.
+    ///
+    /// Absent (default) leaves the consumer off and the `pending` tag on its
+    /// standard local-mempool semantics.
+    #[arg(long = "flashblocks.consumer-url")]
+    pub consumer_url: Option<Url>,
+
+    /// Interval between upstream websocket ping frames, in seconds.
+    #[arg(long = "flashblocks.ping-interval-secs")]
+    pub ping_interval_secs: Option<u64>,
+
+    /// Canonical blocks the pending overlay may trail behind before a rebuild.
+    #[arg(long = "flashblocks.max-trailing-depth")]
+    pub max_trailing_depth: Option<u64>,
+
+    /// Blocks the pending overlay may lead canonical by before slices are dropped.
+    #[arg(long = "flashblocks.max-leading-depth")]
+    pub max_leading_depth: Option<u64>,
+
+    /// Blocks ahead of canonical for which early-arriving slices are cached.
+    #[arg(long = "flashblocks.max-cache-ahead-blocks")]
+    pub max_cache_ahead_blocks: Option<u64>,
+}
+
+impl FlashblocksArgs {
+    /// Converts CLI args into a [`FlashblocksConfig`] when a consumer URL was
+    /// given; otherwise returns `None` (the consumer stays off).
+    ///
+    /// # Errors
+    /// Returns an error when upstream's `--flashblocks-url` is also set: both
+    /// consumers would subscribe and build pending state independently.
+    pub fn into_config(
+        self,
+        upstream_flashblocks_url: Option<&Url>,
+    ) -> Result<Option<FlashblocksConfig>, FlashblocksArgsError> {
+        let Some(consumer_url) = self.consumer_url else {
+            return Ok(None);
+        };
+        if upstream_flashblocks_url.is_some() {
+            return Err(FlashblocksArgsError::ConflictingConsumers);
+        }
+
+        Ok(Some(FlashblocksConfig {
+            websocket_url: consumer_url,
+            max_trailing_depth: self.max_trailing_depth.unwrap_or(DEFAULT_MAX_TRAILING_DEPTH),
+            max_leading_depth: self.max_leading_depth.unwrap_or(DEFAULT_MAX_LEADING_DEPTH),
+            max_cache_ahead_blocks: self
+                .max_cache_ahead_blocks
+                .unwrap_or(DEFAULT_MAX_CACHE_AHEAD_BLOCKS),
+            subscriber_ping_interval: self
+                .ping_interval_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_SUBSCRIBER_PING_INTERVAL),
+        }))
+    }
+}
+
+/// Errors produced while resolving [`FlashblocksArgs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FlashblocksArgsError {
+    /// Both the Mantle and the upstream op-reth consumer were requested.
+    #[error(
+        "--flashblocks.consumer-url and --flashblocks-url are mutually exclusive: the Mantle and \
+         op-reth flashblock consumers are independent implementations and must not both run"
+    )]
+    ConflictingConsumers,
 }
 
 /// Preconfirmation subsystem CLI flags.

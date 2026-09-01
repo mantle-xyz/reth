@@ -50,6 +50,7 @@ members = [
   # Mantle-Reth
   "mantle-reth/crates/cli/",
   "mantle-reth/crates/chainspec/",
+  "mantle-reth/crates/flashblocks/",
   "mantle-reth/crates/flashblocks-types/",
   "mantle-reth/crates/rpc-ext/",
   "mantle-reth/crates/eth-api/",
@@ -152,6 +153,7 @@ reth-optimism-txpool = { path = "op-reth/crates/txpool/" }
 
 # ==================== MANTLE-RETH INTERNAL CRATES ====================
 mantle-reth-chainspec = { path = "mantle-reth/crates/chainspec/", default-features = false }
+mantle-reth-flashblocks = { path = "mantle-reth/crates/flashblocks/" }
 mantle-reth-flashblocks-types = { path = "mantle-reth/crates/flashblocks-types/" }
 mantle-reth-rpc-ext = { path = "mantle-reth/crates/rpc-ext/" }
 mantle-reth-cli = { path = "mantle-reth/crates/cli/" }
@@ -399,6 +401,7 @@ zstd = "0.13"
 bytes = { version = "1.11.1", default-features = false }
 cfg-if = "1.0.4"
 clap = { version = "4", features = ["derive"] }
+arc-swap = "1.7"
 derive_more = { version = "2.0", default-features = false }
 either = "1"
 eyre = "0.6"

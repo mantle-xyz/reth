@@ -21,9 +21,13 @@
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{B256, Bytes, TxKind, U256};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{
+    TransactionRequest,
+    state::{StateOverride, StateOverridesBuilder},
+};
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
+use mantle_reth_flashblocks::PendingStateOverrides;
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_optimism_evm::extract_l1_info;
@@ -254,6 +258,10 @@ pub struct MantleRpcExt<Provider, EthApi> {
     /// `None` ⇒ fall back to `sequencer_client` forward / "not implemented"
     /// stub.
     preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
+    /// Pending flashblock overlay. `Some` only when the flashblock consumer is
+    /// enabled; supplies the state overrides `eth_simulateV1` prepends for the
+    /// `pending` tag.
+    pending_overrides: Option<Arc<dyn PendingStateOverrides>>,
 }
 
 impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
@@ -264,12 +272,71 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         sequencer_client: Option<SequencerClient>,
         preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
     ) -> Self {
-        Self { provider, eth_api, sequencer_client, preconf_handler }
+        Self { provider, eth_api, sequencer_client, preconf_handler, pending_overrides: None }
+    }
+
+    /// Attaches the flashblock pending overlay used by `eth_simulateV1`.
+    #[must_use]
+    pub fn with_pending_overrides(
+        mut self,
+        pending_overrides: Option<Arc<dyn PendingStateOverrides>>,
+    ) -> Self {
+        self.pending_overrides = pending_overrides;
+        self
     }
 
     #[inline]
     fn provider(&self) -> &Provider {
         &self.provider
+    }
+
+    /// Rewrites a `pending`-tagged `eth_simulateV1` request to run against the
+    /// flashblock overlay's base block with the overlay's state prepended.
+    ///
+    /// Returns the request unchanged when the tag is not `pending` or no overlay
+    /// is attached. User-supplied overrides win per address.
+    fn apply_pending_overrides(
+        &self,
+        payload: serde_json::Value,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<(serde_json::Value, Option<BlockId>)> {
+        let block_id = block_number.unwrap_or_default();
+        if !block_id.is_pending() {
+            return Ok((payload, block_number));
+        }
+        let Some(overlay) = self.pending_overrides.as_ref() else {
+            return Ok((payload, block_number));
+        };
+        let Some(pending) = overlay.pending_state_overrides() else {
+            return Ok((payload, Some(overlay.pending_base_block())));
+        };
+
+        let mut payload = payload;
+        if let Some(calls) =
+            payload.get_mut("blockStateCalls").and_then(serde_json::Value::as_array_mut)
+        {
+            for call in calls.iter_mut() {
+                let user: StateOverride = match call.get("stateOverrides") {
+                    Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
+                        invalid_params_rpc_err(format!("invalid stateOverrides: {e}"))
+                    })?,
+                    None => StateOverride::default(),
+                };
+                let merged = StateOverridesBuilder::new(pending.clone()).extend(user).build();
+                let merged = serde_json::to_value(merged).map_err(|e| {
+                    ErrorObject::owned(
+                        -32000,
+                        format!("failed to serialise stateOverrides: {e}"),
+                        None::<()>,
+                    )
+                })?;
+                if let Some(obj) = call.as_object_mut() {
+                    obj.insert("stateOverrides".to_string(), merged);
+                }
+            }
+        }
+
+        Ok((payload, Some(overlay.pending_base_block())))
     }
 
     #[inline]
@@ -772,6 +839,10 @@ where
                 }
             }
         }
+
+        // Flashblocks: for the `pending` tag, resolve to the overlay's base block and
+        // prepend its state overrides to every `blockStateCalls` entry.
+        let (payload, block_number) = self.apply_pending_overrides(payload, block_number)?;
 
         // Not a boundary-crossing simulation: hand off to the standard implementation. Round-trip
         // through JSON so the network-specific payload/result generics stay behind `EthApi`.

@@ -1030,7 +1030,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1041,7 +1041,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1071,6 +1071,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 dependencies = [
  "derive_arbitrary",
+]
+
+[[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]
@@ -3132,7 +3141,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5131,6 +5140,7 @@ dependencies = [
  "futures-util",
  "jsonrpsee-types",
  "mantle-reth-chainspec",
+ "mantle-reth-flashblocks",
  "mantle-reth-preconf",
  "mantle-reth-rpc-ext",
  "metrics",
@@ -5165,7 +5175,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5195,6 +5207,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-reth-flashblocks"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-evm",
+ "alloy-network",
+ "alloy-op-hardforks",
+ "alloy-primitives",
+ "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
+ "alloy-serde 2.0.5",
+ "arc-swap",
+ "derive_more",
+ "futures",
+ "imbl",
+ "jsonrpsee",
+ "jsonrpsee-types",
+ "mantle-reth-chainspec",
+ "mantle-reth-flashblocks-types",
+ "metrics",
+ "op-alloy-consensus",
+ "op-alloy-network",
+ "op-alloy-rpc-types",
+ "op-alloy-rpc-types-engine",
+ "op-revm",
+ "rayon",
+ "reth-chainspec",
+ "reth-evm",
+ "reth-optimism-chainspec",
+ "reth-optimism-evm",
+ "reth-optimism-forks",
+ "reth-optimism-primitives",
+ "reth-optimism-rpc",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "reth-rpc",
+ "reth-rpc-convert",
+ "reth-rpc-eth-api",
+ "reth-rpc-eth-types",
+ "reth-tasks",
+ "revm",
+ "revm-database",
+ "rstest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "mantle-reth-flashblocks-types"
 version = "0.1.0"
 dependencies = [
@@ -5220,10 +5288,12 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "eyre",
+ "futures",
  "jsonrpsee",
  "mantle-reth-chainspec",
  "mantle-reth-cli",
  "mantle-reth-eth-api",
+ "mantle-reth-flashblocks",
  "mantle-reth-flashblocks-types",
  "mantle-reth-preconf",
  "mantle-reth-rpc-ext",
@@ -5239,9 +5309,11 @@ dependencies = [
  "reth-optimism-chainspec",
  "reth-optimism-node",
  "reth-optimism-payload-builder",
+ "reth-optimism-primitives",
  "reth-optimism-rpc",
  "reth-optimism-trie",
  "reth-payload-primitives",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-rpc-api",
  "reth-tasks",
@@ -5251,6 +5323,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]
@@ -5321,6 +5395,7 @@ dependencies = [
  "alloy-serde 2.0.5",
  "async-trait",
  "jsonrpsee",
+ "mantle-reth-flashblocks",
  "metrics",
  "op-revm",
  "reth-chainspec",
@@ -5678,7 +5753,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10768,7 +10843,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10848,7 +10923,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.7",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11456,7 +11531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11654,7 +11729,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12870,7 +12945,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
