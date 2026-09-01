@@ -1,9 +1,9 @@
 //! Reads the preconf allowlists from the on-chain L2 `PreconfWhitelist`
 //! contract and keeps [`PreconfClassifier`]'s in-memory copy in sync.
 //!
-//! The contract is the single source of truth: governance updates it through a
-//! standard OP-Stack L1→L2 cross-domain message, so the lists are auditable
-//! on-chain and every node converges on the same values. This module is the
+//! The contract is the single source of truth: governance updates it with a
+//! direct `OptimismPortal` deposit from L1, so the lists are auditable on-chain
+//! and every node converges on the same values. This module is the
 //! sequencer-local mirror of that state — it is a policy input to the
 //! classifier, not part of consensus.
 //!
@@ -40,10 +40,10 @@
 //! would make the sequencer read garbage — or, worse, an empty list.
 //!
 //! The contract occupies slots 0..=7; this module reads 0, 2, 4 and 6. Slots 1, 3
-//! and 5 are the membership mappings, and slot 7 is `localNonce`, the replay
-//! guard on `updatePreconfs` — governance's business, never read here. A variable
-//! appended past slot 7 disturbs none of this, which is why adding one is not a
-//! layout-version change; touching slots 0..=6 is.
+//! and 5 are the membership mappings, and slot 7 is `authorizedL1`, the one L1
+//! address permitted to govern the lists — the contract's own business, never
+//! read here. A variable appended past slot 7 disturbs none of this, which is why
+//! adding one is not a layout-version change; touching slots 0..=6 is.
 
 use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::foldhash::HashSet};
@@ -92,8 +92,8 @@ pub const TO_WILDCARDS_SLOT: u64 = 4;
 /// Appended after every array on the Solidity side on purpose, so bumping the
 /// version can never shift the slots above.
 ///
-/// Not the contract's last variable — slot 7 holds `localNonce`; see the module
-/// docs for where a further variable has to go.
+/// Not the contract's last variable — slot 7 holds `authorizedL1`; see the
+/// module docs for where a further variable has to go.
 pub const LAYOUT_VERSION_SLOT: u64 = 6;
 
 /// The layout this binary knows how to read.
@@ -866,10 +866,13 @@ pub fn should_reload<N: NodePrimitives>(
 
 /// Watches the canonical chain and refreshes the allowlists when they change.
 ///
-/// Event-driven rather than parsing the deposit that carried the update: the
-/// deposit's calldata targets `L2CrossDomainMessenger.relayMessage`, with the
-/// actual `updatePreconfs` call buried in its `message` argument. Watching for
-/// the effect instead of decoding the cause is both simpler and reorg-safe.
+/// Event-driven rather than parsing the deposit that carried the update.
+/// Watching for the effect rather than decoding the cause is reorg-safe for free
+/// — a revert un-happens without emitting anything, and `latest()` already
+/// accounts for it — and it needs no ABI binding at all, so this path cannot be
+/// broken by a signature change. [`decode_whitelist_update`] exists for the one
+/// caller that genuinely cannot wait for the block to land (the payload builder,
+/// binding the block it is still building); everything here reads state.
 ///
 /// # Why a reorg alone triggers a reload
 ///
@@ -953,34 +956,22 @@ pub async fn run_whitelist_watcher<Pr, N>(
 }
 
 sol! {
-    /// Mantle's messenger takes **seven** parameters, not upstream OP's six:
-    /// `mntValue` sits before `value` (`CrossDomainMessenger.sol:277-285`).
-    /// Decoding with the upstream shape silently misreads every field after
-    /// `target`, and `target` is what routes the message — so the mistake would
-    /// look like "governance updates are simply never seen".
-    function relayMessage(
-        uint256 nonce,
-        address sender,
-        address target,
-        uint256 mntValue,
-        uint256 value,
-        uint256 minGasLimit,
-        bytes message
-    );
-
     #[derive(Debug)]
     struct SolRule {
         address from;
         address to;
     }
 
-    // `nonce` is the contract's replay guard (`PreconfWhitelist.localNonce`) and means nothing on
-    // this side — but it is part of the signature, so the selector depends on it. If the two ever
-    // disagree, `decode_whitelist_update` stops matching, this block keeps the previous allowlist
-    // (with the warning logged at the call site), and the canonical watcher corrects it once the
-    // block lands. A stale-nonce revert needs no handling here: the caller only decodes calldata
-    // for a transaction that succeeded *and* emitted `WhitelistUpdated`.
-    function updatePreconfs(uint256 nonce, SolRule[] add, SolRule[] remove);
+    // The whole ABI surface this module binds. Governance reaches the contract through a **direct
+    // `OptimismPortal` deposit**, so the deposit's calldata *is* this call — there is no
+    // `relayMessage` envelope to unwrap, and no nonce parameter, the deposit channel being
+    // exactly-once by construction rather than by a guard in the contract.
+    //
+    // If this signature drifts from the contract's, the selector stops matching,
+    // `decode_whitelist_update` returns `None`, the block keeps the previous allowlist (with the
+    // warning logged at the call site), and the canonical watcher corrects it once the block lands.
+    // Nothing fails loudly, which is why the selector is asserted against a literal in the tests.
+    function updatePreconfs(SolRule[] add, SolRule[] remove);
 }
 
 /// One governance update, as it was *called* — the add and remove lists from
@@ -992,12 +983,13 @@ sol! {
 /// re-reading the lists out of the in-flight block state is `O(allowlist)`, at
 /// roughly a microsecond a slot, inside the build of a two-second block.
 ///
-/// Two things make that safe. Nothing is decoded unless the transaction
-/// *succeeded and emitted* [`WHITELIST_UPDATED_TOPIC0`] from the configured
-/// contract, so a reverted, misrouted or unauthorised call is never applied —
-/// the contract's `onlyL1Gov` has already passed by the time the event exists.
-/// And the result is scoped to one block build, so any decode that disagrees
-/// with the contract is corrected by the watcher rather than compounded.
+/// Two things make that safe. Nothing is decoded unless the transaction was
+/// addressed to the configured contract *and* succeeded *and* emitted
+/// [`WHITELIST_UPDATED_TOPIC0`] from it, so a reverted, misrouted or
+/// unauthorised call is never applied — the contract's `onlyL1Gov` has already
+/// passed by the time the event exists. And the result is scoped to one block
+/// build, so any decode that disagrees with the contract is corrected by the
+/// watcher rather than compounded.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WhitelistDelta {
     /// Rules authorised by this call, in call order.
@@ -1013,22 +1005,35 @@ impl WhitelistDelta {
     }
 }
 
-/// Decodes a sequencer transaction's calldata into the whitelist update it
-/// carries, or `None` if it does not carry one for `contract`.
+/// Decodes a sequencer transaction into the whitelist update it carries, or
+/// `None` if it does not carry one for `contract`.
 ///
-/// The update arrives wrapped: a deposit calls the messenger's `relayMessage`,
-/// whose `message` argument is the real `updatePreconfs` calldata. Both layers
-/// are checked — a `relayMessage` aimed at some other `target` is not ours, and
-/// a `message` that does not decode as `updatePreconfs` is not either.
+/// **One layer.** A governance deposit is addressed straight at the whitelist
+/// contract, so `input` *is* the `updatePreconfs` calldata — there is no
+/// `relayMessage` envelope to unwrap. What that costs is a target: the previous
+/// channel named its destination *inside* the calldata, so a single `&[u8]` was
+/// enough to tell an update for this contract from one for something else.
 ///
-/// `target` is checked rather than the deposit's `to`, because the deposit is
-/// addressed to the messenger; the whitelist contract only appears inside.
-pub fn decode_whitelist_update(input: &[u8], contract: Address) -> Option<WhitelistDelta> {
-    let relay = relayMessageCall::abi_decode(input).ok()?;
-    if relay.target != contract {
+/// Hence `to`, taken from the transaction header rather than the payload. It is
+/// passed in rather than checked at the call site so that the "is this our
+/// governance call" decision stays in one testable place; the caller has no
+/// remaining judgement to exercise.
+///
+/// This is the weaker of the two checks the caller makes and is not sufficient
+/// alone — calldata says nothing about whether `onlyL1Gov` passed, or whether
+/// the transaction even succeeded. The emitted [`WHITELIST_UPDATED_TOPIC0`]
+/// answers those, and both must hold. The two are not redundant: the log proves
+/// the contract updated, `to` proves *this transaction's calldata* is the call
+/// that did it, and they come apart for an update made through an intermediary.
+pub fn decode_whitelist_update(
+    to: Option<Address>,
+    input: &[u8],
+    contract: Address,
+) -> Option<WhitelistDelta> {
+    if to != Some(contract) {
         return None;
     }
-    let update = updatePreconfsCall::abi_decode(&relay.message).ok()?;
+    let update = updatePreconfsCall::abi_decode(input).ok()?;
     let pairs = |v: Vec<SolRule>| v.into_iter().map(|p| (p.from, p.to)).collect();
     Some(WhitelistDelta { add: pairs(update.add), remove: pairs(update.remove) })
 }
@@ -1881,13 +1886,12 @@ mod tests {
 
         /// The cross-repo seam, pinned from this side.
         ///
-        /// `decode_whitelist_update` matches the inner call by its four-byte
-        /// selector, which is derived from the parameter *types* — the Solidity
-        /// struct's name is not part of it, so renaming `Pair`/`Rule` on the
-        /// contract side cannot break decoding, while changing a parameter type
-        /// silently can. The literal is
-        /// `forge inspect PreconfWhitelist methodIdentifiers`'s entry for
-        /// `updatePreconfs(uint256,(address,address)[],(address,address)[])`.
+        /// `decode_whitelist_update` matches the call by its four-byte selector,
+        /// which is derived from the parameter *types* — the Solidity struct's
+        /// name is not part of it, so renaming `Pair`/`Rule` on the contract side
+        /// cannot break decoding, while changing a parameter type silently can.
+        /// The literal is `forge inspect PreconfWhitelist methodIdentifiers`'s
+        /// entry for `updatePreconfs((address,address)[],(address,address)[])`.
         ///
         /// Same reasoning as [`WHITELIST_UPDATED_TOPIC0`], and the same failure
         /// mode if it drifts: governance updates stop being seen, silently.
@@ -1895,42 +1899,27 @@ mod tests {
         fn the_update_preconfs_selector_matches_the_contract() {
             assert_eq!(
                 alloy_primitives::hex::encode(updatePreconfsCall::SELECTOR),
-                "fd86b420",
+                "141ffdab",
                 "selector drifted from the deployed `updatePreconfs` signature"
             );
         }
 
-        /// The calldata a governance deposit actually carries: `relayMessage`
-        /// wrapping the real `updatePreconfs` call.
-        fn relay(
-            target: Address,
-            add: &[(Address, Address)],
-            remove: &[(Address, Address)],
-        ) -> Vec<u8> {
+        /// The calldata a governance deposit actually carries — the
+        /// `updatePreconfs` call itself, unwrapped, because the deposit is
+        /// addressed straight at the whitelist contract.
+        fn calldata(add: &[(Address, Address)], remove: &[(Address, Address)]) -> Vec<u8> {
             let sol = |v: &[(Address, Address)]| {
                 v.iter().map(|&(from, to)| SolRule { from, to }).collect::<Vec<_>>()
             };
-            let inner =
-                updatePreconfsCall { nonce: U256::from(1), add: sol(add), remove: sol(remove) }
-                    .abi_encode();
-            relayMessageCall {
-                nonce: U256::ZERO,
-                sender: addr(1),
-                target,
-                mntValue: U256::ZERO,
-                value: U256::ZERO,
-                minGasLimit: U256::ZERO,
-                message: inner.into(),
-            }
-            .abi_encode()
+            updatePreconfsCall { add: sol(add), remove: sol(remove) }.abi_encode()
         }
 
         #[test]
-        fn decode_reads_through_both_layers() {
-            let input = relay(WL, &[(addr(1), addr(2))], &[(addr(3), Address::ZERO)]);
+        fn decode_reads_a_governance_deposit() {
+            let input = calldata(&[(addr(1), addr(2))], &[(addr(3), Address::ZERO)]);
 
             assert_eq!(
-                decode_whitelist_update(&input, WL),
+                decode_whitelist_update(Some(WL), &input, WL),
                 Some(WhitelistDelta {
                     add: vec![(addr(1), addr(2))],
                     remove: vec![(addr(3), Address::ZERO)],
@@ -1938,23 +1927,61 @@ mod tests {
             );
         }
 
-        /// The deposit is addressed to the messenger, so the only thing that
-        /// says "this is our contract" is `relayMessage`'s `target`.
         #[test]
-        fn decode_ignores_a_message_aimed_elsewhere() {
-            let input = relay(addr(9), &[(addr(1), addr(2))], &[]);
-            assert_eq!(decode_whitelist_update(&input, WL), None);
+        fn decode_ignores_calldata_that_is_not_update_preconfs() {
+            assert_eq!(decode_whitelist_update(Some(WL), &[0xde, 0xad, 0xbe, 0xef], WL), None);
         }
 
+        /// A perfectly well-formed `updatePreconfs` aimed at some other contract.
+        /// With the target no longer carried inside the calldata, `to` is the
+        /// only thing that distinguishes it — so this is the case that check
+        /// exists for, and it replaces the old `relayMessage.target` test.
         #[test]
-        fn decode_ignores_calldata_that_is_not_a_relay() {
-            assert_eq!(decode_whitelist_update(&[0xde, 0xad, 0xbe, 0xef], WL), None);
+        fn decode_ignores_a_transaction_sent_elsewhere() {
+            let input = calldata(&[(addr(1), addr(2))], &[]);
+            assert_eq!(decode_whitelist_update(Some(addr(9)), &input, WL), None);
         }
 
-        /// A `relayMessage` for our contract whose payload is something else
-        /// entirely — the outer layer matching is not enough.
+        /// A contract creation has no `to` at all. It cannot be a governance
+        /// update — the contract must already exist to be called — and the
+        /// `None` must not be read as "unspecified, therefore allowed".
         #[test]
-        fn decode_ignores_an_inner_call_that_is_not_update_preconfs() {
+        fn decode_ignores_a_contract_creation() {
+            let input = calldata(&[(addr(1), addr(2))], &[]);
+            assert_eq!(decode_whitelist_update(None, &input, WL), None);
+        }
+
+        /// Empty lists decode to an empty delta rather than to `None`. The
+        /// distinction is the payload builder's to act on — it treats an empty
+        /// delta as "nothing to apply" and a `None` as "an update landed that
+        /// could not be read", and only the second is worth a warning.
+        #[test]
+        fn decode_accepts_an_empty_update() {
+            let delta =
+                decode_whitelist_update(Some(WL), &calldata(&[], &[]), WL).expect("still decodes");
+            assert!(delta.is_empty());
+        }
+
+        /// **The previous channel's shape must not decode.** Governance used to
+        /// reach the contract through `L2CrossDomainMessenger.relayMessage`, with
+        /// the real call buried in its `message` argument. A binary that still
+        /// accepted that envelope would read the *messenger's* calldata as an
+        /// allowlist delta; the leading `nonce` word would land where `add`'s
+        /// offset belongs, so the result would be arbitrary rather than empty.
+        /// The selector settles it before any field is read.
+        #[test]
+        fn decode_rejects_the_old_relay_message_envelope() {
+            sol! {
+                function relayMessage(
+                    uint256 nonce,
+                    address sender,
+                    address target,
+                    uint256 mntValue,
+                    uint256 value,
+                    uint256 minGasLimit,
+                    bytes message
+                );
+            }
             let input = relayMessageCall {
                 nonce: U256::ZERO,
                 sender: addr(1),
@@ -1962,49 +1989,34 @@ mod tests {
                 mntValue: U256::ZERO,
                 value: U256::ZERO,
                 minGasLimit: U256::ZERO,
-                message: vec![0xde, 0xad, 0xbe, 0xef].into(),
+                message: calldata(&[(addr(1), addr(2))], &[]).into(),
             }
             .abi_encode();
 
-            assert_eq!(decode_whitelist_update(&input, WL), None);
+            assert_eq!(decode_whitelist_update(Some(WL), &input, WL), None);
         }
 
-        /// Pins the seven-parameter Mantle shape. The two signatures hash to
-        /// different selectors, so this is caught at the first four bytes rather
-        /// than by any field-level check — which is exactly the guard worth
-        /// having: a binary built against upstream OP's six-parameter
-        /// `relayMessage` would decode *nothing*, and the symptom would be
-        /// "governance updates are silently never seen" rather than a wrong
-        /// allowlist.
+        /// The nonce-carrying signature this contract used to have must not
+        /// decode either. It differs from the current one only by a leading
+        /// `uint256`, so a field-level check could plausibly let it through —
+        /// the selector is what makes the two unambiguously different calls.
         #[test]
-        fn decode_rejects_the_upstream_six_parameter_shape() {
+        fn decode_rejects_the_previous_nonce_carrying_signature() {
             sol! {
-                function relayMessage(
-                    uint256 nonce,
-                    address sender,
-                    address target,
-                    uint256 value,
-                    uint256 minGasLimit,
-                    bytes message
-                );
+                struct OldRule {
+                    address from;
+                    address to;
+                }
+                function updatePreconfs(uint256 nonce, OldRule[] add, OldRule[] remove);
             }
-            let inner = updatePreconfsCall {
+            let input = updatePreconfsCall {
                 nonce: U256::from(1),
-                add: vec![SolRule { from: addr(1), to: addr(2) }],
+                add: vec![OldRule { from: addr(1), to: addr(2) }],
                 remove: vec![],
             }
             .abi_encode();
-            let input = relayMessageCall {
-                nonce: U256::ZERO,
-                sender: addr(1),
-                target: WL,
-                value: U256::ZERO,
-                minGasLimit: U256::ZERO,
-                message: inner.into(),
-            }
-            .abi_encode();
 
-            assert_eq!(decode_whitelist_update(&input, WL), None);
+            assert_eq!(decode_whitelist_update(Some(WL), &input, WL), None);
         }
 
         #[test]
@@ -2086,8 +2098,8 @@ mod tests {
             apply_delta(
                 &mut delta_side,
                 &decode_whitelist_update(
-                    &relay(
-                        WL,
+                    Some(WL),
+                    &calldata(
                         &[(addr(3), addr(4)), (Address::ZERO, addr(8))],
                         &[(addr(1), addr(2)), (addr(7), Address::ZERO)],
                     ),

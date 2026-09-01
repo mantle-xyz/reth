@@ -15,13 +15,13 @@
 //!
 //! ## What is deliberately not tested here
 //!
-//! * **The contract itself** (two auth gates, idempotence, `MAX_BATCH`) — covered by the forge
+//! * **The contract itself** (the alias auth gate, idempotence, `MAX_BATCH`) — covered by the forge
 //!   tests in `mantle-v2/packages/contracts-bedrock/test/PreconfWhitelist.t.sol`. The seam between
 //!   the two repos is the storage layout and the event topic0, and both are asserted from both
 //!   sides.
-//! * **The full L1→L2 governance path** (governance Safe → `L1CrossDomainMessenger.sendMessage` →
-//!   deposit → `relayMessage` → the auth gates) — that needs an L1 and op-node, so it is a testnet
-//!   exercise; it has been run end-to-end on public Mantle Sepolia.
+//! * **The full L1→L2 governance path** (governance Safe → `PreconfWhitelistGov` →
+//!   `OptimismPortal.depositTransaction` → the aliased deposit → the auth gate) — that needs an L1
+//!   and op-node, so it is a testnet exercise.
 //! * **The production wiring itself.** Cold start and the watcher run inside `build_pool`, which
 //!   this harness does execute — `cold_start_loads_genesis_whitelist_before_the_node_is_up` asserts
 //!   the allowlist is already loaded by the time launch returns. The other T1 tests then re-run
@@ -30,12 +30,13 @@
 //!   `build_pool` returns, and a test needs a handle it can abort.
 
 use super::helpers::{
-    PreconfCfgBuilder, PreconfSetup, address_array_storage, layout_version_storage,
+    PreconfCfgBuilder, PreconfSetup, address_array_storage, l1_attrs_with, layout_version_storage,
     mantle_chain_spec_with_account, pair_array_storage, send_preconf, storage_writer_bytecode,
+    user_deposit,
 };
 use crate::launch_preconf_node_with_classifier;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{Address, B256, Bytes, TxKind, U256, bytes};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256, bytes, hex};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::{
     FROM_WILDCARDS_SLOT, PAIRS_SLOT, TO_WILDCARDS_SLOT, WHITELIST_UPDATED_TOPIC0,
@@ -596,4 +597,128 @@ async fn watcher_applies_governance_draining_the_whitelist() {
     );
 
     watcher.abort();
+}
+
+// ===== T3: a governance update carried by the block being built =====
+
+/// `updatePreconfs(add, remove)` calldata, encoded by hand.
+///
+/// Deliberately not built with the `sol!` types the decoder itself uses: that
+/// would round-trip through one encoder and assert nothing about the selector,
+/// so a signature drift on the contract side would keep this test green. The
+/// literal below is `forge inspect PreconfWhitelist methodIdentifiers`'s entry
+/// for `updatePreconfs((address,address)[],(address,address)[])`.
+fn update_preconfs_calldata(add: &[(Address, Address)], remove: &[(Address, Address)]) -> Bytes {
+    fn push_word(out: &mut Vec<u8>, value: U256) {
+        out.extend_from_slice(&value.to_be_bytes::<32>());
+    }
+    fn push_rules(out: &mut Vec<u8>, rules: &[(Address, Address)]) {
+        push_word(out, U256::from(rules.len()));
+        for (from, to) in rules {
+            push_word(out, U256::from_be_bytes(from.into_word().0));
+            push_word(out, U256::from_be_bytes(to.into_word().0));
+        }
+    }
+
+    let mut out = Vec::from(hex!("141ffdab"));
+    // Two dynamic arrays, so the head is two offsets measured from the end of it.
+    push_word(&mut out, U256::from(0x40));
+    push_word(&mut out, U256::from(0x40 + 32 + 64 * add.len()));
+    push_rules(&mut out, add);
+    push_rules(&mut out, remove);
+    out.into()
+}
+
+/// **The block-scoped governance path, end to end.** A whitelist update carried by
+/// the block being built must bind that block's own preconf admission — stage 2
+/// decodes the deposit's calldata and layers the delta onto the allowlist stage 3
+/// judges against.
+///
+/// Nothing else covers this. The watcher tests above drive the *event* path, which
+/// re-reads storage and has no ABI coupling at all; `classifier_freeze` flips the
+/// allowlist by calling the classifier directly. Only here does a real deposit —
+/// addressed at the contract, carrying real `updatePreconfs` calldata — reach
+/// `execute_sequencer_transactions_watching_whitelist`.
+///
+/// The fixture is arranged so **calldata and storage disagree**: the stub writes
+/// the allowlist back unchanged, while the deposit's calldata revokes the pair. A
+/// build that ignored the calldata would therefore still authorize the commitment
+/// and this test would fail — which is what makes it about the decode path rather
+/// than about the watcher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_governance_deposit_in_this_block_bars_its_own_commitment() {
+    let sender = wallet_address();
+
+    // Genesis authorizes `sender -> ALLOWED_TO`. The stub writes those same words
+    // back, so storage still says "allowed" after the update lands; only the
+    // calldata revokes it.
+    let seeded = whitelist_storage(&[sender], &[ALLOWED_TO]);
+    let code = storage_writer_bytecode(&seeded, WHITELIST_UPDATED_TOPIC0);
+    let spec = mantle_chain_spec_with_account(CHAIN_ID, WL, &code, &seeded);
+
+    let setup = onchain_cfg();
+    let cfg = Arc::new(setup.cfg.clone());
+    let (node, http, wallet, _chain_id, classifier) =
+        launch_preconf_node_with_classifier!(setup, spec).await;
+
+    bootstrap_whitelist(&node.inner.provider, &cfg, &classifier).expect("bootstrap");
+    assert!(
+        classifier.preview_eligibility(&sender, Some(&ALLOWED_TO)),
+        "the commitment must be admissible before the update, or the test proves nothing",
+    );
+
+    // A preconf submission with no payload job open: the commitment parks in the
+    // fifo instead of being applied, so the build below decides its fate.
+    let preconf_tx = signed_transfer(&wallet, 0, ALLOWED_TO).await;
+    let preconf_hash = alloy_primitives::keccak256(&preconf_tx);
+    let http_c = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_c, preconf_tx).await });
+
+    // Long enough for the RPC handler to attach its responder and the pool
+    // listener to create the fifo entry.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The governance deposit: addressed at WL, revoking exactly the pair the
+    // parked commitment relies on. `from` is the already-aliased L1 governor,
+    // which is what op-node derives from the portal's log.
+    let gov_from = Address::new([0xd0; 20]);
+    let revoke = update_preconfs_calldata(&[], &[(sender, ALLOWED_TO)]);
+    let attrs = l1_attrs_with(0, 1, vec![user_deposit(gov_from, WL, revoke, 500_000)]);
+
+    let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
+    let payload_id = crate::fcu_v3_start!(node, genesis, attrs);
+
+    // One or two sweep ticks (200ms default) so the preconf arm has genuinely had
+    // its chance at the parked entry.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let payload = crate::get_payload_v5!(node, payload_id);
+
+    let err = rpc_task
+        .await
+        .expect("rpc join")
+        .expect_err("a commitment revoked by this block's own update must be refused");
+    assert!(
+        err.to_string().contains("not preconf eligible"),
+        "the client must be told why rather than waiting out preconf_timeout; got {err}",
+    );
+
+    let sealed: Vec<B256> = payload
+        .block()
+        .body()
+        .transactions()
+        .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
+        .collect();
+    assert!(
+        !sealed.contains(&preconf_hash),
+        "the revoked commitment must not be built. sealed = {sealed:?}",
+    );
+
+    // The delta is scoped to this build and never written back: a payload that is
+    // superseded or never sealed must not leave its revocation visible to the RPC
+    // admission path. Storage still holds the pair, so this is stable even if the
+    // node's own watcher reloads off the block's `WhitelistUpdated` log.
+    assert!(
+        classifier.preview_eligibility(&sender, Some(&ALLOWED_TO)),
+        "a block-scoped delta must not mutate the classifier's shared allowlist",
+    );
 }
