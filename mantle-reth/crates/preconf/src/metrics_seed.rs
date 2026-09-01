@@ -26,20 +26,41 @@ const COUNTERS: &[&str] = &[
     "preconf.dispatch.deadline_skipped_total",
     "preconf.dispatch.gas_budget_skipped_total",
     "preconf.listener.replacement_rejected_total",
-    "preconf.journal.abandoned_total",
     "preconf.pending_responders.expired_total",
+    // Commitment retention + on-chain allowlist governance.
+    "preconf.canon.reorg_drift_total",
+    "preconf.tx.commitment_broken_total",
+    "preconf.tx.replay_round_total",
+    "preconf.journal.restore_nonce_taken",
+    "preconf.journal.restore_undecodable",
+    "preconf.journal.restore_unknown",
+    "preconf.whitelist.zero_entry_skipped",
+    "preconf.whitelist.revoked_total",
+    // The pair that says whether the in-memory allowlist is still tracking the
+    // contract. Seeding matters more than usual here: a refresh only ever runs on
+    // a governance update or a reorg, so on a quiet chain both series would stay
+    // unregistered for hours and "never refreshed" would be indistinguishable
+    // from "refreshing fine".
+    "preconf.whitelist.reload_ok",
+    "preconf.whitelist.reload_failed",
 ];
 
 /// Gauge series. Registered **non-destructively** via `increment(0.0)`: the
-/// journal already publishes real values for `size_bytes` / `promised_len` at
-/// `open()`, so `set(0.0)` here could clobber them back to `0` depending on
-/// call ordering; a zero increment only registers the series, leaving any
-/// existing value intact.
+/// journal already publishes a real value for `size_bytes` at `open()`, so
+/// `set(0.0)` here could clobber it back to `0` depending on call ordering; a
+/// zero increment only registers the series, leaving any existing value intact.
 const GAUGES: &[&str] = &[
     "preconf.fifo.pending",
-    "preconf.journal.sealed_len",
-    "preconf.journal.promised_len",
     "preconf.journal.size_bytes",
+    "preconf.classifier.verdicts",
+    "preconf.classifier.slots",
+    "preconf.classifier.over_capacity",
+    "preconf.classifier.persisted_height",
+    "preconf.whitelist.pair_count",
+    "preconf.whitelist.from_wildcard_count",
+    "preconf.whitelist.to_wildcard_count",
+    "preconf.whitelist.warn_threshold",
+    "preconf.whitelist.consecutive_reload_failures",
 ];
 
 /// Histogram series. Registered only — never `record(0.0)`, which would inject
@@ -123,11 +144,22 @@ mod tests {
             let seeded: HashSet<&str> = seeded.iter().copied().collect();
             let emitted = emitted_names(&src, macro_name);
             total_found += emitted.len();
-            for name in emitted {
+            for name in &emitted {
                 assert!(
                     seeded.contains(name.as_str()),
                     "{macro_name} metric {name:?} is emitted but missing from the seed list \
                      in metrics_seed.rs — add it so its series is pre-registered",
+                );
+            }
+            // And the reverse: a deleted emit site would otherwise leave its
+            // series pre-registered and flat at zero — indistinguishable from
+            // "this never happened", the very failure mode seeding exists to
+            // prevent.
+            for name in &seeded {
+                assert!(
+                    emitted.contains(*name),
+                    "{macro_name} metric {name:?} is pre-registered but nothing emits it — \
+                     drop it from the seed list, or restore the emit site",
                 );
             }
         }

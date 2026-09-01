@@ -1,10 +1,10 @@
 //! Journal **rotation** lifecycle, end-to-end.
 //!
-//! `journal.rs` unit tests cover `rotate()` at the disk layer (sealed
-//! entries dropped, unsealed kept, atomic rename). This module chains
-//! `rotate()` with the *restore* path to pin the property operators
-//! actually care about: **a commitment that has been observed on chain
-//! (sealed) and rotated out is NOT replayed after a restart** — so a
+//! `journal.rs` unit tests cover `rotate()` at the disk layer (entries the
+//! `retain` predicate refuses are dropped, the rest kept, atomic rename). This
+//! module chains `rotate()` with the *restore* path to pin the property
+//! operators actually care about: **a commitment observed on chain and buried
+//! deep enough to be rotated out is NOT replayed after a restart** — so a
 //! rotated-then-restarted node never double-lands an already-canon tx.
 //!
 //! Rotation here is driven by calling `PreconfJournal::rotate()` directly
@@ -99,12 +99,13 @@ async fn rotate_drops_sealed_then_relaunch_replays_only_survivors() {
         journal.append_promised(&journal_entry(&tx_b)).await.expect("append B");
         journal.append_promised(&journal_entry(&tx_c)).await.expect("append C");
 
-        // A has been observed on chain → sealed. Rotation must drop it.
-        journal.mark_sealed_batch([hash_a]).await;
-
-        let stats = journal.rotate().await.expect("rotate");
+        // A has been observed on chain and buried deep enough that the
+        // classifier has stopped tracking it, so the rotation predicate — which
+        // in production is exactly "is the classifier still tracking this" —
+        // says drop.
+        let stats = journal.rotate(|h| *h != hash_a).await.expect("rotate");
         assert_eq!(stats.kept, 2, "B + C survive rotation");
-        assert_eq!(stats.dropped, 1, "sealed A is dropped");
+        assert_eq!(stats.dropped, 1, "the released A is dropped");
         assert_eq!(stats.bad_lines_skipped, 0, "no corrupt lines");
     }
 
@@ -115,7 +116,7 @@ async fn rotate_drops_sealed_then_relaunch_replays_only_survivors() {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str::<JournalEntry>(l).expect("valid entry").hash)
         .collect();
-    assert!(!survivors.contains(&hash_a), "sealed A must be gone from disk");
+    assert!(!survivors.contains(&hash_a), "the released A must be gone from disk");
     assert!(survivors.contains(&hash_b) && survivors.contains(&hash_c), "B, C remain on disk");
 
     // ── Phase 2: launch against the rotated file; only survivors replay ─

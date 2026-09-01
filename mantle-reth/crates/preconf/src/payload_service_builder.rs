@@ -48,7 +48,7 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_storage_api::BlockReaderIdExt;
 
 use crate::{
-    PreconfConfig, PreconfTxSet,
+    PreconfClassifier, PreconfConfig, PreconfTxSet,
     builder::{
         payload_builder::PreconfPayloadBuilder, payload_job_generator::PreconfPayloadJobGenerator,
     },
@@ -71,6 +71,7 @@ use crate::{
 /// `N = OpPrimitives`.
 pub struct MantlePreconfServiceBuilder<N> {
     cfg: Arc<PreconfConfig>,
+    classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
     /// OP builder settings (DA limits, max gas per tx, sdm-enable, ...).
     builder_config: OpBuilderConfig,
@@ -84,10 +85,11 @@ impl<N> MantlePreconfServiceBuilder<N> {
     /// and OP builder settings.
     pub const fn new(
         cfg: Arc<PreconfConfig>,
+        classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
         builder_config: OpBuilderConfig,
     ) -> Self {
-        Self { cfg, fifo, builder_config, _pd: PhantomData }
+        Self { cfg, classifier, fifo, builder_config, _pd: PhantomData }
     }
 }
 
@@ -156,7 +158,7 @@ where
         pool: Pool,
         evm_config: EvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let Self { cfg, fifo, builder_config, _pd } = self;
+        let Self { cfg, classifier, fifo, builder_config, _pd } = self;
 
         // Rollback safety — when `--preconf.enable` is absent, `cfg` is
         // `PreconfConfig::default()` with `enabled: false`. In that case
@@ -187,6 +189,7 @@ where
             evm_config,
             builder_config,
             cfg,
+            classifier,
             fifo,
         );
 

@@ -15,9 +15,6 @@
 //! - **flag on**: the forwarded tx IS retained — queryable locally and reflected in the `pending`
 //!   nonce.
 //!
-//! See `docs/reth_geth_txpool_forwarded_tx_admission.md` in the rde-v3 superproject for the full
-//! investigation.
-//!
 //! Run with:
 //!
 //! ```sh

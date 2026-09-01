@@ -258,15 +258,24 @@ async fn timeout_recovered_by_same_hash_resubmit() {
 /// test sets `safety_margin=0`, letting dispatch complete apply right
 /// past the RPC deadline.
 ///
-/// **Quarantined (`#[ignore]`)**: it deliberately races a ~5ms window (build
-/// started 195ms into a 200ms deadline), so the outcome hinges on whether
-/// dispatch grabs the `apply_lock` before the deadline — a coin flip (~50%)
-/// under load that retries can't recover. Determinism needs an internal hook to
-/// pause dispatch mid-apply, unavailable at the integration layer. The SLA
-/// (a sealed tx must never report `Timeout`) belongs in a `rpc.rs` unit test
-/// that drives the deadline/apply interleaving directly.
-#[ignore = "deliberate ~5ms deadline/apply race → ~50% under load; not integration-deterministic. Cover the SLA via a rpc.rs unit test."]
+/// **Quarantined (`#[ignore]`)**, measured rather than assumed: it fails roughly 1 run in
+/// 3 even alone and serially, so this is not the suite's parallel-load problem. The test
+/// needs dispatch to be mid-apply at the instant the client deadline fires, and the only
+/// lever from outside the node is the 195 ms sleep below guessing that the following FCU
+/// round-trip lands inside the remaining 5 ms. When it does not, race resolution finds a
+/// `Waiting` entry and correctly reports `Timeout` for a tx that really had not been
+/// applied — the assertion fails with nothing actually wrong. Determinism would need a
+/// production hook to pause dispatch mid-apply; not worth it, because
+/// `builder::dispatch::tests::apply_lock_blocks_rpc_timeout_race_and_yields_success` pins
+/// the same lock ordering with no clock involved. Kept as a manual end-to-end check:
+///
+/// ```text
+/// cargo test -p mantle-reth-integration-tests --test preconf \
+///     timeout::race_resolution -- --ignored
+/// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "~us-wide race reproduced by a wall-clock guess; fails ~1/3 even alone. \
+            Covered deterministically by dispatch's apply_lock unit test."]
 async fn race_resolution_returns_success_when_apply_completes_after_deadline() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
