@@ -16,25 +16,29 @@
 use std::sync::Arc;
 
 use alloy_consensus::{
-    BlockHeader, Sealable, Transaction, TxEnvelope, Typed2718, transaction::Recovered,
+    BlockHeader, Sealable, Transaction, TxEnvelope, TxReceipt, Typed2718, transaction::Recovered,
 };
 use alloy_eips::eip2718::Encodable2718;
-use alloy_evm::{Evm, block::TxResult};
-use alloy_primitives::{Address, Sealed, TxHash, U256};
+use alloy_evm::{
+    Evm,
+    block::{BlockExecutor as _, TxResult},
+};
+use alloy_primitives::{Address, B256, Sealed, TxHash, U256};
+use mantle_reth_flashblocks_types::FlashblockId;
 use op_alloy_consensus::{SDMGasEntry, TxPostExec, build_post_exec_tx};
+use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
 use op_revm::{L1BlockInfo, constants::L1_BLOCK_CONTRACT};
 use reth_basic_payload_builder::BuildArguments;
 use reth_evm::execute::{
-    BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockValidationError,
+    BlockAssembler as _, BlockBuilder, BlockBuilderOutcome, BlockExecutionError,
+    BlockValidationError,
 };
-use reth_execution_types::BlockExecutionOutput;
+use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpBuiltPayload;
 use reth_optimism_payload_builder::{
-    OpAttributes, OpPayloadPrimitives,
-    builder::{ExecutionInfo, OpPayloadBuilderCtx},
-    config::OpBuilderConfig,
+    OpAttributes, OpPayloadPrimitives, builder::OpPayloadBuilderCtx, config::OpBuilderConfig,
     error::OpPayloadBuilderError,
 };
 use reth_optimism_primitives::OpTransaction;
@@ -46,10 +50,13 @@ use reth_optimism_txpool::{
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuildNextEnv, BuiltPayloadExecutedBlock};
 use reth_payload_util::{BestPayloadTransactions, PayloadTransactions};
-use reth_primitives_traits::{HeaderTy, SignedTransaction, TxTy, WithEncoded};
+use reth_primitives_traits::{
+    Block as _, BlockBody as _, BlockTy, HeaderTy, SealedBlock, SignedTransaction, TxTy,
+    WithEncoded,
+};
 use reth_revm::{
     State, cancelled::CancelOnDrop, context::Block as RevmBlockTrait,
-    database::StateProviderDatabase,
+    database::StateProviderDatabase, db::BundleState,
 };
 use reth_transaction_pool::{BestTransactions, PoolTransaction};
 use tokio::sync::broadcast;
@@ -58,8 +65,17 @@ use tracing::{debug, warn};
 use crate::{
     PreconfClassifier, PreconfConfig, PreconfTxSet,
     apply::{ApplyError, apply_preconf_tx},
-    builder::{cancel::JobCancel, dispatch},
+    builder::{
+        ExecutionInfo,
+        cancel::JobCancel,
+        dispatch,
+        pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
+    },
     classifier::{Verdict, Whitelist},
+    flashblocks::{
+        BlockInvariants, FlashblockProducerConfig, PublisherHandle, SenderBalances, SliceHeader,
+        SliceLimits, build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
+    },
     types::{PreconfError, PreconfReceipt, PreconfSource},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
 };
@@ -90,12 +106,12 @@ fn execute_sequencer_transactions_watching_whitelist<N, B>(
     sequencer_txs: &[WithEncoded<TxTy<N>>],
     builder: &mut B,
     whitelist_contract: Option<Address>,
-) -> Result<(ExecutionInfo, Vec<WhitelistDelta>), PayloadBuilderError>
+) -> Result<(ExecutionInfo<N::SignedTx>, Vec<WhitelistDelta>), PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
     B: BlockBuilder<Primitives = N>,
 {
-    let mut info = ExecutionInfo::new();
+    let mut info = ExecutionInfo::default();
     let mut deltas = Vec::new();
 
     for sequencer_tx in sequencer_txs {
@@ -166,6 +182,7 @@ where
         }
 
         info.cumulative_gas_used += gas_used.tx_gas_used();
+        info.record(recovered);
     }
 
     Ok((info, deltas))
@@ -230,6 +247,19 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     /// pool best-tx step, which is why it cannot be the (async) fifo.
     classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
+    /// Slice publishing, when it is switched on. `None` leaves the build loop
+    /// behaving exactly as it did before slicing existed, which is what makes
+    /// turning flashblocks off a real rollback rather than a second code path.
+    flashblocks: Option<FlashblocksProducer>,
+}
+
+/// What the build loop needs in order to publish slices.
+#[derive(Debug, Clone)]
+pub struct FlashblocksProducer {
+    /// Slice cadence and budget settings.
+    pub cfg: Arc<FlashblockProducerConfig>,
+    /// Where finished slices go.
+    pub publisher: PublisherHandle,
 }
 
 impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
@@ -248,7 +278,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
     ) -> Self {
-        Self { pool, client, evm_config, builder_config, cfg, classifier, fifo }
+        Self { pool, client, evm_config, builder_config, cfg, classifier, fifo, flashblocks: None }
+    }
+
+    /// Publish a slice of the block being built on every tick.
+    pub fn with_flashblocks(mut self, producer: FlashblocksProducer) -> Self {
+        self.flashblocks = Some(producer);
+        self
     }
 
     /// Borrow the underlying transaction pool.
@@ -301,7 +337,7 @@ fn convert_and_apply_preconf<N, B>(
     tx: Arc<TxEnvelope>,
     hash: TxHash,
     height: u64,
-) -> Result<PreconfReceipt, ApplyError>
+) -> Result<(PreconfReceipt, Recovered<N::SignedTx>), ApplyError>
 where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
@@ -320,7 +356,9 @@ where
             "ec-recover failed for preconf tx".into(),
         ))
     })?;
-    apply_preconf_tx(builder, recovered, hash, height)
+    let receipt = apply_preconf_tx(builder, recovered.clone(), hash, height)?;
+
+    Ok((receipt, recovered))
 }
 
 /// Immutable per-block gas / DA / fee constraints, snapshotted once at
@@ -472,7 +510,7 @@ fn preconf_admission(
 /// dispatches on `Admit`. A gate here would be dead code.
 fn apply_preconf_with_da<N, B>(
     builder: &mut B,
-    info: &mut ExecutionInfo,
+    info: &mut ExecutionInfo<N::SignedTx>,
     limits: BuildConstraints,
     tx: Arc<TxEnvelope>,
     hash: TxHash,
@@ -487,9 +525,10 @@ where
     // Miner tip is independent of gas used — capture it before `tx` is consumed
     // by apply, then fold `tip × gas_used` into the block value below.
     let miner_tip = tx.effective_tip_per_gas(limits.base_fee).unwrap_or_default();
-    let receipt = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
+    let (receipt, recovered) = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
     info.cumulative_da_bytes_used = info.cumulative_da_bytes_used.saturating_add(tx_da);
     info.cumulative_gas_used += receipt.gas_used;
+    info.record(recovered);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
     // `blockValue` and `is_better_payload` ignore preconf-sourced revenue.
@@ -548,7 +587,7 @@ async fn admit_and_dispatch<N, B>(
     hash: TxHash,
     loop_state: &mut dispatch::LoopState,
     builder: &mut B,
-    info: &mut ExecutionInfo,
+    info: &mut ExecutionInfo<N::SignedTx>,
     limits: BuildConstraints,
     whitelist: &Whitelist,
 ) -> Result<(), PayloadBuilderError>
@@ -723,102 +762,6 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
     carryover_hashes
 }
 
-/// Derived schedule for the adaptive-N pool quota — see
-/// `build_payload` Stage 3 setup. Extracted as a pure function so the
-/// (`time_drift`, `sweep_interval`, `slot_duration`, `block_gas_limit`)
-/// → `(ticks_remaining, gas_per_batch, first_offset, build_delay_ms)`
-/// mapping is unit-testable without a real payload build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PoolQuotaSchedule {
-    /// Time-until-slot-deadline used for the derivation, clamped to
-    /// `[sweep_interval, slot_duration]`.
-    time_drift: std::time::Duration,
-    /// Number of quota ticks fitting in `time_drift` (rounded up so a
-    /// residual remainder gets its own tick). Always ≥ 1.
-    ticks_remaining: u64,
-    /// Per-tick pool gas share — `block_gas_limit / ticks_remaining`.
-    gas_per_batch: u64,
-    /// First tick offset — aligns subsequent ticks to `sweep_interval`
-    /// boundaries within the slot. Equal to `sweep_interval` when the
-    /// slot already sits on a boundary.
-    first_offset: std::time::Duration,
-    /// Delay from the target slot start to now, in milliseconds.
-    /// Useful for observability / alerting.
-    build_delay_ms: u64,
-}
-
-/// Compute the adaptive-N pool gas schedule from wall-clock inputs.
-///
-/// `time_drift_or_fallback` should be the caller's already-saturated
-/// remaining-time-to-slot-deadline (falling back to `sweep_interval`
-/// for late-FCU / clock-skew cases). This helper is deterministic
-/// modulo integer arithmetic — no wall-clock reads inside.
-fn derive_pool_quota_schedule(
-    time_drift_or_fallback: std::time::Duration,
-    sweep_interval: std::time::Duration,
-    slot_duration: std::time::Duration,
-    block_gas_limit: u64,
-) -> PoolQuotaSchedule {
-    let time_drift = time_drift_or_fallback.min(slot_duration);
-    let interval_ms = sweep_interval.as_millis().max(1) as u64;
-    let drift_ms = time_drift.as_millis() as u64;
-    let ticks_remaining = drift_ms.div_ceil(interval_ms).max(1);
-    let gas_per_batch = block_gas_limit / ticks_remaining;
-    let first_offset_ms = drift_ms.checked_rem(interval_ms).unwrap_or(0);
-    let first_offset = if first_offset_ms == 0 {
-        sweep_interval
-    } else {
-        std::time::Duration::from_millis(first_offset_ms)
-    };
-    let build_delay_ms = slot_duration.saturating_sub(time_drift).as_millis() as u64;
-    PoolQuotaSchedule { time_drift, ticks_remaining, gas_per_batch, first_offset, build_delay_ms }
-}
-
-/// Adaptive-N pool-admission pacer — owns all pool-arm gas-pacing state for
-/// one build. Groups the running consumption (`used`), the time-proportional
-/// ceiling (`quota`, bumped one `per_batch` per sweep tick, capped at the
-/// block gas limit) and the increment, so the select! loop's pool arm reads a
-/// single object instead of scattered locals + a `LoopState` counter.
-///
-/// Distinct from `ExecutionInfo::cumulative_gas_used` (the all-source block
-/// total): `used` tracks **only** the pool best-tx arm, so pacing is not
-/// perturbed by preconf-tx or deposit gas.
-#[derive(Debug)]
-struct PoolPacer {
-    /// Gas admitted by the pool best-tx arm so far this build.
-    used: u64,
-    /// Current admission ceiling — pool txs admit while `used < quota`.
-    quota: u64,
-    /// Per-sweep-tick quota increment (`PoolQuotaSchedule::gas_per_batch`).
-    per_batch: u64,
-    /// Hard cap the quota is clamped to (the block gas limit).
-    block_gas_limit: u64,
-}
-
-impl PoolPacer {
-    /// Start with a drained quota (`0`) — the pool arm cannot admit until the
-    /// first sweep tick raises the ceiling by `per_batch`.
-    fn new(per_batch: u64, block_gas_limit: u64) -> Self {
-        Self { used: 0, quota: 0, per_batch, block_gas_limit }
-    }
-
-    /// Whether the pool arm may admit another tx under the current ceiling.
-    fn can_admit(&self) -> bool {
-        self.used < self.quota
-    }
-
-    /// Record `delta` gas consumed by a just-admitted pool best-tx.
-    fn record(&mut self, delta: u64) {
-        self.used = self.used.saturating_add(delta);
-    }
-
-    /// Raise the admission ceiling by one batch on a sweep tick, clamped to
-    /// the block gas limit.
-    fn tick(&mut self) {
-        self.quota = self.quota.saturating_add(self.per_batch).min(self.block_gas_limit);
-    }
-}
-
 /// Outcome of one iteration of the pool best-tx step inside the
 /// select! loop.
 enum BestTxStep {
@@ -843,8 +786,9 @@ fn apply_one_best_tx<N, Builder>(
         Transaction: PoolTransaction<Consensus = N::SignedTx> + OpPooledTx,
     >,
     builder: &mut Builder,
-    info: &mut ExecutionInfo,
+    info: &mut ExecutionInfo<N::SignedTx>,
     constraints: &BuildConstraints,
+    pacer: &mut AdmissionPacer,
 ) -> Result<BestTxStep, PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
@@ -905,26 +849,320 @@ where
         return Ok(BestTxStep::Continue);
     }
 
+    // Charged before running, at the gas the transaction declares, because
+    // what it actually burns is not known until it has. Whatever it does not
+    // use comes back on settle.
+    let Some(ticket) = pacer.reserve(tx.gas_limit(), tx_da_size) else {
+        // Too big for what is left of this slice's allowance. Skipped rather
+        // than treated as the end of the arm: stopping here would hold back
+        // every smaller transaction behind it for the rest of the tick, and a
+        // transaction declaring more gas than one slice's whole allowance would
+        // hold them back for the rest of the block. The iterator is rebuilt at
+        // the next boundary, so the skip lasts one slice and this transaction
+        // gets another chance against a larger allowance.
+        best_txs.mark_invalid(tx.signer(), tx.nonce());
+        return Ok(BestTxStep::Continue);
+    };
+
+    let recovered = tx.clone();
     let gas_used = match builder.execute_transaction(tx.clone()) {
         Ok(g) => g,
         Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { error, .. })) => {
+            pacer.cancel(ticket);
             if !error.is_nonce_too_low() {
                 best_txs.mark_invalid(tx.signer(), tx.nonce());
             }
             return Ok(BestTxStep::Continue);
         }
         Err(err) => {
+            pacer.cancel(ticket);
             return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
         }
     };
     let tx_gas_used = gas_used.tx_gas_used();
+    pacer.settle(ticket, tx_gas_used);
     info.cumulative_gas_used += tx_gas_used;
     info.cumulative_da_bytes_used += tx_da_size;
     let miner_fee = tx
         .effective_tip_per_gas(constraints.base_fee)
         .expect("fee is always valid; execution succeeded");
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
+    info.record(recovered);
     Ok(BestTxStep::Continue)
+}
+
+/// Assemble and seal the block as it stands, so a slice's header fields come
+/// from the same code that seals the final one.
+///
+/// Reuses the node's own block assembler rather than reassembling a header by
+/// hand: every field then comes from the code that seals blocks, so a slice
+/// cannot drift from the block it is a prefix of. The state root is left at
+/// zero — computing it per slice is the one cost slicing deliberately does not
+/// pay — which means the hash identifies the slice's contents rather than the
+/// block that will eventually be sealed.
+///
+/// The block is a throwaway: nothing here touches the executor, so it can be
+/// called as often as a slice is published.
+fn seal_block_so_far<N, Evm, ChainSpec, Attrs, B>(
+    ctx: &OpPayloadBuilderCtx<Evm, ChainSpec, Attrs>,
+    builder: &mut B,
+    info: &ExecutionInfo<N::SignedTx>,
+    state_provider: &dyn reth_storage_api::StateProvider,
+) -> Result<SealedBlock<BlockTy<N>>, PayloadBuilderError>
+where
+    N: OpPayloadPrimitives,
+    Evm: ConfigurePostExecEvm<
+            Primitives = N,
+            NextBlockEnvCtx: BuildNextEnv<Attrs, HeaderTy<N>, ChainSpec>,
+        >,
+    ChainSpec: reth_chainspec::EthChainSpec + reth_optimism_forks::OpHardforks,
+    Attrs: OpAttributes<Transaction = TxTy<N>>,
+    B: BlockBuilder<Primitives = N, Executor: alloy_evm::block::BlockExecutor>,
+{
+    let next_env_ctx = Evm::NextBlockEnvCtx::build_next_env(
+        ctx.attributes(),
+        ctx.parent(),
+        ctx.chain_spec.as_ref(),
+    )
+    .map_err(PayloadBuilderError::other)?;
+    let evm_env = ctx
+        .evm_config
+        .next_evm_env(ctx.parent(), &next_env_ctx)
+        .map_err(PayloadBuilderError::other)?;
+    let execution_ctx = ctx
+        .evm_config
+        .context_for_next_block(ctx.parent(), next_env_ctx)
+        .map_err(PayloadBuilderError::other)?;
+
+    let receipts = builder.executor().receipts().to_vec();
+    // The executor stamps its running gas into every receipt, so the last one
+    // holds its current total — the same number the sealed header will carry.
+    // Read from there rather than from `info`, whose tally depends on every
+    // execution site remembering to fold its gas in.
+    let gas_used = receipts.last().map_or(0, |receipt| receipt.cumulative_gas_used());
+
+    let output = BlockExecutionResult {
+        receipts,
+        requests: Default::default(),
+        gas_used,
+        // Left unset. Post-Jovian this field carries the block's DA footprint,
+        // which the executor derives per transaction from its own estimate and
+        // does not hand out — so there is nothing here to fill it with, and a
+        // number in the wrong unit would be worse than none. The gauge
+        // `flashblock.blob_gas_used_unpopulated` says when that is in force.
+        blob_gas_used: 0,
+    };
+    // One clone of the block's transactions per slice: the assembler takes them
+    // owned. Bounded by the assembler's signature rather than by choice, and
+    // the reason `flashblock.tick_duration` is worth watching on full blocks.
+    let transactions = info.executed().iter().map(|tx| tx.inner().clone()).collect::<Vec<_>>();
+
+    let block = ctx
+        .evm_config
+        .block_assembler()
+        .assemble_block(reth_evm::execute::BlockAssemblerInput::new(
+            evm_env,
+            execution_ctx,
+            ctx.parent(),
+            transactions,
+            &output,
+            // Empty: the only thing the assembler reads a bundle for is the
+            // `L2ToL1MessagePasser` storage root, and the live state is not
+            // reachable from here — the builder holds it for the whole build.
+            // That root is a block-level constant anyway, so leaving it at the
+            // parent's value costs the hash nothing as an identifier: what
+            // distinguishes one slice from the next is the transactions,
+            // receipts and gas, all of which are exact.
+            &BundleState::default(),
+            state_provider,
+            B256::ZERO,
+        ))
+        .map_err(PayloadBuilderError::other)?;
+
+    Ok(block.seal_slow())
+}
+
+/// The header fields that change from one slice to the next.
+fn slice_header<B: reth_primitives_traits::Block>(sealed: &SealedBlock<B>) -> SliceHeader {
+    let header = sealed.header();
+    SliceHeader {
+        gas_used: header.gas_used(),
+        receipts_root: header.receipts_root(),
+        logs_bloom: header.logs_bloom(),
+        block_hash: sealed.hash(),
+        blob_gas_used: header.blob_gas_used(),
+    }
+}
+
+/// The header fields that hold for the whole block.
+///
+/// Taken from the assembled header rather than gathered from the build context:
+/// every field then means exactly what it will mean in the sealed block, and
+/// there is no second place to keep in step. Read once per block and reused —
+/// re-deriving them per slice would make "these do not change" a coincidence
+/// rather than a guarantee, and pays for a predeploy storage read every tick.
+fn block_invariants<B: reth_primitives_traits::Block>(sealed: &SealedBlock<B>) -> BlockInvariants {
+    let header = sealed.header();
+    BlockInvariants {
+        base: OpFlashblockPayloadBase {
+            parent_beacon_block_root: header.parent_beacon_block_root().unwrap_or_default(),
+            parent_hash: header.parent_hash(),
+            fee_recipient: header.beneficiary(),
+            prev_randao: header.mix_hash().unwrap_or_default(),
+            block_number: header.number(),
+            gas_limit: header.gas_limit(),
+            timestamp: header.timestamp(),
+            extra_data: header.extra_data().clone(),
+            base_fee_per_gas: U256::from(header.base_fee_per_gas().unwrap_or_default()),
+        },
+        withdrawals: sealed.body().withdrawals().cloned().unwrap_or_default().into_inner(),
+        withdrawals_root: header.withdrawals_root().unwrap_or_default(),
+    }
+}
+
+/// Sender balances for pool maintenance, read from the parent state.
+///
+/// The live mid-block balances are not reachable from here — the block builder
+/// holds the state for the whole build — so a sender who has already spent in
+/// this block reads higher than they now are. The pool treats balance as a
+/// hint and execution is the real gate, so the cost is an occasional
+/// transaction admitted and then skipped, never one wrongly withheld.
+struct ProviderBalances<'a, P: ?Sized>(&'a P);
+
+impl<P: reth_storage_api::AccountReader + ?Sized> SenderBalances for ProviderBalances<'_, P> {
+    fn balance_of(&self, address: Address) -> Option<U256> {
+        self.0.basic_account(&address).ok().flatten().map(|account| account.balance)
+    }
+}
+
+/// Everything slicing carries from one tick to the next.
+///
+/// Held for the life of one block: the block-level fields a subscriber needs
+/// are established once, and the index and predecessor pointer are what let a
+/// subscriber tell a gap from a fresh start.
+struct SliceState {
+    producer: FlashblocksProducer,
+    /// Established by the first slice of this block, then reused.
+    invariants: Option<BlockInvariants>,
+    next_index: u64,
+    previous: FlashblockId,
+}
+
+impl SliceState {
+    fn new(producer: &FlashblocksProducer) -> Self {
+        // The predecessor of this block's first slice is the last slice of the
+        // previous block, which a block-scoped builder does not know — so it
+        // comes from what the publisher has actually sent. Only a producer that
+        // has published nothing has no predecessor, and the sentinel is how a
+        // subscriber tells that fresh start from a gap it should go and fill.
+        //
+        // Rebuilding a block points the new first slice at the last slice of
+        // the attempt being replaced. Deliberate: the index restarting at zero
+        // with `base` present is what says a build began again, and claiming no
+        // predecessor at all would say something less true.
+        let previous =
+            producer.publisher.latest_position().map_or(FlashblockId::NO_PREV, |position| {
+                FlashblockId {
+                    block_number: position.block_number,
+                    index: position.flashblock_index,
+                }
+            });
+
+        Self { producer: producer.clone(), invariants: None, next_index: 0, previous }
+    }
+
+    /// Assemble and publish everything executed since the last slice.
+    ///
+    /// Never fails the build. Publishing a slice is a side channel: a state read
+    /// that fell over, or an encoding that did not, costs a slice and leaves its
+    /// transactions pending for the next one — whereas failing here would cost
+    /// the slot its block. A subscriber that ends up short is told by
+    /// `prev_flashblock_id` and fills the gap from the canonical chain.
+    fn publish<N, Evm, ChainSpec, Attrs, B, P>(
+        &mut self,
+        ctx: &OpPayloadBuilderCtx<Evm, ChainSpec, Attrs>,
+        builder: &mut B,
+        info: &mut ExecutionInfo<N::SignedTx>,
+        state_provider: &P,
+        cancel: &JobCancel,
+    ) where
+        N: OpPayloadPrimitives,
+        Evm: ConfigurePostExecEvm<
+                Primitives = N,
+                NextBlockEnvCtx: BuildNextEnv<Attrs, HeaderTy<N>, ChainSpec>,
+            >,
+        ChainSpec: reth_chainspec::EthChainSpec + reth_optimism_forks::OpHardforks,
+        Attrs: OpAttributes<Transaction = TxTy<N>>,
+        B: BlockBuilder<Primitives = N, Executor: alloy_evm::block::BlockExecutor>,
+        P: reth_storage_api::StateProvider,
+    {
+        // Assembling means rooting every transaction in the block, which is not
+        // cheap. A payload that has already been resolved is being sealed, so
+        // there is nothing left to publish about it.
+        if cancel.is_cancelled() {
+            debug!(
+                target: "mantle::preconf::flashblocks",
+                index = self.next_index,
+                "payload already resolved; skipping the slice",
+            );
+            return;
+        }
+
+        let sealed = match seal_block_so_far(ctx, builder, info, state_provider) {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                warn!(
+                    target: "mantle::preconf::flashblocks",
+                    %err,
+                    index = self.next_index,
+                    "failed to assemble a slice; skipping it",
+                );
+                return;
+            }
+        };
+        let invariants = self.invariants.get_or_insert_with(|| block_invariants(&sealed));
+        let payload = build_flashblock(
+            invariants,
+            slice_header(&sealed),
+            info.pending_slice(),
+            ctx.payload_id(),
+            self.next_index,
+            self.previous,
+        );
+        let block_number = invariants.base.block_number;
+
+        // Checked again after assembling: a payload resolved while this slice
+        // was being put together is already being sealed, and a subscriber told
+        // about transactions the sealed block will not contain has no way to
+        // unsee them.
+        if cancel.is_cancelled() {
+            debug!(
+                target: "mantle::preconf::flashblocks",
+                index = self.next_index,
+                "payload resolved while the slice was assembled; dropping it",
+            );
+            return;
+        }
+
+        if let Err(err) = self.producer.publisher.publish(&payload) {
+            warn!(
+                target: "mantle::preconf::flashblocks",
+                %err,
+                index = self.next_index,
+                "failed to serialize a slice; skipping it",
+            );
+            return;
+        }
+
+        // Only now, and only on the path where the slice actually went out.
+        // Settling a slice that was dropped would leave its transactions in no
+        // slice at all while the index chain still looked unbroken, so a
+        // subscriber would have no way to notice the hole.
+        info.advance_publish_cursor();
+
+        self.previous = FlashblockId { block_number, index: self.next_index };
+        self.next_index += 1;
+    }
 }
 
 // ─── build_payload (async) ──────────────────────────────────────────────────
@@ -945,19 +1183,23 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     /// 2. **Stage 1** — `apply_pre_execution_changes`.
     /// 3. **Stage 2** — `execute_sequencer_transactions_watching_whitelist` (deposits + L1 info +
     ///    system txs, snapshotting any `WhitelistUpdated` delta they emit).
-    /// 4. **Stage 3** — unified `select!` loop with four `biased` branches:
+    /// 4. **Stage 3** — unified `select!` loop with four `biased` branches, **in this order**:
     ///    - `cancel.wait()` — exits the loop.
+    ///    - `flashblock_ticker.tick()` — publishes the slice, opens the next allowance, brings the
+    ///      pool up to date and takes a fresh best-tx iterator. Ahead of the pool arm because that
+    ///      arm is always ready: behind it the ticker would never be polled, and a slice would go
+    ///      out when gas ran out rather than when its window closed.
     ///    - `fifo_rx.recv()` — preconf-tx dispatch (`admit_and_dispatch` per hash on `Ok`; on
     ///      `Lagged` re-scan the fifo snapshot through the same gate; break on `Closed`).
-    ///    - **Level-triggered pool arm** (`ready(()) if PoolPacer::can_admit()`) — each fire admits
-    ///      exactly one pool best-tx, then returns to `select!`. Cancel and preconf get preempt
-    ///      chances between every pool tx via biased priority.
-    ///    - `sweep_ticker.tick()` — raises the `PoolPacer` ceiling by
-    ///      `PoolQuotaSchedule::gas_per_batch`; the pool arm consumes the new headroom.
+    ///    - **Level-triggered pool arm** (`ready(()) if AdmissionPacer::has_headroom()`) — each
+    ///      fire admits exactly one pool best-tx, then returns to `select!`. Unbounded readiness,
+    ///      so it goes last; cancel, the ticker and preconf all get a preempt chance between every
+    ///      pool tx via biased priority.
     ///
-    ///    Before the loop, a **carryover replay preamble** (`replay_fifo_carryover`) applies stale
-    ///    in-flight / journal-restored entries directly, bypassing the broadcast queue so they
-    ///    land ahead of concurrently-queued RPC pushes.
+    ///    Before the loop: the **index 0 slice** (deposits and system txs only), then a **carryover
+    ///    replay preamble** (`replay_fifo_carryover`) applying stale in-flight / journal-restored
+    ///    entries directly, bypassing the broadcast queue so they land ahead of concurrently-queued
+    ///    RPC pushes.
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).
     /// 6. **Stage 5** — `builder.finish` → seal + wrap into `OpBuiltPayload`.
     ///
@@ -979,7 +1221,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         cancel: JobCancel,
     ) -> Result<OpBuiltPayload<N>, PayloadBuilderError>
     where
-        Pool: reth_transaction_pool::TransactionPool<
+        Pool: reth_transaction_pool::TransactionPoolExt<
                 Transaction: reth_optimism_txpool::OpPooledTx<Consensus = N::SignedTx>,
             >,
         Client: reth_storage_api::StateProviderFactory
@@ -1139,12 +1381,37 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // ticker itself is monotonic.
         let slot_deadline =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(attrs_timestamp);
-        let time_drift_input = slot_deadline
-            .duration_since(std::time::SystemTime::now())
-            .unwrap_or(self.cfg.sweep_interval);
+        // With slicing on, the tick is what publishes, so its cadence is the
+        // slice interval. With it off the cadence is what preconf always used,
+        // which is what keeps turning the feature off a true rollback rather
+        // than a second code path.
+        let flashblock_cfg = self.flashblocks.as_ref().map(|producer| producer.cfg.as_ref());
+        let tick_interval =
+            crate::flashblocks::tick_interval(flashblock_cfg, self.cfg.sweep_interval);
+
+        // Measured once and handed to both schedules unreduced; each subtracts
+        // the leeway it holds back itself. Reducing it here and adding it back
+        // for the other caller is a round trip that does not survive saturation.
+        let time_to_deadline =
+            slot_deadline.duration_since(std::time::SystemTime::now()).unwrap_or(tick_interval);
+
+        // Divides the block across the slices still expected to fit. Also owns
+        // the tick grid when slicing is on: the ticker and the budget have to
+        // agree on where the tick boundaries are, and the way to guarantee that
+        // is to read both from one schedule.
+        let slice_schedule = flashblock_cfg.map(|cfg| {
+            derive_slice_schedule(
+                time_to_deadline,
+                cfg.leeway_time,
+                tick_interval,
+                self.cfg.slot_duration,
+                SliceLimits { block_gas_limit, block_da_limit, da_footprint_gas_scalar },
+            )
+        });
+
         let schedule = derive_pool_quota_schedule(
-            time_drift_input,
-            self.cfg.sweep_interval,
+            time_to_deadline,
+            tick_interval,
             self.cfg.slot_duration,
             block_gas_limit,
         );
@@ -1159,15 +1426,36 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             );
         }
 
-        let mut sweep_ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + schedule.first_offset,
-            self.cfg.sweep_interval,
-        );
-        // Adaptive-N pool admission pacer. Starts with a drained quota (0) —
-        // the pool arm cannot admit until the first sweep tick raises the
-        // ceiling by `gas_per_batch`; its `can_admit()` guard is a level
-        // trigger that self-disables once the current allocation is drained.
-        let mut pool_pacer = PoolPacer::new(schedule.gas_per_batch, block_gas_limit);
+        let first_offset =
+            slice_schedule.map_or(schedule.first_offset, |schedule| schedule.first_offset);
+        // The grid every tick is measured against. Kept as one instant so a
+        // skipped tick can be told apart from a late one.
+        let tick_grid_start = tokio::time::Instant::now() + first_offset;
+        let mut flashblock_ticker = tokio::time::interval_at(tick_grid_start, tick_interval);
+        // A tick that arrives late has missed the window it was going to
+        // publish; firing the backlog immediately afterwards would send a burst
+        // of near-empty slices rather than catch anything up. Only with slicing
+        // on: with it off the tick only raises a ceiling, nothing is missed by
+        // firing late, and the default is what preconf has always run.
+        if flashblock_cfg.is_some() {
+            flashblock_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        }
+        let mut pool_pacer = match slice_schedule {
+            Some(schedule) => AdmissionPacer::slicing(&schedule),
+            // Starts with a drained quota (0) — the pool arm cannot admit
+            // until the first sweep tick raises the ceiling by
+            // `gas_per_batch`; its `has_headroom()` guard is a level trigger
+            // that self-disables once the current allocation is drained.
+            None => AdmissionPacer::sweeping(schedule.gas_per_batch, block_gas_limit),
+        };
+        // Skipping a tick would otherwise skip the allowance it carried, so the
+        // budget is opened by where the clock is rather than by how many ticks
+        // were delivered: one allowance per grid point already passed. Slicing
+        // only — with it off tokio delivers every missed tick itself, and
+        // counting them again here would open the same allowance twice.
+        let catch_up_budget = flashblock_cfg.is_some();
+        let tick_interval_ms = tick_interval.as_millis().max(1);
+        let mut allowances_opened: u128 = 0;
 
         // `no_tx_pool=true` on the payload attrs signals a
         // **deterministic derivation build**: the block must exactly
@@ -1198,6 +1486,33 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // in-flight block, so it is safe (and desirable — keeps fifo
         // aligned with chain state) during derivation builds too.
         sync_fifo_forward_to_head(&self.fifo, state_provider_for_finish.as_ref()).await;
+
+        // ── Slice publishing state ────────────────────────────────────
+        //
+        // Gated on `allow_preconf`: a derivation build has to reproduce what
+        // other nodes derive from L1 data, and a subscriber watching a block
+        // that is being replayed rather than built has nothing to gain from
+        // seeing it in pieces.
+        let mut slices = self.flashblocks.as_ref().filter(|_| allow_preconf).map(SliceState::new);
+
+        if slices.is_some() {
+            // Post-Jovian the header's `blob_gas_used` carries the block's DA
+            // footprint, which slices leave unset (see `seal_block_so_far`).
+            // Sampled per build so a deployment can see it is in force rather
+            // than discover it from a consumer's numbers not adding up.
+            metrics::gauge!("flashblock.blob_gas_used_unpopulated")
+                .set(if da_footprint_gas_scalar.is_some() { 1.0 } else { 0.0 });
+        }
+
+        // The first slice goes out before any preconf or pool transaction has
+        // been applied, so it carries exactly the deposits and system
+        // transactions that are fixed for this block, plus the block-level
+        // fields a subscriber needs to reconstruct a header. Publishing it
+        // after the carryover preamble would fold replayed commitments into it
+        // and break that guarantee.
+        if let Some(state) = slices.as_mut() {
+            state.publish(&ctx, &mut builder, &mut info, &state_provider_for_finish, &cancel);
+        }
 
         // Carryover replay preamble — apply stale in-flight / journal-
         // restored entries directly (see `replay_fifo_carryover`). The
@@ -1237,6 +1552,48 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             tokio::select! {
                 biased;
                 () = cancel.wait() => break,
+                // Publishes what has been executed since the last tick, then
+                // opens the next slice's budget and refreshes the pool's view
+                // of the block. The order matters: publishing first is what
+                // makes a slice the delta since the previous one.
+                _ = flashblock_ticker.tick() => {
+                    if let Some(state) = slices.as_mut() {
+                        state.publish(
+                            &ctx,
+                            &mut builder,
+                            &mut info,
+                            &state_provider_for_finish,
+                            &cancel,
+                        );
+
+                        // Tell the pool what ran, then take a fresh iterator.
+                        // Both have to happen here and in this order: the
+                        // correction only survives until the next arrival
+                        // overwrites it, so anything between it and the new
+                        // iterator is wasted.
+                        maintain_pool_at_slice_boundary(
+                            &self.pool,
+                            &ProviderBalances(state_provider_for_finish.as_ref()),
+                            &mut info,
+                        );
+                        let attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
+                        best_txs_iter = Some(BestPayloadTransactions::new(
+                            self.pool.best_transactions_with_attributes(attrs).without_updates(),
+                        ));
+                    }
+
+                    if catch_up_budget {
+                        let elapsed = tokio::time::Instant::now()
+                            .saturating_duration_since(tick_grid_start);
+                        let due = allowances_due(elapsed, tick_interval_ms);
+                        for _ in allowances_opened..due {
+                            pool_pacer.tick();
+                        }
+                        allowances_opened = due;
+                    } else {
+                        pool_pacer.tick();
+                    }
+                }
                 recv = fifo_rx.recv() => {
                     match recv {
                         Ok(hash) => {
@@ -1278,34 +1635,22 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 // Admits ONE pool tx per fire, then returns to select! so
                 // biased cancel / preconf can preempt between every tx.
                 _ = std::future::ready(()), if best_txs_iter.is_some()
-                    && pool_pacer.can_admit() =>
+                    && pool_pacer.has_headroom() =>
                 {
                     let iter = best_txs_iter.as_mut().expect("guard verified Some");
-                    let before = info.cumulative_gas_used;
                     match apply_one_best_tx::<N, _>(
                         &self.classifier,
                         iter,
                         &mut builder,
                         &mut info,
                         &constraints,
+                        &mut pool_pacer,
                     )? {
-                        BestTxStep::Continue => {
-                            // delta == 0 → tx was filtered (mark_invalid /
-                            // nonce-too-low); iterator has advanced. Next
-                            // select! iteration re-fires this arm and
-                            // pulls the next tx.
-                            let delta = info.cumulative_gas_used - before;
-                            if delta > 0 {
-                                pool_pacer.record(delta);
-                            }
-                        }
+                        // The iterator has advanced either way; the next
+                        // select! iteration re-fires this arm.
+                        BestTxStep::Continue => {}
                         BestTxStep::Done => best_txs_iter = None,
                     }
-                }
-                // Only raises the pacer's ceiling; the pool arm above drains
-                // the new headroom on subsequent iterations.
-                _ = sweep_ticker.tick() => {
-                    pool_pacer.tick();
                 }
             }
         }
@@ -1318,8 +1663,26 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             let block_number = builder.evm_mut().block().number().saturating_to();
             let entries = builder.executor_mut().take_post_exec_entries();
             try_include_post_exec_tx::<N::SignedTx, _>(block_number, entries, |tx| {
-                builder.execute_transaction(tx).map(|g| g.tx_gas_used())
+                let recorded = tx.clone();
+                builder.execute_transaction(tx).map(|gas| {
+                    let tx_gas_used = gas.tx_gas_used();
+                    // Accounted for like every other execution. The closing
+                    // slice is published after this stage, so leaving the
+                    // transaction out would make the published slices stop one
+                    // short of the sealed block; leaving its gas out would make
+                    // `info` stop being the block's running total.
+                    info.cumulative_gas_used += tx_gas_used;
+                    info.record(recorded);
+                    tx_gas_used
+                })
             })?;
+        }
+
+        // The closing slice. Published after the post-execution transaction so
+        // that what subscribers have seen adds up to exactly what gets sealed,
+        // rather than stopping one transaction short of it.
+        if let Some(state) = slices.as_mut() {
+            state.publish(&ctx, &mut builder, &mut info, &state_provider_for_finish, &cancel);
         }
 
         // ── Stage 5: finalize ─────────────────────────────────────────
@@ -1575,125 +1938,6 @@ mod tests {
         assert!(chain.contains("synthetic execute failure"), "unexpected error chain: {chain}");
     }
 
-    // ============ derive_pool_quota_schedule ============
-    //
-    // Pure-function math tests for the adaptive-N pool quota schedule.
-    // These are wall-clock free — the caller pre-computes `time_drift`,
-    // so the helper is deterministic.
-
-    const TEST_SLOT: std::time::Duration = std::time::Duration::from_millis(2000);
-    const TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
-    const TEST_BLOCK_GAS: u64 = 30_000_000;
-
-    /// No delay: full slot remaining. Schedule matches the "no-delay"
-    /// case documented in the state-machine comment — 10 ticks × 3M
-    /// each, first tick aligned to `sweep_interval`.
-    #[test]
-    fn quota_schedule_full_slot_produces_ten_ticks_of_three_million_each() {
-        let s = derive_pool_quota_schedule(TEST_SLOT, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
-        assert_eq!(s.ticks_remaining, 10);
-        assert_eq!(s.gas_per_batch, 3_000_000);
-        // Aligned drift → first tick equals full interval.
-        assert_eq!(s.first_offset, TEST_INTERVAL);
-        assert_eq!(s.build_delay_ms, 0);
-        assert_eq!(s.time_drift, TEST_SLOT);
-    }
-
-    /// Delay 1s (1s remaining). Adaptive-N shrinks to 5 ticks × 6M each
-    /// — pool still fills the whole block over the remaining window.
-    #[test]
-    fn quota_schedule_one_second_delay_produces_five_ticks_of_six_million_each() {
-        let drift = std::time::Duration::from_millis(1000);
-        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
-        assert_eq!(s.ticks_remaining, 5);
-        assert_eq!(s.gas_per_batch, 6_000_000);
-        assert_eq!(s.first_offset, TEST_INTERVAL); // 1000 % 200 == 0 → align to interval
-        assert_eq!(s.build_delay_ms, 1000);
-    }
-
-    /// Non-aligned drift: `first_offset` shrinks to the remainder so
-    /// every subsequent tick lands on an interval boundary within the
-    /// slot. 900ms remaining → first tick after 100ms, then every
-    /// 200ms → 5 ticks total: [100, 300, 500, 700, 900].
-    #[test]
-    fn quota_schedule_non_aligned_drift_uses_remainder_as_first_offset() {
-        let drift = std::time::Duration::from_millis(900);
-        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
-        assert_eq!(s.first_offset, std::time::Duration::from_millis(100));
-        // ceil(900/200) = 5 ticks; each tick admits 6M.
-        assert_eq!(s.ticks_remaining, 5);
-        assert_eq!(s.gas_per_batch, 6_000_000);
-        assert_eq!(s.build_delay_ms, 1100);
-    }
-
-    /// Extreme delay: less than one interval remaining. Schedule still
-    /// admits one tick with the full block budget — a "single-shot"
-    /// pool sweep at the end of the slot rather than degenerating to
-    /// zero pool admission.
-    #[test]
-    fn quota_schedule_sub_interval_drift_yields_one_tick_full_budget() {
-        let drift = std::time::Duration::from_millis(120);
-        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
-        assert_eq!(s.ticks_remaining, 1);
-        assert_eq!(s.gas_per_batch, TEST_BLOCK_GAS);
-        // 120 % 200 = 120 → first tick after 120ms.
-        assert_eq!(s.first_offset, std::time::Duration::from_millis(120));
-        assert_eq!(s.build_delay_ms, 1880);
-    }
-
-    /// Late FCU / clock skew: caller has already fallen back to
-    /// `sweep_interval` (its typical fallback). Schedule handles it
-    /// gracefully — one tick, full budget, offset = interval.
-    #[test]
-    fn quota_schedule_fallback_to_sweep_interval_is_valid() {
-        let s = derive_pool_quota_schedule(TEST_INTERVAL, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
-        assert_eq!(s.ticks_remaining, 1);
-        assert_eq!(s.gas_per_batch, TEST_BLOCK_GAS);
-        assert_eq!(s.first_offset, TEST_INTERVAL);
-    }
-
-    /// Drift exceeds `slot_duration` (misconfigured attrs.timestamp far
-    /// in the future). Clamped to `slot_duration` — no unbounded quota.
-    #[test]
-    fn quota_schedule_over_long_drift_clamps_to_slot_duration() {
-        let drift = std::time::Duration::from_secs(60);
-        let s = derive_pool_quota_schedule(drift, TEST_INTERVAL, TEST_SLOT, TEST_BLOCK_GAS);
-        assert_eq!(s.time_drift, TEST_SLOT);
-        // Same as full-slot case.
-        assert_eq!(s.ticks_remaining, 10);
-        assert_eq!(s.gas_per_batch, 3_000_000);
-    }
-
-    /// Sum-invariant: `ticks_remaining × gas_per_batch` ≤
-    /// `block_gas_limit` (integer division floor). Pool never
-    /// over-admits by design; slight under-admission (up to
-    /// `ticks_remaining - 1` gas due to floor) is acceptable and
-    /// bounded.
-    #[test]
-    fn quota_schedule_total_admission_never_exceeds_block_gas() {
-        for drift_ms in [100u64, 200, 500, 900, 1000, 1500, 1900, 2000] {
-            let s = derive_pool_quota_schedule(
-                std::time::Duration::from_millis(drift_ms),
-                TEST_INTERVAL,
-                TEST_SLOT,
-                TEST_BLOCK_GAS,
-            );
-            let total_admitted = s.ticks_remaining.saturating_mul(s.gas_per_batch);
-            assert!(
-                total_admitted <= TEST_BLOCK_GAS,
-                "drift_ms={drift_ms}: total {total_admitted} exceeds block gas {TEST_BLOCK_GAS}",
-            );
-            // Under-admission bound: at most (ticks_remaining - 1) gas
-            // lost to floor rounding.
-            let under = TEST_BLOCK_GAS - total_admitted;
-            assert!(
-                under < s.ticks_remaining,
-                "drift_ms={drift_ms}: under-admission {under} exceeds ticks {ticks}",
-                ticks = s.ticks_remaining,
-            );
-        }
-    }
-
     // ============ preconf_admission (block-capacity gate) ============
     //
     // Pure-function tests for the pre-dispatch admission gate. Classifies a tx as
@@ -1799,53 +2043,6 @@ mod tests {
             preconf_admission(100, 21_000, 900, 0, limits, PreconfSource::Replay),
             Admission::Admit
         ));
-    }
-
-    // ============ PoolPacer (Adaptive-N pool admission pacing) ============
-
-    /// Quota starts drained (0): no admission until the first sweep tick
-    /// raises the ceiling by `per_batch`.
-    #[test]
-    fn pool_pacer_starts_drained_then_first_tick_opens_admission() {
-        let mut p = PoolPacer::new(1_000, 5_000);
-        assert!(!p.can_admit(), "quota starts at 0 → cannot admit before first tick");
-        p.tick();
-        assert!(p.can_admit(), "after one tick quota=1000 > used=0 → can admit");
-    }
-
-    /// `record` accumulates consumption; admission gates on `used < quota`
-    /// (strict — boundary `used == quota` cannot admit, matching the old
-    /// `pool_gas_used < pool_quota` guard).
-    #[test]
-    fn pool_pacer_record_accumulates_and_gates_admission() {
-        let mut p = PoolPacer::new(1_000, 5_000);
-        p.tick(); // quota = 1000
-        p.record(600);
-        assert!(p.can_admit(), "used 600 < quota 1000");
-        p.record(400);
-        assert!(!p.can_admit(), "used 1000 == quota 1000 → cannot admit (strict <)");
-    }
-
-    /// Ticks raise the ceiling by `per_batch` but never past the block gas
-    /// limit.
-    #[test]
-    fn pool_pacer_tick_clamps_to_block_gas_limit() {
-        let mut p = PoolPacer::new(4_000, 5_000);
-        p.tick();
-        assert_eq!(p.quota, 4_000);
-        p.tick(); // 8000 → clamp to 5000
-        assert_eq!(p.quota, 5_000);
-        p.tick(); // stays clamped
-        assert_eq!(p.quota, 5_000);
-    }
-
-    /// `record` saturates rather than overflowing.
-    #[test]
-    fn pool_pacer_record_saturates() {
-        let mut p = PoolPacer::new(1, 1);
-        p.record(u64::MAX);
-        p.record(u64::MAX);
-        assert_eq!(p.used, u64::MAX);
     }
 
     // ============ dispatch-time allowlist gate ============

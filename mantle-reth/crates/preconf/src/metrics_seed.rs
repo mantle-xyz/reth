@@ -61,6 +61,10 @@ const GAUGES: &[&str] = &[
     "preconf.whitelist.to_wildcard_count",
     "preconf.whitelist.warn_threshold",
     "preconf.whitelist.consecutive_reload_failures",
+    // Whether published slices are under-reporting the block's DA footprint.
+    // A gauge and not a counter: it reports a property of the deployment
+    // (which fork is in force), not something that happens.
+    "flashblock.blob_gas_used_unpopulated",
 ];
 
 /// Histogram series. Registered only — never `record(0.0)`, which would inject
@@ -113,25 +117,31 @@ mod tests {
         }
     }
 
-    /// Extract every `"preconf.…"` name passed to `<macro>!("preconf.…"` in the
-    /// source (i.e. the inline emit sites; the seed lists use a variable, not a
-    /// literal, so they don't match).
+    /// Namespaces this crate emits under. Both are scanned, so a metric added
+    /// under either one is held to the same seeding rule.
+    const PREFIXES: &[&str] = &["preconf.", "flashblock."];
+
+    /// Extract every name passed to `<macro>!("<prefix>…"` in the source (i.e.
+    /// the inline emit sites; the seed lists use a variable, not a literal, so
+    /// they don't match).
     fn emitted_names(src: &str, macro_name: &str) -> HashSet<String> {
-        let needle = format!("{macro_name}!(\"preconf.");
         let mut names = HashSet::new();
-        let mut rest = src;
-        while let Some(pos) = rest.find(&needle) {
-            let after = &rest[pos + needle.len() - "preconf.".len()..];
-            if let Some(end) = after.find('"') {
-                names.insert(after[..end].to_string());
+        for prefix in PREFIXES {
+            let needle = format!("{macro_name}!(\"{prefix}");
+            let mut rest = src;
+            while let Some(pos) = rest.find(&needle) {
+                let after = &rest[pos + needle.len() - prefix.len()..];
+                if let Some(end) = after.find('"') {
+                    names.insert(after[..end].to_string());
+                }
+                rest = &rest[pos + needle.len()..];
             }
-            rest = &rest[pos + needle.len()..];
         }
         names
     }
 
-    /// Every `preconf.*` metric emitted anywhere in the crate must appear in the
-    /// matching seed list — otherwise it regresses to lazy registration.
+    /// Every metric emitted anywhere in the crate must appear in the matching
+    /// seed list — otherwise it regresses to lazy registration.
     #[test]
     fn seed_lists_cover_every_emitted_metric() {
         let mut src = String::new();

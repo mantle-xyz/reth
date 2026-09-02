@@ -123,6 +123,17 @@ impl PublisherHandle {
         Ok(size)
     }
 
+    /// Where the most recently published slice sits, across every block this
+    /// producer has published.
+    ///
+    /// A block-scoped producer cannot know what preceded it, so this is what
+    /// lets one block's first slice point at the last slice of the previous
+    /// one. `None` means nothing has been published yet — a fresh start, which
+    /// is the one case with genuinely no predecessor.
+    pub fn latest_position(&self) -> Option<FlashblockPosition> {
+        self.ring.read().latest()
+    }
+
     /// Subscribers currently connected.
     pub fn subscriber_count(&self) -> usize {
         self.pipe.receiver_count()

@@ -131,7 +131,7 @@ where
         + 'static,
     <Node::Provider as reth_chainspec::ChainSpecProvider>::ChainSpec:
         reth_chainspec::EthChainSpec + reth_optimism_forks::OpHardforks,
-    Pool: reth_transaction_pool::TransactionPool<
+    Pool: reth_transaction_pool::TransactionPoolExt<
             Transaction: reth_optimism_txpool::OpPooledTx<Consensus = N::SignedTx>,
         > + Clone
         + Send

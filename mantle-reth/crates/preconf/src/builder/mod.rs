@@ -22,10 +22,13 @@
 //!   build task.
 //! - [`execution_info`] — what the loop has executed so far, and how much of it has already been
 //!   published as a flashblock.
+//! - `pacing` — how fast the loop may admit pool transactions: the adaptive-N schedule and the
+//!   sweep / per-slice budgets behind one enum. Pure arithmetic, no reth types.
 
 pub mod cancel;
 pub(crate) mod dispatch;
 pub mod execution_info;
+mod pacing;
 pub mod payload_builder;
 pub mod payload_job;
 pub mod payload_job_generator;

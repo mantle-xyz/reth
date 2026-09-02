@@ -130,7 +130,7 @@ where
     // Pool / Client / Evm constraints needed by build_payload's where
     // clause. Repeated here because the trait impl is a fresh
     // generics scope.
-    Pool: reth_transaction_pool::TransactionPool<
+    Pool: reth_transaction_pool::TransactionPoolExt<
             Transaction: reth_optimism_txpool::OpPooledTx<Consensus = N::SignedTx>,
         > + Clone
         + Send
