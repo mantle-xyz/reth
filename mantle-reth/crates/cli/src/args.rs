@@ -61,10 +61,11 @@ pub struct MantleArgs {
 pub struct FlashblocksArgs {
     /// Websocket endpoint streaming flashblocks to the Mantle consumer.
     ///
+    /// Named to match the `flashblocks-rpc` deployments already in operation.
     /// Absent (default) leaves the consumer off and the `pending` tag on its
     /// standard local-mempool semantics.
-    #[arg(long = "flashblocks.consumer-url")]
-    pub consumer_url: Option<Url>,
+    #[arg(long = "flashblocks.websocket-url")]
+    pub websocket_url: Option<Url>,
 
     /// Interval between upstream websocket ping frames, in seconds.
     #[arg(long = "flashblocks.ping-interval-secs")]
@@ -94,7 +95,7 @@ impl FlashblocksArgs {
         self,
         upstream_flashblocks_url: Option<&Url>,
     ) -> Result<Option<FlashblocksConfig>, FlashblocksArgsError> {
-        let Some(consumer_url) = self.consumer_url else {
+        let Some(websocket_url) = self.websocket_url else {
             return Ok(None);
         };
         if upstream_flashblocks_url.is_some() {
@@ -102,7 +103,7 @@ impl FlashblocksArgs {
         }
 
         Ok(Some(FlashblocksConfig {
-            websocket_url: consumer_url,
+            websocket_url,
             max_trailing_depth: self.max_trailing_depth.unwrap_or(DEFAULT_MAX_TRAILING_DEPTH),
             max_leading_depth: self.max_leading_depth.unwrap_or(DEFAULT_MAX_LEADING_DEPTH),
             max_cache_ahead_blocks: self
@@ -121,7 +122,7 @@ impl FlashblocksArgs {
 pub enum FlashblocksArgsError {
     /// Both the Mantle and the upstream op-reth consumer were requested.
     #[error(
-        "--flashblocks.consumer-url and --flashblocks-url are mutually exclusive: the Mantle and \
+        "--flashblocks.websocket-url and --flashblocks-url are mutually exclusive: the Mantle and \
          op-reth flashblock consumers are independent implementations and must not both run"
     )]
     ConflictingConsumers,
@@ -385,5 +386,86 @@ mod tests {
         assert_eq!(cfg.rejournal_interval, DEFAULT_REJOURNAL_INTERVAL);
         assert_eq!(cfg.journal_max_size, DEFAULT_JOURNAL_MAX_SIZE);
         assert_eq!(cfg.broadcast_cap, DEFAULT_BROADCAST_CAP);
+    }
+
+    /// Wraps the full `MantleArgs` so the flashblock flags are parsed alongside
+    /// `RollupArgs`: upstream registers `--flashblocks-url` there, and a clash
+    /// with our own long names would make clap panic on startup.
+    #[derive(Parser, Debug)]
+    struct FlashblocksTestCli {
+        #[command(flatten)]
+        args: MantleArgs,
+    }
+
+    fn parse_flashblocks(argv: &[&str]) -> MantleArgs {
+        FlashblocksTestCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
+    }
+
+    #[test]
+    fn no_url_leaves_the_consumer_off() {
+        let args = parse_flashblocks(&[]);
+        assert!(
+            args.flashblocks
+                .into_config(args.rollup.flashblocks_url.as_ref())
+                .expect("no conflict")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn websocket_url_enables_the_consumer_with_defaults() {
+        // The flag name matches the `flashblocks-rpc` deployments in operation.
+        let args = parse_flashblocks(&["--flashblocks.websocket-url", "ws://sequencer:1111"]);
+        let cfg = args
+            .flashblocks
+            .into_config(args.rollup.flashblocks_url.as_ref())
+            .expect("no conflict")
+            .expect("enabled");
+        assert_eq!(cfg.websocket_url.as_str(), "ws://sequencer:1111/");
+        assert_eq!(cfg.max_trailing_depth, DEFAULT_MAX_TRAILING_DEPTH);
+        assert_eq!(cfg.max_leading_depth, DEFAULT_MAX_LEADING_DEPTH);
+        assert_eq!(cfg.max_cache_ahead_blocks, DEFAULT_MAX_CACHE_AHEAD_BLOCKS);
+        assert_eq!(cfg.subscriber_ping_interval, DEFAULT_SUBSCRIBER_PING_INTERVAL);
+    }
+
+    #[test]
+    fn tuning_flags_override_defaults() {
+        let args = parse_flashblocks(&[
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+            "--flashblocks.ping-interval-secs",
+            "5",
+            "--flashblocks.max-trailing-depth",
+            "7",
+            "--flashblocks.max-leading-depth",
+            "9",
+            "--flashblocks.max-cache-ahead-blocks",
+            "11",
+        ]);
+        let cfg = args
+            .flashblocks
+            .into_config(args.rollup.flashblocks_url.as_ref())
+            .expect("no conflict")
+            .expect("enabled");
+        assert_eq!(cfg.subscriber_ping_interval, Duration::from_secs(5));
+        assert_eq!(cfg.max_trailing_depth, 7);
+        assert_eq!(cfg.max_leading_depth, 9);
+        assert_eq!(cfg.max_cache_ahead_blocks, 11);
+    }
+
+    #[test]
+    fn both_consumers_is_rejected() {
+        // Two independent implementations would each subscribe and each build
+        // pending state; the node must refuse to start rather than pick one.
+        let args = parse_flashblocks(&[
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+            "--flashblocks-url",
+            "ws://other:2222",
+        ]);
+        assert_eq!(
+            args.flashblocks.into_config(args.rollup.flashblocks_url.as_ref()).unwrap_err(),
+            FlashblocksArgsError::ConflictingConsumers
+        );
     }
 }

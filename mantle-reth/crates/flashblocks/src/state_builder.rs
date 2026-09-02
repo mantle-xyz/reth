@@ -345,9 +345,9 @@ where
                     meta,
                 };
 
-                // `op_gas_refund` comes from the block's SDM post-exec payload, which is
-                // the last transaction of the block and therefore not yet observable
-                // during incremental slice replay.
+                // No SDM accounting here: the refund is produced by an EVM inspector
+                // this path never arms, so gas and balances follow legacy accounting.
+                // Only correct while SDM stays disabled — see T3 in the plan discussion.
                 let mut op_receipt = OpReceiptBuilder::new(
                     self.receipt_builder.chain_spec(),
                     input,

@@ -5,7 +5,7 @@
 
 use mantle_reth_flashblocks::{FlashblocksAPI, PendingBlocksAPI};
 
-use crate::helpers::{FlashblockBuilder, base_slice, launch_flashblocks_node};
+use crate::helpers::{FlashblockBuilder, base_slice, l1_info_deposit, launch_flashblocks_node};
 
 /// Default depths: three blocks of trailing history, three of leading slack.
 macro_rules! launch {
@@ -86,6 +86,50 @@ async fn a_slice_beyond_the_leading_depth_is_dropped() {
     harness.send(base_slice(100)).await;
 
     assert!(harness.pending().is_none(), "the leading-depth guard must drop the slice");
+}
+
+/// A slice carrying an SDM post-exec transaction is rejected whole.
+///
+/// The canonical block executor recognises `POST_EXEC_TX_TYPE_ID` and returns
+/// before handing the transaction to the EVM. This replay path has no such
+/// branch, so it reaches `evm.transact` with the all-default `TxEnv` that
+/// `FromRecoveredTx<TxPostExec>` produces and fails pre-validation with
+/// `InvalidChainId`, taking the whole slice — L1-attributes deposit included —
+/// with it. A producer that publishes the final slice needs a matching skip
+/// branch here first; see T3 in the plan discussion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_carrying_a_post_exec_transaction_is_rejected_whole() {
+    use alloy_network::eip2718::Encodable2718;
+    use alloy_primitives::Sealable;
+    use op_alloy_consensus::{OpTxEnvelope, SDMGasEntry, build_post_exec_tx};
+
+    let (harness, _node) = launch!();
+
+    let post_exec = OpTxEnvelope::PostExec(
+        build_post_exec_tx(1, vec![SDMGasEntry { index: 1, gas_refund: 2_500 }]).seal_slow(),
+    );
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), post_exec.encoded_2718().into()])
+                .build(),
+        )
+        .await;
+
+    let pending = harness.pending();
+    assert!(
+        pending.is_none(),
+        "the whole slice must be rejected, got an overlay at block {:?} with {:?} transactions",
+        pending.as_ref().map(|p| p.latest_block_number()),
+        pending.as_ref().map(|p| p.pending_transaction_count()),
+    );
+
+    // Not fatal: nothing is cached and the processor keeps running, so a clean
+    // slice for the same height still opens an overlay.
+    harness.send(base_slice(1)).await;
+    let pending = harness.pending().expect("a clean slice should still be accepted");
+    assert_eq!(pending.latest_block_number(), 1);
+    assert_eq!(pending.pending_transaction_count(), 1, "only the deposit");
 }
 
 /// The overlay reports the canonical block it was built on.

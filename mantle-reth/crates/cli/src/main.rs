@@ -89,7 +89,7 @@ fn main() {
                 None => {
                     info!(
                         target: "reth::cli",
-                        "Mantle flashblock consumer DISABLED (pass --flashblocks.consumer-url to opt in)",
+                        "Mantle flashblock consumer DISABLED (pass --flashblocks.websocket-url to opt in)",
                     );
                 }
             }
