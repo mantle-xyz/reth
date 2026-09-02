@@ -20,14 +20,18 @@
 //!   [`PayloadJobGenerator`](reth_payload_builder::PayloadJobGenerator) trait.
 //! - [`cancel`] — `JobCancel`, the async-aware cancel signal shared between the job and the spawned
 //!   build task.
+//! - [`execution_info`] — what the loop has executed so far, and how much of it has already been
+//!   published as a flashblock.
 
 pub mod cancel;
 pub(crate) mod dispatch;
+pub mod execution_info;
 pub mod payload_builder;
 pub mod payload_job;
 pub mod payload_job_generator;
 
 pub use cancel::JobCancel;
+pub use execution_info::ExecutionInfo;
 pub use payload_builder::PreconfPayloadBuilder;
 pub use payload_job::{PreconfPayloadJob, ResolvePayloadFuture};
 pub use payload_job_generator::PreconfPayloadJobGenerator;

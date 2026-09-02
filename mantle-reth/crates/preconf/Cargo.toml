@@ -18,6 +18,8 @@ mantle-reth-flashblocks-types.workspace = true
 # Alloy
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
 alloy-consensus = { workspace = true, features = ["std"] }
+# `PayloadId` — identifies the payload a flashblock slice belongs to.
+alloy-rpc-types-engine = { workspace = true, features = ["std"] }
 # alloy-sol-types — decode a revert's `Error(string)` payload so the preconf
 # `reason` matches op-geth's `abi.UnpackRevert` ("execution reverted: <msg>").
 alloy-sol-types.workspace = true
@@ -61,6 +63,9 @@ reth-primitives-traits.workspace = true
 # OP-stack consensus types — listener bridges `OpTxEnvelope` to alloy
 # `TxEnvelope` and drops Deposit / PostExec variants
 op-alloy-consensus.workspace = true
+# `OpFlashblockPayloadBase` / `OpFlashblockPayloadDelta` — the halves of the
+# wire payload reused verbatim from upstream.
+op-alloy-rpc-types-engine = { workspace = true, features = ["std", "serde"] }
 
 # reth storage — RPC handler reads on-chain account nonce via
 # `StateProviderFactory::latest()` + `StateProvider::account_nonce` to compute
