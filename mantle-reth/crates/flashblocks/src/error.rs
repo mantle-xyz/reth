@@ -178,3 +178,99 @@ impl From<crate::ReceiptBuildError> for StateProcessorError {
 
 /// A type alias for `Result<T, StateProcessorError>`.
 pub type Result<T> = std::result::Result<T, StateProcessorError>;
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn tx_hash() -> B256 {
+        B256::with_last_byte(0xAA)
+    }
+
+    /// Messages reaching operators through logs; the interpolated fields are the
+    /// part worth pinning, since a silent reordering makes triage reports wrong.
+    #[rstest]
+    #[case(ProtocolError::InvalidSequence.into(), "must be processed in order")]
+    #[case(ProtocolError::MissingBase.into(), "first flashblock in sequence")]
+    #[case(ProtocolError::EmptyFlashblocks.into(), "zero flashblocks")]
+    #[case(
+        ProviderError::MissingCanonicalHeader { block_number: 7 }.into(),
+        "missing canonical header for block 7"
+    )]
+    #[case(ProviderError::StateProvider("cold".into()).into(), "state provider error: cold")]
+    #[case(
+        ExecutionError::TransactionFailed {
+            tx_hash: tx_hash(),
+            sender: Address::with_last_byte(0xBB),
+            reason: "nonce too low".into(),
+        }
+        .into(),
+        "nonce too low"
+    )]
+    #[case(ExecutionError::GasOverflow.into(), "cumulative gas used exceeded u64::MAX")]
+    #[case(ExecutionError::EvmEnv("bad env".into()).into(), "EVM environment error: bad env")]
+    #[case(BuildError::MissingReceipt { tx_hash: tx_hash() }.into(), "has no receipt")]
+    #[case(BuildError::DuplicateTransaction { tx_hash: tx_hash() }.into(), "more than once")]
+    #[case(StateProcessorError::MissingFirstFlashblock, "missing first flashblock")]
+    #[case(
+        StateProcessorError::NonConsecutiveBlock {
+            block_number: 12,
+            index: 3,
+            tracked_block_number: 9,
+        },
+        "flashblock 12-3 does not continue block 9"
+    )]
+    fn display_contains(#[case] error: StateProcessorError, #[case] expected: &str) {
+        assert!(error.to_string().contains(expected), "`{error}` should contain `{expected}`");
+    }
+
+    /// The four wrapping variants are `#[error(transparent)]`, so they must add no
+    /// prefix of their own — a wrapped error reads the same at either level.
+    #[rstest]
+    #[case(ProtocolError::MissingBase.into(), ProtocolError::MissingBase.to_string())]
+    #[case(
+        ProviderError::StateProvider("io".into()).into(),
+        ProviderError::StateProvider("io".into()).to_string()
+    )]
+    #[case(
+        ExecutionError::DepositReceiptMismatch.into(),
+        ExecutionError::DepositReceiptMismatch.to_string()
+    )]
+    #[case(BuildError::NoFlashblocks.into(), BuildError::NoFlashblocks.to_string())]
+    fn wrapping_variants_are_transparent(
+        #[case] wrapped: StateProcessorError,
+        #[case] inner: String,
+    ) {
+        assert_eq!(wrapped.to_string(), inner);
+    }
+
+    /// `?` must reach `StateProcessorError` from a recovery failure in one step,
+    /// landing in `Execution(SenderRecovery)` rather than a fresh variant.
+    #[test]
+    fn recovery_error_converts_at_both_levels() {
+        let execution = ExecutionError::from(RecoveryError::new());
+        assert!(matches!(execution, ExecutionError::SenderRecovery(_)));
+
+        let processor = StateProcessorError::from(RecoveryError::new());
+        assert_eq!(processor, StateProcessorError::Execution(execution));
+    }
+
+    #[test]
+    fn receipt_build_error_converts_at_both_levels() {
+        let execution = ExecutionError::from(crate::ReceiptBuildError::DepositAccountLoad);
+        assert!(matches!(execution, ExecutionError::RpcReceiptBuild(_)));
+        assert!(execution.to_string().contains("failed to load deposit account"));
+
+        let processor = StateProcessorError::from(crate::ReceiptBuildError::DepositAccountLoad);
+        assert_eq!(processor, StateProcessorError::Execution(execution));
+    }
+
+    /// The error crosses the processor task boundary, so it must stay `Send + Sync`.
+    #[test]
+    const fn error_is_send_and_sync() {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StateProcessorError>();
+    }
+}

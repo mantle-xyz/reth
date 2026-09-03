@@ -27,7 +27,7 @@ use alloy_rpc_types_eth::{
 };
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
-use mantle_reth_flashblocks::PendingStateOverrides;
+use mantle_reth_flashblocks::{Metrics, PendingStateOverrides};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_optimism_evm::extract_l1_info;
@@ -307,6 +307,10 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         let Some(overlay) = self.pending_overrides.as_ref() else {
             return Ok((payload, block_number));
         };
+        // Counted here rather than right after the `pending` check: unlike the nine
+        // `flashblocks.rpc.*` counters in the override module, this method is
+        // registered whether or not the consumer is enabled.
+        Metrics::rpc_simulate_v1().increment(1);
         let Some(pending) = overlay.pending_state_overrides() else {
             return Ok((payload, Some(overlay.pending_base_block())));
         };
@@ -917,7 +921,200 @@ fn build_unsigned_tx_envelope(
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::Address;
+    use jsonrpsee::types::error::INVALID_PARAMS_CODE;
+
     use super::*;
+
+    // ─── pending overlay injection into eth_simulateV1 ──────────────────
+
+    /// Stands in for the flashblock overlay. The real implementor is
+    /// `mantle-reth-flashblocks`'s state; this crate only consumes the trait.
+    #[derive(Debug)]
+    struct StubOverlay {
+        base_block: BlockId,
+        overrides: Option<StateOverride>,
+    }
+
+    impl PendingStateOverrides for StubOverlay {
+        fn pending_base_block(&self) -> BlockId {
+            self.base_block
+        }
+
+        fn pending_state_overrides(&self) -> Option<StateOverride> {
+            self.overrides.clone()
+        }
+    }
+
+    const OVERLAY_ONLY: Address = Address::repeat_byte(0xA1);
+    const CONTESTED: Address = Address::repeat_byte(0xB2);
+
+    fn state_override(address: Address, balance: &str) -> StateOverride {
+        serde_json::from_value(serde_json::json!({
+            format!("{address:#x}"): { "balance": balance }
+        }))
+        .expect("a valid state override")
+    }
+
+    /// `MantleRpcExt`'s inherent impl carries no bounds on either generic, so the
+    /// overlay path can be exercised without standing up a provider or eth API.
+    fn ext(overlay: Option<StubOverlay>) -> MantleRpcExt<(), ()> {
+        MantleRpcExt::new((), Arc::new(()), None, None)
+            .with_pending_overrides(overlay.map(|o| Arc::new(o) as Arc<dyn PendingStateOverrides>))
+    }
+
+    fn overlay_at_block_9() -> StubOverlay {
+        StubOverlay {
+            base_block: BlockId::from(9u64),
+            overrides: Some(state_override(OVERLAY_ONLY, "0x64")),
+        }
+    }
+
+    fn payload_with_user_override() -> serde_json::Value {
+        serde_json::json!({
+            "blockStateCalls": [
+                { "calls": [], "stateOverrides": state_override(CONTESTED, "0x2") },
+                { "calls": [] },
+            ]
+        })
+    }
+
+    fn overrides_of(payload: &serde_json::Value, call: usize) -> StateOverride {
+        serde_json::from_value(payload["blockStateCalls"][call]["stateOverrides"].clone())
+            .expect("a valid state override")
+    }
+
+    fn balance_of(overrides: &StateOverride, address: Address) -> Option<U256> {
+        overrides.get(&address).and_then(|account| account.balance)
+    }
+
+    /// A concrete tag names a settled block; the overlay must not be consulted.
+    #[test]
+    fn a_non_pending_tag_is_left_alone() {
+        let payload = payload_with_user_override();
+        let block = Some(BlockId::from(BlockNumberOrTag::Latest));
+
+        let (out, out_block) = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload.clone(), block)
+            .expect("no rewrite");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, block);
+    }
+
+    /// The default tag is `latest`, so an absent block number is also left alone.
+    #[test]
+    fn an_absent_block_number_is_left_alone() {
+        let payload = payload_with_user_override();
+
+        let (out, out_block) = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload.clone(), None)
+            .expect("no rewrite");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, None);
+    }
+
+    /// Without the flashblock consumer the `pending` tag stays untouched, so the
+    /// standard implementation keeps resolving it.
+    #[test]
+    fn pending_passes_through_when_no_overlay_is_attached() {
+        let payload = payload_with_user_override();
+        let block = Some(BlockId::pending());
+
+        let (out, out_block) =
+            ext(None).apply_pending_overrides(payload.clone(), block).expect("no rewrite");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, block, "the tag must survive for the standard implementation");
+    }
+
+    /// An attached overlay that holds no state still pins the simulation to its
+    /// base block, so a later canonical commit cannot move the ground underneath.
+    #[test]
+    fn an_empty_overlay_still_pins_the_base_block() {
+        let payload = payload_with_user_override();
+        let overlay = StubOverlay { base_block: BlockId::from(9u64), overrides: None };
+
+        let (out, out_block) = ext(Some(overlay))
+            .apply_pending_overrides(payload.clone(), Some(BlockId::pending()))
+            .expect("rewrite");
+
+        assert_eq!(out, payload, "no overlay state means no override merging");
+        assert_eq!(out_block, Some(BlockId::from(9u64)));
+    }
+
+    /// R4: the overlay's state is prepended to every entry, and a user override
+    /// for the same address wins — the caller's intent is not silently replaced.
+    #[test]
+    fn the_overlay_is_prepended_to_every_call_and_user_overrides_win() {
+        let overlay = StubOverlay {
+            base_block: BlockId::from(9u64),
+            overrides: Some(
+                serde_json::from_value(serde_json::json!({
+                    format!("{OVERLAY_ONLY:#x}"): { "balance": "0x64" },
+                    format!("{CONTESTED:#x}"): { "balance": "0x1" },
+                }))
+                .expect("a valid state override"),
+            ),
+        };
+
+        let (out, out_block) = ext(Some(overlay))
+            .apply_pending_overrides(payload_with_user_override(), Some(BlockId::pending()))
+            .expect("rewrite");
+
+        assert_eq!(out_block, Some(BlockId::from(9u64)));
+
+        let first = overrides_of(&out, 0);
+        assert_eq!(
+            balance_of(&first, OVERLAY_ONLY),
+            Some(U256::from(0x64)),
+            "overlay-only address"
+        );
+        assert_eq!(
+            balance_of(&first, CONTESTED),
+            Some(U256::from(2)),
+            "the user's 0x2 must win over the overlay's 0x1"
+        );
+
+        let second = overrides_of(&out, 1);
+        assert_eq!(
+            balance_of(&second, OVERLAY_ONLY),
+            Some(U256::from(0x64)),
+            "an entry without user overrides still receives the overlay"
+        );
+        assert_eq!(balance_of(&second, CONTESTED), Some(U256::from(1)), "overlay value stands");
+    }
+
+    /// A malformed `stateOverrides` must be reported as a bad request rather than
+    /// dropped, which would run the simulation against unintended state.
+    #[test]
+    fn a_malformed_state_override_is_rejected() {
+        let payload = serde_json::json!({
+            "blockStateCalls": [{ "calls": [], "stateOverrides": "not an object" }]
+        });
+
+        let error = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload, Some(BlockId::pending()))
+            .expect_err("must not be silently dropped");
+
+        assert_eq!(error.code(), INVALID_PARAMS_CODE);
+        assert!(error.message().contains("invalid stateOverrides"));
+    }
+
+    /// A payload without `blockStateCalls` is malformed for `eth_simulateV1`, but
+    /// this stage must not panic on it — rejection belongs to the typed decode.
+    #[test]
+    fn a_payload_without_block_state_calls_is_only_repointed() {
+        let payload = serde_json::json!({});
+
+        let (out, out_block) = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload.clone(), Some(BlockId::pending()))
+            .expect("no panic");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, Some(BlockId::from(9u64)));
+    }
 
     // ─── gas price selection ────────────────────────────────────────────
 
