@@ -132,10 +132,17 @@ async fn a_slice_carrying_a_post_exec_transaction_is_rejected_whole() {
     assert_eq!(pending.pending_transaction_count(), 1, "only the deposit");
 }
 
-/// The overlay reports the canonical block it was built on.
+/// The overlay reports the canonical block it was built on; with no overlay the base
+/// stays `pending` so the standard implementation keeps serving that tag.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_overlay_reports_its_canonical_base() {
     let (harness, _node) = launch!();
+
+    assert_eq!(
+        harness.state().get_pending_blocks().get_canonical_block_number(),
+        alloy_rpc_types_eth::BlockNumberOrTag::Pending,
+        "no overlay yet, so `pending` passes through"
+    );
 
     harness.send(base_slice(1)).await;
 

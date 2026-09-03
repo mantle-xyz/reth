@@ -45,10 +45,10 @@ macro_rules! overlay_with_user_call {
     }};
 }
 
-/// `eth_getBlockByNumber("pending")` serves the overlay, and falls back to
-/// `latest` when there is none.
+/// `eth_getBlockByNumber("pending")` serves the overlay, and passes `pending`
+/// through to the standard implementation when there is none.
 #[tokio::test(flavor = "multi_thread")]
-async fn get_block_by_number_serves_the_overlay_and_falls_back_to_latest() {
+async fn get_block_by_number_serves_the_overlay_and_passes_pending_through() {
     let (harness, node) = launch_flashblocks_node!(3, 3);
     let api = eth_api!(node, harness);
 
@@ -56,8 +56,11 @@ async fn get_block_by_number_serves_the_overlay_and_falls_back_to_latest() {
         .block_by_number(pending_tag(), false)
         .await
         .expect("query succeeds")
-        .expect("latest block exists");
-    assert_eq!(fallback["number"], "0x0", "without an overlay, pending is latest");
+        .expect("the standard implementation resolves the tag");
+    assert_eq!(
+        fallback["number"], "0x0",
+        "without an overlay, op-reth resolves `pending` to latest, as op-geth does"
+    );
 
     let tx_hash = overlay_with_user_call!(harness);
 

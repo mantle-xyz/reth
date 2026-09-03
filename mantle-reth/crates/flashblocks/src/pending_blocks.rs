@@ -705,7 +705,7 @@ impl PendingBlocks {
 
 impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
     fn get_canonical_block_number(&self) -> BlockNumberOrTag {
-        self.as_ref().map(|pb| pb.canonical_block_number()).unwrap_or(BlockNumberOrTag::Latest)
+        self.as_ref().map(|pb| pb.canonical_block_number()).unwrap_or(BlockNumberOrTag::Pending)
     }
 
     fn get_transaction_count(&self, address: Address) -> U256 {

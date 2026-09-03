@@ -41,7 +41,7 @@ const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
 /// Implemented for the flashblocks state so `MantleEthApiExt::simulate_v1` can
 /// prepend pending state without depending on this crate's RPC layer.
 pub trait PendingStateOverrides: std::fmt::Debug + Send + Sync {
-    /// Canonical block the pending overlay is built on, or `latest` when absent.
+    /// Canonical block the pending overlay is built on, or `pending` when absent.
     fn pending_base_block(&self) -> BlockId;
 
     /// State overrides representing the pending overlay, if any.
@@ -233,11 +233,7 @@ where
             if pending_blocks.as_ref().is_some() {
                 return Ok(pending_blocks.get_block(full));
             }
-            // No pending state available — treat `pending` as `latest`.
-            let block = EthBlocks::rpc_block(&self.eth_api, BlockNumberOrTag::Latest.into(), full)
-                .await
-                .map_err(Into::into)?;
-            return block.map(to_value).transpose();
+            // No overlay: fall through so the standard implementation serves `pending`.
         }
 
         let block =
@@ -501,13 +497,7 @@ where
             {
                 return Ok(Some(U256::from(count)));
             }
-            return EthBlocks::block_transaction_count(
-                &self.eth_api,
-                BlockNumberOrTag::Latest.into(),
-            )
-            .await
-            .map(|opt| opt.map(U256::from))
-            .map_err(Into::into);
+            // No overlay: fall through so the standard implementation serves `pending`.
         }
 
         EthBlocks::block_transaction_count(&self.eth_api, number.into())

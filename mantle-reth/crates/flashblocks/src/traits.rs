@@ -32,6 +32,9 @@ pub trait FlashblocksAPI {
 /// carries no network-specific generics, matching `MantleEthApiExt`.
 pub trait PendingBlocksAPI {
     /// Get the canonical block number on top of which all pending state is built.
+    ///
+    /// Returns `pending`, not a block number, when there is no overlay: the tag is
+    /// left for the standard implementation to resolve.
     fn get_canonical_block_number(&self) -> BlockNumberOrTag;
 
     /// Get the pending transaction count for an address.
