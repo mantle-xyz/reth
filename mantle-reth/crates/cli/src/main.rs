@@ -3,8 +3,9 @@
 use clap::Parser;
 use eyre::ErrReport;
 use mantle_reth_cli::{
-    MantleArgs, MantleChainSpecParser, MantleNode, proofs_history::with_proofs_history_launch_ctx,
-    seed_blockchain_tree_metrics, spawn_proofs_db_metrics,
+    MantleArgs, MantleChainSpecParser, MantleConfigs, MantleNode,
+    proofs_history::with_proofs_history_launch_ctx, seed_blockchain_tree_metrics,
+    spawn_proofs_db_metrics,
 };
 use mantle_reth_preconf::{PreconfServiceBuilder, seed_preconf_metrics};
 use reth_db::DatabaseEnv;
@@ -17,7 +18,7 @@ use reth_optimism_trie::{
     db::{MdbxProofsStorage, MdbxProofsStorageV2},
 };
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
@@ -40,8 +41,36 @@ fn main() {
         async move |builder, args| {
             info!(target: "reth::cli", "Launching Mantle node");
             let mut node = MantleNode::new(args.rollup.clone());
-            let preconf_cfg = args.preconf.into_config();
+            let rollup = args.rollup.clone();
+            let sweep_interval_given = args.preconf.sweep_interval_ms.is_some();
+            let MantleConfigs { preconf: preconf_cfg, publisher: flashblocks_cfg, consumer } =
+                args.into_configs()?;
             let preconf_enabled = preconf_cfg.is_some();
+            if flashblocks_cfg.is_some() && consumer.is_some() {
+                warn!(
+                    target: "reth::cli",
+                    "Mantle flashblocks publisher and consumer are both enabled; this node will \
+                     subscribe to a stream it may itself produce",
+                );
+            }
+            if let Some(fb) = flashblocks_cfg.as_ref() {
+                info!(
+                    target: "reth::cli",
+                    "Mantle flashblocks ENABLED (publish={}:{}, block_time={:?}, leeway={:?})",
+                    fb.addr, fb.port, fb.block_time, fb.leeway_time,
+                );
+                if sweep_interval_given {
+                    info!(
+                        target: "reth::cli",
+                        "--preconf.sweep-interval-ms is superseded by --flashblocks.block-time while flashblocks are enabled",
+                    );
+                }
+            } else {
+                info!(
+                    target: "reth::cli",
+                    "Mantle flashblocks DISABLED (pass --flashblocks.enable to opt in)",
+                );
+            }
             match preconf_cfg {
                 Some(mut cfg) => {
                     let all = cfg.all_preconfs;
@@ -76,7 +105,7 @@ fn main() {
                     );
                 }
             }
-            match args.flashblocks.into_config(args.rollup.flashblocks_url.as_ref())? {
+            match consumer {
                 Some(cfg) => {
                     info!(
                         target: "reth::cli",
@@ -94,7 +123,7 @@ fn main() {
                 }
             }
 
-            launch_node(builder, node, args.rollup, preconf_enabled).await
+            launch_node(builder, node, rollup, preconf_enabled).await
         },
     ) {
         eprintln!("Error: {err:?}");

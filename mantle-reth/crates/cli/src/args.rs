@@ -17,7 +17,7 @@
 //! upstream `RollupArgs` convention — every configuration knob lives on the
 //! command line and is discoverable via `--help`.
 
-use std::{path::PathBuf, time::Duration};
+use std::{net::IpAddr, path::PathBuf, time::Duration};
 
 use alloy_primitives::Address;
 use clap::Args;
@@ -26,11 +26,15 @@ use mantle_reth_flashblocks::{
     DEFAULT_SUBSCRIBER_PING_INTERVAL, FlashblocksConfig,
 };
 use mantle_reth_preconf::{
-    PreconfConfig,
+    FlashblockProducerConfig, FlashblockProducerConfigError, PreconfConfig,
     config::{
         DEFAULT_BROADCAST_CAP, DEFAULT_JOURNAL_MAX_SIZE, DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
         DEFAULT_PRECONF_MAX_GAS_PER_TX, DEFAULT_PRECONF_TIMEOUT, DEFAULT_REJOURNAL_INTERVAL,
         DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
+    },
+    flashblocks::{
+        DEFAULT_FLASHBLOCK_ADDR, DEFAULT_FLASHBLOCK_BLOCK_TIME, DEFAULT_FLASHBLOCK_LEEWAY,
+        DEFAULT_FLASHBLOCK_PORT,
     },
 };
 use reth_optimism_node::args::RollupArgs;
@@ -48,17 +52,77 @@ pub struct MantleArgs {
     #[command(flatten)]
     pub preconf: PreconfArgs,
 
-    /// Mantle flashblock consumer arguments (`--flashblocks.*`).
+    /// Mantle flashblocks publisher arguments (`--flashblocks.*`).
     #[command(flatten)]
     pub flashblocks: FlashblocksArgs,
+
+    /// Mantle flashblock consumer arguments (`--flashblocks.*`).
+    ///
+    /// Kept in its own group rather than merged with [`FlashblocksArgs`]: the
+    /// two serve opposite ends of the same stream and validate against
+    /// different preconditions. Their flag names are disjoint, so both groups
+    /// coexist under the one `--flashblocks.` prefix.
+    #[command(flatten)]
+    pub flashblocks_consumer: FlashblocksConsumerArgs,
+}
+
+impl MantleArgs {
+    /// Resolve the three Mantle subsystem configs, rejecting combinations that
+    /// cannot work before the node starts.
+    ///
+    /// Each config is `None` when its subsystem is off. The publisher and the
+    /// consumer are resolved independently: running both on one node is
+    /// permitted but unusual, and `main` warns about it.
+    ///
+    /// # Errors
+    /// Returns an error when the publisher is enabled without preconf, or when
+    /// both this consumer and upstream's are requested.
+    pub fn into_configs(self) -> Result<MantleConfigs, MantleArgsError> {
+        let preconf = self.preconf.into_config();
+        let publisher =
+            self.flashblocks.into_config().map(|cfg| cfg.validate(preconf.as_ref())).transpose()?;
+        let consumer =
+            self.flashblocks_consumer.into_config(self.rollup.flashblocks_url.as_ref())?;
+
+        Ok(MantleConfigs { preconf, publisher, consumer })
+    }
+}
+
+/// The subsystem configs resolved from [`MantleArgs`].
+///
+/// Not `PartialEq`: neither [`PreconfConfig`] nor [`FlashblocksConfig`] is.
+#[derive(Debug)]
+pub struct MantleConfigs {
+    /// Preconfirmation service; `None` when `--preconf.enable` was absent.
+    pub preconf: Option<PreconfConfig>,
+    /// Flashblock publisher; `None` when `--flashblocks.enable` was absent.
+    pub publisher: Option<FlashblockProducerConfig>,
+    /// Flashblock consumer; `None` when `--flashblocks.websocket-url` was absent.
+    pub consumer: Option<FlashblocksConfig>,
+}
+
+/// Errors produced while resolving [`MantleArgs`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MantleArgsError {
+    /// The publisher was enabled in a combination that cannot work.
+    #[error(transparent)]
+    Publisher(#[from] FlashblockProducerConfigError),
+
+    /// The consumer was enabled in a combination that cannot work.
+    #[error(transparent)]
+    Consumer(#[from] FlashblocksConsumerArgsError),
 }
 
 /// Flashblock consumer CLI flags.
 ///
 /// Distinct from upstream's `--flashblocks-url`, which drives op-reth's own
 /// consumer. The two implementations are independent and must not both run.
+///
+/// Separate from [`FlashblocksArgs`] despite sharing the `--flashblocks.`
+/// prefix: that group configures the publisher on a sequencer, this one the
+/// consumer on an RPC node. The flag names are disjoint.
 #[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
-pub struct FlashblocksArgs {
+pub struct FlashblocksConsumerArgs {
     /// Websocket endpoint streaming flashblocks to the Mantle consumer.
     ///
     /// Named to match the `flashblocks-rpc` deployments already in operation.
@@ -84,7 +148,7 @@ pub struct FlashblocksArgs {
     pub max_cache_ahead_blocks: Option<u64>,
 }
 
-impl FlashblocksArgs {
+impl FlashblocksConsumerArgs {
     /// Converts CLI args into a [`FlashblocksConfig`] when a consumer URL was
     /// given; otherwise returns `None` (the consumer stays off).
     ///
@@ -94,12 +158,12 @@ impl FlashblocksArgs {
     pub fn into_config(
         self,
         upstream_flashblocks_url: Option<&Url>,
-    ) -> Result<Option<FlashblocksConfig>, FlashblocksArgsError> {
+    ) -> Result<Option<FlashblocksConfig>, FlashblocksConsumerArgsError> {
         let Some(websocket_url) = self.websocket_url else {
             return Ok(None);
         };
         if upstream_flashblocks_url.is_some() {
-            return Err(FlashblocksArgsError::ConflictingConsumers);
+            return Err(FlashblocksConsumerArgsError::ConflictingConsumers);
         }
 
         Ok(Some(FlashblocksConfig {
@@ -117,15 +181,79 @@ impl FlashblocksArgs {
     }
 }
 
-/// Errors produced while resolving [`FlashblocksArgs`].
+/// Errors produced while resolving [`FlashblocksConsumerArgs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum FlashblocksArgsError {
+pub enum FlashblocksConsumerArgsError {
     /// Both the Mantle and the upstream op-reth consumer were requested.
     #[error(
         "--flashblocks.websocket-url and --flashblocks-url are mutually exclusive: the Mantle and \
          op-reth flashblock consumers are independent implementations and must not both run"
     )]
     ConflictingConsumers,
+}
+
+/// Flashblocks publisher CLI flags.
+///
+/// Sequencer-side only. `--flashblocks.enable` requires `--preconf.enable`;
+/// the check lives in [`FlashblockProducerConfig::validate`] rather than in
+/// clap, because the two flags come from different flattened groups.
+///
+/// Every flag sets an explicit `id`: clap derives the id from the field
+/// name, and `enable` alone would collide with the preconf group.
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct FlashblocksArgs {
+    /// Slice each block as it is built and publish the slices.
+    ///
+    /// Off by default: leaving it off keeps the payload builder's
+    /// pre-flashblock behaviour byte for byte, which is the rollback path.
+    #[arg(id = "flashblocks.enable", long = "flashblocks.enable")]
+    pub enable: bool,
+
+    /// Address the flashblocks publisher binds. Default `127.0.0.1`.
+    #[arg(id = "flashblocks.addr", long = "flashblocks.addr")]
+    pub addr: Option<IpAddr>,
+
+    /// Port the flashblocks publisher binds. Default `1111`.
+    #[arg(id = "flashblocks.port", long = "flashblocks.port")]
+    pub port: Option<u16>,
+
+    /// Interval between slices, in milliseconds. Default 200ms.
+    ///
+    /// When flashblocks are enabled this also becomes the payload builder's
+    /// ticker cadence, superseding `--preconf.sweep-interval-ms`.
+    #[arg(id = "flashblocks.block-time", long = "flashblocks.block-time")]
+    pub block_time_ms: Option<u64>,
+
+    /// How far ahead of the slot deadline the budgeted slice grid finishes,
+    /// in milliseconds. Default 50ms.
+    #[arg(id = "flashblocks.leeway-time", long = "flashblocks.leeway-time")]
+    pub leeway_time_ms: Option<u64>,
+}
+
+impl FlashblocksArgs {
+    /// Convert CLI args into a [`FlashblockProducerConfig`] if
+    /// `--flashblocks.enable` was given; otherwise return `None`.
+    ///
+    /// Ring and broadcast capacities are not exposed on the CLI; they take
+    /// their defaults.
+    pub fn into_config(self) -> Option<FlashblockProducerConfig> {
+        if !self.enable {
+            return None;
+        }
+        Some(FlashblockProducerConfig {
+            addr: self.addr.unwrap_or(DEFAULT_FLASHBLOCK_ADDR),
+            port: self.port.unwrap_or(DEFAULT_FLASHBLOCK_PORT),
+            block_time: self
+                .block_time_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_FLASHBLOCK_BLOCK_TIME),
+            leeway_time: self
+                .leeway_time_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_FLASHBLOCK_LEEWAY),
+            ..Default::default()
+        })
+    }
 }
 
 /// Preconfirmation subsystem CLI flags.
@@ -372,6 +500,121 @@ mod tests {
         assert_eq!(cfg.broadcast_cap, 8192);
     }
 
+    /// Test helper mirroring [`parse`] for the flashblocks group.
+    #[derive(Parser, Debug)]
+    struct TestFlashblocksCli {
+        #[command(flatten)]
+        args: FlashblocksArgs,
+    }
+
+    fn parse_flashblocks(argv: &[&str]) -> FlashblocksArgs {
+        TestFlashblocksCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
+    }
+
+    #[test]
+    fn flashblocks_default_parse_yields_disabled() {
+        // No flags → into_config() returns None → flashblocks stay off,
+        // matching how the preconf group signals the same thing.
+        assert!(parse_flashblocks(&[]).into_config().is_none());
+    }
+
+    #[test]
+    fn flashblocks_numeric_overrides_replace_defaults() {
+        let cfg = parse_flashblocks(&[
+            "--flashblocks.enable",
+            "--flashblocks.addr",
+            "0.0.0.0",
+            "--flashblocks.port",
+            "2222",
+            "--flashblocks.block-time",
+            "250",
+            "--flashblocks.leeway-time",
+            "0",
+        ])
+        .into_config()
+        .expect("enabled");
+
+        assert_eq!(cfg.addr, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.port, 2222);
+        assert_eq!(cfg.block_time, Duration::from_millis(250));
+        assert_eq!(cfg.leeway_time, Duration::ZERO);
+    }
+
+    #[test]
+    fn flashblocks_omitted_flags_keep_defaults() {
+        let cfg = parse_flashblocks(&["--flashblocks.enable"]).into_config().expect("enabled");
+
+        assert_eq!(cfg.addr, DEFAULT_FLASHBLOCK_ADDR);
+        assert_eq!(cfg.port, DEFAULT_FLASHBLOCK_PORT);
+        assert_eq!(cfg.block_time, DEFAULT_FLASHBLOCK_BLOCK_TIME);
+        assert_eq!(cfg.leeway_time, DEFAULT_FLASHBLOCK_LEEWAY);
+    }
+
+    /// The two groups are validated against each other, and enabling
+    /// flashblocks without preconf is rejected before the node starts.
+    #[test]
+    fn flashblocks_without_preconf_is_rejected_at_startup() {
+        let flashblocks =
+            parse_flashblocks(&["--flashblocks.enable"]).into_config().expect("enabled");
+        let preconf = parse(&["--preconf.enable", "--preconf.all"]).into_config();
+
+        assert!(flashblocks.clone().validate(preconf.as_ref()).is_ok());
+        assert!(flashblocks.validate(None).is_err());
+    }
+
+    /// Test helper covering the whole arg surface, so the startup gate is
+    /// exercised the way `main` reaches it.
+    #[derive(Parser, Debug)]
+    struct TestMantleCli {
+        #[command(flatten)]
+        args: MantleArgs,
+    }
+
+    fn parse_mantle(argv: &[&str]) -> MantleArgs {
+        TestMantleCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
+    }
+
+    #[test]
+    fn enabling_flashblocks_alone_fails_the_startup_gate() {
+        let err = parse_mantle(&["--flashblocks.enable"]).into_configs().unwrap_err();
+
+        assert_eq!(
+            err,
+            MantleArgsError::Publisher(FlashblockProducerConfigError::RequiresPreconfEnabled)
+        );
+    }
+
+    #[test]
+    fn enabling_both_passes_the_startup_gate() {
+        let cfgs = parse_mantle(&["--preconf.enable", "--preconf.all", "--flashblocks.enable"])
+            .into_configs()
+            .expect("both enabled is a valid combination");
+
+        assert!(cfgs.preconf.is_some());
+        assert!(cfgs.publisher.is_some());
+        assert!(cfgs.consumer.is_none());
+    }
+
+    /// Today's production shape: preconf on, flashblocks not yet rolled out.
+    #[test]
+    fn enabling_preconf_alone_leaves_flashblocks_absent() {
+        let cfgs = parse_mantle(&["--preconf.enable", "--preconf.all"])
+            .into_configs()
+            .expect("preconf alone is a valid combination");
+
+        assert!(cfgs.preconf.is_some());
+        assert!(cfgs.publisher.is_none());
+    }
+
+    #[test]
+    fn enabling_neither_passes_the_startup_gate() {
+        let cfgs = parse_mantle(&[]).into_configs().expect("defaults are valid");
+
+        assert!(cfgs.preconf.is_none());
+        assert!(cfgs.publisher.is_none());
+        assert!(cfgs.consumer.is_none());
+    }
+
     #[test]
     fn omitted_numeric_flags_keep_defaults() {
         // If the user only opts in without touching tuning knobs, every
@@ -392,20 +635,20 @@ mod tests {
     /// `RollupArgs`: upstream registers `--flashblocks-url` there, and a clash
     /// with our own long names would make clap panic on startup.
     #[derive(Parser, Debug)]
-    struct FlashblocksTestCli {
+    struct FlashblocksConsumerTestCli {
         #[command(flatten)]
         args: MantleArgs,
     }
 
-    fn parse_flashblocks(argv: &[&str]) -> MantleArgs {
-        FlashblocksTestCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
+    fn parse_consumer(argv: &[&str]) -> MantleArgs {
+        FlashblocksConsumerTestCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
     }
 
     #[test]
     fn no_url_leaves_the_consumer_off() {
-        let args = parse_flashblocks(&[]);
+        let args = parse_consumer(&[]);
         assert!(
-            args.flashblocks
+            args.flashblocks_consumer
                 .into_config(args.rollup.flashblocks_url.as_ref())
                 .expect("no conflict")
                 .is_none()
@@ -415,9 +658,9 @@ mod tests {
     #[test]
     fn websocket_url_enables_the_consumer_with_defaults() {
         // The flag name matches the `flashblocks-rpc` deployments in operation.
-        let args = parse_flashblocks(&["--flashblocks.websocket-url", "ws://sequencer:1111"]);
+        let args = parse_consumer(&["--flashblocks.websocket-url", "ws://sequencer:1111"]);
         let cfg = args
-            .flashblocks
+            .flashblocks_consumer
             .into_config(args.rollup.flashblocks_url.as_ref())
             .expect("no conflict")
             .expect("enabled");
@@ -430,7 +673,7 @@ mod tests {
 
     #[test]
     fn tuning_flags_override_defaults() {
-        let args = parse_flashblocks(&[
+        let args = parse_consumer(&[
             "--flashblocks.websocket-url",
             "ws://sequencer:1111",
             "--flashblocks.ping-interval-secs",
@@ -443,7 +686,7 @@ mod tests {
             "11",
         ]);
         let cfg = args
-            .flashblocks
+            .flashblocks_consumer
             .into_config(args.rollup.flashblocks_url.as_ref())
             .expect("no conflict")
             .expect("enabled");
@@ -457,15 +700,37 @@ mod tests {
     fn both_consumers_is_rejected() {
         // Two independent implementations would each subscribe and each build
         // pending state; the node must refuse to start rather than pick one.
-        let args = parse_flashblocks(&[
+        let args = parse_consumer(&[
             "--flashblocks.websocket-url",
             "ws://sequencer:1111",
             "--flashblocks-url",
             "ws://other:2222",
         ]);
         assert_eq!(
-            args.flashblocks.into_config(args.rollup.flashblocks_url.as_ref()).unwrap_err(),
-            FlashblocksArgsError::ConflictingConsumers
+            args.flashblocks_consumer
+                .into_config(args.rollup.flashblocks_url.as_ref())
+                .unwrap_err(),
+            FlashblocksConsumerArgsError::ConflictingConsumers
         );
+    }
+
+    /// The publisher and the consumer groups share the `--flashblocks.` prefix
+    /// but no flag name, so clap accepts both on one command line and each
+    /// resolves independently. Running both is unusual, not an error; `main`
+    /// warns. See issue Q19.
+    #[test]
+    fn the_publisher_and_the_consumer_can_be_enabled_together() {
+        let cfgs = parse_mantle(&[
+            "--preconf.enable",
+            "--preconf.all",
+            "--flashblocks.enable",
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+        ])
+        .into_configs()
+        .expect("both ends on one node is permitted");
+
+        assert!(cfgs.publisher.is_some());
+        assert!(cfgs.consumer.is_some());
     }
 }
