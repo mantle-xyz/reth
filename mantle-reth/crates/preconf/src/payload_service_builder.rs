@@ -48,7 +48,7 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_storage_api::BlockReaderIdExt;
 
 use crate::{
-    PreconfClassifier, PreconfConfig, PreconfTxSet,
+    FlashblocksProducerHandles, PreconfClassifier, PreconfConfig, PreconfTxSet,
     builder::{
         payload_builder::PreconfPayloadBuilder, payload_job_generator::PreconfPayloadJobGenerator,
     },
@@ -73,6 +73,13 @@ pub struct MantlePreconfServiceBuilder<N> {
     cfg: Arc<PreconfConfig>,
     classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
+    /// Slice publishing, when the operator asked for it. `None` leaves the
+    /// build loop on the path it ran before flashblocks existed.
+    ///
+    /// The bound endpoint rather than just a publish handle: this layer both
+    /// hands the handle to the builder and spawns the accept loop that serves
+    /// it, so it is also what keeps the endpoint open.
+    flashblocks: Option<Arc<FlashblocksProducerHandles>>,
     /// OP builder settings (DA limits, max gas per tx, sdm-enable, ...).
     builder_config: OpBuilderConfig,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
@@ -88,8 +95,9 @@ impl<N> MantlePreconfServiceBuilder<N> {
         classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
         builder_config: OpBuilderConfig,
+        flashblocks: Option<Arc<FlashblocksProducerHandles>>,
     ) -> Self {
-        Self { cfg, classifier, fifo, builder_config, _pd: PhantomData }
+        Self { cfg, classifier, fifo, builder_config, flashblocks, _pd: PhantomData }
     }
 }
 
@@ -99,6 +107,7 @@ impl<N> std::fmt::Debug for MantlePreconfServiceBuilder<N> {
             .field("cfg", &self.cfg)
             .field("fifo", &self.fifo)
             .field("builder_config", &self.builder_config)
+            .field("flashblocks", &self.flashblocks)
             .finish_non_exhaustive()
     }
 }
@@ -158,7 +167,7 @@ where
         pool: Pool,
         evm_config: EvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let Self { cfg, classifier, fifo, builder_config, _pd } = self;
+        let Self { cfg, classifier, fifo, builder_config, flashblocks, _pd } = self;
 
         // Rollback safety — when `--preconf.enable` is absent, `cfg` is
         // `PreconfConfig::default()` with `enabled: false`. In that case
@@ -192,6 +201,37 @@ where
             classifier,
             fifo,
         );
+        // Only now: `with_flashblocks` is what turns slice publishing on, and
+        // leaving it off has to keep the loop byte-identical to what it ran
+        // before slicing existed.
+        let builder = match flashblocks.as_deref() {
+            Some(handles) => builder.with_flashblocks(handles.producer().clone()),
+            None => builder,
+        };
+
+        // Serve the endpoint the builder is about to publish through. Spawned
+        // here rather than anywhere else with a task executor because this is
+        // the layer that owns slice publishing — and because it runs exactly
+        // once, which a take-once accept loop needs.
+        //
+        // A plain task rather than a critical one: broadcasting slices is a
+        // side channel, and it going down must not take the node with it. The
+        // executor only names critical tasks, so this one is anonymous — which
+        // is the whole reason "the accept loop stopped" has to be observable
+        // through metrics instead.
+        if let Some(handles) = flashblocks &&
+            let Some(accepting) = handles.take_accept_loop()
+        {
+            ctx.task_executor().spawn_task(async move {
+                // Holds the endpoint open for as long as it is served.
+                let _endpoint = handles;
+                accepting.await;
+            });
+            tracing::info!(
+                target: "mantle::preconf::flashblocks",
+                "flashblocks publisher serving",
+            );
+        }
 
         let generator: PreconfPayloadJobGenerator<Pool, Node::Provider, EvmConfig, N> =
             PreconfPayloadJobGenerator::new(builder);

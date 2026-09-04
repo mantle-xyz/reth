@@ -40,6 +40,7 @@ use crate::{
     PreconfCanonHandler, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfRpcHandler,
     PreconfTxSet,
     config::PreconfConfigError,
+    flashblocks::{FlashblockProducerConfig, FlashblocksProducerHandles},
     journal::{JournalError, RestorePool, restore_preconf_state},
 };
 use thiserror::Error;
@@ -88,6 +89,12 @@ pub struct PreconfServiceBuilder {
     /// `cfg.journal_path` (which the CLI layer resolves to the
     /// datadir-relative default when unset).
     journal: Arc<PreconfJournal>,
+    /// Slice publishing, when the operator asked for it. `None` leaves the
+    /// payload builder on its pre-flashblock path and binds no port.
+    ///
+    /// Behind an `Arc` so the payload service layer can hold the endpoint open
+    /// for as long as it serves it, without holding this whole builder.
+    flashblocks: Option<Arc<FlashblocksProducerHandles>>,
 }
 
 impl PreconfServiceBuilder {
@@ -114,7 +121,29 @@ impl PreconfServiceBuilder {
         let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
-        Ok(Self { cfg, classifier, fifo, journal: Arc::new(journal) })
+        Ok(Self { cfg, classifier, fifo, journal: Arc::new(journal), flashblocks: None })
+    }
+
+    /// Bind the flashblocks endpoint and take ownership of it.
+    ///
+    /// A separate step from [`Self::from_config`] because the two are
+    /// configured independently: flashblocks is its own CLI group, and its
+    /// config is `None` whenever the operator did not ask for it.
+    ///
+    /// See [`FlashblocksProducerHandles::bind`] for what binding involves and
+    /// why it happens up front; this layer only holds the result.
+    pub fn bind_flashblocks(&mut self, cfg: FlashblockProducerConfig) -> std::io::Result<()> {
+        self.flashblocks = Some(Arc::new(FlashblocksProducerHandles::bind(cfg)?));
+        Ok(())
+    }
+
+    /// The flashblocks endpoint, when one was bound.
+    ///
+    /// Handed out as the `Arc` rather than a plain reference: whoever spawns
+    /// the accept loop has to keep the endpoint alive for as long as it runs,
+    /// and dropping the last handle closes it.
+    pub const fn flashblocks(&self) -> Option<&Arc<FlashblocksProducerHandles>> {
+        self.flashblocks.as_ref()
     }
 
     /// Shared config handle. Cheap to clone — internally an `Arc`.
@@ -236,6 +265,53 @@ mod tests {
         };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
         (dir, svc)
+    }
+
+    /// A publisher bound on an OS-assigned port, so tests never collide.
+    fn flashblocks_cfg() -> crate::flashblocks::FlashblockProducerConfig {
+        crate::flashblocks::FlashblockProducerConfig {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            ..Default::default()
+        }
+    }
+
+    fn slice(
+        block_number: u64,
+        index: u64,
+    ) -> mantle_reth_flashblocks_types::MantleFlashblockPayload {
+        let mut payload =
+            mantle_reth_flashblocks_types::MantleFlashblockPayload { index, ..Default::default() };
+        payload.metadata.block_number = block_number;
+        payload
+    }
+
+    /// The payload builder publishes through the very endpoint this builder
+    /// bound — not through a second one that no subscriber is connected to.
+    /// Proven by publishing through the handle the builder is handed and
+    /// reading it back through a handle taken from the owning publisher.
+    #[tokio::test]
+    async fn the_payload_builder_publishes_through_the_bound_endpoint() {
+        let (_dir, mut svc) = svc_with_temp_journal().await;
+        svc.bind_flashblocks(flashblocks_cfg()).expect("binds");
+        let flashblocks = svc.flashblocks().expect("bound above");
+
+        flashblocks.producer().publisher.publish(&slice(10, 3)).expect("publishes");
+
+        assert_eq!(
+            flashblocks.publisher().handle().latest_position(),
+            Some(crate::flashblocks::FlashblockPosition { block_number: 10, flashblock_index: 3 }),
+            "a handle taken from the owning publisher sees what the builder published",
+        );
+    }
+
+    /// Leaving flashblocks off must not bind anything: a verifier running
+    /// without the flag has no endpoint to clash on.
+    #[tokio::test]
+    async fn without_flashblocks_nothing_is_bound() {
+        let (_dir, svc) = svc_with_temp_journal().await;
+
+        assert!(svc.flashblocks().is_none());
     }
 
     #[tokio::test]

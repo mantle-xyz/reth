@@ -5,7 +5,7 @@
 
 use mantle_reth_flashblocks::{FlashblocksAPI, PendingBlocksAPI};
 
-use crate::helpers::{FlashblockBuilder, base_slice, l1_info_deposit, launch_flashblocks_node};
+use crate::consumer_helpers::{FlashblockBuilder, base_slice, l1_info_deposit, launch_flashblocks_node};
 
 /// Default depths: three blocks of trailing history, three of leading slack.
 macro_rules! launch {

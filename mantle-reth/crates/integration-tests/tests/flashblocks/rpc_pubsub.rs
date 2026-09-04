@@ -14,7 +14,7 @@ use jsonrpsee::{
     ws_client::WsClientBuilder,
 };
 
-use crate::helpers::{
+use crate::consumer_helpers::{
     FlashblockBuilder, LOGGER, l1_info_deposit, launch_flashblocks_node, signed_call, test_sender,
 };
 

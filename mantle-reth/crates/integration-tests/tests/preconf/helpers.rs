@@ -727,7 +727,7 @@ macro_rules! launch_preconf_node {
     };
     ($cfg:expr, $chain_spec:expr) => {
         async {
-            let (node, http, wallet, chain_id, _classifier) =
+            let (node, http, wallet, chain_id, _classifier, _fb) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
@@ -741,7 +741,7 @@ macro_rules! launch_preconf_node {
     // per-block DA limit. `$da` is any `OpDAConfig` expression.
     ($cfg:expr, $chain_spec:expr, da_config = $da:expr) => {
         async {
-            let (node, http, wallet, chain_id, _classifier) =
+            let (node, http, wallet, chain_id, _classifier, _fb) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default()
@@ -752,7 +752,14 @@ macro_rules! launch_preconf_node {
             (node, http, wallet, chain_id)
         }
     };
-    (@build $cfg:expr, $chain_spec:expr, $make_node:expr) => {{
+    // Default: nothing to bind, so no flashblocks endpoint and no address.
+    (@build $cfg:expr, $chain_spec:expr, $make_node:expr) => {
+        $crate::launch_preconf_node!(
+            @build $cfg, $chain_spec, $make_node,
+            |_svc: &mut mantle_reth_preconf::PreconfServiceBuilder| None
+        )
+    };
+    (@build $cfg:expr, $chain_spec:expr, $make_node:expr, $bind:expr) => {{
         async {
             use mantle_reth_preconf::PreconfServiceBuilder;
 
@@ -783,10 +790,15 @@ macro_rules! launch_preconf_node {
                     reth_db::test_utils::tempdir_path().join("mantle-preconf-journal.jsonl"),
                 );
             }
-            let svc = PreconfServiceBuilder::from_config(preconf_cfg)
+            let mut svc = PreconfServiceBuilder::from_config(preconf_cfg)
                 .await
                 .expect("preconf svc init");
             let classifier = svc.classifier().clone();
+            // Between construction and the move into the node: binding needs
+            // `&mut svc`, and the address has to be read out before `svc` is
+            // gone, because the port was left to the OS.
+            let bind = $bind;
+            let flashblocks_addr: Option<std::net::SocketAddr> = bind(&mut svc);
             let make_node = $make_node;
 
             let (node_ctx, http, wallet, chain_id) = mantle_reth_integration_tests::launch_mantle_node!(
@@ -796,7 +808,7 @@ macro_rules! launch_preconf_node {
             )
             .await;
 
-            (node_ctx, http, wallet, chain_id, classifier)
+            (node_ctx, http, wallet, chain_id, classifier, flashblocks_addr)
         }
     }};
 }
@@ -1126,9 +1138,45 @@ macro_rules! reorg_to {
 #[macro_export]
 macro_rules! launch_preconf_node_with_classifier {
     ($cfg:expr, $chain_spec:expr) => {
-        $crate::launch_preconf_node!(
-            @build $cfg, $chain_spec,
-            |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
-        )
+        async {
+            let (node, http, wallet, chain_id, classifier, _fb) =
+                $crate::launch_preconf_node!(
+                    @build $cfg, $chain_spec,
+                    |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
+                )
+                .await;
+            (node, http, wallet, chain_id, classifier)
+        }
+    };
+}
+
+/// Launch a preconf node with slice publishing switched on.
+///
+/// Returns the flashblocks endpoint's **actual** address: the config asks for
+/// port 0 so concurrent tests never collide, and the OS picks the real one.
+#[macro_export]
+macro_rules! launch_flashblocks_node {
+    ($cfg:expr, $fb:expr) => {
+        $crate::launch_flashblocks_node!($cfg, $crate::helpers::mantle_test_chain_spec(), $fb)
+    };
+    ($cfg:expr, $chain_spec:expr, $fb:expr) => {
+        async {
+            let (node, http, wallet, chain_id, _classifier, fb_addr) =
+                $crate::launch_preconf_node!(
+                    @build $cfg, $chain_spec,
+                    |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc),
+                    |svc: &mut mantle_reth_preconf::PreconfServiceBuilder| {
+                        svc.bind_flashblocks($fb).expect("flashblocks endpoint binds");
+                        Some(
+                            svc.flashblocks()
+                                .expect("just bound")
+                                .publisher()
+                                .local_addr(),
+                        )
+                    }
+                )
+                .await;
+            (node, http, wallet, chain_id, fb_addr.expect("bound above"))
+        }
     };
 }

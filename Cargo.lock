@@ -5361,6 +5361,7 @@ dependencies = [
  "alloy-signer-local",
  "eyre",
  "futures",
+ "futures-util",
  "jsonrpsee",
  "mantle-reth-chainspec",
  "mantle-reth-cli",

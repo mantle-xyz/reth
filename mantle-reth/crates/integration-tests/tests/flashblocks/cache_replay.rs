@@ -4,7 +4,7 @@
 //! processor parks it in [`FlashblockCache`] and replays it once the canonical
 //! block lands.
 
-use crate::helpers::{
+use crate::consumer_helpers::{
     FlashblockBuilder, base_slice, launch_flashblocks_node, mine_canonical_block as mine,
 };
 

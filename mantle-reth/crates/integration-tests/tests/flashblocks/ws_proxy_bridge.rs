@@ -47,7 +47,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::{CancellationToken, DropGuard};
 use url::Url;
 
-use crate::helpers::base_slice;
+use crate::consumer_helpers::base_slice;
 
 /// Awaits one item, failing the test rather than hanging.
 async fn recv_next<T>(receiver: &mut UnboundedReceiver<T>) -> T {

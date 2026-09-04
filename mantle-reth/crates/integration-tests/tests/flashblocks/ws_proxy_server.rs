@@ -37,7 +37,7 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Error as WsError};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::helpers::base_slice;
+use crate::consumer_helpers::base_slice;
 
 /// An address that appears nowhere in the broadcast slices, so a filter on it
 /// matches no data frame.

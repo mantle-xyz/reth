@@ -451,6 +451,16 @@ impl MantleNode {
             self.op_node.gas_limit_config.clone(),
             args.sdm_enabled,
         );
+        // Slice publishing rides on the preconf handle: `--flashblocks.enable`
+        // requires `--preconf.enable`, so there is no path where flashblocks
+        // are configured without a preconf service to carry them.
+        //
+        // The endpoint goes to the payload service layer rather than being
+        // taken apart here: that layer both hands the publish handle to the
+        // builder and spawns the accept loop, and it runs exactly once — which
+        // is what a take-once accept loop needs.
+        let flashblocks = self.preconf.as_ref().and_then(|p| p.flashblocks()).map(Arc::clone);
+
         let (cfg, classifier, fifo) = if let Some(p) = &self.preconf {
             (p.cfg().clone(), p.classifier().clone(), p.fifo().clone())
         } else {
@@ -464,8 +474,13 @@ impl MantleNode {
             let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
             (Arc::new(cfg), classifier, fifo)
         };
-        let payload_service =
-            MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, classifier, fifo, builder_config);
+        let payload_service = MantlePreconfServiceBuilder::<OpPrimitives>::new(
+            cfg,
+            classifier,
+            fifo,
+            builder_config,
+            flashblocks,
+        );
 
         ComponentsBuilder::default()
             .node_types::<N>()

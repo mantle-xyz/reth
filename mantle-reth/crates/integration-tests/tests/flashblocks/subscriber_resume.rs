@@ -25,7 +25,7 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use crate::helpers::base_slice;
+use crate::consumer_helpers::base_slice;
 
 /// Long enough that the keepalive never fires during a test.
 const NO_PINGS: Duration = Duration::from_secs(600);

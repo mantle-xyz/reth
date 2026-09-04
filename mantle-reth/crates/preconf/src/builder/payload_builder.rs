@@ -73,8 +73,8 @@ use crate::{
     },
     classifier::{Verdict, Whitelist},
     flashblocks::{
-        BlockInvariants, FlashblockProducerConfig, PublisherHandle, SenderBalances, SliceHeader,
-        SliceLimits, build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
+        BlockInvariants, FlashblocksProducer, SenderBalances, SliceHeader, SliceLimits,
+        build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
     },
     types::{PreconfError, PreconfReceipt, PreconfSource},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
@@ -251,15 +251,6 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     /// behaving exactly as it did before slicing existed, which is what makes
     /// turning flashblocks off a real rollback rather than a second code path.
     flashblocks: Option<FlashblocksProducer>,
-}
-
-/// What the build loop needs in order to publish slices.
-#[derive(Debug, Clone)]
-pub struct FlashblocksProducer {
-    /// Slice cadence and budget settings.
-    pub cfg: Arc<FlashblockProducerConfig>,
-    /// Where finished slices go.
-    pub publisher: PublisherHandle,
 }
 
 impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
@@ -1131,27 +1122,33 @@ impl SliceState {
         );
         let block_number = invariants.base.block_number;
 
-        // Checked again after assembling: a payload resolved while this slice
-        // was being put together is already being sealed, and a subscriber told
-        // about transactions the sealed block will not contain has no way to
-        // unsee them.
-        if cancel.is_cancelled() {
-            debug!(
-                target: "mantle::preconf::flashblocks",
-                index = self.next_index,
-                "payload resolved while the slice was assembled; dropping it",
-            );
-            return;
-        }
+        // Checked again after assembling, and this time inseparably from the
+        // send: a payload resolved while this slice was being put together is
+        // already being sealed, and a subscriber told about transactions the
+        // sealed block will not contain has no way to unsee them. Checking and
+        // then sending as two steps would leave a window for the resolve to
+        // land in between — which is the very thing being guarded against.
+        let sent = cancel.unless_cancelled(|| self.producer.publisher.publish(&payload));
 
-        if let Err(err) = self.producer.publisher.publish(&payload) {
-            warn!(
-                target: "mantle::preconf::flashblocks",
-                %err,
-                index = self.next_index,
-                "failed to serialize a slice; skipping it",
-            );
-            return;
+        match sent {
+            None => {
+                debug!(
+                    target: "mantle::preconf::flashblocks",
+                    index = self.next_index,
+                    "payload resolved while the slice was assembled; dropping it",
+                );
+                return;
+            }
+            Some(Err(err)) => {
+                warn!(
+                    target: "mantle::preconf::flashblocks",
+                    %err,
+                    index = self.next_index,
+                    "failed to serialize a slice; skipping it",
+                );
+                return;
+            }
+            Some(Ok(_)) => {}
         }
 
         // Only now, and only on the path where the slice actually went out.
@@ -1678,12 +1675,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             })?;
         }
 
-        // The closing slice. Published after the post-execution transaction so
-        // that what subscribers have seen adds up to exactly what gets sealed,
-        // rather than stopping one transaction short of it.
-        if let Some(state) = slices.as_mut() {
-            state.publish(&ctx, &mut builder, &mut info, &state_provider_for_finish, &cancel);
-        }
+        // No closing slice here, deliberately. Every build ends by being
+        // cancelled — that is how `getPayload` asks for the block — so a slice
+        // assembled at this point is one the guard would always have to drop.
+        // Subscribers therefore stop at the last tick before the payload was
+        // resolved, which is where the reference implementation stops too.
+        //
+        // The cost is that up to one interval of the block's tail reaches
+        // subscribers only when the block itself does. Worth revisiting if
+        // `--rollup.sdm-enabled` is ever turned on for a production network:
+        // its refund transaction executes in the stage above and moves
+        // balances, so leaving it out of every slice would make a consumer's
+        // pending balances wrong rather than merely late.
 
         // ── Stage 5: finalize ─────────────────────────────────────────
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
