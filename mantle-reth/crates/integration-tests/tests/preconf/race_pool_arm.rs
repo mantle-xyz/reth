@@ -1,19 +1,27 @@
 //! Pool-arm regression + co-existence coverage.
 //!
-//! `apply_one_best_tx` in the fork's payload builder skips preconf-
-//! eligible txs (`cfg.is_preconf_tx(sender, to)`) before executing
-//! them, so a preconf-eligible tx that was admitted to the pool via a
-//! **plain** `eth_sendRawTransaction` can never leak out via the pool
-//! iterator ahead of its fifo entry. It must land on chain via the
-//! preconf pipeline (pool listener → fifo broadcast → `apply_one_preconf`).
+//! `apply_one_best_tx` in the fork's payload builder skips a tx that carries a
+//! preconf verdict — `classifier.verdict(hash).is_some_and(Verdict::is_preconf)`
+//! (`builder::payload_builder`) — so a commitment can never leak out through the
+//! pool iterator ahead of its fifo entry and be applied twice.
+//!
+//! The predicate is the **frozen verdict**, not a live allowlist read, and the
+//! only writer of an eligible verdict is `claim_preconf`, called from
+//! `eth_sendRawTransactionWithPreconf`. Being on the allowlist therefore does
+//! **not** make a transaction preconf: the RPC method decides. A whitelisted
+//! sender using plain `eth_sendRawTransaction` is latched `NotEligible` and
+//! lands through the ordinary pool arm.
 //!
 //! Coverage:
 //!
-//! - `preconf_eligible_regular_sendtx_still_lands` — matches predicate, pool arm skips, preconf arm
-//!   applies.
-//! - `non_preconf_eligible_regular_sendtx_lands_via_pool_arm` — does NOT match predicate, gate is a
-//!   no-op, tx lands through the vanilla pool best-tx iterator. Guards against a regression where
-//!   the gate accidentally rejects all pool-path txs on a preconf- enabled node.
+//! - `allowlisted_sender_via_plain_sendtx_lands_through_the_pool_arm` — on the allowlist, but
+//!   submitted the ordinary way, so no verdict is frozen and the pool arm applies it.
+//!   Discriminating in both directions: were plain submissions eligible again, the pool arm would
+//!   skip it *and* no fifo entry would exist (nothing called the preconf RPC), so it would never
+//!   land at all.
+//! - `non_preconf_eligible_regular_sendtx_lands_via_pool_arm` — the same, for a sender that is not
+//!   on the allowlist either. Guards against a regression where the gate rejects every pool-path tx
+//!   on a preconf-enabled node.
 //! - `preconf_and_pool_txs_coexist_in_one_block` — a preconf-RPC tx and a regular-sendTx tx (from
 //!   independent senders) target the same slot; both land in that block, and the `select!`-biased
 //!   preconf arm ensures the preconf tx precedes the pool-arm tx.
@@ -45,17 +53,14 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
 }
 
-/// Preconf-eligible tx submitted through the ordinary `eth_sendRawTransaction`
-/// still lands on chain (via listener → fifo → dispatch), even though the pool
-/// arm now short-circuits it.
+/// A sender on the allowlist that submits the **ordinary** way is not preconf, and lands
+/// through the pool arm: the allowlist is a necessary condition, never a sufficient one.
 ///
-/// Regression guard: before the fix, this tx would leak through the
-/// pool best-tx iterator ahead of its fifo entry, potentially
-/// double-applying or bypassing preconf ordering. After the fix, the
-/// pool arm hits the `is_preconf_tx` gate + `mark_invalid`, and the
-/// tx can only reach the block through `apply_one_preconf`.
+/// Discriminating in both directions — if a regression made plain submissions eligible
+/// again, the pool arm would skip this tx *and* no fifo entry would exist to apply it the
+/// other way, so it would not land at all and the assertion below fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn preconf_eligible_regular_sendtx_still_lands() {
+async fn allowlisted_sender_via_plain_sendtx_lands_through_the_pool_arm() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
@@ -97,26 +102,25 @@ async fn preconf_eligible_regular_sendtx_still_lands() {
         block.body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&tx_hash),
-        "preconf-eligible tx submitted via regular sendRawTransaction must still land \
-         on chain (via preconf listener → fifo → apply_one_preconf); \
-         hash {tx_hash:?} not in sealed block: {sealed:?}"
+        "an allowlisted sender's plain sendRawTransaction must land through the pool arm \
+         (no verdict is frozen, so the arm does not skip it, and no fifo entry exists \
+         to apply it the other way); hash {tx_hash:?} not in sealed block: {sealed:?}"
     );
 }
 
-/// Non-preconf-eligible tx submitted via ordinary `eth_sendRawTransaction`
-/// reaches chain through the vanilla pool best-tx iterator
-/// (`apply_one_best_tx`). The `is_preconf_tx` gate evaluates to false and the
-/// arm executes normally.
+/// A sender that is not on the allowlist either reaches chain through the
+/// vanilla pool best-tx iterator (`apply_one_best_tx`): no verdict is frozen, so
+/// the skip predicate is false and the arm executes normally.
 ///
-/// Regression guard: catches a hypothetical accidental broadening of
-/// the gate (e.g. `!is_preconf_tx` typo) that would starve the pool
-/// path on any preconf-enabled node.
+/// Regression guard: catches an accidental broadening of the gate (an inverted
+/// predicate, or one that treats a missing verdict as eligible) that would
+/// starve the pool path on any preconf-enabled node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn non_preconf_eligible_regular_sendtx_lands_via_pool_arm() {
     // Whitelist an unrelated placeholder pair so the config validates
-    // (`enabled=true` needs non-empty from/to). Our test wallet is not
-    // on the from-list, and RECIPIENT is not on the to-list ⇒
-    // `is_preconf_tx` returns false for the tx below ⇒ pool arm handles it.
+    // (`enabled=true` needs non-empty from/to). Our test wallet is on neither
+    // list — though as the test above shows, that would not change the outcome
+    // for a plain submission anyway.
     let placeholder = Address::from([0xFE; 20]);
     let cfg =
         PreconfCfgBuilder::new().whitelist_from(placeholder).whitelist_to(placeholder).build();
@@ -170,10 +174,10 @@ async fn non_preconf_eligible_regular_sendtx_lands_via_pool_arm() {
 /// `build_payload` must place the preconf tx at a lower body index than
 /// the pool-arm tx.
 ///
-/// The two senders are chosen from different derivation indices so the
-/// pool-arm tx does NOT match the whitelist (`is_preconf_tx=false`) —
-/// otherwise it would also be routed into the fifo and both txs would
-/// land through the preconf path, which is not what we're testing.
+/// The pool-arm sender is deliberately off the allowlist. That is belt and
+/// braces rather than the load-bearing part — it submits the ordinary way, so
+/// no verdict is frozen for it either way — but it keeps the scenario legible:
+/// exactly one of the two transactions goes through the preconf pipeline.
 ///
 /// **The pool tx is injected before the FCU, and has to be:** `build_payload`
 /// freezes its pool iterator at the start of Stage 3, so a tx admitted after
@@ -193,8 +197,7 @@ async fn preconf_and_pool_txs_coexist_in_one_block() {
     // deliberately absent from the whitelist so its tx routes to the pool arm.
     let pool_sender_signer = signers[2].clone();
 
-    // Whitelist ONLY the preconf sender; the pool sender is not on the
-    // list and its tx therefore misses `is_preconf_tx`.
+    // Whitelist ONLY the preconf sender.
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(preconf_sender_addr)
         .whitelist_to(recipient)
@@ -287,8 +290,9 @@ async fn preconf_and_pool_txs_coexist_in_one_block() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pool_tx_arriving_after_build_start_waits_for_the_next_block() {
     // Whitelist an unrelated placeholder so the config validates while the test
-    // wallet misses the list — `is_preconf_tx` is false, so the pool arm is this
-    // tx's only route and the preconf pipeline is not in the picture.
+    // wallet misses the list. The allowlist is not what decides it — this tx is
+    // submitted the ordinary way, so no eligible verdict is ever frozen and the
+    // pool arm is its only route.
     let placeholder = Address::from([0xFE; 20]);
     let cfg =
         PreconfCfgBuilder::new().whitelist_from(placeholder).whitelist_to(placeholder).build();

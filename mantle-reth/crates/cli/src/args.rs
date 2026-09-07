@@ -19,7 +19,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use alloy_primitives::{Address, map::foldhash::HashSet};
+use alloy_primitives::Address;
 use clap::Args;
 use mantle_reth_preconf::{
     PreconfConfig,
@@ -72,20 +72,16 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.all")]
     pub all: bool,
 
-    /// Allowlisted sender addresses. Accepts a comma-separated list
-    /// (`--preconf.from 0x1,0x2,0x3`) matching op-geth's
-    /// `--txpool.frompreconfs="0x1,0x2,0x3"`, or repeated flags
-    /// (`--preconf.from 0x1 --preconf.from 0x2`) — both accumulate.
-    /// Ignored when `--preconf.all` is set.
-    #[arg(long = "preconf.from", value_name = "ADDRESSES", value_delimiter = ',')]
-    pub from: Vec<Address>,
-
-    /// Allowlisted recipient addresses. Same semantics as `--preconf.from`
-    /// (comma-separated or repeated). Aligns with op-geth's
-    /// `--txpool.topreconfs`. Contract-creation txs (`to == None`) are only
-    /// eligible when `--preconf.all` is on.
-    #[arg(long = "preconf.to", value_name = "ADDRESSES", value_delimiter = ',')]
-    pub to: Vec<Address>,
+    /// Address of the L2 `PreconfWhitelist` contract, the single source of
+    /// truth for the sender/recipient allowlists.
+    ///
+    /// Required when `--preconf.enable` is set without `--preconf.all`
+    /// (enforced by `PreconfConfig::validate`). The node reads both lists out
+    /// of this contract's storage at startup and refreshes them whenever it
+    /// emits `WhitelistUpdated`, so the lists are governed on-chain — this
+    /// address is the only allowlist input the CLI accepts.
+    #[arg(long = "preconf.whitelist-contract", value_name = "ADDRESS")]
+    pub whitelist_contract: Option<Address>,
 
     /// Client-visible RPC oneshot timeout, in milliseconds. Default matches
     /// [`mantle_reth_preconf::config::DEFAULT_PRECONF_TIMEOUT`] (1s).
@@ -149,16 +145,7 @@ impl PreconfArgs {
         Some(PreconfConfig {
             enabled: true,
             all_preconfs: self.all,
-            from_preconfs: {
-                let mut s = HashSet::default();
-                s.extend(self.from);
-                s
-            },
-            to_preconfs: {
-                let mut s = HashSet::default();
-                s.extend(self.to);
-                s
-            },
+            whitelist_contract: self.whitelist_contract,
             preconf_timeout: self
                 .timeout_ms
                 .map(Duration::from_millis)
@@ -215,20 +202,17 @@ mod tests {
 
     #[test]
     fn enable_flag_produces_enabled_config() {
-        // Minimal opt-in: --preconf.enable alone is enough. Whitelists empty
-        // and --preconf.all not set → `enabled: true, all_preconfs: false,
-        // {from,to}_preconfs: empty`. This IS a config that `validate()`
-        // rejects with `RequiresEligibilityRules` — but that's a semantic
-        // check enforced at PreconfServiceBuilder::new time, not CLI parse
-        // time. Two-layer defense: clap catches syntax, validate() catches
-        // semantics.
+        // Minimal opt-in: --preconf.enable alone parses. No whitelist
+        // address was given, so this IS a config that `validate()` rejects with
+        // `MissingWhitelistContract` — but that's a semantic check enforced at
+        // PreconfServiceBuilder::new time, not CLI parse time. Two-layer
+        // defense: clap catches syntax, validate() catches semantics.
         let a = parse(&["--preconf.enable"]);
         assert!(a.enable);
         let cfg = a.into_config().expect("enabled");
         assert!(cfg.enabled);
         assert!(!cfg.all_preconfs);
-        assert!(cfg.from_preconfs.is_empty());
-        assert!(cfg.to_preconfs.is_empty());
+        assert_eq!(cfg.whitelist_contract, None);
     }
 
     #[test]
@@ -245,41 +229,29 @@ mod tests {
     }
 
     #[test]
-    fn repeatable_from_to_flags_accumulate_into_sets() {
-        // Two --preconf.from + two --preconf.to → each set has 2 members.
-        // The Vec<Address> parses successfully; into_config dedups via
-        // HashSet.
+    fn whitelist_contract_flag_lands_on_config() {
+        // `--preconf.whitelist-contract` maps to
+        // `PreconfConfig::whitelist_contract`.
         let a = parse(&[
             "--preconf.enable",
-            "--preconf.from",
+            "--preconf.whitelist-contract",
             "0x1111111111111111111111111111111111111111",
-            "--preconf.from",
-            "0x2222222222222222222222222222222222222222",
-            "--preconf.to",
-            "0x3333333333333333333333333333333333333333",
-            "--preconf.to",
-            "0x4444444444444444444444444444444444444444",
         ]);
         let cfg = a.into_config().expect("enabled");
-        assert_eq!(cfg.from_preconfs.len(), 2);
-        assert_eq!(cfg.to_preconfs.len(), 2);
+        assert_eq!(cfg.whitelist_contract, Some(Address::from([0x11; 20])));
+        // And unlike the address-less shape above, this one passes validation.
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
-    fn comma_separated_from_to_matches_op_geth_format() {
-        // op-geth accepts `--txpool.frompreconfs="0x1,0x2,0x3"`.
-        // The CLI must parse the same shape when a single flag carries
-        // a comma-separated address list.
-        let a = parse(&[
-            "--preconf.enable",
-            "--preconf.from",
-            "0x1111111111111111111111111111111111111111,0x2222222222222222222222222222222222222222,0x3333333333333333333333333333333333333333",
-            "--preconf.to",
-            "0x4444444444444444444444444444444444444444,0x5555555555555555555555555555555555555555",
-        ]);
+    fn all_preconfs_needs_no_whitelist_contract() {
+        // `--preconf.all` bypasses the contract entirely, so the address stays
+        // optional in that mode.
+        let a = parse(&["--preconf.enable", "--preconf.all"]);
         let cfg = a.into_config().expect("enabled");
-        assert_eq!(cfg.from_preconfs.len(), 3);
-        assert_eq!(cfg.to_preconfs.len(), 2);
+        assert!(cfg.all_preconfs);
+        assert_eq!(cfg.whitelist_contract, None);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

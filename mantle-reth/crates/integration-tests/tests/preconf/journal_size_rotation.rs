@@ -2,21 +2,22 @@
 //!
 //! `journal_rotation.rs` drives `rotate()` directly at the disk layer;
 //! this module verifies the **wiring**: the launched node actually spawns
-//! `run_rejournal_loop` with the configured `journal_max_size`, and a
-//! commitment that crosses the cap *after* being sealed on chain is
-//! dropped from the on-disk file by the size trigger — with no periodic
-//! tick (the default 60s interval never fires in the sub-second window)
-//! and no manual `rotate()` call.
+//! `run_rejournal_loop` with the configured `journal_max_size`, and the size
+//! trigger fires with no periodic tick (the default 60s interval never fires in
+//! the sub-second window) and no manual `rotate()` call.
 //!
 //! Coverage:
-//! - `size_triggered_rotation_drops_sealed_entry` — the cap is sized between one and two journal
-//!   entries. tx0 lands + is canon-sealed while the file is still under the cap (nothing rotates
-//!   it). tx1's append then pushes the file over the cap, arming the size trigger for the *first*
-//!   time (so the rate limit's `min_gap` is irrelevant — the first trigger is always honoured). The
-//!   loop rotates, dropping the sealed tx0 and keeping the still-unsealed tx1.
+//! - `size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet` — the cap is sized between
+//!   one and two journal entries. tx0 lands on chain while the file is still under the cap; tx1's
+//!   append then pushes it over, arming the size trigger for the *first* time (so the rate limit's
+//!   `min_gap` is irrelevant — the first trigger is always honoured). **Both entries must
+//!   survive**: landing only *starts* tx0's retention clock, it does not end its tracking, and a
+//!   two-block chain is nowhere near `SEAL_DEPTH` deep, so a reorg could still take tx0's block
+//!   back and it must keep both its record and its nonce. This is the retention period observed
+//!   end-to-end; a regression that released on "canonical once" drops tx0 here.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
-use crate::{canonize_built, launch_preconf_node};
+use crate::{canonicalize_payload, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -62,11 +63,11 @@ fn read_journal(path: &std::path::Path) -> Vec<JournalEntry> {
         .collect()
 }
 
-/// End-to-end size-triggered rotation: a sealed commitment is dropped from
-/// the on-disk journal by the node's own rejournal loop once a later append
-/// pushes the file past the configured `journal_max_size`.
+/// End-to-end size-triggered rotation: a later append pushes the file past the configured
+/// `journal_max_size`, the node's own rejournal loop rotates — and keeps a commitment that
+/// has landed but is not yet buried `SEAL_DEPTH` deep. See the module header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn size_triggered_rotation_drops_sealed_entry() {
+async fn size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let chain_id = mantle_test_chain_spec().chain().id();
     let wallet = Wallet::default().with_chain_id(chain_id);
@@ -134,8 +135,7 @@ async fn size_triggered_rotation_drops_sealed_entry() {
     let hash0 = event0.tx_hash;
 
     // Commit to canonical → the canon handler marks tx0 sealed.
-    canonize_built!(node, payload);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _new_head = canonicalize_payload!(node, payload).await;
 
     // Under the cap: nothing has rotated tx0 away yet.
     let before = read_journal(&journal_file);
@@ -146,8 +146,8 @@ async fn size_triggered_rotation_drops_sealed_entry() {
 
     // ── Slot 2: submit tx1 (nonce=1). Its append pushes the file over the
     //    cap → the size trigger fires (first trigger, no rate-limit gap)
-    //    and the loop rotates, dropping the sealed tx0 and keeping the
-    //    still-unsealed tx1. ────────────────────────────────────────────
+    //    and the loop rotates, dropping the released tx0 and keeping the
+    //    still-owed tx1. ────────────────────────────────────────────────
     let tx1 = signed_transfer(chain_id, &wallet, 1).await;
     let hash1 = keccak256(&tx1);
 
@@ -187,17 +187,16 @@ async fn size_triggered_rotation_drops_sealed_entry() {
         event1.reason,
     );
 
-    // The size-triggered rotation must have dropped the sealed tx0 and kept
-    // the unsealed tx1. tx1 is never committed to canonical here, so it is
-    // not sealed and must survive.
+    // Both entries must survive: tx1 because it never landed, tx0 because it is not yet
+    // buried `SEAL_DEPTH` deep (see the module header).
     let after = read_journal(&journal_file);
     assert!(
-        !after.iter().any(|e| e.hash == hash0),
-        "size-triggered rotation must drop the sealed tx0; entries={after:?}",
+        after.iter().any(|e| e.hash == hash0),
+        "an on-chain but shallow commitment must survive rotation; entries={after:?}",
     );
     assert!(
         after.iter().any(|e| e.hash == hash1),
-        "unsealed tx1 must survive the size-triggered rotation; entries={after:?}",
+        "an un-landed commitment must survive the size-triggered rotation; entries={after:?}",
     );
 
     let _ = std::fs::remove_dir_all(&journal_dir);

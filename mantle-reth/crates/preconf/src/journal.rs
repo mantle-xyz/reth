@@ -15,21 +15,19 @@
 //! file grows by ~50 KB/s, comfortably within disk budget for a
 //! short-lived journal that gets rotated periodically.
 //!
-//! In-memory state tracked alongside the file:
+//! **No in-memory view of which commitments are still owed lives here.**
+//! [`PreconfClassifier`] is the single owner of "this commitment is over",
+//! because the only notion this layer could form — *canonical once* — is one a
+//! reorg can undo. Rotation receives that decision as the `retain` predicate
+//! [`PreconfJournal::rotate`] takes, and the pool listener asks
+//! `PreconfClassifier::is_promised` directly. This is the sole statement of that
+//! division; the rest of the file assumes it.
 //!
-//! - **sealed set** — hashes that the canonical-state handler has reported as included in a sealed
-//!   block. Used by the rotation step to drop already-on-chain entries from the next file
-//!   generation, and by the pool listener to detect reorg reinjects (a hash in the sealed set that
-//!   reappears via pool re-admission was previously promised — see
-//!   `pool_ext::preconf_pool_listener`).
-//!
-//! The journal exposes `append_promised` / `load` / `mark_sealed_batch` /
-//! `contains` / `rotate` for the durability path, plus the startup
-//! helper [`restore_preconf_state`] and the background rotation loop
-//! [`spawn_rejournal_loop`].
+//! The journal exposes `append_promised` / `load` / `rotate` for the durability
+//! path, plus the startup helper [`restore_preconf_state`] and the background
+//! rotation loop [`spawn_rejournal_loop`].
 
 use std::{
-    collections::HashSet,
     future::Future,
     io,
     path::{Path, PathBuf},
@@ -51,9 +49,9 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::PreconfTxSet;
+use crate::{PreconfClassifier, PreconfTxSet};
 
 /// One persisted preconf commitment. Carries everything needed to
 /// re-inject the transaction into the pool on restart and to recognise
@@ -100,11 +98,13 @@ pub enum JournalError {
 /// On-disk append-only journal of preconf commitments.
 ///
 /// The journal is `Sync`: a single instance can be held by an `Arc` and
-/// shared between the RPC handler (writer) and the canonical-state
-/// handler (sealed-set updater). All writes serialise through an async
-/// `Mutex` around the file handle; reads of the sealed set are
-/// independent and lock-free at the data-structure level (the inner
-/// `HashSet` is guarded by its own short-lived lock).
+/// shared between the RPC handler (writer) and the rejournal loop
+/// (rotation). All writes serialise through an async `Mutex` around the file
+/// handle.
+///
+/// It holds **no** view of which commitments are still owed (see the module
+/// docs); that decision reaches rotation through the `retain` predicate
+/// [`Self::rotate`] takes.
 #[derive(Debug)]
 pub struct PreconfJournal {
     /// Path to the journal file. Stored for rotation, which writes a
@@ -113,18 +113,6 @@ pub struct PreconfJournal {
     /// Append handle protected by a `Mutex` because the trait
     /// `tokio::io::AsyncWriteExt::write_all` takes `&mut self`.
     writer: Mutex<File>,
-    /// In-memory set of hashes observed on a sealed block **that we also
-    /// promised** (i.e. are present in `promised` / the journal file).
-    /// Consulted by rotation to drop already-on-chain entries. Bounded by
-    /// `promised`: the canon handler reports every committed tx, but
-    /// `mark_sealed` admits only promised hashes, so this can't grow without
-    /// bound.
-    sealed: Mutex<HashSet<TxHash>>,
-    /// Hashes currently recorded in the journal file — the preconf
-    /// commitments we've promised. Inserted by `append_promised`, removed by
-    /// `rotate` when the entry leaves the file, seeded from disk in `open`.
-    /// Admission filter for `sealed`, keeping `sealed ⊆ promised ⊆ file`.
-    promised: Mutex<HashSet<TxHash>>,
     /// On-disk size cap in bytes that arms size-triggered rotation.
     /// Config validation guarantees a positive value whenever the journal
     /// is enabled (see [`crate::PreconfConfig`]).
@@ -138,18 +126,7 @@ pub struct PreconfJournal {
     /// path. `notify_one` coalesces a burst of appends into a single
     /// pending permit.
     rotate_notify: Notify,
-    /// Age after which `rotate` abandons an **unsealed** entry (drops it even
-    /// though it never landed). `None` disables it — only sealed entries drop.
-    /// Set via [`Self::with_abandon_after`]; left `None` in most tests.
-    abandon_unsealed_after: Option<Duration>,
 }
-
-/// Rotation intervals an **unsealed** commitment survives before `rotate`
-/// abandons it as permanently un-landable (a promised tx re-lands within the
-/// reorg/replay window — seconds — so outliving many cadences means it never
-/// will). Abandon age = `rejournal_interval ×` this, so keep the cadence well
-/// below `abandon window / this`.
-pub const UNSEALED_ABANDON_ROTATIONS: u32 = 30;
 
 impl PreconfJournal {
     /// Open (or create) the journal file at `path` in append mode.
@@ -179,24 +156,12 @@ impl PreconfJournal {
         let journal = Self {
             path,
             writer: Mutex::new(file),
-            sealed: Mutex::new(HashSet::new()),
-            promised: Mutex::new(HashSet::new()),
             max_size,
             size_bytes: AtomicU64::new(init_size),
             rotate_notify: Notify::new(),
-            abandon_unsealed_after: None,
         };
-        // Seed `promised` from the existing file so post-restart `mark_sealed`
-        // recognises commitments already on disk; without this they'd never be
-        // admitted to `sealed` and thus never dropped by `rotate`.
-        let (existing, _bad) = journal.load().await?;
-        {
-            let mut promised = journal.promised.lock().await;
-            for e in &existing {
-                promised.insert(e.hash);
-            }
-            metrics::gauge!("preconf.journal.promised_len").set(promised.len() as f64);
-        }
+        // Nothing in memory to seed from the file: recognising a post-restart
+        // commitment as ours is `restore_preconf_state`'s job.
         Ok(journal)
     }
 
@@ -204,15 +169,6 @@ impl PreconfJournal {
     /// instance.
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Enable age-based abandonment: `rotate` drops an **unsealed** entry once
-    /// its `committed_at_ms` is older than `ttl`. Fluent so production can chain
-    /// it after [`Self::open`] without touching the test call sites.
-    #[must_use]
-    pub const fn with_abandon_after(mut self, ttl: Duration) -> Self {
-        self.abandon_unsealed_after = Some(ttl);
-        self
     }
 
     /// Append one commitment to the journal. Performs an explicit
@@ -233,9 +189,6 @@ impl PreconfJournal {
             let mut writer = self.writer.lock().await;
             writer.write_all(&line).await?;
             writer.flush().await?;
-            // Record as promised (writer > promised lock order) so a later
-            // `mark_sealed` for this hash is admitted into `sealed`.
-            self.promised.lock().await.insert(entry.hash);
             self.size_bytes.fetch_add(len, Ordering::Relaxed) + len
         };
         metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
@@ -297,40 +250,8 @@ impl PreconfJournal {
         Ok((out, bad))
     }
 
-    /// Mark transactions observed in a sealed block. **Only hashes we
-    /// actually promised** (present in `promised` / the journal file) are
-    /// admitted into `sealed`; the canon handler reports every committed tx,
-    /// and this filter is what keeps `sealed` bounded to outstanding preconf
-    /// commitments rather than the whole chain. Idempotent.
-    ///
-    /// Batched so the canon hot path takes each lock once per block. Lock
-    /// order: `sealed` then `promised` (global `writer > sealed > promised`).
-    pub async fn mark_sealed_batch(&self, hashes: impl IntoIterator<Item = TxHash>) {
-        let mut sealed = self.sealed.lock().await;
-        let promised = self.promised.lock().await;
-        for h in hashes {
-            if promised.contains(&h) {
-                sealed.insert(h);
-            }
-        }
-        metrics::gauge!("preconf.journal.sealed_len").set(sealed.len() as f64);
-    }
-
-    /// `true` when `hash` has been seen on chain. The canonical-state
-    /// handler uses this to drive the `reorg_drift_total` metric:
-    /// reverted blocks whose txs are tracked here indicate operator
-    /// alert territory.
-    pub async fn contains(&self, hash: &TxHash) -> bool {
-        self.sealed.lock().await.contains(hash)
-    }
-
-    /// Number of sealed hashes currently tracked. Test / telemetry helper.
-    pub async fn sealed_len(&self) -> usize {
-        self.sealed.lock().await.len()
-    }
-
-    /// Rewrite the journal file dropping every entry whose `hash` is
-    /// in the sealed set, then atomically swap it for the live file.
+    /// Rewrite the journal file keeping only the entries `retain` accepts,
+    /// then atomically swap it for the live file.
     ///
     /// Implementation: read all entries, filter, write to a sibling
     /// `<path>.tmp`, then `rename` over the live file. On Unix the
@@ -342,7 +263,10 @@ impl PreconfJournal {
     /// RPC path. While rotation runs, `append_promised` is blocked
     /// behind the same writer `Mutex` — typically a few ms even at
     /// 100 TPS.
-    pub async fn rotate(&self) -> Result<RotateStats, JournalError> {
+    pub async fn rotate(
+        &self,
+        retain: impl Fn(&TxHash) -> bool,
+    ) -> Result<RotateStats, JournalError> {
         // Records `preconf.journal.rotate_duration_ms` on every exit path
         // (including the `?` early returns below).
         let _timer = RotateTimer(std::time::Instant::now());
@@ -354,29 +278,17 @@ impl PreconfJournal {
         let mut writer = self.writer.lock().await;
 
         let (entries, bad_before) = self.load().await?;
-        // Snapshot the sealed set once here. Any `mark_sealed` firing
-        // during the rewrite is intentionally not observed by this
-        // rotation — its hash will land in the sealed set for the
-        // *next* tick, which prevents a hash from being both dropped
-        // by this rotate AND missing from the sealed set on the same
-        // pass.
-        let sealed_snapshot: HashSet<TxHash> = self.sealed.lock().await.clone();
-        metrics::gauge!("preconf.journal.sealed_len").set(sealed_snapshot.len() as f64);
 
-        // Age-based abandonment: drop an unsealed entry older than the TTL —
-        // promised but permanently un-landable, else it replays every restart.
-        // `committed_at_ms == 0` (broken clock) is only ever dropped by sealing.
-        let abandon_ttl_ms = self.abandon_unsealed_after.map(|d| d.as_millis() as u64);
-        let now_ms = now_unix_ms();
-        let expired = |e: &JournalEntry| -> bool {
-            abandon_ttl_ms.is_some_and(|ttl| {
-                e.committed_at_ms != 0 && now_ms.saturating_sub(e.committed_at_ms) > ttl
-            })
-        };
-
+        // Which records may go is the caller's decision, not this type's, and it
+        // is the *only* rule here: `retain` asks the classifier whether the
+        // commitment is still tracked. This type deliberately owns no eviction
+        // policy of its own — a second, journal-local rule could drop a record
+        // the classifier still holds, which is precisely the divergence the two
+        // halves of commitment tracking must not have. Evaluated once per record,
+        // so a concurrent update lands in the *next* rotation rather than half of
+        // this one.
         let mut kept = 0usize;
         let mut dropped = 0usize;
-        let mut abandoned = 0usize;
         let mut kept_bytes = 0u64;
         let tmp_path = tmp_path_for(&self.path);
 
@@ -384,13 +296,8 @@ impl PreconfJournal {
             let mut tmp =
                 OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path).await?;
             for entry in &entries {
-                if sealed_snapshot.contains(&entry.hash) {
+                if !retain(&entry.hash) {
                     dropped += 1;
-                    continue;
-                }
-                if expired(entry) {
-                    dropped += 1;
-                    abandoned += 1;
                     continue;
                 }
                 let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
@@ -412,44 +319,17 @@ impl PreconfJournal {
         self.size_bytes.store(kept_bytes, Ordering::Relaxed);
         metrics::gauge!("preconf.journal.size_bytes").set(kept_bytes as f64);
 
-        // Sealed entries that just left the file are also redundant
-        // in memory now: rotate is the point at which a commitment
-        // can stop being tracked entirely.
-        if dropped > 0 {
-            // Drop the just-removed commitments from both in-memory sets: out
-            // of the file ⇒ out of `promised`, and no longer needed in
-            // `sealed`. Lock order: `sealed` then `promised`.
-            let mut sealed = self.sealed.lock().await;
-            let mut promised = self.promised.lock().await;
-            for entry in &entries {
-                if sealed_snapshot.contains(&entry.hash) {
-                    sealed.remove(&entry.hash);
-                    promised.remove(&entry.hash);
-                } else if expired(entry) {
-                    // Abandoned ⇒ not in `sealed`; drop from `promised` to keep
-                    // `promised ⊆ file`.
-                    promised.remove(&entry.hash);
-                }
-            }
-            metrics::gauge!("preconf.journal.sealed_len").set(sealed.len() as f64);
-            metrics::gauge!("preconf.journal.promised_len").set(promised.len() as f64);
-        }
-
-        if abandoned > 0 {
-            metrics::counter!("preconf.journal.abandoned_total").increment(abandoned as u64);
-        }
-
         Ok(RotateStats { kept, dropped, bad_lines_skipped: bad_before })
     }
 }
 
 /// Telemetry-friendly summary of a single [`PreconfJournal::rotate`]
 /// invocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateStats {
     /// Entries written to the new file.
     pub kept: usize,
-    /// Sealed entries dropped during rotation.
+    /// Entries left out of the new file — every one of them refused by `retain`.
     pub dropped: usize,
     /// Corrupt lines observed during the read pass. Rotate silently
     /// removes them from the rewritten file (they're not carried over
@@ -462,13 +342,6 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     PathBuf::from(tmp)
-}
-
-/// Wall-clock ms since the Unix epoch, `0` if the clock predates 1970 (mirrors
-/// [`JournalEntry::committed_at_ms`]'s fallback so `rotate`'s age check is safe).
-fn now_unix_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Records `preconf.journal.rotate_duration_ms` on drop, so every exit path
@@ -487,9 +360,9 @@ impl Drop for RotateTimer {
 /// Minimal pool-side surface [`restore_preconf_state`] needs.
 ///
 /// Production callers wrap a real [`reth_transaction_pool::TransactionPool`]
-/// via [`PoolAdapter`] (next phase, when the cli crate wires journal in);
-/// tests inject a stub that records `contains` / `add_envelope` calls
-/// without standing up the full reth pool.
+/// via [`RestorePoolAdapter`](crate::RestorePoolAdapter); tests inject a stub
+/// that records `contains` / `add_envelope` calls without standing up the full
+/// reth pool.
 ///
 /// Kept here, alongside the journal, so the restore helper has no
 /// dependency on `reth-transaction-pool` itself — that wiring lives at
@@ -517,10 +390,25 @@ pub trait RestorePool: Send + Sync {
     /// Only genuine pool errors (bad signature, nonce mismatch on the
     /// post-restart state, ...) surface as `Err(reason)` — the restore
     /// helper logs and skips those entries.
-    async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, String>;
+    async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip>;
+
+    /// Recover just the `(sender, nonce)` of `tx_rlp` — no pool involvement.
+    ///
+    /// Exists so [`restore_preconf_state`]'s pre-pass can claim each
+    /// commitment's slot before *any* entry is admitted; see
+    /// [`PreconfClassifier::mark_promised`](crate::PreconfClassifier::mark_promised)
+    /// for why that has to happen before `add_envelope`.
+    ///
+    /// `None` for anything that does not decode or whose signature does not
+    /// recover — the entry will fail `add_envelope` for the same reason a moment
+    /// later, which is where it gets logged.
+    ///
+    /// Decodes the same bytes `add_envelope` decodes again: one extra ec-recover
+    /// per journal entry, once per process start.
+    fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)>;
 
     /// Synchronously remove transactions from the pool by hash. Used
-    /// by [`PreconfTxSet`](crate::PreconfTxSet)'s pool-eviction
+    /// by [`PreconfTxSet`]'s pool-eviction
     /// callback path — every transition to a non-on-chain terminal
     /// state (`Timeout` / `Canceled` / `Failed`) triggers a same-hash
     /// eviction to close the "client saw failure but tx later lands"
@@ -531,6 +419,63 @@ pub trait RestorePool: Send + Sync {
     /// case). Sync because reth's `TransactionPool::remove_transactions`
     /// is sync and holds only the pool's internal mutex briefly.
     fn remove_transactions(&self, hashes: Vec<TxHash>);
+}
+
+/// Whether a commitment is on the canonical chain, as far as this node can
+/// tell.
+///
+/// Three-valued on purpose: [`Self::Unknown`] is a **fact about our knowledge**,
+/// not a failure to be folded into either answer. Collapsing it into `No` turns
+/// every honoured commitment on an index-pruned node into a false "commitment
+/// lost" alarm; collapsing it into `Yes` reinstates the very
+/// silently-wrong-report this type exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnChain {
+    /// Found on the canonical chain, in the block at `height`.
+    ///
+    /// The height is carried because "on chain" is revocable: restore has to
+    /// start the retention clock (`PreconfClassifier::mark_committed`) for this
+    /// commitment, and that clock is a block depth. Without it a restored
+    /// commitment that had already landed would keep a promise record that no
+    /// rotation could ever drop.
+    Yes {
+        /// Canonical block number the transaction was found in.
+        height: u64,
+    },
+    /// Not on the canonical chain, and the index that would have found it is
+    /// intact — so the miss is trustworthy.
+    No,
+    /// Cannot be determined: the transaction-lookup index has been pruned, or
+    /// the query itself failed.
+    Unknown,
+}
+
+/// The chain-side lookup [`restore_preconf_state`] needs to tell "this
+/// commitment landed" apart from "some other transaction consumed its nonce".
+///
+/// Separate from [`RestorePool`] because the pool has no way to answer it — see
+/// [`RestoreSkip::NonceConsumed`].
+pub trait CommitmentChainView: Send + Sync {
+    /// Is `hash` on the canonical chain?
+    fn commitment_on_chain(&self, hash: &TxHash) -> OnChain;
+}
+
+/// Why a journal entry was not re-admitted to the pool.
+///
+/// Deliberately says only what the **pool** can distinguish. Which of the three
+/// things a consumed nonce means — commitment honoured, nonce stolen, or
+/// unknowable — is resolved by [`restore_preconf_state`] with a
+/// [`CommitmentChainView`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreSkip {
+    /// The sender's account nonce has moved past this transaction — by **some** transaction, not
+    /// necessarily this one, so it cannot mean the commitment was kept: `validate_sender_nonce`
+    /// compares the *account's* nonce, never the hash, so a different tx yields the same error.
+    NonceConsumed(String),
+    /// Anything else: corrupt bytes, a variant that cannot be preconfirmed, or
+    /// a pool refusal that is not "nonce already consumed". A real failure —
+    /// the commitment is lost.
+    Rejected(String),
 }
 
 /// Output of a successful [`RestorePool::add_envelope`] — the decoded
@@ -550,34 +495,52 @@ pub struct RestoredEnvelope {
 /// Walk the journal at startup and re-establish the in-memory state
 /// the running system expects.
 ///
-/// For each entry, in order:
+/// Order matters:
 ///
-/// 1. Decode + attempt to admit into the pool via [`RestorePool::add_envelope`]. The trait treats
+/// 1. Mark **every** loaded hash [`Verdict::Promised`] up front, before admitting any of them. This
+///    is what carries "a receipt for this tx already went out to a client" across the restart, and
+///    it has to happen first — step 2 runs the pool validator, which classifies. See below.
+/// 2. Decode + attempt to admit into the pool via [`RestorePool::add_envelope`]. The trait treats
 ///    `AlreadyImported` as success — reth's own local-tx backup may have restored the same tx from
 ///    disk before this call, and either outcome yields the recovered envelope needed for the fifo
 ///    push.
-/// 2. Push the recovered envelope into the fifo with
+/// 3. Push the recovered envelope into the fifo with
 ///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so the dispatch layer's
 ///    deadline / gas-budget gates bypass the tx (SLA: "receipt returned → tx must land").
+///
+/// ## Why step 1 has to come first
+///
+/// Restore deliberately does not re-derive eligibility — a commitment already
+/// acknowledged to a client must come back regardless of what current policy
+/// says. Cold start runs before restore, so without step 1 a restored tx would
+/// be classified `Eligible` and re-judged against the *current*
+/// `preconf_max_gas_per_tx`: lower that flag, restart, and `add_envelope` starts
+/// rejecting commitments a client was already told had succeeded — silently,
+/// since restore skips and logs.
+///
+/// [`Verdict::Promised`] makes the exemption explicit: `admit_and_claim` is
+/// get-or-insert, so the verdict installed here survives step 2, and the
+/// validator returns a promised transaction straight to its inner validator —
+/// ahead of the ceiling and every other preconf gate. The pre-pass loop carries
+/// the rest of the argument.
 ///
 /// Non-recoverable failures (corrupt tx bytes, pool refusal for reasons
 /// other than `AlreadyImported`) are logged and skipped — best-effort
 /// restore, never block startup.
-pub async fn restore_preconf_state<P: RestorePool>(
+///
+/// [`Verdict::Promised`]: crate::classifier::Verdict::Promised
+pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
     journal: &PreconfJournal,
     pool: &P,
+    chain: &C,
     fifo: &Arc<PreconfTxSet>,
+    classifier: &PreconfClassifier,
 ) {
-    // Prune before replay: one rotate drops sealed + age-abandoned entries so we
-    // neither re-inject them into the fifo nor re-`add_envelope` them every
-    // restart. Best-effort — on failure we just replay the un-pruned file.
-    if let Err(e) = journal.rotate().await {
-        warn!(
-            target: "mantle::preconf::journal",
-            ?e,
-            "pre-restore rotate failed; restoring against un-pruned journal"
-        );
-    }
+    // No prune before the replay pass: the only eviction rule is "the classifier
+    // no longer tracks this", and the classifier is empty until the loop below
+    // populates it — pruning here would discard every commitment we owe on the
+    // very restart meant to honour them. The prune happens once at the end
+    // instead, against the records this pass just established.
     let (entries, bad_lines) = match journal.load().await {
         Ok(v) => v,
         Err(e) => {
@@ -596,20 +559,151 @@ pub async fn restore_preconf_state<P: RestorePool>(
         "preconf journal load"
     );
 
+    // Step 1 — a pre-pass: every hash becomes a live commitment owning its nonce before any is
+    // admitted. Two reasons it is not folded into the loop below.
+    //
+    // **The verdict.** `add_envelope` hands the tx to the pool, whose validator classifies
+    // whatever is not yet marked. Two journal entries sharing a `(sender, nonce)` are enough to
+    // matter: admitting the first would classify the *second* against the current allowlists and
+    // put it through the replacement guard instead of treating it as the commitment it is.
+    //
+    // **The slot.** `mark_promised` both records "a receipt for this went out in a previous
+    // process" and claims the `(sender, nonce)`, from what `recover_slot` hands it. Back-filling
+    // the claim at validator time would leave the nonce reading free in between, so a same-nonce
+    // transaction admitted there would take a nonce the client was already told it had. Startup
+    // ordering closes that window today (`cli::node` runs restore before the pool loader, the RPC
+    // server and the network); claiming here makes it structural instead.
+    for entry in &entries {
+        match pool.recover_slot(&entry.tx_rlp) {
+            Some((from, nonce)) => {
+                if let Err(owner) =
+                    classifier.mark_promised(entry.hash, &from, nonce, entry.block_height)
+                {
+                    // Someone already owns the nonce, so this commitment is the
+                    // one that will lose it. Deliberately not seized — see
+                    // `mark_promised`. `add_envelope` below decides the outcome
+                    // (typically `ReplacementUnderpriced`) and logs it.
+                    warn!(
+                        target: "mantle::preconf::journal",
+                        hash = ?entry.hash,
+                        ?owner,
+                        "a same-nonce tx already owns this slot; commitment may not be honoured"
+                    );
+                }
+            }
+            // Undecodable envelope. **No record is written**, deliberately:
+            // `recover_slot` shares its first step with `add_envelope`
+            // (`recover_raw_transaction::<PoolPooledTx<P>>`), so this entry is
+            // about to be rejected there too — it will never enter the pool or
+            // get a fifo entry, and a `Promised` record would break the rule that
+            // a promise names the `(sender, nonce)` it was issued against.
+            //
+            // Reaching this means the file was corrupted in a way that survived
+            // JSON parsing, or this binary no longer supports that transaction
+            // type. Either way it is a broken commitment we cannot even name, so
+            // it is an `error!`, not a `debug!`.
+            None => {
+                error!(
+                    target: "mantle::preconf::journal",
+                    hash = ?entry.hash,
+                    "journal entry does not decode; its commitment cannot be honoured or even \
+                     attributed to a (sender, nonce)"
+                );
+                metrics::counter!("preconf.journal.restore_undecodable").increment(1);
+            }
+        }
+    }
+
     let mut restored = 0usize;
-    let mut decode_failures = 0usize;
+    let mut honored = 0usize;
+    let mut nonce_taken = 0usize;
+    let mut unknown = 0usize;
+    let mut rejected = 0usize;
 
     for entry in entries {
         let recovered = match pool.add_envelope(&entry.tx_rlp).await {
             Ok(rec) => rec,
-            Err(reason) => {
+            Err(RestoreSkip::NonceConsumed(reason)) => {
+                // The nonce is gone, but the pool cannot say to whom. Ask the
+                // chain: the three answers mean entirely different things, and
+                // only the first is the commitment having been kept.
+                match chain.commitment_on_chain(&entry.hash) {
+                    OnChain::Yes { height } => {
+                        // The promise was kept before the restart. Start its
+                        // retention clock at the block it actually landed in:
+                        // rotation keeps a record only while the classifier is
+                        // still tracking it, so without this the entry would be
+                        // immortal — nothing else will ever report this block,
+                        // it is already in the past, and every future restart
+                        // would replay (and complain about) the same entry.
+                        //
+                        // Starting the clock deliberately does not release the
+                        // tracking outright. Landing is revocable; if the block
+                        // is shallow, a reorg right after startup must still
+                        // find the commitment holding its nonce.
+                        classifier.mark_committed(&entry.hash, height);
+                        debug!(
+                            target: "mantle::preconf::journal",
+                            hash = ?entry.hash,
+                            height,
+                            reason,
+                            "restored tx is already on chain; commitment was kept"
+                        );
+                        honored += 1;
+                    }
+                    OnChain::No => {
+                        // A different transaction took this nonce. The commitment
+                        // is broken and cannot be recovered while that stays true
+                        // — the hash is bound to its nonce by its own signature.
+                        //
+                        // Deliberately still retained: if the transaction that
+                        // took the nonce is itself reverted, this commitment
+                        // becomes applicable again, so there is nothing to
+                        // forget yet. The cost is that the entry survives
+                        // rotation until then, and every restart repeats this
+                        // warning — which is the right noise for a promise we
+                        // could not keep.
+                        warn!(
+                            target: "mantle::preconf::journal",
+                            hash = ?entry.hash,
+                            reason,
+                            "restored tx is NOT on chain but its nonce was consumed by another \
+                             transaction; commitment is broken"
+                        );
+                        nonce_taken += 1;
+                    }
+                    OnChain::Unknown => {
+                        // Retained too: an entry we cannot judge must be
+                        // kept. Actionable for operators, since it means the
+                        // transaction-lookup index this check needs has been
+                        // pruned away.
+                        warn!(
+                            target: "mantle::preconf::journal",
+                            hash = ?entry.hash,
+                            reason,
+                            "restored tx's nonce was consumed but whether the tx itself landed \
+                             cannot be determined (transaction-lookup index pruned?); entry kept"
+                        );
+                        unknown += 1;
+                    }
+                }
+                continue;
+            }
+            Err(RestoreSkip::Rejected(reason)) => {
+                // Give the record up here rather than leaving it to expire.
+                // Nothing else will ever revisit this hash — it has no fifo
+                // entry and will never be observed on chain — so keeping the
+                // promise record would pin the nonce and hold the journal line
+                // for a commitment this process has already abandoned. The two
+                // halves go together or the journal outlives what tracks it.
+                classifier.release_unless_committed(&entry.hash);
                 warn!(
                     target: "mantle::preconf::journal",
                     hash = ?entry.hash,
                     reason,
-                    "pool rejected restored tx; skipping fifo push"
+                    "pool rejected restored tx; commitment cannot be honoured"
                 );
-                decode_failures += 1;
+                rejected += 1;
                 continue;
             }
         };
@@ -628,12 +722,34 @@ pub async fn restore_preconf_state<P: RestorePool>(
         restored += 1;
     }
 
+    // `nonce_taken` is the one to alert on: each is a receipt handed out for a
+    // transaction that can no longer land. It is published as a counter too,
+    // because a log line that only appears at startup is easy to miss.
+    metrics::counter!("preconf.journal.restore_nonce_taken").increment(nonce_taken as u64);
+    metrics::counter!("preconf.journal.restore_unknown").increment(unknown as u64);
     info!(
         target: "mantle::preconf::journal",
         restored,
-        decode_failures,
+        honored,
+        nonce_taken,
+        unknown,
+        rejected,
         "preconf restore complete"
     );
+
+    // Prune now, against the records this pass just established: entries whose
+    // commitment was kept and buried, and the ones given up above, are gone from
+    // the classifier and so leave the file here. Doing it after the replay rather
+    // than before is what lets the eviction rule be the classifier's alone —
+    // before it, every record would read as untracked. Best-effort; the next
+    // rotation retries.
+    if let Err(e) = journal.rotate(|hash| classifier.is_tracked(hash)).await {
+        warn!(
+            target: "mantle::preconf::journal",
+            ?e,
+            "post-restore rotate failed; the file keeps entries the classifier has dropped"
+        );
+    }
 }
 
 // ─── Background rotation loop ───────────────────────────────────────────────
@@ -652,24 +768,30 @@ pub async fn restore_preconf_state<P: RestorePool>(
 /// is never left in a half-written state.
 ///
 /// After the shutdown signal is observed, one **final** rotation is
-/// attempted so any entries that have accumulated since the last tick
-/// (in particular sealed hashes reported by the canonical-state handler
-/// on the way down) are dropped from the on-disk file before the
-/// process exits. Callers that hold a reth `GracefulShutdownGuard` must
-/// keep it alive across this call so the `TaskManager` waits for the
-/// final rotate.
+/// attempted so entries that `retain` stopped accepting since the last
+/// tick leave the on-disk file before the process exits. Callers that
+/// hold a reth `GracefulShutdownGuard` must keep it alive across this
+/// call so the `TaskManager` waits for the final rotate.
 ///
 /// The first rotation is skipped (the interval's immediate-first tick
 /// is consumed at start) so a long-running node does not rotate a
 /// nearly-empty journal in the first few seconds after boot.
 pub async fn run_rejournal_loop<F, T>(
     journal: Arc<PreconfJournal>,
+    classifier: Arc<PreconfClassifier>,
     interval: Duration,
     shutdown: F,
 ) -> T
 where
     F: Future<Output = T>,
 {
+    // The one eviction rule: a record may go once the classifier has stopped
+    // tracking its commitment. That happens when the commitment was kept and
+    // buried `SEAL_DEPTH` persisted blocks deep, when a promise can no longer
+    // reach the block it was made for, or when a build gave it up. Everything
+    // else — never landed but still reachable, landed but shallow, landed and
+    // then reorged out — is still owed and stays in the file.
+    let retain = |hash: &TxHash| classifier.is_tracked(hash);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Consume the immediate-first tick so we don't rotate at t=0.
@@ -705,24 +827,23 @@ where
             _ = journal.rotate_notify.notified() => {
                 let now = Instant::now();
                 if last_rotate.is_none_or(|t| now.duration_since(t) >= min_gap) {
-                    log_rotate(journal.rotate().await, "size");
+                    log_rotate(journal.rotate(&retain).await, "size");
                     last_rotate = Some(now);
                 }
             }
             _ = ticker.tick() => {
-                log_rotate(journal.rotate().await, "tick");
+                log_rotate(journal.rotate(&retain).await, "tick");
                 last_rotate = Some(Instant::now());
             }
         }
     };
 
-    // Final rotate on shutdown — persist any sealed hashes accumulated
-    // since the last tick before exiting. `signal_output` is held alive
-    // across this await so callers passing a graceful-shutdown guard as
-    // `T` keep their runtime's shutdown latch open until the final
-    // on-disk write completes. Failures are logged; we do not surface
-    // them because the process is going away anyway.
-    log_rotate(journal.rotate().await, "shutdown");
+    // Final rotate on shutdown — flush records `retain` has stopped accepting
+    // since the last tick. `signal_output` is held alive across this await so
+    // callers passing a graceful-shutdown guard as `T` keep their runtime's
+    // shutdown latch open until the final on-disk write completes. Failures are
+    // logged; we do not surface them because the process is going away anyway.
+    log_rotate(journal.rotate(&retain).await, "shutdown");
 
     signal_output
 }
@@ -738,14 +859,16 @@ const SIZE_ROTATE_MIN_GAP: Duration = Duration::from_secs(2);
 /// trigger sites.
 fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
     match result {
-        Ok(stats) => debug!(
-            target: "mantle::preconf::journal",
-            reason,
-            kept = stats.kept,
-            dropped = stats.dropped,
-            bad = stats.bad_lines_skipped,
-            "journal rotation"
-        ),
+        Ok(stats) => {
+            debug!(
+                target: "mantle::preconf::journal",
+                reason,
+                kept = stats.kept,
+                dropped = stats.dropped,
+                bad = stats.bad_lines_skipped,
+                "journal rotation"
+            );
+        }
         Err(e) => warn!(
             target: "mantle::preconf::journal",
             reason,
@@ -765,6 +888,7 @@ fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
 /// the reth `TaskManager` participates in the graceful shutdown handoff.
 pub fn spawn_rejournal_loop(
     journal: Arc<PreconfJournal>,
+    classifier: Arc<PreconfClassifier>,
     interval: Duration,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
@@ -775,7 +899,7 @@ pub fn spawn_rejournal_loop(
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
-        let () = run_rejournal_loop(journal, interval, shutdown).await;
+        let () = run_rejournal_loop(journal, classifier, interval, shutdown).await;
     })
 }
 
@@ -783,6 +907,7 @@ pub fn spawn_rejournal_loop(
 mod tests {
     use super::*;
     use alloy_primitives::Bytes;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     fn entry(byte: u8, height: u64) -> JournalEntry {
@@ -811,42 +936,43 @@ mod tests {
         }
     }
 
-    /// With abandonment enabled, `rotate` drops an unsealed entry older than the
-    /// TTL and keeps a fresh one (sealed entries are dropped regardless of age).
+    /// Age is not an eviction rule here. An entry stamped at the epoch is kept
+    /// as long as the classifier still tracks its commitment — the journal has
+    /// no clock of its own to overrule that with.
     #[tokio::test]
-    async fn rotate_abandons_stale_unsealed_entries() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("preconf.jsonl");
-        let j = PreconfJournal::open(&path, 0)
-            .await
-            .unwrap()
-            .with_abandon_after(Duration::from_secs(60));
-
-        let now = now_unix_ms();
-        let stale = entry_at(1, 10, 1_000); // ~epoch ⇒ far older than 60s
-        let fresh = entry_at(2, 11, now); // just committed
-        j.append_promised(&stale).await.unwrap();
-        j.append_promised(&fresh).await.unwrap();
-
-        let stats = j.rotate().await.unwrap();
-        assert_eq!(stats.dropped, 1, "only the stale unsealed entry is abandoned");
-
-        let (survivors, _) = j.load().await.unwrap();
-        assert_eq!(survivors, vec![fresh], "fresh unsealed entry survives; stale one abandoned");
-    }
-
-    /// Default (abandonment disabled) preserves the old behaviour: a stale
-    /// unsealed entry is kept, no matter how old.
-    #[tokio::test]
-    async fn rotate_without_abandon_keeps_stale_unsealed() {
+    async fn rotate_keeps_an_ancient_entry_the_classifier_still_tracks() {
         let (_dir, j) = fresh_journal().await;
-        let stale = entry_at(1, 10, 1_000);
-        j.append_promised(&stale).await.unwrap();
+        let ancient = entry_at(1, 10, 1_000);
+        j.append_promised(&ancient).await.unwrap();
 
-        let stats = j.rotate().await.unwrap();
+        let c = empty_classifier();
+        c.mark_promised(ancient.hash, &Address::from([0xEE; 20]), 0, ancient.block_height).unwrap();
+
+        let stats = j.rotate(|h| c.is_tracked(h)).await.unwrap();
         assert_eq!(stats.dropped, 0);
         let (survivors, _) = j.load().await.unwrap();
-        assert_eq!(survivors, vec![stale], "no abandonment configured ⇒ survivor kept");
+        assert_eq!(survivors, vec![ancient], "still tracked ⇒ still owed ⇒ kept");
+    }
+
+    /// The entry leaves the file exactly when the classifier stops tracking its
+    /// commitment — nothing else. When that happens (buried `SEAL_DEPTH` deep, a
+    /// promise out of reach, a build giving up) is the classifier's question, and
+    /// is pinned by its own `sweep` tests.
+    #[tokio::test]
+    async fn rotate_drops_an_entry_the_classifier_gave_up() {
+        let (_dir, j) = fresh_journal().await;
+        let e = entry_at(1, 10, 1_000);
+        j.append_promised(&e).await.unwrap();
+
+        let c = empty_classifier();
+        c.mark_promised(e.hash, &Address::from([0xEE; 20]), 0, e.block_height).unwrap();
+        assert_eq!(j.rotate(|h| c.is_tracked(h)).await.unwrap().dropped, 0);
+
+        assert!(c.release_unless_committed(&e.hash));
+        let stats = j.rotate(|h| c.is_tracked(h)).await.unwrap();
+        assert_eq!(stats.dropped, 1);
+        let (survivors, _) = j.load().await.unwrap();
+        assert!(survivors.is_empty(), "the journal follows the classifier");
     }
 
     #[tokio::test]
@@ -878,12 +1004,9 @@ mod tests {
         let j = PreconfJournal {
             path: path.clone(),
             writer: Mutex::new(File::create(dir.path().join("dummy")).await.unwrap()),
-            sealed: Mutex::new(HashSet::new()),
-            promised: Mutex::new(HashSet::new()),
             max_size: 0,
             size_bytes: AtomicU64::new(0),
             rotate_notify: Notify::new(),
-            abandon_unsealed_after: None,
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());
@@ -918,101 +1041,77 @@ mod tests {
         assert_eq!(bad, 0);
     }
 
+    /// Rotation keeps whatever `retain` says to keep. Production passes "the
+    /// classifier is still tracking this".
     #[tokio::test]
-    async fn mark_sealed_is_idempotent() {
+    async fn rotate_keeps_exactly_what_retain_accepts() {
         let (_dir, j) = fresh_journal().await;
-        // Must be promised first — `mark_sealed` only admits promised hashes.
-        let e = entry(5, 50);
-        j.append_promised(&e).await.unwrap();
-        j.mark_sealed_batch([e.hash]).await;
-        j.mark_sealed_batch([e.hash]).await;
-        j.mark_sealed_batch([e.hash]).await;
-        assert!(j.contains(&e.hash).await);
-        assert_eq!(j.sealed_len().await, 1);
+        let e_a = entry(1, 10);
+        let e_b = entry(2, 11);
+        let e_c = entry(3, 12);
+        j.append_promised(&e_a).await.unwrap();
+        j.append_promised(&e_b).await.unwrap();
+        j.append_promised(&e_c).await.unwrap();
+
+        let dropped_hash = e_b.hash;
+        let stats = j.rotate(|h| *h != dropped_hash).await.unwrap();
+        assert_eq!(stats.kept, 2);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.bad_lines_skipped, 0);
+
+        let (after, _) = j.load().await.unwrap();
+        assert_eq!(after, vec![e_a, e_c]);
     }
 
+    /// The safe direction: a predicate that keeps everything drops nothing, so a
+    /// classifier that is still tracking every commitment cannot lose one to a
+    /// rotation tick.
     #[tokio::test]
-    async fn mark_sealed_ignores_unpromised_hash() {
-        // The canon handler reports every committed tx; a hash we never
-        // journaled (non-preconf, or already rotated out) must not enter
-        // `sealed` — this is what bounds the set.
+    async fn rotate_keeps_everything_when_retain_always_true() {
         let (_dir, j) = fresh_journal().await;
-        let unpromised = TxHash::from([9; 32]);
-        j.mark_sealed_batch([unpromised]).await;
-        assert!(!j.contains(&unpromised).await);
-        assert_eq!(j.sealed_len().await, 0);
+        let e_a = entry(1, 10);
+        let e_b = entry(2, 11);
+        j.append_promised(&e_a).await.unwrap();
+        j.append_promised(&e_b).await.unwrap();
 
-        // Once promised, the same hash is admitted.
-        let e = entry(9, 90);
-        j.append_promised(&e).await.unwrap();
-        j.mark_sealed_batch([e.hash]).await;
-        assert!(j.contains(&e.hash).await);
-        assert_eq!(j.sealed_len().await, 1);
+        let stats = j.rotate(|_| true).await.unwrap();
+        assert_eq!((stats.kept, stats.dropped), (2, 0));
+        let (after, _) = j.load().await.unwrap();
+        assert_eq!(after, vec![e_a, e_b]);
     }
 
-    #[tokio::test]
-    async fn rotate_drops_hash_from_promised_too() {
-        // After rotate evicts a sealed entry from the file, its hash must
-        // also leave `promised`; a subsequent stray `mark_sealed` for it is
-        // then correctly ignored (no longer a live commitment).
-        let (_dir, j) = fresh_journal().await;
-        let e = entry(1, 10);
-        j.append_promised(&e).await.unwrap();
-        j.mark_sealed_batch([e.hash]).await;
-
-        let stats = j.rotate().await.unwrap();
-        assert_eq!((stats.kept, stats.dropped), (0, 1));
-        assert!(!j.contains(&e.hash).await, "sealed cleared on rotate");
-
-        // Not promised anymore ⇒ a stray re-seal is a no-op.
-        j.mark_sealed_batch([e.hash]).await;
-        assert_eq!(j.sealed_len().await, 0);
-    }
-
-    #[tokio::test]
-    async fn open_seeds_promised_from_existing_file() {
-        // A commitment surviving a restart (still on disk) must be
-        // re-admitted by `mark_sealed` after reopen, else it could never be
-        // dropped by rotate.
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("preconf.jsonl");
-        let e = entry(3, 30);
-        {
-            let seed = PreconfJournal::open(&path, 0).await.unwrap();
-            seed.append_promised(&e).await.unwrap();
-        }
-        // Reopen: `promised` is seeded from the file.
-        let j = PreconfJournal::open(&path, 0).await.unwrap();
-        j.mark_sealed_batch([e.hash]).await;
-        assert!(j.contains(&e.hash).await, "reopened journal must admit on-disk commitment");
-    }
-
+    /// An append racing a rotate must not be lost. `retain` accepts everything
+    /// here, so any absence is the race, not the retention rule.
+    ///
+    /// Two failure modes: an entry landing in rotate's load → rename window can
+    /// be dropped outright, and even when it survives on disk, rotate's
+    /// `size_bytes.store(kept_bytes)` is computed from the pre-append snapshot,
+    /// so storing it would leave the counter short of the real file and silently
+    /// mistune the size-rotation trigger. Deterministic because rotate holds the
+    /// writer lock end to end.
     #[tokio::test]
     async fn rotate_does_not_lose_concurrent_appends() {
-        // Regression: an append racing a rotate must not be lost (nothing is
-        // sealed here, so every appended entry must survive). Deterministic
-        // post-fix; pre-fix it drops entries landing in the load→rename window.
         use std::sync::Arc;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let j = Arc::new(PreconfJournal::open(&path, 0).await.unwrap());
 
-        // Unsealed survivors widen rotate's tmp-write window.
+        // Survivors widen rotate's tmp-write window, so the race has something
+        // to land in.
         for i in 0..5u8 {
-            j.append_promised(&entry(i, i as u64)).await.unwrap();
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
         }
 
-        // Race a burst of appends against one rotate.
         let n: u8 = 30;
         let rot = {
             let j = j.clone();
-            tokio::spawn(async move { j.rotate().await.unwrap() })
+            tokio::spawn(async move { j.rotate(|_| true).await.unwrap() })
         };
         let mut appends = Vec::new();
         for i in 5..n {
             let j = j.clone();
             appends.push(tokio::spawn(async move {
-                j.append_promised(&entry(i, i as u64)).await.unwrap()
+                j.append_promised(&entry(i, u64::from(i))).await.unwrap()
             }));
         }
         rot.await.unwrap();
@@ -1020,7 +1119,6 @@ mod tests {
             a.await.unwrap();
         }
 
-        // Nothing was sealed ⇒ every appended hash must still be on disk.
         let (after, _) = j.load().await.unwrap();
         let on_disk: HashSet<TxHash> = after.iter().map(|e| e.hash).collect();
         for i in 0..n {
@@ -1030,13 +1128,6 @@ mod tests {
             );
         }
 
-        // Same race, second failure mode: the in-memory `size_bytes` counter
-        // must not be clobbered by a rotate that raced an append — it must
-        // still equal the file's true length. If rotate's
-        // `size_bytes.store(kept_bytes)` (computed from the pre-append
-        // snapshot) dropped the racing append's byte contribution, the counter
-        // would sit short of the real file and silently mistune the
-        // size-rotation trigger even though the entry itself survived on disk.
         let on_disk_bytes = tokio::fs::metadata(&path).await.unwrap().len();
         assert_eq!(
             j.size_bytes.load(Ordering::Relaxed),
@@ -1046,44 +1137,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contains_is_false_for_unknown_hash() {
-        let (_dir, j) = fresh_journal().await;
-        assert!(!j.contains(&TxHash::from([9; 32])).await);
-    }
-
-    #[tokio::test]
-    async fn rotate_drops_sealed_keeps_unsealed() {
-        let (_dir, j) = fresh_journal().await;
-        let e_a = entry(1, 10);
-        let e_b = entry(2, 11);
-        let e_c = entry(3, 12);
-        j.append_promised(&e_a).await.unwrap();
-        j.append_promised(&e_b).await.unwrap();
-        j.append_promised(&e_c).await.unwrap();
-        j.mark_sealed_batch([e_b.hash]).await;
-
-        let stats = j.rotate().await.unwrap();
-        assert_eq!(stats.kept, 2);
-        assert_eq!(stats.dropped, 1);
-        assert_eq!(stats.bad_lines_skipped, 0);
-
-        let (after, _) = j.load().await.unwrap();
-        assert_eq!(after, vec![e_a, e_c]);
-
-        // Sealed entry is removed from in-memory set too — it has no
-        // further utility once it's out of the file.
-        assert!(!j.contains(&e_b.hash).await);
-    }
-
-    #[tokio::test]
     async fn rotate_then_append_writes_to_new_file_handle() {
         // Verify the writer is re-opened against the new inode after
         // rotation — a subsequent append must land in the rotated file.
         let (_dir, j) = fresh_journal().await;
         let e_a = entry(1, 10);
         j.append_promised(&e_a).await.unwrap();
-        j.mark_sealed_batch([e_a.hash]).await;
-        j.rotate().await.unwrap();
+        let dropped_hash = e_a.hash;
+        j.rotate(|h| *h != dropped_hash).await.unwrap();
 
         let e_b = entry(2, 11);
         j.append_promised(&e_b).await.unwrap();
@@ -1106,6 +1167,8 @@ mod tests {
         add_calls: std::sync::Mutex<Vec<Bytes>>,
         // Whether add_envelope should return Err.
         reject_add: bool,
+        // Whether recover_slot should fail, i.e. the bytes do not decode.
+        undecodable: bool,
     }
 
     impl StubPool {
@@ -1115,6 +1178,7 @@ mod tests {
                 contains_calls: std::sync::Mutex::new(Vec::new()),
                 add_calls: std::sync::Mutex::new(Vec::new()),
                 reject_add: false,
+                undecodable: false,
             }
         }
     }
@@ -1128,10 +1192,26 @@ mod tests {
         fn remove_transactions(&self, _hashes: Vec<TxHash>) {
             // No mark_* fires in journal-only tests; keep no-op.
         }
-        async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, String> {
+        /// Must agree with the `(from, nonce)` `add_envelope` fabricates below —
+        /// restore claims the slot from this and pushes the fifo entry from that,
+        /// so a mismatch would silently test nothing.
+        fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+            if self.undecodable {
+                return None;
+            }
+            let seed = tx_rlp.first().copied().unwrap_or(0);
+            Some((Address::from([seed; 20]), u64::from(seed)))
+        }
+        async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
             self.add_calls.lock().unwrap().push(tx_rlp.clone());
             if self.reject_add {
-                return Err("rejected by stub".into());
+                return Err(RestoreSkip::Rejected("rejected by stub".into()));
+            }
+            // Undecodable bytes fail here too: the real adapter decodes the same
+            // RLP in both methods, so a stub that let one succeed while the other
+            // failed would exercise a state production cannot reach.
+            if self.undecodable {
+                return Err(RestoreSkip::Rejected("does not decode".into()));
             }
             // Fabricate an envelope. We use a deterministic dummy
             // legacy tx — the journal restore code only needs `envelope`
@@ -1151,12 +1231,113 @@ mod tests {
         }
     }
 
+    /// Scripted chain view: answers every hash the same way.
+    ///
+    /// [`OnChain::Yes`] is what tests that predate the three-way split want —
+    /// back then a consumed nonce *was* "the commitment landed", so passing `Yes`
+    /// keeps their subject unchanged.
+    struct StubChain(OnChain);
+
+    impl CommitmentChainView for StubChain {
+        fn commitment_on_chain(&self, _hash: &TxHash) -> OnChain {
+            self.0
+        }
+    }
+
+    /// The chain view for tests that are not about this distinction.
+    fn landed() -> StubChain {
+        StubChain(OnChain::Yes { height: LANDED_AT })
+    }
+
+    /// Height `landed()` reports. Arbitrary; the tests only care about it
+    /// relative to the persisted watermark they publish.
+    const LANDED_AT: u64 = 10;
+
+    /// The production rotation predicate: a record stays while the classifier is
+    /// still tracking its commitment. Tests use it so they exercise the same
+    /// decision production does, rather than a hand-written stand-in.
+    fn retain_tracked(c: &PreconfClassifier) -> impl Fn(&TxHash) -> bool + '_ {
+        move |h| c.is_tracked(h)
+    }
+
+    /// Classifier for restore tests, with **empty allowlists on purpose**: cold
+    /// start may legitimately have loaded two empty lists (governance allows
+    /// nobody) and restore must still bring commitments back. `restart_replay.rs`
+    /// structurally cannot reproduce that, since it seeds the lists before the
+    /// node starts.
+    ///
+    /// Built **enabled**, because `PreconfConfig::default()` has
+    /// `enabled: false`, which short-circuits every write on this type — restore
+    /// would appear to run and record nothing. Any classifier a test hands to
+    /// `restore_preconf_state` must be enabled for the same reason.
+    fn empty_classifier() -> PreconfClassifier {
+        PreconfClassifier::from_config(&crate::PreconfConfig {
+            enabled: true,
+            ..crate::PreconfConfig::default()
+        })
+    }
+
+    /// A classifier that has finished tracking `hashes`: each was promised,
+    /// observed on chain, and has since been buried `SEAL_DEPTH` persisted
+    /// blocks deep. That is the only state in which rotation may drop a record,
+    /// so it is what the rejournal-loop tests need to set up.
+    fn classifier_done_with(hashes: &[TxHash]) -> Arc<PreconfClassifier> {
+        let c = empty_classifier();
+        for (i, h) in hashes.iter().enumerate() {
+            // Distinct (sender, nonce) per hash so the claims do not collide.
+            let _ = c.mark_promised(*h, &Address::from([0xEE; 20]), i as u64, 0);
+            c.mark_committed(h, LANDED_AT);
+        }
+        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        for h in hashes {
+            // Rotation keys on the record, so take the step that removes it — the
+            // same one `forward` takes when the fifo drops a landed entry. Its
+            // `true` doubles as the fixture's sanity check: it refuses while the
+            // commitment is still inside its retention period.
+            assert!(c.release_unless_committed(h), "fixture must be done with the commitment");
+        }
+        Arc::new(c)
+    }
+
+    /// A classifier with the watermark already high enough that anything
+    /// [`finish_tracking`] marks becomes immediately releasable. For tests that
+    /// need to finish a commitment *after* the rotation loop has started.
+    fn classifier_with_high_watermark() -> Arc<PreconfClassifier> {
+        let c = empty_classifier();
+        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        Arc::new(c)
+    }
+
+    /// Mark `hash` as a commitment this process still owes: promised, never
+    /// landed, and promised for a block the chain cannot have buried. Rotation
+    /// must keep it — an entry with no record at all would be dropped as an
+    /// orphan, so a fixture's survivor has to say so explicitly.
+    fn still_owed(c: &PreconfClassifier, hash: TxHash) {
+        let _ = c.mark_promised(hash, &Address::from([0xEE; 20]), u64::from(hash.0[0]), u64::MAX);
+        assert!(c.is_tracked(&hash));
+    }
+
+    /// Take `hash` through promise → committed → released, so the classifier is
+    /// done with it — i.e. finish tracking a commitment mid-flight.
+    ///
+    /// The release is the point: rotation keys on the record, and retention
+    /// expiring is not the record disappearing. This takes the same step
+    /// production takes when `forward` drops the fifo entry of a landed
+    /// commitment, so the journal predicate sees what it would see there.
+    fn finish_tracking(c: &PreconfClassifier, hash: TxHash) {
+        // The nonce is derived from the hash so repeated calls do not collide.
+        let _ = c.mark_promised(hash, &Address::from([0xEE; 20]), u64::from(hash.0[0]), 0);
+        c.mark_committed(&hash, LANDED_AT);
+        assert!(c.release_unless_committed(&hash), "the watermark must make it releasable");
+        assert!(!c.is_tracked(&hash));
+    }
+
     #[tokio::test]
     async fn restore_from_empty_journal_is_noop() {
         let (_dir, j) = fresh_journal().await;
         let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &fifo).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
         assert!(pool.contains_calls.lock().unwrap().is_empty());
         assert!(pool.add_calls.lock().unwrap().is_empty());
         assert!(fifo.snapshot().await.is_empty());
@@ -1170,7 +1351,7 @@ mod tests {
 
         let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &fifo).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
 
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "both txs admitted");
         let snapshot = fifo.snapshot().await;
@@ -1192,15 +1373,440 @@ mod tests {
         let mut pool = StubPool::new();
         pool.known.insert(e1.hash);
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &fifo).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
 
         assert_eq!(pool.add_calls.lock().unwrap().len(), 1);
         // Core J5 assertion: fifo received the entry.
         assert_eq!(fifo.snapshot().await.len(), 1);
     }
 
+    /// **The ordering invariant of C4.** Every entry must already carry
+    /// `Verdict::Promised` **before the first one is offered to the pool**, not
+    /// merely before its own admission. Asserted from inside `add_envelope`, i.e.
+    /// at exactly the moment the real validator would run. See the pre-pass in
+    /// `restore_preconf_state` for why the stronger form is the one that matters.
     #[tokio::test]
-    async fn restore_skips_entry_on_decode_failure_and_continues() {
+    async fn restore_marks_every_entry_promised_before_admitting_any() {
+        /// Pool that, on each tx it is handed, snapshots the verdicts of **all**
+        /// journal hashes — including the ones not offered yet.
+        struct VerdictSpyPool {
+            classifier: Arc<PreconfClassifier>,
+            hashes: Vec<TxHash>,
+            seen: std::sync::Mutex<Vec<Vec<Option<crate::classifier::Verdict>>>>,
+        }
+        #[async_trait::async_trait]
+        impl RestorePool for VerdictSpyPool {
+            async fn contains(&self, _hash: &TxHash) -> bool {
+                false
+            }
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+                let seed = tx_rlp.first().copied().unwrap_or(0);
+                Some((Address::from([seed; 20]), u64::from(seed)))
+            }
+            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+                use alloy_consensus::{Signed, TxLegacy};
+                use alloy_primitives::Signature;
+
+                let seed = tx_rlp.first().copied().unwrap_or(0);
+                let inner = TxLegacy { nonce: u64::from(seed), ..Default::default() };
+                let sig = Signature::test_signature();
+                let hash = TxHash::from([seed; 32]);
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(self.hashes.iter().map(|h| self.classifier.verdict(h)).collect());
+                Ok(RestoredEnvelope {
+                    envelope: TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)),
+                    from: Address::from([seed; 20]),
+                })
+            }
+            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+        }
+
+        let (_dir, j) = fresh_journal().await;
+        // `entry(byte, height)` keys both the journal hash and the stub's
+        // fabricated envelope off the same byte, so the spy can look the verdict
+        // up by hash.
+        j.append_promised(&entry(1, 10)).await.unwrap();
+        j.append_promised(&entry(2, 11)).await.unwrap();
+        j.append_promised(&entry(3, 12)).await.unwrap();
+
+        let classifier = Arc::new(empty_classifier());
+        let pool = VerdictSpyPool {
+            classifier: classifier.clone(),
+            hashes: (1u8..=3).map(|b| TxHash::from([b; 32])).collect(),
+            seen: std::sync::Mutex::new(vec![]),
+        };
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &classifier).await;
+
+        let seen = pool.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "every entry must be offered to the pool");
+        // The discriminating assertion is on the **first** admission: entries 2
+        // and 3 have not been offered yet and must already be `Promised`. Marking
+        // each entry just before its own admission satisfies "this one is
+        // Promised" but leaves those two `None` — that arrangement fails here.
+        assert!(
+            seen[0].iter().all(|v| *v == Some(crate::classifier::Verdict::Promised)),
+            "all entries must be Promised before the first admission, including \
+             those not yet admitted; got {:?}",
+            seen[0],
+        );
+    }
+
+    /// The same ordering invariant for the **slot**: every commitment must own
+    /// its `(sender, nonce)` before the first entry is offered to the pool.
+    ///
+    /// Without the pre-pass claiming it, the nonce would read as *free* from
+    /// restore until `add_envelope` drives that entry through the validator. A
+    /// same-nonce transaction admitted in that interval takes the slot, and the
+    /// commitment loses a nonce its client was already told it had. Nothing can
+    /// admit in that interval as the node is wired today (`cli::node` runs
+    /// restore before reth's local-tx backup loader, the RPC server and the
+    /// network), so this pins the property that the *index* enforces it rather
+    /// than startup order.
+    ///
+    /// NB the classifier here is **enabled** with empty allowlists, not
+    /// `empty_classifier()` (which is built from a default config, i.e. disabled).
+    /// `mark_promised` returns early on a disabled classifier and records
+    /// nothing at all, which would make this test vacuous.
+    #[tokio::test]
+    async fn restore_claims_every_slot_before_admitting_any() {
+        /// Pool that, on each tx it is handed, snapshots the owner of **all** the
+        /// journal entries' slots — including those not offered yet.
+        struct SlotSpyPool {
+            classifier: Arc<PreconfClassifier>,
+            slots: Vec<(Address, u64)>,
+            seen: std::sync::Mutex<Vec<Vec<Option<TxHash>>>>,
+        }
+        #[async_trait::async_trait]
+        impl RestorePool for SlotSpyPool {
+            async fn contains(&self, _hash: &TxHash) -> bool {
+                false
+            }
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+                let seed = tx_rlp.first().copied().unwrap_or(0);
+                Some((Address::from([seed; 20]), u64::from(seed)))
+            }
+            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+                use alloy_consensus::{Signed, TxLegacy};
+                use alloy_primitives::Signature;
+
+                let seed = tx_rlp.first().copied().unwrap_or(0);
+                self.seen.lock().unwrap().push(
+                    self.slots
+                        .iter()
+                        .map(|(from, nonce)| self.classifier.slot_owner(from, *nonce))
+                        .collect(),
+                );
+                let inner = TxLegacy { nonce: u64::from(seed), ..Default::default() };
+                Ok(RestoredEnvelope {
+                    envelope: TxEnvelope::Legacy(Signed::new_unchecked(
+                        inner,
+                        Signature::test_signature(),
+                        TxHash::from([seed; 32]),
+                    )),
+                    from: Address::from([seed; 20]),
+                })
+            }
+            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+        }
+
+        let (_dir, j) = fresh_journal().await;
+        j.append_promised(&entry(1, 10)).await.unwrap();
+        j.append_promised(&entry(2, 11)).await.unwrap();
+        j.append_promised(&entry(3, 12)).await.unwrap();
+
+        let classifier = Arc::new(PreconfClassifier::new(
+            false,
+            std::time::Duration::from_secs(3600),
+            crate::classifier::DEFAULT_VERDICT_CACHE_CAP,
+        ));
+        let pool = SlotSpyPool {
+            classifier: classifier.clone(),
+            slots: (1u8..=3).map(|b| (Address::from([b; 20]), u64::from(b))).collect(),
+            seen: std::sync::Mutex::new(vec![]),
+        };
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &classifier).await;
+
+        let seen = pool.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "every entry must be offered to the pool");
+        // Discriminating on the **first** admission: entries 2 and 3 have not been
+        // offered yet. Claiming inside the loop, or leaving the claim to the
+        // validator, leaves those two `None` here.
+        assert_eq!(
+            seen[0],
+            (1u8..=3).map(|b| Some(TxHash::from([b; 32]))).collect::<Vec<_>>(),
+            "every slot must be claimed before the first admission",
+        );
+    }
+
+    /// An entry whose transaction is **already on chain** is the commitment
+    /// having been kept, not a failure. Landing starts the retention clock
+    /// rather than ending tracking: while the block is shallow a reorg could
+    /// bring the commitment back, so rotation keeps the record. Once
+    /// [`crate::classifier::SEAL_DEPTH`] persisted blocks sit on top, retention
+    /// expires and the record may go — which is what stops every future restart
+    /// replaying and complaining about the same entry forever.
+    ///
+    /// That such an entry never reaches the fifo is covered separately, by
+    /// `a_consumed_nonce_never_reaches_the_fifo`.
+    #[tokio::test]
+    async fn restore_starts_the_retention_clock_for_an_already_landed_entry() {
+        struct OnChainPool;
+        #[async_trait::async_trait]
+        impl RestorePool for OnChainPool {
+            async fn contains(&self, _hash: &TxHash) -> bool {
+                false
+            }
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+                let seed = tx_rlp.first().copied().unwrap_or(0);
+                Some((Address::from([seed; 20]), u64::from(seed)))
+            }
+            async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+                Err(RestoreSkip::NonceConsumed("nonce too low".into()))
+            }
+            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+        }
+
+        let (_dir, j) = fresh_journal().await;
+        let e = entry(1, 10);
+        j.append_promised(&e).await.unwrap();
+
+        let c = empty_classifier();
+        restore_preconf_state(&j, &OnChainPool, &landed(), &Arc::new(PreconfTxSet::new(16)), &c)
+            .await;
+
+        // Landing starts the retention clock — it does not end tracking. Until
+        // the block is buried, a reorg could bring the commitment back and it
+        // must still hold its nonce, so the release `forward` would attempt is
+        // refused and the record stays.
+        assert!(!c.release_unless_committed(&e.hash), "shallow: the record is held");
+        let stats = j.rotate(retain_tracked(&c)).await.unwrap();
+        let (remaining, _) = j.load().await.unwrap();
+        assert_eq!(remaining, vec![e.clone()], "kept while shallow; stats = {stats:?}");
+
+        // Buried deep enough, the record may go — so the next restart will not
+        // see it again.
+        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        assert!(c.release_unless_committed(&e.hash), "buried: the record is released");
+        let stats = j.rotate(retain_tracked(&c)).await.unwrap();
+        let (remaining, _) = j.load().await.unwrap();
+        assert!(remaining.is_empty(), "rotation must drop it; stats = {stats:?}");
+    }
+
+    /// **The invariant the guard's occupancy check rests on**: nothing ever gets
+    /// a fifo entry for a `(sender, nonce)` it does not own.
+    ///
+    /// Restore is the one place that pushes entries without going through the
+    /// pool listener, and the one place that mints `Verdict::Promised` — the
+    /// verdict the guard waves past its occupancy check. So it is the only
+    /// candidate for producing the violating state, and it needs two journal
+    /// records on one `(sender, nonce)` to try.
+    ///
+    /// Two records like that should not exist (a commitment holds its nonce from
+    /// the receipt until it is buried `SEAL_DEPTH` deep, so a same-nonce
+    /// replacement can never earn its own receipt). This test does not rely on
+    /// that: it hands restore exactly that input and shows the loser still comes
+    /// away with no entry, because `push_if_absent` refuses a different hash on
+    /// an occupied `(sender, nonce)`.
+    #[tokio::test]
+    async fn restore_never_leaves_a_fifo_entry_without_its_slot() {
+        /// Every entry decodes to the *same* `(sender, nonce)` but a hash taken
+        /// from its first rlp byte — the collision the invariant forbids.
+        struct SameSlotPool;
+
+        const SHARED_SENDER: Address = Address::new([0xAB; 20]);
+        const SHARED_NONCE: u64 = 7;
+
+        #[async_trait::async_trait]
+        impl RestorePool for SameSlotPool {
+            async fn contains(&self, _hash: &TxHash) -> bool {
+                false
+            }
+            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+            fn recover_slot(&self, _tx_rlp: &Bytes) -> Option<(Address, u64)> {
+                Some((SHARED_SENDER, SHARED_NONCE))
+            }
+            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+                use alloy_consensus::{Signed, TxLegacy};
+                use alloy_primitives::Signature;
+                let byte = tx_rlp.first().copied().unwrap_or(0);
+                let inner = TxLegacy { nonce: SHARED_NONCE, ..Default::default() };
+                let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+                    inner,
+                    Signature::test_signature(),
+                    TxHash::from([byte; 32]),
+                ));
+                Ok(RestoredEnvelope { envelope, from: SHARED_SENDER })
+            }
+        }
+
+        let (_dir, j) = fresh_journal().await;
+        let winner = entry(1, 10);
+        let loser = entry(2, 11);
+        j.append_promised(&winner).await.unwrap();
+        j.append_promised(&loser).await.unwrap();
+
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        let c = empty_classifier();
+        restore_preconf_state(&j, &SameSlotPool, &landed(), &fifo, &c).await;
+
+        // The pre-pass gives the slot to whoever asks first; the other loses it.
+        let owner = c.slot_owner(&SHARED_SENDER, SHARED_NONCE).expect("someone owns the nonce");
+        let other = if owner == winner.hash { loser.hash } else { winner.hash };
+
+        // The invariant: every fifo entry owns its `(sender, nonce)`.
+        assert!(fifo.contains(&owner).await, "the owner is the one that gets an entry");
+        assert!(
+            !fifo.contains(&other).await,
+            "a transaction that lost the slot must not hold a fifo entry",
+        );
+    }
+
+    /// A pool that only ever answers "the nonce is gone" — the one error whose
+    /// meaning the pool cannot pin down. Reused by the three tests below, which
+    /// differ only in what the *chain* then says.
+    struct NonceConsumedPool;
+
+    #[async_trait::async_trait]
+    impl RestorePool for NonceConsumedPool {
+        async fn contains(&self, _hash: &TxHash) -> bool {
+            false
+        }
+        fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+            let seed = tx_rlp.first().copied().unwrap_or(0);
+            Some((Address::from([seed; 20]), u64::from(seed)))
+        }
+        async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            Err(RestoreSkip::NonceConsumed("nonce too low".into()))
+        }
+        fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+    }
+
+    /// **The bug this three-way split exists for.** The sender's nonce is gone,
+    /// but a *different* transaction consumed it — so the commitment is broken,
+    /// not kept.
+    ///
+    /// There is nothing to forget: the transaction that took the nonce may itself
+    /// be reverted, and then this commitment applies again. So restore must not
+    /// record it as landed, and `retain_tracked` must therefore keep it. Until
+    /// 2026-08-05 this case was indistinguishable from "kept" —
+    /// `is_nonce_too_low()` reduces to `tx.nonce < account.nonce` and never looks
+    /// at the hash — so the entry was dropped at the next rotation and counted as
+    /// honoured.
+    #[tokio::test]
+    async fn a_stolen_nonce_keeps_its_entry_through_rotation() {
+        let (_dir, j) = fresh_journal().await;
+        let e = entry(1, 10);
+        j.append_promised(&e).await.unwrap();
+
+        let c = empty_classifier();
+        restore_preconf_state(
+            &j,
+            &NonceConsumedPool,
+            &StubChain(OnChain::No),
+            &Arc::new(PreconfTxSet::new(16)),
+            &c,
+        )
+        .await;
+
+        // `retain_tracked`, not `|_| true`: the entry survives because the
+        // classifier still has its record, which is what the old behaviour got
+        // wrong — treating the consumed nonce as "kept" dropped the line here.
+        j.rotate(retain_tracked(&c)).await.unwrap();
+        let (remaining, _) = j.load().await.unwrap();
+        assert_eq!(
+            remaining,
+            vec![e.clone()],
+            "must survive rotation, so a later reorg can still free its nonce"
+        );
+
+        // And the record is un-landed, not landed-and-shallow: only an un-landed
+        // one can be released outright. A commitment observed on chain would be
+        // held by its retention depth instead. How long an un-landed promise is
+        // kept is `sweep`'s question, pinned in the classifier's own tests.
+        assert!(c.release_unless_committed(&e.hash), "restore must not record it as landed");
+    }
+
+    /// Cannot tell ⇒ keep. Folding `Unknown` into "on chain" would reinstate the
+    /// silent misreport on a node whose transaction-lookup index is pruned.
+    #[tokio::test]
+    async fn an_undeterminable_entry_is_retained() {
+        let (_dir, j) = fresh_journal().await;
+        let e = entry(1, 10);
+        j.append_promised(&e).await.unwrap();
+
+        let c = empty_classifier();
+        restore_preconf_state(
+            &j,
+            &NonceConsumedPool,
+            &StubChain(OnChain::Unknown),
+            &Arc::new(PreconfTxSet::new(16)),
+            &c,
+        )
+        .await;
+
+        j.rotate(retain_tracked(&c)).await.unwrap();
+        let (remaining, _) = j.load().await.unwrap();
+        assert_eq!(remaining, vec![e.clone()]);
+        assert!(c.release_unless_committed(&e.hash), "an unjudgeable entry is not recorded landed");
+    }
+
+    /// The counterpart: the chain confirms the hash, so the promise *was* kept
+    /// and the record may go — once it is buried deep enough. This is the common
+    /// outcome on any restart.
+    #[tokio::test]
+    async fn a_confirmed_commitment_is_dropped_once_it_is_deep_enough() {
+        let (_dir, j) = fresh_journal().await;
+        let e = entry(1, 10);
+        j.append_promised(&e).await.unwrap();
+
+        let c = empty_classifier();
+        restore_preconf_state(
+            &j,
+            &NonceConsumedPool,
+            &StubChain(OnChain::Yes { height: LANDED_AT }),
+            &Arc::new(PreconfTxSet::new(16)),
+            &c,
+        )
+        .await;
+
+        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        assert!(c.release_unless_committed(&e.hash), "buried ⇒ the record may go");
+        j.rotate(retain_tracked(&c)).await.unwrap();
+        let (remaining, _) = j.load().await.unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    /// None of the three pushes into the fifo: the nonce is consumed, so there is
+    /// nothing left for the preconf arm to apply either way.
+    #[tokio::test]
+    async fn a_consumed_nonce_never_reaches_the_fifo() {
+        for answer in [OnChain::Yes { height: LANDED_AT }, OnChain::No, OnChain::Unknown] {
+            let (_dir, j) = fresh_journal().await;
+            j.append_promised(&entry(1, 10)).await.unwrap();
+            let fifo = Arc::new(PreconfTxSet::new(16));
+
+            restore_preconf_state(
+                &j,
+                &NonceConsumedPool,
+                &StubChain(answer),
+                &fifo,
+                &empty_classifier(),
+            )
+            .await;
+
+            assert!(fifo.snapshot().await.is_empty(), "{answer:?}");
+        }
+    }
+
+    /// A pool refusal is a commitment that cannot be honoured. Restore walks
+    /// every entry regardless, and gives each refused one up — record released,
+    /// so the prune at the end of restore takes its line with it.
+    #[tokio::test]
+    async fn restore_gives_up_every_entry_the_pool_refuses() {
         let (_dir, j) = fresh_journal().await;
         j.append_promised(&entry(4, 40)).await.unwrap();
         j.append_promised(&entry(5, 50)).await.unwrap();
@@ -1208,12 +1814,38 @@ mod tests {
         let mut pool = StubPool::new();
         pool.reject_add = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &fifo).await;
+        let c = empty_classifier();
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
 
         // Both entries' add_envelope calls return Err — the function
         // does not panic and walks all entries.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2);
         assert!(fifo.snapshot().await.is_empty());
+        assert!(!c.is_tracked(&entry(4, 40).hash), "a refused commitment is not kept in memory");
+        let (remaining, _) = j.load().await.unwrap();
+        assert!(remaining.is_empty(), "nor on disk — the two halves go together");
+    }
+
+    /// An entry whose bytes do not decode cannot even be named: the pre-pass gets
+    /// no `(sender, nonce)` out of it, so it never becomes a promise record, and
+    /// nothing in this process will revisit it. The prune at the end of restore is
+    /// what stops it being replayed on every future restart.
+    #[tokio::test]
+    async fn restore_drops_an_entry_it_cannot_decode() {
+        let (_dir, j) = fresh_journal().await;
+        let e = entry(6, 60);
+        j.append_promised(&e).await.unwrap();
+
+        let mut pool = StubPool::new();
+        pool.undecodable = true;
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        let c = empty_classifier();
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
+
+        assert!(!c.is_tracked(&e.hash), "an entry that cannot be named holds no record");
+        assert!(fifo.snapshot().await.is_empty());
+        let (remaining, _) = j.load().await.unwrap();
+        assert!(remaining.is_empty(), "and it leaves the file rather than replaying forever");
     }
 
     // ── spawn_rejournal_loop ────────────────────────────────────────
@@ -1223,22 +1855,22 @@ mod tests {
         let (_dir, j) = fresh_journal().await;
         let e_a = entry(1, 10);
         j.append_promised(&e_a).await.unwrap();
-        j.mark_sealed_batch([e_a.hash]).await;
+        let c = classifier_done_with(&[e_a.hash]);
 
         let j = Arc::new(j);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         // 30ms interval — first tick consumed at start, so the next
         // rotate happens at t ≈ 30ms.
-        let handle = spawn_rejournal_loop(j.clone(), Duration::from_millis(30), shutdown_rx);
+        let handle = spawn_rejournal_loop(j.clone(), c, Duration::from_millis(30), shutdown_rx);
 
         // Wait long enough for at least one rotate to fire.
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // The sealed entry should have been dropped from the file.
+        // The no-longer-tracked entry should have been dropped from the file.
         let (after, _) = j.load().await.unwrap();
         assert!(
             after.is_empty(),
-            "rotation must have dropped the sealed entry; instead got {after:?}"
+            "rotation must have dropped the untracked entry; instead got {after:?}"
         );
 
         // Graceful shutdown.
@@ -1250,7 +1882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn size_trigger_rotates_dropping_sealed_without_periodic_tick() {
+    async fn size_trigger_rotates_dropping_untracked_without_periodic_tick() {
         // Tiny `max_size` (1 byte) → every append crosses the cap and
         // pings the rotate notify. A huge interval guarantees the
         // periodic ticker cannot rotate within the test window, so any
@@ -1264,11 +1896,11 @@ mod tests {
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
         j.append_promised(&e3).await.unwrap();
-        j.mark_sealed_batch([e1.hash]).await;
-        j.mark_sealed_batch([e2.hash]).await;
+        let c = classifier_done_with(&[e1.hash, e2.hash]);
+        still_owed(&c, e3.hash);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
+        let handle = spawn_rejournal_loop(j.clone(), c, Duration::from_secs(3600), shutdown_rx);
 
         // Let the loop consume the pending size-notify and rotate.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1277,7 +1909,7 @@ mod tests {
         assert_eq!(
             after,
             vec![e3],
-            "size-triggered rotation must drop sealed entries and keep the unsealed survivor"
+            "size-triggered rotation must drop untracked entries and keep the still-owed survivor"
         );
 
         shutdown_tx.send(()).unwrap();
@@ -1289,7 +1921,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_with_max_size_seeds_counter_from_existing_file() {
-        // A pre-existing (unsealed) entry already exceeding the cap must
+        // A pre-existing entry already exceeding the cap must
         // be counted at open, so the very first post-restart append trips
         // the size trigger even though on its own it is tiny.
         let dir = TempDir::new().unwrap();
@@ -1319,7 +1951,12 @@ mod tests {
         // (immediately-consumed) tick happens; no interval rotation calls.
         // (A single final rotate on shutdown still runs by design; see
         // `graceful_shutdown_performs_final_rotate` for that behavior.)
-        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(60), shutdown_rx);
+        let handle = spawn_rejournal_loop(
+            j.clone(),
+            empty_classifier().into(),
+            Duration::from_secs(60),
+            shutdown_rx,
+        );
 
         // Hand the shutdown signal immediately.
         shutdown_tx.send(()).unwrap();
@@ -1333,22 +1970,24 @@ mod tests {
     async fn graceful_shutdown_performs_final_rotate() {
         // Regression guard for the graceful-shutdown contract:
         // `run_rejournal_loop` MUST perform one final rotate after the
-        // shutdown signal fires, so hashes appended to `sealed` between
-        // the last periodic tick and the shutdown are not lost on the
-        // on-disk file.
+        // shutdown signal fires, so entries that stopped being tracked
+        // between the last periodic tick and the shutdown are still
+        // dropped from the on-disk file.
         let (_dir, j) = fresh_journal().await;
         j.append_promised(&entry(1, 100)).await.unwrap();
         let j = Arc::new(j);
 
+        let c = classifier_with_high_watermark();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         // Interval large — no periodic tick will fire during the test.
-        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(60), shutdown_rx);
+        let handle =
+            spawn_rejournal_loop(j.clone(), c.clone(), Duration::from_secs(60), shutdown_rx);
 
-        // Mark sealed AFTER the loop starts but BEFORE shutdown — the
-        // sealed hash lives only in memory until a rotate flushes it.
-        j.mark_sealed_batch([TxHash::from([1; 32])]).await;
+        // Finish tracking AFTER the loop starts but BEFORE shutdown — nothing
+        // touches the file until a rotate runs.
+        finish_tracking(&c, TxHash::from([1; 32]));
 
-        // Trigger shutdown; the loop's final rotate must drop the sealed entry.
+        // Trigger shutdown; the loop's final rotate must drop the untracked entry.
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_millis(500), handle)
             .await
@@ -1358,7 +1997,7 @@ mod tests {
         let (after, _) = j.load().await.unwrap();
         assert!(
             after.is_empty(),
-            "final rotate on shutdown must have dropped the sealed entry; got {after:?}"
+            "final rotate on shutdown must have dropped the untracked entry; got {after:?}"
         );
     }
 
@@ -1378,7 +2017,13 @@ mod tests {
         struct Sentinel(u32);
 
         let shutdown = async { Sentinel(7) };
-        let out = run_rejournal_loop(j.clone(), Duration::from_secs(60), shutdown).await;
+        let out = run_rejournal_loop(
+            j.clone(),
+            empty_classifier().into(),
+            Duration::from_secs(60),
+            shutdown,
+        )
+        .await;
         assert_eq!(out, Sentinel(7));
     }
 
@@ -1400,19 +2045,23 @@ mod tests {
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
         j.append_promised(&e3).await.unwrap();
-        j.mark_sealed_batch([e1.hash]).await;
+        let c = classifier_with_high_watermark();
+        finish_tracking(&c, e1.hash);
+        still_owed(&c, e2.hash);
+        still_owed(&c, e3.hash);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
+        let handle =
+            spawn_rejournal_loop(j.clone(), c.clone(), Duration::from_secs(3600), shutdown_rx);
 
-        // First (coalesced) size trigger is honoured → sealed e1 dropped.
+        // First (coalesced) size trigger is honoured → released e1 dropped.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (after_first, _) = j.load().await.unwrap();
-        assert_eq!(after_first, vec![e2.clone(), e3], "first size trigger drops sealed e1");
+        assert_eq!(after_first, vec![e2.clone(), e3], "first size trigger drops released e1");
 
-        // Seal e2 and fire a *second* trigger well within `min_gap`
+        // Release e2 and fire a *second* trigger well within `min_gap`
         // (~150ms elapsed ≪ 2s). It must be rate-limited — e2 stays on disk.
-        j.mark_sealed_batch([e2.hash]).await;
+        finish_tracking(&c, e2.hash);
         j.append_promised(&entry(4, 13)).await.unwrap(); // re-notifies (over cap)
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (after_second, _) = j.load().await.unwrap();
@@ -1445,27 +2094,30 @@ mod tests {
         let e2 = entry(2, 11);
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
-        j.mark_sealed_batch([e1.hash]).await;
+        let c = classifier_with_high_watermark();
+        finish_tracking(&c, e1.hash);
+        still_owed(&c, e2.hash);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let handle = spawn_rejournal_loop(j.clone(), Duration::from_secs(3600), shutdown_rx);
+        let handle =
+            spawn_rejournal_loop(j.clone(), c.clone(), Duration::from_secs(3600), shutdown_rx);
 
         // First append-driven trigger drops e1; survivor e2 alone still
         // exceeds `max_size = 1`.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (after_first, _) = j.load().await.unwrap();
-        assert_eq!(after_first, vec![e2.clone()], "first rotate drops sealed e1, keeps e2");
+        assert_eq!(after_first, vec![e2.clone()], "first rotate drops released e1, keeps e2");
 
-        // Seal e2 but issue NO further append. Wait past `min_gap` (2s) so a
+        // Release e2 but issue NO further append. Wait past `min_gap` (2s) so a
         // self-retrigger, if it existed, would be free to fire.
-        j.mark_sealed_batch([e2.hash]).await;
+        finish_tracking(&c, e2.hash);
         tokio::time::sleep(Duration::from_millis(2200)).await;
 
         let (after_wait, _) = j.load().await.unwrap();
         assert_eq!(
             after_wait,
             vec![e2.clone()],
-            "no append ⇒ no size trigger; sealed e2 must survive over the cap, got {after_wait:?}"
+            "no append ⇒ no size trigger; released e2 must survive over the cap, got {after_wait:?}"
         );
 
         shutdown_tx.send(()).unwrap();
@@ -1503,11 +2155,10 @@ mod tests {
             "counter must equal file size after appends"
         );
 
-        // Drop two sealed entries; the counter must reset to the kept-bytes
+        // Drop two released entries; the counter must reset to the kept-bytes
         // total, which equals the rewritten file's true size.
-        j.mark_sealed_batch([e1.hash]).await;
-        j.mark_sealed_batch([e3.hash]).await;
-        let stats = j.rotate().await.unwrap();
+        let dropped = [e1.hash, e3.hash];
+        let stats = j.rotate(|h| !dropped.contains(h)).await.unwrap();
         assert_eq!((stats.kept, stats.dropped), (1, 2));
 
         let on_disk_after = tokio::fs::metadata(&path).await.unwrap().len();
@@ -1534,9 +2185,9 @@ mod tests {
         tokio::fs::write(&path, format!("{good_a}\n{bad}\n{good_b}\n")).await.unwrap();
 
         let j = PreconfJournal::open(&path, 0).await.unwrap();
-        let stats = j.rotate().await.unwrap();
+        let stats = j.rotate(|_| true).await.unwrap();
         assert_eq!(stats.kept, 2, "both good entries survive");
-        assert_eq!(stats.dropped, 0, "nothing sealed → nothing dropped");
+        assert_eq!(stats.dropped, 0, "retain kept everything → nothing dropped");
         assert_eq!(stats.bad_lines_skipped, 1, "one corrupt line reported");
 
         // The corrupt line is gone from the rewritten file: a second load
@@ -1584,13 +2235,17 @@ mod tests {
 
 /// Stateful property model for [`PreconfJournal`].
 ///
-/// Replays random `append` / `mark_sealed` / `rotate` sequences against the
-/// real journal and an independent reference model, checking after every step
-/// that the on-disk file, the `size_bytes` counter, and the in-memory
-/// `sealed` / `promised` sets all agree. Exercises the rotate retention rules
-/// (drop sealed, keep the rest) and the `sealed ⊆ promised == set(file)` shrink
-/// invariant — guarding against retention / accounting changes that leak
-/// entries or drift the counter. Deterministic behind the writer lock.
+/// Replays random `append` / `rotate` sequences against the real journal and an
+/// independent reference model, checking after every step that the on-disk file
+/// and the `size_bytes` counter agree with it. Guards the retention accounting
+/// against changes that leak entries or drift the counter.
+///
+/// Which records may be dropped is the caller's decision, expressed through
+/// `rotate`'s `retain` predicate (production passes "the classifier is still
+/// tracking this"), so `Op::Untrack` mutates a tracking set the *test* owns.
+/// The model therefore poses the question the interface actually asks: does
+/// rotate drop exactly what it was told to, and does the file stay in
+/// lock-step. It also pins `abandoned` staying empty while no TTL is set.
 #[cfg(test)]
 mod proptest_journal_model {
     use super::*;
@@ -1598,7 +2253,7 @@ mod proptest_journal_model {
     use std::collections::BTreeSet;
     use tempfile::TempDir;
 
-    // Small identity space so seal/rotate collisions are frequent.
+    /// Small identity space so untrack/rotate collisions are frequent.
     const IDS: u8 = 6;
 
     fn hash(byte: u8) -> TxHash {
@@ -1619,7 +2274,9 @@ mod proptest_journal_model {
     #[derive(Clone, Debug)]
     enum Op {
         Append(u8),
-        MarkSealed(Vec<u8>),
+        /// The caller stops tracking these hashes, so the next `rotate` drops
+        /// them.
+        Untrack(Vec<u8>),
         Rotate,
     }
 
@@ -1630,45 +2287,31 @@ mod proptest_journal_model {
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
             byte().prop_map(Op::Append),
-            prop::collection::vec(byte(), 0..4).prop_map(Op::MarkSealed),
+            prop::collection::vec(byte(), 0..4).prop_map(Op::Untrack),
             Just(Op::Rotate),
         ]
     }
 
     /// Reference model. `file` mirrors the on-disk line sequence (by identity
-    /// byte); `promised` / `sealed` mirror the in-memory sets.
+    /// byte); `untracked` mirrors what the caller's `retain` will reject.
     #[derive(Default)]
     struct Model {
         file: Vec<u8>,
-        promised: BTreeSet<u8>,
-        sealed: BTreeSet<u8>,
+        untracked: BTreeSet<u8>,
     }
 
     impl Model {
         fn apply(&mut self, op: &Op) {
             match op {
-                Op::Append(b) => {
-                    self.file.push(*b);
-                    self.promised.insert(*b);
-                }
-                Op::MarkSealed(bytes) => {
-                    for b in bytes {
-                        // `mark_sealed` only admits already-promised hashes.
-                        if self.promised.contains(b) {
-                            self.sealed.insert(*b);
-                        }
-                    }
-                }
+                Op::Append(b) => self.file.push(*b),
+                Op::Untrack(bytes) => self.untracked.extend(bytes.iter().copied()),
+                // No TTL is configured, so `retain` is the only drop rule.
+                // Unlike the old model, an untracked hash *stays* untracked:
+                // the set lives outside the journal, so re-appending the same
+                // hash and rotating again drops it again.
                 Op::Rotate => {
-                    // Drop every file line whose hash is sealed; the dropped
-                    // hashes leave both `sealed` and `promised` (no abandon
-                    // TTL is configured, so that is the only drop rule).
-                    let sealed = self.sealed.clone();
-                    self.file.retain(|b| !sealed.contains(b));
-                    for b in &sealed {
-                        self.sealed.remove(b);
-                        self.promised.remove(b);
-                    }
+                    let untracked = self.untracked.clone();
+                    self.file.retain(|b| !untracked.contains(b));
                 }
             }
         }
@@ -1690,13 +2333,16 @@ mod proptest_journal_model {
         for (i, op) in ops.iter().enumerate() {
             match op {
                 Op::Append(b) => j.append_promised(&entry_for(*b)).await.unwrap(),
-                Op::MarkSealed(bytes) => j.mark_sealed_batch(bytes.iter().map(|b| hash(*b))).await,
+                Op::Untrack(_) => {}
                 Op::Rotate => {
                     // Stats computed from the pre-rotate model.
                     let before = model.file.len();
                     let kept_expected =
-                        model.file.iter().filter(|b| !model.sealed.contains(b)).count();
-                    let stats = j.rotate().await.unwrap();
+                        model.file.iter().filter(|b| !model.untracked.contains(b)).count();
+                    let untracked = model.untracked.clone();
+                    let stats =
+                        j.rotate(|h| !untracked.iter().any(|b| hash(*b) == *h)).await.unwrap();
+
                     assert_eq!(stats.kept, kept_expected, "step {i}: rotate kept mismatch");
                     assert_eq!(
                         stats.dropped,
@@ -1720,38 +2366,23 @@ mod proptest_journal_model {
                 disk,
                 "step {i}: size_bytes drifted from disk after {op:?}"
             );
-
-            // (C) `sealed` matches (public API).
-            assert_eq!(j.sealed_len().await, model.sealed.len(), "step {i}: sealed_len mismatch");
-            for b in 0..IDS {
-                assert_eq!(
-                    j.contains(&hash(b)).await,
-                    model.sealed.contains(&b),
-                    "step {i}: sealed membership mismatch for {b}"
-                );
-            }
-
-            // (D) `promised == set(file)` — the shrink invariant: rotate must
-            // evict dropped commitments from `promised`, not leak them forever.
-            let real_promised: BTreeSet<TxHash> = j.promised.lock().await.iter().copied().collect();
-            let model_promised: BTreeSet<TxHash> =
-                model.promised.iter().map(|b| hash(*b)).collect();
-            assert_eq!(real_promised, model_promised, "step {i}: promised set diverged");
         }
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 192, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
-        /// Any sequence of append / mark_sealed / rotate keeps the on-disk
-        /// journal, the `size_bytes` counter, and the in-memory
-        /// `sealed` / `promised` sets in lock-step with the reference model —
-        /// in particular rotate drops exactly the sealed commitments and
-        /// shrinks `promised` / `sealed` (no unbounded growth).
+        /// Any sequence of append / untrack / rotate keeps the on-disk file and
+        /// the `size_bytes` counter in lock-step with the reference model — in
+        /// particular rotate drops exactly the entries `retain` rejects, and no
+        /// more.
         #[test]
-        fn preconf_journal_matches_reference_model(ops in prop::collection::vec(op(), 1..30)) {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(run_and_check(&ops));
+        fn journal_matches_reference_model(ops in prop::collection::vec(op(), 1..24)) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_and_check(&ops));
         }
     }
 }

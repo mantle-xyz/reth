@@ -12,6 +12,6 @@ pub mod pool_adapter;
 pub mod preconf_pool_listener;
 pub mod validator;
 
-pub use pool_adapter::RestorePoolAdapter;
+pub use pool_adapter::{ProviderChainView, RestorePoolAdapter};
 pub use preconf_pool_listener::PreconfPoolListener;
 pub use validator::{PreconfAwareValidator, PreconfGasLimitExceeded, ReplaceActivePreconf};

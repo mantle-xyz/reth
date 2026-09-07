@@ -20,24 +20,46 @@ pub fn mantle_test_chain_spec() -> Arc<OpChainSpec> {
     mantle_chain_spec_for(5000)
 }
 
+/// EIP-1559 parameters as the built blocks encode them: version 1, denominator
+/// 8, elasticity 2, then Mantle's trailing bytes.
+///
+/// The shipped fixture has `extraData: 0x00`, which encodes no parameters at all. Since
+/// `newPayload` derives a block's expected base fee by decoding the parameters off its
+/// **parent**, anything built on genesis was rejected `Invalid { "base fee missing" }` and
+/// the head silently stayed at 0 — the root cause of this suite's long-running flakiness.
+/// Giving genesis the same encoding its children use makes the parent decode succeed,
+/// which is what [`canonicalize_payload!`] relies on.
+const GENESIS_EIP1559_EXTRA_DATA: &str = "0x0100000008000000020000000000000000";
+
+/// The shared genesis fixture with `chainId` patched and
+/// [`GENESIS_EIP1559_EXTRA_DATA`] installed.
+///
+/// Shared by every spec helper below so no test can accidentally build on a
+/// genesis that cannot be a valid parent.
+fn patched_genesis_value(chain_id: u64) -> serde_json::Value {
+    let raw = include_str!("../assets/genesis.json");
+    let mut value: serde_json::Value = serde_json::from_str(raw).expect("valid genesis JSON");
+    value["config"]["chainId"] = serde_json::Value::from(chain_id);
+    value["extraData"] = serde_json::Value::from(GENESIS_EIP1559_EXTRA_DATA);
+    value
+}
+
 /// Build a Mantle-flavoured `OpChainSpec` bound to the given L2 chain id.
 ///
 /// The base fixture is Mantle mainnet's `assets/genesis.json` (all Mantle
-/// hardforks at timestamp 0). The `chainId` field of the genesis config
-/// is patched to `chain_id` before the spec is constructed, so every
-/// other invariant (fork schedule, EIP-1559 params, allocations) stays
-/// identical across networks — the only difference on the L2 side is
-/// the id used for signature recovery and network identification.
+/// hardforks at timestamp 0), with `chainId` patched and genesis given valid
+/// EIP-1559 parameters (see [`patched_genesis_value`]). Every other invariant
+/// (fork schedule, allocations) stays identical across networks — the only
+/// difference on the L2 side is the id used for signature recovery and network
+/// identification.
 ///
 /// Supported ids for the pair-test matrix:
 /// - `5000` — Mantle Mainnet
 /// - `5003` — Mantle Sepolia
 /// - `50002` — Mantle Hoodi
 pub fn mantle_chain_spec_for(chain_id: u64) -> Arc<OpChainSpec> {
-    let raw = include_str!("../assets/genesis.json");
-    let mut value: serde_json::Value = serde_json::from_str(raw).expect("valid genesis JSON");
-    value["config"]["chainId"] = serde_json::Value::from(chain_id);
-    let genesis: Genesis = serde_json::from_value(value).expect("patched genesis deserialises");
+    let genesis: Genesis =
+        serde_json::from_value(patched_genesis_value(chain_id)).expect("genesis deserialises");
     Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
 }
 
@@ -70,12 +92,8 @@ pub fn mantle_chain_spec_for(chain_id: u64) -> Arc<OpChainSpec> {
 ///   open("src/reth/mantle-reth/crates/integration-tests/tests/assets/predeploys.json","w"), indent=2)'
 /// ```
 pub fn mantle_chain_spec_with_predeploys_for(chain_id: u64) -> Arc<OpChainSpec> {
-    let genesis_raw = include_str!("../assets/genesis.json");
     let predeploys_raw = include_str!("../assets/predeploys.json");
-
-    let mut base: serde_json::Value =
-        serde_json::from_str(genesis_raw).expect("valid genesis JSON");
-    base["config"]["chainId"] = serde_json::Value::from(chain_id);
+    let mut base = patched_genesis_value(chain_id);
 
     let predeploys: serde_json::Value =
         serde_json::from_str(predeploys_raw).expect("valid predeploys JSON");
@@ -89,6 +107,129 @@ pub fn mantle_chain_spec_with_predeploys_for(chain_id: u64) -> Arc<OpChainSpec> 
 
     let genesis: Genesis = serde_json::from_value(base).expect("merged genesis deserialises");
     Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
+}
+
+/// Builds a chainspec whose genesis allocates `address` with `code` and
+/// `storage`, on top of [`mantle_chain_spec_for`].
+///
+/// Used by the on-chain whitelist suite to stand up a `PreconfWhitelist`-shaped
+/// account without deploying anything: the sequencer only ever reads that
+/// contract's storage, so pre-seeded slots are indistinguishable from slots a
+/// real `updatePreconfs` wrote.
+pub fn mantle_chain_spec_with_account(
+    chain_id: u64,
+    address: Address,
+    code: &Bytes,
+    storage: &[(B256, B256)],
+) -> Arc<OpChainSpec> {
+    let mut base = patched_genesis_value(chain_id);
+
+    let storage_map: serde_json::Map<String, serde_json::Value> = storage
+        .iter()
+        .map(|(slot, value)| (format!("{slot:#x}"), serde_json::Value::from(format!("{value:#x}"))))
+        .collect();
+
+    let alloc = base["alloc"].as_object_mut().expect("genesis.json `alloc` must be an object");
+    alloc.insert(
+        format!("{address:#x}"),
+        serde_json::json!({
+            "balance": "0x0",
+            "code": format!("{code:#x}"),
+            "storage": serde_json::Value::Object(storage_map),
+        }),
+    );
+
+    let genesis: Genesis = serde_json::from_value(base).expect("patched genesis deserialises");
+    Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
+}
+
+/// Storage words laying out `entries` as a Solidity `address[]` declared at
+/// `slot`: the length at `slot`, element `i` at `keccak256(slot) + i`.
+///
+/// Mirrors `PreconfWhitelist`'s layout so tests can seed a list — or assert one —
+/// the way the contract would have written it. The layout itself is pinned from
+/// both sides (`whitelist.rs` slot-base unit tests and
+/// `test/PreconfWhitelist.t.sol`'s `vm.load` assertions).
+pub fn address_array_storage(slot: u64, entries: &[Address]) -> Vec<(B256, B256)> {
+    let mut out = vec![(B256::from(U256::from(slot)), B256::from(U256::from(entries.len())))];
+    let base = U256::from_be_bytes(alloy_primitives::keccak256(B256::from(U256::from(slot))).0);
+    for (i, entry) in entries.iter().enumerate() {
+        out.push((B256::from(base.saturating_add(U256::from(i))), entry.into_word()));
+    }
+    out
+}
+
+/// Storage words laying out `entries` as a Solidity `Rule[]` declared at `slot`.
+///
+/// A `Rule` is two `address` fields — 40 bytes — so it cannot pack into one
+/// slot: element `i` occupies `keccak256(slot) + 2i` (`from`) and
+/// `keccak256(slot) + 2i + 1` (`to`). That stride is pinned from both sides
+/// (`whitelist::tests::read_preconf_pairs_decodes_the_two_slot_stride` and
+/// `test/PreconfWhitelist.t.sol`'s `vm.load` assertions).
+pub fn pair_array_storage(slot: u64, entries: &[(Address, Address)]) -> Vec<(B256, B256)> {
+    let mut out = vec![(B256::from(U256::from(slot)), B256::from(U256::from(entries.len())))];
+    let base = U256::from_be_bytes(alloy_primitives::keccak256(B256::from(U256::from(slot))).0);
+    for (i, (from, to)) in entries.iter().enumerate() {
+        let i = i as u64;
+        out.push((B256::from(base.saturating_add(U256::from(2 * i))), from.into_word()));
+        out.push((B256::from(base.saturating_add(U256::from(2 * i + 1))), to.into_word()));
+    }
+    out
+}
+
+/// The one storage word that declares which layout a `PreconfWhitelist` was
+/// deployed with.
+///
+/// Every fixture that stands one up has to include it: cold start refuses an
+/// address whose marker does not match the binary, which is the point — reading
+/// the previous layout would install that contract's recipient list as sender
+/// wildcards. A fixture that forgets it looks exactly like a version skew, and
+/// fails the same way.
+pub fn layout_version_storage() -> (B256, B256) {
+    (
+        B256::from(U256::from(mantle_reth_preconf::LAYOUT_VERSION_SLOT)),
+        B256::from(U256::from(mantle_reth_preconf::EXPECTED_LAYOUT_VERSION)),
+    )
+}
+
+/// Assembles minimal EVM bytecode that performs `writes` then emits a single
+/// log with `topic` and no data.
+///
+/// Why hand-assembled rather than a compiled contract: the sequencer's watcher
+/// only reacts to two observable things — the storage at the whitelist's array
+/// slots, and a log whose `address` and `topics[0]` match — so this is the whole
+/// surface reth cares about. Producing it here keeps the suite free of any
+/// cross-repo Solidity build step. The real contract's own behaviour (auth gates,
+/// idempotence, batch cap) is covered by the forge tests in
+/// `mantle-v2/packages/contracts-bedrock/test/PreconfWhitelist.t.sol`.
+///
+/// Emits, per write, `PUSH32 <value> PUSH32 <slot> SSTORE`, then
+/// `PUSH32 <topic> PUSH1 0 PUSH1 0 LOG1` and `STOP`.
+pub fn storage_writer_bytecode(writes: &[(B256, B256)], topic: B256) -> Bytes {
+    const PUSH32: u8 = 0x7f;
+    const PUSH1: u8 = 0x60;
+    const SSTORE: u8 = 0x55;
+    const LOG1: u8 = 0xa1;
+    const STOP: u8 = 0x00;
+
+    let mut code = Vec::new();
+    for (slot, value) in writes {
+        code.push(PUSH32);
+        code.extend_from_slice(value.as_slice());
+        code.push(PUSH32);
+        code.extend_from_slice(slot.as_slice());
+        code.push(SSTORE);
+    }
+    // LOG1 pops (offset, size, topic) — zero-length data needs no memory.
+    code.push(PUSH32);
+    code.extend_from_slice(topic.as_slice());
+    code.push(PUSH1);
+    code.push(0);
+    code.push(PUSH1);
+    code.push(0);
+    code.push(LOG1);
+    code.push(STOP);
+    code.into()
 }
 
 /// Like [`mantle_chain_spec_for`] but with an **always-reverting** contract at
@@ -131,6 +272,61 @@ pub fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
     })
 }
 
+/// Stand-in `PreconfWhitelist` address for tests that do not care about the
+/// contract itself, only about which `(from, to)` pairs are allowlisted.
+///
+/// `launch_preconf_node!` allocates a minimal coded account here and writes the
+/// builder's lists into its storage in the exact layout the real contract uses,
+/// so cold start loads them through the production path
+/// (`bootstrap_whitelist`) rather than having them injected into memory. Two
+/// reasons that matters now that cold start runs inside `build_pool`:
+///
+/// * an address with **no code** is fatal by design, so every suite would refuse to boot;
+/// * cold start (and any later watcher reload) overwrite the in-memory lists, so an in-memory seed
+///   would simply be erased.
+///
+/// Tests that point `whitelist_contract` at a real address own that address's
+/// genesis themselves and are left untouched — see
+/// [`PreconfCfgBuilder::whitelist_contract`].
+pub const WHITELIST_CONTRACT_SENTINEL: Address = Address::new([0x77; 20]);
+
+/// Minimal bytecode for the sentinel: a single `STOP`. Nothing ever calls it; it exists
+/// only to satisfy the has-code check described on [`WHITELIST_CONTRACT_SENTINEL`].
+const SENTINEL_CODE: [u8; 1] = [0x00];
+
+/// Returns `spec` with the sentinel account allocated and holding the given
+/// allowlist — exact pairs plus the two wildcard sets — in `PreconfWhitelist`'s
+/// storage layout.
+///
+/// Rebuilds the chain spec from `spec`'s own genesis plus one extra alloc entry,
+/// so it composes with every spec helper here (plain, predeploys, custom
+/// account) without those needing to know about preconf.
+pub fn with_sentinel_whitelist(
+    spec: Arc<OpChainSpec>,
+    pairs: &[(Address, Address)],
+    from_wildcards: &[Address],
+    to_wildcards: &[Address],
+) -> Arc<OpChainSpec> {
+    use alloy_genesis::GenesisAccount;
+    use reth_chainspec::EthChainSpec;
+
+    // Same constants production reads, so a layout change breaks both sides
+    // together instead of silently diverging.
+    let mut storage = pair_array_storage(mantle_reth_preconf::PAIRS_SLOT, pairs);
+    storage.extend(address_array_storage(mantle_reth_preconf::FROM_WILDCARDS_SLOT, from_wildcards));
+    storage.extend(address_array_storage(mantle_reth_preconf::TO_WILDCARDS_SLOT, to_wildcards));
+    storage.push(layout_version_storage());
+
+    let mut genesis = spec.genesis().clone();
+    genesis.alloc.insert(
+        WHITELIST_CONTRACT_SENTINEL,
+        GenesisAccount::default()
+            .with_code(Some(Bytes::from_static(&SENTINEL_CODE)))
+            .with_storage(Some(storage.into_iter().collect())),
+    );
+    Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
+}
+
 /// Fluent builder for `PreconfConfig` inside tests. Every knob has a
 /// safe default; individual test cases tweak only what they exercise.
 ///
@@ -139,8 +335,11 @@ pub fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
 /// silently retune the integration tests.
 #[derive(Debug, Clone)]
 pub struct PreconfCfgBuilder {
+    pairs: Vec<(Address, Address)>,
     from: Vec<Address>,
     to: Vec<Address>,
+    from_wildcards: Vec<Address>,
+    to_wildcards: Vec<Address>,
     all_preconfs: bool,
     preconf_timeout_ms: u64,
     safety_margin_ms: u64,
@@ -148,13 +347,17 @@ pub struct PreconfCfgBuilder {
     max_gas_per_block: u64,
     journal_path: Option<PathBuf>,
     journal_max_size: u64,
+    whitelist_contract: Address,
 }
 
 impl Default for PreconfCfgBuilder {
     fn default() -> Self {
         Self {
+            pairs: Vec::new(),
             from: Vec::new(),
             to: Vec::new(),
+            from_wildcards: Vec::new(),
+            to_wildcards: Vec::new(),
             all_preconfs: false,
             preconf_timeout_ms: 1_500,
             safety_margin_ms: 40,
@@ -162,6 +365,7 @@ impl Default for PreconfCfgBuilder {
             max_gas_per_block: 6_000_000,
             journal_path: None,
             journal_max_size: PreconfConfig::default().journal_max_size,
+            whitelist_contract: WHITELIST_CONTRACT_SENTINEL,
         }
     }
 }
@@ -179,9 +383,45 @@ impl PreconfCfgBuilder {
         self
     }
 
+    /// Allowlist exactly the rule `from -> to`. Repeatable.
+    ///
+    /// Prefer this in tests that are *about* the allowlist: [`Self::whitelist_from`] and
+    /// [`Self::whitelist_to`] expand to their cross product (see [`Self::build`]), so a
+    /// reader has to know that expansion to see what rules they actually install.
+    pub fn whitelist_pair(mut self, from: Address, to: Address) -> Self {
+        self.pairs.push((from, to));
+        self
+    }
+
+    /// Allowlist every transaction **from** `addr`, whatever the recipient —
+    /// including a contract creation. Repeatable.
+    pub fn whitelist_from_wildcard(mut self, addr: Address) -> Self {
+        self.from_wildcards.push(addr);
+        self
+    }
+
+    /// Allowlist every transaction **to** `addr`, whatever the sender.
+    /// Repeatable.
+    pub fn whitelist_to_wildcard(mut self, addr: Address) -> Self {
+        self.to_wildcards.push(addr);
+        self
+    }
+
     /// Add one recipient to the whitelist. Repeatable.
     pub fn whitelist_to(mut self, to: Address) -> Self {
         self.to.push(to);
+        self
+    }
+
+    /// Point the config at a real on-chain `PreconfWhitelist` instead of relying on
+    /// the in-memory seed.
+    ///
+    /// Overrides the placeholder [`WHITELIST_CONTRACT_SENTINEL`]. Cold start runs
+    /// inside `build_pool`, so it will read this address; tests that need a
+    /// specific post-boot state call `mantle_reth_preconf::bootstrap_whitelist`
+    /// again themselves after seeding storage.
+    pub fn whitelist_contract(mut self, contract: Address) -> Self {
+        self.whitelist_contract = contract;
         self
     }
 
@@ -231,14 +471,24 @@ impl PreconfCfgBuilder {
         self
     }
 
-    /// Materialise the config. Panics on invariant violations because
-    /// these are test-controlled inputs — a panic is more useful than
-    /// threading a `Result` through every launch call site.
-    pub fn build(self) -> PreconfConfig {
-        PreconfConfig {
+    /// Materialise the config plus the allowlists to seed. Panics on invariant
+    /// violations because these are test-controlled inputs — a panic is more
+    /// useful than threading a `Result` through every launch call site.
+    ///
+    /// Returns a [`PreconfSetup`] rather than a bare `PreconfConfig` because the
+    /// allowlists no longer live on the config: they belong to the
+    /// `PreconfClassifier`, which only exists once the `PreconfServiceBuilder`
+    /// has been constructed. `launch_preconf_node!` does that and then calls
+    /// [`PreconfSetup::seed`].
+    pub fn build(self) -> PreconfSetup {
+        let cfg = PreconfConfig {
             enabled: true,
-            from_preconfs: self.from.into_iter().collect(),
-            to_preconfs: self.to.into_iter().collect(),
+            // `validate()` requires a non-zero whitelist address whenever
+            // preconf is enabled without `all_preconfs`. These tests seed the
+            // allowlists directly instead of reading them from a contract, so a
+            // sentinel satisfies the check — see `WHITELIST_CONTRACT_SENTINEL`
+            // for why the address must still carry code.
+            whitelist_contract: Some(self.whitelist_contract),
             all_preconfs: self.all_preconfs,
             preconf_timeout: std::time::Duration::from_millis(self.preconf_timeout_ms),
             safety_margin: std::time::Duration::from_millis(self.safety_margin_ms),
@@ -247,8 +497,130 @@ impl PreconfCfgBuilder {
             journal_path: self.journal_path,
             journal_max_size: self.journal_max_size,
             ..PreconfConfig::default()
+        };
+        // `whitelist_from` / `whitelist_to` mean `from in F && to in T`, which is exactly
+        // the cross product of the two lists. Tests wanting a wildcard say so directly.
+        let mut pairs = self.pairs;
+        pairs.extend(self.from.iter().flat_map(|f| self.to.iter().map(move |t| (*f, *t))));
+        PreconfSetup {
+            cfg,
+            pairs,
+            from_wildcards: self.from_wildcards,
+            to_wildcards: self.to_wildcards,
         }
     }
+}
+
+/// A config plus the allowlists a test wants installed on the classifier.
+///
+/// Exists because the two halves are owned by different objects now: the config
+/// is consumed by `PreconfServiceBuilder::from_config`, and the allowlist is
+/// written into the genesis of the classifier that builder creates.
+#[derive(Debug, Clone)]
+pub struct PreconfSetup {
+    /// The config handed to `PreconfServiceBuilder::from_config`.
+    pub cfg: PreconfConfig,
+    /// Exact `(from, to)` rules to seed.
+    pub pairs: Vec<(Address, Address)>,
+    /// Senders whose every transaction is eligible.
+    pub from_wildcards: Vec<Address>,
+    /// Recipients that make any transaction to them eligible.
+    pub to_wildcards: Vec<Address>,
+}
+
+/// How long [`canonicalize_payload!`] waits for a block to become canonical,
+/// as 20 ms ticks.
+///
+/// Deliberately generous (4s): the whole suite spawns nodes in parallel, and
+/// under that load the engine's commit + provider refresh take far longer than
+/// when a test runs alone. Costs nothing on the happy path — the loop exits as
+/// soon as the head moves.
+pub const CANON_POLL_TICKS: usize = 200;
+
+/// Submit `payload`, make it canonical, and **wait until the node's own
+/// provider actually serves it**. Returns the new head hash.
+///
+/// ## Why this exists
+///
+/// `update_forkchoice` resolves as soon as the engine has accepted the forkchoice update;
+/// the provider starts serving the new head only once the canonical-chain update has been
+/// committed. Bridging that gap with a fixed `sleep`, as this suite used to, is a race:
+/// under parallel load the commit takes longer, the test reads pre-block state, and the
+/// failure surfaces as a wrong balance or a stale nonce rather than as "canonicalisation was
+/// slow". Polling on the
+/// observable condition removes the guess, and failing to converge panics with the block
+/// number and hash, so a real canonicalisation failure is distinguishable from a slow one.
+///
+/// A macro, not a function: the `NodeTestContext<Node, AddOns>` type parameters cannot be
+/// spelled at a function boundary. `reth`'s own `NodeTestContext::wait_block` does almost
+/// this, but loops forever — a hang instead of a failure — so it is not used here.
+#[macro_export]
+macro_rules! canonicalize_payload {
+    ($node:expr, $payload:expr) => {{
+        async {
+            use reth_provider::{BlockNumReader, HeaderProvider};
+
+            let number = $payload.block().header().number;
+            // Submitted through the engine handle rather than
+            // `NodeTestContext::submit_payload`, which discards the
+            // `PayloadStatus` — an INVALID newPayload then only surfaced later as
+            // an FCU "links to previously rejected block", or not at all.
+            let new_head = $payload.block().hash();
+            let np = $node
+                .inner
+                .add_ons_handle
+                .beacon_engine_handle
+                .new_payload(
+                    <reth_optimism_node::engine::OpEngineTypes as reth_node_api::PayloadTypes>
+                        ::block_to_payload($payload.block().clone()),
+                )
+                .await
+                .expect("newPayload call must not error");
+            assert!(
+                np.is_valid(),
+                "newPayload for block {number} must be VALID, got {np:?}",
+            );
+            let fcu = $node
+                .inner
+                .add_ons_handle
+                .beacon_engine_handle
+                .fork_choice_updated(
+                    alloy_rpc_types_engine::ForkchoiceState {
+                        head_block_hash: new_head,
+                        safe_block_hash: new_head,
+                        finalized_block_hash: new_head,
+                    },
+                    None,
+                )
+                .await
+                .expect("forkchoice update must be accepted");
+
+            let mut landed = false;
+            for _ in 0..$crate::helpers::CANON_POLL_TICKS {
+                let best = $node.inner.provider.best_block_number().unwrap_or_default();
+                if best >= number &&
+                    $node
+                        .inner
+                        .provider
+                        .header_by_number(number)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|h| h.hash_slow() == new_head)
+                {
+                    landed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                landed,
+                "block {number} ({new_head:?}) never became canonical; best_block_number = {:?}; fcu = {fcu:?}",
+                $node.inner.provider.best_block_number(),
+            );
+
+            new_head
+        }
+    }};
 }
 
 /// Call `eth_sendRawTransactionWithPreconf` and return the parsed wire
@@ -343,7 +715,9 @@ pub fn fresh_journal(prefix: &str) -> PathBuf {
 ///
 /// ```ignore
 /// let (mut node, http, wallet, chain_id) =
-///     launch_preconf_node!(PreconfCfgBuilder::new().whitelist_from(addr).build())
+///     launch_preconf_node!(
+///         PreconfCfgBuilder::new().whitelist_from(sender).whitelist_to(recipient).build(),
+///     )
 ///         .await;
 /// ```
 #[macro_export]
@@ -352,21 +726,31 @@ macro_rules! launch_preconf_node {
         $crate::launch_preconf_node!($cfg, $crate::helpers::mantle_test_chain_spec())
     };
     ($cfg:expr, $chain_spec:expr) => {
-        $crate::launch_preconf_node!(
-            @build $cfg, $chain_spec,
-            |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
-        )
+        async {
+            let (node, http, wallet, chain_id, _classifier) =
+                $crate::launch_preconf_node!(
+                    @build $cfg, $chain_spec,
+                    |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
+                )
+                .await;
+            (node, http, wallet, chain_id)
+        }
     };
     // Variant that additionally installs an `OpDAConfig` on the node so
     // tests can exercise the DA-footprint gate with a tight per-tx /
     // per-block DA limit. `$da` is any `OpDAConfig` expression.
     ($cfg:expr, $chain_spec:expr, da_config = $da:expr) => {
-        $crate::launch_preconf_node!(
-            @build $cfg, $chain_spec,
-            |svc| mantle_reth_cli::node::MantleNode::default()
-                .with_preconf(svc)
-                .with_da_config($da)
-        )
+        async {
+            let (node, http, wallet, chain_id, _classifier) =
+                $crate::launch_preconf_node!(
+                    @build $cfg, $chain_spec,
+                    |svc| mantle_reth_cli::node::MantleNode::default()
+                        .with_preconf(svc)
+                        .with_da_config($da)
+                )
+                .await;
+            (node, http, wallet, chain_id)
+        }
     };
     (@build $cfg:expr, $chain_spec:expr, $make_node:expr) => {{
         async {
@@ -381,7 +765,24 @@ macro_rules! launch_preconf_node {
             use reth_provider::providers::BlockchainProvider;
             use reth_tasks::Runtime;
 
+            // Destructured before the spec is finalised: the allowlists have to
+            // be written into genesis, not into memory, because cold start now
+            // runs inside `build_pool` and would overwrite an in-memory seed.
+            let $crate::helpers::PreconfSetup { cfg, pairs, from_wildcards, to_wildcards } = $cfg;
             let chain_spec = $chain_spec;
+            let chain_spec =
+                if cfg.whitelist_contract == Some($crate::helpers::WHITELIST_CONTRACT_SENTINEL) {
+                    $crate::helpers::with_sentinel_whitelist(
+                        chain_spec,
+                        &pairs,
+                        &from_wildcards,
+                        &to_wildcards,
+                    )
+                } else {
+                    // The test pointed at a real contract address and owns that
+                    // address's genesis itself.
+                    chain_spec
+                };
             let chain_id = chain_spec.chain().id();
             let wallet = Wallet::default().with_chain_id(chain_id);
 
@@ -406,7 +807,7 @@ macro_rules! launch_preconf_node {
 
             // The journal is mandatory; fill a temp default path when the test
             // didn't set one (mirrors production's datadir-relative default).
-            let mut preconf_cfg = $cfg;
+            let mut preconf_cfg = cfg;
             if preconf_cfg.journal_path.is_none() {
                 preconf_cfg.journal_path = Some(
                     reth_db::test_utils::tempdir_path().join("mantle-preconf-journal.jsonl"),
@@ -415,6 +816,7 @@ macro_rules! launch_preconf_node {
             let svc = PreconfServiceBuilder::from_config(preconf_cfg)
                 .await
                 .expect("preconf svc init");
+            let classifier = svc.classifier().clone();
             let make_node = $make_node;
             let node_type = make_node(svc);
 
@@ -446,7 +848,7 @@ macro_rules! launch_preconf_node {
                     .await
                     .unwrap();
 
-            (node_ctx, http, wallet, chain_id)
+            (node_ctx, http, wallet, chain_id, classifier)
         }
     }};
 }
@@ -503,6 +905,19 @@ pub fn l1_info_deposit(origin: u64) -> Bytes {
 /// Payload attributes for a block at height `n` referencing L1 origin `origin`:
 /// timestamp = `l2_ts(n)`, tx[0] = the L1-attributes deposit for `origin`.
 pub fn l1_attrs(n: u64, origin: u64) -> OpPayloadAttrs {
+    l1_attrs_with(n, origin, vec![])
+}
+
+/// [`l1_attrs`] with further sequencer transactions appended after the
+/// L1-attributes deposit, in the order given.
+///
+/// The L1-info deposit stays at tx[0] because the fee logic reads it, so `extra`
+/// is appended rather than substituted. These land in `sequencer_transactions()`
+/// and so are executed by the builder's stage 2 — which is the only stage that
+/// watches for a governance whitelist update.
+pub fn l1_attrs_with(n: u64, origin: u64, extra: Vec<Bytes>) -> OpPayloadAttrs {
+    let mut transactions = vec![l1_info_deposit(origin)];
+    transactions.extend(extra);
     OpPayloadAttrs(OpPayloadAttributes {
         payload_attributes: PayloadAttributes {
             timestamp: l2_ts(n),
@@ -512,12 +927,35 @@ pub fn l1_attrs(n: u64, origin: u64) -> OpPayloadAttrs {
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
         },
-        transactions: Some(vec![l1_info_deposit(origin)]),
+        transactions: Some(transactions),
         no_tx_pool: None,
         gas_limit: Some(30_000_000),
         eip_1559_params: Some(B64::ZERO),
         min_base_fee: Some(0),
     })
+}
+
+/// A user deposit from `from` to `to` carrying `input` — the shape
+/// `OptimismPortal.depositTransaction` produces once op-node derives it.
+///
+/// `from` is the value the portal already aliased on L1; nothing on L2 transforms
+/// it further, which is why a test supplies the aliased address directly.
+/// `is_system_transaction` is false: this is a user deposit, not an L1-attributes
+/// one.
+pub fn user_deposit(from: Address, to: Address, input: Bytes, gas_limit: u64) -> Bytes {
+    let dep = TxDeposit {
+        source_hash: keccak256(input.as_ref()),
+        from,
+        to: TxKind::Call(to),
+        mint: 0,
+        value: U256::ZERO,
+        gas_limit,
+        is_system_transaction: false,
+        input,
+        eth_value: 0,
+        eth_tx_value: None,
+    };
+    dep.encoded_2718().into()
 }
 
 // ─────────────────────────── engine-API façade ───────────────────────────
@@ -764,4 +1202,21 @@ macro_rules! op_node_slot_l1 {
 macro_rules! reorg_to {
     ($node:expr, $ancestor:expr) => {{ $crate::op_node_slot!($node, on = $ancestor) }};
     ($node:expr, $ancestor:expr,n = $n:expr,l1 = $l1:expr) => {{ $crate::op_node_slot_l1!($node, on = $ancestor, n = $n, l1 = $l1) }};
+}
+
+/// Same as [`launch_preconf_node!`] but also yields the node's
+/// `Arc<PreconfClassifier>` as a fifth element.
+///
+/// Needed by tests that drive the allowlists themselves — reading them out of
+/// chain state via `bootstrap_whitelist`, or asserting on what the watcher
+/// loaded. They cannot reach the classifier otherwise: the service builder that
+/// owns it is moved into the node.
+#[macro_export]
+macro_rules! launch_preconf_node_with_classifier {
+    ($cfg:expr, $chain_spec:expr) => {
+        $crate::launch_preconf_node!(
+            @build $cfg, $chain_spec,
+            |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
+        )
+    };
 }

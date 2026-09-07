@@ -2,9 +2,9 @@
 //!
 //! [`PreconfServiceBuilder`] is the **application-level owner** of the
 //! preconf subsystem's cross-component shared state — a validated
-//! [`Arc<PreconfConfig>`], a single [`Arc<PreconfTxSet>`], and a
-//! mandatory [`Arc<PreconfJournal>`] — and exposes typed factories for
-//! the per-task handlers that consume them:
+//! [`Arc<PreconfConfig>`], a single [`Arc<PreconfClassifier>`], a single
+//! [`Arc<PreconfTxSet>`], and a mandatory [`Arc<PreconfJournal>`] — and
+//! exposes typed factories for the per-task handlers that consume them:
 //!
 //! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical- state notifications and
 //!   forward the fifo past sealed block nonces.
@@ -37,9 +37,10 @@ use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::TransactionPool;
 
 use crate::{
-    PreconfCanonHandler, PreconfConfig, PreconfJournal, PreconfRpcHandler, PreconfTxSet,
+    PreconfCanonHandler, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfRpcHandler,
+    PreconfTxSet,
     config::PreconfConfigError,
-    journal::{JournalError, RestorePool, UNSEALED_ABANDON_ROTATIONS, restore_preconf_state},
+    journal::{JournalError, RestorePool, restore_preconf_state},
 };
 use thiserror::Error;
 
@@ -78,6 +79,10 @@ pub enum PreconfStartError {}
 #[derive(Debug)]
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
+    /// Owns the allowlists and the frozen per-tx verdicts. Built
+    /// here so every consumer — validator, pool listener, payload builder, RPC
+    /// handler — shares one instance; two classifiers would mean two answers.
+    classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
     /// Commitment journal — always present. Opened at construction from
     /// `cfg.journal_path` (which the CLI layer resolves to the
@@ -103,20 +108,24 @@ impl PreconfServiceBuilder {
         let broadcast_cap = cfg.broadcast_cap;
         let journal_path =
             cfg.journal_path.clone().ok_or(PreconfServiceError::MissingJournalPath)?;
-        // Abandon an unsealed commitment after `UNSEALED_ABANDON_ROTATIONS`
-        // rotation cadences without sealing (bounds the journal vs zombies).
-        let abandon_after = cfg.rejournal_interval * UNSEALED_ABANDON_ROTATIONS;
-        let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size)
-            .await?
-            .with_abandon_after(abandon_after);
+        let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size).await?;
+        // Built from the validated config, before it is shared: the classifier
+        // reads `all_preconfs` and the verdict grace period off it.
+        let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
-        Ok(Self { cfg, fifo, journal: Arc::new(journal) })
+        Ok(Self { cfg, classifier, fifo, journal: Arc::new(journal) })
     }
 
     /// Shared config handle. Cheap to clone — internally an `Arc`.
     pub fn cfg(&self) -> &Arc<PreconfConfig> {
         &self.cfg
+    }
+
+    /// Shared classifier handle — the single owner of the allowlists.
+    /// Cheap to clone — internally an `Arc`.
+    pub fn classifier(&self) -> &Arc<PreconfClassifier> {
+        &self.classifier
     }
 
     /// Shared fifo handle. Cheap to clone — internally an `Arc`.
@@ -135,11 +144,12 @@ impl PreconfServiceBuilder {
     /// Call once from the pool builder after the pool is up, **before**
     /// the pool listener + canon handler are spawned so the fifo state
     /// is populated when they start consuming events.
-    pub async fn start<P>(&self, pool: &P) -> Result<(), PreconfStartError>
+    pub async fn start<P, C>(&self, pool: &P, chain: &C) -> Result<(), PreconfStartError>
     where
         P: RestorePool + Clone + 'static,
+        C: crate::journal::CommitmentChainView,
     {
-        restore_preconf_state(&self.journal, pool, &self.fifo).await;
+        restore_preconf_state(&self.journal, pool, chain, &self.fifo, &self.classifier).await;
 
         // Every non-on-chain terminal transition (mark_timeout /
         // mark_canceled / mark_failed) synchronously removes the tx
@@ -149,6 +159,20 @@ impl PreconfServiceBuilder {
         let pool_for_evict = pool.clone();
         self.fifo.set_pool_eviction_callback(Arc::new(move |hash| {
             pool_for_evict.remove_transactions(vec![hash]);
+        }));
+
+        // Every fifo removal path also drops the frozen verdict: on most of
+        // them, once the commitment record is gone there is nothing left for
+        // the verdict to protect. `forward` is the exception — it removes on
+        // "the sender's nonce moved past this entry", which neither identifies
+        // the tx that advanced the nonce nor is irrevocable, so the commitment
+        // may still be live.
+        // Registered as a callback rather than a direct reference so the fifo
+        // stays ignorant of the classifier (the sweep in the other
+        // direction is driven by the canonical-state handler, which holds both).
+        let classifier_for_evict = self.classifier.clone();
+        self.fifo.set_verdict_eviction_callback(Arc::new(move |hash| {
+            classifier_for_evict.release_unless_committed(&hash);
         }));
 
         Ok(())
@@ -164,14 +188,19 @@ impl PreconfServiceBuilder {
     /// pool; the handler uses it to `remove_transactions` on hashes
     /// evicted by `PreconfTxSet::clean_reclaimable`, so a Timeout / Canceled preconf
     /// tx cannot land on chain after the client already saw `Timeout`.
+    ///
+    /// `Pr` must also be a `BlockNumReader`: the handler publishes
+    /// `last_block_number()` (the **persisted** tip) to the classifier each
+    /// notification, which is the ruler the retention period is measured
+    /// against — see `classifier::SEAL_DEPTH`.
     pub fn canon_handler<Pr, P, N>(&self, provider: Pr, pool: P) -> PreconfCanonHandler<Pr, P, N>
     where
-        Pr: CanonStateSubscriptions<Primitives = N> + 'static,
+        Pr: CanonStateSubscriptions<Primitives = N> + reth_storage_api::BlockNumReader + 'static,
         P: TransactionPool + 'static,
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
     {
-        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.journal().clone())
+        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.classifier.clone())
     }
 
     /// Construct the local-sequencer RPC handler. Returned by value so
@@ -187,7 +216,8 @@ impl PreconfServiceBuilder {
             provider,
             self.fifo.clone(),
             self.cfg.clone(),
-            self.journal().clone(),
+            self.classifier.clone(),
+            self.journal.clone(),
         )
     }
 }
@@ -213,9 +243,10 @@ mod tests {
         let (_dir, svc) = svc_with_temp_journal().await;
         let svc = Arc::new(svc);
         let svc2 = Arc::clone(&svc);
-        // Arc-shared instance: both refs see the same fifo / cfg.
+        // Arc-shared instance: both refs see the same fifo / cfg / classifier.
         assert!(Arc::ptr_eq(svc.cfg(), svc2.cfg()));
         assert!(Arc::ptr_eq(svc.fifo(), svc2.fifo()));
+        assert!(Arc::ptr_eq(svc.classifier(), svc2.classifier()));
     }
 
     #[tokio::test]
@@ -292,15 +323,31 @@ mod tests {
     #[derive(Clone)]
     struct UnreachablePool;
 
+    /// Same reasoning for the chain view: with an empty journal there is no entry
+    /// whose nonce could have been consumed, so nothing asks.
+    struct UnreachableChain;
+
+    impl crate::journal::CommitmentChainView for UnreachableChain {
+        fn commitment_on_chain(&self, _hash: &alloy_primitives::TxHash) -> crate::journal::OnChain {
+            unreachable!("empty journal → restore_preconf_state must not consult the chain")
+        }
+    }
+
     #[async_trait::async_trait]
     impl RestorePool for UnreachablePool {
         async fn contains(&self, _hash: &alloy_primitives::TxHash) -> bool {
             unreachable!("empty journal → restore_preconf_state must not call the pool")
         }
+        fn recover_slot(
+            &self,
+            _tx_rlp: &alloy_primitives::Bytes,
+        ) -> Option<(alloy_primitives::Address, u64)> {
+            unreachable!("empty journal → restore_preconf_state must not call the pool")
+        }
         async fn add_envelope(
             &self,
             _tx_rlp: &alloy_primitives::Bytes,
-        ) -> Result<crate::journal::RestoredEnvelope, String> {
+        ) -> Result<crate::journal::RestoredEnvelope, crate::journal::RestoreSkip> {
             unreachable!("empty journal → restore_preconf_state must not call the pool")
         }
         fn remove_transactions(&self, _hashes: Vec<alloy_primitives::TxHash>) {
@@ -312,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_empty_journal_is_noop_on_fifo() {
         let (_dir, svc) = svc_with_temp_journal().await;
-        svc.start(&UnreachablePool).await.unwrap();
+        svc.start(&UnreachablePool, &UnreachableChain).await.unwrap();
         // Empty journal ⇒ nothing was replayed into the fifo.
         assert_eq!(svc.fifo().snapshot().await.len(), 0);
     }
@@ -321,8 +368,8 @@ mod tests {
     async fn start_is_idempotent() {
         let (_dir, svc) = svc_with_temp_journal().await;
         // Calling twice must not panic; both calls succeed.
-        svc.start(&UnreachablePool).await.unwrap();
-        svc.start(&UnreachablePool).await.unwrap();
+        svc.start(&UnreachablePool, &UnreachableChain).await.unwrap();
+        svc.start(&UnreachablePool, &UnreachableChain).await.unwrap();
     }
 
     /// `start()` reads the journal from disk and pushes each
@@ -350,7 +397,15 @@ mod tests {
             async fn contains(&self, _hash: &TxHash) -> bool {
                 false
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, String> {
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(alloy_primitives::Address, u64)> {
+                // Same `(from, nonce)` `add_envelope` fabricates below.
+                let seed = tx_rlp.first().copied().unwrap_or(0);
+                Some((alloy_primitives::Address::from([seed; 20]), u64::from(seed)))
+            }
+            async fn add_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, crate::journal::RestoreSkip> {
                 self.add_calls.lock().unwrap().push(tx_rlp.clone());
                 // Fabricate a deterministic legacy envelope keyed off
                 // the first byte of the RLP so every restored entry
@@ -380,9 +435,8 @@ mod tests {
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
-        // Fresh commit timestamps so `start`'s pre-restore rotate does not
-        // age-abandon them before they can be replayed (see
-        // `journal::UNSEALED_ABANDON_ROTATIONS`).
+        // Fresh commit timestamps, so the entries are ordinary in-flight
+        // commitments rather than anything a rotation would drop.
         let now_ms =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
                 as u64;
@@ -407,7 +461,8 @@ mod tests {
             .unwrap();
 
         let pool = RecordingPool { add_calls: Arc::new(std::sync::Mutex::new(Vec::new())) };
-        svc.start(&pool).await.unwrap();
+        // This pool admits everything, so the chain is never consulted either.
+        svc.start(&pool, &UnreachableChain).await.unwrap();
 
         // The adapter was invoked for each journal entry.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "one add per entry");
@@ -416,21 +471,37 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
     }
 
-    /// An age-abandoned journal entry is pruned by `start`'s pre-restore rotate,
-    /// so it is never replayed into the pool/fifo. `UnreachablePool` panics if
-    /// `add_envelope` is reached, so a passing run proves the entry was dropped
-    /// before restore rather than re-injected.
+    /// A restore that cannot re-admit an entry gives the commitment up, and the
+    /// journal line goes with it — `start`'s prune runs *after* the replay pass,
+    /// keyed on the records that pass established, so there is no window in which
+    /// the file and the classifier disagree.
     #[tokio::test]
-    async fn start_prunes_age_abandoned_entry_before_restore() {
-        use crate::journal::JournalEntry;
-        use alloy_primitives::{Bytes, TxHash};
+    async fn start_prunes_an_entry_whose_commitment_cannot_be_honoured() {
+        use crate::journal::{JournalEntry, RestoreSkip, RestoredEnvelope};
+        use alloy_primitives::{Address, Bytes, TxHash};
+
+        #[derive(Clone)]
+        struct RejectingPool;
+
+        #[async_trait::async_trait]
+        impl RestorePool for RejectingPool {
+            async fn contains(&self, _hash: &TxHash) -> bool {
+                false
+            }
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+                Some((Address::from([0xB1; 20]), u64::from(tx_rlp[0])))
+            }
+            async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+                Err(RestoreSkip::Rejected("stub refuses to admit".into()))
+            }
+            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+        }
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
-        // Ancient commit timestamp ⇒ far older than the abandon window.
         svc.journal()
             .append_promised(&JournalEntry {
                 hash: TxHash::from([0xB1; 32]),
@@ -441,10 +512,15 @@ mod tests {
             .await
             .unwrap();
 
-        svc.start(&UnreachablePool).await.unwrap();
+        // `RestoreSkip::Rejected` never consults the chain, so `UnreachableChain`
+        // is still the right stub here.
+        svc.start(&RejectingPool, &UnreachableChain).await.unwrap();
+
         assert!(
             svc.fifo().snapshot().await.is_empty(),
-            "age-abandoned entry must be pruned, not restored",
+            "a commitment the pool refuses reaches no fifo entry",
         );
+        let (remaining, _) = svc.journal().load().await.unwrap();
+        assert!(remaining.is_empty(), "and its journal line is pruned along with its record");
     }
 }

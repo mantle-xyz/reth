@@ -127,6 +127,85 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
+/// **C4 regression guard.** A commitment already acknowledged to a client must
+/// come back after a restart even if the operator has since *lowered*
+/// `--preconf.max-gas-per-tx` below that tx's gas limit.
+///
+/// The tx below asks for 21 000 gas while the restarted node caps preconf txs at
+/// 20 000. The cap is an admission-time check, so restore's `add_envelope` runs
+/// straight into it — unless the entry is already `Verdict::Promised`, which the
+/// validator waves past every preconf gate. Without that exemption `add_envelope`
+/// returns `Err`, restore logs and skips, and the commitment is **silently
+/// dropped**: the client was told it succeeded and nothing lands.
+///
+/// This used to work by accident: cold start ran *after* restore, so the
+/// allowlists were still empty, every restored tx classified as ineligible, and
+/// the ceiling never applied. Cold start now runs ahead of restore (it has to:
+/// restore must judge a commitment against the policy in force), which removed
+/// the accident; the receipt-already-sent exemption
+/// replaces it with something explicit. This test fails on a build that has the
+/// new ordering but not the exemption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn journal_replay_survives_a_lowered_per_tx_gas_cap() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_id = mantle_test_chain_spec().chain().id();
+    let wallet = Wallet::default().with_chain_id(chain_id);
+    let wallet_addr = wallet.inner.address();
+
+    let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
+    let tx_hash = keccak256(&raw_tx);
+
+    let (journal_file, journal_dir) = write_journal(&[JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+    }]);
+
+    // Allowlisted *and* over the cap: the tx would be classified `Eligible` on a
+    // fresh submission, so only the `Promised` exemption can get it through.
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .journal_path(journal_file.clone())
+        .max_gas_per_tx(20_000)
+        .build();
+
+    let (mut node, _http, _node_wallet, _launched_chain_id) = launch_preconf_node!(cfg).await;
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(
+        sealed.contains(&tx_hash),
+        "a promised tx must be restored even when it exceeds the current \
+         per-tx gas cap; hash {tx_hash:?} not in sealed {sealed:?}",
+    );
+
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
 /// Helper: create a fresh JSON-Lines journal file under `tempdir` with
 /// the given entries and return the file path + tempdir handle.
 fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -144,6 +223,108 @@ fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::Pa
     }
     std::fs::write(&journal_file, &buf).expect("write journal file");
     (journal_file, journal_dir)
+}
+
+/// **D4 regression guard, second door.** A client resubmitting a hash that is
+/// mid-replay must not be able to destroy the commitment by timing out.
+///
+/// Shape: journal restore leaves the entry in the fifo as `Waiting` /
+/// `PreconfSource::Replay` with no responder. `attach_responder` therefore
+/// accepts a same-hash resubmit onto it (see
+/// `preconf_tx_set::tests::attach_responder_accepts_a_resubmit_onto_a_replaying_entry`),
+/// and that resubmit's `handle_inner` reaches the deadline branch with
+/// `final_status == Some(Waiting)`. That branch used to run `mark_timeout`
+/// unconditionally, which makes the commitment replaceable by any same-nonce tx,
+/// sweepable by `clean_reclaimable`, **and** evicts it from the pool — so a
+/// promise whose receipt went out in the previous process would silently never
+/// land.
+///
+/// No payload build is driven until after the deadline, so the RPC call is
+/// guaranteed to hit the deadline path. Two observables, either of which the
+/// pre-D4 behaviour breaks:
+///
+/// 1. the tx is still in the pool afterwards (`mark_timeout` would have evicted it);
+/// 2. it still lands in the next block (a `Timeout` entry is skipped by `replay_fifo_carryover`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rpc_deadline_does_not_time_out_a_replaying_commitment() {
+    use super::helpers::send_preconf;
+    use mantle_reth_rpc_ext::PreconfStatus;
+
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_id = mantle_test_chain_spec().chain().id();
+    let wallet = Wallet::default().with_chain_id(chain_id);
+    let wallet_addr = wallet.inner.address();
+
+    let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
+    let tx_hash = keccak256(&raw_tx);
+
+    let (journal_file, journal_dir) = write_journal(&[JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+    }]);
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .journal_path(journal_file.clone())
+        .preconf_timeout_ms(150)
+        .build();
+
+    let (mut node, http, _node_wallet, _launched_chain_id) = launch_preconf_node!(cfg).await;
+
+    // Restore has already re-injected the tx and pushed a `Replay` fifo entry.
+    // Resubmitting the same hash attaches a fresh responder to that live entry;
+    // with no build running, this call can only end at the deadline.
+    let event = send_preconf(&http, raw_tx.clone()).await.expect("resubmit must not error");
+    assert_eq!(
+        event.status,
+        PreconfStatus::Timeout,
+        "this client's request times out — that part is expected",
+    );
+
+    // Observable 1: the commitment is still in the pool. `mark_timeout` fires the
+    // pool-eviction hook, so a regression empties it.
+    assert_eq!(
+        reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool).total,
+        1,
+        "the replaying commitment must survive this client's timeout",
+    );
+
+    // Observable 2: it still lands. A `Timeout` fifo entry is terminal for
+    // `replay_fifo_carryover`, so a regression leaves the block empty.
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(
+        sealed.contains(&tx_hash),
+        "the commitment must still land after the resubmit's deadline; \
+         hash {tx_hash:?} not in sealed {sealed:?}",
+    );
+
+    let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
 /// Multi-entry journal replay: three consecutive nonces from the same

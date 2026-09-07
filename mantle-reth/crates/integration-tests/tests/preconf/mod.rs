@@ -17,6 +17,7 @@ pub mod helpers;
 
 mod canon_cleanup;
 mod chain_id_pair;
+mod classifier_freeze;
 mod da_footprint;
 mod gas_budgets;
 mod happy_path;
@@ -40,3 +41,4 @@ mod restart_replay;
 mod single_payload;
 mod timeout;
 mod validation_reject;
+mod whitelist_onchain;

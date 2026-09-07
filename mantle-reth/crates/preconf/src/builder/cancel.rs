@@ -24,7 +24,7 @@ use tokio::sync::watch;
 /// Cancel handle for a single payload job. Constructed once per job by
 /// [`PreconfPayloadJobGenerator`]; cloned into the inner builder loop.
 ///
-/// [`PreconfPayloadJobGenerator`]: crate::builder::generator::PreconfPayloadJobGenerator
+/// [`PreconfPayloadJobGenerator`]: crate::builder::payload_job_generator::PreconfPayloadJobGenerator
 #[derive(Debug, Clone)]
 pub struct JobCancel {
     tx: Arc<watch::Sender<bool>>,
