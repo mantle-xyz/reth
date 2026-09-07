@@ -897,8 +897,8 @@ pub fn should_reload<N: NodePrimitives>(
 /// (a missed notification, a reload that only warned, a race between `latest()`
 /// and the notification) is corrected on the next reorg.
 ///
-/// A failed refresh is logged and retried on the next notification rather than
-/// killing the task — the previous allowlists stay in force meanwhile.
+/// A failed refresh is logged and never kills the task — the previous allowlists
+/// stay in force, and every canonical notification retries until one succeeds.
 pub async fn run_whitelist_watcher<Pr, N>(
     provider: Pr,
     cfg: Arc<PreconfConfig>,
@@ -922,8 +922,13 @@ pub async fn run_whitelist_watcher<Pr, N>(
     // reporting the last good read.
     let mut consecutive_failures: u64 = 0;
 
+    // Armed by any failure, cleared by the next success. While armed, *every*
+    // canonical notification retries — otherwise the retry waits for the next
+    // governance event, which on a quiet chain may never come.
+    let mut retry_pending = false;
+
     while let Some(notif) = stream.next().await {
-        if !should_reload(&notif, contract) {
+        if !should_reload(&notif, contract) && !retry_pending {
             continue;
         }
 
@@ -937,14 +942,16 @@ pub async fn run_whitelist_watcher<Pr, N>(
                     );
                 }
                 consecutive_failures = 0;
+                retry_pending = false;
             }
             Err(err) => {
                 consecutive_failures += 1;
+                retry_pending = true;
                 warn!(
                     target: "mantle::preconf::whitelist",
                     %err, %contract, reverted = notif.reverted().is_some(),
                     consecutive_failures,
-                    "whitelist refresh failed; keeping previous allowlists",
+                    "whitelist refresh failed; keeping previous allowlists, retrying every block",
                 );
             }
         }
