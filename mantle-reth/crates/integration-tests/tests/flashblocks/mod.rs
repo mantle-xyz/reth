@@ -23,6 +23,7 @@ mod producer_e2e;
 mod reconciliation;
 mod rpc_pending;
 mod rpc_pubsub;
+mod slice_journal;
 mod subscriber_resume;
 mod wire_compat;
 mod ws_proxy_bridge;

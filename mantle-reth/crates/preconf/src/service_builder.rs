@@ -246,7 +246,6 @@ impl PreconfServiceBuilder {
             self.fifo.clone(),
             self.cfg.clone(),
             self.classifier.clone(),
-            self.journal.clone(),
         )
     }
 }

@@ -48,7 +48,7 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_storage_api::BlockReaderIdExt;
 
 use crate::{
-    FlashblocksProducerHandles, PreconfClassifier, PreconfConfig, PreconfTxSet,
+    FlashblocksProducerHandles, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfTxSet,
     builder::{
         payload_builder::PreconfPayloadBuilder, payload_job_generator::PreconfPayloadJobGenerator,
     },
@@ -73,6 +73,7 @@ pub struct MantlePreconfServiceBuilder<N> {
     cfg: Arc<PreconfConfig>,
     classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
+    journal: Option<Arc<PreconfJournal>>,
     /// Slice publishing, when the operator asked for it. `None` leaves the
     /// build loop on the path it ran before flashblocks existed.
     ///
@@ -94,10 +95,11 @@ impl<N> MantlePreconfServiceBuilder<N> {
         cfg: Arc<PreconfConfig>,
         classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
+        journal: Option<Arc<PreconfJournal>>,
         builder_config: OpBuilderConfig,
         flashblocks: Option<Arc<FlashblocksProducerHandles>>,
     ) -> Self {
-        Self { cfg, classifier, fifo, builder_config, flashblocks, _pd: PhantomData }
+        Self { cfg, classifier, fifo, journal, builder_config, flashblocks, _pd: PhantomData }
     }
 }
 
@@ -167,7 +169,7 @@ where
         pool: Pool,
         evm_config: EvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let Self { cfg, classifier, fifo, builder_config, flashblocks, _pd } = self;
+        let Self { cfg, classifier, fifo, journal, builder_config, flashblocks, _pd } = self;
 
         // Rollback safety — when `--preconf.enable` is absent, `cfg` is
         // `PreconfConfig::default()` with `enabled: false`. In that case
@@ -201,6 +203,10 @@ where
             classifier,
             fifo,
         );
+        let builder = match journal {
+            Some(journal) => builder.with_journal(journal),
+            None => builder,
+        };
         // Only now: `with_flashblocks` is what turns slice publishing on, and
         // leaving it off has to keep the loop byte-identical to what it ran
         // before slicing existed.

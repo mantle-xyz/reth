@@ -76,6 +76,7 @@ use crate::{
         BlockInvariants, FlashblocksProducer, SenderBalances, SliceHeader, SliceLimits,
         build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
     },
+    journal::{JournalEntry, PreconfJournal},
     types::{PreconfError, PreconfReceipt, PreconfSource},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
 };
@@ -247,6 +248,10 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     /// pool best-tx step, which is why it cannot be the (async) fifo.
     classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
+    /// Commitment journal. `None` only on the disabled path, which builds no
+    /// preconf transactions and so has nothing to persist — `node.rs` skips
+    /// opening a file there because the default config leaves its path unset.
+    journal: Option<Arc<PreconfJournal>>,
     /// Slice publishing, when it is switched on. `None` leaves the build loop
     /// behaving exactly as it did before slicing existed, which is what makes
     /// turning flashblocks off a real rollback rather than a second code path.
@@ -269,7 +274,28 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
     ) -> Self {
-        Self { pool, client, evm_config, builder_config, cfg, classifier, fifo, flashblocks: None }
+        Self {
+            pool,
+            client,
+            evm_config,
+            builder_config,
+            cfg,
+            classifier,
+            fifo,
+            journal: None,
+            flashblocks: None,
+        }
+    }
+
+    /// Persist preconf commitments and, with slicing on, the pool transactions
+    /// a slice carries.
+    ///
+    /// Absent only on the disabled path, which builds no preconf transactions
+    /// and so has nothing to persist — `node.rs` skips opening a file there
+    /// because the default config leaves its path unset.
+    pub fn with_journal(mut self, journal: Arc<PreconfJournal>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Publish a slice of the block being built on every tick.
@@ -575,6 +601,7 @@ fn barred_by_allowlist(
 async fn admit_and_dispatch<N, B>(
     fifo: &PreconfTxSet,
     cfg: &PreconfConfig,
+    journal: Option<&PreconfJournal>,
     hash: TxHash,
     loop_state: &mut dispatch::LoopState,
     builder: &mut B,
@@ -657,7 +684,8 @@ where
             // Propagate a fatal apply error to abort the whole build; a
             // per-tx rejection resolves inside `apply_one_preconf` and
             // returns `Ok(())`.
-            dispatch::apply_one_preconf(fifo, cfg, hash, loop_state, &mut apply_fn).await?;
+            dispatch::apply_one_preconf(fifo, cfg, journal, hash, loop_state, &mut apply_fn)
+                .await?;
         }
         Admission::Defer => {
             loop_state.block_sender(sender, nonce, dispatch::BlockKind::Defer);
@@ -878,7 +906,11 @@ where
         .effective_tip_per_gas(constraints.base_fee)
         .expect("fee is always valid; execution succeeded");
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
-    info.record(recovered);
+    // The one class of transaction nothing else brings back after a restart:
+    // deposits arrive with the attributes, a preconf commitment is journaled
+    // when its receipt goes out, and the post-execution transaction is made by
+    // the executor rather than sent by anyone.
+    info.record_journalable(recovered);
     Ok(BestTxStep::Continue)
 }
 
@@ -1039,6 +1071,20 @@ struct SliceState {
     previous: FlashblockId,
 }
 
+/// The journal records for what a slice is about to carry.
+///
+/// A free function with its own bound rather than a method: the hash accessor
+/// needs `SignedTransaction` on the transaction type itself, which the payload
+/// primitives alias does not hand over.
+fn slice_journal_entries<T: SignedTransaction>(
+    info: &ExecutionInfo<T>,
+    block_height: u64,
+) -> Vec<JournalEntry> {
+    info.pending_journal()
+        .map(|tx| JournalEntry::for_executed(*tx.tx_hash(), tx, block_height))
+        .collect()
+}
+
 impl SliceState {
     fn new(producer: &FlashblocksProducer) -> Self {
         // The predecessor of this block's first slice is the last slice of the
@@ -1060,6 +1106,60 @@ impl SliceState {
             });
 
         Self { producer: producer.clone(), invariants: None, next_index: 0, previous }
+    }
+
+    /// Write this slice's transactions to the journal, then publish it.
+    ///
+    /// The order is the whole point. A transaction a subscriber has been shown
+    /// has to land, so it must be on disk before anyone hears about it —
+    /// reversing this leaves a crash window in which a transaction was
+    /// announced but not persisted, which is the case the journal exists for.
+    ///
+    /// The write stays outside the cancel gate because it cannot go inside:
+    /// [`JobCancel::unless_cancelled`] takes a synchronous closure. The cost is
+    /// that a slice dropped by that guard is already journaled — harmless,
+    /// since its transactions belong in this block either way, and a restart
+    /// finds them already on chain once it seals.
+    ///
+    /// A failed write does not stop the slice going out. The journal is a
+    /// best-effort recovery substrate, and the alternative — withholding a
+    /// slice because a disk write failed — trades a subscriber's whole view of
+    /// the block for a durability guarantee it never had (this is `flush`, not
+    /// `sync_all`).
+    async fn journal_and_publish<N, Evm, ChainSpec, Attrs, B, P>(
+        &mut self,
+        ctx: &OpPayloadBuilderCtx<Evm, ChainSpec, Attrs>,
+        builder: &mut B,
+        info: &mut ExecutionInfo<N::SignedTx>,
+        state_provider: &P,
+        cancel: &JobCancel,
+        journal: Option<&PreconfJournal>,
+    ) where
+        N: OpPayloadPrimitives,
+        Evm: ConfigurePostExecEvm<
+                Primitives = N,
+                NextBlockEnvCtx: BuildNextEnv<Attrs, HeaderTy<N>, ChainSpec>,
+            >,
+        ChainSpec: reth_chainspec::EthChainSpec + reth_optimism_forks::OpHardforks,
+        Attrs: OpAttributes<Transaction = TxTy<N>>,
+        B: BlockBuilder<Primitives = N, Executor: alloy_evm::block::BlockExecutor>,
+        P: reth_storage_api::StateProvider,
+        N::SignedTx: SignedTransaction,
+    {
+        if let Some(journal) = journal {
+            let entries = slice_journal_entries(info, ctx.parent().number() + 1);
+            match journal.append_batch(&entries).await {
+                Ok(()) => info.advance_journal_cursor(),
+                Err(err) => warn!(
+                    target: "mantle::preconf::flashblocks",
+                    %err,
+                    index = self.next_index,
+                    "failed to journal a slice; its transactions may be lost on restart",
+                ),
+            }
+        }
+
+        self.publish(ctx, builder, info, state_provider, cancel);
     }
 
     /// Assemble and publish everything executed since the last slice.
@@ -1508,7 +1608,16 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // after the carryover preamble would fold replayed commitments into it
         // and break that guarantee.
         if let Some(state) = slices.as_mut() {
-            state.publish(&ctx, &mut builder, &mut info, &state_provider_for_finish, &cancel);
+            state
+                .journal_and_publish(
+                    &ctx,
+                    &mut builder,
+                    &mut info,
+                    &state_provider_for_finish,
+                    &cancel,
+                    self.journal.as_deref(),
+                )
+                .await;
         }
 
         // Carryover replay preamble — apply stale in-flight / journal-
@@ -1528,6 +1637,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 admit_and_dispatch::<N, _>(
                     &self.fifo,
                     &self.cfg,
+                    self.journal.as_deref(),
                     hash,
                     &mut loop_state,
                     &mut builder,
@@ -1555,13 +1665,14 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 // makes a slice the delta since the previous one.
                 _ = flashblock_ticker.tick() => {
                     if let Some(state) = slices.as_mut() {
-                        state.publish(
+                        state.journal_and_publish(
                             &ctx,
                             &mut builder,
                             &mut info,
                             &state_provider_for_finish,
                             &cancel,
-                        );
+                            self.journal.as_deref(),
+                        ).await;
 
                         // Tell the pool what ran, then take a fresh iterator.
                         // Both have to happen here and in this order: the
@@ -1595,7 +1706,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     match recv {
                         Ok(hash) => {
                             admit_and_dispatch::<N, _>(
-                                &self.fifo, &self.cfg, hash, &mut loop_state,
+                                &self.fifo, &self.cfg, self.journal.as_deref(), hash,
+                                &mut loop_state,
                                 &mut builder, &mut info, constraints,
                                 &whitelist,
                             )
@@ -1613,7 +1725,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             );
                             for hash in self.fifo.snapshot().await {
                                 admit_and_dispatch::<N, _>(
-                                    &self.fifo, &self.cfg, hash, &mut loop_state,
+                                    &self.fifo, &self.cfg, self.journal.as_deref(), hash,
+                                &mut loop_state,
                                     &mut builder, &mut info, constraints,
                                     &whitelist,
                                 )

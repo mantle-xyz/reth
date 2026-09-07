@@ -39,6 +39,7 @@ use std::{
 };
 
 use alloy_consensus::TxEnvelope;
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, TxHash};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -69,6 +70,31 @@ pub struct JournalEntry {
     /// Wall-clock ms at which the commitment was made. Used by
     /// operators to correlate journal entries against logs / metrics.
     pub committed_at_ms: u64,
+}
+
+/// Current wall-clock milliseconds since the Unix epoch, for stamping
+/// [`JournalEntry::committed_at_ms`]. Falls back to `0` if the system clock is
+/// set before 1970, which is better read as "unset" than worth a panic on a
+/// path that is only telemetry.
+pub(crate) fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+impl JournalEntry {
+    /// The record for a transaction just executed into the block being built.
+    ///
+    /// One definition for both writers: preconf commitments are recorded from
+    /// the apply, pool transactions from the slice that carries them, and what
+    /// a record *is* must not depend on which of the two wrote it.
+    pub(crate) fn for_executed(hash: TxHash, tx: &impl Encodable2718, block_height: u64) -> Self {
+        Self {
+            hash,
+            tx_rlp: tx.encoded_2718().into(),
+            block_height,
+            committed_at_ms: now_unix_ms(),
+        }
+    }
 }
 
 /// Errors surfaced by the journal IO surface.
@@ -176,25 +202,48 @@ impl PreconfJournal {
     /// buffer before this call returns; durability against power loss
     /// would require an additional `sync_all`, traded off against
     /// per-tx latency.
+    ///
+    /// A batch of one — the size accounting, the rotation threshold and the
+    /// lock discipline have to be identical for both, and writing them twice
+    /// is how they stop being.
     pub async fn append_promised(&self, entry: &JournalEntry) -> Result<(), JournalError> {
-        // Encode first so a bad serialise does not partially write.
-        let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
-        line.push(b'\n');
-        let len = line.len() as u64;
-        // The size counter is bumped *under the writer lock*, so the
-        // on-disk write and the count stay consistent w.r.t. `rotate`'s
-        // swap+reset (which also holds the writer lock). `notify_one`
-        // is deferred until after the lock is released.
+        self.append_batch(std::slice::from_ref(entry)).await
+    }
+
+    /// Append many records under one lock, with a single write and a single
+    /// flush.
+    ///
+    /// `flush`, not `sync_all`: the bytes leave the runtime's buffer before this
+    /// returns, but power-loss durability would cost a per-call fsync.
+    ///
+    /// The batching is what keeps a slice affordable: it can carry a thousand
+    /// transactions, and taking the writer lock once per transaction would hold
+    /// up the preconf path that appends through the same lock. An empty batch
+    /// does no IO.
+    ///
+    /// This is the one place the write mechanics live — [`Self::append_promised`]
+    /// is a batch of one.
+    ///
+    /// All-or-nothing on encode: every record is serialised before anything is
+    /// written, so a record `serde_json` cannot encode leaves the file
+    /// untouched rather than half a batch on disk.
+    pub async fn append_batch(&self, entries: &[JournalEntry]) -> Result<(), JournalError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        for entry in entries {
+            serde_json::to_writer(&mut buf, entry).map_err(JournalError::Encode)?;
+            buf.push(b'\n');
+        }
+        let len = buf.len() as u64;
         let new_size = {
             let mut writer = self.writer.lock().await;
-            writer.write_all(&line).await?;
+            writer.write_all(&buf).await?;
             writer.flush().await?;
             self.size_bytes.fetch_add(len, Ordering::Relaxed) + len
         };
         metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
-        // Size-triggered rotation: wake the rejournal loop when the file
-        // crosses the cap. The heavy `rotate()` runs off this hot path;
-        // the loop rate-limits repeated triggers (see `run_rejournal_loop`).
         if new_size >= self.max_size {
             self.rotate_notify.notify_one();
         }
@@ -924,6 +973,66 @@ mod tests {
         let path = dir.path().join("preconf.jsonl");
         let j = PreconfJournal::open(&path, 0).await.unwrap();
         (dir, j)
+    }
+
+    /// A slice's transactions are written together. One write and one flush
+    /// rather than one per transaction: a slice can carry a thousand of them,
+    /// and the writer lock it takes is the one the RPC path appends through.
+    #[tokio::test]
+    async fn append_batch_writes_every_entry_in_order() {
+        let (_dir, j) = fresh_journal().await;
+        let batch = [entry(1, 10), entry(2, 10), entry(3, 10)];
+
+        j.append_batch(&batch).await.unwrap();
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, batch.to_vec());
+        assert_eq!(bad, 0);
+    }
+
+    // Deliberately untested: that `append_batch` flushes before returning.
+    // Removing the `flush` does not turn any test here red — tokio's `File`
+    // hands the write to a blocking thread, which has normally finished by the
+    // time a second handle reads the path, so such a test passes on timing
+    // rather than on the guarantee. `append_promised` has the same gap.
+
+    /// A slice that executed nothing is the common case once the pool is
+    /// drained; it must not cost a write.
+    #[tokio::test]
+    async fn append_batch_of_nothing_writes_nothing() {
+        let (_dir, j) = fresh_journal().await;
+
+        j.append_batch(&[]).await.unwrap();
+
+        let (loaded, _) = j.load().await.unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    /// A batch counts toward the size cap exactly as the same entries appended
+    /// one at a time would — otherwise a slicing node would never rotate.
+    #[tokio::test]
+    async fn append_batch_arms_size_triggered_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // 1-byte cap: any write at all crosses it.
+        let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
+        let kept = entry(3, 12);
+        j.append_batch(&[entry(1, 10), entry(2, 11), kept.clone()]).await.unwrap();
+        let c = classifier_done_with(&[TxHash::from([1; 32]), TxHash::from([2; 32])]);
+        still_owed(&c, kept.hash);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = spawn_rejournal_loop(j.clone(), c, Duration::from_secs(3600), shutdown_rx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (after, _) = j.load().await.unwrap();
+        assert_eq!(after, vec![kept], "the batch must have pinged the rotate notify");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("loop did not shut down")
+            .expect("loop panicked");
     }
 
     /// A `JournalEntry` with an explicit commit timestamp.

@@ -30,6 +30,11 @@ pub struct ExecutionInfo<T> {
     executed_sender_nonces: HashMap<Address, u64>,
     published_upto: usize,
     pruned_upto: usize,
+    /// Positions in `executed` of the transactions that need a journal record,
+    /// in execution order. Positions rather than copies: the transaction is
+    /// already held once, and a second copy is a pair that can fall out of step.
+    journalable: Vec<usize>,
+    journaled_upto: usize,
 }
 
 impl<T> Default for ExecutionInfo<T> {
@@ -40,6 +45,8 @@ impl<T> Default for ExecutionInfo<T> {
             executed_sender_nonces: HashMap::new(),
             published_upto: 0,
             pruned_upto: 0,
+            journalable: Vec::new(),
+            journaled_upto: 0,
         }
     }
 }
@@ -69,9 +76,36 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
         self.executed.push(tx);
     }
 
+    /// Record a transaction that also has to survive a restart.
+    ///
+    /// Only pool transactions do. A deposit arrives with the attributes on
+    /// every rebuild, a preconf commitment is journaled when its receipt goes
+    /// out, and the post-execution transaction is produced by the executor
+    /// rather than sent by anyone — putting any of them back in the pool on
+    /// restart would be wrong.
+    pub fn record_journalable(&mut self, tx: Recovered<T>) {
+        self.journalable.push(self.executed.len());
+        self.record(tx);
+    }
+
     /// Everything executed this block, in execution order.
     pub fn executed(&self) -> &[Recovered<T>] {
         &self.executed
+    }
+
+    /// What has been executed but not yet written to the journal, in execution
+    /// order.
+    ///
+    /// Tracked separately from publishing: a slice is journaled before it is
+    /// sent, so one dropped by the cancel guard is already on disk and must not
+    /// be written again when the next slice carries its transactions.
+    pub fn pending_journal(&self) -> impl Iterator<Item = &Recovered<T>> {
+        self.journalable[self.journaled_upto..].iter().map(|&at| &self.executed[at])
+    }
+
+    /// Mark everything executed so far as written to the journal.
+    pub fn advance_journal_cursor(&mut self) {
+        self.journaled_upto = self.journalable.len();
     }
 
     /// The highest nonce executed this block per sender.
@@ -202,6 +236,56 @@ mod tests {
 
         assert!(info.pending_slice().is_empty());
         assert_eq!(info.published_upto(), 0);
+    }
+
+    /// Only pool transactions need a journal record. Deposits arrive with the
+    /// attributes on every rebuild, preconf commitments are journaled when
+    /// their receipt goes out, and the post-execution transaction is not a
+    /// user transaction at all — journaling any of them would put something
+    /// back in the pool that does not belong there.
+    #[test]
+    fn only_transactions_recorded_as_journalable_are_queued_for_the_journal() {
+        let mut info = Info::default();
+
+        info.record(tx(sender(0xaa), 0));
+        info.record_journalable(tx(sender(0xbb), 1));
+        info.record(tx(sender(0xcc), 2));
+
+        let pending: Vec<_> = info.pending_journal().collect();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].signer(), sender(0xbb));
+        assert_eq!(info.executed().len(), 3, "all three still executed, in order");
+    }
+
+    /// The journal cursor tracks the file, the publish cursor tracks the wire.
+    /// A slice assembled and then dropped by the cancel guard has already been
+    /// journaled — its transactions must not be written a second time when the
+    /// next slice carries them.
+    #[test]
+    fn a_dropped_slice_does_not_journal_its_transactions_twice() {
+        let mut info = Info::default();
+        info.record_journalable(tx(sender(0xaa), 0));
+
+        // The slice was journaled, then dropped before it went out.
+        info.advance_journal_cursor();
+
+        assert!(info.pending_journal().next().is_none(), "already on disk");
+        assert_eq!(info.pending_slice().len(), 1, "but never published");
+    }
+
+    #[test]
+    fn the_journal_cursor_keeps_the_order_transactions_executed_in() {
+        let mut info = Info::default();
+        info.record_journalable(tx(sender(0xaa), 0));
+        info.record(tx(sender(0xbb), 0));
+        info.advance_journal_cursor();
+        info.record_journalable(tx(sender(0xaa), 1));
+        info.record_journalable(tx(sender(0xaa), 2));
+
+        let pending: Vec<_> = info.pending_journal().map(|tx| tx.nonce()).collect();
+
+        assert_eq!(pending, vec![1, 2]);
     }
 
     /// The pool is told a sender's nonce has moved on. Only the highest one

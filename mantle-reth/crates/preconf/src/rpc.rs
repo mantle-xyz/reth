@@ -54,9 +54,8 @@ use tokio::sync::oneshot;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    PreconfClassifier, PreconfConfig, PreconfJournal, PreconfTxSet,
+    PreconfClassifier, PreconfConfig, PreconfTxSet,
     classifier::PreconfClaimError,
-    journal::JournalEntry,
     types::{AttachError, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
@@ -70,12 +69,6 @@ pub struct PreconfRpcHandler<P, Pr> {
     /// Owns the allowlists and every frozen verdict. The single decider of
     /// preconf eligibility, shared with the validator and the builder.
     classifier: Arc<PreconfClassifier>,
-    /// Persistence sink (mandatory) — every commitment whose receipt goes
-    /// out is appended to the journal before the `PreconfTxEvent` is
-    /// returned to the client. Append failures are logged but do not block
-    /// the response (best-effort durability; a crash before the next disk
-    /// flush loses at most the most recent commitment).
-    journal: Arc<PreconfJournal>,
 }
 
 // Manual Debug — `P` (TransactionPool) and `Pr` (StateProviderFactory) do
@@ -93,16 +86,14 @@ impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
 
 impl<P, Pr> PreconfRpcHandler<P, Pr> {
     /// Construct a handler bound to the given pool + provider + fifo.
-    /// The `journal` is mandatory — every successful commitment is persisted.
     pub const fn new(
         pool: P,
         provider: Pr,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
         classifier: Arc<PreconfClassifier>,
-        journal: Arc<PreconfJournal>,
     ) -> Self {
-        Self { pool, provider, fifo, cfg, classifier, journal }
+        Self { pool, provider, fifo, cfg, classifier }
     }
 }
 
@@ -111,12 +102,10 @@ where
     P: TransactionPool + 'static,
     Pr: StateProviderFactory + 'static,
 {
-    /// Records a returned receipt in **both** halves of commitment tracking: the
-    /// classifier (in memory, the authority for slot retention) and the journal
-    /// (on disk, for restart). Both writes live here so the two cannot drift —
-    /// `mark_committed` needs the classifier's promise record to recognise our
-    /// transactions among a whole block's hashes, and journal restore rebuilds
-    /// that record from the file.
+    /// Claim the `(sender, nonce)` slot for a commitment whose receipt is going
+    /// out, and record the promise with the classifier — the in-memory authority
+    /// for slot retention. `mark_committed` needs that record to recognise our
+    /// transactions among a whole block's hashes.
     ///
     /// **Every receipt counts, not only `Success`.** A `Failed` event on a
     /// receipt path is an EVM revert that *produced* a receipt; every
@@ -125,13 +114,12 @@ where
     /// owed a replay exactly as a successful one is — and `builder::dispatch`
     /// agrees, marking the fifo entry `Success` without reading `receipt.status`.
     /// Pinned by `a_reverted_receipt_is_still_recorded_as_a_commitment`.
-    async fn record_commitment(
+    async fn claim_commitment_slot(
         &self,
         event: &PreconfTxEvent,
         hash: alloy_primitives::TxHash,
         sender: &alloy_primitives::Address,
         nonce: u64,
-        tx_rlp: &Bytes,
     ) {
         // Establishing the record here — at the receipt, which necessarily
         // precedes the block — is what makes it available to both later events
@@ -143,21 +131,6 @@ where
                 ?hash, ?owner,
                 "a different tx already owns this (sender, nonce) at receipt time; \
                  the commitment may not be honoured"
-            );
-        }
-
-        // Best-effort — a crash before flush loses at most this single record.
-        let entry = JournalEntry {
-            hash,
-            tx_rlp: tx_rlp.clone(),
-            block_height: event.block_height,
-            committed_at_ms: now_unix_ms(),
-        };
-        if let Err(e) = self.journal.append_promised(&entry).await {
-            warn!(
-                target: "mantle::preconf::rpc",
-                ?hash, ?e,
-                "journal append failed; commitment may be lost on restart"
             );
         }
     }
@@ -371,10 +344,10 @@ where
 
         match recv_result {
             // Receipt arrived within the deadline. Every receipt is recorded,
-            // reverts included — see `record_commitment`.
+            // reverts included — see `claim_commitment_slot`.
             Some(Ok(Ok(receipt))) => {
                 let event = PreconfTxEvent::from(receipt);
-                self.record_commitment(&event, hash, &sender, nonce, &bytes).await;
+                self.claim_commitment_slot(&event, hash, &sender, nonce).await;
                 Ok(event)
             }
 
@@ -462,7 +435,7 @@ where
                         match resp_rx.try_recv() {
                             Ok(Ok(receipt)) => {
                                 let event = PreconfTxEvent::from(receipt);
-                                self.record_commitment(&event, hash, &sender, nonce, &bytes).await;
+                                self.claim_commitment_slot(&event, hash, &sender, nonce).await;
                                 Ok(event)
                             }
                             Ok(Err(err)) => Err(preconf_error_to_rpc(&err)),
@@ -669,15 +642,6 @@ pub(crate) fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Addre
     }
 }
 
-/// Current wall-clock milliseconds since the Unix epoch. Used to
-/// stamp [`JournalEntry::committed_at_ms`]. Falls back to `0` if the
-/// system clock is set before 1970, which is best treated as
-/// "unset" rather than crashing the RPC path.
-fn now_unix_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,11 +786,6 @@ mod tests {
         classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
         signer: PrivateKeySigner,
-        journal: Arc<PreconfJournal>,
-        /// Owns the journal file's directory: dropping it deletes the file, so
-        /// it has to outlive `handler`. The journal is mandatory, so there is no
-        /// "no persistence" variant of this harness to fall back on.
-        _journal_dir: tempfile::TempDir,
     }
 
     async fn harness() -> Harness {
@@ -856,22 +815,14 @@ mod tests {
             ..Default::default()
         };
 
-        let journal_dir = tempfile::tempdir().expect("tempdir");
-        let journal = Arc::new(
-            PreconfJournal::open(journal_dir.path().join("preconf.jsonl"), cfg.journal_max_size)
-                .await
-                .expect("journal opens in a fresh temp dir"),
-        );
-
         let handler = PreconfRpcHandler::new(
             NoopTransactionPool::<OpPooledTransaction>::new(),
             provider,
             fifo.clone(),
             Arc::new(cfg),
             classifier.clone(),
-            journal.clone(),
         );
-        Harness { handler, classifier, fifo, signer, journal, _journal_dir: journal_dir }
+        Harness { handler, classifier, fifo, signer }
     }
 
     /// A genuinely signed EIP-1559 transfer, encoded the way the wire delivers
@@ -924,13 +875,13 @@ mod tests {
     /// The same refusal must **not** drop a promised commitment.
     ///
     /// Reachable shape: the transaction was applied and its `Success` receipt
-    /// returned, so `record_commitment` → `mark_promised` ran, but its block is
+    /// returned, so `claim_commitment_slot` → `mark_promised` ran, but its block is
     /// **not yet canonical** — so no `committed_height` guards the record. A
     /// same-hash resubmit inside that window is re-validated (the transaction is
     /// still pooled, so nothing deduplicates it) and can be refused on account
     /// state alone: Mantle recomputes `extra_balance_cost` every validation.
     /// Both preconditions are established through the production calls in
-    /// production order — Step 3b's `claim_preconf`, then `record_commitment`'s
+    /// production order — Step 3b's `claim_preconf`, then `claim_commitment_slot`'s
     /// `mark_promised` — with only the block application elided; the refusal
     /// comes from the pool, not a hand-set flag.
     ///
@@ -963,16 +914,15 @@ mod tests {
     }
 
     /// An EVM revert that produced a receipt is a commitment like any other —
-    /// see `record_commitment` for why the gate is not on `Success`.
+    /// see `claim_commitment_slot` for why the gate is not on `Success`.
     ///
-    /// Both halves are asserted because the failure mode of such a gate is
-    /// precisely that they disagree: `builder::dispatch` marks the fifo entry
-    /// `Success` regardless, so the fifo would say "committed" while the
-    /// classifier and the journal had never heard of the transaction.
+    /// `builder::dispatch` marks the fifo entry `Success` regardless of
+    /// `receipt.status`, so a gate here would leave the fifo saying "committed"
+    /// about a transaction the classifier had never heard of.
     #[tokio::test]
     async fn a_reverted_receipt_is_still_recorded_as_a_commitment() {
         let h = harness().await;
-        let (raw, hash) = signed_raw_tx(&h.signer, 0, 21_000);
+        let (_raw, hash) = signed_raw_tx(&h.signer, 0, 21_000);
         let sender = h.signer.address();
 
         let event = PreconfTxEvent::from(PreconfReceipt {
@@ -986,19 +936,12 @@ mod tests {
         });
         assert_eq!(event.status, WireStatus::Failed, "precondition: this is the reverted arm");
 
-        h.handler.record_commitment(&event, hash, &sender, 0, &raw).await;
+        h.handler.claim_commitment_slot(&event, hash, &sender, 0).await;
 
         assert!(
             h.classifier.is_promised(&hash),
             "the classifier must know the commitment, or a reorg reinject is \
              re-gated as a fresh submission and `mark_committed` cannot count it",
-        );
-        let (entries, _bad) = h.journal.load().await.expect("journal reads back");
-        assert_eq!(
-            entries.iter().map(|e| e.hash).collect::<Vec<_>>(),
-            vec![hash],
-            "and it must be on disk, or a crash before sealing loses a receipt \
-             the client is already holding",
         );
     }
 }
