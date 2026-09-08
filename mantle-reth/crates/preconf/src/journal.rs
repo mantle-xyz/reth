@@ -858,7 +858,7 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
                             hash = ?entry.hash,
                             reason,
                             "restored tx is NOT on chain but its nonce was consumed by another \
-                             transaction; commitment is broken"
+                             transaction; whatever was announced about it will not happen"
                         );
                         nonce_taken += 1;
                     }
@@ -912,9 +912,26 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
         restored += 1;
     }
 
-    // `nonce_taken` is the one to alert on: each is a receipt handed out for a
-    // transaction that can no longer land. It is published as a counter too,
-    // because a log line that only appears at startup is easy to miss.
+    // `nonce_taken` is the one worth watching: a transaction this node told the
+    // outside about, whose nonce something else has since taken. Published as a
+    // counter as well, because a log line that only appears at startup is easy
+    // to miss.
+    //
+    // It counts two things that do not weigh the same, and cannot tell them
+    // apart. A preconf commitment reaching here means a client holds a
+    // synchronous receipt for a transaction that can never land. An ordinary
+    // pool transaction reaching here means someone replaced their own pending
+    // transaction after a slice had shown it — routine, and the sort of thing
+    // that will bury the first case if an alert is hung on this number as it
+    // stands.
+    //
+    // Telling them apart needs the entry to say which it is, and nothing here
+    // can work it out: the classifier is empty at this point — this very pass
+    // is what fills it — and the record carries no marker. A field would do it,
+    // and old files would need no guess, since every record written before pool
+    // transactions were journaled is a commitment. Left for the pass that
+    // settles the metrics, which is where the alert thresholds get decided and
+    // where it will be clear whether this wants a second counter or a label.
     metrics::counter!("preconf.journal.restore_nonce_taken").increment(nonce_taken as u64);
     metrics::counter!("preconf.journal.restore_unknown").increment(unknown as u64);
     info!(
