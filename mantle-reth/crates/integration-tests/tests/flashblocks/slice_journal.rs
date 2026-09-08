@@ -18,7 +18,7 @@ use mantle_reth_preconf::{JournalEntry, flashblocks::FlashblockProducerConfig};
 use op_alloy_consensus::DEPOSIT_TX_TYPE_ID;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
-use crate::helpers::PreconfCfgBuilder;
+use crate::helpers::{PreconfCfgBuilder, send_preconf};
 
 const RECIPIENT: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
 
@@ -139,6 +139,62 @@ async fn a_pool_transaction_is_journaled_and_the_blocks_deposits_are_not() {
              system transaction back into the pool",
         );
     }
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// A preconf commitment gets exactly one record, from its own apply.
+///
+/// Its journal entry is written by dispatch when the transaction lands. The
+/// slice that goes on to carry it must not write a second one: the same hash
+/// twice would be restored twice, and the count of what a restart owes would
+/// stop matching the transactions it owes them for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preconf_commitment_is_journaled_once_not_once_per_slice() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = fresh_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, http, wallet, chain_id, _fb_addr) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    // Hold a block open so the preconf lands mid-build and several slices go
+    // out after it — each of them a chance to write the record again.
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let event = send_preconf(&http, raw).await.expect("the commitment is accepted");
+    let hash = event.tx_hash;
+
+    // Let the ticker fire several more times before sealing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let written = read_journal(&journal_file);
+    let for_this_tx = written.iter().filter(|entry| entry.hash == hash).count();
+    assert_eq!(
+        for_this_tx, 1,
+        "the commitment is recorded at its apply and nowhere else; got {for_this_tx} records \
+         out of {written:?}",
+    );
 
     std::fs::remove_dir_all(&journal_dir).ok();
 }
