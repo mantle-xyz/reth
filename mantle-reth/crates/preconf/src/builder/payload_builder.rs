@@ -76,7 +76,7 @@ use crate::{
         BlockInvariants, FlashblocksProducer, SenderBalances, SliceHeader, SliceLimits,
         build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
     },
-    journal::{JournalEntry, PreconfJournal},
+    journal::PreconfJournal,
     types::{PreconfError, PreconfReceipt, PreconfSource},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
 };
@@ -1072,20 +1072,6 @@ struct SliceState {
     previous: FlashblockId,
 }
 
-/// The journal records for what a slice is about to carry.
-///
-/// A free function with its own bound rather than a method: the hash accessor
-/// needs `SignedTransaction` on the transaction type itself, which the payload
-/// primitives alias does not hand over.
-fn slice_journal_entries<T: SignedTransaction>(
-    info: &ExecutionInfo<T>,
-    block_height: u64,
-) -> Vec<JournalEntry> {
-    info.pending_journal()
-        .map(|tx| JournalEntry::for_executed(*tx.tx_hash(), tx, block_height))
-        .collect()
-}
-
 impl SliceState {
     fn new(producer: &FlashblocksProducer) -> Self {
         // The predecessor of this block's first slice is the last slice of the
@@ -1148,15 +1134,14 @@ impl SliceState {
         N::SignedTx: SignedTransaction,
     {
         if let Some(journal) = journal {
-            let entries = slice_journal_entries(info, ctx.parent().number() + 1);
-            match journal.append_batch(&entries).await {
-                Ok(()) => info.advance_journal_cursor(),
-                Err(err) => warn!(
+            let entries = info.take_journal_records(ctx.parent().number() + 1);
+            if let Err(err) = journal.append_batch(&entries).await {
+                warn!(
                     target: "mantle::preconf::flashblocks",
                     %err,
                     index = self.next_index,
-                    "failed to journal a slice; its transactions may be lost on restart",
-                ),
+                    "slice journal write failed; the records are held for the next write",
+                );
             }
         }
 

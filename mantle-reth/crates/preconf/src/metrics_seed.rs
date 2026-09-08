@@ -31,6 +31,7 @@ const COUNTERS: &[&str] = &[
     "preconf.canon.reorg_drift_total",
     "preconf.tx.commitment_broken_total",
     "preconf.tx.replay_round_total",
+    "preconf.journal.dropped_entries_total",
     "preconf.journal.restore_nonce_taken",
     "preconf.journal.restore_undecodable",
     "preconf.journal.restore_unknown",
@@ -51,6 +52,7 @@ const COUNTERS: &[&str] = &[
 /// zero increment only registers the series, leaving any existing value intact.
 const GAUGES: &[&str] = &[
     "preconf.fifo.pending",
+    "preconf.journal.pending_entries",
     "preconf.journal.size_bytes",
     "preconf.classifier.verdicts",
     "preconf.classifier.slots",

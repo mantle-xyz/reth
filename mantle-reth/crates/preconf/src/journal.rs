@@ -33,7 +33,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -41,7 +41,9 @@ use std::{
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, TxHash};
+use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
@@ -95,6 +97,55 @@ impl JournalEntry {
             committed_at_ms: now_unix_ms(),
         }
     }
+}
+
+/// How many un-written records the retry buffer holds before the oldest start
+/// falling out — thirty blocks' worth.
+///
+/// Thirty blocks is one rotation interval (the 60s default over 2s blocks),
+/// which is as far back as a record can still matter: past it rotation has
+/// already dropped the ones no longer owed. Fifteen hundred a block is what
+/// 30M of gas holds when it is all simple transfers.
+const PENDING_CAPACITY: usize = 30 * 1_500;
+
+/// Backstop on what the retry buffer may hold, in bytes.
+///
+/// [`PENDING_CAPACITY`] is the limit to reason with — it is expressed in the
+/// units the rest of the subsystem uses. It does not bound memory, though: a
+/// record carries its transaction's encoding, and at the pool's 128 KiB ceiling
+/// per transaction a full buffer would be gigabytes rather than the tens of
+/// megabytes ordinary traffic produces.
+///
+/// This is the fuse for that, not a second budget. Reaching it takes hours of
+/// uninterrupted maximum-size transactions with the disk refusing writes
+/// throughout; ordinary traffic never comes close, so which limit bites stays
+/// predictable.
+const PENDING_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Drop the oldest held records until one of `incoming` bytes fits, returning
+/// how many went. `bytes` is the running size of `pending` and is adjusted to
+/// match.
+///
+/// Split out from [`PreconfJournal::buffer`] so the rule can be exercised at a
+/// budget a test can afford: [`PENDING_MAX_BYTES`] is a gigabyte, and reaching
+/// it for real would mean allocating one.
+fn evict_to_fit(
+    pending: &mut VecDeque<Vec<u8>>,
+    bytes: &mut usize,
+    incoming: usize,
+    max_count: usize,
+    max_bytes: usize,
+) -> u64 {
+    let mut dropped = 0;
+    // `while` for the byte fuse, because one arriving record can be worth many
+    // of the ones it displaces. Never evicts down to empty: a record bigger
+    // than the whole budget is still worth more held than dropped.
+    while pending.len() >= max_count || (*bytes + incoming > max_bytes && !pending.is_empty()) {
+        let evicted = pending.pop_front().expect("non-empty");
+        *bytes -= evicted.len();
+        dropped += 1;
+    }
+    dropped
 }
 
 /// Errors surfaced by the journal IO surface.
@@ -152,6 +203,20 @@ pub struct PreconfJournal {
     /// path. `notify_one` coalesces a burst of appends into a single
     /// pending permit.
     rotate_notify: Notify,
+    /// Records a write could not place on disk, waiting for the next one.
+    ///
+    /// Bounded by [`PENDING_CAPACITY`], and by [`PENDING_MAX_BYTES`] as a fuse;
+    /// over either the oldest are dropped, because they are the ones whose block
+    /// has most likely sealed already — a record only matters until its block is
+    /// canonical.
+    ///
+    /// Distinct from the eviction `rotate` performs: that one decides which
+    /// *durable* records are still owed and is the caller's rule (`retain`).
+    /// This one is about records that never reached the disk at all, and is the
+    /// price of not blocking the build loop on a failing disk.
+    pending: SyncMutex<VecDeque<Vec<u8>>>,
+    /// Running size of `pending`, so the byte fuse costs no walk.
+    pending_bytes: AtomicUsize,
 }
 
 impl PreconfJournal {
@@ -185,6 +250,8 @@ impl PreconfJournal {
             max_size,
             size_bytes: AtomicU64::new(init_size),
             rotate_notify: Notify::new(),
+            pending: SyncMutex::new(VecDeque::new()),
+            pending_bytes: AtomicUsize::new(0),
         };
         // Nothing in memory to seed from the file: recognising a post-restart
         // commitment as ours is `restore_preconf_state`'s job.
@@ -227,27 +294,100 @@ impl PreconfJournal {
     /// All-or-nothing on encode: every record is serialised before anything is
     /// written, so a record `serde_json` cannot encode leaves the file
     /// untouched rather than half a batch on disk.
+    ///
+    /// An **IO** failure is different: the records are kept for the next write
+    /// and `Err` is returned for the caller to log, not to act on. Callers must
+    /// not resend them — see [`Self::write_lines`].
     pub async fn append_batch(&self, entries: &[JournalEntry]) -> Result<(), JournalError> {
-        if entries.is_empty() {
+        // Encoded up front, and separately from the write: a record `serde_json`
+        // cannot encode will not encode on the next attempt either, so it fails
+        // outright instead of joining the retry buffer and being carried
+        // forever. Nothing is written if any of them fails.
+        let mut lines = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
+            line.push(b'\n');
+            lines.push(line);
+        }
+        self.write_lines(lines).await
+    }
+
+    /// Write `lines`, preceded by anything an earlier attempt could not place.
+    ///
+    /// On IO failure everything goes to the retry buffer and the error is
+    /// returned for the caller to log. The caller is expected to carry on
+    /// regardless: journaling is a side path, and the transactions it describes
+    /// are in the block either way — the record only matters if the process
+    /// dies before that block is canonical.
+    async fn write_lines(&self, mut lines: Vec<Vec<u8>>) -> Result<(), JournalError> {
+        if lines.is_empty() && self.pending.lock().is_empty() {
             return Ok(());
         }
+        // The writer lock is taken first so a concurrent append cannot slip
+        // between draining the buffer and writing it, which would put the older
+        // records after the newer ones in the file.
+        let mut writer = self.writer.lock().await;
+        let mut retried: Vec<Vec<u8>> = {
+            let mut pending = self.pending.lock();
+            self.pending_bytes.store(0, Ordering::Relaxed);
+            pending.drain(..).collect()
+        };
+
         let mut buf = Vec::new();
-        for entry in entries {
-            serde_json::to_writer(&mut buf, entry).map_err(JournalError::Encode)?;
+        if !retried.is_empty() {
+            // The write that failed may have stopped mid-line. A newline closes
+            // it so this attempt does not fuse onto its tail and cost both
+            // records; `load` skips the blank line it leaves behind.
             buf.push(b'\n');
         }
+        for line in retried.iter().chain(lines.iter()) {
+            buf.extend_from_slice(line);
+        }
         let len = buf.len() as u64;
-        let new_size = {
-            let mut writer = self.writer.lock().await;
-            writer.write_all(&buf).await?;
-            writer.flush().await?;
-            self.size_bytes.fetch_add(len, Ordering::Relaxed) + len
-        };
+
+        if let Err(e) = writer.write_all(&buf).await.and(writer.flush().await) {
+            drop(writer);
+            retried.append(&mut lines);
+            self.buffer(retried);
+            return Err(JournalError::Io(e));
+        }
+        let new_size = self.size_bytes.fetch_add(len, Ordering::Relaxed) + len;
+        drop(writer);
+
+        metrics::gauge!("preconf.journal.pending_entries").set(0.0);
         metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
         if new_size >= self.max_size {
             self.rotate_notify.notify_one();
         }
         Ok(())
+    }
+
+    /// Hold `lines` for the next write, dropping the oldest once full.
+    fn buffer(&self, lines: Vec<Vec<u8>>) {
+        let mut pending = self.pending.lock();
+        let mut bytes = self.pending_bytes.load(Ordering::Relaxed);
+        let mut dropped = 0u64;
+        for line in lines {
+            dropped += evict_to_fit(
+                &mut pending,
+                &mut bytes,
+                line.len(),
+                PENDING_CAPACITY,
+                PENDING_MAX_BYTES,
+            );
+            bytes += line.len();
+            pending.push_back(line);
+        }
+        self.pending_bytes.store(bytes, Ordering::Relaxed);
+        if dropped > 0 {
+            metrics::counter!("preconf.journal.dropped_entries_total").increment(dropped);
+        }
+        metrics::gauge!("preconf.journal.pending_entries").set(pending.len() as f64);
+    }
+
+    /// How many records are waiting for a write to succeed.
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().len()
     }
 
     /// Read the journal file from disk and return every entry that
@@ -1008,6 +1148,169 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
+    /// A journal whose file handle cannot be written to, for exercising the
+    /// failure path with a real IO error rather than a stand-in.
+    async fn read_only_journal() -> (TempDir, PreconfJournal) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // Create the file, then hold it open read-only: `write_all` on it fails
+        // with EBADF, which is as close to a disk refusing a write as a test
+        // gets without a filesystem fixture.
+        let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
+        let ro = OpenOptions::new().read(true).open(&path).await.unwrap();
+        *j.writer.lock().await = ro;
+        (dir, j)
+    }
+
+    /// A write that fails keeps its records for the next attempt.
+    ///
+    /// Losing them outright is what the journal exists to prevent, and the
+    /// caller has moved on — its cursor advanced the moment it handed them over.
+    #[tokio::test]
+    async fn a_failed_write_keeps_its_records_for_the_next_attempt() {
+        let (_dir, j) = read_only_journal().await;
+
+        j.append_batch(&[entry(1, 10), entry(2, 10)]).await.expect_err("the handle is read-only");
+
+        assert_eq!(j.pending_len(), 2, "both records must be held for a retry");
+        let (loaded, _) = j.load().await.unwrap();
+        assert!(loaded.is_empty(), "and none of them reached the file");
+    }
+
+    /// The next successful write carries the held records with it, oldest first.
+    #[tokio::test]
+    async fn the_next_write_carries_what_the_failed_one_held() {
+        let (dir, j) = read_only_journal().await;
+        j.append_batch(&[entry(1, 10)]).await.expect_err("the handle is read-only");
+
+        // The disk comes back.
+        let writable =
+            OpenOptions::new().append(true).open(dir.path().join("preconf.jsonl")).await.unwrap();
+        *j.writer.lock().await = writable;
+
+        j.append_batch(&[entry(2, 10)]).await.expect("the handle writes again");
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.hash).collect::<Vec<_>>(),
+            vec![entry(1, 10).hash, entry(2, 10).hash],
+            "the held record goes first, keeping the file in execution order",
+        );
+        assert_eq!(bad, 0);
+        assert_eq!(j.pending_len(), 0, "and the buffer is empty again");
+    }
+
+    /// A write that stopped mid-line does not cost the record that follows it.
+    ///
+    /// `write_all` can fail partway, leaving a line without its newline. The
+    /// retry appends behind it, and without something to close the line the two
+    /// fuse into one unparseable record — losing the held one as well as the
+    /// truncated one.
+    #[tokio::test]
+    async fn a_retry_does_not_fuse_onto_a_half_written_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // A line that stops mid-record, exactly as an interrupted write leaves it.
+        std::fs::write(&path, br#"{"hash":"0x12"#).unwrap();
+
+        let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
+        // Hold a record back, the way a failed write does.
+        let ro = OpenOptions::new().read(true).open(&path).await.unwrap();
+        *j.writer.lock().await = ro;
+        let held = entry(1, 10);
+        j.append_batch(std::slice::from_ref(&held)).await.expect_err("the handle is read-only");
+        assert_eq!(j.pending_len(), 1);
+
+        // The disk comes back and the retry lands.
+        let writable = OpenOptions::new().append(true).open(&path).await.unwrap();
+        *j.writer.lock().await = writable;
+        let fresh = entry(2, 10);
+        j.append_batch(std::slice::from_ref(&fresh)).await.expect("writes again");
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.hash).collect::<Vec<_>>(),
+            vec![held.hash, fresh.hash],
+            "the truncated line must cost only itself",
+        );
+        assert_eq!(bad, 1, "and it is still counted as the corrupt line it is");
+    }
+
+    /// The buffer stops at its capacity, and the records it drops are the ones
+    /// offered first — theirs are the blocks most likely sealed by now.
+    ///
+    /// Offered as one batch rather than one call each: eviction is what is under
+    /// test, and forty-five thousand failed writes would be a slow way to reach
+    /// it.
+    #[tokio::test]
+    async fn a_full_buffer_drops_its_oldest_records() {
+        let (_dir, j) = read_only_journal().await;
+        let overflow = 3usize;
+        let offered: Vec<JournalEntry> = (0..PENDING_CAPACITY + overflow)
+            .map(|i| JournalEntry {
+                hash: TxHash::from(alloy_primitives::U256::from(i as u64).to_be_bytes()),
+                ..entry(0, 10)
+            })
+            .collect();
+
+        j.append_batch(&offered).await.expect_err("the handle is read-only");
+
+        assert_eq!(j.pending_len(), PENDING_CAPACITY, "the buffer stops at its capacity");
+        let oldest_line = j.pending.lock().front().cloned().expect("buffer is not empty");
+        let oldest: JournalEntry = serde_json::from_slice(oldest_line.trim_ascii_end()).unwrap();
+        assert_eq!(
+            oldest.hash, offered[overflow].hash,
+            "the records dropped are the ones offered first",
+        );
+    }
+
+    /// Fill a buffer through the real eviction rule at a budget a test can
+    /// afford, and report what survived.
+    fn fill(sizes: &[usize], max_count: usize, max_bytes: usize) -> (VecDeque<Vec<u8>>, u64) {
+        let mut pending = VecDeque::new();
+        let mut bytes = 0usize;
+        let mut dropped = 0u64;
+        for (i, &len) in sizes.iter().enumerate() {
+            let line = vec![i as u8; len];
+            dropped += evict_to_fit(&mut pending, &mut bytes, line.len(), max_count, max_bytes);
+            bytes += line.len();
+            pending.push_back(line);
+        }
+        (pending, dropped)
+    }
+
+    /// The byte fuse bites when the record count never would.
+    ///
+    /// The count is the limit to reason with, but it says nothing about memory:
+    /// at the pool's 128 KiB per transaction a full buffer is gigabytes.
+    #[test]
+    fn the_byte_fuse_evicts_where_the_count_limit_would_not() {
+        let (pending, dropped) = fill(&[100, 100, 100, 100], 1_000, 300);
+
+        assert_eq!(pending.len(), 3, "only three hundred bytes may be held");
+        assert_eq!(dropped, 1);
+        assert_eq!(pending.front().expect("non-empty")[0], 1, "and the oldest is what went");
+    }
+
+    /// The count still bites first at the sizes ordinary traffic produces —
+    /// which is what makes it the limit worth reasoning about.
+    #[test]
+    fn the_count_limit_bites_first_at_ordinary_sizes() {
+        let (pending, dropped) = fill(&[100; 6], 4, 1_000_000);
+
+        assert_eq!(pending.len(), 4);
+        assert_eq!(dropped, 2);
+    }
+
+    /// A record larger than the whole budget is still held: evicting to empty
+    /// and dropping it too would keep nothing at all.
+    #[test]
+    fn a_record_larger_than_the_budget_is_still_held() {
+        let (pending, _) = fill(&[5_000], 1_000, 300);
+
+        assert_eq!(pending.len(), 1);
+    }
+
     /// A batch counts toward the size cap exactly as the same entries appended
     /// one at a time would — otherwise a slicing node would never rotate.
     #[tokio::test]
@@ -1116,6 +1419,8 @@ mod tests {
             max_size: 0,
             size_bytes: AtomicU64::new(0),
             rotate_notify: Notify::new(),
+            pending: SyncMutex::new(VecDeque::new()),
+            pending_bytes: AtomicUsize::new(0),
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());
@@ -1439,6 +1744,55 @@ mod tests {
         c.mark_committed(&hash, LANDED_AT);
         assert!(c.release_unless_committed(&hash), "the watermark must make it releasable");
         assert!(!c.is_tracked(&hash));
+    }
+
+    /// What a restart costs, at the volume slicing produces.
+    ///
+    /// Journaling pool transactions takes the file from a handful of entries per
+    /// block to roughly a block's worth, and rotation only clears it once a
+    /// minute — so a restart can face tens of thousands of entries, each one
+    /// decoded, claimed and offered to the pool before the node serves anything.
+    ///
+    /// Not an assertion about wall-clock time, which would be a flaky test on
+    /// shared CI. It prints, so the number can be read off a run and recorded;
+    /// what it *guards* is that restore stays linear — the two volumes differ by
+    /// 10x, and anything quadratic in the entry count would show up as 100x.
+    #[tokio::test]
+    async fn restore_cost_grows_with_the_entry_count_not_faster() {
+        async fn restore_n(n: usize) -> std::time::Duration {
+            let (_dir, journal) = fresh_journal().await;
+            let entries: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut e = entry(0, 10);
+                    // Distinct hashes; the restore pre-pass keys on them.
+                    e.hash = TxHash::from(alloy_primitives::U256::from(i as u64).to_be_bytes());
+                    e
+                })
+                .collect();
+            journal.append_batch(&entries).await.unwrap();
+
+            let pool = StubPool::new();
+            let chain = landed();
+            let fifo = Arc::new(PreconfTxSet::new(1 << 16));
+            let classifier = empty_classifier();
+
+            let started = std::time::Instant::now();
+            restore_preconf_state(&journal, &pool, &chain, &fifo, &classifier).await;
+            started.elapsed()
+        }
+
+        let small = restore_n(1_000).await;
+        let large = restore_n(10_000).await;
+        println!("restore: 1k entries {small:?}, 10k entries {large:?}");
+
+        // 10x the entries, generously under 40x the time. A quadratic restore
+        // would be near 100x and trip this; ordinary scheduling noise will not.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::EPSILON);
+        assert!(
+            ratio < 40.0,
+            "restore should stay roughly linear in the entry count; 1k took {small:?}, \
+             10k took {large:?} ({ratio:.1}x)",
+        );
     }
 
     #[tokio::test]

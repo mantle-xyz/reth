@@ -11,6 +11,8 @@ use alloy_primitives::Address;
 use reth_optimism_payload_builder::builder::ExecutionInfo as OpExecutionInfo;
 use reth_primitives_traits::SignedTransaction;
 
+use crate::journal::JournalEntry;
+
 /// The upstream execution counters, plus what slicing a block needs on top.
 ///
 /// Transactions are kept whole rather than as encodings: assembling a slice
@@ -34,6 +36,7 @@ pub struct ExecutionInfo<T> {
     /// in execution order. Positions rather than copies: the transaction is
     /// already held once, and a second copy is a pair that can fall out of step.
     journalable: Vec<usize>,
+    /// How far into `journalable` the journal has been handed records.
     journaled_upto: usize,
 }
 
@@ -93,19 +96,28 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
         &self.executed
     }
 
-    /// What has been executed but not yet written to the journal, in execution
-    /// order.
+    /// The journal records for everything executed since the last call, and
+    /// moves past them in the same step.
     ///
-    /// Tracked separately from publishing: a slice is journaled before it is
-    /// sent, so one dropped by the cancel guard is already on disk and must not
-    /// be written again when the next slice carries its transactions.
-    pub fn pending_journal(&self) -> impl Iterator<Item = &Recovered<T>> {
-        self.journalable[self.journaled_upto..].iter().map(|&at| &self.executed[at])
-    }
-
-    /// Mark everything executed so far as written to the journal.
-    pub fn advance_journal_cursor(&mut self) {
+    /// One operation rather than a read and an advance, because there is no
+    /// correct way to do one without the other: records left behind are written
+    /// twice, records skipped are never written at all. Repeating a handover is
+    /// the journal's own business — it keeps what a write could not place and
+    /// carries it forward — so a record leaves here exactly once, whether or not
+    /// the disk took it.
+    ///
+    /// Separate from the publish cursor because the two diverge: a slice dropped
+    /// by the cancel guard was handed over all the same.
+    pub fn take_journal_records(&mut self, block_height: u64) -> Vec<JournalEntry> {
+        let records = self.journalable[self.journaled_upto..]
+            .iter()
+            .map(|&at| {
+                let tx = &self.executed[at];
+                JournalEntry::for_executed(*tx.tx_hash(), tx, block_height)
+            })
+            .collect();
         self.journaled_upto = self.journalable.len();
+        records
     }
 
     /// The highest nonce executed this block per sender.
@@ -251,26 +263,27 @@ mod tests {
         info.record_journalable(tx(sender(0xbb), 1));
         info.record(tx(sender(0xcc), 2));
 
-        let pending: Vec<_> = info.pending_journal().collect();
+        let records = info.take_journal_records(7);
 
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].signer(), sender(0xbb));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].hash, *info.executed()[1].tx_hash());
+        assert_eq!(records[0].block_height, 7);
         assert_eq!(info.executed().len(), 3, "all three still executed, in order");
     }
 
-    /// The journal cursor tracks the file, the publish cursor tracks the wire.
-    /// A slice assembled and then dropped by the cancel guard has already been
-    /// journaled — its transactions must not be written a second time when the
-    /// next slice carries them.
+    /// The journal cursor tracks what has been handed over, the publish cursor
+    /// what reached subscribers. A slice dropped by the cancel guard was handed
+    /// to the journal all the same, so its transactions must not be offered
+    /// again when the next slice carries them.
     #[test]
     fn a_dropped_slice_does_not_journal_its_transactions_twice() {
         let mut info = Info::default();
         info.record_journalable(tx(sender(0xaa), 0));
 
         // The slice was journaled, then dropped before it went out.
-        info.advance_journal_cursor();
+        assert_eq!(info.take_journal_records(7).len(), 1);
 
-        assert!(info.pending_journal().next().is_none(), "already on disk");
+        assert!(info.take_journal_records(7).is_empty(), "already handed over");
         assert_eq!(info.pending_slice().len(), 1, "but never published");
     }
 
@@ -279,13 +292,14 @@ mod tests {
         let mut info = Info::default();
         info.record_journalable(tx(sender(0xaa), 0));
         info.record(tx(sender(0xbb), 0));
-        info.advance_journal_cursor();
+        info.take_journal_records(7);
         info.record_journalable(tx(sender(0xaa), 1));
         info.record_journalable(tx(sender(0xaa), 2));
 
-        let pending: Vec<_> = info.pending_journal().map(|tx| tx.nonce()).collect();
+        let taken: Vec<_> = info.take_journal_records(7).iter().map(|r| r.hash).collect();
+        let expected: Vec<_> = info.executed()[2..].iter().map(|tx| *tx.tx_hash()).collect();
 
-        assert_eq!(pending, vec![1, 2]);
+        assert_eq!(taken, expected, "in execution order, and only the new ones");
     }
 
     /// The pool is told a sender's nonce has moved on. Only the highest one
