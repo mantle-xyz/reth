@@ -1176,6 +1176,7 @@ impl SliceState {
         P: reth_storage_api::StateProvider,
         N::SignedTx: SignedTransaction,
     {
+        // Before the publish below, always. See this function's docs.
         if let Some(journal) = journal {
             let entries = info.take_journal_records(ctx.parent().number() + 1);
             if let Err(err) = journal.append_batch(&entries).await {
@@ -1192,6 +1193,14 @@ impl SliceState {
     }
 
     /// Assemble and publish everything executed since the last slice.
+    ///
+    /// **Reached through [`Self::journal_and_publish`], and not otherwise.** A
+    /// slice's records go to the journal first so that nothing is announced
+    /// that has not already been written down; announcing first leaves a window
+    /// in which a crash costs subscribers transactions they were shown. Calling
+    /// this directly skips that, and nothing in the type system says so — the
+    /// order is two statements in one function, and this note is what keeps
+    /// them in it.
     ///
     /// Never fails the build. Publishing a slice is a side channel: a state read
     /// that fell over, or an encoding that did not, costs a slice and leaves its

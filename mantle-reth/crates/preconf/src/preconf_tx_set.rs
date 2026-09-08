@@ -631,7 +631,7 @@ impl PreconfTxSet {
     /// `Waiting → Success`. Called by the builder after a successful EVM apply.
     ///
     /// Terminal for the build that set it — no `mark_*` moves it again, and
-    /// [`Self::forward`] is the only path that drops it (a `Success` entry is
+    /// [`Self::forward_all`] is the only path that drops it (a `Success` entry is
     /// neither replaceable nor reclaimable). The one way out is
     /// [`Self::reset_success_to_waiting`], which the *next* payload job's
     /// carryover preamble uses on a `Success` entry that outlived the block it

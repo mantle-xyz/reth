@@ -101,6 +101,11 @@ macro_rules! build_one_block {
 /// Both halves matter. Without the first, a restart loses a transaction
 /// subscribers were shown. With a deposit in the file, a restart would try to
 /// put a system transaction back into the pool as if a user had sent it.
+///
+/// Asserting it of *every* ordinary transaction in the sealed block also covers
+/// the slices the cancel guard dropped on the way: those were journaled before
+/// the guard ran, and their transactions are carried by a later slice, so a
+/// record going missing with a dropped slice would show up here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pool_transaction_is_journaled_and_the_blocks_deposits_are_not() {
     let sender = Wallet::default().inner.address();

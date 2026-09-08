@@ -297,7 +297,8 @@ impl PreconfJournal {
     ///
     /// An **IO** failure is different: the records are kept for the next write
     /// and `Err` is returned for the caller to log, not to act on. Callers must
-    /// not resend them — see [`Self::write_lines`].
+    /// not resend them: the next write carries them, and a resend would put the
+    /// same record on disk twice once one succeeds.
     pub async fn append_batch(&self, entries: &[JournalEntry]) -> Result<(), JournalError> {
         // Encoded up front, and separately from the write: a record `serde_json`
         // cannot encode will not encode on the next attempt either, so it fails
