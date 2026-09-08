@@ -428,18 +428,12 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
 ///
 /// All three commitments were promised to a client, so all three must land.
 ///
-/// **Currently red, and the failure is the point.** Measured 2026-09-08: only
-/// nonce 0 reaches the block. Dispatch takes nonce 2 first, the account is still
-/// at 0, so the apply is rejected as invalid and the entry goes to `Failed` —
-/// terminal for carryover, revivable only by a same-hash resubmit. Nonce 1 goes
-/// the same way. Two commitments a client holds receipts for disappear without
-/// a trace in the block.
-///
-/// Ignored rather than deleted: the fix is to order the entries by nonce per
-/// sender before they reach the fifo, and this is the test that will show it
-/// working. Remove the attribute then.
-#[ignore = "known defect: out-of-nonce-order journal entries are dropped; \
-            un-ignore once restore sorts per sender"]
+/// Read the file in that order and only nonce 0 arrives: nonce 2 goes first
+/// against an account still at 0, is rejected as invalid, and lands in `Failed`
+/// — terminal for carryover, revivable only by a same-hash resubmit. Nonce 1
+/// goes the same way, and two commitments a client holds receipts for disappear.
+/// What keeps that from happening is the carryover preamble ordering each
+/// sender's entries by nonce before dispatch sees them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn journal_replay_out_of_nonce_order_still_lands_every_commitment() {
     let recipient: Address = RECIPIENT.parse().unwrap();

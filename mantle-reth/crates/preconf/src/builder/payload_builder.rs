@@ -13,7 +13,7 @@
 //!
 //! [`OpPayloadBuilderCtx`]: reth_optimism_payload_builder::builder::OpPayloadBuilderCtx
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_consensus::{
     BlockHeader, Sealable, Transaction, TxEnvelope, TxReceipt, Typed2718, transaction::Recovered,
@@ -77,6 +77,7 @@ use crate::{
         build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
     },
     journal::PreconfJournal,
+    preconf_tx_set::TxEntryView,
     types::{PreconfError, PreconfReceipt, PreconfSource},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
 };
@@ -763,13 +764,13 @@ where
 /// helper free of EVM/builder types and unit-testable.
 async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
     use crate::types::PreconfStatus;
-    let mut carryover_hashes = Vec::new();
+    let mut carryover = Vec::new();
     for view in fifo.entries().await {
         match view.status {
-            PreconfStatus::Waiting => carryover_hashes.push(view.hash),
+            PreconfStatus::Waiting => carryover.push(view),
             PreconfStatus::Success => {
                 if fifo.reset_success_to_waiting(&view.hash).await.is_ok() {
-                    carryover_hashes.push(view.hash);
+                    carryover.push(view);
                 }
             }
             // Terminal for carryover purposes: dispatch gave up on these after
@@ -779,7 +780,42 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
             PreconfStatus::Failed | PreconfStatus::Timeout | PreconfStatus::Canceled => {}
         }
     }
-    carryover_hashes
+    ordered_for_dispatch(&carryover)
+}
+
+/// Order carried-over commitments: each sender's by nonce, senders in the order
+/// they first appear.
+///
+/// The fifo records the order commitments were made, and that order decides who
+/// lands when a block fills up — so senders keep it. Sorting by address instead
+/// would hand a standing advantage to whoever holds the lower one.
+///
+/// What the fifo cannot record is that one sender's transactions execute only
+/// in nonce order. Its own order is arrival order, and for entries restored from
+/// the journal that is the order two writers with different latencies happened
+/// to leave them in: a commitment is recorded from its apply, a pool transaction
+/// from the slice that carries it, so one sender's consecutive nonces can land
+/// in the file the wrong way round. Dispatched that way the higher nonce is
+/// rejected as invalid, and for a carried-over entry that rejection is terminal
+/// — a commitment broken with no second attempt.
+///
+/// Only the carryover preamble needs this. It is the sole way a restored entry
+/// reaches dispatch: restore runs before any build, so its fifo notifications
+/// reach no subscriber, and by the time the broadcast arm's `Lagged` rescan sees
+/// those entries the preamble has already decided them and the dedup gate
+/// short-circuits. Entries pushed during a build arrive one at a time, in the
+/// order the pool admitted them.
+fn ordered_for_dispatch(carryover: &[TxEntryView]) -> Vec<TxHash> {
+    let mut first_seen: HashMap<Address, usize> = HashMap::new();
+    let mut ordered: Vec<(usize, u64, TxHash)> = Vec::with_capacity(carryover.len());
+    for (position, view) in carryover.iter().enumerate() {
+        let sender_rank = *first_seen.entry(view.from).or_insert(position);
+        ordered.push((sender_rank, view.nonce, view.hash));
+    }
+    // Stable, so two entries claiming one (sender, nonce) keep the order the
+    // fifo had them in — which of them wins is not this function's to decide.
+    ordered.sort_by_key(|&(sender_rank, nonce, _)| (sender_rank, nonce));
+    ordered.into_iter().map(|(_, _, hash)| hash).collect()
 }
 
 /// Outcome of one iteration of the pool best-tx step inside the
@@ -1930,6 +1966,83 @@ mod tests {
         assert_eq!(
             fifo.find_by_hash(t_journal.tx_hash()).await.unwrap().source,
             PreconfSource::Replay,
+        );
+    }
+
+    /// One sender's carried-over transactions go out in nonce order, whatever
+    /// order the fifo holds them in.
+    ///
+    /// They only execute in that order. A higher nonce reaching the builder
+    /// first is rejected as invalid, and for a carried-over entry that rejection
+    /// is terminal — the commitment is broken with no second attempt.
+    #[tokio::test]
+    async fn carryover_orders_one_senders_transactions_by_nonce() {
+        let fifo = PreconfTxSet::new(16);
+        let sender = Address::from([1; 20]);
+        // Pushed newest-nonce-first, as two writers with different latencies
+        // leave them in the journal.
+        let mut by_nonce = Vec::new();
+        for nonce in [2u64, 1, 0] {
+            let t = tx(0xd0 + nonce as u8, nonce);
+            by_nonce.push((nonce, *t.tx_hash()));
+            fifo.push_if_absent(t, sender, PreconfSource::Replay).await;
+        }
+        by_nonce.sort_by_key(|(nonce, _)| *nonce);
+
+        let carryover = replay_fifo_carryover(&fifo).await;
+
+        assert_eq!(
+            carryover,
+            by_nonce.iter().map(|(_, hash)| *hash).collect::<Vec<_>>(),
+            "a sender's transactions must reach the builder in nonce order",
+        );
+    }
+
+    /// Senders keep the order they first appear in, which is the order their
+    /// commitments were made — not the order their addresses happen to sort in.
+    ///
+    /// That order decides who lands when a block fills up, so sorting by address
+    /// would hand a standing advantage to whoever holds the lower one.
+    #[tokio::test]
+    async fn carryover_keeps_senders_in_the_order_they_first_appear() {
+        let fifo = PreconfTxSet::new(16);
+        // High address first, so an address sort would swap them.
+        let early = Address::from([0xee; 20]);
+        let late = Address::from([0x11; 20]);
+        let first = tx(0xe0, 0);
+        let second = tx(0xe1, 0);
+        fifo.push_if_absent(first.clone(), early, PreconfSource::Rpc).await;
+        fifo.push_if_absent(second.clone(), late, PreconfSource::Rpc).await;
+
+        let carryover = replay_fifo_carryover(&fifo).await;
+
+        assert_eq!(
+            carryover,
+            vec![*first.tx_hash(), *second.tx_hash()],
+            "the sender that committed first still goes first",
+        );
+    }
+
+    /// Both rules at once: nonces gathered under their sender, senders in the
+    /// order they first appear.
+    #[tokio::test]
+    async fn carryover_gathers_each_senders_nonces_without_reordering_senders() {
+        let fifo = PreconfTxSet::new(16);
+        let a = Address::from([0xaa; 20]);
+        let b = Address::from([0x0b; 20]);
+        let a1 = tx(0xf1, 1);
+        let b0 = tx(0xf2, 0);
+        let a0 = tx(0xf3, 0);
+        fifo.push_if_absent(a1.clone(), a, PreconfSource::Replay).await;
+        fifo.push_if_absent(b0.clone(), b, PreconfSource::Replay).await;
+        fifo.push_if_absent(a0.clone(), a, PreconfSource::Replay).await;
+
+        let carryover = replay_fifo_carryover(&fifo).await;
+
+        assert_eq!(
+            carryover,
+            vec![*a0.tx_hash(), *a1.tx_hash(), *b0.tx_hash()],
+            "sender A appeared first so it stays first, and its nonce 0 precedes its nonce 1",
         );
     }
 
