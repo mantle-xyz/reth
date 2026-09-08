@@ -149,7 +149,7 @@ async fn canon_commit_permits_next_nonce_from_same_sender() {
 /// nonce in one canon step — not just the single-nonce case covered by
 /// `canon_commit_permits_next_nonce_from_same_sender`.
 ///
-/// Regression guard: an off-by-one in `fifo.forward(sender, max+1)`
+/// Regression guard: an off-by-one in the canon-forward's `max+1`
 /// (e.g. using `min` instead of `max`, or `<=` instead of `<`) would
 /// either leave stale entries or drop the wrong ones, and would only
 /// surface in the multi-nonce case.

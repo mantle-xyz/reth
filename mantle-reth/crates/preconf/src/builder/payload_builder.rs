@@ -724,23 +724,30 @@ where
 /// slot N, so a new build could observe stale `Success` entries and
 /// incorrectly replay them via `reset_success_to_waiting`).
 ///
-/// Iterates the fifo once to collect the set of unique senders, queries
-/// each sender's on-chain nonce from the parent-block state provider,
-/// and calls [`PreconfTxSet::forward`] per sender. Idempotent — a
-/// sender with no fifo entries or all entries at `nonce ≥ on_chain_nonce`
-/// results in a no-op forward.
+/// Reads the senders holding entries, asks the parent-block state for each of
+/// their nonces, and drops everything those nonces have passed in one sweep.
+/// Idempotent — a sender with no entries, or none below its on-chain nonce,
+/// costs nothing.
+///
+/// Both halves are deliberately whole-fifo rather than per-sender. Asking for
+/// the senders alone avoids cloning a view of every entry, and one sweep avoids
+/// re-reading every entry once per sender — which is nothing at the handful of
+/// commitments preconf alone holds, and quadratic at the tens of thousands a
+/// journal replay can restore.
 async fn sync_fifo_forward_to_head<S>(fifo: &PreconfTxSet, state_provider: &S)
 where
     S: reth_storage_api::StateProvider + ?Sized,
 {
-    use std::collections::HashSet;
-    let entries = fifo.entries().await;
-    let senders: HashSet<Address> = entries.iter().map(|e| e.from).collect();
-    drop(entries);
-    for sender in senders {
-        let on_chain_nonce = state_provider.account_nonce(&sender).ok().flatten().unwrap_or(0);
-        fifo.forward(&sender, on_chain_nonce).await;
-    }
+    let heads: HashMap<Address, u64> = fifo
+        .senders()
+        .await
+        .into_iter()
+        .map(|sender| {
+            let nonce = state_provider.account_nonce(&sender).ok().flatten().unwrap_or(0);
+            (sender, nonce)
+        })
+        .collect();
+    fifo.forward_all(&heads).await;
 }
 
 /// Preamble that walks the fifo snapshot in insertion order and returns the
