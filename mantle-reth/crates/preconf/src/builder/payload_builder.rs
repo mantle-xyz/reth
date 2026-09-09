@@ -896,6 +896,9 @@ where
         tx.gas_limit(),
         constraints.da_footprint_gas_scalar,
     ) {
+        // The block's own ceilings, not a slice's — this one says the block is
+        // full, where the allowance rejection below says only that this slice is.
+        metrics::counter!("preconf.build.tx_over_block_limits_total").increment(1);
         best_txs.mark_invalid(tx.signer(), tx.nonce());
         return Ok(BestTxStep::Continue);
     }
@@ -923,6 +926,11 @@ where
         // hold them back for the rest of the block. The iterator is rebuilt at
         // the next boundary, so the skip lasts one slice and this transaction
         // gets another chance against a larger allowance.
+        //
+        // The one rejection slicing introduces, and the one to watch: a rate
+        // that climbs means the per-slice allowance is holding transactions
+        // back that the block itself had room for.
+        metrics::counter!("flashblock.slice_allowance_exhausted_total").increment(1);
         best_txs.mark_invalid(tx.signer(), tx.nonce());
         return Ok(BestTxStep::Continue);
     };
@@ -932,7 +940,12 @@ where
         Ok(g) => g,
         Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { error, .. })) => {
             pacer.cancel(ticket);
-            if !error.is_nonce_too_low() {
+            // A nonce already used is the pool being behind the block, which
+            // the next boundary corrects; anything else is the transaction.
+            if error.is_nonce_too_low() {
+                metrics::counter!("preconf.build.tx_nonce_already_used_total").increment(1);
+            } else {
+                metrics::counter!("preconf.build.tx_rejected_by_evm_total").increment(1);
                 best_txs.mark_invalid(tx.signer(), tx.nonce());
             }
             return Ok(BestTxStep::Continue);
@@ -1109,6 +1122,10 @@ impl<P: reth_storage_api::AccountReader + ?Sized> SenderBalances for ProviderBal
 /// subscriber tell a gap from a fresh start.
 struct SliceState {
     producer: FlashblocksProducer,
+    /// When this block's build began, for the first slice's offset.
+    opened_at: std::time::Instant,
+    /// When the previous slice went out, for the gap to the next.
+    last_published: Option<std::time::Instant>,
     /// Established by the first slice of this block, then reused.
     invariants: Option<BlockInvariants>,
     next_index: u64,
@@ -1135,7 +1152,14 @@ impl SliceState {
                 }
             });
 
-        Self { producer: producer.clone(), invariants: None, next_index: 0, previous }
+        Self {
+            producer: producer.clone(),
+            opened_at: std::time::Instant::now(),
+            last_published: None,
+            invariants: None,
+            next_index: 0,
+            previous,
+        }
     }
 
     /// Write this slice's transactions to the journal, then publish it.
@@ -1179,7 +1203,13 @@ impl SliceState {
         // Before the publish below, always. See this function's docs.
         if let Some(journal) = journal {
             let entries = info.take_journal_records(ctx.parent().number() + 1);
-            if let Err(err) = journal.append_batch(&entries).await {
+            // The one part of a slice that touches the disk, and the one that
+            // could put a tick over its interval.
+            let started = std::time::Instant::now();
+            let write = journal.append_batch(&entries).await;
+            metrics::histogram!("flashblock.journal_write_duration_ms")
+                .record(started.elapsed().as_secs_f64() * 1000.0);
+            if let Err(err) = write {
                 warn!(
                     target: "mantle::preconf::flashblocks",
                     %err,
@@ -1270,6 +1300,11 @@ impl SliceState {
 
         match sent {
             None => {
+                // The guard did its job: the payload was resolved between
+                // assembling this slice and sending it. Expected under load,
+                // and a rate that climbs says slices are being assembled too
+                // close to the deadline.
+                metrics::counter!("flashblock.dropped_after_resolve_total").increment(1);
                 debug!(
                     target: "mantle::preconf::flashblocks",
                     index = self.next_index,
@@ -1288,6 +1323,18 @@ impl SliceState {
             }
             Some(Ok(_)) => {}
         }
+
+        // How far apart subscribers actually see slices — the tick interval is
+        // what was asked for, this is what happened. The first slice of a block
+        // has no predecessor to measure against and is reported separately.
+        let now = std::time::Instant::now();
+        match self.last_published {
+            Some(previous) => metrics::histogram!("flashblock.publish_interval_ms")
+                .record(now.duration_since(previous).as_secs_f64() * 1000.0),
+            None => metrics::histogram!("flashblock.first_slice_offset_ms")
+                .record(now.duration_since(self.opened_at).as_secs_f64() * 1000.0),
+        }
+        self.last_published = Some(now);
 
         // Only now, and only on the path where the slice actually went out.
         // Settling a slice that was dropped would leave its transactions in no
@@ -1803,6 +1850,15 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             }
         }
 
+        if let Some(state) = slices.as_ref() {
+            // What the budget divided the block into is `tick_count`; this is
+            // what the block actually produced. They part company when a build
+            // starts early or late, which the budget allows for by design — a
+            // distribution that stops matching the configured interval is the
+            // signal, not any single block.
+            metrics::histogram!("flashblock.slices_per_block").record(state.next_index as f64);
+        }
+
         // ── Stage 3b: hand back what a build nobody used took ──────────
         // Slicing prunes each slice's transactions as it goes out, half a slot
         // before the block could be canonical, and tells the pool their senders
@@ -1824,6 +1880,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 .collect();
             if !returning.is_empty() {
                 let handed_back = returning.len();
+                metrics::counter!("flashblock.returned_to_pool_total")
+                    .increment(handed_back as u64);
                 // Best effort: the pool may refuse some of them on its own
                 // terms, which is its right — being asked is what matters.
                 let _ = self.pool.add_external_transactions(returning).await;

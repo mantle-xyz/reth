@@ -231,7 +231,19 @@ where
             ctx.task_executor().spawn_task(async move {
                 // Holds the endpoint open for as long as it is served.
                 let _endpoint = handles;
+                metrics::gauge!("flashblock.endpoint_serving").set(1.0);
                 accepting.await;
+                // Only reached if the loop returns, which it is not expected to.
+                // The task is not critical — broadcast is a side channel and its
+                // failure should not take the node down — and the executor names
+                // only critical tasks, so nothing else would say the endpoint
+                // stopped answering. Subscribers would simply stop reconnecting
+                // successfully, with the node otherwise healthy.
+                metrics::gauge!("flashblock.endpoint_serving").set(0.0);
+                tracing::error!(
+                    target: "mantle::preconf::flashblocks",
+                    "flashblocks accept loop returned; the endpoint is no longer served",
+                );
             });
             tracing::info!(
                 target: "mantle::preconf::flashblocks",

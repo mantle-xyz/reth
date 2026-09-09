@@ -189,6 +189,18 @@ where
         let (pending_nonce, committed_cost) =
             self.pool.get_pending_nonce_and_cumulative_cost(sender, on_chain_nonce);
         if nonce > pending_nonce {
+            // Ordinarily the client's own doing — a nonce ahead of what they
+            // have pending. Slicing adds a way for it to be ours: pruning at a
+            // slice boundary drops the pool's record of a sender whose
+            // transactions have all left it, and until the boundary's nonce
+            // correction lands, a request that should pass reads as a gap.
+            //
+            // The two cannot be told apart here. What the pool hands back is a
+            // nonce, not a reason. So this counts both, and what says the second
+            // is happening is the shape: a rate that moves with slicing being
+            // switched on, or that clusters inside a block rather than spreading
+            // across senders.
+            metrics::counter!("preconf.rpc.nonce_gap_rejected_total").increment(1);
             debug!(target: "mantle::preconf::rpc", ?sender, ?nonce, ?pending_nonce, "nonce gap rejected");
             return Err(preconf_error_to_rpc(&PreconfError::NonceGap {
                 tx_nonce: nonce,

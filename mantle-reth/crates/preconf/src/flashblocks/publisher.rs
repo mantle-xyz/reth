@@ -108,6 +108,9 @@ impl PublisherHandle {
     pub fn publish(&self, payload: &MantleFlashblockPayload) -> Result<usize, serde_json::Error> {
         let json = serde_json::to_string(payload)?;
         let size = json.len();
+        // Against the decoder's 5 MiB ceiling, and the input to whether
+        // compression is worth adding to the wire.
+        metrics::histogram!("flashblock.byte_size").record(size as f64);
         let text = Utf8Bytes::from(json);
         let position = FlashblockPosition {
             block_number: payload.metadata.block_number,

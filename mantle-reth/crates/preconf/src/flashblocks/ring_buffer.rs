@@ -44,8 +44,18 @@ impl FlashblockRingBuffer {
     /// land. Dropping them also keeps positions ascending, which the lookups
     /// below rely on.
     pub fn push(&mut self, position: FlashblockPosition, payload: Utf8Bytes) {
+        // A slice at or past this position was published by a build that is
+        // being replaced — the only point at which something a subscriber may
+        // already hold stops being true. Counted because nothing else says it
+        // happened: the replacement carries `base` and restarts at index zero,
+        // which reads as a fresh block rather than as a retraction.
+        let mut superseded = 0u64;
         while self.entries.back().is_some_and(|(stored, _)| *stored >= position) {
             self.entries.pop_back();
+            superseded += 1;
+        }
+        if superseded > 0 {
+            metrics::counter!("flashblock.superseded_slices_total").increment(superseded);
         }
         if self.entries.len() == self.capacity {
             self.entries.pop_front();

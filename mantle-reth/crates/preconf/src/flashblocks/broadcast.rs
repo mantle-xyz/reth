@@ -94,6 +94,8 @@ pub(crate) async fn serve_subscriber(
     ring: Arc<RwLock<FlashblockRingBuffer>>,
     cancel: CancellationToken,
 ) {
+    let subscribers = Subscription::join();
+
     // The resume position lives in the upgrade request, which the handshake
     // consumes: once it returns, the stream no longer carries it. The callback
     // writes it out on the way past.
@@ -154,7 +156,42 @@ pub(crate) async fn serve_subscriber(
     }
 
     let exit = pump_live(&mut stream, &mut receiver, &cancel).await;
+    subscribers.leave(&exit);
     debug!(target: "mantle::preconf::flashblocks", ?exit, "subscription ended");
+}
+
+/// Counts one live subscription for as long as it is held.
+///
+/// A guard rather than a pair of calls: the subscription has several ways out —
+/// a failed handshake, a replay that could not be delivered, the client going
+/// away — and a gauge that only comes down on some of them drifts upward until
+/// it says the endpoint is busier than it is.
+struct Subscription;
+
+impl Subscription {
+    fn join() -> Self {
+        metrics::gauge!("flashblock.subscribers").increment(1.0);
+        Self
+    }
+
+    /// Record how the subscription ended, before dropping the count.
+    fn leave(self, exit: &SubscriptionExit) {
+        if let SubscriptionExit::Lagged(skipped) = exit {
+            // The subscriber could not keep up and was cut off rather than
+            // handed a stream with holes in it. Its reconnect replays from the
+            // archive, so this is recoverable — but a rising rate says the
+            // channel is too small for the traffic, or the subscriber too slow.
+            metrics::counter!("flashblock.slow_subscriber_dropped_total").increment(1);
+            metrics::counter!("flashblock.slices_missed_by_slow_subscribers_total")
+                .increment(*skipped);
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        metrics::gauge!("flashblock.subscribers").decrement(1.0);
+    }
 }
 
 /// Hand over everything published after `cutoff`, in two phases.

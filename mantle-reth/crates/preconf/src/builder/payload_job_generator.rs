@@ -48,6 +48,7 @@ use std::{
 };
 
 use alloy_consensus::TxEnvelope;
+use alloy_primitives::B256;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth_optimism_evm::ConfigurePostExecEvm;
 use reth_optimism_node::OpBuiltPayload;
@@ -64,7 +65,9 @@ use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::builder::{
-    cancel::JobCancel, payload_builder::PreconfPayloadBuilder, payload_job::PreconfPayloadJob,
+    cancel::{CancelReason, JobCancel},
+    payload_builder::PreconfPayloadBuilder,
+    payload_job::PreconfPayloadJob,
 };
 
 /// `PayloadJobGenerator` impl that spawns the mantle preconf-aware
@@ -92,7 +95,9 @@ pub struct PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
     /// `ensure_only_one_payload`: cancel handle of the most-recently
     /// spawned build. Signalled when the next job is created so at most
     /// one build task is ever live — see [`Self::new_payload_job`].
-    last_cancel: Arc<Mutex<Option<JobCancel>>>,
+    /// The live job's cancel handle and the parent it builds on. The parent
+    /// is what tells a supersede at the same height from ordinary progress.
+    last_cancel: Arc<Mutex<Option<(JobCancel, B256)>>>,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
     /// constraining `N` itself.
     _pd: PhantomData<fn() -> N>,
@@ -214,12 +219,24 @@ where
         // `ensure_only_one_payload`: cancel the previously spawned build so at
         // most one is ever live (rationale in the module docs). Idempotent in
         // steady state — the previous job was already cancelled by `resolve_kind`.
-        if let Some(prev) = self
+        if let Some((prev, prev_parent)) = self
             .last_cancel
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace(cancel.clone())
+            .replace((cancel.clone(), parent_hash))
         {
+            // A job on the same parent is a second attempt at one height, so
+            // whatever the first produced is not what the chain took. Counted
+            // only when that first attempt had been asked for: a payload nobody
+            // asked for hands its transactions back at the end of its build,
+            // and one that was asked for does not — which leaves this the only
+            // sign that a block's worth of them went nowhere.
+            //
+            // A job on a *different* parent is ordinary progress and says
+            // nothing about the last block either way.
+            if prev_parent == parent_hash && prev.reason() == Some(CancelReason::Resolved) {
+                metrics::counter!("preconf.build.resolved_payload_superseded_total").increment(1);
+            }
             // The previous job's work is being thrown away — a later job for
             // the same height supersedes it. Idempotent in steady state: if the
             // consensus layer already asked for that payload, its reason is
@@ -276,6 +293,11 @@ where
                     }
                 }
                 Ok(Err(err)) => {
+                    // The panic arm below has always been counted; this one was
+                    // not, which made "the build failed" invisible to anything
+                    // reading metrics — and a build that returns an error is the
+                    // more likely of the two.
+                    metrics::counter!("preconf.build.failed_total").increment(1);
                     warn!(
                         target: "mantle::preconf::payload_job_generator",
                         ?err,

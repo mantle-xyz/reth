@@ -69,6 +69,15 @@ pub fn derive_slice_schedule(
     // dropping it; the floor of one keeps a passed deadline buildable.
     let tick_count = drift_ms.div_ceil(interval_ms).max(1);
 
+    // No window left to divide, so the floor above is what produced the one
+    // tick rather than the arithmetic. The block still gets built — Mantle
+    // seals on its own rather than waiting for the consensus layer — but its
+    // whole gas limit opens at once, which is the budget doing nothing.
+    // Counted because it is otherwise indistinguishable from a normal block.
+    if drift_ms == 0 {
+        metrics::counter!("flashblock.deadline_already_passed_total").increment(1);
+    }
+
     // The remainder goes to the first tick so every later one lands on the
     // interval grid. An evenly dividing drift has no remainder to absorb and
     // takes a whole interval instead — except when the window has no length

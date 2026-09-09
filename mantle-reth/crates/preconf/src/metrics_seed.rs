@@ -15,6 +15,19 @@
 /// Counter series. Registered at their true starting value (`0`) —
 /// `increment(0)` never clobbers.
 const COUNTERS: &[&str] = &[
+    "flashblock.slice_allowance_exhausted_total",
+    "preconf.build.failed_total",
+    "preconf.build.resolved_payload_superseded_total",
+    "preconf.build.tx_nonce_already_used_total",
+    "preconf.build.tx_over_block_limits_total",
+    "preconf.build.tx_rejected_by_evm_total",
+    "preconf.rpc.nonce_gap_rejected_total",
+    "flashblock.deadline_already_passed_total",
+    "flashblock.dropped_after_resolve_total",
+    "flashblock.returned_to_pool_total",
+    "flashblock.slices_missed_by_slow_subscribers_total",
+    "flashblock.slow_subscriber_dropped_total",
+    "flashblock.superseded_slices_total",
     "preconf.api.timeout_total",
     "preconf.tx.success_total",
     "preconf.tx.failure_total",
@@ -51,6 +64,8 @@ const COUNTERS: &[&str] = &[
 /// `set(0.0)` here could clobber it back to `0` depending on call ordering; a
 /// zero increment only registers the series, leaving any existing value intact.
 const GAUGES: &[&str] = &[
+    "flashblock.endpoint_serving",
+    "flashblock.subscribers",
     "preconf.fifo.pending",
     "preconf.journal.pending_entries",
     "preconf.journal.size_bytes",
@@ -75,6 +90,11 @@ const GAUGES: &[&str] = &[
 /// almost immediately so the gap is negligible; the list exists mainly so the
 /// drift test covers histograms too.
 const HISTOGRAMS: &[&str] = &[
+    "flashblock.byte_size",
+    "flashblock.first_slice_offset_ms",
+    "flashblock.journal_write_duration_ms",
+    "flashblock.publish_interval_ms",
+    "flashblock.slices_per_block",
     "preconf.api.handle_duration_ms",
     "preconf.execute.duration_ms",
     "preconf.validate.duration_ms",
