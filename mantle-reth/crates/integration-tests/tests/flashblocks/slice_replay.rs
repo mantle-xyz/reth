@@ -263,3 +263,247 @@ async fn a_commitment_and_ordinary_transactions_both_survive_the_restart() {
     drop(first);
     std::fs::remove_dir_all(&journal_dir).ok();
 }
+
+/// A build nobody used gives back what it took from the pool.
+///
+/// Slicing prunes each slice's transactions the moment it goes out, a good half
+/// slot before the block could be canonical. If that build is then thrown away
+/// — superseded by a later job for the same height, timed out, dropped — the
+/// transactions are in no block and no pool, and nothing else brings them back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_nobody_used_gives_back_what_it_pruned() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Held open long enough for the ticker to execute it and prune it away.
+    hold_a_block_open!(node, Duration::from_millis(500));
+
+    // A second job for the same height supersedes the first, which is one of
+    // the ways a build ends up used by nobody.
+    let payload = build_one_block!(node, Duration::from_millis(500));
+
+    assert!(
+        ordinary_transactions(&payload).contains(&hash),
+        "a transaction the abandoned build pruned must be back in the pool for the next one",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// And the sender's nonce comes back with them.
+///
+/// The slice boundary also tells the pool the sender has moved on, which is a
+/// lie once the build is thrown away. The pool discards transactions below the
+/// nonce it holds — discards, not parks — so leaving it raised would cost the
+/// sender everything they send until a real block corrected it.
+///
+/// Nothing sets it back explicitly: re-admitting the transactions overwrites
+/// the sender's record with the nonce the validator reads from the chain. This
+/// asserts the outcome rather than the mechanism, so it holds whichever way the
+/// nonce ends up being restored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_nobody_used_gives_back_the_senders_nonce() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    let first = signed_transfer(&wallet, chain_id, 0).await;
+    node.rpc.inject_tx(first).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    hold_a_block_open!(node, Duration::from_millis(500));
+
+    // Nonce 1 is what the sender would send next if nonce 0 had landed. It did
+    // not — the build that executed it was thrown away — so the pool must still
+    // be expecting nonce 0 and must not discard this one for being behind.
+    let second = signed_transfer(&wallet, chain_id, 1).await;
+    let second_hash = keccak256(&second);
+    node.rpc.inject_tx(second).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = build_one_block!(node, Duration::from_millis(500));
+    let landed = ordinary_transactions(&payload);
+
+    assert!(
+        landed.contains(&second_hash),
+        "the sender's next transaction must survive the abandoned build; landed={landed:?}",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// A build that was used hands nothing back.
+///
+/// Its transactions are in a block on its way to the consensus layer, and the
+/// senders really have moved on. Handing them back would put a block's worth of
+/// transactions into the pool for the next canonical update to take out again,
+/// every block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_that_was_used_hands_nothing_back() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let first = build_one_block!(node, Duration::from_millis(500));
+    assert!(
+        ordinary_transactions(&first).contains(&hash),
+        "precondition: the transaction is in the payload the consensus layer asked for",
+    );
+
+    // The next build starts from the same parent — this harness never makes the
+    // first block canonical — so a transaction handed back would reappear here.
+    let second = build_one_block!(node, Duration::from_millis(500));
+    assert!(
+        !ordinary_transactions(&second).contains(&hash),
+        "a used build must not put its transactions back for the next one to take again",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// With slicing off there is nothing to hand back, and the loop must not go
+/// looking. Nothing prunes mid-build, so the pool never lost anything, and a
+/// hand-back here would be re-admitting transactions the pool still holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_slicing_an_abandoned_build_hands_nothing_back() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id) = crate::launch_preconf_node!(cfg).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    hold_a_block_open!(node, Duration::from_millis(300));
+    let payload = build_one_block!(node, Duration::from_millis(300));
+
+    // It was never pruned, so it is still in the pool and lands exactly once.
+    let landed = ordinary_transactions(&payload);
+    assert_eq!(
+        landed.iter().filter(|h| **h == hash).count(),
+        1,
+        "with nothing pruned there is nothing to give back; landed={landed:?}",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// A commitment is not handed back to the pool.
+///
+/// The fifo holds it and replays it on the next build, which is a path of its
+/// own; putting it back in the pool as well would leave the two arms each
+/// believing they owe the same transaction, and the pool arm skips it anyway
+/// for as long as its verdict stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commitment_is_not_handed_back_to_the_pool() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    hold_a_block_open!(node, Duration::from_millis(200));
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    send_preconf(&http, raw).await.expect("the commitment is accepted");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The build above is abandoned by this one, which rebuilds the same height.
+    let payload = build_one_block!(node, Duration::from_millis(500));
+    let landed = ordinary_transactions(&payload);
+
+    assert_eq!(
+        landed.iter().filter(|h| **h == hash).count(),
+        1,
+        "the commitment lands once, by the fifo's replay and not by the pool's; landed={landed:?}",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// The same hand-back, reached the way the technical design names it: a reorg.
+///
+/// A reorg arrives as a forkchoice update whose head points elsewhere, and the
+/// generator supersedes the job in flight — which is the same `abandon` any
+/// other superseding update causes, so this exercises the path
+/// `a_build_nobody_used_gives_back_what_it_pruned` already covers. It is kept
+/// because the trigger is the production-shaped one: the rebuilt block differs
+/// from the abandoned one by its L1 origin, so the reorg is observable rather
+/// than assumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_a_reorg_threw_away_gives_back_what_it_pruned() {
+    use crate::helpers::l1_info_deposit;
+
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    // The block the reorg will build on.
+    let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
+    let (base, _) = crate::op_node_slot_l1!(node, on = genesis, n = 0, l1 = 1);
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A build at height 1 against L1 origin 100, held open long enough for the
+    // ticker to execute the transaction and prune it away. Never resolved.
+    let _pid = crate::fcu_v3_start!(node, base, crate::helpers::l1_attrs(1, 100));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The reorg: same height, different L1 origin. The build above is superseded.
+    let (_head, sealed) = crate::reorg_to!(node, base, n = 1, l1 = 200);
+
+    assert_eq!(
+        sealed[0],
+        keccak256(l1_info_deposit(200)),
+        "precondition: the rebuild must reference the new L1 origin, or no reorg happened",
+    );
+    assert!(
+        sealed.contains(&hash),
+        "a transaction the reorged-away build pruned must be back for the rebuild; \
+         sealed={sealed:?}",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}

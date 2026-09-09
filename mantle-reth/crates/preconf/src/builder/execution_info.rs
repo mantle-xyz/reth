@@ -120,6 +120,16 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
         records
     }
 
+    /// Everything executed that came from the pool, in execution order.
+    ///
+    /// The same set the journal records, for the same reason: these are the
+    /// transactions no other mechanism brings back. Deposits arrive with the
+    /// attributes, a preconf commitment is held by the fifo, and the
+    /// post-execution transaction is the executor's own.
+    pub fn from_the_pool(&self) -> impl Iterator<Item = &Recovered<T>> {
+        self.journalable.iter().map(|&at| &self.executed[at])
+    }
+
     /// The highest nonce executed this block per sender.
     pub const fn executed_sender_nonces(&self) -> &HashMap<Address, u64> {
         &self.executed_sender_nonces

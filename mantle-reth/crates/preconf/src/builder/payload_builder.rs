@@ -67,7 +67,7 @@ use crate::{
     apply::{ApplyError, apply_preconf_tx},
     builder::{
         ExecutionInfo,
-        cancel::JobCancel,
+        cancel::{CancelReason, JobCancel},
         dispatch,
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
     },
@@ -1800,6 +1800,38 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         BestTxStep::Done => best_txs_iter = None,
                     }
                 }
+            }
+        }
+
+        // ── Stage 3b: hand back what a build nobody used took ──────────
+        // Slicing prunes each slice's transactions as it goes out, half a slot
+        // before the block could be canonical, and tells the pool their senders
+        // have moved on. Both are true only if this block lands. When the job
+        // was thrown away instead, nothing else undoes either: the transactions
+        // are in no block and no pool, and the raised nonce makes the pool
+        // discard — not park — everything those senders send until a real block
+        // corrects it.
+        //
+        // Re-admitting them settles the nonce too. Admission overwrites the
+        // sender's record with the nonce the validator reads from the chain,
+        // which is the one this build's advance was pretending to be ahead of —
+        // the same overwrite that makes the slice boundary's ordering
+        // load-bearing, used here in the other direction.
+        if slices.is_some() && cancel.reason() == Some(CancelReason::Abandoned) {
+            let returning: Vec<Pool::Transaction> = info
+                .from_the_pool()
+                .filter_map(|tx| Pool::Transaction::try_from_consensus(tx.clone()).ok())
+                .collect();
+            if !returning.is_empty() {
+                let handed_back = returning.len();
+                // Best effort: the pool may refuse some of them on its own
+                // terms, which is its right — being asked is what matters.
+                let _ = self.pool.add_external_transactions(returning).await;
+                debug!(
+                    target: "mantle::preconf::flashblocks",
+                    handed_back,
+                    "build abandoned; returned its pruned transactions to the pool",
+                );
             }
         }
 

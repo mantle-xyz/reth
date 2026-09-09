@@ -220,7 +220,11 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .replace(cancel.clone())
         {
-            prev.signal();
+            // The previous job's work is being thrown away — a later job for
+            // the same height supersedes it. Idempotent in steady state: if the
+            // consensus layer already asked for that payload, its reason is
+            // recorded and this changes nothing.
+            prev.abandon();
         }
 
         let cancel_for_build = cancel.clone();
@@ -338,7 +342,7 @@ const STALL_WATCHDOG_SLOTS: u32 = 3;
 /// common case returns `false` at once.
 async fn run_stall_watchdog(cancel: JobCancel, window: std::time::Duration) -> bool {
     if tokio::time::timeout(window, cancel.wait()).await.is_err() {
-        cancel.signal();
+        cancel.abandon();
         true
     } else {
         false
@@ -381,7 +385,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stall_watchdog_does_not_fire_when_cancelled_early() {
         let cancel = JobCancel::new();
-        cancel.signal(); // normal terminator (getPayload / Drop / next FCU)
+        cancel.abandon(); // normal terminator (getPayload / Drop / next FCU)
         let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
         assert!(!fired, "cancel before the window ⇒ watchdog is a no-op");
     }
