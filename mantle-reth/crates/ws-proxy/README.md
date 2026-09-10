@@ -190,3 +190,30 @@ Useful first checks:
 | `flashblocks.proxy.active_connections` | Current downstream subscribers |
 | `flashblocks.proxy.lagged_connections` | Subscribers dropped for falling more than `--message-buffer-size` behind |
 | `flashblocks.proxy.per_ip_rate_limited_requests` | Rejections from `--per-ip-connection-limit` |
+
+## Building and testing
+
+The binary is not in the workspace's default-run set, so `-p` is required —
+without it `cargo` reports `no bin target named mantle-ws-proxy`.
+
+```bash
+# Build the binary; lands in target/release/mantle-ws-proxy
+cargo build --release -p mantle-reth-ws-proxy --bin mantle-ws-proxy
+
+# Unit tests, including the metrics-registration cases
+cargo test -p mantle-reth-ws-proxy
+
+# The two integration suites: the sequencer→proxy→consumer bridge, and the
+# server's routing and admission behaviour
+cargo test -p mantle-reth-integration-tests --test flashblocks ws_proxy
+```
+
+The integration suites bind loopback sockets. A local HTTP proxy exported into
+the environment will intercept those connections and the tests will fail with
+errors unrelated to the code; unset the proxy variables for the run:
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u ALL_PROXY \
+    cargo test -p mantle-reth-integration-tests --test flashblocks ws_proxy
+```
