@@ -47,6 +47,9 @@ mantle-reth-flashblocks = { workspace = true }
 mantle-reth-flashblocks-types = { workspace = true }
 mantle-reth-preconf = { workspace = true }
 mantle-reth-rpc-ext = { workspace = true }
+# mantle-reth-ws-proxy — the ws-proxy/consumer bridge test assembles the proxy
+# in-process rather than spawning its binary.
+mantle-reth-ws-proxy = { workspace = true }
 
 # op-reth
 reth-optimism-chainspec = { workspace = true }
@@ -92,6 +95,7 @@ op-revm = { workspace = true, features = ["std"] }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
 url = { workspace = true }
 eyre = { workspace = true }
 serde_json = { workspace = true }

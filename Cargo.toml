@@ -56,6 +56,7 @@ members = [
   "mantle-reth/crates/eth-api/",
   "mantle-reth/crates/integration-tests/",
   "mantle-reth/crates/preconf/",
+  "mantle-reth/crates/ws-proxy/",
 
   # Optimism ecosystem crates (from mantle-xyz/mantle-v2, git dependency)
   # (no longer workspace members — referenced via git dep)
@@ -159,6 +160,7 @@ mantle-reth-rpc-ext = { path = "mantle-reth/crates/rpc-ext/" }
 mantle-reth-cli = { path = "mantle-reth/crates/cli/" }
 mantle-reth-eth-api = { path = "mantle-reth/crates/eth-api/" }
 mantle-reth-preconf = { path = "mantle-reth/crates/preconf/" }
+mantle-reth-ws-proxy = { path = "mantle-reth/crates/ws-proxy/" }
 
 # ==================== RETH CRATES (crates.io published) ====================
 reth-codecs = { version = "0.3.1", default-features = false, features = ["alloy"] }
@@ -327,8 +329,11 @@ async-trait = "0.1.89"
 futures = "0.3.31"
 futures-core = "0.3"
 futures-util = { version = "0.3.31", default-features = false }
+axum = { version = "0.8.9", default-features = false }
+backoff = "0.4.0"
 hyper = "1.8"
 hyper-util = "0.1.20"
+ipnet = "2.12"
 pin-project = "1.1.10"
 tower = "0.5.3"
 tower-http = "0.6"
