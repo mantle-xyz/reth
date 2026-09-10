@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 # op-reth
 reth-optimism-rpc.workspace = true
+mantle-reth-flashblocks.workspace = true
 reth-optimism-evm.workspace = true
 reth-optimism-forks.workspace = true
 

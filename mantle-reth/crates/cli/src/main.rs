@@ -3,8 +3,9 @@
 use clap::Parser;
 use eyre::ErrReport;
 use mantle_reth_cli::{
-    MantleArgs, MantleChainSpecParser, MantleNode, proofs_history::with_proofs_history_launch_ctx,
-    seed_blockchain_tree_metrics, spawn_proofs_db_metrics,
+    MantleArgs, MantleChainSpecParser, MantleConfigs, MantleNode,
+    proofs_history::with_proofs_history_launch_ctx, seed_blockchain_tree_metrics,
+    spawn_proofs_db_metrics,
 };
 use mantle_reth_preconf::{PreconfServiceBuilder, seed_preconf_metrics};
 use reth_db::DatabaseEnv;
@@ -17,7 +18,7 @@ use reth_optimism_trie::{
     db::{MdbxProofsStorage, MdbxProofsStorageV2},
 };
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
@@ -42,8 +43,16 @@ fn main() {
             let mut node = MantleNode::new(args.rollup.clone());
             let rollup = args.rollup.clone();
             let sweep_interval_given = args.preconf.sweep_interval_ms.is_some();
-            let (preconf_cfg, flashblocks_cfg) = args.into_configs()?;
+            let MantleConfigs { preconf: preconf_cfg, publisher: flashblocks_cfg, consumer } =
+                args.into_configs()?;
             let preconf_enabled = preconf_cfg.is_some();
+            if flashblocks_cfg.is_some() && consumer.is_some() {
+                warn!(
+                    target: "reth::cli",
+                    "Mantle flashblocks publisher and consumer are both enabled; this node will \
+                     subscribe to a stream it may itself produce",
+                );
+            }
             if let Some(fb) = flashblocks_cfg.as_ref() {
                 info!(
                     target: "reth::cli",
@@ -96,6 +105,24 @@ fn main() {
                     );
                 }
             }
+            match consumer {
+                Some(cfg) => {
+                    info!(
+                        target: "reth::cli",
+                        url = %cfg.websocket_url,
+                        max_leading_depth = cfg.max_leading_depth,
+                        "Mantle flashblock consumer ENABLED",
+                    );
+                    node = node.with_flashblocks(cfg);
+                }
+                None => {
+                    info!(
+                        target: "reth::cli",
+                        "Mantle flashblock consumer DISABLED (pass --flashblocks.websocket-url to opt in)",
+                    );
+                }
+            }
+
             launch_node(builder, node, rollup, preconf_enabled).await
         },
     ) {

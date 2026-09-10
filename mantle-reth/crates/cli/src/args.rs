@@ -21,6 +21,10 @@ use std::{net::IpAddr, path::PathBuf, time::Duration};
 
 use alloy_primitives::Address;
 use clap::Args;
+use mantle_reth_flashblocks::{
+    DEFAULT_MAX_CACHE_AHEAD_BLOCKS, DEFAULT_MAX_LEADING_DEPTH, DEFAULT_MAX_TRAILING_DEPTH,
+    DEFAULT_SUBSCRIBER_PING_INTERVAL, FlashblocksConfig,
+};
 use mantle_reth_preconf::{
     FlashblockProducerConfig, FlashblockProducerConfigError, PreconfConfig,
     config::{
@@ -34,6 +38,7 @@ use mantle_reth_preconf::{
     },
 };
 use reth_optimism_node::args::RollupArgs;
+use url::Url;
 
 /// Top-level mantle CLI args — flattens upstream `RollupArgs` and mantle
 /// preconf options into a single `clap::Args`-derived struct.
@@ -50,25 +55,141 @@ pub struct MantleArgs {
     /// Mantle flashblocks publisher arguments (`--flashblocks.*`).
     #[command(flatten)]
     pub flashblocks: FlashblocksArgs,
+
+    /// Mantle flashblock consumer arguments (`--flashblocks.*`).
+    ///
+    /// Kept in its own group rather than merged with [`FlashblocksArgs`]: the
+    /// two serve opposite ends of the same stream and validate against
+    /// different preconditions. Their flag names are disjoint, so both groups
+    /// coexist under the one `--flashblocks.` prefix.
+    #[command(flatten)]
+    pub flashblocks_consumer: FlashblocksConsumerArgs,
 }
 
 impl MantleArgs {
-    /// Resolve both Mantle subsystem configs, rejecting combinations that
+    /// Resolve the three Mantle subsystem configs, rejecting combinations that
     /// cannot work before the node starts.
     ///
-    /// Either config is `None` when its subsystem is off.
-    pub fn into_configs(
-        self,
-    ) -> Result<
-        (Option<PreconfConfig>, Option<FlashblockProducerConfig>),
-        FlashblockProducerConfigError,
-    > {
+    /// Each config is `None` when its subsystem is off. The publisher and the
+    /// consumer are resolved independently: running both on one node is
+    /// permitted but unusual, and `main` warns about it.
+    ///
+    /// # Errors
+    /// Returns an error when the publisher is enabled without preconf, or when
+    /// both this consumer and upstream's are requested.
+    pub fn into_configs(self) -> Result<MantleConfigs, MantleArgsError> {
         let preconf = self.preconf.into_config();
-        let flashblocks =
+        let publisher =
             self.flashblocks.into_config().map(|cfg| cfg.validate(preconf.as_ref())).transpose()?;
+        let consumer =
+            self.flashblocks_consumer.into_config(self.rollup.flashblocks_url.as_ref())?;
 
-        Ok((preconf, flashblocks))
+        Ok(MantleConfigs { preconf, publisher, consumer })
     }
+}
+
+/// The subsystem configs resolved from [`MantleArgs`].
+///
+/// Not `PartialEq`: neither [`PreconfConfig`] nor [`FlashblocksConfig`] is.
+#[derive(Debug)]
+pub struct MantleConfigs {
+    /// Preconfirmation service; `None` when `--preconf.enable` was absent.
+    pub preconf: Option<PreconfConfig>,
+    /// Flashblock publisher; `None` when `--flashblocks.enable` was absent.
+    pub publisher: Option<FlashblockProducerConfig>,
+    /// Flashblock consumer; `None` when `--flashblocks.websocket-url` was absent.
+    pub consumer: Option<FlashblocksConfig>,
+}
+
+/// Errors produced while resolving [`MantleArgs`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MantleArgsError {
+    /// The publisher was enabled in a combination that cannot work.
+    #[error(transparent)]
+    Publisher(#[from] FlashblockProducerConfigError),
+
+    /// The consumer was enabled in a combination that cannot work.
+    #[error(transparent)]
+    Consumer(#[from] FlashblocksConsumerArgsError),
+}
+
+/// Flashblock consumer CLI flags.
+///
+/// Distinct from upstream's `--flashblocks-url`, which drives op-reth's own
+/// consumer. The two implementations are independent and must not both run.
+///
+/// Separate from [`FlashblocksArgs`] despite sharing the `--flashblocks.`
+/// prefix: that group configures the publisher on a sequencer, this one the
+/// consumer on an RPC node. The flag names are disjoint.
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct FlashblocksConsumerArgs {
+    /// Websocket endpoint streaming flashblocks to the Mantle consumer.
+    ///
+    /// Named to match the `flashblocks-rpc` deployments already in operation.
+    /// Absent (default) leaves the consumer off and the `pending` tag on its
+    /// standard local-mempool semantics.
+    #[arg(long = "flashblocks.websocket-url")]
+    pub websocket_url: Option<Url>,
+
+    /// Interval between upstream websocket ping frames, in seconds.
+    #[arg(long = "flashblocks.ping-interval-secs")]
+    pub ping_interval_secs: Option<u64>,
+
+    /// Canonical blocks the pending overlay may trail behind before a rebuild.
+    #[arg(long = "flashblocks.max-trailing-depth")]
+    pub max_trailing_depth: Option<u64>,
+
+    /// Blocks the pending overlay may lead canonical by before slices are dropped.
+    #[arg(long = "flashblocks.max-leading-depth")]
+    pub max_leading_depth: Option<u64>,
+
+    /// Blocks ahead of canonical for which early-arriving slices are cached.
+    #[arg(long = "flashblocks.max-cache-ahead-blocks")]
+    pub max_cache_ahead_blocks: Option<u64>,
+}
+
+impl FlashblocksConsumerArgs {
+    /// Converts CLI args into a [`FlashblocksConfig`] when a consumer URL was
+    /// given; otherwise returns `None` (the consumer stays off).
+    ///
+    /// # Errors
+    /// Returns an error when upstream's `--flashblocks-url` is also set: both
+    /// consumers would subscribe and build pending state independently.
+    pub fn into_config(
+        self,
+        upstream_flashblocks_url: Option<&Url>,
+    ) -> Result<Option<FlashblocksConfig>, FlashblocksConsumerArgsError> {
+        let Some(websocket_url) = self.websocket_url else {
+            return Ok(None);
+        };
+        if upstream_flashblocks_url.is_some() {
+            return Err(FlashblocksConsumerArgsError::ConflictingConsumers);
+        }
+
+        Ok(Some(FlashblocksConfig {
+            websocket_url,
+            max_trailing_depth: self.max_trailing_depth.unwrap_or(DEFAULT_MAX_TRAILING_DEPTH),
+            max_leading_depth: self.max_leading_depth.unwrap_or(DEFAULT_MAX_LEADING_DEPTH),
+            max_cache_ahead_blocks: self
+                .max_cache_ahead_blocks
+                .unwrap_or(DEFAULT_MAX_CACHE_AHEAD_BLOCKS),
+            subscriber_ping_interval: self
+                .ping_interval_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_SUBSCRIBER_PING_INTERVAL),
+        }))
+    }
+}
+
+/// Errors produced while resolving [`FlashblocksConsumerArgs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FlashblocksConsumerArgsError {
+    /// Both the Mantle and the upstream op-reth consumer were requested.
+    #[error(
+        "--flashblocks.websocket-url and --flashblocks-url are mutually exclusive: the Mantle and \
+         op-reth flashblock consumers are independent implementations and must not both run"
+    )]
+    ConflictingConsumers,
 }
 
 /// Flashblocks publisher CLI flags.
@@ -457,37 +578,41 @@ mod tests {
     fn enabling_flashblocks_alone_fails_the_startup_gate() {
         let err = parse_mantle(&["--flashblocks.enable"]).into_configs().unwrap_err();
 
-        assert_eq!(err, FlashblockProducerConfigError::RequiresPreconfEnabled);
+        assert_eq!(
+            err,
+            MantleArgsError::Publisher(FlashblockProducerConfigError::RequiresPreconfEnabled)
+        );
     }
 
     #[test]
     fn enabling_both_passes_the_startup_gate() {
-        let (preconf, flashblocks) =
-            parse_mantle(&["--preconf.enable", "--preconf.all", "--flashblocks.enable"])
-                .into_configs()
-                .expect("both enabled is a valid combination");
+        let cfgs = parse_mantle(&["--preconf.enable", "--preconf.all", "--flashblocks.enable"])
+            .into_configs()
+            .expect("both enabled is a valid combination");
 
-        assert!(preconf.is_some());
-        assert!(flashblocks.is_some());
+        assert!(cfgs.preconf.is_some());
+        assert!(cfgs.publisher.is_some());
+        assert!(cfgs.consumer.is_none());
     }
 
     /// Today's production shape: preconf on, flashblocks not yet rolled out.
     #[test]
     fn enabling_preconf_alone_leaves_flashblocks_absent() {
-        let (preconf, flashblocks) = parse_mantle(&["--preconf.enable", "--preconf.all"])
+        let cfgs = parse_mantle(&["--preconf.enable", "--preconf.all"])
             .into_configs()
             .expect("preconf alone is a valid combination");
 
-        assert!(preconf.is_some());
-        assert!(flashblocks.is_none());
+        assert!(cfgs.preconf.is_some());
+        assert!(cfgs.publisher.is_none());
     }
 
     #[test]
     fn enabling_neither_passes_the_startup_gate() {
-        let (preconf, flashblocks) = parse_mantle(&[]).into_configs().expect("defaults are valid");
+        let cfgs = parse_mantle(&[]).into_configs().expect("defaults are valid");
 
-        assert!(preconf.is_none());
-        assert!(flashblocks.is_none());
+        assert!(cfgs.preconf.is_none());
+        assert!(cfgs.publisher.is_none());
+        assert!(cfgs.consumer.is_none());
     }
 
     #[test]
@@ -504,5 +629,108 @@ mod tests {
         assert_eq!(cfg.rejournal_interval, DEFAULT_REJOURNAL_INTERVAL);
         assert_eq!(cfg.journal_max_size, DEFAULT_JOURNAL_MAX_SIZE);
         assert_eq!(cfg.broadcast_cap, DEFAULT_BROADCAST_CAP);
+    }
+
+    /// Wraps the full `MantleArgs` so the flashblock flags are parsed alongside
+    /// `RollupArgs`: upstream registers `--flashblocks-url` there, and a clash
+    /// with our own long names would make clap panic on startup.
+    #[derive(Parser, Debug)]
+    struct FlashblocksConsumerTestCli {
+        #[command(flatten)]
+        args: MantleArgs,
+    }
+
+    fn parse_consumer(argv: &[&str]) -> MantleArgs {
+        FlashblocksConsumerTestCli::parse_from(std::iter::once(&"reth").chain(argv.iter())).args
+    }
+
+    #[test]
+    fn no_url_leaves_the_consumer_off() {
+        let args = parse_consumer(&[]);
+        assert!(
+            args.flashblocks_consumer
+                .into_config(args.rollup.flashblocks_url.as_ref())
+                .expect("no conflict")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn websocket_url_enables_the_consumer_with_defaults() {
+        // The flag name matches the `flashblocks-rpc` deployments in operation.
+        let args = parse_consumer(&["--flashblocks.websocket-url", "ws://sequencer:1111"]);
+        let cfg = args
+            .flashblocks_consumer
+            .into_config(args.rollup.flashblocks_url.as_ref())
+            .expect("no conflict")
+            .expect("enabled");
+        assert_eq!(cfg.websocket_url.as_str(), "ws://sequencer:1111/");
+        assert_eq!(cfg.max_trailing_depth, DEFAULT_MAX_TRAILING_DEPTH);
+        assert_eq!(cfg.max_leading_depth, DEFAULT_MAX_LEADING_DEPTH);
+        assert_eq!(cfg.max_cache_ahead_blocks, DEFAULT_MAX_CACHE_AHEAD_BLOCKS);
+        assert_eq!(cfg.subscriber_ping_interval, DEFAULT_SUBSCRIBER_PING_INTERVAL);
+    }
+
+    #[test]
+    fn tuning_flags_override_defaults() {
+        let args = parse_consumer(&[
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+            "--flashblocks.ping-interval-secs",
+            "5",
+            "--flashblocks.max-trailing-depth",
+            "7",
+            "--flashblocks.max-leading-depth",
+            "9",
+            "--flashblocks.max-cache-ahead-blocks",
+            "11",
+        ]);
+        let cfg = args
+            .flashblocks_consumer
+            .into_config(args.rollup.flashblocks_url.as_ref())
+            .expect("no conflict")
+            .expect("enabled");
+        assert_eq!(cfg.subscriber_ping_interval, Duration::from_secs(5));
+        assert_eq!(cfg.max_trailing_depth, 7);
+        assert_eq!(cfg.max_leading_depth, 9);
+        assert_eq!(cfg.max_cache_ahead_blocks, 11);
+    }
+
+    #[test]
+    fn both_consumers_is_rejected() {
+        // Two independent implementations would each subscribe and each build
+        // pending state; the node must refuse to start rather than pick one.
+        let args = parse_consumer(&[
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+            "--flashblocks-url",
+            "ws://other:2222",
+        ]);
+        assert_eq!(
+            args.flashblocks_consumer
+                .into_config(args.rollup.flashblocks_url.as_ref())
+                .unwrap_err(),
+            FlashblocksConsumerArgsError::ConflictingConsumers
+        );
+    }
+
+    /// The publisher and the consumer groups share the `--flashblocks.` prefix
+    /// but no flag name, so clap accepts both on one command line and each
+    /// resolves independently. Running both is unusual, not an error; `main`
+    /// warns. See issue Q19.
+    #[test]
+    fn the_publisher_and_the_consumer_can_be_enabled_together() {
+        let cfgs = parse_mantle(&[
+            "--preconf.enable",
+            "--preconf.all",
+            "--flashblocks.enable",
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+        ])
+        .into_configs()
+        .expect("both ends on one node is permitted");
+
+        assert!(cfgs.publisher.is_some());
+        assert!(cfgs.consumer.is_some());
     }
 }
