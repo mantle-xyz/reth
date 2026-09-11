@@ -47,7 +47,7 @@ use std::collections::VecDeque;
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     sync::{Mutex, Notify, oneshot},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
@@ -408,7 +408,53 @@ impl PreconfJournal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
             Err(e) => return Err(JournalError::Io(e)),
         };
-        let reader = BufReader::new(file);
+        Self::parse_entries(BufReader::new(file)).await
+    }
+
+    /// Entries from the first `limit` bytes of the file.
+    ///
+    /// Rotation compacts the file as it stood when the pass began, not as it
+    /// stands when the pass ends, so it reads to a byte offset rather than to
+    /// end of file. `limit` comes from the size counter, which only ever
+    /// advances by whole writes, so the cut cannot land mid-record.
+    async fn load_upto(&self, limit: u64) -> Result<(Vec<JournalEntry>, usize), JournalError> {
+        let file = match tokio::fs::File::open(&self.path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            Err(e) => return Err(JournalError::Io(e)),
+        };
+        Self::parse_entries(BufReader::new(file.take(limit))).await
+    }
+
+    /// The raw bytes the file has grown by past `from`.
+    ///
+    /// Copied verbatim rather than parsed and re-encoded: these records arrived
+    /// after the compaction pass took its snapshot, so they belong to the
+    /// generation being started rather than the one being compacted. Verbatim
+    /// also keeps `retain` — a caller-supplied predicate of unknown cost — off
+    /// the one stretch of rotation that holds the writer lock.
+    ///
+    /// A write that failed part-way leaves a partial line, which is carried
+    /// across like anything else; the next append closes it with a newline and
+    /// [`Self::load`] skips it.
+    async fn bytes_after(&self, from: u64) -> Result<Vec<u8>, JournalError> {
+        let mut file = match tokio::fs::File::open(&self.path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(JournalError::Io(e)),
+        };
+        file.seek(io::SeekFrom::Start(from)).await?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).await?;
+        Ok(out)
+    }
+
+    /// Parse newline-delimited entries out of `reader`, skipping the ones that
+    /// will not decode and returning how many those were.
+    async fn parse_entries<R>(reader: R) -> Result<(Vec<JournalEntry>, usize), JournalError>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
         let mut lines = reader.lines();
         let mut out = Vec::new();
         let mut bad = 0usize;
@@ -449,10 +495,15 @@ impl PreconfJournal {
     /// mid-rotate leaves either the old file or the new one intact,
     /// never a half-written hybrid.
     ///
-    /// The caller is expected to be the rotation loop, not the hot
-    /// RPC path. While rotation runs, `append_promised` is blocked
-    /// behind the same writer `Mutex` — typically a few ms even at
-    /// 100 TPS.
+    /// The caller is expected to be the rotation loop, not the hot RPC path.
+    ///
+    /// The read-filter-rewrite pass runs with **no lock held**, so appends
+    /// continue into the live file throughout it. Only the tail end takes the
+    /// writer lock, and what it does there is bounded by one pass's worth of
+    /// appends rather than by the size of the file: splice, rename, re-open.
+    /// This matters because a slice is journalled before it is broadcast, so an
+    /// append that waits for a multi-megabyte rewrite is a broadcast that
+    /// waits for it too.
     pub async fn rotate(
         &self,
         retain: impl Fn(&TxHash) -> bool,
@@ -461,13 +512,17 @@ impl PreconfJournal {
         // (including the `?` early returns below).
         let _timer = RotateTimer(std::time::Instant::now());
 
-        // Hold the writer lock for the WHOLE rotate (load → rename → reset),
-        // not just the swap: an `append_promised` landing between `load()` and
-        // the rename would otherwise be silently discarded by it. Appends
-        // block until the new file is in place, then land in it.
-        let mut writer = self.writer.lock().await;
+        // How much of the file this pass is answerable for. Read under the
+        // writer lock so it cannot be sampled part-way through an append, and
+        // taken from the size counter rather than from a `stat` because the
+        // counter only advances by whole writes — which is what makes it safe
+        // to cut the file here.
+        let compacting_upto = {
+            let _writer = self.writer.lock().await;
+            self.size_bytes.load(Ordering::Relaxed)
+        };
 
-        let (entries, bad_before) = self.load().await?;
+        let (entries, bad_before) = self.load_upto(compacting_upto).await?;
 
         // Which records may go is the caller's decision, not this type's, and it
         // is the *only* rule here: `retain` asks the classifier whether the
@@ -482,34 +537,49 @@ impl PreconfJournal {
         let mut kept_bytes = 0u64;
         let tmp_path = tmp_path_for(&self.path);
 
-        {
-            let mut tmp =
-                OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path).await?;
-            for entry in &entries {
-                if !retain(&entry.hash) {
-                    dropped += 1;
-                    continue;
-                }
-                let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
-                line.push(b'\n');
-                tmp.write_all(&line).await?;
-                kept_bytes += line.len() as u64;
-                kept += 1;
+        let mut tmp =
+            OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path).await?;
+        for entry in &entries {
+            if !retain(&entry.hash) {
+                dropped += 1;
+                continue;
             }
-            tmp.flush().await?;
+            let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
+            line.push(b'\n');
+            tmp.write_all(&line).await?;
+            kept_bytes += line.len() as u64;
+            kept += 1;
         }
 
-        // Atomic swap (writer lock held since the top): rename into place,
-        // then re-open the writer against the new inode.
+        // From here to the end of the function the writer lock is held, and
+        // appends wait. Everything expensive is already done.
+        let mut writer = self.writer.lock().await;
+
+        // Splice on whatever landed while the pass was running. Without this the
+        // swap below would discard those records, and the size counter would
+        // describe a file that never existed.
+        let carried = self.bytes_after(compacting_upto).await?;
+        tmp.write_all(&carried).await?;
+        tmp.flush().await?;
+        drop(tmp);
+
+        // Atomic swap: rename into place, then re-open the writer against the
+        // new inode.
         tokio::fs::rename(&tmp_path, &self.path).await?;
         *writer = OpenOptions::new().create(true).append(true).open(&self.path).await?;
-        // Reset the byte counter to the new file's true size while still
-        // holding the writer lock, so it stays consistent with any
-        // `append_promised` that serialises before/after this swap.
-        self.size_bytes.store(kept_bytes, Ordering::Relaxed);
-        metrics::gauge!("preconf.journal.size_bytes").set(kept_bytes as f64);
+        // Reset the byte counter to the new file's true size while still holding
+        // the writer lock, so it stays consistent with any append that
+        // serialises before or after this swap.
+        let new_size = kept_bytes + carried.len() as u64;
+        self.size_bytes.store(new_size, Ordering::Relaxed);
+        metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
 
-        Ok(RotateStats { kept, dropped, bad_lines_skipped: bad_before })
+        Ok(RotateStats {
+            kept,
+            dropped,
+            carried_bytes: carried.len() as u64,
+            bad_lines_skipped: bad_before,
+        })
     }
 }
 
@@ -517,10 +587,20 @@ impl PreconfJournal {
 /// invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateStats {
-    /// Entries written to the new file.
+    /// Entries the compaction pass carried over — every one of them accepted by
+    /// `retain`. Not the whole of the rotated file: see
+    /// [`carried_bytes`](Self::carried_bytes).
     pub kept: usize,
     /// Entries left out of the new file — every one of them refused by `retain`.
     pub dropped: usize,
+    /// Bytes appended while the pass was running and spliced onto the end of
+    /// the rotated file.
+    ///
+    /// These arrived after the pass took its snapshot, so `retain` was never
+    /// asked about them and they are counted in neither `kept` nor `dropped`.
+    /// They face the next rotation instead. Reported so `kept` and the rotated
+    /// file's line count can be reconciled.
+    pub carried_bytes: u64,
     /// Corrupt lines observed during the read pass. Rotate silently
     /// removes them from the rewritten file (they're not carried over
     /// into the new generation) — this count is reported for
@@ -1072,6 +1152,7 @@ fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
                 reason,
                 kept = stats.kept,
                 dropped = stats.dropped,
+                carried_bytes = stats.carried_bytes,
                 bad = stats.bad_lines_skipped,
                 "journal rotation"
             );
@@ -1515,12 +1596,15 @@ mod tests {
     /// An append racing a rotate must not be lost. `retain` accepts everything
     /// here, so any absence is the race, not the retention rule.
     ///
-    /// Two failure modes: an entry landing in rotate's load → rename window can
-    /// be dropped outright, and even when it survives on disk, rotate's
-    /// `size_bytes.store(kept_bytes)` is computed from the pre-append snapshot,
-    /// so storing it would leave the counter short of the real file and silently
-    /// mistune the size-rotation trigger. Deterministic because rotate holds the
-    /// writer lock end to end.
+    /// Two failure modes: an entry landing in rotate's snapshot → rename window
+    /// can be dropped outright, and even when it survives on disk, a counter
+    /// reset to the compaction pass's byte total alone would leave it short of
+    /// the real file and silently mistune the size-rotation trigger.
+    ///
+    /// The appends here race the rotation rather than being placed inside it, so
+    /// which of them land in that window varies between runs; the deterministic
+    /// placement is
+    /// [`an_entry_appended_during_the_compaction_pass_survives_the_swap`].
     #[tokio::test]
     async fn rotate_does_not_lose_concurrent_appends() {
         use std::sync::Arc;
@@ -1565,6 +1649,129 @@ mod tests {
             j.size_bytes.load(Ordering::Relaxed),
             on_disk_bytes,
             "size_bytes counter drifted from true on-disk size across concurrent rotate"
+        );
+    }
+
+    /// Hold a rotation open inside its compaction pass.
+    ///
+    /// `retain` is called once per record being compacted, which makes it the
+    /// one place a test can stand in the middle of a rotation and ask what else
+    /// can still happen. Returns the journal, a receiver that fires when the
+    /// pass has begun, the handle to release it, and the rotation's own handle.
+    fn rotation_held_open(
+        j: Arc<PreconfJournal>,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<RotateStats>,
+    ) {
+        let (compacting_tx, compacting_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let rotate = tokio::spawn(async move {
+            let first = std::sync::atomic::AtomicBool::new(true);
+            j.rotate(move |_| {
+                if first.swap(false, Ordering::Relaxed) {
+                    compacting_tx.send(()).expect("test is listening");
+                    // Blocks the pass until the test has its answer. A blocking
+                    // recv because `retain` is synchronous.
+                    release_rx.recv().expect("test releases the pass");
+                }
+                true
+            })
+            .await
+            .expect("rotate")
+        });
+        (compacting_rx, release_tx, rotate)
+    }
+
+    /// The compaction pass reads to the offset it snapshotted, not to end of
+    /// file. Reading further would put records into the rewritten file that the
+    /// splice then appends a second time.
+    ///
+    /// Pinned on `load_upto` directly rather than by racing a rotation: the
+    /// window between taking the snapshot and finishing the read has no hook a
+    /// test could stand in, so a concurrent append can only land inside it by
+    /// luck.
+    #[tokio::test]
+    async fn the_compaction_pass_reads_only_as_far_as_its_snapshot() {
+        let (_dir, j) = fresh_journal().await;
+        let compacted = entry(1, 10);
+        j.append_promised(&compacted).await.unwrap();
+
+        let snapshot = j.size_bytes.load(Ordering::Relaxed);
+        let latecomer = entry(2, 11);
+        j.append_promised(&latecomer).await.unwrap();
+
+        let (seen, bad) = j.load_upto(snapshot).await.unwrap();
+
+        assert_eq!(bad, 0);
+        assert_eq!(seen, vec![compacted], "read past the snapshot into {latecomer:?}");
+    }
+
+    /// Compaction reads and rewrites the whole file — megabytes of it once a
+    /// block carries a thousand transactions. An append must not queue behind
+    /// that: a slice is journalled before it is broadcast, so an append that
+    /// waits is a broadcast that waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_append_does_not_wait_for_the_compaction_pass() {
+        let dir = TempDir::new().unwrap();
+        let j = Arc::new(PreconfJournal::open(dir.path().join("preconf.jsonl"), 0).await.unwrap());
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
+        }
+
+        let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
+        compacting.recv().await.expect("compaction pass began");
+
+        // Generous: the question is whether the append is blocked at all, not
+        // how quickly it finishes.
+        let appended =
+            tokio::time::timeout(Duration::from_secs(5), j.append_promised(&entry(9, 9))).await;
+
+        release.send(()).unwrap();
+        rotate.await.unwrap();
+        appended.expect("append waited for the compaction pass to finish").unwrap();
+    }
+
+    /// The compaction pass owns the file only as far as it had grown when the
+    /// pass began. Whatever lands past that point has to be carried into the
+    /// rotated file, and counted, or the swap discards it and leaves the size
+    /// counter describing a file that no longer exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_entry_appended_during_the_compaction_pass_survives_the_swap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = Arc::new(PreconfJournal::open(&path, 0).await.unwrap());
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
+        }
+
+        let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
+        compacting.recv().await.expect("compaction pass began");
+
+        // Timed, not a bare await: an implementation that blocks appends for the
+        // duration of the pass would otherwise deadlock the test here rather
+        // than fail it.
+        let late = entry(9, 9);
+        let appended = tokio::time::timeout(Duration::from_secs(5), j.append_promised(&late)).await;
+
+        release.send(()).unwrap();
+        rotate.await.unwrap();
+        appended.expect("append waited for the compaction pass to finish").unwrap();
+
+        // Exact, not `contains`: the survivors in their original order followed
+        // by the one that arrived late. Equality is what rules out the entry
+        // being dropped, duplicated, or reordered against the compacted ones.
+        let mut expected: Vec<JournalEntry> = (0..5u8).map(|i| entry(i, u64::from(i))).collect();
+        expected.push(late);
+
+        let (after, bad) = j.load().await.unwrap();
+        assert_eq!(bad, 0);
+        assert_eq!(after, expected, "rotated file is not survivors-then-latecomer");
+        assert_eq!(
+            j.size_bytes.load(Ordering::Relaxed),
+            tokio::fs::metadata(&path).await.unwrap().len(),
+            "size counter does not describe the rotated file"
         );
     }
 
