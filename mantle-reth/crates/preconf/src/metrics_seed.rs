@@ -100,6 +100,7 @@ const HISTOGRAMS: &[&str] = &[
     "preconf.validate.duration_ms",
     "preconf.dispatch.elapsed_at_gate_ms",
     "preconf.journal.rotate_duration_ms",
+    "preconf.journal.rotate_locked_ms",
 ];
 
 /// Pre-register every preconf metric so its Prometheus series exists from node

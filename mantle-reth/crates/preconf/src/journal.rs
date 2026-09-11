@@ -554,6 +554,10 @@ impl PreconfJournal {
         // From here to the end of the function the writer lock is held, and
         // appends wait. Everything expensive is already done.
         let mut writer = self.writer.lock().await;
+        // Declared after the guard so it is dropped before it: what this
+        // records is the span an append could have been waiting on, measured
+        // from acquiring the lock to just short of releasing it.
+        let locked = LockedTimer(std::time::Instant::now());
 
         // Splice on whatever landed while the pass was running. Without this the
         // swap below would discard those records, and the size counter would
@@ -577,6 +581,7 @@ impl PreconfJournal {
         Ok(RotateStats {
             kept,
             dropped,
+            locked_for: locked.0.elapsed(),
             carried_bytes: carried.len() as u64,
             bad_lines_skipped: bad_before,
         })
@@ -593,6 +598,14 @@ pub struct RotateStats {
     pub kept: usize,
     /// Entries left out of the new file — every one of them refused by `retain`.
     pub dropped: usize,
+    /// How long the writer lock was held, and so how long an append could have
+    /// been waiting on this rotation.
+    ///
+    /// Reported rather than only measured into
+    /// `preconf.journal.rotate_locked_ms` because the metric is emitted from a
+    /// drop guard, and nothing that reads the source can tell whether the guard
+    /// is still being constructed. As a returned value it is assertable.
+    pub locked_for: Duration,
     /// Bytes appended while the pass was running and spliced onto the end of
     /// the rotated file.
     ///
@@ -622,6 +635,23 @@ impl Drop for RotateTimer {
     fn drop(&mut self) {
         metrics::histogram!("preconf.journal.rotate_duration_ms")
             .record(self.0.elapsed().as_millis() as f64);
+    }
+}
+
+/// Records `preconf.journal.rotate_locked_ms` on drop: the part of a rotation
+/// that holds the writer lock, and so the only part of it an append can wait
+/// for. [`RotateTimer`] covers the whole pass, most of which runs unlocked, so
+/// it cannot answer that question on its own.
+///
+/// Fractional milliseconds, unlike the whole-pass timer: this span is expected
+/// to be under a millisecond, and at integer resolution "fast" and "did not
+/// happen" would both read as zero.
+struct LockedTimer(std::time::Instant);
+
+impl Drop for LockedTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("preconf.journal.rotate_locked_ms")
+            .record(self.0.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
@@ -1152,6 +1182,7 @@ fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
                 reason,
                 kept = stats.kept,
                 dropped = stats.dropped,
+                locked_ms = stats.locked_for.as_secs_f64() * 1000.0,
                 carried_bytes = stats.carried_bytes,
                 bad = stats.bad_lines_skipped,
                 "journal rotation"
@@ -1682,6 +1713,37 @@ mod tests {
             .expect("rotate")
         });
         (compacting_rx, release_tx, rotate)
+    }
+
+    /// What the locked span reports must be the swap, not the whole rotation —
+    /// otherwise `rotate_locked_ms` says appends waited for the rewrite, which
+    /// is the number the split was made to bring down.
+    ///
+    /// The pass is held open for a known stretch and the span is required to be
+    /// shorter than that stretch. A timer covering the whole pass would report
+    /// at least the hold; the true value is microseconds, so the margin is
+    /// three orders of magnitude rather than a threshold to tune.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_locked_span_excludes_the_compaction_pass() {
+        let dir = TempDir::new().unwrap();
+        let j = Arc::new(PreconfJournal::open(dir.path().join("preconf.jsonl"), 0).await.unwrap());
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
+        }
+
+        let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
+        compacting.recv().await.expect("compaction pass began");
+
+        let held = Duration::from_millis(300);
+        tokio::time::sleep(held).await;
+        release.send(()).unwrap();
+        let stats = rotate.await.unwrap();
+
+        assert!(
+            stats.locked_for < held,
+            "locked span {:?} covers the compaction pass, which was held open for {held:?}",
+            stats.locked_for,
+        );
     }
 
     /// The compaction pass reads to the offset it snapshotted, not to end of
