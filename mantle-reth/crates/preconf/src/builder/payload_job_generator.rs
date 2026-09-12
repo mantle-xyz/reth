@@ -44,7 +44,7 @@
 
 use std::{
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use alloy_consensus::TxEnvelope;
@@ -70,6 +70,12 @@ use crate::builder::{
     payload_job::PreconfPayloadJob,
 };
 
+/// The live build's cancel handle paired with the block it produced.
+///
+/// The block is filled in once, by the build itself, and read by the job that
+/// comes after it.
+type LiveBuild = (JobCancel, Arc<OnceLock<B256>>);
+
 /// `PayloadJobGenerator` impl that spawns the mantle preconf-aware
 /// build loop on each new payload request.
 ///
@@ -92,12 +98,17 @@ pub struct PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
     /// `Arc<PreconfConfig>` / `Arc<PreconfTxSet>` and the OP builder
     /// config (DA / gas / SDM-enable).
     builder: PreconfPayloadBuilder<Pool, Client, Evm>,
-    /// `ensure_only_one_payload`: cancel handle of the most-recently
-    /// spawned build. Signalled when the next job is created so at most
-    /// one build task is ever live — see [`Self::new_payload_job`].
-    /// The live job's cancel handle and the parent it builds on. The parent
-    /// is what tells a supersede at the same height from ordinary progress.
-    last_cancel: Arc<Mutex<Option<(JobCancel, B256)>>>,
+    /// `ensure_only_one_payload`: cancel handle of the most-recently spawned
+    /// build, signalled when the next job is created so at most one build task
+    /// is ever live — see [`Self::new_payload_job`] — paired with the block that
+    /// build produced.
+    ///
+    /// That block is what tells one the consensus layer built on from one it
+    /// took and discarded: the next job's parent is the former and not the
+    /// latter. A bare `OnceLock` rather than the payload channel because
+    /// `OpBuiltPayload<N>` would force `N: NodePrimitives` onto this struct,
+    /// which it deliberately does not constrain.
+    last_cancel: Arc<Mutex<Option<LiveBuild>>>,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
     /// constraining `N` itself.
     _pd: PhantomData<fn() -> N>,
@@ -219,22 +230,23 @@ where
         // `ensure_only_one_payload`: cancel the previously spawned build so at
         // most one is ever live (rationale in the module docs). Idempotent in
         // steady state — the previous job was already cancelled by `resolve_kind`.
-        if let Some((prev, prev_parent)) = self
+        // Filled by the spawned build below, read by the *next* job.
+        let built_block: Arc<OnceLock<B256>> = Arc::new(OnceLock::new());
+
+        if let Some((prev, prev_built)) = self
             .last_cancel
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace((cancel.clone(), parent_hash))
+            .replace((cancel.clone(), Arc::clone(&built_block)))
         {
-            // A job on the same parent is a second attempt at one height, so
-            // whatever the first produced is not what the chain took. Counted
-            // only when that first attempt had been asked for: a payload nobody
-            // asked for hands its transactions back at the end of its build,
-            // and one that was asked for does not — which leaves this the only
-            // sign that a block's worth of them went nowhere.
-            //
-            // A job on a *different* parent is ordinary progress and says
-            // nothing about the last block either way.
-            if prev_parent == parent_hash && prev.reason() == Some(CancelReason::Resolved) {
+            // Only this job's parent can say whether the last payload was used:
+            // if the consensus layer built on what it was given, that parent is
+            // the block we produced. A second attempt at the same height and a
+            // switch to another chain both fail that test, and both mean a
+            // block's worth of transactions went nowhere with nothing else to
+            // report it.
+            if resolved_payload_went_nowhere(prev.reason(), prev_built.get().copied(), parent_hash)
+            {
                 metrics::counter!("preconf.build.resolved_payload_superseded_total").increment(1);
             }
             // The previous job's work is being thrown away — a later job for
@@ -246,6 +258,7 @@ where
 
         let cancel_for_build = cancel.clone();
         let (payload_tx, payload_rx) = watch::channel::<Option<OpBuiltPayload<N>>>(None);
+        let built_block_for_build = Arc::clone(&built_block);
 
         let builder_clone = self.builder.clone();
 
@@ -282,6 +295,9 @@ where
 
             match build_result {
                 Ok(Ok(payload)) => {
+                    // Recorded before the send, so the next job cannot read an
+                    // empty cell for a build that did deliver.
+                    let _ = built_block_for_build.set(payload.block().hash());
                     // `send` only fails when the receiver has been dropped,
                     // which means the job was torn down before we finished.
                     // Nothing we can do — log and exit.
@@ -368,6 +384,85 @@ async fn run_stall_watchdog(cancel: JobCancel, window: std::time::Duration) -> b
         true
     } else {
         false
+    }
+}
+
+/// Whether the payload the consensus layer asked for went nowhere.
+///
+/// A build the consensus layer never asked for hands its transactions back at
+/// the end of its own build; one that *was* asked for does not, because the
+/// block it produced is expected to land. When it does not land, those
+/// transactions are in no block and no pool, and this is the only sign of it.
+///
+/// The test is the next job's parent: if the consensus layer built on what it
+/// was given, that parent is our block. Anything else — the same height again,
+/// or a different chain entirely — means what we handed over was not used.
+fn resolved_payload_went_nowhere(
+    reason: Option<CancelReason>,
+    resolved_block: Option<B256>,
+    next_parent: B256,
+) -> bool {
+    reason == Some(CancelReason::Resolved) && resolved_block != Some(next_parent)
+}
+
+#[cfg(test)]
+mod went_nowhere_tests {
+    use alloy_primitives::B256;
+
+    use super::{CancelReason, resolved_payload_went_nowhere};
+
+    fn hash(byte: u8) -> B256 {
+        B256::from([byte; 32])
+    }
+
+    /// The healthy case: the consensus layer built on what it was given, so the
+    /// next job's parent *is* that payload's block.
+    #[test]
+    fn a_payload_the_next_block_builds_on_is_not_counted() {
+        assert!(!resolved_payload_went_nowhere(
+            Some(CancelReason::Resolved),
+            Some(hash(1)),
+            hash(1),
+        ));
+    }
+
+    /// A second attempt at the same height: the next job's parent is the parent
+    /// the abandoned payload was built on, not the payload itself.
+    #[test]
+    fn a_second_attempt_at_the_same_height_is_counted() {
+        let parent = hash(9);
+        assert!(resolved_payload_went_nowhere(
+            Some(CancelReason::Resolved),
+            Some(hash(1)), // the block we handed over, a child of `parent`
+            parent,
+        ));
+    }
+
+    /// The case the parent-equality rule could not see: the consensus layer took
+    /// the payload and then moved to a different chain, so the next job's parent
+    /// is neither our block nor the height we were building on.
+    #[test]
+    fn a_payload_left_behind_by_a_chain_switch_is_counted() {
+        assert!(resolved_payload_went_nowhere(
+            Some(CancelReason::Resolved),
+            Some(hash(1)),
+            hash(42),
+        ));
+    }
+
+    /// A job nobody asked for hands its transactions back at the end of its own
+    /// build, so counting it here would double-report.
+    #[test]
+    fn a_job_nobody_asked_for_is_not_counted() {
+        assert!(!resolved_payload_went_nowhere(Some(CancelReason::Abandoned), None, hash(1)));
+        assert!(!resolved_payload_went_nowhere(None, None, hash(1)));
+    }
+
+    /// Asked for and never produced. Its slices still pruned their transactions,
+    /// so they went nowhere just the same.
+    #[test]
+    fn a_resolved_job_that_produced_no_payload_is_counted() {
+        assert!(resolved_payload_went_nowhere(Some(CancelReason::Resolved), None, hash(1)));
     }
 }
 
