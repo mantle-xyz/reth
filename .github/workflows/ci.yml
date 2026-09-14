@@ -1,10 +1,13 @@
 name: ci
 
 on:
+  # `branches` filters on the base branch, and this repo has no fallback workflow:
+  # a branch missing here gets no CI at all.
   pull_request:
-    branches: [mantle-stage2, main]
+    branches: [main, "dev/**", "release/**"]
   push:
-    branches: [mantle-stage2, main]
+    branches: [main, "dev/**", "release/**"]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
