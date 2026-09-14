@@ -99,23 +99,23 @@ impl JobCancel {
         *self.rx.borrow()
     }
 
-    /// Run `work` unless the job has already been cancelled, holding off
-    /// cancellation until it returns. `None` means it was already cancelled.
+    /// Run `work` unless the job has been abandoned, holding off both endings
+    /// until it returns. `None` means it had been abandoned already.
     ///
-    /// Reading the flag and acting on it are two steps, and a cancel landing
-    /// between them is the case the check exists to stop — so both happen
-    /// under one gate. Concretely, for slice publishing: a slice either goes
-    /// out before the payload is resolved, or not at all. Never after.
+    /// Abandoned rather than cancelled: only one of the two endings makes what
+    /// the build executed untrue. A resolved payload is on its way to the
+    /// consensus layer carrying exactly that work.
     ///
-    /// `work` must not block for long and must not `.await`: cancellation is
-    /// on hold for its duration.
+    /// Check and `work` both stay inside the gate, because an ending landing
+    /// between them is what this exists to stop. Lifting the check out, into a
+    /// local acted on afterwards, compiles, reads the same, and gives up the
+    /// guarantee.
     ///
-    /// Both the check and `work` have to stay inside the gate. Lifting the
-    /// check out — reading the flag into a local and acting on it afterwards —
-    /// compiles, reads the same, and silently gives up the guarantee.
-    pub fn unless_cancelled<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
+    /// `work` must not `.await`: the gate is a blocking mutex, and holding it
+    /// across a yield point deadlocks whoever is ending the job.
+    pub fn unless_abandoned<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
         let _gate = self.gate.lock();
-        self.rx.borrow().is_none().then(work)
+        (*self.rx.borrow() != Some(CancelReason::Abandoned)).then(work)
     }
 
     /// Fast non-async read of the cancel flag.
@@ -153,6 +153,63 @@ impl Default for JobCancel {
 mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
+
+    /// A resolved job is being sealed, so what it executed is going on chain
+    /// and announcing it is telling the truth. Only an abandoned one has to be
+    /// held back.
+    #[tokio::test]
+    async fn work_runs_for_a_live_job_and_for_a_resolved_one() {
+        let live = JobCancel::new();
+        assert_eq!(live.unless_abandoned(|| "ran"), Some("ran"));
+
+        let asked_for = JobCancel::new();
+        asked_for.resolve();
+        assert_eq!(
+            asked_for.unless_abandoned(|| "ran"),
+            Some("ran"),
+            "a resolved payload is on its way to the chain; its slices are not a lie",
+        );
+    }
+
+    #[tokio::test]
+    async fn work_does_not_run_for_an_abandoned_job() {
+        let dropped = JobCancel::new();
+        dropped.abandon();
+        assert_eq!(dropped.unless_abandoned(|| "ran"), None);
+    }
+
+    /// The gate, not just the predicate: abandoning waits for work already
+    /// inside. Without it a slice could go out after the build was thrown away,
+    /// which is the single thing this guard exists to prevent.
+    #[tokio::test]
+    async fn abandoning_waits_for_work_already_inside_the_gate() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let cancel = Arc::new(JobCancel::new());
+        let inside = Arc::new(AtomicBool::new(false));
+        let left = Arc::new(AtomicBool::new(false));
+
+        let held = {
+            let (cancel, inside, left) = (cancel.clone(), inside.clone(), left.clone());
+            std::thread::spawn(move || {
+                cancel.unless_abandoned(|| {
+                    inside.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    left.store(true, Ordering::SeqCst);
+                })
+            })
+        };
+
+        while !inside.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        cancel.abandon();
+        assert!(left.load(Ordering::SeqCst), "abandon returned while the work was still running");
+        held.join().expect("the work completes");
+    }
 
     /// The two ways a build ends are not the same thing, and only one of them
     /// means the block is on its way to the consensus layer.
@@ -245,93 +302,5 @@ mod tests {
         let b = a.clone();
         b.abandon();
         assert!(a.is_cancelled(), "parent should observe clone's signal");
-    }
-
-    // ============ unless_cancelled ============
-    //
-    // Checking the flag and then acting on it are two steps, and a cancel
-    // landing between them is exactly the case the check exists to stop.
-    // These pin that the pair is indivisible.
-
-    #[tokio::test]
-    async fn unless_cancelled_runs_the_work_when_live() {
-        let c = JobCancel::new();
-
-        assert_eq!(c.unless_cancelled(|| 7), Some(7));
-    }
-
-    #[tokio::test]
-    async fn unless_cancelled_skips_the_work_once_cancelled() {
-        let c = JobCancel::new();
-        c.abandon();
-
-        let mut ran = false;
-        let outcome = c.unless_cancelled(|| ran = true);
-
-        assert!(outcome.is_none());
-        assert!(!ran, "the work must not run after cancellation");
-    }
-
-    /// The point of the gate: work that got past the check finishes before a
-    /// concurrent cancel takes effect. Without it, `signal` could flip the
-    /// flag while the work is half done — which for slice publishing means a
-    /// slice going out after the payload was already resolved.
-    ///
-    /// The observable is what `signal` can see the moment it returns: it
-    /// returns only once it holds the gate, so with the gate the work must
-    /// already be finished by then. Asserting after joining the worker would
-    /// prove nothing — the work is finished by then either way.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cancel_waits_for_work_already_past_the_check() {
-        use std::sync::{
-            Arc as StdArc,
-            atomic::{AtomicBool, Ordering},
-        };
-
-        let c = JobCancel::new();
-        let finished = StdArc::new(AtomicBool::new(false));
-
-        let worker = {
-            let c = c.clone();
-            let finished = StdArc::clone(&finished);
-            tokio::task::spawn_blocking(move || {
-                c.unless_cancelled(|| {
-                    // Long enough that a concurrent `signal` is certain to
-                    // arrive mid-work if the gate does not hold it off.
-                    std::thread::sleep(Duration::from_millis(100));
-                    finished.store(true, Ordering::SeqCst);
-                })
-            })
-        };
-
-        // Let the worker get past the check, then cancel and read the flag
-        // the instant the cancel took effect.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let finished_when_cancelled = {
-            let finished = StdArc::clone(&finished);
-            tokio::task::spawn_blocking(move || {
-                c.abandon();
-                finished.load(Ordering::SeqCst)
-            })
-            .await
-            .expect("signaller task")
-        };
-
-        assert!(worker.await.expect("worker task").is_some(), "the worker was live at the gate");
-        assert!(finished_when_cancelled, "the cancel took effect while the work was still running",);
-    }
-
-    /// And the other direction: a cancel that gets the gate first shuts the
-    /// work out entirely rather than letting it start.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn work_arriving_after_a_cancel_never_starts() {
-        let c = JobCancel::new();
-        let signaller = {
-            let c = c.clone();
-            tokio::task::spawn_blocking(move || c.abandon())
-        };
-        signaller.await.expect("signaller task");
-
-        assert!(c.unless_cancelled(|| -> () { unreachable!("must not run") }).is_none());
     }
 }

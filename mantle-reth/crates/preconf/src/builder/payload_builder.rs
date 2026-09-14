@@ -1270,13 +1270,14 @@ impl SliceState {
         P: reth_storage_api::StateProvider,
     {
         // Assembling means rooting every transaction in the block, which is not
-        // cheap. A payload that has already been resolved is being sealed, so
-        // there is nothing left to publish about it.
-        if cancel.is_cancelled() {
+        // cheap, and a block that was thrown away has nothing worth saying
+        // about it. A resolved one does: it is being sealed with exactly what
+        // this slice describes.
+        if cancel.reason() == Some(CancelReason::Abandoned) {
             debug!(
                 target: "mantle::preconf::flashblocks",
                 index = self.next_index,
-                "payload already resolved; skipping the slice",
+                "build abandoned; skipping the slice",
             );
             return;
         }
@@ -1316,19 +1317,18 @@ impl SliceState {
         // sealed block will not contain has no way to unsee them. Checking and
         // then sending as two steps would leave a window for the resolve to
         // land in between — which is the very thing being guarded against.
-        let sent = cancel.unless_cancelled(|| self.producer.publisher.publish(&payload));
+        let sent = cancel.unless_abandoned(|| self.producer.publisher.publish(&payload));
 
         match sent {
             None => {
-                // The guard did its job: the payload was resolved between
-                // assembling this slice and sending it. Expected under load,
-                // and a rate that climbs says slices are being assembled too
-                // close to the deadline.
-                metrics::counter!("flashblock.dropped_after_resolve_total").increment(1);
+                // The build was thrown away while this slice was being put
+                // together. Its transactions go back to the pool below, so
+                // announcing them would name a block that will never exist.
+                metrics::counter!("flashblock.dropped_after_abandon_total").increment(1);
                 debug!(
                     target: "mantle::preconf::flashblocks",
                     index = self.next_index,
-                    "payload resolved while the slice was assembled; dropping it",
+                    "build abandoned while the slice was assembled; dropping it",
                 );
                 return;
             }
@@ -1931,18 +1931,31 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             })?;
         }
 
-        // No closing slice here, deliberately. Every build ends by being
-        // cancelled — that is how `getPayload` asks for the block — so a slice
-        // assembled at this point is one the guard would always have to drop.
-        // Subscribers therefore stop at the last tick before the payload was
-        // resolved, which is where the reference implementation stops too.
+        // ── Stage 4b: the closing slice ───────────────────────────────
+        // The loop has no end of its own — it runs until `getPayload` cancels
+        // it — so whatever executed since the last tick, the SDM refund among
+        // it, is in the block and in no slice. A block whose transactions
+        // arrive late is otherwise one a subscriber sees nothing of until it
+        // seals.
         //
-        // The cost is that up to one interval of the block's tail reaches
-        // subscribers only when the block itself does. Worth revisiting if
-        // `--rollup.sdm-enabled` is ever turned on for a production network:
-        // its refund transaction executes in the stage above and moves
-        // balances, so leaving it out of every slice would make a consumer's
-        // pending balances wrong rather than merely late.
+        // The reference implementation needs no such slice: its loop stops on
+        // its own once the budgeted count is reached, so it has published
+        // everything by the time it finalizes. A difference in shape, not in
+        // policy.
+        if let Some(state) = slices.as_mut() &&
+            cancel.reason() == Some(CancelReason::Resolved)
+        {
+            state
+                .journal_and_publish(
+                    &ctx,
+                    &mut builder,
+                    &mut info,
+                    &state_provider_for_finish,
+                    &cancel,
+                    self.journal.as_deref(),
+                )
+                .await;
+        }
 
         // ── Stage 5: finalize ─────────────────────────────────────────
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =

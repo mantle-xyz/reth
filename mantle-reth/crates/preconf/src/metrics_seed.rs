@@ -23,7 +23,7 @@ const COUNTERS: &[&str] = &[
     "preconf.build.tx_rejected_by_evm_total",
     "preconf.rpc.nonce_gap_rejected_total",
     "flashblock.deadline_already_passed_total",
-    "flashblock.dropped_after_resolve_total",
+    "flashblock.dropped_after_abandon_total",
     "flashblock.returned_to_pool_total",
     "flashblock.slices_missed_by_slow_subscribers_total",
     "flashblock.slow_subscriber_dropped_total",

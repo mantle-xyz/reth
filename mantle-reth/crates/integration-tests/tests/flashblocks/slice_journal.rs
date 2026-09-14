@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{Address, Bytes, TxKind, address, keccak256};
+use alloy_primitives::{Address, B256, Bytes, TxKind, address, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::{JournalEntry, flashblocks::FlashblockProducerConfig};
 use op_alloy_consensus::DEPOSIT_TX_TYPE_ID;
@@ -239,4 +239,70 @@ async fn a_block_built_without_slicing_journals_nothing() {
     );
 
     std::fs::remove_dir_all(&journal_dir).ok();
+}
+/// The closing slice is journaled like any other.
+///
+/// It is published after the payload was resolved, on a path of its own that
+/// the ordinary publish guard does not cover — so the rule the journal exists
+/// for has to be restated here rather than inherited: a transaction a
+/// subscriber has been shown is on disk before it is shown. Without it the
+/// block's tail would be the one part of a block announced but not persisted,
+/// which is the exact window a crash turns into a broken promise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_closing_slice_is_journaled_before_it_goes_out() {
+    let (journal_file, journal_dir) = fresh_journal_path();
+    let cfg = PreconfCfgBuilder::new().journal_path(journal_file.clone()).build();
+    // Wide enough that one tick lets the transactions execute and the next is
+    // far away — see `producer_e2e::wide_enough_to_have_a_tail`.
+    let fb = FlashblockProducerConfig { block_time: Duration::from_secs(1), ..flashblocks_cfg() };
+    let (mut node, _http, wallet, chain_id, _fb_addr) =
+        crate::launch_flashblocks_node!(cfg, fb).await;
+
+    // Opened first, so these arrive mid-build and land in the tail.
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    for nonce in 0..5u64 {
+        let raw = signed_transfer(&wallet, chain_id, nonce).await;
+        node.rpc.inject_tx(raw).await.expect("inject");
+    }
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let journaled: Vec<B256> = read_journal(&journal_file).iter().map(|e| e.hash).collect();
+    let ordinary: Vec<B256> = payload
+        .block()
+        .body()
+        .transactions()
+        .map(|tx| Bytes::from(tx.encoded_2718()))
+        .filter(|raw| raw.first().is_some_and(|tag| *tag != DEPOSIT_TX_TYPE_ID))
+        .map(|raw| keccak256(&raw))
+        .collect();
+
+    assert_eq!(ordinary.len(), 5, "the block was supposed to carry all five");
+    for hash in &ordinary {
+        assert!(
+            journaled.contains(hash),
+            "{hash:?} was announced in the closing slice but is not on disk; journaled {journaled:?}",
+        );
+    }
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(journal_dir);
 }
