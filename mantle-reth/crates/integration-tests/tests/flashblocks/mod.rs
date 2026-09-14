@@ -21,6 +21,7 @@ mod cache_replay;
 mod consumer_pipeline;
 mod producer_e2e;
 mod reconciliation;
+mod reverted_tx;
 mod rpc_pending;
 mod rpc_pubsub;
 mod slice_journal;
