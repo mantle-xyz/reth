@@ -78,10 +78,6 @@ const GAUGES: &[&str] = &[
     "preconf.whitelist.to_wildcard_count",
     "preconf.whitelist.warn_threshold",
     "preconf.whitelist.consecutive_reload_failures",
-    // Whether published slices are under-reporting the block's DA footprint.
-    // A gauge and not a counter: it reports a property of the deployment
-    // (which fork is in force), not something that happens.
-    "flashblock.blob_gas_used_unpopulated",
 ];
 
 /// Histogram series. Registered only — never `record(0.0)`, which would inject

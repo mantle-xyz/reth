@@ -25,7 +25,8 @@
     },
     "mantleSkadiTime": 0,
     "mantleLimbTime": 0,
-    "mantleArsiaTime": 0
+    "mantleArsiaTime": 0,
+    "jovianTime": 0
   },
   "nonce": "0x0",
   "timestamp": "0x0",
@@ -97,6 +98,13 @@
     },
     "0xfabb0ac9d68b0b445fb7357272ff202c5651694a": {
       "balance": "0xd3c21bcecceda1000000"
+    },
+    "0x4200000000000000000000000000000000000015": {
+      "balance": "0x0",
+      "code": "0x00",
+      "storage": {
+        "0x0000000000000000000000000000000000000000000000000000000000000008": "0x0000000000000000000000000000000000000064000000000000000000000000"
+      }
     }
   },
   "number": "0x0"

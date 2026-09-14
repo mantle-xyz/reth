@@ -988,6 +988,7 @@ fn seal_block_so_far<N, Evm, ChainSpec, Attrs, B>(
     builder: &mut B,
     info: &ExecutionInfo<N::SignedTx>,
     state_provider: &dyn reth_storage_api::StateProvider,
+    da_footprint_gas_scalar: Option<u16>,
 ) -> Result<SealedBlock<BlockTy<N>>, PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
@@ -1025,12 +1026,18 @@ where
         receipts,
         requests: Default::default(),
         gas_used,
-        // Left unset. Post-Jovian this field carries the block's DA footprint,
-        // which the executor derives per transaction from its own estimate and
-        // does not hand out — so there is nothing here to fill it with, and a
-        // number in the wrong unit would be worse than none. The gauge
-        // `flashblock.blob_gas_used_unpopulated` says when that is in force.
-        blob_gas_used: 0,
+        // Post-Jovian the assembler puts this in the header as the block's DA
+        // footprint. The executor accumulates the same figure and hands it to
+        // no one, so it is recomputed here from what the build already tracks
+        // for its own limit checks — the same two numbers, multiplied the same
+        // way, as the executor's per-transaction estimates summed: the scalar
+        // is a per-block constant, and multiplication distributes over the sum.
+        // Deposits are excluded on both sides, which is what keeps the two
+        // totals the same rather than merely close.
+        //
+        // Before Jovian the assembler ignores whatever is passed here.
+        blob_gas_used: da_footprint_gas_scalar
+            .map_or(0, |scalar| info.cumulative_da_bytes_used.saturating_mul(u64::from(scalar))),
     };
     // One clone of the block's transactions per slice: the assembler takes them
     // owned. Bounded by the assembler's signature rather than by choice, and
@@ -1122,6 +1129,12 @@ impl<P: reth_storage_api::AccountReader + ?Sized> SenderBalances for ProviderBal
 /// subscriber tell a gap from a fresh start.
 struct SliceState {
     producer: FlashblocksProducer,
+    /// Post-Jovian DA footprint scalar, or `None` before Jovian.
+    ///
+    /// A per-block constant read once by the build loop, carried here rather
+    /// than re-read per slice: it turns the DA bytes the build has accumulated
+    /// into the footprint a Jovian header reports.
+    da_footprint_gas_scalar: Option<u16>,
     /// When this block's build began, for the first slice's offset.
     opened_at: std::time::Instant,
     /// When the previous slice went out, for the gap to the next.
@@ -1133,7 +1146,7 @@ struct SliceState {
 }
 
 impl SliceState {
-    fn new(producer: &FlashblocksProducer) -> Self {
+    fn new(producer: &FlashblocksProducer, da_footprint_gas_scalar: Option<u16>) -> Self {
         // The predecessor of this block's first slice is the last slice of the
         // previous block, which a block-scoped builder does not know — so it
         // comes from what the publisher has actually sent. Only a producer that
@@ -1154,6 +1167,7 @@ impl SliceState {
 
         Self {
             producer: producer.clone(),
+            da_footprint_gas_scalar,
             opened_at: std::time::Instant::now(),
             last_published: None,
             invariants: None,
@@ -1267,7 +1281,13 @@ impl SliceState {
             return;
         }
 
-        let sealed = match seal_block_so_far(ctx, builder, info, state_provider) {
+        let sealed = match seal_block_so_far(
+            ctx,
+            builder,
+            info,
+            state_provider,
+            self.da_footprint_gas_scalar,
+        ) {
             Ok(sealed) => sealed,
             Err(err) => {
                 warn!(
@@ -1675,16 +1695,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // other nodes derive from L1 data, and a subscriber watching a block
         // that is being replayed rather than built has nothing to gain from
         // seeing it in pieces.
-        let mut slices = self.flashblocks.as_ref().filter(|_| allow_preconf).map(SliceState::new);
-
-        if slices.is_some() {
-            // Post-Jovian the header's `blob_gas_used` carries the block's DA
-            // footprint, which slices leave unset (see `seal_block_so_far`).
-            // Sampled per build so a deployment can see it is in force rather
-            // than discover it from a consumer's numbers not adding up.
-            metrics::gauge!("flashblock.blob_gas_used_unpopulated")
-                .set(if da_footprint_gas_scalar.is_some() { 1.0 } else { 0.0 });
-        }
+        let mut slices = self
+            .flashblocks
+            .as_ref()
+            .filter(|_| allow_preconf)
+            .map(|producer| SliceState::new(producer, da_footprint_gas_scalar));
 
         // The first slice goes out before any preconf or pool transaction has
         // been applied, so it carries exactly the deposits and system

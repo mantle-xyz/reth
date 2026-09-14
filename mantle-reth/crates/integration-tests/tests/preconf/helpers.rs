@@ -36,6 +36,21 @@ const GENESIS_EIP1559_EXTRA_DATA: &str = "0x0100000008000000020000000000000000";
 ///
 /// Shared by every spec helper below so no test can accidentally build on a
 /// genesis that cannot be a valid parent.
+///
+/// Two entries in the fixture are worth knowing about, because JSON cannot
+/// carry a comment and nothing else explains them:
+///
+/// * `config.jovianTime: 0` — Jovian from genesis, matching the devnet and every network this
+///   builds for. Until it was set, the whole suite ran on a fork the deployed node had already
+///   passed, and the paths Jovian changes — `blob_gas_used` carrying a block's DA footprint among
+///   them — went unexercised.
+/// * the `L1Block` predeploy at `0x42..15`, holding the DA footprint gas scalar at slot 8, big-
+///   endian at byte offset 18 (`DA_FOOTPRINT_GAS_SCALAR_SLOT` / `_OFFSET` in op-revm). On a real
+///   chain that value arrives in each block's L1 info transaction; [`mantle_payload_attributes`]
+///   sends none, so genesis is the only way it can be there. Its value, 100, is the devnet's: a
+///   bare transfer sits at the 100-byte DA floor and produces the footprint of 10000 seen in devnet
+///   blocks. Zero would work equally well for booting and would silently reduce every footprint
+///   assertion to `0 == 0`.
 fn patched_genesis_value(chain_id: u64) -> serde_json::Value {
     let raw = include_str!("../assets/genesis.json");
     let mut value: serde_json::Value = serde_json::from_str(raw).expect("valid genesis JSON");
