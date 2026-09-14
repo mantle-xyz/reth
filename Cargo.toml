@@ -19,7 +19,7 @@
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.94"
+rust-version = "1.95"
 authors = ["Mantle Core Contributors"]
 homepage = "https://github.com/mantle-xyz/reth"
 repository = "https://github.com/mantle-xyz/reth"
