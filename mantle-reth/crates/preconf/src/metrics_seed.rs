@@ -161,6 +161,22 @@ mod tests {
 
     /// Every metric emitted anywhere in the crate must appear in the matching
     /// seed list — otherwise it regresses to lazy registration.
+    ///
+    /// Names are all this compares, because names are all it can read out of
+    /// the source: passing says a series is registered and spelled right, not
+    /// that it reports anything true. Computing a value wrong
+    /// (`increment(superseded - 1)`), counting a gauge the wrong way
+    /// (`decrement` when a subscriber arrives), and deleting the line that
+    /// constructs a `Drop`-guard all leave the whole suite green — the last
+    /// because the macro call stays in the source for this test to find while
+    /// the metric never fires again, and is caught by `-D warnings` on the
+    /// unused binding instead.
+    ///
+    /// Deliberately so: a wrong number bends a chart rather than changing what
+    /// the chain does, and the recorder is process-global, so reading values
+    /// back inside a shared test binary would collide with whatever else is
+    /// running. Names are held here; values by review and by watching a real
+    /// network.
     #[test]
     fn seed_lists_cover_every_emitted_metric() {
         let mut src = String::new();
