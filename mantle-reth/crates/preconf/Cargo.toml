@@ -92,7 +92,6 @@ reth-basic-payload-builder.workspace = true
 reth-chainspec.workspace = true
 reth-payload-util.workspace = true
 op-revm.workspace = true
-either.workspace = true
 
 # Step 7b: payload-service builder integration — implements reth's
 # `PayloadServiceBuilder` trait so the mantle cli can swap our

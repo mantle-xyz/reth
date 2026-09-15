@@ -110,12 +110,9 @@ async fn launch_node(
         return handle.node_exit_future.await;
     }
 
-    let path = args
-        .proofs_history_storage_path
-        .clone()
-        .ok_or_else(|| eyre::eyre!("--proofs-history.storage-path is required"))?;
+    let path = args.history.resolve_storage_path(builder.config().datadir().as_ref());
 
-    match args.proofs_history_storage_version {
+    match args.history.storage_version {
         ProofsStorageVersion::V1 => {
             info!(target: "reth::cli", "Using on-disk storage for proofs history (v1)");
             let mdbx = Arc::new(

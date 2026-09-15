@@ -16,6 +16,7 @@ pub mod import;
 pub mod import_receipts;
 pub mod init_state;
 pub mod op_proofs;
+mod slot_preimages_seed;
 
 #[cfg(feature = "dev")]
 pub mod test_vectors;

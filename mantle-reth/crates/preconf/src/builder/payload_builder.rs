@@ -222,6 +222,9 @@ struct BuildConstraints {
     base_fee: u64,
     /// Payload attributes timestamp (interop-deadline validation).
     timestamp: u64,
+    /// Max cumulative uncompressed (EIP-2718) block size; `None` disables the cap.
+    /// Keeps a built payload inside the size CL clients assume.
+    max_uncompressed_block_size: Option<u64>,
 }
 
 /// Estimate a preconf tx's data-availability footprint in bytes.
@@ -711,6 +714,8 @@ where
         constraints.block_da_limit,
         tx.gas_limit(),
         constraints.da_footprint_gas_scalar,
+        tx.encode_2718_len() as u64,
+        constraints.max_uncompressed_block_size,
     ) {
         best_txs.mark_invalid(tx.signer(), tx.nonce());
         return Ok(BestTxStep::Continue);
@@ -892,7 +897,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         })?;
 
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
-        let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
+        let mut info = ctx.execute_sequencer_transactions(&mut builder, None)?;
 
         // ── Stage 3: unified select! loop (see method rustdoc) ────────
 
@@ -931,6 +936,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             da_footprint_gas_scalar,
             base_fee,
             timestamp: attrs_timestamp,
+            max_uncompressed_block_size: self.builder_config.max_uncompressed_block_size,
         };
 
         let mut best_txs_iter = best_txs_iter_opt;
@@ -1124,8 +1130,14 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         }
 
         // ── Stage 5: finalize ─────────────────────────────────────────
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(state_provider_for_finish, None)?;
+        let BlockBuilderOutcome {
+            execution_result,
+            hashed_state,
+            trie_updates,
+            block,
+            // EIP-7928 block access list; the preconf builder does not produce one.
+            block_access_list: _,
+        } = builder.finish(state_provider_for_finish, None)?;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(
@@ -1141,10 +1153,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let executed: BuiltPayloadExecutedBlock<N> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
-            // Match upstream: keep unsorted; conversion to sorted happens
-            // when needed downstream.
-            hashed_state: either::Either::Left(Arc::new(hashed_state)),
-            trie_updates: either::Either::Left(Arc::new(trie_updates)),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
+            changed_paths: None,
         };
 
         Ok(OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed)))
@@ -1510,6 +1521,8 @@ mod tests {
             da_footprint_gas_scalar: scalar,
             base_fee: 0,
             timestamp: 0,
+            // These tests exercise the DA limits, not the block-size cap.
+            max_uncompressed_block_size: None,
         }
     }
 

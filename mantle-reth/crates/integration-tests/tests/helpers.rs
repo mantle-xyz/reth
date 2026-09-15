@@ -44,6 +44,7 @@ pub(crate) fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
+            target_gas_limit: None,
             slot_number: None,
         },
         transactions: None,
@@ -135,8 +136,8 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
             ..Default::default()
         })
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    config.network.discovery.discv5_port = 0;
-    config.network.discovery.discv5_port_ipv6 = 0;
+    config.network.discovery.discv5_port = Some(0);
+    config.network.discovery.discv5_port_ipv6 = Some(0);
 
     let db = create_test_rw_db_with_path(
         config
