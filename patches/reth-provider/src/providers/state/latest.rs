@@ -509,7 +509,9 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// 缺原像账户（只在 HashedAccounts），legacy + 无 marker → 返回 None（保留旧语义，防回归）。
+    /// Preimage-less account (present only in `HashedAccounts`), legacy DB without the marker:
+    /// returns `None`. Keeps the old behaviour on ordinary legacy DBs, guarding against a
+    /// regression there.
     #[test]
     fn basic_account_legacy_no_marker_ignores_hashed() {
         let factory = create_test_provider_factory();
@@ -520,7 +522,8 @@ mod tests {
         assert_eq!(LatestStateProviderRef::new(&db).basic_account(&A).unwrap(), None);
     }
 
-    /// 缺原像账户，legacy + 有 marker → 回退读 HashedAccounts，返回真实值（修复行为，修分叉）。
+    /// Preimage-less account, legacy DB with the marker: falls back to `HashedAccounts` and
+    /// returns the real value. This is the fix -- reading zero here forks the state root.
     #[test]
     fn basic_account_legacy_marker_reads_hashed() {
         let factory = create_test_provider_factory();
@@ -532,12 +535,13 @@ mod tests {
         assert_eq!(acc.map(|a| a.balance), Some(U256::from(100)));
     }
 
-    /// 有原像的普通账户（在 PlainAccountState），legacy + 有 marker → 仍读 plain，marker 不干扰。
+    /// Ordinary account with a preimage (present in `PlainAccountState`), legacy DB with the
+    /// marker: still served from plain. The marker must not disturb the normal path.
     #[test]
     fn basic_account_legacy_marker_prefers_plain() {
         let factory = create_test_provider_factory();
         put_plain_account(&factory, A, 55);
-        // 同时在 hashed 放一个不同值，确认命中的是 plain 而非 hashed。
+        // Put a different value in hashed as well, to prove the read came from plain.
         put_hashed_account(&factory, A, 999);
         set_hashed_snapshot_marker(&factory);
 
@@ -546,7 +550,8 @@ mod tests {
         assert_eq!(acc.map(|a| a.balance), Some(U256::from(55)));
     }
 
-    /// 全新/从不存在的账户，legacy + 有 marker + 两表皆无 → 返回 None（不会误报，仍正确返 0）。
+    /// Account that never existed, legacy DB with the marker and absent from both tables:
+    /// returns `None`. The fallback must not invent an account.
     #[test]
     fn basic_account_legacy_marker_absent_account_is_none() {
         let factory = create_test_provider_factory();
@@ -556,7 +561,8 @@ mod tests {
         assert_eq!(LatestStateProviderRef::new(&db).basic_account(&A).unwrap(), None);
     }
 
-    /// storage：缺原像账户的槽只在 HashedStorages，legacy + 有 marker → 回退读到真实值。
+    /// Storage: a preimage-less account's slot lives only in `HashedStorages`; legacy DB with
+    /// the marker falls back to it and reads the real value.
     #[test]
     fn storage_legacy_marker_reads_hashed() {
         let factory = create_test_provider_factory();
@@ -577,7 +583,8 @@ mod tests {
         );
     }
 
-    /// storage：全新槽，legacy + 有 marker + 两表皆无 → 返回 None。
+    /// Storage: a slot that never existed, legacy DB with the marker and absent from both
+    /// tables: returns `None`.
     #[test]
     fn storage_legacy_marker_absent_slot_is_none() {
         let factory = create_test_provider_factory();
