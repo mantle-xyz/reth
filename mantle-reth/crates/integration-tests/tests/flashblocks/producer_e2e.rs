@@ -248,27 +248,54 @@ async fn published_slices_are_a_prefix_of_the_sealed_block() {
 /// A tick interval wide enough to place work in the tail without racing.
 ///
 /// Mid-build arrivals are only picked up when the pool iterator is rebuilt,
-/// which happens on a tick — so the tail cannot be reached by simply silencing
-/// the ticker: with no tick the transactions never execute at all, and there is
-/// nothing to miss. What is needed is one tick to pick them up and a long gap
-/// before the next, leaving a window in which they execute and the payload is
-/// resolved. A second is enough to make that window hundreds of milliseconds
-/// wide rather than a coin flip.
+/// which happens on a tick — so the tail cannot be reached by silencing the
+/// ticker: with no tick they never execute and there is nothing to miss. What
+/// is needed is one tick to pick them up and a long gap before the next, which
+/// a second makes hundreds of milliseconds wide rather than a coin flip.
 fn wide_enough_to_have_a_tail() -> FlashblockProducerConfig {
     FlashblockProducerConfig { block_time: Duration::from_secs(1), ..flashblocks_cfg() }
+}
+
+/// Open a block, inject five transactions into it, and wait until they have
+/// executed but no further tick has carried them. Returns the payload id.
+///
+/// Injecting after the block opens is what puts them past the opening slice;
+/// the wait is past the tick that lets them execute and well before the next.
+macro_rules! open_a_block_with_a_tail {
+    ($node:expr, $wallet:expr, $chain_id:expr) => {{
+        let attrs = $node.payload.next_attributes();
+        let fcu_state = $node.current_forkchoice_state().expect("forkchoice state");
+        let payload_id = $node
+            .inner
+            .add_ons_handle
+            .beacon_engine_handle
+            .fork_choice_updated(fcu_state, Some(attrs))
+            .await
+            .expect("FCU must succeed")
+            .payload_id
+            .expect("payload_id present");
+
+        for nonce in 0..5u64 {
+            let raw = signed_transfer(&$wallet, $chain_id, nonce).await;
+            $node.rpc.inject_tx(raw).await.expect("inject");
+        }
+        // One tick's worth plus enough for the pool arm to drain them, and no
+        // more: the rest of that second is the tail. Under a loaded machine the
+        // margin on both sides is what keeps this from measuring the wrong
+        // window, so it is stated rather than tuned.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        payload_id
+    }};
 }
 
 /// Transactions that arrive after the last tick still reach subscribers.
 ///
 /// The build loop has no end of its own — it runs until `getPayload` cancels it
 /// — so whatever executes between the final tick and that cancel would be in
-/// the sealed block and in no slice. Measured before this was closed: five
-/// transactions injected mid-build, five sealed, four slices carrying none.
-///
-/// The reference implementation has no such window, which is why it needs no
-/// closing slice: its loop stops on its own once the budgeted count is reached,
-/// so everything is out by the time it finalizes. Ours keeps ticking until
-/// asked for the block, and settles up at the end.
+/// the sealed block and in no slice. The reference implementation has no such
+/// window: its loop stops once the budgeted count is reached, so everything is
+/// out by the time it finalizes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transactions_arriving_after_the_last_tick_still_reach_subscribers() {
     let cfg = PreconfCfgBuilder::new().build();
@@ -276,28 +303,7 @@ async fn transactions_arriving_after_the_last_tick_still_reach_subscribers() {
         crate::launch_flashblocks_node!(cfg, wide_enough_to_have_a_tail()).await;
     let mut subscriber = subscribe(fb_addr).await;
 
-    // Open the block first: only transactions injected after this point can
-    // execute past the opening slice.
-    let attrs = node.payload.next_attributes();
-    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
-    let payload_id = node
-        .inner
-        .add_ons_handle
-        .beacon_engine_handle
-        .fork_choice_updated(fcu_state, Some(attrs))
-        .await
-        .expect("FCU must succeed")
-        .payload_id
-        .expect("payload_id present");
-
-    for nonce in 0..5u64 {
-        let raw = signed_transfer(&wallet, chain_id, nonce).await;
-        node.rpc.inject_tx(raw).await.expect("inject");
-    }
-    // Past the tick that rebuilds the pool iterator and lets these execute,
-    // with most of a second still to go before the next one — so they are in
-    // the block, and in no slice yet.
-    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let payload_id = open_a_block_with_a_tail!(node, wallet, chain_id);
 
     let payload = node
         .inner
@@ -334,17 +340,14 @@ async fn transactions_arriving_after_the_last_tick_still_reach_subscribers() {
 
 /// A build nobody asked for publishes no closing slice.
 ///
-/// The closing slice exists because the payload was resolved and its
-/// transactions are therefore on their way to the chain. A build that was
-/// thrown away hands them back to the pool instead, so announcing them would be
-/// announcing a block that is going nowhere — the one thing the publish guard
-/// exists to prevent, and the guard cannot help here because the closing slice
-/// deliberately runs after the cancel.
+/// The closing slice is published because the payload was resolved and is
+/// therefore on its way to the chain. A build thrown away hands its
+/// transactions back to the pool instead, so announcing them would name a block
+/// that will never exist.
 ///
-/// Counts slices rather than transactions: an ordinary tick publishes the same
-/// transactions quite legitimately while the build is still live, so their
-/// presence says nothing. What must not appear is another slice *after* the
-/// build was thrown away.
+/// Counts slices, not transactions: an ordinary tick publishes the same
+/// transactions quite legitimately while the build is live, so their presence
+/// says nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_abandoned_build_publishes_no_closing_slice() {
     let cfg = PreconfCfgBuilder::new().build();
@@ -352,27 +355,11 @@ async fn an_abandoned_build_publishes_no_closing_slice() {
         crate::launch_flashblocks_node!(cfg, wide_enough_to_have_a_tail()).await;
     let mut subscriber = subscribe(fb_addr).await;
 
-    let attrs = node.payload.next_attributes();
-    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
-    node.inner
-        .add_ons_handle
-        .beacon_engine_handle
-        .fork_choice_updated(fcu_state, Some(attrs))
-        .await
-        .expect("FCU must succeed");
+    let _ = open_a_block_with_a_tail!(node, wallet, chain_id);
 
-    for nonce in 0..5u64 {
-        let raw = signed_transfer(&wallet, chain_id, nonce).await;
-        node.rpc.inject_tx(raw).await.expect("inject");
-    }
-    // Same window as the test above: past the tick that lets them execute, well
-    // before the next one.
-    tokio::time::sleep(Duration::from_millis(1_300)).await;
-
-    // Drained and discarded: whatever ticks published while the build was live
-    // is legitimate, and only what comes *after* it is thrown away is at issue.
-    // The payload id is what separates them — the replacement build has its
-    // own, and is free to publish these transactions again.
+    // What ticks published while the build was live is legitimate; only what
+    // comes after it is thrown away is at issue. The payload id separates
+    // them — the replacement build has its own and may publish these again.
     let abandoned_payload = drain(&mut subscriber, Duration::from_millis(200))
         .await
         .last()
@@ -382,6 +369,7 @@ async fn an_abandoned_build_publishes_no_closing_slice() {
     // A second job on the same parent throws the first away without ever
     // asking for its payload.
     let next = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
     node.inner
         .add_ons_handle
         .beacon_engine_handle
@@ -390,8 +378,8 @@ async fn an_abandoned_build_publishes_no_closing_slice() {
         .expect("second FCU must succeed");
 
     // Generous: the abandoned build is mid-`await` when the second FCU lands,
-    // and a slice that leaks out does so only once it unwinds. Too short a
-    // window here and the test passes by not having looked yet.
+    // so a leaked slice arrives only once it unwinds — too short a window and
+    // this passes by not having looked yet.
     let leaked: Vec<u64> = drain(&mut subscriber, Duration::from_millis(1_500))
         .await
         .iter()

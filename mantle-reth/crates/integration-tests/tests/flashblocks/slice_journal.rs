@@ -242,18 +242,14 @@ async fn a_block_built_without_slicing_journals_nothing() {
 }
 /// The closing slice is journaled like any other.
 ///
-/// It is published after the payload was resolved, on a path of its own that
-/// the ordinary publish guard does not cover — so the rule the journal exists
-/// for has to be restated here rather than inherited: a transaction a
-/// subscriber has been shown is on disk before it is shown. Without it the
-/// block's tail would be the one part of a block announced but not persisted,
-/// which is the exact window a crash turns into a broken promise.
+/// It carries the block's tail, which would otherwise be the one part of a
+/// block announced but not persisted — the window a crash turns into a
+/// transaction a subscriber was shown and the chain never got.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_closing_slice_is_journaled_before_it_goes_out() {
     let (journal_file, journal_dir) = fresh_journal_path();
     let cfg = PreconfCfgBuilder::new().journal_path(journal_file.clone()).build();
-    // Wide enough that one tick lets the transactions execute and the next is
-    // far away — see `producer_e2e::wide_enough_to_have_a_tail`.
+    // Wide enough to have a tail — see `producer_e2e` for why a second.
     let fb = FlashblockProducerConfig { block_time: Duration::from_secs(1), ..flashblocks_cfg() };
     let (mut node, _http, wallet, chain_id, _fb_addr) =
         crate::launch_flashblocks_node!(cfg, fb).await;
