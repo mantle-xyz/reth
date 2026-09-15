@@ -26,7 +26,8 @@
     "mantleSkadiTime": 0,
     "mantleLimbTime": 0,
     "mantleArsiaTime": 0,
-    "jovianTime": 0
+    "jovianTime": 0,
+    "isthmusTime": 0
   },
   "nonce": "0x0",
   "timestamp": "0x0",
