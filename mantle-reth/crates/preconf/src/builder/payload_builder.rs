@@ -1111,9 +1111,22 @@ fn block_invariants<B: reth_primitives_traits::Block>(sealed: &SealedBlock<B>) -
 ///
 /// The live mid-block balances are not reachable from here — the block builder
 /// holds the state for the whole build — so a sender who has already spent in
-/// this block reads higher than they now are. The pool treats balance as a
-/// hint and execution is the real gate, so the cost is an occasional
-/// transaction admitted and then skipped, never one wrongly withheld.
+/// this block reads higher than they now are. Only ever higher, which makes it
+/// a cost rather than a hazard: too much balance admits a transaction that
+/// execution then refuses, too little would withhold a good one.
+///
+/// Measured: of three transfers spending a third of a balance each, the last
+/// falls short by the gas the first two burned, and the pool — told the parent
+/// balance at every boundary — keeps it pending. The arm executes it, is
+/// refused, returns the allowance it reserved, counts
+/// `preconf.build.tx_rejected_by_evm_total`, and carries on. It takes a slice
+/// boundary between them to happen at all; within one slice the pool iterator
+/// tracks the spending itself.
+///
+/// Both ways to close it cost more than that one wasted execution: reaching
+/// the executor's mid-block state means restructuring who holds state for the
+/// build, and tallying spending here means a second copy of the EVM's fee
+/// rules, which would drift.
 struct ProviderBalances<'a, P: ?Sized>(&'a P);
 
 impl<P: reth_storage_api::AccountReader + ?Sized> SenderBalances for ProviderBalances<'_, P> {
