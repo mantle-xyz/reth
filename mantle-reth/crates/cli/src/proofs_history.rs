@@ -46,8 +46,6 @@ macro_rules! install_proofs_history {
         let storage: OpProofsStorage<Arc<_>> = $mdbx.into();
         let storage_exec = storage.clone();
 
-        // v2.4.2: `proofs_history_window` became `ProofsHistoryWindowArg`, and the prune
-        // interval was dropped upstream (from the arg and from the ExEx builder alike).
         let RollupArgs { proofs_history_window, proofs_history_verification_interval, .. } =
             *$args;
 

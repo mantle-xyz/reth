@@ -1,12 +1,16 @@
 //! Materializes `res/superchain-configs.tar` from the `superchain-registry`
-//! submodule, so the (large, non-text) archive doesn't need to be committed — only
-//! its `res/superchain-configs.tar.sha256` is. The Rust port of the former
+//! submodule. The Rust port of the former
 //! `res/fetch_superchain_config.sh`, using pinned, deterministic crates
 //! (`toml`/`serde_json` for TOML→JSON, `zstd` to decode the dictionary-compressed
 //! genesis, `miniz_oxide` to re-emit plain zlib the `no_std` runtime can inflate).
 //!
-//! Semantics mirror kona's `KONA_SYNC_SUPERCHAIN`, with one addition — op-reth's tar
-//! is gitignored (not committed text), so it can be absent:
+//! [MANTLE] Upstream leaves the archive uncommitted and regenerates it from the
+//! submodule. That submodule belongs to the optimism monorepo and is not reachable
+//! from this standalone repo, so the tar is committed here next to its `.sha256` and
+//! the default path below always takes the "already present" branch.
+//!
+//! Semantics mirror kona's `KONA_SYNC_SUPERCHAIN`, with one addition — the tar can be
+//! absent:
 //! - **default** (env unset): if `res/superchain-configs.tar` is present (provided by `just
 //!   sync-superchain-rust` or copied into the build context), use it as-is — no submodule needed —
 //!   after checking it matches the committed `.sha256`. If it is absent, regenerate it from the

@@ -28,7 +28,6 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
 
     let args = RollupArgs {
         proofs_history: true,
-        // v2.4.2 groups these under the shared `ProofsHistoryStorageArgs`.
         history: ProofsHistoryStorageArgs {
             storage_path: Some(sidecar_path.clone()),
             storage_version: ProofsStorageVersion::V2,

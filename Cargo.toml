@@ -13,8 +13,8 @@
 #   alloy-evm      → crates.io 0.37.0 (upstream, no Mantle patches; see mantle-v2#359)
 #   alloy base     → crates.io 2.1.1
 #
-# The three Mantle forks are on branch dev/mantle-v1.6.3 while this line is in
-# development. They move to release/* at hand-off and to tags at release.
+# The three Mantle forks track branches while this line is in development; they are
+# pinned to tags at release.
 
 [workspace.package]
 edition = "2024"
@@ -427,24 +427,14 @@ thiserror = { version = "2", default-features = false }
 tokio-tungstenite = "0.28.0"
 url = "2.5"
 
-# ==================== [patch] — reth core minimal patches ====================
-# Uncomment when patches/ crates are populated:
-# ==================== ADDED FOR op-reth/v2.4.2 ====================
-# Declarations the imported crates inherit, copied from the anchor's manifest.
+criterion = { package = "codspeed-criterion-compat", version = "2.10" }
 crossbeam-channel = "0.5.13"
 libc = "0.2"
 rustls = { version = "0.23", default-features = false }
-
-# ==================== ADDED FOR op-reth/v2.4.2 ====================
-# Declarations the imported crates inherit, copied from the anchor's manifest.
 tar = "0.4.44"
 
-# ==================== ADDED FOR op-reth/v2.4.2 ====================
-# Declarations the imported crates inherit, copied from the anchor's manifest.
-criterion = { package = "codspeed-criterion-compat", version = "2.10" }
-
+# ==================== [patch] — reth core minimal patches ====================
 [patch."https://github.com/paradigmxyz/reth"]
-# reth-rpc = { path = "patches/reth-rpc" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
 

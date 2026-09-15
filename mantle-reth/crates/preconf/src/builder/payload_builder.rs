@@ -223,7 +223,7 @@ struct BuildConstraints {
     /// Payload attributes timestamp (interop-deadline validation).
     timestamp: u64,
     /// Max cumulative uncompressed (EIP-2718) block size; `None` disables the cap.
-    /// v2.4.2 added this so a built payload stays inside the size CL clients assume.
+    /// Keeps a built payload inside the size CL clients assume.
     max_uncompressed_block_size: Option<u64>,
 }
 

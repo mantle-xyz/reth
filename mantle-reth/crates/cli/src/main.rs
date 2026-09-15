@@ -110,8 +110,6 @@ async fn launch_node(
         return handle.node_exit_future.await;
     }
 
-    // v2.4.2 moved these into the shared `ProofsHistoryStorageArgs` and made the path optional:
-    // it now defaults to `<reth-data-dir>/historical-proofs` instead of being required.
     let path = args.history.resolve_storage_path(builder.config().datadir().as_ref());
 
     match args.history.storage_version {
