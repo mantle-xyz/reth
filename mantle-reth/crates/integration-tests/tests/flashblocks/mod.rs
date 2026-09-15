@@ -16,6 +16,7 @@ pub mod helpers;
 // instead of driving a producer, so their fixtures are a separate set from the
 // preconf ones above and keep their own name.
 pub mod consumer_helpers;
+
 mod cache_replay;
 mod consumer_pipeline;
 mod da_footprint_header;

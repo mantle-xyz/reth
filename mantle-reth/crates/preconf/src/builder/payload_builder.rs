@@ -1061,13 +1061,20 @@ where
             // the block moves the real one. Slices of a block containing
             // withdrawals therefore carry a root the sealed block will not have.
             //
-            // The reference implementation passes its live bundle here and gets
-            // this right. Reaching ours means going through `evm_mut().db_mut()`
-            // to the state the builder holds, which is a change to who may
-            // borrow what during a slice; it is not in place yet, and until it
-            // is, this field is reliable only for blocks without withdrawals.
-            // The rest of the slice header — transactions, receipts, gas — is
-            // exact either way.
+            // The reference implementation passes its live bundle here, which
+            // reads as the line to copy and is not: a bundle only holds what
+            // `merge_transitions` has folded into it, and slicing never merges
+            // — doing so a second time appends an empty revert block and
+            // truncates the real one, which is what `slice_state_invariants`
+            // pins. Ours would be as empty as this one. Getting the figure
+            // means assembling it from the pending transitions instead, for
+            // this one predeploy, without touching the bundle.
+            //
+            // Left until a consumer is known to read the field. Until then it
+            // buys one header field on blocks that contain withdrawals, at the
+            // price of code that walks state revm expects to own; the rest of
+            // the slice header — transactions, receipts, gas — is exact
+            // regardless.
             &BundleState::default(),
             state_provider,
             B256::ZERO,
