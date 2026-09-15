@@ -1053,13 +1053,21 @@ where
             ctx.parent(),
             transactions,
             &output,
-            // Empty: the only thing the assembler reads a bundle for is the
-            // `L2ToL1MessagePasser` storage root, and the live state is not
-            // reachable from here — the builder holds it for the whole build.
-            // That root is a block-level constant anyway, so leaving it at the
-            // parent's value costs the hash nothing as an identifier: what
-            // distinguishes one slice from the next is the transactions,
-            // receipts and gas, all of which are exact.
+            // Empty, and post-Isthmus that is wrong rather than merely
+            // approximate: the assembler reads a bundle only to derive the
+            // `L2ToL1MessagePasser` storage root, which `storage_root` computes
+            // as the current state plus whatever updates it is handed — so an
+            // empty bundle reports the parent's root, while every withdrawal in
+            // the block moves the real one. Slices of a block containing
+            // withdrawals therefore carry a root the sealed block will not have.
+            //
+            // The reference implementation passes its live bundle here and gets
+            // this right. Reaching ours means going through `evm_mut().db_mut()`
+            // to the state the builder holds, which is a change to who may
+            // borrow what during a slice; it is not in place yet, and until it
+            // is, this field is reliable only for blocks without withdrawals.
+            // The rest of the slice header — transactions, receipts, gas — is
+            // exact either way.
             &BundleState::default(),
             state_provider,
             B256::ZERO,
