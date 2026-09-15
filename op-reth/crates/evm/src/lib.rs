@@ -345,12 +345,20 @@ where
         let timestamp = payload.payload.timestamp();
         let block_number = payload.payload.block_number();
 
+        // [MANTLE] Mantle-aware spec picker: it resolves Skadi/Limb/Arsia, which the standard
+        // OP progression does not, so the engine-API payload path agrees with the block
+        // executor and the RPC handlers on which fork a payload belongs to.
         let spec =
             alloy_op_evm::spec_by_timestamp_after_bedrock(self.chain_spec().as_ref(), timestamp);
 
-        let cfg_env = CfgEnv::new()
+        let mut cfg_env = CfgEnv::new()
             .with_chain_id(self.chain_spec().chain().id())
             .with_spec_and_mainnet_gas_params(spec);
+        // [MANTLE] This builds its own `CfgEnv` rather than going through
+        // `evm_env_for_op_block`, so Mantle's EIP-7825 exemption has to be applied here too.
+        // This is the engine-API validation path: without it a follower rejects any block
+        // carrying a transaction above the cap, and forks off the chain.
+        cfg_env.tx_gas_limit_cap = spec.tx_gas_limit_cap_override();
 
         let blob_excess_gas_and_price = spec
             .into_eth_spec()
