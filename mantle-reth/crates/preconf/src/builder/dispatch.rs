@@ -45,6 +45,7 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 use crate::{
     PreconfConfig, PreconfTxSet,
     apply::ApplyError,
+    journal::{JournalEntry, PreconfJournal},
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
@@ -201,6 +202,7 @@ impl LoopState {
 pub(super) async fn apply_one_preconf<F>(
     fifo: &PreconfTxSet,
     cfg: &PreconfConfig,
+    journal: Option<&PreconfJournal>,
     hash: TxHash,
     loop_state: &mut LoopState,
     mut apply_fn: F,
@@ -428,6 +430,30 @@ where
                     "mark_succeeded lost race"
                 );
             }
+            // Persist before the receipt goes anywhere. The commitment is made
+            // by the transaction landing, not by a client hearing about it:
+            // a listener-pushed entry has no responder at all, and a client
+            // that timed out has stopped listening — both are still in the
+            // block, and with slicing both have been broadcast.
+            //
+            // A `Replay` entry came out of this file; writing it back on every
+            // block it is retried in would grow it without adding anything.
+            if let Some(journal) = journal &&
+                entry.source != PreconfSource::Replay
+            {
+                let record = JournalEntry::for_executed(
+                    hash,
+                    entry.tx.as_ref(),
+                    loop_state.predicted_height,
+                );
+                if let Err(e) = journal.append_promised(&record).await {
+                    warn!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?e,
+                        "journal append failed; commitment may be lost on restart"
+                    );
+                }
+            }
             if let Some(resp) = fifo.take_responder(&hash).await {
                 let _ = resp.send(Ok(receipt));
             }
@@ -611,6 +637,108 @@ mod tests {
         Err(ApplyError::Fatal(PayloadBuilderError::other(std::fmt::Error)))
     }
 
+    /// A journal under a temp dir, for the dispatch-side write.
+    async fn temp_journal() -> (tempfile::TempDir, PreconfJournal) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let j =
+            PreconfJournal::open(dir.path().join("preconf.jsonl"), 1 << 20).await.expect("opens");
+        (dir, j)
+    }
+
+    /// Persisting a commitment hangs off the transaction landing, not off a
+    /// client being there to hear about it.
+    ///
+    /// `take_responder` returns `None` for entries the pool listener pushed,
+    /// and `resp.send` fails for a client that already gave up — in both cases
+    /// the transaction is still in the block, and with slicing it has been
+    /// broadcast. Journaling from the receipt path missed exactly those.
+    #[tokio::test]
+    async fn an_applied_commitment_is_journaled_even_with_no_responder_attached() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let (_dir, journal) = temp_journal().await;
+        let tx = make_tx(0x21);
+        let hash = *tx.tx_hash();
+        // Deliberately no `attach_responder`.
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, Some(&journal), hash, &mut state, synthetic_ok)
+            .await
+            .unwrap();
+
+        let (entries, _) = journal.load().await.unwrap();
+        assert_eq!(entries.len(), 1, "the commitment landed, so it belongs on disk");
+        assert_eq!(entries[0].hash, hash);
+        assert_eq!(entries[0].block_height, 42);
+    }
+
+    /// A revert still produced a receipt, so the commitment was made and has
+    /// to survive a restart exactly as a successful one does. Dispatch reads
+    /// `Ok(receipt)`, never `receipt.status`.
+    #[tokio::test]
+    async fn a_reverted_commitment_is_journaled_too() {
+        fn synthetic_revert(
+            tx: Arc<TxEnvelope>,
+            hash: TxHash,
+            height: u64,
+        ) -> Result<PreconfReceipt, ApplyError> {
+            Ok(PreconfReceipt {
+                tx_hash: hash,
+                block_height: height,
+                status: false,
+                logs: Vec::new(),
+                gas_used: tx.gas_limit(),
+                reason: "execution reverted".to_string(),
+                revert_data: Bytes::new(),
+            })
+        }
+
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let (_dir, journal) = temp_journal().await;
+        let tx = make_tx(0x23);
+        let hash = *tx.tx_hash();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, Some(&journal), hash, &mut state, synthetic_revert)
+            .await
+            .unwrap();
+
+        let (entries, _) = journal.load().await.unwrap();
+        assert_eq!(entries.iter().map(|e| e.hash).collect::<Vec<_>>(), vec![hash]);
+    }
+
+    /// A replayed entry came *out* of the journal. Writing it back every block
+    /// it is retried in would grow the file without adding anything.
+    #[tokio::test]
+    async fn a_replayed_commitment_is_not_journaled_again() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let (_dir, journal) = temp_journal().await;
+        let tx = make_tx(0x22);
+        let hash = *tx.tx_hash();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Replay).await,
+            PushResult::Inserted
+        ));
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, Some(&journal), hash, &mut state, synthetic_ok)
+            .await
+            .unwrap();
+
+        let (entries, _) = journal.load().await.unwrap();
+        assert!(entries.is_empty(), "it is already in the file it was read from");
+    }
+
     #[tokio::test]
     async fn apply_one_preconf_calls_closure_and_marks_succeeded() {
         let fifo = PreconfTxSet::new(8);
@@ -626,7 +754,7 @@ mod tests {
         ));
 
         let mut state = LoopState::new(42);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         // Responder got the synthetic receipt.
         let receipt = resp_rx.await.expect("responder closed").expect("synthetic ok");
@@ -662,12 +790,12 @@ mod tests {
             call_count.set(call_count.get() + 1);
             synthetic_ok(tx, h, height)
         };
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, &mut counting_apply).await.unwrap();
         assert_eq!(call_count.get(), 1);
         assert_eq!(state.committed_len(), 1);
 
         // Second call: dedup guard fires before apply_fn is invoked.
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, &mut counting_apply).await.unwrap();
         assert_eq!(call_count.get(), 1, "apply closure must not be called twice");
         assert_eq!(state.committed_len(), 1);
     }
@@ -699,7 +827,7 @@ mod tests {
             apply_called.set(true);
             synthetic_ok(tx, h, height)
         };
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut tracking_apply).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, &mut tracking_apply).await.unwrap();
 
         // apply closure must NOT have been invoked — deadline gate fires
         // earlier so the in-flight builder is untouched.
@@ -745,7 +873,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
         // First dispatch: Timeout via deadline gate.
         let err = resp_rx1.await.expect("responder closed").expect_err("must be Timeout");
         assert!(matches!(err, PreconfError::Timeout { .. }));
@@ -765,7 +893,7 @@ mod tests {
         // Step 3: second dispatch. Dedup CLEARS the stale Timeout and
         // falls through; deadline gate reads fresh inserted_at (< 50ms)
         // and passes; apply succeeds.
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.excluded_len(), 0, "stale Timeout exclusion must be cleared");
         assert_eq!(state.committed_len(), 1, "second dispatch must apply successfully");
@@ -787,7 +915,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(99);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err).await.unwrap();
 
         // Responder got the apply error verbatim.
         let err = resp_rx.await.expect("responder closed").expect_err("must be Err");
@@ -832,7 +960,7 @@ mod tests {
         let hash = push_replayed(&fifo, make_tx(0x91)).await;
 
         let mut state = LoopState::new(7);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err)
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
@@ -867,7 +995,7 @@ mod tests {
         let hash = push_replayed(&fifo, make_tx(0x92)).await;
 
         let mut state = LoopState::new(7);
-        let outcome = apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_fatal).await;
+        let outcome = apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_fatal).await;
 
         assert!(outcome.is_err(), "a fatal execution error aborts the whole build");
 
@@ -904,7 +1032,7 @@ mod tests {
 
         let hash = push_replayed(&fifo, make_tx(0x92)).await;
         let mut state = LoopState::new(7);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err)
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
@@ -926,7 +1054,7 @@ mod tests {
         let hash = push_replayed(&fifo, make_tx(0x94)).await;
 
         let mut state = LoopState::new(7);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err)
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err)
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
         assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Failed);
@@ -938,7 +1066,7 @@ mod tests {
             synthetic_ok(tx, h, height)
         };
         let mut next_state = LoopState::new(8);
-        apply_one_preconf(&fifo, &cfg, hash, &mut next_state, &mut counting)
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut next_state, &mut counting)
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
@@ -966,7 +1094,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(7);
-        let out = apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_fatal).await;
+        let out = apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_fatal).await;
 
         // 1. Propagates as a build-aborting error.
         assert!(out.is_err(), "fatal apply must abort the build (return Err)");
@@ -1021,7 +1149,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         let receipt = resp_rx.await.expect("responder closed").expect("must succeed at boundary");
         assert_eq!(receipt.gas_used, 21_000);
@@ -1053,7 +1181,7 @@ mod tests {
         fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         // Responder got the typed error with all three fields.
         let err = resp_rx.await.expect("responder closed").expect_err("must be Err");
@@ -1095,7 +1223,7 @@ mod tests {
             let tx = make_tx_with_gas(0x77 + i as u8, i as u64, gas);
             let hash = *tx.tx_hash();
             fifo.push_if_absent(tx, Address::from([i as u8 + 1; 20]), PreconfSource::Rpc).await;
-            apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+            apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
             expected_total += gas;
             assert_eq!(
                 state.preconf_gas_used(),
@@ -1130,7 +1258,7 @@ mod tests {
         };
 
         // hash never seen — no push_if_absent, no attach_responder.
-        apply_one_preconf(&fifo, &cfg, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn)
+        apply_one_preconf(&fifo, &cfg, None, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn)
             .await
             .unwrap();
 
@@ -1182,7 +1310,7 @@ mod tests {
                 synthetic_ok(tx, h, height)
             };
 
-            apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut apply_fn).await.unwrap();
+            apply_one_preconf(&fifo, &cfg, None, hash, &mut state, &mut apply_fn).await.unwrap();
 
             assert_eq!(call_count.get(), 0, "apply_fn must not run when status={pre_status:?}",);
             assert_eq!(state.committed_len(), 0);
@@ -1226,7 +1354,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal-replayed tx must apply despite deadline");
         assert_eq!(state.excluded_len(), 0);
@@ -1253,7 +1381,7 @@ mod tests {
         let hash = *tx.tx_hash();
         fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Replay).await;
 
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal tx must apply despite over-budget");
         assert_eq!(state.excluded_len(), 0);
@@ -1284,14 +1412,14 @@ mod tests {
         let j_tx = make_tx_with_gas(0xe2, 0, 30_000);
         let j_hash = *j_tx.tx_hash();
         fifo.push_if_absent(j_tx, Address::from([1; 20]), PreconfSource::Replay).await;
-        apply_one_preconf(&fifo, &cfg, j_hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, j_hash, &mut state, synthetic_ok).await.unwrap();
         assert_eq!(state.preconf_gas_used(), 30_000);
 
         // RPC tx: 21_000 gas. 30_000 + 21_000 = 51_000 > 40_000 → rejected.
         let r_tx = make_tx_with_gas(0xe3, 0, 21_000);
         let r_hash = *r_tx.tx_hash();
         fifo.push_if_absent(r_tx, Address::from([2; 20]), PreconfSource::Rpc).await;
-        apply_one_preconf(&fifo, &cfg, r_hash, &mut state, synthetic_ok).await.unwrap();
+        apply_one_preconf(&fifo, &cfg, None, r_hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "only the journal tx committed");
         assert_eq!(state.excluded_len(), 1, "RPC tx was gated out");
@@ -1353,7 +1481,9 @@ mod tests {
         let cfg_clone = cfg.clone();
         let dispatch_task = tokio::spawn(async move {
             let mut state = LoopState::new(7);
-            apply_one_preconf(&fifo_clone, &cfg_clone, hash, &mut state, slow_apply).await.unwrap();
+            apply_one_preconf(&fifo_clone, &cfg_clone, None, hash, &mut state, slow_apply)
+                .await
+                .unwrap();
         });
 
         // Give dispatch time to enter `apply_fn` (holding apply_lock).

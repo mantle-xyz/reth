@@ -33,18 +33,21 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use alloy_consensus::TxEnvelope;
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, TxHash};
+use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     sync::{Mutex, Notify, oneshot},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
@@ -69,6 +72,80 @@ pub struct JournalEntry {
     /// Wall-clock ms at which the commitment was made. Used by
     /// operators to correlate journal entries against logs / metrics.
     pub committed_at_ms: u64,
+}
+
+/// Current wall-clock milliseconds since the Unix epoch, for stamping
+/// [`JournalEntry::committed_at_ms`]. Falls back to `0` if the system clock is
+/// set before 1970, which is better read as "unset" than worth a panic on a
+/// path that is only telemetry.
+pub(crate) fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+impl JournalEntry {
+    /// The record for a transaction just executed into the block being built.
+    ///
+    /// One definition for both writers: preconf commitments are recorded from
+    /// the apply, pool transactions from the slice that carries them, and what
+    /// a record *is* must not depend on which of the two wrote it.
+    pub(crate) fn for_executed(hash: TxHash, tx: &impl Encodable2718, block_height: u64) -> Self {
+        Self {
+            hash,
+            tx_rlp: tx.encoded_2718().into(),
+            block_height,
+            committed_at_ms: now_unix_ms(),
+        }
+    }
+}
+
+/// How many un-written records the retry buffer holds before the oldest start
+/// falling out — thirty blocks' worth.
+///
+/// Thirty blocks is one rotation interval (the 60s default over 2s blocks),
+/// which is as far back as a record can still matter: past it rotation has
+/// already dropped the ones no longer owed. Fifteen hundred a block is what
+/// 30M of gas holds when it is all simple transfers.
+const PENDING_CAPACITY: usize = 30 * 1_500;
+
+/// Backstop on what the retry buffer may hold, in bytes.
+///
+/// [`PENDING_CAPACITY`] is the limit to reason with — it is expressed in the
+/// units the rest of the subsystem uses. It does not bound memory, though: a
+/// record carries its transaction's encoding, and at the pool's 128 KiB ceiling
+/// per transaction a full buffer would be gigabytes rather than the tens of
+/// megabytes ordinary traffic produces.
+///
+/// This is the fuse for that, not a second budget. Reaching it takes hours of
+/// uninterrupted maximum-size transactions with the disk refusing writes
+/// throughout; ordinary traffic never comes close, so which limit bites stays
+/// predictable.
+const PENDING_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Drop the oldest held records until one of `incoming` bytes fits, returning
+/// how many went. `bytes` is the running size of `pending` and is adjusted to
+/// match.
+///
+/// Split out from [`PreconfJournal::buffer`] so the rule can be exercised at a
+/// budget a test can afford: [`PENDING_MAX_BYTES`] is a gigabyte, and reaching
+/// it for real would mean allocating one.
+fn evict_to_fit(
+    pending: &mut VecDeque<Vec<u8>>,
+    bytes: &mut usize,
+    incoming: usize,
+    max_count: usize,
+    max_bytes: usize,
+) -> u64 {
+    let mut dropped = 0;
+    // `while` for the byte fuse, because one arriving record can be worth many
+    // of the ones it displaces. Never evicts down to empty: a record bigger
+    // than the whole budget is still worth more held than dropped.
+    while pending.len() >= max_count || (*bytes + incoming > max_bytes && !pending.is_empty()) {
+        let evicted = pending.pop_front().expect("non-empty");
+        *bytes -= evicted.len();
+        dropped += 1;
+    }
+    dropped
 }
 
 /// Errors surfaced by the journal IO surface.
@@ -126,6 +203,20 @@ pub struct PreconfJournal {
     /// path. `notify_one` coalesces a burst of appends into a single
     /// pending permit.
     rotate_notify: Notify,
+    /// Records a write could not place on disk, waiting for the next one.
+    ///
+    /// Bounded by [`PENDING_CAPACITY`], and by [`PENDING_MAX_BYTES`] as a fuse;
+    /// over either the oldest are dropped, because they are the ones whose block
+    /// has most likely sealed already — a record only matters until its block is
+    /// canonical.
+    ///
+    /// Distinct from the eviction `rotate` performs: that one decides which
+    /// *durable* records are still owed and is the caller's rule (`retain`).
+    /// This one is about records that never reached the disk at all, and is the
+    /// price of not blocking the build loop on a failing disk.
+    pending: SyncMutex<VecDeque<Vec<u8>>>,
+    /// Running size of `pending`, so the byte fuse costs no walk.
+    pending_bytes: AtomicUsize,
 }
 
 impl PreconfJournal {
@@ -159,6 +250,8 @@ impl PreconfJournal {
             max_size,
             size_bytes: AtomicU64::new(init_size),
             rotate_notify: Notify::new(),
+            pending: SyncMutex::new(VecDeque::new()),
+            pending_bytes: AtomicUsize::new(0),
         };
         // Nothing in memory to seed from the file: recognising a post-restart
         // commitment as ours is `restore_preconf_state`'s job.
@@ -176,29 +269,126 @@ impl PreconfJournal {
     /// buffer before this call returns; durability against power loss
     /// would require an additional `sync_all`, traded off against
     /// per-tx latency.
+    ///
+    /// A batch of one — the size accounting, the rotation threshold and the
+    /// lock discipline have to be identical for both, and writing them twice
+    /// is how they stop being.
     pub async fn append_promised(&self, entry: &JournalEntry) -> Result<(), JournalError> {
-        // Encode first so a bad serialise does not partially write.
-        let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
-        line.push(b'\n');
-        let len = line.len() as u64;
-        // The size counter is bumped *under the writer lock*, so the
-        // on-disk write and the count stay consistent w.r.t. `rotate`'s
-        // swap+reset (which also holds the writer lock). `notify_one`
-        // is deferred until after the lock is released.
-        let new_size = {
-            let mut writer = self.writer.lock().await;
-            writer.write_all(&line).await?;
-            writer.flush().await?;
-            self.size_bytes.fetch_add(len, Ordering::Relaxed) + len
+        self.append_batch(std::slice::from_ref(entry)).await
+    }
+
+    /// Append many records under one lock, with a single write and a single
+    /// flush.
+    ///
+    /// `flush`, not `sync_all`: the bytes leave the runtime's buffer before this
+    /// returns, but power-loss durability would cost a per-call fsync.
+    ///
+    /// The batching is what keeps a slice affordable: it can carry a thousand
+    /// transactions, and taking the writer lock once per transaction would hold
+    /// up the preconf path that appends through the same lock. An empty batch
+    /// does no IO.
+    ///
+    /// This is the one place the write mechanics live — [`Self::append_promised`]
+    /// is a batch of one.
+    ///
+    /// All-or-nothing on encode: every record is serialised before anything is
+    /// written, so a record `serde_json` cannot encode leaves the file
+    /// untouched rather than half a batch on disk.
+    ///
+    /// An **IO** failure is different: the records are kept for the next write
+    /// and `Err` is returned for the caller to log, not to act on. Callers must
+    /// not resend them: the next write carries them, and a resend would put the
+    /// same record on disk twice once one succeeds.
+    pub async fn append_batch(&self, entries: &[JournalEntry]) -> Result<(), JournalError> {
+        // Encoded up front, and separately from the write: a record `serde_json`
+        // cannot encode will not encode on the next attempt either, so it fails
+        // outright instead of joining the retry buffer and being carried
+        // forever. Nothing is written if any of them fails.
+        let mut lines = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
+            line.push(b'\n');
+            lines.push(line);
+        }
+        self.write_lines(lines).await
+    }
+
+    /// Write `lines`, preceded by anything an earlier attempt could not place.
+    ///
+    /// On IO failure everything goes to the retry buffer and the error is
+    /// returned for the caller to log. The caller is expected to carry on
+    /// regardless: journaling is a side path, and the transactions it describes
+    /// are in the block either way — the record only matters if the process
+    /// dies before that block is canonical.
+    async fn write_lines(&self, mut lines: Vec<Vec<u8>>) -> Result<(), JournalError> {
+        if lines.is_empty() && self.pending.lock().is_empty() {
+            return Ok(());
+        }
+        // The writer lock is taken first so a concurrent append cannot slip
+        // between draining the buffer and writing it, which would put the older
+        // records after the newer ones in the file.
+        let mut writer = self.writer.lock().await;
+        let mut retried: Vec<Vec<u8>> = {
+            let mut pending = self.pending.lock();
+            self.pending_bytes.store(0, Ordering::Relaxed);
+            pending.drain(..).collect()
         };
+
+        let mut buf = Vec::new();
+        if !retried.is_empty() {
+            // The write that failed may have stopped mid-line. A newline closes
+            // it so this attempt does not fuse onto its tail and cost both
+            // records; `load` skips the blank line it leaves behind.
+            buf.push(b'\n');
+        }
+        for line in retried.iter().chain(lines.iter()) {
+            buf.extend_from_slice(line);
+        }
+        let len = buf.len() as u64;
+
+        if let Err(e) = writer.write_all(&buf).await.and(writer.flush().await) {
+            drop(writer);
+            retried.append(&mut lines);
+            self.buffer(retried);
+            return Err(JournalError::Io(e));
+        }
+        let new_size = self.size_bytes.fetch_add(len, Ordering::Relaxed) + len;
+        drop(writer);
+
+        metrics::gauge!("preconf.journal.pending_entries").set(0.0);
         metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
-        // Size-triggered rotation: wake the rejournal loop when the file
-        // crosses the cap. The heavy `rotate()` runs off this hot path;
-        // the loop rate-limits repeated triggers (see `run_rejournal_loop`).
         if new_size >= self.max_size {
             self.rotate_notify.notify_one();
         }
         Ok(())
+    }
+
+    /// Hold `lines` for the next write, dropping the oldest once full.
+    fn buffer(&self, lines: Vec<Vec<u8>>) {
+        let mut pending = self.pending.lock();
+        let mut bytes = self.pending_bytes.load(Ordering::Relaxed);
+        let mut dropped = 0u64;
+        for line in lines {
+            dropped += evict_to_fit(
+                &mut pending,
+                &mut bytes,
+                line.len(),
+                PENDING_CAPACITY,
+                PENDING_MAX_BYTES,
+            );
+            bytes += line.len();
+            pending.push_back(line);
+        }
+        self.pending_bytes.store(bytes, Ordering::Relaxed);
+        if dropped > 0 {
+            metrics::counter!("preconf.journal.dropped_entries_total").increment(dropped);
+        }
+        metrics::gauge!("preconf.journal.pending_entries").set(pending.len() as f64);
+    }
+
+    /// How many records are waiting for a write to succeed.
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().len()
     }
 
     /// Read the journal file from disk and return every entry that
@@ -218,7 +408,53 @@ impl PreconfJournal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
             Err(e) => return Err(JournalError::Io(e)),
         };
-        let reader = BufReader::new(file);
+        Self::parse_entries(BufReader::new(file)).await
+    }
+
+    /// Entries from the first `limit` bytes of the file.
+    ///
+    /// Rotation compacts the file as it stood when the pass began, not as it
+    /// stands when the pass ends, so it reads to a byte offset rather than to
+    /// end of file. `limit` comes from the size counter, which only ever
+    /// advances by whole writes, so the cut cannot land mid-record.
+    async fn load_upto(&self, limit: u64) -> Result<(Vec<JournalEntry>, usize), JournalError> {
+        let file = match tokio::fs::File::open(&self.path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            Err(e) => return Err(JournalError::Io(e)),
+        };
+        Self::parse_entries(BufReader::new(file.take(limit))).await
+    }
+
+    /// The raw bytes the file has grown by past `from`.
+    ///
+    /// Copied verbatim rather than parsed and re-encoded: these records arrived
+    /// after the compaction pass took its snapshot, so they belong to the
+    /// generation being started rather than the one being compacted. Verbatim
+    /// also keeps `retain` — a caller-supplied predicate of unknown cost — off
+    /// the one stretch of rotation that holds the writer lock.
+    ///
+    /// A write that failed part-way leaves a partial line, which is carried
+    /// across like anything else; the next append closes it with a newline and
+    /// [`Self::load`] skips it.
+    async fn bytes_after(&self, from: u64) -> Result<Vec<u8>, JournalError> {
+        let mut file = match tokio::fs::File::open(&self.path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(JournalError::Io(e)),
+        };
+        file.seek(io::SeekFrom::Start(from)).await?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).await?;
+        Ok(out)
+    }
+
+    /// Parse newline-delimited entries out of `reader`, skipping the ones that
+    /// will not decode and returning how many those were.
+    async fn parse_entries<R>(reader: R) -> Result<(Vec<JournalEntry>, usize), JournalError>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
         let mut lines = reader.lines();
         let mut out = Vec::new();
         let mut bad = 0usize;
@@ -259,10 +495,15 @@ impl PreconfJournal {
     /// mid-rotate leaves either the old file or the new one intact,
     /// never a half-written hybrid.
     ///
-    /// The caller is expected to be the rotation loop, not the hot
-    /// RPC path. While rotation runs, `append_promised` is blocked
-    /// behind the same writer `Mutex` — typically a few ms even at
-    /// 100 TPS.
+    /// The caller is expected to be the rotation loop, not the hot RPC path.
+    ///
+    /// The read-filter-rewrite pass runs with **no lock held**, so appends
+    /// continue into the live file throughout it. Only the tail end takes the
+    /// writer lock, and what it does there is bounded by one pass's worth of
+    /// appends rather than by the size of the file: splice, rename, re-open.
+    /// This matters because a slice is journalled before it is broadcast, so an
+    /// append that waits for a multi-megabyte rewrite is a broadcast that
+    /// waits for it too.
     pub async fn rotate(
         &self,
         retain: impl Fn(&TxHash) -> bool,
@@ -271,13 +512,17 @@ impl PreconfJournal {
         // (including the `?` early returns below).
         let _timer = RotateTimer(std::time::Instant::now());
 
-        // Hold the writer lock for the WHOLE rotate (load → rename → reset),
-        // not just the swap: an `append_promised` landing between `load()` and
-        // the rename would otherwise be silently discarded by it. Appends
-        // block until the new file is in place, then land in it.
-        let mut writer = self.writer.lock().await;
+        // How much of the file this pass is answerable for. Read under the
+        // writer lock so it cannot be sampled part-way through an append, and
+        // taken from the size counter rather than from a `stat` because the
+        // counter only advances by whole writes — which is what makes it safe
+        // to cut the file here.
+        let compacting_upto = {
+            let _writer = self.writer.lock().await;
+            self.size_bytes.load(Ordering::Relaxed)
+        };
 
-        let (entries, bad_before) = self.load().await?;
+        let (entries, bad_before) = self.load_upto(compacting_upto).await?;
 
         // Which records may go is the caller's decision, not this type's, and it
         // is the *only* rule here: `retain` asks the classifier whether the
@@ -292,34 +537,54 @@ impl PreconfJournal {
         let mut kept_bytes = 0u64;
         let tmp_path = tmp_path_for(&self.path);
 
-        {
-            let mut tmp =
-                OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path).await?;
-            for entry in &entries {
-                if !retain(&entry.hash) {
-                    dropped += 1;
-                    continue;
-                }
-                let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
-                line.push(b'\n');
-                tmp.write_all(&line).await?;
-                kept_bytes += line.len() as u64;
-                kept += 1;
+        let mut tmp =
+            OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path).await?;
+        for entry in &entries {
+            if !retain(&entry.hash) {
+                dropped += 1;
+                continue;
             }
-            tmp.flush().await?;
+            let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
+            line.push(b'\n');
+            tmp.write_all(&line).await?;
+            kept_bytes += line.len() as u64;
+            kept += 1;
         }
 
-        // Atomic swap (writer lock held since the top): rename into place,
-        // then re-open the writer against the new inode.
+        // From here to the end of the function the writer lock is held, and
+        // appends wait. Everything expensive is already done.
+        let mut writer = self.writer.lock().await;
+        // Declared after the guard so it is dropped before it: what this
+        // records is the span an append could have been waiting on, measured
+        // from acquiring the lock to just short of releasing it.
+        let locked = LockedTimer(std::time::Instant::now());
+
+        // Splice on whatever landed while the pass was running. Without this the
+        // swap below would discard those records, and the size counter would
+        // describe a file that never existed.
+        let carried = self.bytes_after(compacting_upto).await?;
+        tmp.write_all(&carried).await?;
+        tmp.flush().await?;
+        drop(tmp);
+
+        // Atomic swap: rename into place, then re-open the writer against the
+        // new inode.
         tokio::fs::rename(&tmp_path, &self.path).await?;
         *writer = OpenOptions::new().create(true).append(true).open(&self.path).await?;
-        // Reset the byte counter to the new file's true size while still
-        // holding the writer lock, so it stays consistent with any
-        // `append_promised` that serialises before/after this swap.
-        self.size_bytes.store(kept_bytes, Ordering::Relaxed);
-        metrics::gauge!("preconf.journal.size_bytes").set(kept_bytes as f64);
+        // Reset the byte counter to the new file's true size while still holding
+        // the writer lock, so it stays consistent with any append that
+        // serialises before or after this swap.
+        let new_size = kept_bytes + carried.len() as u64;
+        self.size_bytes.store(new_size, Ordering::Relaxed);
+        metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
 
-        Ok(RotateStats { kept, dropped, bad_lines_skipped: bad_before })
+        Ok(RotateStats {
+            kept,
+            dropped,
+            locked_for: locked.0.elapsed(),
+            carried_bytes: carried.len() as u64,
+            bad_lines_skipped: bad_before,
+        })
     }
 }
 
@@ -327,10 +592,28 @@ impl PreconfJournal {
 /// invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateStats {
-    /// Entries written to the new file.
+    /// Entries the compaction pass carried over — every one of them accepted by
+    /// `retain`. Not the whole of the rotated file: see
+    /// [`carried_bytes`](Self::carried_bytes).
     pub kept: usize,
     /// Entries left out of the new file — every one of them refused by `retain`.
     pub dropped: usize,
+    /// How long the writer lock was held, and so how long an append could have
+    /// been waiting on this rotation.
+    ///
+    /// Reported rather than only measured into
+    /// `preconf.journal.rotate_locked_ms` because the metric is emitted from a
+    /// drop guard, and nothing that reads the source can tell whether the guard
+    /// is still being constructed. As a returned value it is assertable.
+    pub locked_for: Duration,
+    /// Bytes appended while the pass was running and spliced onto the end of
+    /// the rotated file.
+    ///
+    /// These arrived after the pass took its snapshot, so `retain` was never
+    /// asked about them and they are counted in neither `kept` nor `dropped`.
+    /// They face the next rotation instead. Reported so `kept` and the rotated
+    /// file's line count can be reconciled.
+    pub carried_bytes: u64,
     /// Corrupt lines observed during the read pass. Rotate silently
     /// removes them from the rewritten file (they're not carried over
     /// into the new generation) — this count is reported for
@@ -352,6 +635,23 @@ impl Drop for RotateTimer {
     fn drop(&mut self) {
         metrics::histogram!("preconf.journal.rotate_duration_ms")
             .record(self.0.elapsed().as_millis() as f64);
+    }
+}
+
+/// Records `preconf.journal.rotate_locked_ms` on drop: the part of a rotation
+/// that holds the writer lock, and so the only part of it an append can wait
+/// for. [`RotateTimer`] covers the whole pass, most of which runs unlocked, so
+/// it cannot answer that question on its own.
+///
+/// Fractional milliseconds, unlike the whole-pass timer: this span is expected
+/// to be under a millisecond, and at integer resolution "fast" and "did not
+/// happen" would both read as zero.
+struct LockedTimer(std::time::Instant);
+
+impl Drop for LockedTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("preconf.journal.rotate_locked_ms")
+            .record(self.0.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
@@ -668,7 +968,7 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
                             hash = ?entry.hash,
                             reason,
                             "restored tx is NOT on chain but its nonce was consumed by another \
-                             transaction; commitment is broken"
+                             transaction; whatever was announced about it will not happen"
                         );
                         nonce_taken += 1;
                     }
@@ -722,9 +1022,26 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
         restored += 1;
     }
 
-    // `nonce_taken` is the one to alert on: each is a receipt handed out for a
-    // transaction that can no longer land. It is published as a counter too,
-    // because a log line that only appears at startup is easy to miss.
+    // `nonce_taken` is the one worth watching: a transaction this node told the
+    // outside about, whose nonce something else has since taken. Published as a
+    // counter as well, because a log line that only appears at startup is easy
+    // to miss.
+    //
+    // It counts two things that do not weigh the same, and cannot tell them
+    // apart. A preconf commitment reaching here means a client holds a
+    // synchronous receipt for a transaction that can never land. An ordinary
+    // pool transaction reaching here means someone replaced their own pending
+    // transaction after a slice had shown it — routine, and the sort of thing
+    // that will bury the first case if an alert is hung on this number as it
+    // stands.
+    //
+    // Telling them apart needs the entry to say which it is, and nothing here
+    // can work it out: the classifier is empty at this point — this very pass
+    // is what fills it — and the record carries no marker. A field would do it,
+    // and old files would need no guess, since every record written before pool
+    // transactions were journaled is a commitment. Left for the pass that
+    // settles the metrics, which is where the alert thresholds get decided and
+    // where it will be clear whether this wants a second counter or a label.
     metrics::counter!("preconf.journal.restore_nonce_taken").increment(nonce_taken as u64);
     metrics::counter!("preconf.journal.restore_unknown").increment(unknown as u64);
     info!(
@@ -865,6 +1182,8 @@ fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
                 reason,
                 kept = stats.kept,
                 dropped = stats.dropped,
+                locked_ms = stats.locked_for.as_secs_f64() * 1000.0,
+                carried_bytes = stats.carried_bytes,
                 bad = stats.bad_lines_skipped,
                 "journal rotation"
             );
@@ -924,6 +1243,229 @@ mod tests {
         let path = dir.path().join("preconf.jsonl");
         let j = PreconfJournal::open(&path, 0).await.unwrap();
         (dir, j)
+    }
+
+    /// A slice's transactions are written together. One write and one flush
+    /// rather than one per transaction: a slice can carry a thousand of them,
+    /// and the writer lock it takes is the one the RPC path appends through.
+    #[tokio::test]
+    async fn append_batch_writes_every_entry_in_order() {
+        let (_dir, j) = fresh_journal().await;
+        let batch = [entry(1, 10), entry(2, 10), entry(3, 10)];
+
+        j.append_batch(&batch).await.unwrap();
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, batch.to_vec());
+        assert_eq!(bad, 0);
+    }
+
+    // Deliberately untested: that `append_batch` flushes before returning.
+    // Removing the `flush` does not turn any test here red — tokio's `File`
+    // hands the write to a blocking thread, which has normally finished by the
+    // time a second handle reads the path, so such a test passes on timing
+    // rather than on the guarantee. `append_promised` has the same gap.
+
+    /// A slice that executed nothing is the common case once the pool is
+    /// drained; it must not cost a write.
+    #[tokio::test]
+    async fn append_batch_of_nothing_writes_nothing() {
+        let (_dir, j) = fresh_journal().await;
+
+        j.append_batch(&[]).await.unwrap();
+
+        let (loaded, _) = j.load().await.unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    /// A journal whose file handle cannot be written to, for exercising the
+    /// failure path with a real IO error rather than a stand-in.
+    async fn read_only_journal() -> (TempDir, PreconfJournal) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // Create the file, then hold it open read-only: `write_all` on it fails
+        // with EBADF, which is as close to a disk refusing a write as a test
+        // gets without a filesystem fixture.
+        let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
+        let ro = OpenOptions::new().read(true).open(&path).await.unwrap();
+        *j.writer.lock().await = ro;
+        (dir, j)
+    }
+
+    /// A write that fails keeps its records for the next attempt.
+    ///
+    /// Losing them outright is what the journal exists to prevent, and the
+    /// caller has moved on — its cursor advanced the moment it handed them over.
+    #[tokio::test]
+    async fn a_failed_write_keeps_its_records_for_the_next_attempt() {
+        let (_dir, j) = read_only_journal().await;
+
+        j.append_batch(&[entry(1, 10), entry(2, 10)]).await.expect_err("the handle is read-only");
+
+        assert_eq!(j.pending_len(), 2, "both records must be held for a retry");
+        let (loaded, _) = j.load().await.unwrap();
+        assert!(loaded.is_empty(), "and none of them reached the file");
+    }
+
+    /// The next successful write carries the held records with it, oldest first.
+    #[tokio::test]
+    async fn the_next_write_carries_what_the_failed_one_held() {
+        let (dir, j) = read_only_journal().await;
+        j.append_batch(&[entry(1, 10)]).await.expect_err("the handle is read-only");
+
+        // The disk comes back.
+        let writable =
+            OpenOptions::new().append(true).open(dir.path().join("preconf.jsonl")).await.unwrap();
+        *j.writer.lock().await = writable;
+
+        j.append_batch(&[entry(2, 10)]).await.expect("the handle writes again");
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.hash).collect::<Vec<_>>(),
+            vec![entry(1, 10).hash, entry(2, 10).hash],
+            "the held record goes first, keeping the file in execution order",
+        );
+        assert_eq!(bad, 0);
+        assert_eq!(j.pending_len(), 0, "and the buffer is empty again");
+    }
+
+    /// A write that stopped mid-line does not cost the record that follows it.
+    ///
+    /// `write_all` can fail partway, leaving a line without its newline. The
+    /// retry appends behind it, and without something to close the line the two
+    /// fuse into one unparseable record — losing the held one as well as the
+    /// truncated one.
+    #[tokio::test]
+    async fn a_retry_does_not_fuse_onto_a_half_written_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // A line that stops mid-record, exactly as an interrupted write leaves it.
+        std::fs::write(&path, br#"{"hash":"0x12"#).unwrap();
+
+        let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
+        // Hold a record back, the way a failed write does.
+        let ro = OpenOptions::new().read(true).open(&path).await.unwrap();
+        *j.writer.lock().await = ro;
+        let held = entry(1, 10);
+        j.append_batch(std::slice::from_ref(&held)).await.expect_err("the handle is read-only");
+        assert_eq!(j.pending_len(), 1);
+
+        // The disk comes back and the retry lands.
+        let writable = OpenOptions::new().append(true).open(&path).await.unwrap();
+        *j.writer.lock().await = writable;
+        let fresh = entry(2, 10);
+        j.append_batch(std::slice::from_ref(&fresh)).await.expect("writes again");
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.hash).collect::<Vec<_>>(),
+            vec![held.hash, fresh.hash],
+            "the truncated line must cost only itself",
+        );
+        assert_eq!(bad, 1, "and it is still counted as the corrupt line it is");
+    }
+
+    /// The buffer stops at its capacity, and the records it drops are the ones
+    /// offered first — theirs are the blocks most likely sealed by now.
+    ///
+    /// Offered as one batch rather than one call each: eviction is what is under
+    /// test, and forty-five thousand failed writes would be a slow way to reach
+    /// it.
+    #[tokio::test]
+    async fn a_full_buffer_drops_its_oldest_records() {
+        let (_dir, j) = read_only_journal().await;
+        let overflow = 3usize;
+        let offered: Vec<JournalEntry> = (0..PENDING_CAPACITY + overflow)
+            .map(|i| JournalEntry {
+                hash: TxHash::from(alloy_primitives::U256::from(i as u64).to_be_bytes()),
+                ..entry(0, 10)
+            })
+            .collect();
+
+        j.append_batch(&offered).await.expect_err("the handle is read-only");
+
+        assert_eq!(j.pending_len(), PENDING_CAPACITY, "the buffer stops at its capacity");
+        let oldest_line = j.pending.lock().front().cloned().expect("buffer is not empty");
+        let oldest: JournalEntry = serde_json::from_slice(oldest_line.trim_ascii_end()).unwrap();
+        assert_eq!(
+            oldest.hash, offered[overflow].hash,
+            "the records dropped are the ones offered first",
+        );
+    }
+
+    /// Fill a buffer through the real eviction rule at a budget a test can
+    /// afford, and report what survived.
+    fn fill(sizes: &[usize], max_count: usize, max_bytes: usize) -> (VecDeque<Vec<u8>>, u64) {
+        let mut pending = VecDeque::new();
+        let mut bytes = 0usize;
+        let mut dropped = 0u64;
+        for (i, &len) in sizes.iter().enumerate() {
+            let line = vec![i as u8; len];
+            dropped += evict_to_fit(&mut pending, &mut bytes, line.len(), max_count, max_bytes);
+            bytes += line.len();
+            pending.push_back(line);
+        }
+        (pending, dropped)
+    }
+
+    /// The byte fuse bites when the record count never would.
+    ///
+    /// The count is the limit to reason with, but it says nothing about memory:
+    /// at the pool's 128 KiB per transaction a full buffer is gigabytes.
+    #[test]
+    fn the_byte_fuse_evicts_where_the_count_limit_would_not() {
+        let (pending, dropped) = fill(&[100, 100, 100, 100], 1_000, 300);
+
+        assert_eq!(pending.len(), 3, "only three hundred bytes may be held");
+        assert_eq!(dropped, 1);
+        assert_eq!(pending.front().expect("non-empty")[0], 1, "and the oldest is what went");
+    }
+
+    /// The count still bites first at the sizes ordinary traffic produces —
+    /// which is what makes it the limit worth reasoning about.
+    #[test]
+    fn the_count_limit_bites_first_at_ordinary_sizes() {
+        let (pending, dropped) = fill(&[100; 6], 4, 1_000_000);
+
+        assert_eq!(pending.len(), 4);
+        assert_eq!(dropped, 2);
+    }
+
+    /// A record larger than the whole budget is still held: evicting to empty
+    /// and dropping it too would keep nothing at all.
+    #[test]
+    fn a_record_larger_than_the_budget_is_still_held() {
+        let (pending, _) = fill(&[5_000], 1_000, 300);
+
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// A batch counts toward the size cap exactly as the same entries appended
+    /// one at a time would — otherwise a slicing node would never rotate.
+    #[tokio::test]
+    async fn append_batch_arms_size_triggered_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        // 1-byte cap: any write at all crosses it.
+        let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
+        let kept = entry(3, 12);
+        j.append_batch(&[entry(1, 10), entry(2, 11), kept.clone()]).await.unwrap();
+        let c = classifier_done_with(&[TxHash::from([1; 32]), TxHash::from([2; 32])]);
+        still_owed(&c, kept.hash);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = spawn_rejournal_loop(j.clone(), c, Duration::from_secs(3600), shutdown_rx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (after, _) = j.load().await.unwrap();
+        assert_eq!(after, vec![kept], "the batch must have pinged the rotate notify");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("loop did not shut down")
+            .expect("loop panicked");
     }
 
     /// A `JournalEntry` with an explicit commit timestamp.
@@ -1007,6 +1549,8 @@ mod tests {
             max_size: 0,
             size_bytes: AtomicU64::new(0),
             rotate_notify: Notify::new(),
+            pending: SyncMutex::new(VecDeque::new()),
+            pending_bytes: AtomicUsize::new(0),
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());
@@ -1083,12 +1627,15 @@ mod tests {
     /// An append racing a rotate must not be lost. `retain` accepts everything
     /// here, so any absence is the race, not the retention rule.
     ///
-    /// Two failure modes: an entry landing in rotate's load → rename window can
-    /// be dropped outright, and even when it survives on disk, rotate's
-    /// `size_bytes.store(kept_bytes)` is computed from the pre-append snapshot,
-    /// so storing it would leave the counter short of the real file and silently
-    /// mistune the size-rotation trigger. Deterministic because rotate holds the
-    /// writer lock end to end.
+    /// Two failure modes: an entry landing in rotate's snapshot → rename window
+    /// can be dropped outright, and even when it survives on disk, a counter
+    /// reset to the compaction pass's byte total alone would leave it short of
+    /// the real file and silently mistune the size-rotation trigger.
+    ///
+    /// The appends here race the rotation rather than being placed inside it, so
+    /// which of them land in that window varies between runs; the deterministic
+    /// placement is
+    /// [`an_entry_appended_during_the_compaction_pass_survives_the_swap`].
     #[tokio::test]
     async fn rotate_does_not_lose_concurrent_appends() {
         use std::sync::Arc;
@@ -1133,6 +1680,160 @@ mod tests {
             j.size_bytes.load(Ordering::Relaxed),
             on_disk_bytes,
             "size_bytes counter drifted from true on-disk size across concurrent rotate"
+        );
+    }
+
+    /// Hold a rotation open inside its compaction pass.
+    ///
+    /// `retain` is called once per record being compacted, which makes it the
+    /// one place a test can stand in the middle of a rotation and ask what else
+    /// can still happen. Returns the journal, a receiver that fires when the
+    /// pass has begun, the handle to release it, and the rotation's own handle.
+    fn rotation_held_open(
+        j: Arc<PreconfJournal>,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<RotateStats>,
+    ) {
+        let (compacting_tx, compacting_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let rotate = tokio::spawn(async move {
+            let first = std::sync::atomic::AtomicBool::new(true);
+            j.rotate(move |_| {
+                if first.swap(false, Ordering::Relaxed) {
+                    compacting_tx.send(()).expect("test is listening");
+                    // Blocks the pass until the test has its answer. A blocking
+                    // recv because `retain` is synchronous.
+                    release_rx.recv().expect("test releases the pass");
+                }
+                true
+            })
+            .await
+            .expect("rotate")
+        });
+        (compacting_rx, release_tx, rotate)
+    }
+
+    /// What the locked span reports must be the swap, not the whole rotation —
+    /// otherwise `rotate_locked_ms` says appends waited for the rewrite, which
+    /// is the number the split was made to bring down.
+    ///
+    /// The pass is held open for a known stretch and the span is required to be
+    /// shorter than that stretch. A timer covering the whole pass would report
+    /// at least the hold; the true value is microseconds, so the margin is
+    /// three orders of magnitude rather than a threshold to tune.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_locked_span_excludes_the_compaction_pass() {
+        let dir = TempDir::new().unwrap();
+        let j = Arc::new(PreconfJournal::open(dir.path().join("preconf.jsonl"), 0).await.unwrap());
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
+        }
+
+        let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
+        compacting.recv().await.expect("compaction pass began");
+
+        let held = Duration::from_millis(300);
+        tokio::time::sleep(held).await;
+        release.send(()).unwrap();
+        let stats = rotate.await.unwrap();
+
+        assert!(
+            stats.locked_for < held,
+            "locked span {:?} covers the compaction pass, which was held open for {held:?}",
+            stats.locked_for,
+        );
+    }
+
+    /// The compaction pass reads to the offset it snapshotted, not to end of
+    /// file. Reading further would put records into the rewritten file that the
+    /// splice then appends a second time.
+    ///
+    /// Pinned on `load_upto` directly rather than by racing a rotation: the
+    /// window between taking the snapshot and finishing the read has no hook a
+    /// test could stand in, so a concurrent append can only land inside it by
+    /// luck.
+    #[tokio::test]
+    async fn the_compaction_pass_reads_only_as_far_as_its_snapshot() {
+        let (_dir, j) = fresh_journal().await;
+        let compacted = entry(1, 10);
+        j.append_promised(&compacted).await.unwrap();
+
+        let snapshot = j.size_bytes.load(Ordering::Relaxed);
+        let latecomer = entry(2, 11);
+        j.append_promised(&latecomer).await.unwrap();
+
+        let (seen, bad) = j.load_upto(snapshot).await.unwrap();
+
+        assert_eq!(bad, 0);
+        assert_eq!(seen, vec![compacted], "read past the snapshot into {latecomer:?}");
+    }
+
+    /// Compaction reads and rewrites the whole file — megabytes of it once a
+    /// block carries a thousand transactions. An append must not queue behind
+    /// that: a slice is journalled before it is broadcast, so an append that
+    /// waits is a broadcast that waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_append_does_not_wait_for_the_compaction_pass() {
+        let dir = TempDir::new().unwrap();
+        let j = Arc::new(PreconfJournal::open(dir.path().join("preconf.jsonl"), 0).await.unwrap());
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
+        }
+
+        let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
+        compacting.recv().await.expect("compaction pass began");
+
+        // Generous: the question is whether the append is blocked at all, not
+        // how quickly it finishes.
+        let appended =
+            tokio::time::timeout(Duration::from_secs(5), j.append_promised(&entry(9, 9))).await;
+
+        release.send(()).unwrap();
+        rotate.await.unwrap();
+        appended.expect("append waited for the compaction pass to finish").unwrap();
+    }
+
+    /// The compaction pass owns the file only as far as it had grown when the
+    /// pass began. Whatever lands past that point has to be carried into the
+    /// rotated file, and counted, or the swap discards it and leaves the size
+    /// counter describing a file that no longer exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_entry_appended_during_the_compaction_pass_survives_the_swap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let j = Arc::new(PreconfJournal::open(&path, 0).await.unwrap());
+        for i in 0..5u8 {
+            j.append_promised(&entry(i, u64::from(i))).await.unwrap();
+        }
+
+        let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
+        compacting.recv().await.expect("compaction pass began");
+
+        // Timed, not a bare await: an implementation that blocks appends for the
+        // duration of the pass would otherwise deadlock the test here rather
+        // than fail it.
+        let late = entry(9, 9);
+        let appended = tokio::time::timeout(Duration::from_secs(5), j.append_promised(&late)).await;
+
+        release.send(()).unwrap();
+        rotate.await.unwrap();
+        appended.expect("append waited for the compaction pass to finish").unwrap();
+
+        // Exact, not `contains`: the survivors in their original order followed
+        // by the one that arrived late. Equality is what rules out the entry
+        // being dropped, duplicated, or reordered against the compacted ones.
+        let mut expected: Vec<JournalEntry> = (0..5u8).map(|i| entry(i, u64::from(i))).collect();
+        expected.push(late);
+
+        let (after, bad) = j.load().await.unwrap();
+        assert_eq!(bad, 0);
+        assert_eq!(after, expected, "rotated file is not survivors-then-latecomer");
+        assert_eq!(
+            j.size_bytes.load(Ordering::Relaxed),
+            tokio::fs::metadata(&path).await.unwrap().len(),
+            "size counter does not describe the rotated file"
         );
     }
 
@@ -1330,6 +2031,55 @@ mod tests {
         c.mark_committed(&hash, LANDED_AT);
         assert!(c.release_unless_committed(&hash), "the watermark must make it releasable");
         assert!(!c.is_tracked(&hash));
+    }
+
+    /// What a restart costs, at the volume slicing produces.
+    ///
+    /// Journaling pool transactions takes the file from a handful of entries per
+    /// block to roughly a block's worth, and rotation only clears it once a
+    /// minute — so a restart can face tens of thousands of entries, each one
+    /// decoded, claimed and offered to the pool before the node serves anything.
+    ///
+    /// Not an assertion about wall-clock time, which would be a flaky test on
+    /// shared CI. It prints, so the number can be read off a run and recorded;
+    /// what it *guards* is that restore stays linear — the two volumes differ by
+    /// 10x, and anything quadratic in the entry count would show up as 100x.
+    #[tokio::test]
+    async fn restore_cost_grows_with_the_entry_count_not_faster() {
+        async fn restore_n(n: usize) -> std::time::Duration {
+            let (_dir, journal) = fresh_journal().await;
+            let entries: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut e = entry(0, 10);
+                    // Distinct hashes; the restore pre-pass keys on them.
+                    e.hash = TxHash::from(alloy_primitives::U256::from(i as u64).to_be_bytes());
+                    e
+                })
+                .collect();
+            journal.append_batch(&entries).await.unwrap();
+
+            let pool = StubPool::new();
+            let chain = landed();
+            let fifo = Arc::new(PreconfTxSet::new(1 << 16));
+            let classifier = empty_classifier();
+
+            let started = std::time::Instant::now();
+            restore_preconf_state(&journal, &pool, &chain, &fifo, &classifier).await;
+            started.elapsed()
+        }
+
+        let small = restore_n(1_000).await;
+        let large = restore_n(10_000).await;
+        println!("restore: 1k entries {small:?}, 10k entries {large:?}");
+
+        // 10x the entries, generously under 40x the time. A quadratic restore
+        // would be near 100x and trip this; ordinary scheduling noise will not.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::EPSILON);
+        assert!(
+            ratio < 40.0,
+            "restore should stay roughly linear in the entry count; 1k took {small:?}, \
+             10k took {large:?} ({ratio:.1}x)",
+        );
     }
 
     #[tokio::test]

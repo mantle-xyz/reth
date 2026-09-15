@@ -32,7 +32,7 @@ use alloy_primitives::{
     map::foldhash::{HashMap, HashMapExt},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -183,6 +183,37 @@ impl PreconfTxSetInner {
     /// recover from unexpected torn state (e.g. a future bug that partially
     /// evicts an entry) so the "clean all indices" contract stays honest.
     fn drop_hash(&mut self, hash: &TxHash) -> Option<TxEntry> {
+        let entry = self.unindex(hash);
+        if let Some(pos) = self.order.iter().position(|h| h == hash) {
+            self.order.remove(pos);
+        }
+        entry
+    }
+
+    /// [`Self::drop_hash`] for many hashes at once.
+    ///
+    /// Leaving `order` is what costs: a queue has no index, so removing one
+    /// hash means finding it, and doing that per hash costs the queue's length
+    /// each time. Nothing at the handful of commitments preconf alone holds;
+    /// quadratic at the tens of thousands a journal replay restores. One pass
+    /// drops them all.
+    fn drop_hashes(&mut self, hashes: &[TxHash]) {
+        if hashes.is_empty() {
+            return;
+        }
+        for hash in hashes {
+            self.unindex(hash);
+        }
+        let dropping: HashSet<TxHash> = hashes.iter().copied().collect();
+        self.order.retain(|hash| !dropping.contains(hash));
+    }
+
+    /// Remove `hash` from every index except `order`, returning its entry.
+    ///
+    /// Split from [`Self::drop_hash`] because `order` is the one index that
+    /// cannot be left in constant time, so the two ways of leaving it — find
+    /// this one, or sweep for all of them — share everything else.
+    fn unindex(&mut self, hash: &TxHash) -> Option<TxEntry> {
         let entry = self.entries.remove(hash);
         if let Some(ref e) = entry {
             self.by_sender.remove(&(e.from, e.nonce));
@@ -191,9 +222,6 @@ impl PreconfTxSetInner {
             // `entries[hash]` was already gone (defensive self-heal). O(n)
             // linear scan; acceptable because it should never run in prod.
             self.by_sender.retain(|_, v| v != hash);
-        }
-        if let Some(pos) = self.order.iter().position(|h| h == hash) {
-            self.order.remove(pos);
         }
         self.pending_responders.remove(hash);
 
@@ -503,9 +531,16 @@ impl PreconfTxSet {
         Some(lock_arc.lock_owned().await)
     }
 
-    /// Drops entries with `from == addr && nonce < new_nonce`.
+    /// Drops every entry a sender's nonce has moved past: `heads[from]` present
+    /// and `nonce < heads[from]`. Senders absent from `heads` keep everything.
     ///
-    /// Sole production caller is the `PayloadJob` prologue
+    /// Every sender at once, deliberately, because a pass reads every held
+    /// entry — asking per sender costs senders times entries, which is nothing
+    /// at the handful of commitments preconf alone holds and quadratic at the
+    /// tens of thousands a journal replay can restore. There is no single-sender
+    /// version for that reason: its only natural use is in a loop.
+    ///
+    /// The production caller is the `PayloadJob` prologue
     /// (`builder::payload_builder`'s `sync_fifo_forward_to_head`), which reads
     /// each sender's nonce from the parent-block state. It used to run in
     /// `canon_handler`; that sweep was moved because it raced new payload jobs.
@@ -514,17 +549,27 @@ impl PreconfTxSet {
     /// is **not** the same as "this entry's tx landed" — a different tx taking
     /// the nonce drops the entry just the same. Callers that need to know
     /// *which* tx advanced the nonce cannot get it from here.
-    pub async fn forward(&self, addr: &Address, new_nonce: u64) {
+    pub async fn forward_all<S: std::hash::BuildHasher>(
+        &self,
+        heads: &std::collections::HashMap<Address, u64, S>,
+    ) {
         let mut inner = self.inner.lock().await;
         let to_drop: Vec<TxHash> = inner
             .by_sender
             .iter()
-            .filter(|((a, n), _)| a == addr && *n < new_nonce)
-            .map(|(_, h)| *h)
+            .filter(|((sender, nonce), _)| heads.get(sender).is_some_and(|head| nonce < head))
+            .map(|(_, hash)| *hash)
             .collect();
-        for h in to_drop {
-            inner.drop_hash(&h);
-        }
+        inner.drop_hashes(&to_drop);
+    }
+
+    /// Every sender holding an entry.
+    ///
+    /// Cheaper than reading the entries for it: this walks one index and copies
+    /// addresses, where [`Self::entries`] clones a view — transaction handle
+    /// included — for each of them.
+    pub async fn senders(&self) -> HashSet<Address> {
+        self.inner.lock().await.by_sender.keys().map(|(sender, _)| *sender).collect()
     }
 
     /// Evicts every entry in a [`PreconfStatus::is_replaceable`] state, returning
@@ -541,9 +586,7 @@ impl PreconfTxSet {
             .filter(|(_, e)| e.status.is_replaceable())
             .map(|(h, _)| *h)
             .collect();
-        for h in &to_drop {
-            inner.drop_hash(h);
-        }
+        inner.drop_hashes(&to_drop);
         to_drop
     }
 
@@ -588,7 +631,7 @@ impl PreconfTxSet {
     /// `Waiting → Success`. Called by the builder after a successful EVM apply.
     ///
     /// Terminal for the build that set it — no `mark_*` moves it again, and
-    /// [`Self::forward`] is the only path that drops it (a `Success` entry is
+    /// [`Self::forward_all`] is the only path that drops it (a `Success` entry is
     /// neither replaceable nor reclaimable). The one way out is
     /// [`Self::reset_success_to_waiting`], which the *next* payload job's
     /// carryover preamble uses on a `Success` entry that outlived the block it
@@ -1266,7 +1309,7 @@ mod tests {
         set.push_if_absent(t7.clone(), addr(1), PreconfSource::Rpc).await;
         set.push_if_absent(other.clone(), addr(2), PreconfSource::Rpc).await;
 
-        set.forward(&addr(1), 7).await;
+        forward_one(&set, &addr(1), 7).await;
 
         assert!(!set.contains(t5.tx_hash()).await);
         assert!(!set.contains(t6.tx_hash()).await);
@@ -1539,6 +1582,84 @@ mod tests {
     /// carry the responder, the size check + explicit field-parity assertion
     /// catches the regression before it can leak a `oneshot::Sender` outside
     /// the fifo.
+    /// Forward one sender. Production forwards them all at once — see
+    /// [`PreconfTxSet::forward_all`] for why there is no such method.
+    pub(super) async fn forward_one(set: &PreconfTxSet, addr: &Address, new_nonce: u64) {
+        let mut one = std::collections::HashMap::new();
+        one.insert(*addr, new_nonce);
+        set.forward_all(&one).await;
+    }
+
+    /// A fifo of `entries` transactions spread evenly over `senders` accounts.
+    /// Each sender's transactions sit together, so the entries a forward drops
+    /// — one per sender — are spread evenly through the queue rather than
+    /// bunched at its head. Bunched, a scan that starts at the head finds them
+    /// immediately and the measurement flatters itself.
+    fn crowded(entries: usize, senders: usize) -> Vec<(Arc<TxEnvelope>, Address)> {
+        let per_sender = entries / senders;
+        (0..entries)
+            .map(|i| {
+                let mut sender = [0u8; 20];
+                sender[..8].copy_from_slice(&((i / per_sender) as u64).to_be_bytes());
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                let inner = alloy_consensus::TxLegacy {
+                    nonce: (i % per_sender) as u64,
+                    gas_limit: 21_000,
+                    ..Default::default()
+                };
+                let tx = TxEnvelope::Legacy(Signed::new_unchecked(
+                    inner,
+                    Signature::test_signature(),
+                    B256::from(hash),
+                ));
+                (Arc::new(tx), Address::from(sender))
+            })
+            .collect()
+    }
+
+    /// Time one build's worth of canon-forward: read the senders, drop what
+    /// their nonces have passed.
+    async fn sweep(entries: usize, senders: usize) -> std::time::Duration {
+        let set = PreconfTxSet::new(1 << 17);
+        for (tx, sender) in crowded(entries, senders) {
+            set.push_if_absent(tx, sender, PreconfSource::Replay).await;
+        }
+        let started = std::time::Instant::now();
+        let heads: HashMap<Address, u64> =
+            set.senders().await.into_iter().map(|sender| (sender, 1)).collect();
+        set.forward_all(&heads).await;
+        started.elapsed()
+    }
+
+    /// The per-build canon-forward stays linear in the number of held entries.
+    ///
+    /// Two things used to make it grow faster than that, both invisible at the
+    /// handful of commitments preconf alone holds and ruinous at the tens of
+    /// thousands a journal replay restores: the fifo was asked once per sender
+    /// and walked every entry for each answer, and every dropped entry was then
+    /// hunted down in a queue that has no index. Measured with both in place,
+    /// ten times the entries and ten times the senders cost seventy-four times
+    /// the work — 75ms, ahead of the block's first transaction.
+    ///
+    /// Asserts the ratio rather than a wall-clock figure, which would only be
+    /// flaky on shared CI. Ten times the input should cost about ten times the
+    /// work; the bound leaves room for the constants without leaving room for
+    /// either of those two coming back.
+    #[tokio::test]
+    async fn forwarding_every_sender_stays_linear_in_the_entries_held() {
+        let small = sweep(4_000, 400).await;
+        let large = sweep(40_000, 4_000).await;
+        println!("canon-forward: 4k/400 {small:?}, 40k/4k {large:?}");
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::EPSILON);
+        assert!(
+            ratio < 25.0,
+            "canon-forward must stay linear in the entries held; \
+             4k/400 took {small:?}, 40k/4k took {large:?} ({ratio:.1}x)",
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_view_omits_responder_by_construction() {
         let (resp_tx, _resp_rx) = oneshot::channel();
@@ -2118,7 +2239,7 @@ mod proptest_model {
                 set.clean_reclaimable().await;
             }
             Op::Forward { sender, new_nonce } => {
-                set.forward(&addr(*sender), *new_nonce as u64).await;
+                super::tests::forward_one(set, &addr(*sender), *new_nonce as u64).await;
             }
         }
     }
@@ -2394,7 +2515,7 @@ mod proptest_responder_model {
                     }
                 }
                 Op::Forward(new_nonce) => {
-                    set.forward(&sender, u64::from(*new_nonce)).await;
+                    super::tests::forward_one(&set, &sender, u64::from(*new_nonce)).await;
                     for b in 0..HASHES {
                         let st = &mut model[b as usize];
                         // forward only drops *entries* (nonce == b) below new_nonce.

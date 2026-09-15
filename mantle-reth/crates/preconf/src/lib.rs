@@ -34,7 +34,10 @@ pub use builder::{
 pub use canon_handler::PreconfCanonHandler;
 pub use classifier::{DEFAULT_VERDICT_CACHE_CAP, PreconfClassifier, Verdict, Whitelist};
 pub use config::{DEFAULT_SAFETY_MARGIN, PreconfConfig};
-pub use flashblocks::{FlashblockProducerConfig, FlashblockProducerConfigError};
+pub use flashblocks::{
+    FlashblockProducerConfig, FlashblockProducerConfigError, FlashblocksProducer,
+    FlashblocksProducerHandles,
+};
 pub use journal::{
     CommitmentChainView, JournalEntry, JournalError, OnChain, PreconfJournal, RestorePool,
     RestoreSkip, RestoredEnvelope, RotateStats, restore_preconf_state, run_rejournal_loop,

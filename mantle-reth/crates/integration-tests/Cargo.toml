@@ -93,7 +93,10 @@ op-revm = { workspace = true, features = ["std"] }
 
 # misc
 futures = { workspace = true }
+futures-util = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+# WebSocket client for the flashblocks producer end-to-end tests: connect to the
+# node's publisher and read the slices it broadcasts.
 tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 url = { workspace = true }

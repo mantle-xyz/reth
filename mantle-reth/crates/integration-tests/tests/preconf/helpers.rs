@@ -36,6 +36,21 @@ const GENESIS_EIP1559_EXTRA_DATA: &str = "0x0100000008000000020000000000000000";
 ///
 /// Shared by every spec helper below so no test can accidentally build on a
 /// genesis that cannot be a valid parent.
+///
+/// Two entries in the fixture are worth knowing about, because JSON cannot
+/// carry a comment and nothing else explains them:
+///
+/// * `config.jovianTime: 0` — Jovian from genesis, matching the devnet and every network this
+///   builds for. Until it was set, the whole suite ran on a fork the deployed node had already
+///   passed, and the paths Jovian changes — `blob_gas_used` carrying a block's DA footprint among
+///   them — went unexercised.
+/// * the `L1Block` predeploy at `0x42..15`, holding the DA footprint gas scalar at slot 8, big-
+///   endian at byte offset 18 (`DA_FOOTPRINT_GAS_SCALAR_SLOT` / `_OFFSET` in op-revm). On a real
+///   chain that value arrives in each block's L1 info transaction; [`mantle_payload_attributes`]
+///   sends none, so genesis is the only way it can be there. Its value, 100, is the devnet's: a
+///   bare transfer sits at the 100-byte DA floor and produces the footprint of 10000 seen in devnet
+///   blocks. Zero would work equally well for booting and would silently reduce every footprint
+///   assertion to `0 == 0`.
 fn patched_genesis_value(chain_id: u64) -> serde_json::Value {
     let raw = include_str!("../assets/genesis.json");
     let mut value: serde_json::Value = serde_json::from_str(raw).expect("valid genesis JSON");
@@ -727,7 +742,7 @@ macro_rules! launch_preconf_node {
     };
     ($cfg:expr, $chain_spec:expr) => {
         async {
-            let (node, http, wallet, chain_id, _classifier) =
+            let (node, http, wallet, chain_id, _classifier, _fb) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
@@ -741,7 +756,7 @@ macro_rules! launch_preconf_node {
     // per-block DA limit. `$da` is any `OpDAConfig` expression.
     ($cfg:expr, $chain_spec:expr, da_config = $da:expr) => {
         async {
-            let (node, http, wallet, chain_id, _classifier) =
+            let (node, http, wallet, chain_id, _classifier, _fb) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default()
@@ -752,7 +767,14 @@ macro_rules! launch_preconf_node {
             (node, http, wallet, chain_id)
         }
     };
-    (@build $cfg:expr, $chain_spec:expr, $make_node:expr) => {{
+    // Default: nothing to bind, so no flashblocks endpoint and no address.
+    (@build $cfg:expr, $chain_spec:expr, $make_node:expr) => {
+        $crate::launch_preconf_node!(
+            @build $cfg, $chain_spec, $make_node,
+            |_svc: &mut mantle_reth_preconf::PreconfServiceBuilder| None
+        )
+    };
+    (@build $cfg:expr, $chain_spec:expr, $make_node:expr, $bind:expr) => {{
         async {
             use mantle_reth_preconf::PreconfServiceBuilder;
 
@@ -783,10 +805,15 @@ macro_rules! launch_preconf_node {
                     reth_db::test_utils::tempdir_path().join("mantle-preconf-journal.jsonl"),
                 );
             }
-            let svc = PreconfServiceBuilder::from_config(preconf_cfg)
+            let mut svc = PreconfServiceBuilder::from_config(preconf_cfg)
                 .await
                 .expect("preconf svc init");
             let classifier = svc.classifier().clone();
+            // Between construction and the move into the node: binding needs
+            // `&mut svc`, and the address has to be read out before `svc` is
+            // gone, because the port was left to the OS.
+            let bind = $bind;
+            let flashblocks_addr: Option<std::net::SocketAddr> = bind(&mut svc);
             let make_node = $make_node;
 
             let (node_ctx, http, wallet, chain_id) = mantle_reth_integration_tests::launch_mantle_node!(
@@ -796,7 +823,7 @@ macro_rules! launch_preconf_node {
             )
             .await;
 
-            (node_ctx, http, wallet, chain_id, classifier)
+            (node_ctx, http, wallet, chain_id, classifier, flashblocks_addr)
         }
     }};
 }
@@ -853,6 +880,19 @@ pub fn l1_info_deposit(origin: u64) -> Bytes {
 /// Payload attributes for a block at height `n` referencing L1 origin `origin`:
 /// timestamp = `l2_ts(n)`, tx[0] = the L1-attributes deposit for `origin`.
 pub fn l1_attrs(n: u64, origin: u64) -> OpPayloadAttrs {
+    l1_attrs_with(n, origin, vec![])
+}
+
+/// [`l1_attrs`] with further sequencer transactions appended after the
+/// L1-attributes deposit, in the order given.
+///
+/// The L1-info deposit stays at tx[0] because the fee logic reads it, so `extra`
+/// is appended rather than substituted. These land in `sequencer_transactions()`
+/// and so are executed by the builder's stage 2 — which is the only stage that
+/// watches for a governance whitelist update.
+pub fn l1_attrs_with(n: u64, origin: u64, extra: Vec<Bytes>) -> OpPayloadAttrs {
+    let mut transactions = vec![l1_info_deposit(origin)];
+    transactions.extend(extra);
     OpPayloadAttrs(OpPayloadAttributes {
         payload_attributes: PayloadAttributes {
             timestamp: l2_ts(n),
@@ -862,12 +902,35 @@ pub fn l1_attrs(n: u64, origin: u64) -> OpPayloadAttrs {
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
         },
-        transactions: Some(vec![l1_info_deposit(origin)]),
+        transactions: Some(transactions),
         no_tx_pool: None,
         gas_limit: Some(30_000_000),
         eip_1559_params: Some(B64::ZERO),
         min_base_fee: Some(0),
     })
+}
+
+/// A user deposit from `from` to `to` carrying `input` — the shape
+/// `OptimismPortal.depositTransaction` produces once op-node derives it.
+///
+/// `from` is the value the portal already aliased on L1; nothing on L2 transforms
+/// it further, which is why a test supplies the aliased address directly.
+/// `is_system_transaction` is false: this is a user deposit, not an L1-attributes
+/// one.
+pub fn user_deposit(from: Address, to: Address, input: Bytes, gas_limit: u64) -> Bytes {
+    let dep = TxDeposit {
+        source_hash: keccak256(input.as_ref()),
+        from,
+        to: TxKind::Call(to),
+        mint: 0,
+        value: U256::ZERO,
+        gas_limit,
+        is_system_transaction: false,
+        input,
+        eth_value: 0,
+        eth_tx_value: None,
+    };
+    dep.encoded_2718().into()
 }
 
 // ─────────────────────────── engine-API façade ───────────────────────────
@@ -1126,9 +1189,45 @@ macro_rules! reorg_to {
 #[macro_export]
 macro_rules! launch_preconf_node_with_classifier {
     ($cfg:expr, $chain_spec:expr) => {
-        $crate::launch_preconf_node!(
-            @build $cfg, $chain_spec,
-            |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
-        )
+        async {
+            let (node, http, wallet, chain_id, classifier, _fb) =
+                $crate::launch_preconf_node!(
+                    @build $cfg, $chain_spec,
+                    |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
+                )
+                .await;
+            (node, http, wallet, chain_id, classifier)
+        }
+    };
+}
+
+/// Launch a preconf node with slice publishing switched on.
+///
+/// Returns the flashblocks endpoint's **actual** address: the config asks for
+/// port 0 so concurrent tests never collide, and the OS picks the real one.
+#[macro_export]
+macro_rules! launch_flashblocks_node {
+    ($cfg:expr, $fb:expr) => {
+        $crate::launch_flashblocks_node!($cfg, $crate::helpers::mantle_test_chain_spec(), $fb)
+    };
+    ($cfg:expr, $chain_spec:expr, $fb:expr) => {
+        async {
+            let (node, http, wallet, chain_id, _classifier, fb_addr) =
+                $crate::launch_preconf_node!(
+                    @build $cfg, $chain_spec,
+                    |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc),
+                    |svc: &mut mantle_reth_preconf::PreconfServiceBuilder| {
+                        svc.bind_flashblocks($fb).expect("flashblocks endpoint binds");
+                        Some(
+                            svc.flashblocks()
+                                .expect("just bound")
+                                .publisher()
+                                .local_addr(),
+                        )
+                    }
+                )
+                .await;
+            (node, http, wallet, chain_id, fb_addr.expect("bound above"))
+        }
     };
 }

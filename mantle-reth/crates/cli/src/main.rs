@@ -89,9 +89,18 @@ fn main() {
                     }
                     let journal = cfg.journal_path.clone();
                     let whitelist = cfg.whitelist_contract;
-                    let svc = PreconfServiceBuilder::from_config(cfg)
+                    let mut svc = PreconfServiceBuilder::from_config(cfg)
                         .await
                         .map_err(|e| eyre::eyre!("preconf service init: {e}"))?;
+                    // Bind here rather than inside a task: a port already in
+                    // use should stop the node with a clear message, not leave
+                    // it running with an endpoint nobody is serving.
+                    if let Some(fb) = flashblocks_cfg {
+                        let addr = format!("{}:{}", fb.addr, fb.port);
+                        svc.bind_flashblocks(fb).map_err(|e| {
+                            eyre::eyre!("flashblocks publisher could not bind {addr}: {e}")
+                        })?;
+                    }
                     node = node.with_preconf(svc);
                     info!(
                         target: "reth::cli",

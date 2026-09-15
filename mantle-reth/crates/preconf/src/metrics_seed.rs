@@ -15,6 +15,19 @@
 /// Counter series. Registered at their true starting value (`0`) —
 /// `increment(0)` never clobbers.
 const COUNTERS: &[&str] = &[
+    "flashblock.slice_allowance_exhausted_total",
+    "preconf.build.failed_total",
+    "preconf.build.resolved_payload_superseded_total",
+    "preconf.build.tx_nonce_already_used_total",
+    "preconf.build.tx_over_block_limits_total",
+    "preconf.build.tx_rejected_by_evm_total",
+    "preconf.rpc.nonce_gap_rejected_total",
+    "flashblock.deadline_already_passed_total",
+    "flashblock.dropped_after_abandon_total",
+    "flashblock.returned_to_pool_total",
+    "flashblock.slices_missed_by_slow_subscribers_total",
+    "flashblock.slow_subscriber_dropped_total",
+    "flashblock.superseded_slices_total",
     "preconf.api.timeout_total",
     "preconf.tx.success_total",
     "preconf.tx.failure_total",
@@ -31,6 +44,7 @@ const COUNTERS: &[&str] = &[
     "preconf.canon.reorg_drift_total",
     "preconf.tx.commitment_broken_total",
     "preconf.tx.replay_round_total",
+    "preconf.journal.dropped_entries_total",
     "preconf.journal.restore_nonce_taken",
     "preconf.journal.restore_undecodable",
     "preconf.journal.restore_unknown",
@@ -50,7 +64,10 @@ const COUNTERS: &[&str] = &[
 /// `set(0.0)` here could clobber it back to `0` depending on call ordering; a
 /// zero increment only registers the series, leaving any existing value intact.
 const GAUGES: &[&str] = &[
+    "flashblock.endpoint_serving",
+    "flashblock.subscribers",
     "preconf.fifo.pending",
+    "preconf.journal.pending_entries",
     "preconf.journal.size_bytes",
     "preconf.classifier.verdicts",
     "preconf.classifier.slots",
@@ -69,11 +86,17 @@ const GAUGES: &[&str] = &[
 /// almost immediately so the gap is negligible; the list exists mainly so the
 /// drift test covers histograms too.
 const HISTOGRAMS: &[&str] = &[
+    "flashblock.byte_size",
+    "flashblock.first_slice_offset_ms",
+    "flashblock.journal_write_duration_ms",
+    "flashblock.publish_interval_ms",
+    "flashblock.slices_per_block",
     "preconf.api.handle_duration_ms",
     "preconf.execute.duration_ms",
     "preconf.validate.duration_ms",
     "preconf.dispatch.elapsed_at_gate_ms",
     "preconf.journal.rotate_duration_ms",
+    "preconf.journal.rotate_locked_ms",
 ];
 
 /// Pre-register every preconf metric so its Prometheus series exists from node
@@ -113,25 +136,47 @@ mod tests {
         }
     }
 
-    /// Extract every `"preconf.…"` name passed to `<macro>!("preconf.…"` in the
-    /// source (i.e. the inline emit sites; the seed lists use a variable, not a
-    /// literal, so they don't match).
+    /// Namespaces this crate emits under. Both are scanned, so a metric added
+    /// under either one is held to the same seeding rule.
+    const PREFIXES: &[&str] = &["preconf.", "flashblock."];
+
+    /// Extract every name passed to `<macro>!("<prefix>…"` in the source (i.e.
+    /// the inline emit sites; the seed lists use a variable, not a literal, so
+    /// they don't match).
     fn emitted_names(src: &str, macro_name: &str) -> HashSet<String> {
-        let needle = format!("{macro_name}!(\"preconf.");
         let mut names = HashSet::new();
-        let mut rest = src;
-        while let Some(pos) = rest.find(&needle) {
-            let after = &rest[pos + needle.len() - "preconf.".len()..];
-            if let Some(end) = after.find('"') {
-                names.insert(after[..end].to_string());
+        for prefix in PREFIXES {
+            let needle = format!("{macro_name}!(\"{prefix}");
+            let mut rest = src;
+            while let Some(pos) = rest.find(&needle) {
+                let after = &rest[pos + needle.len() - prefix.len()..];
+                if let Some(end) = after.find('"') {
+                    names.insert(after[..end].to_string());
+                }
+                rest = &rest[pos + needle.len()..];
             }
-            rest = &rest[pos + needle.len()..];
         }
         names
     }
 
-    /// Every `preconf.*` metric emitted anywhere in the crate must appear in the
-    /// matching seed list — otherwise it regresses to lazy registration.
+    /// Every metric emitted anywhere in the crate must appear in the matching
+    /// seed list — otherwise it regresses to lazy registration.
+    ///
+    /// Names are all this compares, because names are all it can read out of
+    /// the source: passing says a series is registered and spelled right, not
+    /// that it reports anything true. Computing a value wrong
+    /// (`increment(superseded - 1)`), counting a gauge the wrong way
+    /// (`decrement` when a subscriber arrives), and deleting the line that
+    /// constructs a `Drop`-guard all leave the whole suite green — the last
+    /// because the macro call stays in the source for this test to find while
+    /// the metric never fires again, and is caught by `-D warnings` on the
+    /// unused binding instead.
+    ///
+    /// Deliberately so: a wrong number bends a chart rather than changing what
+    /// the chain does, and the recorder is process-global, so reading values
+    /// back inside a shared test binary would collide with whatever else is
+    /// running. Names are held here; values by review and by watching a real
+    /// network.
     #[test]
     fn seed_lists_cover_every_emitted_metric() {
         let mut src = String::new();

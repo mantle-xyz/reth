@@ -451,8 +451,18 @@ impl MantleNode {
             self.op_node.gas_limit_config.clone(),
             args.sdm_enabled,
         );
-        let (cfg, classifier, fifo) = if let Some(p) = &self.preconf {
-            (p.cfg().clone(), p.classifier().clone(), p.fifo().clone())
+        // Slice publishing rides on the preconf handle: `--flashblocks.enable`
+        // requires `--preconf.enable`, so there is no path where flashblocks
+        // are configured without a preconf service to carry them.
+        //
+        // The endpoint goes to the payload service layer rather than being
+        // taken apart here: that layer both hands the publish handle to the
+        // builder and spawns the accept loop, and it runs exactly once — which
+        // is what a take-once accept loop needs.
+        let flashblocks = self.preconf.as_ref().and_then(|p| p.flashblocks()).map(Arc::clone);
+
+        let (cfg, classifier, fifo, journal) = if let Some(p) = &self.preconf {
+            (p.cfg().clone(), p.classifier().clone(), p.fifo().clone(), Some(p.journal().clone()))
         } else {
             // Disabled path: default-empty cfg / classifier / fifo (no allowlists,
             // no events). Built by hand rather than via `PreconfServiceBuilder`,
@@ -462,10 +472,16 @@ impl MantleNode {
             let cfg = PreconfConfig::default();
             let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
             let fifo = Arc::new(PreconfTxSet::new(cfg.broadcast_cap));
-            (Arc::new(cfg), classifier, fifo)
+            (Arc::new(cfg), classifier, fifo, None)
         };
-        let payload_service =
-            MantlePreconfServiceBuilder::<OpPrimitives>::new(cfg, classifier, fifo, builder_config);
+        let payload_service = MantlePreconfServiceBuilder::<OpPrimitives>::new(
+            cfg,
+            classifier,
+            fifo,
+            journal,
+            builder_config,
+            flashblocks,
+        );
 
         ComponentsBuilder::default()
             .node_types::<N>()

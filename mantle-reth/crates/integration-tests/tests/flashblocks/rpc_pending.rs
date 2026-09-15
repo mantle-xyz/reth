@@ -8,7 +8,7 @@ use alloy_primitives::{Address, U256, keccak256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
 use mantle_reth_flashblocks::EthApiOverrideServer;
 
-use crate::helpers::{
+use crate::consumer_helpers::{
     FlashblockBuilder, LOGGER, l1_info_deposit, launch_flashblocks_node, signed_call, test_sender,
 };
 

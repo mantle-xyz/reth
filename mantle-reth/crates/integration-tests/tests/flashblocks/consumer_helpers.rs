@@ -134,9 +134,9 @@ impl FlashblockBuilder {
 macro_rules! launch_flashblocks_node {
     ($max_trailing_depth:expr, $max_leading_depth:expr) => {{
         let (node, _http, _wallet, _chain_id) = mantle_reth_integration_tests::launch_mantle_node!(
-            crate::helpers::flashblocks_test_chain_spec(),
+            crate::consumer_helpers::flashblocks_test_chain_spec(),
             mantle_reth_cli::node::MantleNode::default(),
-            crate::helpers::flashblocks_payload_attributes
+            crate::consumer_helpers::flashblocks_payload_attributes
         )
         .await;
 
@@ -147,7 +147,7 @@ macro_rules! launch_flashblocks_node {
         ));
         state.start(node.inner.provider.clone());
 
-        (crate::helpers::FlashblocksHarness::new(state), node)
+        (crate::consumer_helpers::FlashblocksHarness::new(state), node)
     }};
 }
 

@@ -414,6 +414,92 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
+/// The same three commitments, written to the journal newest-nonce-first.
+///
+/// Nothing sorts between the file and the builder: `restore_preconf_state`
+/// pushes entries into the fifo in file order, and `replay_fifo_carryover`
+/// hands them to dispatch in fifo order. So a file that is out of nonce order
+/// asks the builder to apply nonce 2 while the account is still at 0.
+///
+/// The journal's own writers can produce this. A preconf commitment is
+/// recorded from its apply and a pool transaction from the slice that carries
+/// it, so two transactions from one sender land in the file in the order those
+/// two moments happened to occur — not in nonce order.
+///
+/// All three commitments were promised to a client, so all three must land.
+///
+/// Read the file in that order and only nonce 0 arrives: nonce 2 goes first
+/// against an account still at 0, is rejected as invalid, and lands in `Failed`
+/// — terminal for carryover, revivable only by a same-hash resubmit. Nonce 1
+/// goes the same way, and two commitments a client holds receipts for disappear.
+/// What keeps that from happening is the carryover preamble ordering each
+/// sender's entries by nonce before dispatch sees them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn journal_replay_out_of_nonce_order_still_lands_every_commitment() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_id = mantle_test_chain_spec().chain().id();
+    let wallet = Wallet::default().with_chain_id(chain_id);
+    let wallet_addr = wallet.inner.address();
+
+    let tx0 = signed_transfer(chain_id, &wallet, 0).await;
+    let tx1 = signed_transfer(chain_id, &wallet, 1).await;
+    let tx2 = signed_transfer(chain_id, &wallet, 2).await;
+    let hash0 = keccak256(&tx0);
+    let hash1 = keccak256(&tx1);
+    let hash2 = keccak256(&tx2);
+
+    // Reversed: the highest nonce is the first line in the file.
+    let entries = [
+        JournalEntry { hash: hash2, tx_rlp: tx2.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash1, tx_rlp: tx1.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0 },
+    ];
+    let (journal_file, journal_dir) = write_journal(&entries);
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .journal_path(journal_file.clone())
+        .build();
+
+    let (mut node, _http, _wallet_launched, _launched_chain_id) = launch_preconf_node!(cfg).await;
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+
+    for (label, h) in [("nonce=0", hash0), ("nonce=1", hash1), ("nonce=2", hash2)] {
+        assert!(
+            sealed.contains(&h),
+            "a promised commitment must land whatever order the file held it in; \
+             missing {label}, sealed={sealed:?}",
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
 /// Multi-sender journal replay: two independent senders, each with a
 /// single promised commitment, both land in the first block.
 ///

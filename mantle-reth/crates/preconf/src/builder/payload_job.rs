@@ -134,7 +134,11 @@ where
 // `ensure_only_one_payload` the supersede path; both funnel to the same signal.
 impl<Attrs, Payload> Drop for PreconfPayloadJob<Attrs, Payload> {
     fn drop(&mut self) {
-        self.cancel.signal();
+        // `abandon`, not `resolve`: reaching here says the job is going away,
+        // not what became of its payload. A job whose payload *was* asked for
+        // has already recorded that, and the first reason is the one that
+        // sticks — so this only decides the case where nobody asked.
+        self.cancel.abandon();
     }
 }
 
@@ -183,7 +187,7 @@ where
         // arm inside `build_payload` will break out of its loop, run
         // SDM post-exec + finalize, and then `payload_rx` will receive
         // the final payload.
-        self.cancel.signal();
+        self.cancel.resolve();
         let fut = ResolvePayloadFuture::new(self.payload_rx.clone());
         (fut, KeepPayloadJobAlive::No)
     }
@@ -295,7 +299,7 @@ mod tests {
         let handle = tokio::spawn(async {});
         let job = PreconfPayloadJob::new((), rx, cancel.clone(), handle);
 
-        cancel.signal();
+        cancel.abandon();
         // Should resolve immediately
         timeout(Duration::from_millis(50), job)
             .await
@@ -319,7 +323,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!task.is_finished(), "job must still be pending before cancel");
 
-        cancel.signal();
+        cancel.abandon();
         timeout(Duration::from_millis(500), task)
             .await
             .expect("cancel must wake the parked job future via its waker")
@@ -362,7 +366,7 @@ mod tests {
         let job = PreconfPayloadJob::new((), rx, cancel.clone(), handle);
 
         // Simulate `resolve_kind`'s cancel firing before drop.
-        cancel.signal();
+        cancel.abandon();
         assert!(cancel_observer.is_cancelled(), "explicit signal marks cancel");
 
         // Dropping the (already-cancelled) job must not panic or

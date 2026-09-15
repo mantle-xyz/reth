@@ -4,7 +4,7 @@
 //! the node's canonical-state task does; the websocket subscriber is not
 //! started.
 
-use crate::helpers::{
+use crate::consumer_helpers::{
     FlashblockBuilder, base_slice, base_slice_builder, filler_deposit, launch_flashblocks_node,
     mine_canonical_block as mine,
 };
