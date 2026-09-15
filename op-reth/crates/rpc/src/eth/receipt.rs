@@ -553,7 +553,7 @@ mod test {
     use alloy_primitives::{Address, B256, Bytes, Signature, U256, hex};
     use op_alloy_consensus::{OpTypedTransaction, SDMGasEntry, TxDeposit, build_post_exec_tx};
     use op_alloy_network::eip2718::Decodable2718;
-    use reth_optimism_chainspec::OP_MAINNET;
+    use reth_optimism_chainspec::{OP_MAINNET, OpChainSpecBuilder};
     use reth_optimism_forks::OpHardforks;
     use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
     use reth_primitives_traits::{Recovered, SealedBlock};
@@ -889,10 +889,21 @@ mod test {
             },
         });
 
+        // SDM post-exec is gated on Lagoon (`is_sdm_active_at_timestamp`), which Mantle never
+        // activates -- this test covers the parsing path itself, so it needs a Lagoon-active
+        // spec, exactly as upstream does. An earlier resolution pointed it at
+        // `mantle_test_chain_spec()`, which only worked while the gate was a dead bool.
+        let interop_active = std::sync::Arc::new(
+            OpChainSpecBuilder::default()
+                .chain(OP_MAINNET.chain())
+                .genesis(alloy_genesis::Genesis::default())
+                .lagoon_activated()
+                .build(),
+        );
         let converter = OpReceiptConverter::new(reth_storage_api::noop::NoopProvider::<
             _,
             OpPrimitives,
-        >::new(mantle_test_chain_spec()));
+        >::new(interop_active));
         let receipts =
             <OpReceiptConverter<_> as ReceiptConverter<OpPrimitives>>::convert_receipts_with_block(
                 &converter,
