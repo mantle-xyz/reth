@@ -5,7 +5,7 @@ use alloy_consensus::BlockHeader;
 use alloy_eips::{BlockId, Encodable2718};
 use alloy_network::{TransactionBuilder, TransactionBuilder4844};
 use alloy_primitives::{B256, Bytes, U256};
-use alloy_rpc_types_eth::TransactionInfo;
+use alloy_rpc_types_eth::{TransactionInfo, state::EvmOverrides};
 use futures::StreamExt;
 use op_alloy_consensus::{
     OpTransaction,
@@ -238,8 +238,9 @@ where
         }
 
         if request.as_ref().gas_limit().is_none() {
-            let estimated_gas =
-                self.estimate_gas_at(request.clone(), BlockId::pending(), None).await?;
+            let estimated_gas = self
+                .estimate_gas_at(request.clone(), BlockId::pending(), EvmOverrides::default())
+                .await?;
             request.as_mut().set_gas_limit(estimated_gas.to());
         }
 

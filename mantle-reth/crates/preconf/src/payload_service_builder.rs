@@ -175,7 +175,7 @@ where
             let upstream = OpPayloadBuilder::new(false)
                 .with_da_config(builder_config.da_config.clone())
                 .with_gas_limit_config(builder_config.gas_limit_config.clone())
-                .with_sdm_enabled(builder_config.sdm_enabled);
+                .with_operator_sdm_opt_in(builder_config.operator_sdm_opt_in.clone());
             return BasicPayloadServiceBuilder::new(upstream)
                 .spawn_payload_builder_service(ctx, pool, evm_config)
                 .await;

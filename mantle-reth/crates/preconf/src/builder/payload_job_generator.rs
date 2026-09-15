@@ -164,7 +164,8 @@ where
         input: BuildNewPayload<<Self::Job as reth_payload_builder::PayloadJob>::PayloadAttributes>,
         id: PayloadId,
     ) -> Result<Self::Job, PayloadBuilderError> {
-        let BuildNewPayload { attributes: rpc_attrs, parent_hash, cache, trie_handle } = input;
+        let BuildNewPayload { attributes: rpc_attrs, parent_hash, cache, state_root_handle } =
+            input;
 
         // Look up parent header — mirrors Base's pattern. Genesis edge
         // case (parent_hash zero) intentionally surfaces as
@@ -197,7 +198,7 @@ where
                 // significant.
                 Default::default(),
                 cache,
-                trie_handle,
+                state_root_handle,
                 config,
                 // The CancelOnDrop in BuildArguments is consumed by the
                 // upstream OpPayloadBuilderCtx. Our async cancel signal is

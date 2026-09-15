@@ -125,6 +125,7 @@ reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef9
 reth-node-types = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
 reth-testing-utils = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-tokio-util = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
 notify = { version = "8.0.0", default-features = false, features = ["macos_fsevent"] }
 rocksdb = { version = "0.24" }
 
@@ -438,8 +439,11 @@ rustls = { version = "0.23", default-features = false }
 # Declarations the imported crates inherit, copied from the anchor's manifest.
 tar = "0.4.44"
 
+# ==================== ADDED FOR op-reth/v2.4.2 ====================
+# Declarations the imported crates inherit, copied from the anchor's manifest.
+criterion = { package = "codspeed-criterion-compat", version = "2.10" }
+
 [patch."https://github.com/paradigmxyz/reth"]
-reth-trie-common = { path = "patches/reth-trie-common" }
 # reth-rpc = { path = "patches/reth-rpc" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }

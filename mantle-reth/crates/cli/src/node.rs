@@ -381,11 +381,14 @@ impl MantleNode {
         // `(cfg, fifo)` — no whitelist, no broadcast events. The fork's
         // select! loop then sits idle waiting for cancel, and the
         // block seals at CL `getPayload` time.
-        let builder_config = OpBuilderConfig::new_with_sdm(
+        let mut builder_config = OpBuilderConfig::new(
             self.op_node.da_config.clone(),
             self.op_node.gas_limit_config.clone(),
-            args.sdm_enabled,
         );
+        // [MANTLE] v2.4.2 turned the SDM switch into a shared, runtime-toggleable handle
+        // (`admin_setOperatorSdmOptIn`). Clone the node's handle rather than seeding a new one,
+        // so the builder and the executor below observe the same toggle.
+        builder_config.operator_sdm_opt_in = self.op_node.operator_sdm_opt_in.clone();
         let (cfg, fifo) = if let Some(p) = &self.preconf {
             (p.cfg().clone(), p.fifo().clone())
         } else {
@@ -401,7 +404,9 @@ impl MantleNode {
 
         ComponentsBuilder::default()
             .node_types::<N>()
-            .executor(OpExecutorBuilder::default().with_sdm_enabled(args.sdm_enabled))
+            // v2.4.2 removed the SDM knob from the executor; it now flows only through
+            // `OpBuilderConfig::operator_sdm_opt_in`, wired above.
+            .executor(OpExecutorBuilder::default())
             .pool(pool_builder)
             .payload(payload_service)
             .network(OpNetworkBuilder::new(args.disable_txpool_gossip, !args.discovery_v4))

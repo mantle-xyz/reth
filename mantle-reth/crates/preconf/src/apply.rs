@@ -251,6 +251,9 @@ mod tests {
     #[error("dummy db error")]
     struct DummyDbErr;
 
+    // revm 41 requires the DB error type of `EVMError` to carry this marker.
+    impl reth_revm::context::DBErrorMarker for DummyDbErr {}
+
     fn h(byte: u8) -> TxHash {
         TxHash::from([byte; 32])
     }

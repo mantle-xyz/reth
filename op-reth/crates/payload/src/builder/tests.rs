@@ -910,6 +910,12 @@ fn miner_fee_uses_pool_wrapper_tip() {
         fn encoded_2718(&self) -> Cow<'_, Bytes> {
             OpPooledTx::encoded_2718(&self.inner)
         }
+
+        // [MANTLE] `OpPooledTx` carries the L1 + operator fee overlay here; delegate like the
+        // rest of this wrapper does.
+        fn set_extra_balance_cost(&mut self, cost: alloy_primitives::U256) {
+            self.inner.set_extra_balance_cost(cost);
+        }
     }
 
     let signer = Address::repeat_byte(0x11);

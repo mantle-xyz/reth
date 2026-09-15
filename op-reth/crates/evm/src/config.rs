@@ -95,7 +95,7 @@ mod tests {
         };
         let sealed = SealedHeader::new(header, B256::ZERO);
 
-        let attrs = OpNextBlockEnvAttributes::build_pending_env(&sealed);
+        let attrs = OpNextBlockEnvAttributes::build_pending_env(&sealed, None);
 
         assert_eq!(attrs.parent_beacon_block_root, Some(B256::ZERO));
     }
@@ -107,7 +107,7 @@ mod tests {
         let header = Header { parent_beacon_block_root: None, ..Default::default() };
         let sealed = SealedHeader::new(header, B256::ZERO);
 
-        let attrs = OpNextBlockEnvAttributes::build_pending_env(&sealed);
+        let attrs = OpNextBlockEnvAttributes::build_pending_env(&sealed, None);
 
         assert_eq!(attrs.parent_beacon_block_root, None);
     }

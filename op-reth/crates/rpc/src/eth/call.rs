@@ -3,9 +3,13 @@ use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{TxKind, U256};
-use alloy_rpc_types_eth::state::StateOverride;
+use alloy_rpc_types_eth::state::EvmOverrides;
 use reth_chainspec::{ChainSpecProvider, MIN_TRANSACTION_GAS};
-use reth_evm::{ConfigureEvm, Evm, EvmEnvFor, TransactionEnvMut, overrides::apply_state_overrides};
+use reth_evm::{
+    ConfigureEvm, Evm, EvmEnvFor, TransactionEnvMut,
+    env::BlockEnvironment,
+    overrides::{apply_block_overrides, apply_state_overrides},
+};
 use reth_optimism_evm::extract_l1_info;
 use reth_optimism_forks::OpHardforks;
 use reth_primitives_traits::Block;
@@ -49,7 +53,7 @@ where
         &self,
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         at: BlockId,
-        state_override: Option<StateOverride>,
+        overrides: EvmOverrides,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
             // [MANTLE] Apply the request's `stateOverride` balance for `from` to the Mantle
@@ -57,9 +61,9 @@ where
             // state before reading balances, but these checks read the raw provider
             // state (`state_by_block_id`), which ignored `stateOverride` and spuriously
             // rejected overridden-balance estimates. Extracted once here because
-            // `state_override` is moved into the inner call below.
+            // `overrides` is moved into the inner call below.
             let from_override_balance = request.as_ref().from.and_then(|from| {
-                state_override.as_ref().and_then(|ov| ov.get(&from)).and_then(|acc| acc.balance)
+                overrides.state.as_ref().and_then(|ov| ov.get(&from)).and_then(|acc| acc.balance)
             });
 
             // [MANTLE] Pre-check: value transfer (op-geth `gasestimator.go` clause 6,
@@ -97,7 +101,7 @@ where
             }
 
             let estimate =
-                EstimateCall::estimate_gas_at(self, request.clone(), at, state_override).await?;
+                EstimateCall::estimate_gas_at(self, request.clone(), at, overrides).await?;
 
             // [MANTLE] Post-estimation Arsia balance check (op-geth v1.5.5 mantleArsiaCheckFunds)
             // geth uses target block state (opts.State from StateAndHeaderByNumberOrHash).
@@ -174,7 +178,7 @@ where
         mut evm_env: EvmEnvFor<Self::Evm>,
         mut request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         state: S,
-        state_override: Option<StateOverride>,
+        overrides: EvmOverrides,
     ) -> Result<U256, Self::Error>
     where
         S: EvmStateProvider,
@@ -219,8 +223,15 @@ where
         // Configure the evm env
         let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
 
+        // Apply block overrides first, so `gasLimit` / `baseFee` / `blobBaseFee` are visible to
+        // estimation. v2.4.2 added this upstream (mirroring go-ethereum#30695); this Mantle
+        // override predates it and would otherwise drop them silently.
+        if let Some(block_overrides) = overrides.block {
+            apply_block_overrides(*block_overrides, &mut db, evm_env.block_env.inner_mut());
+        }
+
         // Apply any state overrides if specified.
-        if let Some(state_override) = state_override {
+        if let Some(state_override) = overrides.state {
             apply_state_overrides(state_override, &mut db).map_err(Self::Error::from_eth_err)?;
         }
 

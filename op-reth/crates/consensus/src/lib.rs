@@ -881,6 +881,8 @@ mod tests {
                 &block,
                 &result,
                 Some((unstripped_root, bloom)),
+                // EIP-7928 block access list hash; not exercised by this Mantle test.
+                None,
             );
         assert!(post_exec.is_ok(), "Mantle should ignore pre-computed receipt root: {post_exec:?}");
 
@@ -893,6 +895,8 @@ mod tests {
                 &block,
                 &result,
                 Some((unstripped_root, bloom)),
+                // EIP-7928 block access list hash; not exercised by this Mantle test.
+                None,
             );
         assert!(
             post_exec_op.is_err(),

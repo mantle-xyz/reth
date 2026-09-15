@@ -78,7 +78,12 @@ where
                 .proof(Default::default(), address, &storage_keys)
                 .map_err(Into::into)?;
 
-            Ok(proof.into_eip1186_response(keys))
+            // [MANTLE] geth returns B256::ZERO for codeHash and storageHash on an account that
+            // does not exist, where reth returns KECCAK_EMPTY / EMPTY_ROOT_HASH. Mantle follows
+            // geth, so the exclusion-proof shape stays the one op-geth clients already parse.
+            // v2.4.2 made this an argument (go-ethereum#28357); before that it needed a patched
+            // reth-trie-common.
+            Ok(proof.into_eip1186_response_with(keys, true))
         }
         .await;
 

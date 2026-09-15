@@ -21,7 +21,7 @@
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{B256, Bytes, TxKind, U256};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{TransactionRequest, state::EvmOverrides};
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
@@ -597,7 +597,7 @@ where
             })?)
             .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?,
             block_id,
-            None,
+            EvmOverrides::default(),
         )
         .await
         .map_err(|e| {

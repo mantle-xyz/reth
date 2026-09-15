@@ -1045,7 +1045,6 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
         self.flashblock_consensus = flashblock_consensus;
         self
     }
-
 }
 
 impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {

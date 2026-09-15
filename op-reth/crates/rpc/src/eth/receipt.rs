@@ -548,22 +548,15 @@ mod test {
         Block, BlockBody, Eip658Value, Header, Receipt, Sealable, SignableTransaction, TxEip7702,
         transaction::TransactionMeta,
     };
-    use alloy_genesis::Genesis;
-    use alloy_op_hardforks::{
-        OP_MAINNET_ISTHMUS_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP, OpChainHardforks,
-    };
-    use alloy_primitives::{Address, Bytes, Signature, U256, hex};
-    use op_alloy_consensus::{OpTypedTransaction, SDMGasEntry, build_post_exec_tx};
-    use op_alloy_network::eip2718::Decodable2718;
-    use reth_optimism_chainspec::{OP_MAINNET, OpChainSpecBuilder};
+
     use alloy_op_hardforks::{OP_MAINNET_ISTHMUS_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP};
     use alloy_primitives::{Address, B256, Bytes, Signature, U256, hex};
     use op_alloy_consensus::{OpTypedTransaction, SDMGasEntry, TxDeposit, build_post_exec_tx};
+    use op_alloy_network::eip2718::Decodable2718;
     use reth_optimism_chainspec::OP_MAINNET;
     use reth_optimism_forks::OpHardforks;
     use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
     use reth_primitives_traits::{Recovered, SealedBlock};
-    use std::sync::Arc;
 
     /// Build a Mantle-compatible `OpChainSpec` for tests without importing `mantle-reth-chainspec`.
     ///
@@ -896,13 +889,6 @@ mod test {
             },
         });
 
-        let interop_active = Arc::new(
-            OpChainSpecBuilder::default()
-                .chain(OP_MAINNET.chain())
-                .genesis(Genesis::default())
-                .lagoon_activated()
-                .build(),
-        );
         let converter = OpReceiptConverter::new(reth_storage_api::noop::NoopProvider::<
             _,
             OpPrimitives,
@@ -1158,10 +1144,13 @@ mod test {
             OpTransactionSigned::new_unhashed(OpTypedTransaction::Deposit(tx), signature);
 
         let mut l1_block_info = op_revm::L1BlockInfo::default();
-        let op_hardforks = OpChainHardforks::op_mainnet();
+        // [MANTLE] `OpReceiptBuilder::new` takes `impl OpHardforks + EthChainSpec` here, so the
+        // upstream helper's bare `OpChainHardforks` does not satisfy it. OP mainnet carries the
+        // Regolith/Canyon activations this test varies over.
+        let chain_spec = &*OP_MAINNET;
 
         let op_receipt = OpReceiptBuilder::new(
-            &op_hardforks,
+            chain_spec,
             ConvertReceiptInput::<OpPrimitives> {
                 tx: Recovered::new_unchecked(&tx, from),
                 receipt: OpReceipt::Deposit(OpDepositReceipt {
@@ -1491,5 +1480,4 @@ mod test {
             "a deposit call tx must not have a contract address"
         );
     }
-
 }

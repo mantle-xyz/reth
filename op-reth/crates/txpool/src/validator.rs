@@ -270,11 +270,11 @@ where
         // network-bound (access-list filtering, up to `CHECK_ACCESS_LIST_TIMEOUT_SECS`). Rejecting
         // an over-gas-limit transaction here avoids that work and is better admission-DoS hygiene.
         let gas_limit = transaction.gas_limit();
-        let effective_gas_limit = self.inner.block_gas_limit().saturating_sub(L1_INFO_GAS_OVERHEAD);
-        if gas_limit > effective_gas_limit {
+        let effective_limit = effective_gas_limit(self.inner.block_gas_limit());
+        if gas_limit > effective_limit {
             return TransactionValidationOutcome::Invalid(
                 transaction,
-                InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, effective_gas_limit),
+                InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, effective_limit),
             );
         }
 
@@ -295,22 +295,6 @@ where
                     .set_interop_deadline(self.block_timestamp() + CHECK_ACCESS_LIST_TIMEOUT_SECS);
             }
             _ => {}
-        }
-
-        // [MANTLE] Reserve gas for the L1-info deposit present in every L2 block, matching
-        // op-geth `EffectiveGasLimit` (`core/txpool/validation.go`). Upstream reth caps at the
-        // full block gas limit, so without this a tx with gas_limit in
-        // `(block_gas_limit - overhead, block_gas_limit]` would be admitted but could never be
-        // included (the L1-info deposit always consumes part of the block), leaving it stuck.
-        if self.chain_spec().is_mantle() {
-            let gas_limit = transaction.gas_limit();
-            let effective_limit = effective_gas_limit(self.inner.block_gas_limit());
-            if gas_limit > effective_limit {
-                return TransactionValidationOutcome::Invalid(
-                    transaction,
-                    InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, effective_limit),
-                );
-            }
         }
 
         let outcome = self.inner.validate_one_with_state(origin, transaction, state);
