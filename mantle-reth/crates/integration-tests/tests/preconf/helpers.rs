@@ -494,7 +494,7 @@ pub fn l1_info_deposit(origin: u64) -> Bytes {
         gas_limit: 1_000_000,
         is_system_transaction: true,
         input: data.into(),
-        eth_value: 0,
+        eth_value: U256::ZERO,
         eth_tx_value: None,
     };
     dep.encoded_2718().into()

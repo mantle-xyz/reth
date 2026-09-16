@@ -62,7 +62,7 @@ fn l1_attributes_deposit_bytes() -> Bytes {
         gas_limit: 1_000_000,
         is_system_transaction: true,
         input: arsia_l1_attributes_calldata(),
-        eth_value: 0,
+        eth_value: U256::ZERO,
         eth_tx_value: None,
     }
     .encoded_2718()
