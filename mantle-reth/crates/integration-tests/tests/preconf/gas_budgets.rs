@@ -467,22 +467,34 @@ async fn block_gas_budget_rejects_third_sender_in_same_slot() {
     );
 }
 
-/// Same-slot resubmit of an budget-rejected tx: `dispatch.rs::apply_one_preconf`
-/// dedups on `loop_state.excluded_reason(&hash)` before re-running any
-/// gate, but **forwards the stored rejection reason** to any responder
-/// attached by the second submission. The revived fifo entry (Canceled
-/// → Waiting via `push_if_absent`) never reaches the block-gas-budget gate a second
-/// time, yet the client sees a consistent error rather than a slow
-/// `Ok(Timeout)`.
+/// Same-slot resubmit of a budget-rejected tx: `dispatch.rs::apply_one_preconf`
+/// dedups on `loop_state.excluded_reason(&hash)` before re-running any gate,
+/// **forwards the stored rejection reason** to any responder attached by the
+/// second submission, and **re-terminalizes** the entry that resubmit had
+/// revived (`Canceled → Waiting` via `push_if_absent`).
 ///
 /// Wire contract pinned by this test:
 ///
 ///   1st call → `Err(BlockGasBudgetExceeded)` (dispatch block-gas-budget gate, fast)
 ///   2nd call same slot → **same** `Err(BlockGasBudgetExceeded)` (dedup
 ///     forwards the stored reason, also fast — well under `preconf_timeout`)
+///   tx2 on chain → never, in this slot or the next
 ///
-/// Cross-slot recovery (canonicalise then resubmit, budget resets) is
-/// covered by `canceled_tx_recoverable_in_next_slot`.
+/// The cross-slot half is the audit Issue-2 regression: leaving the revived
+/// entry `Waiting` lets the next payload job's `replay_fifo_carryover` —
+/// which collects every `Waiting` entry — dispatch it against a fresh
+/// block-gas budget, landing a tx both submissions were told was rejected.
+/// **No third submission happens after slot 1**, so anything in block 2 got
+/// there on its own.
+///
+/// Cross-slot *recovery* (canonicalise, then resubmit against a reset
+/// budget) is covered by `canceled_tx_recoverable_in_next_slot`.
+///
+/// `preconf_timeout_ms` must exceed the resubmit → slot-2-dispatch gap, or
+/// the dispatch deadline gate flips the stale `Waiting` entry to `Timeout`
+/// and masks the defect — the test would then pass for the wrong reason. It
+/// also keeps the `< 500ms` fast-forward assertion unambiguous against a
+/// deadline-path regression.
 ///
 /// Regression risks this guards:
 ///  - `LoopState::excluded` reverting from `HashMap<TxHash, PreconfError>` back to a plain
@@ -490,19 +502,19 @@ async fn block_gas_budget_rejects_third_sender_in_same_slot() {
 ///    would fall back to waiting the full `preconf_timeout`.
 ///  - The dedup branch dropping its `cancel_responder(..., reason)` call and just `return`ing —
 ///    same slow-Timeout regression.
+///  - The dedup branch dropping its `mark_canceled` — the revived entry stays a dispatch candidate
+///    and lands in the next slot (audit Issue-2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
+async fn canceled_tx_same_slot_resubmit_forwards_same_error_and_never_lands() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    // Long-ish timeout so any regression that falls back to the RPC-layer
-    // deadline path is unambiguously slower than the fast-forward path.
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(wallet_addr)
         .whitelist_to(recipient)
         .max_gas_per_tx(30_000)
         .max_gas_per_block(50_000)
-        .preconf_timeout_ms(1_500)
+        .preconf_timeout_ms(3_000)
         .build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
@@ -589,22 +601,66 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     );
 
     // Close the build and verify tx2 never lands in this slot.
-    let payload = node
+    let payload_1 = node
         .inner
         .payload_builder_handle
         .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
         .await
-        .expect("resolve_kind")
-        .expect("payload build");
-    let sealed: Vec<alloy_primitives::B256> = payload
+        .expect("resolve_kind 1")
+        .expect("payload 1");
+    let sealed_1: Vec<alloy_primitives::B256> = payload_1
         .block()
         .body()
         .transactions()
         .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
         .collect();
     assert!(
-        !sealed.contains(&tx2_hash),
-        "budget-rejected tx must never land in its own slot, even after resubmit; sealed={sealed:?}",
+        !sealed_1.contains(&tx2_hash),
+        "budget-rejected tx must never land in its own slot, even after resubmit; \
+         sealed={sealed_1:?}",
+    );
+
+    // ── Slot 2: no new submission; tx2 must stay off chain ───────────
+    canonize_built!(node, payload_1);
+    wait_latest_nonce(&http, wallet_addr, 2).await;
+
+    let attrs_2 = node.payload.next_attributes();
+    let fcu_state_2 = node.current_forkchoice_state().expect("forkchoice state 2");
+    let payload_id_2 = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state_2, Some(attrs_2))
+        .await
+        .expect("FCU 2")
+        .payload_id
+        .expect("payload_id 2");
+
+    // Give the carryover preamble time to dispatch whatever it collected —
+    // without this the assertion could pass simply by resolving too early.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload_2 = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id_2, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind 2")
+        .expect("payload 2");
+    let sealed_2: Vec<alloy_primitives::B256> = payload_2
+        .block()
+        .body()
+        .transactions()
+        .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
+        .collect();
+    assert!(
+        !sealed_2.contains(&tx2_hash),
+        "tx reported as rejected must not land in the next slot without a new submission; \
+         sealed={sealed_2:?}",
+    );
+    assert!(
+        reth_transaction_pool::TransactionPool::get(&node.inner.pool, &tx2_hash).is_none(),
+        "re-terminalizing the revived entry must also evict {tx2_hash:?} from the pool",
     );
 }
 
