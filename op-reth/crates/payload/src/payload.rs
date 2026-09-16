@@ -673,8 +673,11 @@ where
 mod tests {
     use super::*;
     use crate::OpPayloadAttributes;
-    use alloy_primitives::{FixedBytes, address, b256, bytes};
+    use alloy_consensus::BlockBody;
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{FixedBytes, TxKind, address, b256, bytes};
     use alloy_rpc_types_engine::PayloadAttributes;
+    use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
     use reth_optimism_primitives::OpTransactionSigned;
     use reth_payload_primitives::EngineApiMessageVersion;
     use std::str::FromStr;
@@ -807,5 +810,98 @@ mod tests {
             };
         let extra_data = attributes.get_jovian_extra_data(BaseFeeParams::new(80, 60));
         assert_eq!(extra_data.unwrap_err(), EIP1559ParamError::MinBaseFeeNotSet);
+    }
+
+    // [MANTLE] Regression coverage for deposits whose BVM_ETH `ethTxValue` exceeds `u128::MAX`.
+    //
+    // `OptimismPortal.depositTransaction` takes `_ethTxValue` as an unbounded `uint256` and, unlike
+    // `_mntValue`/`msg.value`, charges nothing for it, so any address can post a deposit above
+    // `2^128` for the price of one L1 transaction. While the field was `Option<u128>`, `alloy_rlp`
+    // failed such a deposit with `Error::Overflow` instead of truncating it. Deposits are mandatory,
+    // so neither side could skip the transaction: the sequencer never got past building attributes
+    // and the verifier rejected the payload, both permanently. op-geth decodes the same deposit into
+    // a `*big.Int` and only fails it at execution time, so the node kept producing blocks.
+
+    fn deposit_with_eth_tx_value(eth_tx_value: U256) -> OpTransactionSigned {
+        TxDeposit {
+            source_hash: B256::ZERO,
+            from: Address::ZERO,
+            to: TxKind::Call(Address::ZERO),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            eth_value: U256::ZERO,
+            input: Bytes::new(),
+            eth_tx_value: Some(eth_tx_value),
+        }
+        .into()
+    }
+
+    fn decoded_eth_tx_value(tx: &OpTransactionSigned) -> Option<U256> {
+        match tx {
+            OpTxEnvelope::Deposit(deposit) => deposit.eth_tx_value,
+            other => panic!("expected a deposit transaction, got {other:?}"),
+        }
+    }
+
+    /// Sequencer side: `OpPayloadBuilderAttributes::try_new` decodes the sequencer transactions
+    /// op-node hands to `engine_forkchoiceUpdated`. A decode error here aborts the build, so an
+    /// oversized `ethTxValue` used to stop block production entirely.
+    #[test]
+    fn payload_attributes_accept_deposit_with_eth_tx_value_above_u128() {
+        let eth_tx_value = U256::from(1u8) << 128;
+        let encoded = deposit_with_eth_tx_value(eth_tx_value).encoded_2718();
+
+        let attributes = OpPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 1_728_933_301,
+                prev_randao: B256::ZERO,
+                suggested_fee_recipient: Address::ZERO,
+                withdrawals: Some(vec![]),
+                parent_beacon_block_root: Some(B256::ZERO),
+                slot_number: None,
+            },
+            transactions: Some(vec![encoded.into()]),
+            no_tx_pool: None,
+            gas_limit: Some(30_000_000),
+            eip_1559_params: None,
+            min_base_fee: None,
+        };
+
+        let built = OpPayloadBuilderAttributes::<OpTransactionSigned>::try_new(
+            B256::ZERO,
+            attributes,
+            EngineApiMessageVersion::V3 as u8,
+        )
+        .expect("attributes must build for a deposit with ethTxValue > u128::MAX");
+
+        assert_eq!(decoded_eth_tx_value(&built.transactions[0].1), Some(eth_tx_value));
+    }
+
+    /// Verifier side: `engine_newPayload` turns the payload into a block through
+    /// `try_into_block_with_sidecar`, which is the first thing
+    /// [`crate::validator::ensure_well_formed_payload`] calls. A decode error there surfaces as
+    /// `Invalid`, and since op-node re-derives the same L1 block forever, the node never recovers.
+    #[test]
+    fn engine_payload_decodes_deposit_with_eth_tx_value_above_u128() {
+        let eth_tx_value = U256::from(1u8) << 128;
+        let block = Block {
+            header: alloy_consensus::Header::default(),
+            body: BlockBody {
+                transactions: vec![deposit_with_eth_tx_value(eth_tx_value)],
+                ommers: vec![],
+                withdrawals: Some(Default::default()),
+            },
+        };
+
+        let OpExecutionData { payload, sidecar } =
+            OpExecutionData::v3(ExecutionPayloadV3::from_block_slow(&block), vec![], B256::ZERO);
+
+        let decoded: Block<OpTransactionSigned> = payload
+            .try_into_block_with_sidecar(&sidecar)
+            .expect("newPayload must decode a deposit with ethTxValue > u128::MAX");
+
+        assert_eq!(decoded_eth_tx_value(&decoded.body.transactions[0]), Some(eth_tx_value));
     }
 }
