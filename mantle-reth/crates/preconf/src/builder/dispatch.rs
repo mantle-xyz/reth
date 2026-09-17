@@ -5,7 +5,9 @@
 //! one hash at a time. Four invariants are enforced for every hash:
 //!
 //! - **Dedup**: a hash already in `committed` or `excluded` is short-circuited before any fifo /
-//!   EVM work.
+//!   EVM work; a non-`Timeout` `excluded` hash is also re-terminalized so it never stays a dispatch
+//!   candidate. (A `Timeout` exclusion is instead cleared and re-evaluated — see
+//!   `apply_one_preconf`.)
 //! - **Status gate**: only `Waiting` entries proceed; terminal entries are recorded as excluded and
 //!   skipped.
 //! - **Pre-apply deadline**: when `entry.inserted_at.elapsed() + safety_margin >= preconf_timeout`,
@@ -267,8 +269,12 @@ where
             trace!(
                 target: "mantle::preconf::dispatch",
                 ?hash, ?reason,
-                "dedup hit; forwarding prior rejection to any pending responder"
+                "dedup hit; re-terminalizing and forwarding prior rejection to any pending responder"
             );
+            // A same-slot resubmit may have revived the entry to `Waiting`;
+            // re-terminalize so the next build's carryover cannot pick up a
+            // hash we just reported as rejected. No-op if still terminal.
+            let _ = fifo.mark_canceled(&hash).await;
             fifo.cancel_responder(&hash, reason).await;
             return Ok(());
         }
@@ -782,6 +788,70 @@ mod tests {
         // Fifo entry transitioned to Failed (not Success).
         let entry = fifo.find_by_hash(&hash).await.unwrap();
         assert_eq!(entry.status, PreconfStatus::Failed);
+    }
+
+    /// Counterpart to `dedup_timeout_re_evaluates_gate_on_fresh_inserted_at`
+    /// for the non-`Timeout` dedup branch: a same-slot resubmit revives the
+    /// entry to `Waiting`, then the dedup gate forwards the stored rejection.
+    ///
+    /// Locks the "excluded ⇒ not `Waiting`" invariant. Leaving it `Waiting`
+    /// would let `replay_fifo_carryover` dispatch — and land on chain — a
+    /// hash the client was already told had been rejected.
+    #[tokio::test]
+    async fn dedup_non_timeout_exclusion_reterminalizes_revived_entry() {
+        use std::time::Instant;
+
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x66);
+        let hash = *tx.tx_hash();
+
+        // Step 1 — first submission, rejected by the builder.
+        let (resp_tx1, resp_rx1) = oneshot::channel();
+        fifo.attach_responder(hash, Instant::now(), resp_tx1).await.unwrap();
+        fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await;
+
+        let mut state = LoopState::new(1);
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err).await.unwrap();
+
+        let err1 = resp_rx1.await.expect("responder closed").expect_err("must be Err");
+        assert!(matches!(err1, PreconfError::BuilderRejected(_)));
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.unwrap().status,
+            PreconfStatus::Failed,
+            "a builder rejection must drive the entry to a terminal state",
+        );
+
+        // Step 2 — same-hash resubmit: fresh responder, then revive.
+        let (resp_tx2, resp_rx2) = oneshot::channel();
+        fifo.attach_responder(hash, Instant::now(), resp_tx2).await.unwrap();
+        assert_eq!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Revived,
+        );
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.unwrap().status,
+            PreconfStatus::Waiting,
+            "revive must flip status back to Waiting",
+        );
+
+        // Step 3 — dedup forwards the stored rejection without re-applying.
+        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err).await.unwrap();
+
+        let err2 = resp_rx2.await.expect("responder closed").expect_err("must be Err");
+        assert!(
+            matches!(err2, PreconfError::BuilderRejected(_)),
+            "the resubmitting client is told the tx was rejected",
+        );
+        assert_eq!(state.committed_len(), 0, "apply closure must not be called a second time");
+        assert_eq!(state.excluded_len(), 1, "`record_excluded` must keep the first reason");
+
+        // `Canceled`, not `Failed`: this dispatch returned before `apply_fn`.
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.unwrap().status,
+            PreconfStatus::Canceled,
+            "entry whose rejection was reported to the client must not stay dispatchable",
+        );
     }
 
     /// A FATAL apply error (DB / header / fatal precompile) must abort the
