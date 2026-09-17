@@ -153,6 +153,14 @@ impl LoopState {
         self.committed.contains(hash)
     }
 
+    /// `true` iff this build already reached a **binding** verdict on `hash`.
+    /// A stored `Timeout` is not one: the dedup gate below re-evaluates it
+    /// against the refreshed `inserted_at`, so its admission must be re-run too.
+    pub(super) fn is_decided(&self, hash: &TxHash) -> bool {
+        self.committed.contains(hash) ||
+            self.excluded.get(hash).is_some_and(|r| !matches!(r, PreconfError::Timeout { .. }))
+    }
+
     /// If `hash` was previously excluded in this loop instance, return
     /// the stored rejection reason. `None` when the hash is either
     /// unseen or was committed. Callers forward the returned error to
@@ -516,6 +524,27 @@ mod tests {
     }
 
     // ============ LoopState::blocked_senders (same-sender cascade) ============
+
+    /// `is_decided` gates `admit_and_dispatch`'s skip of the admission gates:
+    /// committed and binding exclusions skip them, a stored `Timeout` must not
+    /// (the dedup gate re-evaluates it, so its admission has to be re-run).
+    #[test]
+    fn is_decided_holds_for_committed_and_binding_exclusions_only() {
+        let mut st = LoopState::new(1);
+        let committed = TxHash::from([1u8; 32]);
+        let rejected = TxHash::from([2u8; 32]);
+        let timed_out = TxHash::from([3u8; 32]);
+
+        assert!(!st.is_decided(&committed), "unseen hash");
+
+        st.record_committed(committed);
+        st.record_excluded(rejected, PreconfError::BuilderRejected("nope".into()));
+        st.record_excluded(timed_out, PreconfError::Timeout { timeout_ms: 400 });
+
+        assert!(st.is_decided(&committed));
+        assert!(st.is_decided(&rejected));
+        assert!(!st.is_decided(&timed_out), "a stale Timeout is re-evaluated, not binding");
+    }
 
     /// Blocking a sender at nonce `n0` makes every same-sender entry at
     /// `nonce ≥ n0` inherit the kind; lower nonces (predecessors) and other
