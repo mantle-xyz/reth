@@ -40,10 +40,10 @@ use std::{
 
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, Bytes, TxHash};
+use alloy_primitives::{Address, B256, Bytes, TxHash};
 use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
@@ -179,9 +179,14 @@ pub enum JournalError {
 /// (rotation). All writes serialise through an async `Mutex` around the file
 /// handle.
 ///
-/// It holds **no** view of which commitments are still owed (see the module
-/// docs); that decision reaches rotation through the `retain` predicate
+/// It holds **no** view of which preconf commitments are still owed (see the
+/// module docs); that decision reaches rotation through the `retain` predicate
 /// [`Self::rotate`] takes.
+///
+/// It does hold an index of pool transactions announced in a flashblock and not
+/// yet seen on chain (see [`crate::unlanded::Unlanded`]) — but the judgement is
+/// still the caller's: the chain nonces the sweep runs on are read by the build
+/// and handed in. This type never reads the chain.
 #[derive(Debug)]
 pub struct PreconfJournal {
     /// Path to the journal file. Stored for rotation, which writes a
@@ -217,6 +222,10 @@ pub struct PreconfJournal {
     pending: SyncMutex<VecDeque<Vec<u8>>>,
     /// Running size of `pending`, so the byte fuse costs no walk.
     pending_bytes: AtomicUsize,
+    /// What this node announced in a flashblock and has not yet seen on chain.
+    /// See [`crate::unlanded::Unlanded`] — the journal owns it because every
+    /// component that needs it already holds the journal.
+    unlanded: crate::unlanded::Unlanded,
 }
 
 impl PreconfJournal {
@@ -252,6 +261,7 @@ impl PreconfJournal {
             rotate_notify: Notify::new(),
             pending: SyncMutex::new(VecDeque::new()),
             pending_bytes: AtomicUsize::new(0),
+            unlanded: crate::unlanded::Unlanded::new(),
         };
         // Nothing in memory to seed from the file: recognising a post-restart
         // commitment as ours is `restore_preconf_state`'s job.
@@ -275,6 +285,56 @@ impl PreconfJournal {
     /// is how they stop being.
     pub async fn append_promised(&self, entry: &JournalEntry) -> Result<(), JournalError> {
         self.append_batch(std::slice::from_ref(entry)).await
+    }
+
+    /// Record what a slice announced. See [`Unlanded::note_announced`].
+    ///
+    /// [`Unlanded::note_announced`]: crate::unlanded::Unlanded::note_announced
+    pub fn note_announced(&self, height: u64, txs: &[crate::unlanded::Announced]) {
+        self.unlanded.note_announced(height, txs);
+    }
+
+    /// Record the block this build sealed. See [`Unlanded::note_sealed`].
+    ///
+    /// [`Unlanded::note_sealed`]: crate::unlanded::Unlanded::note_sealed
+    pub fn note_sealed(&self, block: B256) {
+        self.unlanded.note_sealed(block);
+    }
+
+    /// Whether the chain built on the block this node last sealed.
+    /// See [`Unlanded::parent_is_ours`].
+    ///
+    /// [`Unlanded::parent_is_ours`]: crate::unlanded::Unlanded::parent_is_ours
+    pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
+        self.unlanded.parent_is_ours(parent_hash)
+    }
+
+    /// Drop everything staged. See [`Unlanded::clear`].
+    ///
+    /// [`Unlanded::clear`]: crate::unlanded::Unlanded::clear
+    pub fn clear_unlanded(&self) {
+        self.unlanded.clear();
+    }
+
+    /// Whether anything is staged. See [`Unlanded::is_empty`].
+    ///
+    /// [`Unlanded::is_empty`]: crate::unlanded::Unlanded::is_empty
+    pub fn unlanded_is_empty(&self) -> bool {
+        self.unlanded.is_empty()
+    }
+
+    /// Every distinct staged sender. See [`Unlanded::senders`].
+    ///
+    /// [`Unlanded::senders`]: crate::unlanded::Unlanded::senders
+    pub fn unlanded_senders(&self) -> HashSet<Address> {
+        self.unlanded.senders()
+    }
+
+    /// Take what the chain has not passed. See [`Unlanded::take_unlanded`].
+    ///
+    /// [`Unlanded::take_unlanded`]: crate::unlanded::Unlanded::take_unlanded
+    pub fn take_unlanded(&self, heads: &HashMap<Address, u64>) -> Vec<crate::unlanded::UnlandedTx> {
+        self.unlanded.take_unlanded(heads)
     }
 
     /// Append many records under one lock, with a single write and a single
@@ -1551,6 +1611,7 @@ mod tests {
             rotate_notify: Notify::new(),
             pending: SyncMutex::new(VecDeque::new()),
             pending_bytes: AtomicUsize::new(0),
+            unlanded: crate::unlanded::Unlanded::new(),
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());

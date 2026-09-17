@@ -7,11 +7,12 @@ use std::{
 };
 
 use alloy_consensus::transaction::Recovered;
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::Address;
 use reth_optimism_payload_builder::builder::ExecutionInfo as OpExecutionInfo;
 use reth_primitives_traits::SignedTransaction;
 
-use crate::journal::JournalEntry;
+use crate::{journal::JournalEntry, unlanded::Announced};
 
 /// The upstream execution counters, plus what slicing a block needs on top.
 ///
@@ -96,8 +97,9 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
         &self.executed
     }
 
-    /// The journal records for everything executed since the last call, and
-    /// moves past them in the same step.
+    /// Everything executed since the last call, projected twice — once as
+    /// journal records and once as what the unlanded index needs — and moves
+    /// past them in the same step.
     ///
     /// One operation rather than a read and an advance, because there is no
     /// correct way to do one without the other: records left behind are written
@@ -106,28 +108,38 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
     /// carries it forward — so a record leaves here exactly once, whether or not
     /// the disk took it.
     ///
+    /// Both projections come out of one call for that same reason: the cursor
+    /// may only advance once, so taking them separately would either announce a
+    /// transaction the journal skipped or journal one the index never saw.
+    ///
+    /// The index projection carries the signer and nonce alongside the encoding
+    /// because the sweep that reads them runs at the start of every build,
+    /// healthy ones included — decoding there, let alone ec-recovering, would
+    /// put a block's worth of work on a path that usually has nothing to do.
+    ///
     /// Separate from the publish cursor because the two diverge: a slice dropped
     /// by the cancel guard was handed over all the same.
-    pub fn take_journal_records(&mut self, block_height: u64) -> Vec<JournalEntry> {
-        let records = self.journalable[self.journaled_upto..]
+    pub fn take_journal_records(
+        &mut self,
+        block_height: u64,
+    ) -> (Vec<JournalEntry>, Vec<Announced>) {
+        let taken = &self.journalable[self.journaled_upto..];
+        let records: Vec<JournalEntry> = taken
             .iter()
             .map(|&at| {
                 let tx = &self.executed[at];
                 JournalEntry::for_executed(*tx.tx_hash(), tx, block_height)
             })
             .collect();
+        let announced: Vec<Announced> = taken
+            .iter()
+            .map(|&at| {
+                let tx = &self.executed[at];
+                (*tx.tx_hash(), tx.encoded_2718().into(), tx.signer(), tx.nonce())
+            })
+            .collect();
         self.journaled_upto = self.journalable.len();
-        records
-    }
-
-    /// Everything executed that came from the pool, in execution order.
-    ///
-    /// The same set the journal records, for the same reason: these are the
-    /// transactions no other mechanism brings back. Deposits arrive with the
-    /// attributes, a preconf commitment is held by the fifo, and the
-    /// post-execution transaction is the executor's own.
-    pub fn from_the_pool(&self) -> impl Iterator<Item = &Recovered<T>> {
-        self.journalable.iter().map(|&at| &self.executed[at])
+        (records, announced)
     }
 
     /// The highest nonce executed this block per sender.
@@ -273,12 +285,34 @@ mod tests {
         info.record_journalable(tx(sender(0xbb), 1));
         info.record(tx(sender(0xcc), 2));
 
-        let records = info.take_journal_records(7);
+        let (records, _) = info.take_journal_records(7);
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].hash, *info.executed()[1].tx_hash());
         assert_eq!(records[0].block_height, 7);
         assert_eq!(info.executed().len(), 3, "all three still executed, in order");
+    }
+
+    /// The two projections describe the same transactions. They are taken
+    /// together so that they cannot diverge, and this is what "the same set"
+    /// means: one announcement per record, carrying the signer and nonce the
+    /// sweep compares against the chain without decoding anything.
+    #[test]
+    fn the_index_projection_describes_the_same_transactions_as_the_records() {
+        let mut info = Info::default();
+        info.record(tx(sender(0xaa), 0));
+        info.record_journalable(tx(sender(0xbb), 1));
+        info.record_journalable(tx(sender(0xcc), 2));
+
+        let (records, announced) = info.take_journal_records(7);
+
+        assert_eq!(announced.len(), records.len());
+        let hashes: Vec<_> = announced.iter().map(|(hash, ..)| *hash).collect();
+        assert_eq!(hashes, records.iter().map(|r| r.hash).collect::<Vec<_>>());
+        assert_eq!(announced[0].2, sender(0xbb), "the signer, not re-derived");
+        assert_eq!(announced[0].3, 1);
+        assert_eq!(announced[1].2, sender(0xcc));
+        assert_eq!(announced[1].3, 2);
     }
 
     /// The journal cursor tracks what has been handed over, the publish cursor
@@ -291,9 +325,9 @@ mod tests {
         info.record_journalable(tx(sender(0xaa), 0));
 
         // The slice was journaled, then dropped before it went out.
-        assert_eq!(info.take_journal_records(7).len(), 1);
+        assert_eq!(info.take_journal_records(7).0.len(), 1);
 
-        assert!(info.take_journal_records(7).is_empty(), "already handed over");
+        assert!(info.take_journal_records(7).0.is_empty(), "already handed over");
         assert_eq!(info.pending_slice().len(), 1, "but never published");
     }
 
@@ -306,7 +340,7 @@ mod tests {
         info.record_journalable(tx(sender(0xaa), 1));
         info.record_journalable(tx(sender(0xaa), 2));
 
-        let taken: Vec<_> = info.take_journal_records(7).iter().map(|r| r.hash).collect();
+        let taken: Vec<_> = info.take_journal_records(7).0.iter().map(|r| r.hash).collect();
         let expected: Vec<_> = info.executed()[2..].iter().map(|tx| *tx.tx_hash()).collect();
 
         assert_eq!(taken, expected, "in execution order, and only the new ones");

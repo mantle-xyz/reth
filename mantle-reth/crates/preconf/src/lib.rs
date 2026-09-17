@@ -25,6 +25,7 @@ pub mod preconf_tx_set;
 pub mod rpc;
 pub mod service_builder;
 pub mod types;
+pub mod unlanded;
 pub mod whitelist;
 
 pub use builder::{
@@ -53,6 +54,7 @@ pub use preconf_tx_set::{PreconfTxSet, TxEntry};
 pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
 pub use types::{AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult};
+pub use unlanded::{Announced, UNLANDED_CAP, Unlanded, UnlandedTx};
 pub use whitelist::{
     EXPECTED_LAYOUT_VERSION, FROM_WILDCARDS_SLOT, LAYOUT_VERSION_SLOT, PAIRS_SLOT,
     TO_WILDCARDS_SLOT, WHITELIST_UPDATED_TOPIC0, WhitelistError, bootstrap_whitelist,
