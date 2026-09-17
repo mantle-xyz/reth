@@ -58,7 +58,7 @@ use crate::{
     PreconfConfig, PreconfTxSet,
     apply::{ApplyError, apply_preconf_tx},
     builder::{cancel::JobCancel, dispatch},
-    types::{PreconfError, PreconfReceipt, PreconfSource},
+    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
 // Replicated from upstream private helper
@@ -386,6 +386,9 @@ where
 /// "execute an admitted tx + record result".
 ///
 /// Decision:
+/// - **already decided** (dedup hit, or entry no longer `Waiting`): skip the gates and let
+///   [`dispatch::apply_one_preconf`] restate the verdict. Re-gating a hash this build already
+///   committed would poison `blocked_senders` at a nonce that in fact landed.
 /// - **same-sender cascade** (Replay only): if a lower-nonce entry from this sender was already
 ///   deferred / rejected this slot, inherit that outcome (a successor cannot land before its
 ///   predecessor). Prevents a deferred tx1's successor tx2 from being admitted and then
@@ -413,9 +416,19 @@ where
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
+    let status = entry.status;
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     drop(entry);
+
+    // (0) Already decided — a duplicate event (carryover / broadcast overlap, a
+    // `Lagged` re-scan) or a terminal entry. Skip the gates and let the dedup +
+    // status gates in `apply_one_preconf` own the verdict; see the fn docs.
+    if loop_state.is_decided(&hash) || status != PreconfStatus::Waiting {
+        let mut apply_fn =
+            |tx, h, height| apply_preconf_with_da::<N, _>(builder, info, limits, tx, h, height);
+        return dispatch::apply_one_preconf(fifo, cfg, hash, loop_state, &mut apply_fn).await;
+    }
 
     // (1) Same-sender cascade — Replay entries only. A successor inherits the
     // predecessor's non-admission outcome; it cannot execute before the
@@ -536,7 +549,6 @@ where
 /// later. Returning the hash list (rather than applying inline) keeps this
 /// helper free of EVM/builder types and unit-testable.
 async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
-    use crate::types::PreconfStatus;
     let mut carryover_hashes = Vec::new();
     for view in fifo.entries().await {
         match view.status {
