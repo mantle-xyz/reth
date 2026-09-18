@@ -11,6 +11,11 @@ use alloy_op_hardforks::{
 use reth_primitives_traits::sync::LazyLock;
 
 /// The Mantle Sepolia spec with hardcoded Mantle hardfork timestamps.
+///
+/// Its genesis header is the synthetic block zero used to identify databases created by Mantle's
+/// supported mid-chain import workflow, not the public historical block zero. Its raw and sealed
+/// hashes must remain equal and stable: changing this identity makes existing MDBX databases fail
+/// the genesis compatibility check at startup.
 pub static MANTLE_SEPOLIA: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
     let genesis = create_mantle_sepolia_genesis();
     let spec = crate::from_mantle_genesis(genesis);
@@ -41,6 +46,17 @@ mod tests {
     #[test]
     fn verify_mantle_sepolia_chain_id() {
         assert_eq!(MANTLE_SEPOLIA.chain.id(), 5003);
+    }
+
+    #[test]
+    fn verify_mantle_sepolia_genesis_raw_hash() {
+        let expected = alloy_primitives::b256!(
+            "0x9b0514e8b74666bb9dbc9cc5dca2d74b412b0bf5e10ac69de8d017f50598b48d"
+        );
+        let header = MANTLE_SEPOLIA.genesis_header();
+
+        assert_eq!(header.hash_slow(), expected);
+        assert_eq!(MANTLE_SEPOLIA.genesis_hash(), expected);
     }
 
     #[test]
