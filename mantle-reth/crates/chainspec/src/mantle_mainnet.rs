@@ -14,6 +14,11 @@ const MANTLE_MAINNET_GENESIS_HASH: alloy_primitives::B256 =
     alloy_primitives::b256!("0xcd3253817bbf6ae83c9839c362a0688a83d59d2fabeb9463b348cc98c4b056aa");
 
 /// The Mantle Mainnet spec with hardcoded Mantle hardfork timestamps.
+///
+/// Its genesis header is the synthetic block zero used to identify databases created by Mantle's
+/// supported mid-chain import workflow, not the public historical block zero. Its raw and sealed
+/// hashes must remain equal and stable: changing this identity makes existing MDBX databases fail
+/// the genesis compatibility check at startup.
 pub static MANTLE_MAINNET: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
     let genesis = create_mantle_mainnet_genesis();
     let mut spec = crate::from_mantle_genesis(genesis);
@@ -51,15 +56,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_mantle_mainnet_genesis_hash() {
+    fn verify_mantle_mainnet_genesis_raw_hash() {
         let header = MANTLE_MAINNET.genesis_header();
-        assert_eq!(
-            MANTLE_MAINNET.genesis_hash(),
-            alloy_primitives::b256!(
-                "0xcd3253817bbf6ae83c9839c362a0688a83d59d2fabeb9463b348cc98c4b056aa"
-            )
-        );
-        let _ = header;
+        assert_eq!(header.hash_slow(), MANTLE_MAINNET_GENESIS_HASH);
+        assert_eq!(MANTLE_MAINNET.genesis_hash(), MANTLE_MAINNET_GENESIS_HASH);
     }
 
     #[test]
