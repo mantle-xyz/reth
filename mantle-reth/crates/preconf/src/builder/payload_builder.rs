@@ -58,7 +58,7 @@ use crate::{
     PreconfConfig, PreconfTxSet,
     apply::{ApplyError, apply_preconf_tx},
     builder::{cancel::JobCancel, dispatch},
-    types::{PreconfError, PreconfReceipt, PreconfSource},
+    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
 // Replicated from upstream private helper
@@ -378,6 +378,19 @@ where
     Ok(receipt)
 }
 
+/// Whether the admission gates still have a question to answer for `hash`: only
+/// a live fifo entry that this build has not already applied. Anything else was
+/// settled elsewhere — by a prior apply, or by whoever drove the entry terminal.
+///
+/// Load-bearing because the gates are not pure: `Defer` / `Reject` write
+/// [`dispatch::LoopState::block_sender`], so a verdict derived for a settled
+/// hash — against a block that has since filled up, with that tx's own gas
+/// counted a second time — would block the sender's chain at a nonce that in
+/// fact landed, and its same-sender successors inherit that.
+fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: PreconfStatus) -> bool {
+    status == PreconfStatus::Waiting && !loop_state.is_committed(hash)
+}
+
 /// Block-capacity admission + same-sender cascade for a single preconf hash,
 /// run **before** dispatching to [`dispatch::apply_one_preconf`] (which drives
 /// the [`PreconfTxSet`] entry status machine). This is the one funnel all
@@ -413,9 +426,17 @@ where
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
+    let status = entry.status;
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     drop(entry);
+
+    // (0) Nothing left to admit — see [`needs_admission`]. Duplicate events are
+    // routine (carryover overlaps the broadcast arm, a `Lagged` re-scan replays
+    // the whole snapshot), and re-gating on one is what poisons `blocked_senders`.
+    if !needs_admission(loop_state, &hash, status) {
+        return Ok(());
+    }
 
     // (1) Same-sender cascade — Replay entries only. A successor inherits the
     // predecessor's non-admission outcome; it cannot execute before the
@@ -438,12 +459,6 @@ where
                 // gap) — never handed to the builder, so `Canceled`, not
                 // `Failed`.
                 let _ = fifo.mark_canceled(&hash).await;
-                loop_state.record_excluded(
-                    hash,
-                    PreconfError::BuilderRejected(
-                        "preconf predecessor from same sender rejected (nonce gap)".into(),
-                    ),
-                );
                 return Ok(());
             }
         }
@@ -480,9 +495,8 @@ where
             // and rejected it).
             let _ = fifo.mark_canceled(&hash).await;
             if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Err(e.clone()));
+                let _ = resp.send(Err(e));
             }
-            loop_state.record_excluded(hash, e);
         }
     }
     Ok(())
@@ -536,7 +550,6 @@ where
 /// later. Returning the hash list (rather than applying inline) keeps this
 /// helper free of EVM/builder types and unit-testable.
 async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
-    use crate::types::PreconfStatus;
     let mut carryover_hashes = Vec::new();
     for view in fifo.entries().await {
         match view.status {
@@ -1193,6 +1206,39 @@ mod tests {
         let sig = Signature::test_signature();
         let hash = B256::from([byte; 32]);
         Arc::new(TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)))
+    }
+
+    /// The gates run for a live, not-yet-applied entry and for nothing else.
+    /// A duplicate event for a hash this build already applied, or for an entry
+    /// someone drove terminal, must not reach them — their `Defer` / `Reject`
+    /// verdicts write `blocked_senders` and would block the sender's chain at a
+    /// nonce that actually landed.
+    #[test]
+    fn needs_admission_only_for_a_live_unapplied_entry() {
+        let hash = B256::from([1u8; 32]);
+        let mut state = dispatch::LoopState::new(1);
+
+        assert!(
+            needs_admission(&state, &hash, PreconfStatus::Waiting),
+            "a fresh Waiting entry is exactly what the gates are for"
+        );
+        for terminal in [
+            PreconfStatus::Success,
+            PreconfStatus::Failed,
+            PreconfStatus::Timeout,
+            PreconfStatus::Canceled,
+        ] {
+            assert!(
+                !needs_admission(&state, &hash, terminal),
+                "{terminal:?} is settled; the gates have nothing to decide",
+            );
+        }
+
+        state.record_committed(hash);
+        assert!(
+            !needs_admission(&state, &hash, PreconfStatus::Waiting),
+            "already in this block — asking again would double-count its gas",
+        );
     }
 
     /// `replay_fifo_carryover` returns `Waiting` + `Success` hashes (each a
