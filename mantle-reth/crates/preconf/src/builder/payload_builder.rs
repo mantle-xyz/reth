@@ -438,12 +438,6 @@ where
                 // gap) — never handed to the builder, so `Canceled`, not
                 // `Failed`.
                 let _ = fifo.mark_canceled(&hash).await;
-                loop_state.record_excluded(
-                    hash,
-                    PreconfError::BuilderRejected(
-                        "preconf predecessor from same sender rejected (nonce gap)".into(),
-                    ),
-                );
                 return Ok(());
             }
         }
@@ -480,9 +474,8 @@ where
             // and rejected it).
             let _ = fifo.mark_canceled(&hash).await;
             if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Err(e.clone()));
+                let _ = resp.send(Err(e));
             }
-            loop_state.record_excluded(hash, e);
         }
     }
     Ok(())
