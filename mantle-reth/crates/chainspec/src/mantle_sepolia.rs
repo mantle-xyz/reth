@@ -16,6 +16,11 @@ use reth_primitives_traits::sync::LazyLock;
 /// supported mid-chain import workflow, not the public historical block zero. Its raw and sealed
 /// hashes must remain equal and stable: changing this identity makes existing MDBX databases fail
 /// the genesis compatibility check at startup.
+///
+/// This identity does not drive historical block derivation. `init-state --without-evm` inserts a
+/// supplied post-Skadi anchor header and state, filling earlier heights only for storage
+/// continuity, and `import-op` imports subsequent blocks directly. Those imported blocks therefore
+/// do not depend on this synthetic header matching Mantle's public historical block zero.
 pub static MANTLE_SEPOLIA: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
     let genesis = create_mantle_sepolia_genesis();
     let spec = crate::from_mantle_genesis(genesis);
