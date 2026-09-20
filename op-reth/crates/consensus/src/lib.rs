@@ -20,9 +20,9 @@ use core::fmt::Debug;
 use reth_chainspec::EthChainSpec;
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_consensus_common::validation::{
-    validate_against_parent_eip1559_base_fee, validate_against_parent_hash_number,
-    validate_against_parent_timestamp, validate_cancun_gas, validate_header_base_fee,
-    validate_header_extra_data, validate_header_gas,
+    MAX_RLP_BLOCK_SIZE, validate_against_parent_eip1559_base_fee,
+    validate_against_parent_hash_number, validate_against_parent_timestamp, validate_cancun_gas,
+    validate_header_base_fee, validate_header_extra_data, validate_header_gas,
 };
 use reth_execution_types::BlockExecutionResult;
 use reth_optimism_forks::OpHardforks;
@@ -105,6 +105,20 @@ where
     }
 
     fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), ConsensusError> {
+        // Upstream OP Stack disables EIP-7934, but Mantle activates the rule with Limb/Osaka to
+        // match Mantle op-geth consensus.
+        if self.chain_spec.is_mantle() &&
+            self.chain_spec.is_osaka_active_at_timestamp(block.timestamp())
+        {
+            let rlp_length = block.rlp_length();
+            if rlp_length > MAX_RLP_BLOCK_SIZE {
+                return Err(ConsensusError::BlockTooLarge {
+                    rlp_length,
+                    max_rlp_length: MAX_RLP_BLOCK_SIZE,
+                });
+            }
+        }
+
         // Check ommers hash
         let ommers_hash = block.body().calculate_ommers_root();
         if Some(block.ommers_hash()) != ommers_hash {
@@ -268,6 +282,10 @@ mod tests {
     use crate::OpBeaconConsensus;
 
     fn mock_tx(nonce: u64) -> OpTransactionSigned {
+        mock_tx_with_input(nonce, Bytes::from(vec![1, 2]))
+    }
+
+    fn mock_tx_with_input(nonce: u64, input: Bytes) -> OpTransactionSigned {
         let tx = TxEip7702 {
             chain_id: 1u64,
             nonce,
@@ -276,7 +294,7 @@ mod tests {
             gas_limit: 10,
             to: Address::default(),
             value: U256::from(3_u64),
-            input: Bytes::from(vec![1, 2]),
+            input,
             access_list: Default::default(),
             authorization_list: Default::default(),
         };
@@ -284,6 +302,50 @@ mod tests {
         let signature = Signature::new(U256::default(), U256::default(), true);
 
         OpTransactionSigned::new_unhashed(OpTypedTransaction::Eip7702(tx), signature)
+    }
+
+    fn mantle_block_with_input(
+        timestamp: u64,
+        input_len: usize,
+    ) -> SealedBlock<alloy_consensus::Block<OpTransactionSigned>> {
+        let transaction = mock_tx_with_input(0, Bytes::from(vec![0; input_len]));
+        let header = Header {
+            base_fee_per_gas: Some(1_000_000_000),
+            withdrawals_root: Some(proofs::calculate_withdrawals_root(&[])),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            transactions_root: proofs::calculate_transaction_root(std::slice::from_ref(
+                &transaction,
+            )),
+            timestamp,
+            ..Default::default()
+        };
+        let body = BlockBody {
+            transactions: vec![transaction],
+            ommers: vec![],
+            withdrawals: Some(Withdrawals::default()),
+        };
+
+        SealedBlock::seal_slow(alloy_consensus::Block { header, body })
+    }
+
+    fn mantle_block_with_rlp_length(
+        timestamp: u64,
+        target: usize,
+    ) -> SealedBlock<alloy_consensus::Block<OpTransactionSigned>> {
+        let mut input_len = target.saturating_sub(512);
+
+        for _ in 0..16 {
+            let block = mantle_block_with_input(timestamp, input_len);
+            let actual = block.rlp_length();
+            match actual.cmp(&target) {
+                core::cmp::Ordering::Equal => return block,
+                core::cmp::Ordering::Less => input_len += target - actual,
+                core::cmp::Ordering::Greater => input_len -= actual - target,
+            }
+        }
+
+        panic!("failed to construct block with RLP length {target}")
     }
 
     #[test]
@@ -949,5 +1011,68 @@ mod tests {
             unstripped_root, mantle_root,
             "Skadi-only (no Canyon/Arsia) should still strip deposit fields"
         );
+    }
+
+    #[test]
+    fn mantle_block_size_limit_is_inactive_before_limb() {
+        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_LIMB_TIMESTAMP;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let block =
+            mantle_block_with_rlp_length(MANTLE_MAINNET_LIMB_TIMESTAMP - 1, MAX_RLP_BLOCK_SIZE + 1);
+        let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+
+        assert!(consensus.validate_block_pre_execution(&block).is_ok());
+    }
+
+    #[test]
+    fn mantle_block_size_limit_accepts_exact_boundary_after_limb() {
+        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_LIMB_TIMESTAMP;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let block = mantle_block_with_rlp_length(MANTLE_MAINNET_LIMB_TIMESTAMP, MAX_RLP_BLOCK_SIZE);
+        let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+
+        assert!(consensus.validate_block_pre_execution(&block).is_ok());
+    }
+
+    #[test]
+    fn mantle_block_size_limit_rejects_one_byte_over_after_limb() {
+        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_LIMB_TIMESTAMP;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let block =
+            mantle_block_with_rlp_length(MANTLE_MAINNET_LIMB_TIMESTAMP, MAX_RLP_BLOCK_SIZE + 1);
+        let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+
+        assert!(matches!(
+            consensus.validate_block_pre_execution(&block),
+            Err(ConsensusError::BlockTooLarge { rlp_length, max_rlp_length })
+                if rlp_length == MAX_RLP_BLOCK_SIZE + 1 &&
+                    max_rlp_length == MAX_RLP_BLOCK_SIZE
+        ));
+    }
+
+    #[test]
+    fn op_block_size_limit_remains_disabled_after_osaka() {
+        use alloy_hardforks::ForkCondition;
+        use reth_chainspec::EthereumHardfork;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let chain_spec = Arc::new(
+            OpChainSpecBuilder::default()
+                .jovian_activated()
+                .with_fork(EthereumHardfork::Osaka, ForkCondition::Timestamp(0))
+                .genesis(OP_MAINNET.genesis.clone())
+                .chain(OP_MAINNET.chain)
+                .build(),
+        );
+        let block = mantle_block_with_rlp_length(1, MAX_RLP_BLOCK_SIZE + 1);
+        let consensus = OpBeaconConsensus::new(chain_spec);
+
+        assert!(consensus.validate_block_pre_execution(&block).is_ok());
     }
 }
