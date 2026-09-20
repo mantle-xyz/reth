@@ -1063,10 +1063,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             .await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            // Broadcast overflow — re-scan the fifo snapshot and
-                            // run every hash through the admission gate. Dedup
-                            // (loop_state) inside `apply_one_preconf` skips any
-                            // already committed/excluded this build.
+                            // Broadcast overflow — re-scan the fifo snapshot
+                            // and run every hash through the admission gate.
+                            // `needs_admission` absorbs the duplicates: a hash
+                            // this build already committed, or an entry someone
+                            // has already driven terminal. Nothing else is
+                            // remembered per-hash — a revived entry is judged
+                            // afresh.
                             warn!(
                                 target: "mantle::preconf::dispatch",
                                 skipped = n,

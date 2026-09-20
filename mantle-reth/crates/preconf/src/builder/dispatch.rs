@@ -167,8 +167,9 @@ impl LoopState {
 /// closure so this module stays free of EVM-builder generics.
 /// Per call, `apply_fn` is invoked at most once — on success-path
 /// reach. If a dedup / status / deadline / gas-budget guard fires
-/// earlier, `apply_fn` is not called. (The type stays `FnMut` because
-/// [`reconcile_lagged`] reuses the same closure across many hashes.)
+/// earlier, `apply_fn` is not called. (The type stays `FnMut` because the
+/// production closure captures `&mut builder` / `&mut info` — see
+/// `admit_and_dispatch` — and so can never be `Fn`.)
 ///
 /// All terminal paths invoke `take_responder` or `cancel_responder`
 /// exactly once.
@@ -607,11 +608,14 @@ mod tests {
     ///    under `preconf_timeout` the gate does not fire and apply proceeds; the fresh responder
     ///    observes the receipt.
     ///
-    /// Locks the "Timeout is not a stable exclusion" invariant: a
-    /// regression that forwards stored Timeout via `cancel_responder`
+    /// Locks "a terminal status is not a permanent verdict": the rejection
+    /// belongs to the entry, not to the hash, so reviving the entry to
+    /// `Waiting` must put the tx back in front of every gate. A regression
+    /// that kept answering with the stale `Timeout` — by widening the status
+    /// gate, or by re-introducing a per-hash rejection cache in `LoopState` —
     /// would deny service to a legitimately re-eligible tx.
     #[tokio::test]
-    async fn dedup_timeout_re_evaluates_gate_on_fresh_inserted_at() {
+    async fn revived_timeout_re_evaluates_gate_on_fresh_inserted_at() {
         use std::time::Instant;
 
         let cfg = PreconfConfig {
@@ -645,9 +649,9 @@ mod tests {
             "revive must flip status back to Waiting",
         );
 
-        // Step 3: second dispatch. Dedup CLEARS the stale Timeout and
-        // falls through; deadline gate reads fresh inserted_at (< 50ms)
-        // and passes; apply succeeds.
+        // Step 3: second dispatch. The revive already put the status back to
+        // `Waiting`, so the status gate lets it through; the deadline gate then
+        // reads the refreshed inserted_at (< 50ms) and passes; apply succeeds.
         apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "second dispatch must apply successfully");
