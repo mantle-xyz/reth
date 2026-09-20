@@ -5274,6 +5274,7 @@ dependencies = [
  "reth-rpc-eth-api",
  "reth-rpc-server-types",
  "reth-storage-api",
+ "reth-trie-common",
  "serde",
  "serde_json",
  "tracing",

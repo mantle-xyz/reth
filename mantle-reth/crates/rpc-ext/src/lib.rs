@@ -20,8 +20,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{B256, Bytes, TxKind, U256};
-use alloy_rpc_types_eth::{TransactionRequest, state::EvmOverrides};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_rpc_types_eth::{EIP1186AccountProofResponse, TransactionRequest, state::EvmOverrides};
+use alloy_serde::JsonStorageKey;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
@@ -31,13 +32,21 @@ use reth_optimism_forks::OpHardforks;
 use reth_optimism_rpc::SequencerClient;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_rpc_eth_api::{
+    EthApiTypes,
+    FromEthApiError,
     FullEthApiTypes,
-    helpers::{EthBlocks, EthCall, EthFees},
+    helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState},
 };
 use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{
-    BlockIdReader, BlockReaderIdExt, StateProviderBox, StateProviderFactory, errors::ProviderResult,
+    BlockIdReader,
+    BlockReaderIdExt,
+    StateProofProvider,
+    StateProviderBox,
+    StateProviderFactory,
+    errors::ProviderResult,
 };
+use reth_trie_common::AccountProof;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -197,6 +206,28 @@ pub trait MantleEthApiExt {
         payload: serde_json::Value,
         block_number: Option<BlockId>,
     ) -> RpcResult<serde_json::Value>;
+
+    /// Overrides `eth_getProof` to restore geth parity for accounts that do not exist.
+    ///
+    /// Upstream reth (pin `aef8d3ef`, op-reth v2.4.2 anchor) changed the nonexistent-account
+    /// conversion in `AccountProof::into_eip1186_response` to report `KECCAK_EMPTY` /
+    /// `EMPTY_ROOT_HASH`. geth — including op-geth, Mantle's reference client — returns zero
+    /// hashes for such accounts (stable since v1.13.4,
+    /// [go-ethereum#28357](https://github.com/ethereum/go-ethereum/pull/28357)), and so did the
+    /// pre-bump reth pin by accident of defaults. The exclusion-proof shape op-geth clients
+    /// already parse must stay geth's, so this override routes the proof through
+    /// [`AccountProof::into_eip1186_response_with`] with `zero_empty_account = true` (the knob
+    /// upstream added for exactly this case), same as the proofs-history node's `EthApiExt`
+    /// override. Everything else — proof-window enforcement, block-id resolution (pending
+    /// included), off-thread trie walking — delegates to the same helpers the standard
+    /// implementation uses, so responses for existing accounts are identical.
+    #[method(name = "getProof")]
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse>;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -398,6 +429,22 @@ fn first_arsia_boundary_crossing(
     None
 }
 
+/// Converts an [`AccountProof`] into the geth-shaped EIP-1186 response served by
+/// [`MantleEthApiExt::get_proof`].
+///
+/// This is [`AccountProof::into_eip1186_response_with`] with `zero_empty_account = true`:
+/// an account that does not exist reports zero `codeHash`/`storageHash` (geth behavior since
+/// v1.13.4, [go-ethereum#28357](https://github.com/ethereum/go-ethereum/pull/28357)) instead of
+/// `KECCAK_EMPTY`/`EMPTY_ROOT_HASH`, and a lone empty-trie sentinel node collapses to an empty
+/// proof array, matching geth. Responses for existing accounts are identical to the standard
+/// conversion.
+fn into_geth_eip1186_response(
+    proof: AccountProof,
+    slots: Vec<JsonStorageKey>,
+) -> EIP1186AccountProofResponse {
+    proof.into_eip1186_response_with(slots, true)
+}
+
 #[async_trait]
 impl<Provider, EthApi> MantleEthApiExtServer for MantleRpcExt<Provider, EthApi>
 where
@@ -409,7 +456,15 @@ where
         + Send
         + Sync
         + 'static,
-    EthApi: EthBlocks + EthCall + EthFees + FullEthApiTypes + Send + Sync + 'static,
+    EthApi: EthBlocks
+        + EthCall
+        + EthFees
+        + EthApiSpec
+        + EthState
+        + FullEthApiTypes
+        + Send
+        + Sync
+        + 'static,
     // Lets `eth_simulateV1` surface the standard implementation's error verbatim, preserving the
     // spec-defined codes (-38010..-38026) instead of collapsing them into a generic -32000.
     ErrorObject<'static>: From<EthApi::Error>,
@@ -518,6 +573,34 @@ where
         blocks.push(end_value);
 
         Ok(blocks)
+    }
+
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse> {
+        // Mirrors the standard `eth_getProof` (`reth_rpc_eth_api::helpers::EthState::get_proof`)
+        // up to the final conversion, so only the nonexistent-account shape differs: `None`
+        // block id means latest, the proof window is enforced with the standard errors, state
+        // resolves through the standard helpers (pending included), and the trie walk is
+        // offloaded to the blocking pool.
+        let block_id = block_number.unwrap_or_default();
+        EthState::ensure_within_proof_window(self.eth_api(), block_id)
+            .map_err(ErrorObject::from)?;
+
+        self.eth_api()
+            .spawn_blocking_io_fut(async move |eth_api| {
+                let state = eth_api.state_at_block_id(block_id).await?;
+                let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
+                let proof = state
+                    .proof(Default::default(), address, &storage_keys)
+                    .map_err(<EthApi as EthApiTypes>::Error::from_eth_err)?;
+                Ok(into_geth_eip1186_response(proof, keys))
+            })
+            .await
+            .map_err(ErrorObject::from)
     }
 
     async fn send_raw_transaction_with_preconf(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
@@ -810,6 +893,81 @@ fn build_unsigned_tx_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::constants::KECCAK_EMPTY;
+    use reth_primitives_traits::Account;
+    use reth_trie_common::EMPTY_ROOT_HASH;
+
+    // ─── eth_getProof geth-parity conversion ─────────────────────────────
+
+    #[test]
+    fn get_proof_nonexistent_account_is_zeroed_geth_shape() {
+        // A missing account must come back as geth shapes it: zero codeHash/storageHash (not
+        // KECCAK_EMPTY/EMPTY_ROOT_HASH), zero balance/nonce, and an empty proof array — the
+        // lone `0x80` empty-trie sentinel node must be stripped.
+        let proof = AccountProof {
+            address: Address::new([0x12; 20]),
+            info: None,
+            proof: vec![Bytes::from_static(&[0x80])],
+            storage_root: EMPTY_ROOT_HASH,
+            storage_proofs: vec![],
+        };
+        let resp = into_geth_eip1186_response(proof, vec![]);
+        assert_eq!(resp.address, Address::new([0x12; 20]));
+        assert_eq!(resp.code_hash, B256::ZERO);
+        assert_eq!(resp.storage_hash, B256::ZERO);
+        assert_eq!(resp.balance, U256::ZERO);
+        assert_eq!(resp.nonce, 0);
+        assert!(
+            resp.account_proof.is_empty(),
+            "empty-trie sentinel must collapse to an empty proof array"
+        );
+        assert!(resp.storage_proof.is_empty());
+    }
+
+    #[test]
+    fn get_proof_existing_account_is_unchanged() {
+        // An existing account keeps its trie values verbatim: the reported codeHash is the
+        // account's bytecode hash, the storageHash is the proof's storage root, and the proof
+        // array is passed through untouched.
+        let code_hash = B256::new([0xab; 32]);
+        let storage_root = B256::new([0xcd; 32]);
+        let account_proof_node = Bytes::from_static(&[0xf2, 0x01, 0x02]);
+        let proof = AccountProof {
+            address: Address::new([0x34; 20]),
+            info: Some(Account {
+                nonce: 7,
+                balance: U256::from(1_337),
+                bytecode_hash: Some(code_hash),
+            }),
+            proof: vec![account_proof_node.clone()],
+            storage_root,
+            storage_proofs: vec![],
+        };
+        let resp = into_geth_eip1186_response(proof, vec![]);
+        assert_eq!(resp.code_hash, code_hash);
+        assert_eq!(resp.storage_hash, storage_root);
+        assert_eq!(resp.nonce, 7);
+        assert_eq!(resp.balance, U256::from(1_337));
+        assert_eq!(resp.account_proof, vec![account_proof_node]);
+    }
+
+    #[test]
+    fn get_proof_existing_eoa_keeps_canonical_hashes() {
+        // An existing account without bytecode is NOT a nonexistent account: geth reports
+        // keccak256("") as its codeHash and the empty-trie root as its storageHash. The
+        // zeroing must only apply to accounts that are missing entirely.
+        let proof = AccountProof {
+            address: Address::new([0x56; 20]),
+            info: Some(Account::default()),
+            proof: vec![Bytes::from_static(&[0xf2, 0x03])],
+            storage_root: EMPTY_ROOT_HASH,
+            storage_proofs: vec![],
+        };
+        let resp = into_geth_eip1186_response(proof, vec![]);
+        assert_eq!(resp.code_hash, KECCAK_EMPTY);
+        assert_eq!(resp.storage_hash, EMPTY_ROOT_HASH);
+        assert_eq!(resp.account_proof, vec![Bytes::from_static(&[0xf2, 0x03])]);
+    }
 
     // ─── gas price selection ────────────────────────────────────────────
 
