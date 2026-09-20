@@ -34,8 +34,8 @@ pub struct ArsiaFundsCheck<'a, C: ?Sized> {
     pub from_balance: U256,
     /// L1 block info (for L1 cost + operator fee).
     pub l1_block_info: &'a L1BlockInfo,
-    /// Transaction input data.
-    pub tx_input: &'a [u8],
+    /// Encoded EIP-2718 proxy transaction used to estimate the L1 data fee.
+    pub tx_envelope: &'a [u8],
     /// Chain spec for hardfork queries.
     pub chain_spec: &'a C,
     /// Block timestamp.
@@ -47,7 +47,7 @@ pub struct ArsiaFundsCheck<'a, C: ?Sized> {
 /// Port of op-geth v1.5.5 `mantleArsiaCheckFunds` (`eth/gasestimator/gasestimator.go`):
 /// - Skips if `fee_cap == 0` (`GasEstimationWithSkipCheckBalanceMode`)
 /// - Skips if Mantle Arsia not active
-/// - L1 fee: `l1_block_info.calculate_tx_l1_cost_for_estimate(input, spec, 80)` (+80 bytes
+/// - L1 fee: `l1_block_info.calculate_tx_l1_cost_for_estimate(envelope, spec, 80)` (+80 bytes
 ///   overhead)
 /// - Operator fee: `gas_limit * scalar * 100 + constant`
 /// - Total: `gas_limit * fee_cap + l1_cost + operator_cost + value`
@@ -67,7 +67,7 @@ pub fn mantle_arsia_check_funds(
 
     // L1 data fee with +80 bytes geth signature overhead
     let l1_cost =
-        check.l1_block_info.calculate_tx_l1_cost_for_estimate(check.tx_input, spec_id, 80);
+        check.l1_block_info.calculate_tx_l1_cost_for_estimate(check.tx_envelope, spec_id, 80);
 
     // Operator fee: gas_limit * scalar * 100 + constant
     let operator_cost = {
@@ -126,7 +126,7 @@ mod tests {
                 value: U256::ZERO,
                 from_balance: U256::ZERO,
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: OP_DEV.as_ref(),
                 timestamp: 0,
             })
@@ -147,7 +147,7 @@ mod tests {
                 value: U256::ZERO,
                 from_balance: U256::ZERO, // zero balance
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: OP_DEV.as_ref(),
                 timestamp: arsia_ts(),
             })
@@ -174,7 +174,7 @@ mod tests {
                 value: U256::ZERO,
                 from_balance: l2_cost, // exactly enough
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: MANTLE_MAINNET.as_ref(),
                 timestamp: arsia_ts(),
             })
@@ -195,7 +195,7 @@ mod tests {
             value: U256::ZERO,
             from_balance: l2_cost - U256::from(1),
             l1_block_info: &info,
-            tx_input: &[],
+            tx_envelope: &[],
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
@@ -220,7 +220,7 @@ mod tests {
             value,
             from_balance: l2_cost, // enough for gas, not for value
             l1_block_info: &info,
-            tx_input: &[],
+            tx_envelope: &[],
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
@@ -234,7 +234,7 @@ mod tests {
                 value,
                 from_balance: total_needed,
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: MANTLE_MAINNET.as_ref(),
                 timestamp: arsia_ts(),
             })
@@ -260,7 +260,7 @@ mod tests {
             value: U256::ZERO,
             from_balance: l2_cost, // not enough — missing operator cost
             l1_block_info: &info,
-            tx_input: &[],
+            tx_envelope: &[],
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
@@ -274,7 +274,7 @@ mod tests {
                 value: U256::ZERO,
                 from_balance: total,
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: MANTLE_MAINNET.as_ref(),
                 timestamp: arsia_ts(),
             })
@@ -283,13 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn check_funds_with_calldata_l1_fee() {
-        // Non-empty input increases L1 data fee.
+    fn check_funds_with_transaction_envelope_l1_fee() {
+        // A non-empty encoded envelope increases the L1 data fee.
         // With empty operator fee, the only extra cost beyond L2 gas is L1 data fee.
         let info = L1BlockInfo::default();
         let fee_cap = U256::from(10_000_000_000u64);
         let l2_cost = U256::from(21_000u64) * fee_cap;
-        let calldata = vec![0xffu8; 256]; // 256 bytes of non-zero calldata
+        let tx_envelope = vec![0xffu8; 256];
 
         // Exact L2 cost as balance — L1 data fee makes it insufficient
         let result = mantle_arsia_check_funds(&ArsiaFundsCheck {
@@ -298,15 +298,15 @@ mod tests {
             value: U256::ZERO,
             from_balance: l2_cost, // only covers L2, not L1 data fee
             l1_block_info: &info,
-            tx_input: &calldata,
+            tx_envelope: &tx_envelope,
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
 
         // Whether this fails depends on L1BlockInfo defaults (base fee = 0 → L1 cost = 0).
         // With default L1BlockInfo, L1 cost is 0, so this should pass.
-        // This test documents the behavior: with zero L1 base fee, calldata doesn't add cost.
-        assert!(result.is_ok(), "with default (zero) L1 base fee, calldata adds no L1 cost");
+        // This test documents the behavior: with zero L1 base fee, envelope bytes add no cost.
+        assert!(result.is_ok(), "with default (zero) L1 base fee, envelope adds no L1 cost");
 
         // Now set a non-zero L1 base fee and token_ratio to make L1 data fee meaningful.
         // Mantle's L1 cost formula requires token_ratio > 0 to produce non-zero L1 fees.
@@ -323,13 +323,13 @@ mod tests {
             value: U256::ZERO,
             from_balance: l2_cost, // only L2 cost — L1 data fee will push it over
             l1_block_info: &info_with_l1_fee,
-            tx_input: &calldata,
+            tx_envelope: &tx_envelope,
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
         // L1 data fee with non-zero L1 base fee and 256 bytes should be significant
         // This should now fail (insufficient funds)
-        assert!(result.is_err(), "with non-zero L1 base fee, calldata should add L1 cost");
+        assert!(result.is_err(), "with non-zero L1 base fee, envelope should add L1 cost");
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
                 // balance exactly covers value + the 1 wei/gas L2 cost (21000 * 1)
                 from_balance: value + U256::from(21_000u64),
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: MANTLE_MAINNET.as_ref(),
                 timestamp: arsia_ts(),
             })
@@ -373,7 +373,7 @@ mod tests {
             value: U256::ZERO,
             from_balance: l2_cost + U256::from(constant) - U256::from(1),
             l1_block_info: &info,
-            tx_input: &[],
+            tx_envelope: &[],
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
@@ -387,7 +387,7 @@ mod tests {
                 value: U256::ZERO,
                 from_balance: l2_cost + U256::from(constant),
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: MANTLE_MAINNET.as_ref(),
                 timestamp: arsia_ts(),
             })
@@ -414,7 +414,7 @@ mod tests {
             value,
             from_balance: total - U256::from(1),
             l1_block_info: &info,
-            tx_input: &[],
+            tx_envelope: &[],
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
@@ -430,7 +430,7 @@ mod tests {
                 value,
                 from_balance: total,
                 l1_block_info: &info,
-                tx_input: &[],
+                tx_envelope: &[],
                 chain_spec: MANTLE_MAINNET.as_ref(),
                 timestamp: arsia_ts(),
             })
@@ -449,7 +449,7 @@ mod tests {
             value: U256::MAX,
             from_balance: U256::from(1u64),
             l1_block_info: &info,
-            tx_input: &[0xff; 64],
+            tx_envelope: &[0xff; 64],
             chain_spec: MANTLE_MAINNET.as_ref(),
             timestamp: arsia_ts(),
         });
