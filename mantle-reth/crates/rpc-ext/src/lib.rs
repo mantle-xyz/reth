@@ -788,7 +788,7 @@ fn build_unsigned_tx_envelope(
             to,
             value,
             input,
-            access_list: Default::default(),
+            access_list: request.access_list.clone().unwrap_or_default(),
         }
         .into_signed(zero_sig)
         .encoded_2718()
@@ -810,6 +810,36 @@ fn build_unsigned_tx_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::TxEnvelope;
+    use alloy_eips::{
+        eip2718::Decodable2718,
+        eip2930::{AccessList, AccessListItem},
+    };
+    use alloy_primitives::Address;
+
+    fn patterned_bytes<const N: usize>(seed: u8) -> [u8; N] {
+        core::array::from_fn(|index| seed.wrapping_add((index as u8).wrapping_mul(31)))
+    }
+
+    fn test_access_list() -> AccessList {
+        AccessList(
+            (0u8..4)
+                .map(|entry| AccessListItem {
+                    address: Address::from(patterned_bytes(entry.wrapping_mul(53).wrapping_add(1))),
+                    storage_keys: (0u8..4)
+                        .map(|key| {
+                            B256::from(patterned_bytes(
+                                entry
+                                    .wrapping_mul(67)
+                                    .wrapping_add(key.wrapping_mul(29))
+                                    .wrapping_add(3),
+                            ))
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+    }
 
     // ─── gas price selection ────────────────────────────────────────────
 
@@ -887,6 +917,39 @@ mod tests {
             "256-byte calldata should add >200 bytes to envelope (empty={}, with_data={})",
             empty.len(),
             with_data.len()
+        );
+    }
+
+    #[test]
+    fn envelope_preserves_access_list_for_l1_cost() {
+        let access_list = test_access_list();
+        let request_without_list =
+            TransactionRequest { to: Some(TxKind::Call(Address::ZERO)), ..Default::default() };
+        let request_with_list = TransactionRequest {
+            access_list: Some(access_list.clone()),
+            ..request_without_list.clone()
+        };
+
+        let without_list =
+            build_unsigned_tx_envelope(&request_without_list, U256::from(100_000), 1_000_000, 1337);
+        let with_list =
+            build_unsigned_tx_envelope(&request_with_list, U256::from(100_000), 1_000_000, 1337);
+
+        let mut encoded = with_list.as_slice();
+        let decoded = TxEnvelope::decode_2718(&mut encoded).expect("valid EIP-2718 envelope");
+        assert!(encoded.is_empty(), "decoder must consume the complete envelope");
+        let signed = decoded.as_eip1559().expect("EIP-1559 envelope");
+        assert_eq!(signed.tx().access_list, access_list);
+
+        let spec_id = op_revm::OpSpecId::ARSIA;
+        let l1_info = test_l1_block_info();
+        let without_list_cost =
+            l1_info.calculate_tx_l1_cost_for_estimate(&without_list, spec_id, 80);
+        let with_list_cost = l1_info.calculate_tx_l1_cost_for_estimate(&with_list, spec_id, 80);
+        assert!(
+            with_list_cost > without_list_cost,
+            "access-list bytes must increase the L1 data fee: without={without_list_cost}, \
+             with={with_list_cost}"
         );
     }
 
