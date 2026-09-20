@@ -429,22 +429,6 @@ fn first_arsia_boundary_crossing(
     None
 }
 
-/// Converts an [`AccountProof`] into the geth-shaped EIP-1186 response served by
-/// [`MantleEthApiExt::get_proof`].
-///
-/// This is [`AccountProof::into_eip1186_response_with`] with `zero_empty_account = true`:
-/// an account that does not exist reports zero `codeHash`/`storageHash` (geth behavior since
-/// v1.13.4, [go-ethereum#28357](https://github.com/ethereum/go-ethereum/pull/28357)) instead of
-/// `KECCAK_EMPTY`/`EMPTY_ROOT_HASH`, and a lone empty-trie sentinel node collapses to an empty
-/// proof array, matching geth. Responses for existing accounts are identical to the standard
-/// conversion.
-fn into_geth_eip1186_response(
-    proof: AccountProof,
-    slots: Vec<JsonStorageKey>,
-) -> EIP1186AccountProofResponse {
-    proof.into_eip1186_response_with(slots, true)
-}
-
 #[async_trait]
 impl<Provider, EthApi> MantleEthApiExtServer for MantleRpcExt<Provider, EthApi>
 where
@@ -581,11 +565,11 @@ where
         keys: Vec<JsonStorageKey>,
         block_number: Option<BlockId>,
     ) -> RpcResult<EIP1186AccountProofResponse> {
-        // Mirrors the standard `eth_getProof` (`reth_rpc_eth_api::helpers::EthState::get_proof`)
-        // up to the final conversion, so only the nonexistent-account shape differs: `None`
-        // block id means latest, the proof window is enforced with the standard errors, state
-        // resolves through the standard helpers (pending included), and the trie walk is
-        // offloaded to the blocking pool.
+        // `None` is the RPC-level "block parameter omitted" case. Per the EIP-1898 convention
+        // geth applies (`len(args) < 3` → `LatestBlockNumber`) and the standard reth
+        // `get_proof`, an omitted block parameter means the latest state:
+        // `BlockId::default()` is `BlockId::Number(BlockNumberOrTag::Latest)` (alloy's
+        // hand-written `Default` impl, not a zero-ish hash/number).
         let block_id = block_number.unwrap_or_default();
         EthState::ensure_within_proof_window(self.eth_api(), block_id)
             .map_err(ErrorObject::from)?;
@@ -594,10 +578,14 @@ where
             .spawn_blocking_io_fut(async move |eth_api| {
                 let state = eth_api.state_at_block_id(block_id).await?;
                 let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
-                let proof = state
+                let proof: AccountProof = state
                     .proof(Default::default(), address, &storage_keys)
                     .map_err(<EthApi as EthApiTypes>::Error::from_eth_err)?;
-                Ok(into_geth_eip1186_response(proof, keys))
+                // [MANTLE] geth parity (go-ethereum#28357): an account that does not exist
+                // reports zero `codeHash`/`storageHash` instead of `KECCAK_EMPTY`/
+                // `EMPTY_ROOT_HASH`, and a lone empty-trie sentinel node collapses to an empty
+                // proof array. Existing accounts are identical to the standard conversion.
+                Ok(proof.into_eip1186_response_with(keys, true))
             })
             .await
             .map_err(ErrorObject::from)
@@ -895,9 +883,15 @@ mod tests {
     use super::*;
     use alloy_consensus::constants::KECCAK_EMPTY;
     use reth_primitives_traits::Account;
-    use reth_trie_common::EMPTY_ROOT_HASH;
+    use reth_trie_common::{AccountProof, EMPTY_ROOT_HASH};
 
     // ─── eth_getProof geth-parity conversion ─────────────────────────────
+    //
+    // Hand-built fixtures (not ported from op-geth): they pin the exact conversion the
+    // `eth_getProof` override above performs — `into_eip1186_response_with(keys, true)` —
+    // across its three observable branches: nonexistent account, existing account with
+    // bytecode, and existing EOA. Expected values are geth's documented behavior
+    // (go-ethereum#28357), cross-checked live against op-geth on the rde-v3 devnet.
 
     #[test]
     fn get_proof_nonexistent_account_is_zeroed_geth_shape() {
@@ -911,7 +905,7 @@ mod tests {
             storage_root: EMPTY_ROOT_HASH,
             storage_proofs: vec![],
         };
-        let resp = into_geth_eip1186_response(proof, vec![]);
+        let resp = proof.into_eip1186_response_with(vec![], true);
         assert_eq!(resp.address, Address::new([0x12; 20]));
         assert_eq!(resp.code_hash, B256::ZERO);
         assert_eq!(resp.storage_hash, B256::ZERO);
@@ -943,7 +937,7 @@ mod tests {
             storage_root,
             storage_proofs: vec![],
         };
-        let resp = into_geth_eip1186_response(proof, vec![]);
+        let resp = proof.into_eip1186_response_with(vec![], true);
         assert_eq!(resp.code_hash, code_hash);
         assert_eq!(resp.storage_hash, storage_root);
         assert_eq!(resp.nonce, 7);
@@ -963,7 +957,7 @@ mod tests {
             storage_root: EMPTY_ROOT_HASH,
             storage_proofs: vec![],
         };
-        let resp = into_geth_eip1186_response(proof, vec![]);
+        let resp = proof.into_eip1186_response_with(vec![], true);
         assert_eq!(resp.code_hash, KECCAK_EMPTY);
         assert_eq!(resp.storage_hash, EMPTY_ROOT_HASH);
         assert_eq!(resp.account_proof, vec![Bytes::from_static(&[0xf2, 0x03])]);
