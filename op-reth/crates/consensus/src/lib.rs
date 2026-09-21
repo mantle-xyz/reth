@@ -17,7 +17,7 @@ use alloy_consensus::{
 };
 use alloy_primitives::B64;
 use core::fmt::Debug;
-use op_alloy_consensus::decode_jovian_extra_data;
+use op_alloy_consensus::{decode_holocene_extra_data, decode_jovian_extra_data};
 use reth_chainspec::EthChainSpec;
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_consensus_common::validation::{
@@ -42,7 +42,7 @@ pub use validation::{canyon, isthmus, validate_block_post_execution};
 pub mod error;
 pub use error::OpConsensusError;
 
-fn validate_mantle_header_extra_data<H, ChainSpec>(
+fn validate_op_header_extra_data<H, ChainSpec>(
     header: &SealedHeader<H>,
     chain_spec: &ChainSpec,
 ) -> Result<(), ConsensusError>
@@ -50,20 +50,53 @@ where
     H: BlockHeader,
     ChainSpec: EthChainSpec<Header = H> + OpHardforks,
 {
-    if !chain_spec.is_mantle() {
-        return Ok(());
+    if chain_spec.is_jovian_active_at_timestamp(header.timestamp()) {
+        decode_jovian_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
+    } else if chain_spec.is_holocene_active_at_timestamp(header.timestamp()) {
+        decode_holocene_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
+    } else if header.hash() != chain_spec.genesis_hash() && !header.extra_data().is_empty() {
+        return Err(ConsensusError::msg("extraData must be empty before Holocene"));
     }
 
-    if chain_spec.is_mantle_arsia_active_at_timestamp(header.timestamp()) {
+    Ok(())
+}
+
+// The pinned op-alloy decoder predates upstream zero-parameter validation. Keep this separate from
+// the upstream validator so it can be removed when the dependency is updated.
+fn validate_pinned_op_alloy_extra_data_params<H, ChainSpec>(
+    header: &SealedHeader<H>,
+    chain_spec: &ChainSpec,
+) -> Result<(), ConsensusError>
+where
+    H: BlockHeader,
+    ChainSpec: EthChainSpec<Header = H> + OpHardforks,
+{
+    let (elasticity, denominator) = if chain_spec.is_jovian_active_at_timestamp(header.timestamp())
+    {
         let (elasticity, denominator, _) =
             decode_jovian_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
+        (elasticity, denominator)
+    } else if chain_spec.is_holocene_active_at_timestamp(header.timestamp()) {
+        decode_holocene_extra_data(header.extra_data()).map_err(ConsensusError::other)?
+    } else {
+        return Ok(());
+    };
+
+    if chain_spec.is_mantle() {
         if elasticity != 0 && denominator == 0 {
             return Err(ConsensusError::msg(
                 "holocene params cannot have a 0 denominator unless elasticity is also 0",
             ));
         }
-    } else if header.hash() != chain_spec.genesis_hash() && !header.extra_data().is_empty() {
-        return Err(ConsensusError::msg("extraData must be empty before Arsia"));
+    } else {
+        if denominator == 0 {
+            return Err(ConsensusError::msg(
+                "EIP1559 extraData must encode a non-zero denominator",
+            ));
+        }
+        if elasticity == 0 {
+            return Err(ConsensusError::msg("EIP1559 extraData must encode a non-zero elasticity"));
+        }
     }
 
     Ok(())
@@ -216,7 +249,8 @@ where
 
         // validate header extra data for all networks post merge
         validate_header_extra_data(header, self.max_extra_data_size)?;
-        validate_mantle_header_extra_data(sealed_header, &self.chain_spec)?;
+        validate_op_header_extra_data(sealed_header, &self.chain_spec)?;
+        validate_pinned_op_alloy_extra_data_params(sealed_header, &self.chain_spec)?;
         validate_header_gas(header)?;
         validate_header_base_fee(header, &self.chain_spec)
     }
@@ -316,43 +350,47 @@ mod tests {
         OpTransactionSigned::new_unhashed(OpTypedTransaction::Eip7702(tx), signature)
     }
 
-    fn mantle_child_header(timestamp: u64, extra_data: Bytes) -> SealedHeader<Header> {
-        use mantle_reth_chainspec::MANTLE_MAINNET;
+    fn test_chain_spec(builder: OpChainSpecBuilder, genesis_extra_data: Bytes) -> Arc<OpChainSpec> {
+        let mut genesis = OP_MAINNET.genesis.clone();
+        genesis.config.chain_id = 12_345;
+        genesis.extra_data = genesis_extra_data;
+        Arc::new(builder.genesis(genesis).chain(12_345u64.into()).build())
+    }
 
-        let mut header = MANTLE_MAINNET.genesis_header().clone();
+    fn child_header_with_extra_data(
+        chain_spec: &OpChainSpec,
+        extra_data: Bytes,
+    ) -> SealedHeader<Header> {
+        let mut header = chain_spec.genesis_header().clone();
         header.number += 1;
-        header.parent_hash = MANTLE_MAINNET.genesis_hash();
-        header.timestamp = timestamp;
+        header.parent_hash = chain_spec.genesis_hash();
+        header.timestamp += 2;
         header.extra_data = extra_data;
         SealedHeader::seal_slow(header)
     }
 
     #[test]
-    fn mantle_header_extra_data_before_arsia() {
-        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_ARSIA_TIMESTAMP;
-        use mantle_reth_chainspec::MANTLE_MAINNET;
+    fn header_extra_data_before_holocene() {
+        let genesis_extra_data = Bytes::from_static(b"custom genesis");
+        let chain_spec = test_chain_spec(
+            OpChainSpecBuilder::default().granite_activated(),
+            genesis_extra_data.clone(),
+        );
+        let consensus = OpBeaconConsensus::new(chain_spec.clone());
+        let genesis = SealedHeader::seal_slow(chain_spec.genesis_header().clone());
 
-        let mut chain_spec = MANTLE_MAINNET.as_ref().clone();
-        let mut genesis_header = chain_spec.genesis_header().clone();
-        genesis_header.extra_data = Bytes::from_static(b"mantle genesis");
-        let genesis = SealedHeader::seal_slow(genesis_header);
-        chain_spec.inner.genesis_header = genesis.clone();
-        let consensus = OpBeaconConsensus::new(Arc::new(chain_spec));
-
-        assert!(!genesis.header().extra_data.is_empty());
-        assert!(consensus.validate_header(&genesis).is_ok());
+        assert_eq!(genesis.extra_data, genesis_extra_data);
+        let genesis_result = consensus.validate_header(&genesis);
+        assert!(genesis_result.is_ok(), "{genesis_result:?}");
         assert!(
             consensus
-                .validate_header(&mantle_child_header(
-                    MANTLE_MAINNET_ARSIA_TIMESTAMP - 1,
-                    Bytes::new(),
-                ))
+                .validate_header(&child_header_with_extra_data(&chain_spec, Bytes::new()))
                 .is_ok()
         );
         assert!(
             consensus
-                .validate_header(&mantle_child_header(
-                    MANTLE_MAINNET_ARSIA_TIMESTAMP - 1,
+                .validate_header(&child_header_with_extra_data(
+                    &chain_spec,
                     Bytes::from_static(b"not allowed"),
                 ))
                 .is_err()
@@ -360,48 +398,82 @@ mod tests {
     }
 
     #[test]
-    fn mantle_header_extra_data_at_arsia() {
+    fn header_extra_data_at_holocene() {
+        let chain_spec =
+            test_chain_spec(OpChainSpecBuilder::default().holocene_activated(), Bytes::new());
+        let consensus = OpBeaconConsensus::new(chain_spec.clone());
+        let valid = encode_holocene_extra_data(B64::ZERO, BaseFeeParams::optimism()).unwrap();
+
+        assert!(
+            consensus.validate_header(&child_header_with_extra_data(&chain_spec, valid)).is_ok()
+        );
+
+        for invalid in [
+            Bytes::new(),
+            Bytes::from(vec![0; 8]),
+            Bytes::from(vec![1, 0, 0, 0, 1, 0, 0, 0, 1]),
+            Bytes::from(vec![0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Bytes::from(vec![0, 0, 0, 0, 1, 0, 0, 0, 0]),
+        ] {
+            assert!(
+                consensus
+                    .validate_header(&child_header_with_extra_data(&chain_spec, invalid))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn header_extra_data_at_jovian() {
+        let chain_spec =
+            test_chain_spec(OpChainSpecBuilder::default().jovian_activated(), Bytes::new());
+        let consensus = OpBeaconConsensus::new(chain_spec.clone());
+        let valid =
+            encode_jovian_extra_data(B64::ZERO, BaseFeeParams::optimism(), 1_000_000_000).unwrap();
+
+        assert!(
+            consensus.validate_header(&child_header_with_extra_data(&chain_spec, valid)).is_ok()
+        );
+
+        for invalid in [
+            encode_holocene_extra_data(B64::ZERO, BaseFeeParams::optimism()).unwrap(),
+            Bytes::from(vec![0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Bytes::from(vec![1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        ] {
+            assert!(
+                consensus
+                    .validate_header(&child_header_with_extra_data(&chain_spec, invalid))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mantle_header_extra_data_params_match_op_geth() {
         use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_ARSIA_TIMESTAMP;
         use mantle_reth_chainspec::MANTLE_MAINNET;
 
         let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
-        let valid =
-            encode_jovian_extra_data(B64::ZERO, BaseFeeParams::new(8, 2), 1_000_000_000).unwrap();
+        let arsia_header = |extra_data| {
+            let mut header = MANTLE_MAINNET.genesis_header().clone();
+            header.number += 1;
+            header.parent_hash = MANTLE_MAINNET.genesis_hash();
+            header.timestamp = MANTLE_MAINNET_ARSIA_TIMESTAMP;
+            header.extra_data = extra_data;
+            SealedHeader::seal_slow(header)
+        };
 
-        assert!(
-            consensus
-                .validate_header(&mantle_child_header(MANTLE_MAINNET_ARSIA_TIMESTAMP, valid))
-                .is_ok()
-        );
-
-        // Match the current Mantle op-geth rule, which only rejects a zero denominator when the
-        // elasticity is non-zero. These compatibility cases intentionally remain accepted.
+        // Current Mantle op-geth only rejects a zero denominator when elasticity is non-zero.
         for compatible in [
             Bytes::from(vec![1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
             Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
         ] {
-            assert!(
-                consensus
-                    .validate_header(&mantle_child_header(
-                        MANTLE_MAINNET_ARSIA_TIMESTAMP,
-                        compatible,
-                    ))
-                    .is_ok()
-            );
+            assert!(consensus.validate_header(&arsia_header(compatible)).is_ok());
         }
 
-        for invalid in [
-            Bytes::new(),
-            encode_holocene_extra_data(B64::ZERO, BaseFeeParams::new(8, 2)).unwrap(),
-            Bytes::from(vec![0, 0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1]),
-            Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1]),
-        ] {
-            assert!(
-                consensus
-                    .validate_header(&mantle_child_header(MANTLE_MAINNET_ARSIA_TIMESTAMP, invalid,))
-                    .is_err()
-            );
-        }
+        let invalid = Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(consensus.validate_header(&arsia_header(invalid)).is_err());
     }
 
     #[test]
