@@ -17,12 +17,13 @@ use alloy_consensus::{
 };
 use alloy_primitives::B64;
 use core::fmt::Debug;
+use op_alloy_consensus::{decode_holocene_extra_data, decode_jovian_extra_data};
 use reth_chainspec::EthChainSpec;
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_consensus_common::validation::{
-    validate_against_parent_eip1559_base_fee, validate_against_parent_hash_number,
-    validate_against_parent_timestamp, validate_cancun_gas, validate_header_base_fee,
-    validate_header_extra_data, validate_header_gas,
+    MAX_RLP_BLOCK_SIZE, validate_against_parent_eip1559_base_fee,
+    validate_against_parent_hash_number, validate_against_parent_timestamp, validate_cancun_gas,
+    validate_header_base_fee, validate_header_extra_data, validate_header_gas,
 };
 use reth_execution_types::BlockExecutionResult;
 use reth_optimism_forks::OpHardforks;
@@ -40,6 +41,66 @@ pub use validation::{canyon, isthmus, validate_block_post_execution};
 
 pub mod error;
 pub use error::OpConsensusError;
+
+fn validate_op_header_extra_data<H, ChainSpec>(
+    header: &SealedHeader<H>,
+    chain_spec: &ChainSpec,
+) -> Result<(), ConsensusError>
+where
+    H: BlockHeader,
+    ChainSpec: EthChainSpec<Header = H> + OpHardforks,
+{
+    if chain_spec.is_jovian_active_at_timestamp(header.timestamp()) {
+        decode_jovian_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
+    } else if chain_spec.is_holocene_active_at_timestamp(header.timestamp()) {
+        decode_holocene_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
+    } else if header.hash() != chain_spec.genesis_hash() && !header.extra_data().is_empty() {
+        return Err(ConsensusError::msg("extraData must be empty before Holocene"));
+    }
+
+    Ok(())
+}
+
+// The pinned op-alloy decoder predates upstream zero-parameter validation. Keep this separate from
+// the upstream validator so it can be removed when the dependency is updated.
+fn validate_pinned_op_alloy_extra_data_params<H, ChainSpec>(
+    header: &SealedHeader<H>,
+    chain_spec: &ChainSpec,
+) -> Result<(), ConsensusError>
+where
+    H: BlockHeader,
+    ChainSpec: EthChainSpec<Header = H> + OpHardforks,
+{
+    let (elasticity, denominator) = if chain_spec.is_jovian_active_at_timestamp(header.timestamp())
+    {
+        let (elasticity, denominator, _) =
+            decode_jovian_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
+        (elasticity, denominator)
+    } else if chain_spec.is_holocene_active_at_timestamp(header.timestamp()) {
+        decode_holocene_extra_data(header.extra_data()).map_err(ConsensusError::other)?
+    } else {
+        return Ok(());
+    };
+
+    if chain_spec.is_mantle() {
+        if elasticity != 0 && denominator == 0 {
+            return Err(ConsensusError::msg(
+                "holocene params cannot have a 0 denominator unless elasticity is also 0",
+            ));
+        }
+    } else {
+        if denominator == 0 {
+            return Err(ConsensusError::msg(
+                "EIP1559 extraData must encode a non-zero denominator",
+            ));
+        }
+        if elasticity == 0 {
+            return Err(ConsensusError::msg("EIP1559 extraData must encode a non-zero elasticity"));
+        }
+    }
+
+    Ok(())
+}
 
 /// Optimism consensus implementation.
 ///
@@ -105,6 +166,20 @@ where
     }
 
     fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), ConsensusError> {
+        // Upstream OP Stack disables EIP-7934, but Mantle activates the rule with Limb/Osaka to
+        // match Mantle op-geth consensus.
+        if self.chain_spec.is_mantle() &&
+            self.chain_spec.is_osaka_active_at_timestamp(block.timestamp())
+        {
+            let rlp_length = block.rlp_length();
+            if rlp_length > MAX_RLP_BLOCK_SIZE {
+                return Err(ConsensusError::BlockTooLarge {
+                    rlp_length,
+                    max_rlp_length: MAX_RLP_BLOCK_SIZE,
+                });
+            }
+        }
+
         // Check ommers hash
         let ommers_hash = block.body().calculate_ommers_root();
         if Some(block.ommers_hash()) != ommers_hash {
@@ -162,7 +237,8 @@ where
     ChainSpec: EthChainSpec<Header = H> + OpHardforks + Debug + Send + Sync,
 {
     fn validate_header(&self, header: &SealedHeader<H>) -> Result<(), ConsensusError> {
-        let header = header.header();
+        let sealed_header = header;
+        let header = sealed_header.header();
         // with OP-stack Bedrock activation number determines when TTD (eth Merge) has been reached.
         debug_assert!(
             self.chain_spec.is_bedrock_active_at_block(header.number()),
@@ -187,6 +263,8 @@ where
 
         // validate header extra data for all networks post merge
         validate_header_extra_data(header, self.max_extra_data_size)?;
+        validate_op_header_extra_data(sealed_header, &self.chain_spec)?;
+        validate_pinned_op_alloy_extra_data_params(sealed_header, &self.chain_spec)?;
         validate_header_gas(header)?;
         validate_header_base_fee(header, &self.chain_spec)
     }
@@ -254,11 +332,11 @@ mod tests {
 
     use alloy_consensus::{BlockBody, Eip658Value, Header, Receipt, TxEip7702, TxReceipt};
     use alloy_eips::{eip4895::Withdrawals, eip7685::Requests};
-    use alloy_primitives::{Address, Bytes, Log, Signature, U256};
+    use alloy_primitives::{Address, B64, Bytes, Log, Signature, U256};
     use op_alloy_consensus::{
         OpTypedTransaction, encode_holocene_extra_data, encode_jovian_extra_data,
     };
-    use reth_chainspec::BaseFeeParams;
+    use reth_chainspec::{BaseFeeParams, EthChainSpec};
     use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
     use reth_optimism_chainspec::{OP_MAINNET, OpChainSpec, OpChainSpecBuilder};
     use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
@@ -268,6 +346,10 @@ mod tests {
     use crate::OpBeaconConsensus;
 
     fn mock_tx(nonce: u64) -> OpTransactionSigned {
+        mock_tx_with_input(nonce, Bytes::from(vec![1, 2]))
+    }
+
+    fn mock_tx_with_input(nonce: u64, input: Bytes) -> OpTransactionSigned {
         let tx = TxEip7702 {
             chain_id: 1u64,
             nonce,
@@ -276,7 +358,7 @@ mod tests {
             gas_limit: 10,
             to: Address::default(),
             value: U256::from(3_u64),
-            input: Bytes::from(vec![1, 2]),
+            input,
             access_list: Default::default(),
             authorization_list: Default::default(),
         };
@@ -284,6 +366,176 @@ mod tests {
         let signature = Signature::new(U256::default(), U256::default(), true);
 
         OpTransactionSigned::new_unhashed(OpTypedTransaction::Eip7702(tx), signature)
+    }
+
+    fn test_chain_spec(builder: OpChainSpecBuilder, genesis_extra_data: Bytes) -> Arc<OpChainSpec> {
+        let mut genesis = OP_MAINNET.genesis.clone();
+        genesis.config.chain_id = 12_345;
+        genesis.extra_data = genesis_extra_data;
+        Arc::new(builder.genesis(genesis).chain(12_345u64.into()).build())
+    }
+
+    fn child_header_with_extra_data(
+        chain_spec: &OpChainSpec,
+        extra_data: Bytes,
+    ) -> SealedHeader<Header> {
+        let mut header = chain_spec.genesis_header().clone();
+        header.number += 1;
+        header.parent_hash = chain_spec.genesis_hash();
+        header.timestamp += 2;
+        header.extra_data = extra_data;
+        SealedHeader::seal_slow(header)
+    }
+
+    #[test]
+    fn header_extra_data_before_holocene() {
+        let genesis_extra_data = Bytes::from_static(b"custom genesis");
+        let chain_spec = test_chain_spec(
+            OpChainSpecBuilder::default().granite_activated(),
+            genesis_extra_data.clone(),
+        );
+        let consensus = OpBeaconConsensus::new(chain_spec.clone());
+        let genesis = SealedHeader::seal_slow(chain_spec.genesis_header().clone());
+
+        assert_eq!(genesis.extra_data, genesis_extra_data);
+        let genesis_result = consensus.validate_header(&genesis);
+        assert!(genesis_result.is_ok(), "{genesis_result:?}");
+        assert!(
+            consensus
+                .validate_header(&child_header_with_extra_data(&chain_spec, Bytes::new()))
+                .is_ok()
+        );
+        assert!(
+            consensus
+                .validate_header(&child_header_with_extra_data(
+                    &chain_spec,
+                    Bytes::from_static(b"not allowed"),
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn header_extra_data_at_holocene() {
+        let chain_spec =
+            test_chain_spec(OpChainSpecBuilder::default().holocene_activated(), Bytes::new());
+        let consensus = OpBeaconConsensus::new(chain_spec.clone());
+        let valid = encode_holocene_extra_data(B64::ZERO, BaseFeeParams::optimism()).unwrap();
+
+        assert!(
+            consensus.validate_header(&child_header_with_extra_data(&chain_spec, valid)).is_ok()
+        );
+
+        for invalid in [
+            Bytes::new(),
+            Bytes::from(vec![0; 8]),
+            Bytes::from(vec![1, 0, 0, 0, 1, 0, 0, 0, 1]),
+            Bytes::from(vec![0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Bytes::from(vec![0, 0, 0, 0, 1, 0, 0, 0, 0]),
+        ] {
+            assert!(
+                consensus
+                    .validate_header(&child_header_with_extra_data(&chain_spec, invalid))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn header_extra_data_at_jovian() {
+        let chain_spec =
+            test_chain_spec(OpChainSpecBuilder::default().jovian_activated(), Bytes::new());
+        let consensus = OpBeaconConsensus::new(chain_spec.clone());
+        let valid =
+            encode_jovian_extra_data(B64::ZERO, BaseFeeParams::optimism(), 1_000_000_000).unwrap();
+
+        assert!(
+            consensus.validate_header(&child_header_with_extra_data(&chain_spec, valid)).is_ok()
+        );
+
+        for invalid in [
+            encode_holocene_extra_data(B64::ZERO, BaseFeeParams::optimism()).unwrap(),
+            Bytes::from(vec![0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Bytes::from(vec![1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        ] {
+            assert!(
+                consensus
+                    .validate_header(&child_header_with_extra_data(&chain_spec, invalid))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mantle_header_extra_data_params_match_op_geth() {
+        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_ARSIA_TIMESTAMP;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+
+        let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+        let arsia_header = |extra_data| {
+            let mut header = MANTLE_MAINNET.genesis_header().clone();
+            header.number += 1;
+            header.parent_hash = MANTLE_MAINNET.genesis_hash();
+            header.timestamp = MANTLE_MAINNET_ARSIA_TIMESTAMP;
+            header.extra_data = extra_data;
+            SealedHeader::seal_slow(header)
+        };
+
+        // Current Mantle op-geth only rejects a zero denominator when elasticity is non-zero.
+        for compatible in [
+            Bytes::from(vec![1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        ] {
+            assert!(consensus.validate_header(&arsia_header(compatible)).is_ok());
+        }
+
+        let invalid = Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(consensus.validate_header(&arsia_header(invalid)).is_err());
+    }
+
+    fn mantle_block_with_input(
+        timestamp: u64,
+        input_len: usize,
+    ) -> SealedBlock<alloy_consensus::Block<OpTransactionSigned>> {
+        let transaction = mock_tx_with_input(0, Bytes::from(vec![0; input_len]));
+        let header = Header {
+            base_fee_per_gas: Some(1_000_000_000),
+            withdrawals_root: Some(proofs::calculate_withdrawals_root(&[])),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            transactions_root: proofs::calculate_transaction_root(std::slice::from_ref(
+                &transaction,
+            )),
+            timestamp,
+            ..Default::default()
+        };
+        let body = BlockBody {
+            transactions: vec![transaction],
+            ommers: vec![],
+            withdrawals: Some(Withdrawals::default()),
+        };
+
+        SealedBlock::seal_slow(alloy_consensus::Block { header, body })
+    }
+
+    fn mantle_block_with_rlp_length(
+        timestamp: u64,
+        target: usize,
+    ) -> SealedBlock<alloy_consensus::Block<OpTransactionSigned>> {
+        let mut input_len = target.saturating_sub(512);
+
+        for _ in 0..16 {
+            let block = mantle_block_with_input(timestamp, input_len);
+            let actual = block.rlp_length();
+            match actual.cmp(&target) {
+                core::cmp::Ordering::Equal => return block,
+                core::cmp::Ordering::Less => input_len += target - actual,
+                core::cmp::Ordering::Greater => input_len -= actual - target,
+            }
+        }
+
+        panic!("failed to construct block with RLP length {target}")
     }
 
     #[test]
@@ -949,5 +1201,68 @@ mod tests {
             unstripped_root, mantle_root,
             "Skadi-only (no Canyon/Arsia) should still strip deposit fields"
         );
+    }
+
+    #[test]
+    fn mantle_block_size_limit_is_inactive_before_limb() {
+        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_LIMB_TIMESTAMP;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let block =
+            mantle_block_with_rlp_length(MANTLE_MAINNET_LIMB_TIMESTAMP - 1, MAX_RLP_BLOCK_SIZE + 1);
+        let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+
+        assert!(consensus.validate_block_pre_execution(&block).is_ok());
+    }
+
+    #[test]
+    fn mantle_block_size_limit_accepts_exact_boundary_after_limb() {
+        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_LIMB_TIMESTAMP;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let block = mantle_block_with_rlp_length(MANTLE_MAINNET_LIMB_TIMESTAMP, MAX_RLP_BLOCK_SIZE);
+        let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+
+        assert!(consensus.validate_block_pre_execution(&block).is_ok());
+    }
+
+    #[test]
+    fn mantle_block_size_limit_rejects_one_byte_over_after_limb() {
+        use alloy_op_hardforks::mantle::mainnet::MANTLE_MAINNET_LIMB_TIMESTAMP;
+        use mantle_reth_chainspec::MANTLE_MAINNET;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let block =
+            mantle_block_with_rlp_length(MANTLE_MAINNET_LIMB_TIMESTAMP, MAX_RLP_BLOCK_SIZE + 1);
+        let consensus = OpBeaconConsensus::new(MANTLE_MAINNET.clone());
+
+        assert!(matches!(
+            consensus.validate_block_pre_execution(&block),
+            Err(ConsensusError::BlockTooLarge { rlp_length, max_rlp_length })
+                if rlp_length == MAX_RLP_BLOCK_SIZE + 1 &&
+                    max_rlp_length == MAX_RLP_BLOCK_SIZE
+        ));
+    }
+
+    #[test]
+    fn op_block_size_limit_remains_disabled_after_osaka() {
+        use alloy_hardforks::ForkCondition;
+        use reth_chainspec::EthereumHardfork;
+        use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
+        let chain_spec = Arc::new(
+            OpChainSpecBuilder::default()
+                .jovian_activated()
+                .with_fork(EthereumHardfork::Osaka, ForkCondition::Timestamp(0))
+                .genesis(OP_MAINNET.genesis.clone())
+                .chain(OP_MAINNET.chain)
+                .build(),
+        );
+        let block = mantle_block_with_rlp_length(1, MAX_RLP_BLOCK_SIZE + 1);
+        let consensus = OpBeaconConsensus::new(chain_spec);
+
+        assert!(consensus.validate_block_pre_execution(&block).is_ok());
     }
 }
