@@ -6,24 +6,35 @@
 //! handler that gets injected into `MantleRpcExt` when this node is acting
 //! as the sequencer with preconf enabled.
 //!
-//! Flow:
+//! Flow, labelled to match the `// Step N` markers in
+//! [`PreconfRpcHandler::handle_inner`] rather than renumbered — the steps are
+//! not contiguous, and 3b is the one most easily missed:
 //!
-//! 1. Decode + recover the raw transaction.
-//! 2. Whitelist check via [`PreconfConfig::is_preconf_tx`].
-//! 3. Nonce-gap + cumulative-balance pre-checks against a single `latest` snapshot and one pool
-//!    scan (`get_pending_nonce_and_cumulative_cost`).
-//! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
-//!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
-//!    builder could apply it before the responder is registered, dropping the receipt.
-//! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if the fifo
-//!    entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the builder.
-//! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return `Ok(Timeout
-//!    event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
-//!    (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
-//!    fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
-//!    and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
-//!    (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
-//!    `pending_responders`).
+//! * **Step 0** — Decode + recover the raw transaction.
+//! * **Step 1** — Whitelist *preview* via [`PreconfClassifier::preview_eligibility`]. A cheap
+//!   rejection for the common case and **non-authoritative by design**: it reads the allowlist
+//!   without claiming anything. Step 3b is what binds.
+//! * **Step 2** — Nonce-gap + cumulative-balance pre-checks against a single `latest` snapshot and
+//!   one pool scan (`get_pending_nonce_and_cumulative_cost`).
+//! * **Step 3** — Attach a oneshot responder to [`PreconfTxSet`] **before** calling
+//!   [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
+//!   builder could apply it before the responder is registered, dropping the receipt.
+//! * **Step 3b** — **Where eligibility is actually decided.** [`PreconfClassifier::claim_preconf`]
+//!   freezes the verdict, and the per-tx gas ceiling is enforced alongside it, both before the pool
+//!   ever sees the transaction. It has to happen here because the deciding fact — that the client
+//!   called `eth_sendRawTransactionWithPreconf` and not `eth_sendRawTransaction` — exists only at
+//!   this layer; one layer down the two are indistinguishable, since both reach the pool as
+//!   `TransactionOrigin::External`.
+//! * **Step 4** — Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if
+//!   the fifo entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the
+//!   builder.
+//! * **Step 5** — Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return
+//!   `Ok(Timeout event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
+//!   (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
+//!   fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
+//!   and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
+//!   (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
+//!   `pending_responders`).
 
 use std::sync::Arc;
 
@@ -43,9 +54,10 @@ use tokio::sync::oneshot;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    PreconfConfig, PreconfJournal, PreconfTxSet,
+    PreconfClassifier, PreconfConfig, PreconfJournal, PreconfTxSet,
+    classifier::PreconfClaimError,
     journal::JournalEntry,
-    types::{AttachError, PreconfError, PreconfReceipt, PreconfStatus},
+    types::{AttachError, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
 
 /// Generic preconf RPC handler. Constructed by the preconf `ServiceBuilder`
@@ -55,10 +67,13 @@ pub struct PreconfRpcHandler<P, Pr> {
     provider: Pr,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
-    /// Persistence sink (mandatory) — every successful preconf commitment
-    /// is appended to the journal before the `PreconfTxEvent` is returned
-    /// to the client. Append failures are logged but do not block the
-    /// response (best-effort durability; a crash before the next disk
+    /// Owns the allowlists and every frozen verdict. The single decider of
+    /// preconf eligibility, shared with the validator and the builder.
+    classifier: Arc<PreconfClassifier>,
+    /// Persistence sink (mandatory) — every commitment whose receipt goes
+    /// out is appended to the journal before the `PreconfTxEvent` is
+    /// returned to the client. Append failures are logged but do not block
+    /// the response (best-effort durability; a crash before the next disk
     /// flush loses at most the most recent commitment).
     journal: Arc<PreconfJournal>,
 }
@@ -84,9 +99,10 @@ impl<P, Pr> PreconfRpcHandler<P, Pr> {
         provider: Pr,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
+        classifier: Arc<PreconfClassifier>,
         journal: Arc<PreconfJournal>,
     ) -> Self {
-        Self { pool, provider, fifo, cfg, journal }
+        Self { pool, provider, fifo, cfg, classifier, journal }
     }
 }
 
@@ -95,6 +111,57 @@ where
     P: TransactionPool + 'static,
     Pr: StateProviderFactory + 'static,
 {
+    /// Records a returned receipt in **both** halves of commitment tracking: the
+    /// classifier (in memory, the authority for slot retention) and the journal
+    /// (on disk, for restart). Both writes live here so the two cannot drift —
+    /// `mark_committed` needs the classifier's promise record to recognise our
+    /// transactions among a whole block's hashes, and journal restore rebuilds
+    /// that record from the file.
+    ///
+    /// **Every receipt counts, not only `Success`.** A `Failed` event on a
+    /// receipt path is an EVM revert that *produced* a receipt; every
+    /// not-on-chain outcome leaves through an `Err(..)` return and never reaches
+    /// here. The receipt goes out before the block is sealed, so a reverted tx is
+    /// owed a replay exactly as a successful one is — and `builder::dispatch`
+    /// agrees, marking the fifo entry `Success` without reading `receipt.status`.
+    /// Pinned by `a_reverted_receipt_is_still_recorded_as_a_commitment`.
+    async fn record_commitment(
+        &self,
+        event: &PreconfTxEvent,
+        hash: alloy_primitives::TxHash,
+        sender: &alloy_primitives::Address,
+        nonce: u64,
+        tx_rlp: &Bytes,
+    ) {
+        // Establishing the record here — at the receipt, which necessarily
+        // precedes the block — is what makes it available to both later events
+        // (`forward → release_unless_committed` and the canonical notification)
+        // no matter which of them runs first.
+        if let Err(owner) = self.classifier.mark_promised(hash, sender, nonce, event.block_height) {
+            warn!(
+                target: "mantle::preconf::rpc",
+                ?hash, ?owner,
+                "a different tx already owns this (sender, nonce) at receipt time; \
+                 the commitment may not be honoured"
+            );
+        }
+
+        // Best-effort — a crash before flush loses at most this single record.
+        let entry = JournalEntry {
+            hash,
+            tx_rlp: tx_rlp.clone(),
+            block_height: event.block_height,
+            committed_at_ms: now_unix_ms(),
+        };
+        if let Err(e) = self.journal.append_promised(&entry).await {
+            warn!(
+                target: "mantle::preconf::rpc",
+                ?hash, ?e,
+                "journal append failed; commitment may be lost on restart"
+            );
+        }
+    }
+
     /// Process a single `eth_sendRawTransactionWithPreconf` submission.
     ///
     /// See module-level documentation for the step-by-step semantics.
@@ -118,9 +185,18 @@ where
         let hash = *pool_tx.hash();
         let nonce = pool_tx.nonce();
         let to_opt = tx_kind_to_address(pool_tx.kind());
+        let gas_limit = alloy_consensus::Transaction::gas_limit(&pool_tx);
 
-        // Step 1 — whitelist.
-        if !self.cfg.is_preconf_tx(&sender, to_opt.as_ref()) {
+        // Step 1 — whitelist. Non-authoritative by design: a fast rejection
+        // ahead of the state snapshot, the fifo entry and the pool, recording
+        // nothing. The binding decision is Step 3b's `claim_preconf`, which
+        // consults the same allowlists again and freezes the verdict it
+        // derives; an allowlist update landing in between is caught there.
+        // Keeping the two in the same order matters — reaching Step 3b with a
+        // sender that was never allowlisted would still be refused, but only
+        // after a `latest()` snapshot, a pool scan and a responder attached
+        // and cancelled again.
+        if !self.classifier.preview_eligibility(&sender, to_opt.as_ref()) {
             trace!(target: "mantle::preconf::rpc", ?sender, ?to_opt, ?hash, "non-whitelisted preconf submission");
             return Err(preconf_error_to_rpc(&PreconfError::NotPreconfEligible));
         }
@@ -179,6 +255,54 @@ where
             return Err(preconf_error_to_rpc(&PreconfError::AlreadyInProgress));
         }
 
+        // Step 3b — claim the preconf verdict, before the pool ever sees the
+        // transaction.
+        //
+        // **This is where eligibility is decided**: the deciding fact — that the
+        // client called `eth_sendRawTransactionWithPreconf` and not
+        // `eth_sendRawTransaction` — exists only here. One layer down the two are
+        // indistinguishable (both reach the pool as `TransactionOrigin::External`),
+        // so the validator can only latch what it finds, and what it finds is
+        // what we write here.
+        //
+        // The per-tx gas ceiling is checked here too, so no `Eligible` verdict
+        // can exist for a transaction that was never held to it. This is the
+        // operative check, not an optimisation ahead of one: the validator's copy
+        // gates on `verdict.is_preconf()`, which an over-cap request never gets.
+        // Pinned by `per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool`.
+        //
+        // `Err` means the hash already carries a frozen non-preconf verdict —
+        // the same raw transaction went in through plain `eth_sendRawTransaction`
+        // or arrived over p2p first. A verdict is immutable for the life of the
+        // transaction, so this request can never be satisfied; say so plainly
+        // rather than letting the client wait out `preconf_timeout`.
+        if gas_limit > self.cfg.preconf_max_gas_per_tx {
+            let err = PreconfError::PreconfGasLimitExceeded {
+                gas_limit,
+                max: self.cfg.preconf_max_gas_per_tx,
+            };
+            self.fifo.cancel_responder(&hash, err.clone()).await;
+            return Err(preconf_error_to_rpc(&err));
+        }
+        if let Err(rejection) = self.classifier.claim_preconf(hash, &sender, to_opt.as_ref()) {
+            let err = match rejection {
+                // Step 1 already previewed the allowlist, so reaching this arm
+                // means governance changed it in between. Report it the same way
+                // Step 1 would have.
+                PreconfClaimError::NotAllowlisted => PreconfError::NotPreconfEligible,
+                PreconfClaimError::AlreadyClassified(_) => {
+                    PreconfError::AlreadyPooledWithoutPreconf
+                }
+            };
+            trace!(
+                target: "mantle::preconf::rpc",
+                ?hash, ?rejection,
+                "preconf claim refused"
+            );
+            self.fifo.cancel_responder(&hash, err.clone()).await;
+            return Err(preconf_error_to_rpc(&err));
+        }
+
         // Step 4 — submit to pool.
         //
         // `Ok(_)` and `Err(AlreadyImported)` are both admission successes
@@ -195,6 +319,24 @@ where
             Ok(_) => {}
             Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
             Err(e) => {
+                // Everything the pool refuses lands here, **including validator
+                // rejections** — `PoolInner::add_transaction` maps a
+                // `TransactionValidationOutcome::Invalid` to `Err` just as it does
+                // an insertion failure — so this covers the per-tx gas ceiling,
+                // `ReplaceActivePreconf`, a lost handover CAS and every
+                // inner-validator refusal alongside pool limits and underpriced
+                // replacements.
+                //
+                // Either way a verdict is frozen and the `(sender, nonce)` slot
+                // may be claimed for a transaction that is not in the pool;
+                // unreleased, the slot would block that nonce until the next
+                // sweep. The verdict is ours — Step 3b wrote it. The one
+                // exception, a promised commitment, is `release_preconf_claim`'s
+                // to judge, not this call site's; see that method.
+                //
+                // Pinned by `a_pool_refusal_releases_the_verdict_the_request_froze`
+                // and `a_pool_refusal_must_not_drop_a_promised_commitment`.
+                self.classifier.release_preconf_claim(&hash);
                 let err = PreconfError::PoolRejected(format!("{}", e.kind));
                 self.fifo.cancel_responder(&hash, err.clone()).await;
                 return Err(preconf_error_to_rpc(&err));
@@ -228,28 +370,11 @@ where
         };
 
         match recv_result {
-            // Receipt arrived within the deadline. Persist on Success
-            // (best-effort — a crash before flush loses at most this
-            // single record).
+            // Receipt arrived within the deadline. Every receipt is recorded,
+            // reverts included — see `record_commitment`.
             Some(Ok(Ok(receipt))) => {
                 let event = PreconfTxEvent::from(receipt);
-                // Receipt path ⇒ the tx is on chain (`From` maps it to
-                // Success, or Failed for an EVM revert — a receipt exists
-                // either way), so always journal.
-                let entry = JournalEntry {
-                    hash,
-                    tx_rlp: bytes.clone(),
-                    block_height: event.block_height,
-                    committed_at_ms: now_unix_ms(),
-                };
-                if let Err(e) = self.journal.append_promised(&entry).await {
-                    warn!(
-                        target: "mantle::preconf::rpc",
-                        ?hash,
-                        ?e,
-                        "journal append failed; commitment may be lost on restart"
-                    );
-                }
+                self.record_commitment(&event, hash, &sender, nonce, &bytes).await;
                 Ok(event)
             }
 
@@ -297,10 +422,35 @@ where
                 let apply_guard = self.fifo.lock_for_apply(&hash).await;
 
                 // Under the (possibly-held) lock, read the definitive
-                // final status.
-                let final_status = self.fifo.find_by_hash(&hash).await.map(|e| e.status);
+                // final state. The whole view is kept (not just `status`) because
+                // the `Waiting` arm below has to know the entry's `source` — see
+                // the retention note there.
+                let final_entry = self.fifo.find_by_hash(&hash).await;
+                let final_status = final_entry.as_ref().map(|e| e.status);
 
                 match final_status {
+                    // **Must precede the `Success | Failed` arm below.** A
+                    // `Replay`-source `Failed` is a commitment we could not
+                    // honour; an `Rpc`-source one is an ordinary apply
+                    // rejection. That arm assumes dispatch queued a message on
+                    // `resp_rx`, but the breach path deliberately sends
+                    // nothing, so falling into it would report a `Timeout` the
+                    // client retries forever.
+                    //
+                    // This is also the **only** channel through which a client
+                    // can learn its commitment was broken: a `Replay` entry's
+                    // responder was consumed when the receipt went out, and the
+                    // node exposes no status-query RPC.
+                    Some(PreconfStatus::Failed)
+                        if final_entry
+                            .as_ref()
+                            .is_some_and(|e| e.source == PreconfSource::Replay) =>
+                    {
+                        drop(apply_guard);
+                        let err = PreconfError::CommitmentBroken;
+                        self.fifo.cancel_responder(&hash, err.clone()).await;
+                        Err(preconf_error_to_rpc(&err))
+                    }
                     Some(PreconfStatus::Success | PreconfStatus::Failed) => {
                         // Apply committed to builder state between our
                         // deadline firing and lock acquisition. The
@@ -312,21 +462,7 @@ where
                         match resp_rx.try_recv() {
                             Ok(Ok(receipt)) => {
                                 let event = PreconfTxEvent::from(receipt);
-                                // Receipt path ⇒ on chain (Success or an
-                                // EVM-revert Failed), so always journal.
-                                let entry = JournalEntry {
-                                    hash,
-                                    tx_rlp: bytes.clone(),
-                                    block_height: event.block_height,
-                                    committed_at_ms: now_unix_ms(),
-                                };
-                                if let Err(e) = self.journal.append_promised(&entry).await {
-                                    warn!(
-                                        target: "mantle::preconf::rpc",
-                                        ?hash, ?e,
-                                        "journal append failed; commitment may be lost on restart"
-                                    );
-                                }
+                                self.record_commitment(&event, hash, &sender, nonce, &bytes).await;
                                 Ok(event)
                             }
                             Ok(Err(err)) => Err(preconf_error_to_rpc(&err)),
@@ -353,16 +489,43 @@ where
                         }
                     }
                     Some(PreconfStatus::Waiting) | None => {
-                        // Apply never committed. `mark_timeout`'s `Waiting →
-                        // Timeout` CAS evicts the tx from the pool via its
-                        // callback — but a pool-admitted tx with no fifo entry
-                        // (parked in `BaseFee`/`Queued`, so the `Pending`-only
-                        // listener never pushed it) returns `NotFound` and skips
-                        // that callback. Evict it directly, else the orphan
-                        // lingers and is mined once eligible — after the client
-                        // saw `Timeout`.
-                        if self.fifo.mark_timeout(&hash).await.is_err() {
-                            self.pool.remove_transactions(vec![hash]);
+                        // Apply never committed.
+                        //
+                        // Second retention door: do NOT time out an entry whose
+                        // receipt has already gone out. `Replay` means exactly
+                        // that (journal restore / reorg reinject / stale
+                        // in-flight replay — see `PreconfSource`), and
+                        // `mark_timeout` would make that commitment replaceable
+                        // by another hash, sweepable, and evict it from the pool.
+                        //
+                        // Reachable because `attach_responder` accepts a
+                        // same-hash resubmit onto a live `Waiting` entry whose
+                        // responder was already taken, which is the normal shape
+                        // of a replaying commitment. This client's request does
+                        // time out — but the commitment keeps being retried.
+                        let is_replay =
+                            final_entry.as_ref().is_some_and(|e| e.source == PreconfSource::Replay);
+                        if is_replay {
+                            debug!(
+                                target: "mantle::preconf::rpc",
+                                ?hash,
+                                "deadline elapsed on a replaying commitment; leaving it Waiting to retry"
+                            );
+                        } else {
+                            // Transition under the still-held lock (or without
+                            // any lock if the entry was absent — mark_timeout
+                            // returns `NotFound`, which is fine).
+                            //
+                            // The CAS evicts the tx from the pool via its
+                            // callback — but a pool-admitted tx with no fifo
+                            // entry (parked in `BaseFee`/`Queued`, so the
+                            // `Pending`-only listener never pushed it) returns
+                            // `NotFound` and skips that callback. Evict it
+                            // directly, else the orphan lingers and is mined
+                            // once eligible — after the client saw `Timeout`.
+                            if self.fifo.mark_timeout(&hash).await.is_err() {
+                                self.pool.remove_transactions(vec![hash]);
+                            }
                         }
                         drop(apply_guard);
                         self.fifo
@@ -495,7 +658,11 @@ fn internal_err<E: std::fmt::Display>(e: &E) -> ErrorObject<'static> {
     ErrorObject::owned(PRECONF_RPC_ERR_CODE, format!("internal: {e}"), None::<()>)
 }
 
-fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Address> {
+/// A creation has no recipient at all, which is not the same as a call to the
+/// zero address — see `PreconfClassifier::evaluate_whitelist`'s docs for why
+/// only a from-wildcard can authorize one. Shared with the payload builder so
+/// the two ask the allowlist the same question.
+pub(crate) fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Address> {
     match kind {
         TxKind::Call(addr) => Some(addr),
         TxKind::Create => None,
@@ -514,8 +681,18 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{Address, B256, Bytes as PrimBytes, Log, LogData, U256};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
     use mantle_reth_rpc_ext::PreconfStatus as WireStatus;
+    use reth_optimism_txpool::OpPooledTransaction;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_transaction_pool::noop::NoopTransactionPool;
+    use std::{collections::HashSet, time::Duration};
+
+    use crate::classifier::{DEFAULT_VERDICT_CACHE_CAP, Verdict};
 
     fn sample_log(addr_byte: u8, topic_byte: u8, data_byte: u8) -> Log {
         let data = LogData::new_unchecked(
@@ -624,20 +801,204 @@ mod tests {
         assert!(rpc.message().ends_with("boom"));
     }
 
-    // Full handler-flow tests (mock pool + state provider + builder
-    // fan-in) are deferred to end-to-end coverage — building a
-    // `TransactionPool` impl with the right associated `Pooled` type
-    // that supports `recover_raw_transaction` plus a
-    // `StateProviderFactory` mock is heavyweight scaffolding. The flow
-    // itself is straight-line over public `PreconfTxSet` APIs that
-    // already have unit tests covering attach / cancel / mark_timeout /
-    // recover_from_timeout semantics.
+    // --- `handle_inner`'s pool-refusal branch -----------------------------
     //
-    // `U256` is referenced only here so the e2e harness can later
-    // construct receipts with numeric fields without re-touching the
-    // use list.
-    #[allow(dead_code)]
-    fn _u256_marker() -> U256 {
-        U256::ZERO
+    // `NoopTransactionPool<OpPooledTransaction>` is a ready-made pool whose
+    // `add_transaction` **always** returns `Err` — precisely the branch that
+    // needs pinning — and `MockEthProvider` supplies the on-chain nonce Step 2
+    // reads. It has to be pinned here: `validator::tests::validate_preconf`
+    // models the release by hand, so tests built on that fixture assert against
+    // the *copy*, never this call site.
+    //
+    // One test covers all of it: every preconf rejection — inner validator,
+    // `ReplaceActivePreconf`, a lost handover CAS, pool limits — arrives here as
+    // one `Err` and is released by one piece of code; which rejection produced it
+    // is a validator-side fact, covered by `validator::tests`.
+
+    const RECIPIENT: Address = Address::new([0x42; 20]);
+
+    struct Harness {
+        handler: PreconfRpcHandler<NoopTransactionPool<OpPooledTransaction>, MockEthProvider>,
+        classifier: Arc<PreconfClassifier>,
+        fifo: Arc<PreconfTxSet>,
+        signer: PrivateKeySigner,
+        journal: Arc<PreconfJournal>,
+        /// Owns the journal file's directory: dropping it deletes the file, so
+        /// it has to outlive `handler`. The journal is mandatory, so there is no
+        /// "no persistence" variant of this harness to fall back on.
+        _journal_dir: tempfile::TempDir,
+    }
+
+    async fn harness() -> Harness {
+        let signer =
+            PrivateKeySigner::from_bytes(&B256::from([0x11; 32])).expect("valid secp256k1 scalar");
+
+        let classifier = Arc::new(PreconfClassifier::new(
+            false,
+            Duration::from_secs(3600),
+            DEFAULT_VERDICT_CACHE_CAP,
+        ));
+        classifier.update_whitelist(
+            [(signer.address(), RECIPIENT)].into_iter().collect(),
+            HashSet::default(),
+            HashSet::default(),
+        );
+
+        // Nonce 0 on chain, so a nonce-0 submission clears Step 2's gap gate
+        // (`NoopTransactionPool` reports no pending tx for the sender).
+        let provider = MockEthProvider::default();
+        provider.add_account(signer.address(), ExtendedAccount::new(0, U256::from(1u64)));
+
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        let cfg = PreconfConfig {
+            enabled: true,
+            preconf_max_gas_per_tx: 1_000_000,
+            ..Default::default()
+        };
+
+        let journal_dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(
+            PreconfJournal::open(journal_dir.path().join("preconf.jsonl"), cfg.journal_max_size)
+                .await
+                .expect("journal opens in a fresh temp dir"),
+        );
+
+        let handler = PreconfRpcHandler::new(
+            NoopTransactionPool::<OpPooledTransaction>::new(),
+            provider,
+            fifo.clone(),
+            Arc::new(cfg),
+            classifier.clone(),
+            journal.clone(),
+        );
+        Harness { handler, classifier, fifo, signer, journal, _journal_dir: journal_dir }
+    }
+
+    /// A genuinely signed EIP-1559 transfer, encoded the way the wire delivers
+    /// it. Step 0 recovers the sender cryptographically, so the fabricated
+    /// `Signature::test_signature()` + `Signed::new_unchecked` shape the
+    /// validator fixture uses would not survive the decode.
+    fn signed_raw_tx(signer: &PrivateKeySigner, nonce: u64, gas_limit: u64) -> (Bytes, B256) {
+        let tx = TxEip1559 {
+            chain_id: 10,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(RECIPIENT),
+            value: U256::from(1u64),
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).expect("in-memory signer");
+        let signed = tx.into_signed(signature);
+        let hash = *signed.hash();
+        (TxEnvelope::Eip1559(signed).encoded_2718().into(), hash)
+    }
+
+    /// A pool refusal drops the verdict this request froze at Step 3b.
+    ///
+    /// Without it the hash keeps an `Eligible` verdict for a transaction that
+    /// is not in the pool, and a verdict is immutable for the life of the
+    /// transaction — so the sender could never get this transaction
+    /// preconfirmed again, and the grace sweep would be the only way out.
+    ///
+    /// The `(sender, nonce)` slot is deliberately **not** asserted: Step 3b
+    /// claims no slot (that is `admit_and_claim`'s job, inside the pool's own
+    /// admission, which `NoopTransactionPool` never reaches).
+    #[tokio::test]
+    async fn a_pool_refusal_releases_the_verdict_the_request_froze() {
+        let h = harness().await;
+        let (raw, hash) = signed_raw_tx(&h.signer, 0, 21_000);
+
+        let err = h.handler.handle_inner(raw).await.expect_err("the noop pool refuses everything");
+        assert!(
+            err.message().contains("pool rejected"),
+            "the refusal must surface as PoolRejected, not some earlier gate: {}",
+            err.message(),
+        );
+
+        assert_eq!(h.classifier.verdict(&hash), None, "the frozen verdict must be released");
+        assert!(!h.fifo.contains(&hash).await, "and no responder may stay parked");
+    }
+
+    /// The same refusal must **not** drop a promised commitment.
+    ///
+    /// Reachable shape: the transaction was applied and its `Success` receipt
+    /// returned, so `record_commitment` → `mark_promised` ran, but its block is
+    /// **not yet canonical** — so no `committed_height` guards the record. A
+    /// same-hash resubmit inside that window is re-validated (the transaction is
+    /// still pooled, so nothing deduplicates it) and can be refused on account
+    /// state alone: Mantle recomputes `extra_balance_cost` every validation.
+    /// Both preconditions are established through the production calls in
+    /// production order — Step 3b's `claim_preconf`, then `record_commitment`'s
+    /// `mark_promised` — with only the block application elided; the refusal
+    /// comes from the pool, not a hand-set flag.
+    ///
+    /// The assertions key on `is_promised()`, not `verdict == Promised`, because
+    /// `mark_promised` sets the flag without rewriting the verdict — so the
+    /// normal flow leaves `Eligible` + promised. See `release_preconf_claim` for
+    /// why that distinction is what keeps the record alive here.
+    #[tokio::test]
+    async fn a_pool_refusal_must_not_drop_a_promised_commitment() {
+        let h = harness().await;
+        let (raw, hash) = signed_raw_tx(&h.signer, 0, 21_000);
+        let sender = h.signer.address();
+
+        assert_eq!(h.classifier.claim_preconf(hash, &sender, Some(&RECIPIENT)), Ok(()));
+        assert_eq!(h.classifier.mark_promised(hash, &sender, 0, 0), Ok(()));
+        assert_eq!(
+            h.classifier.verdict(&hash),
+            Some(Verdict::Eligible),
+            "the normal flow leaves the verdict alone; only the flag is set",
+        );
+
+        h.handler.handle_inner(raw).await.expect_err("the pool refuses the resubmit");
+
+        assert!(h.classifier.is_promised(&hash), "the commitment record must survive the refusal");
+        assert_eq!(
+            h.classifier.slot_owner(&sender, 0),
+            Some(hash),
+            "and so must the nonce it was promised against",
+        );
+    }
+
+    /// An EVM revert that produced a receipt is a commitment like any other —
+    /// see `record_commitment` for why the gate is not on `Success`.
+    ///
+    /// Both halves are asserted because the failure mode of such a gate is
+    /// precisely that they disagree: `builder::dispatch` marks the fifo entry
+    /// `Success` regardless, so the fifo would say "committed" while the
+    /// classifier and the journal had never heard of the transaction.
+    #[tokio::test]
+    async fn a_reverted_receipt_is_still_recorded_as_a_commitment() {
+        let h = harness().await;
+        let (raw, hash) = signed_raw_tx(&h.signer, 0, 21_000);
+        let sender = h.signer.address();
+
+        let event = PreconfTxEvent::from(PreconfReceipt {
+            tx_hash: hash,
+            block_height: 42,
+            status: false, // EVM revert — a receipt exists all the same
+            logs: vec![],
+            gas_used: 21_000,
+            reason: "execution reverted".to_string(),
+            revert_data: PrimBytes::new(),
+        });
+        assert_eq!(event.status, WireStatus::Failed, "precondition: this is the reverted arm");
+
+        h.handler.record_commitment(&event, hash, &sender, 0, &raw).await;
+
+        assert!(
+            h.classifier.is_promised(&hash),
+            "the classifier must know the commitment, or a reorg reinject is \
+             re-gated as a fresh submission and `mark_committed` cannot count it",
+        );
+        let (entries, _bad) = h.journal.load().await.expect("journal reads back");
+        assert_eq!(
+            entries.iter().map(|e| e.hash).collect::<Vec<_>>(),
+            vec![hash],
+            "and it must be on disk, or a crash before sealing loses a receipt \
+             the client is already holding",
+        );
     }
 }

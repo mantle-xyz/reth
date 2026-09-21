@@ -4,7 +4,7 @@
 //!
 //! The adapter is generic over the same three type parameters as
 //! [`crate::pool_ext::preconf_pool_listener::PreconfPoolListener`] and
-//! shares its [`op_envelope_to_alloy`](super::preconf_pool_listener::op_envelope_to_alloy)
+//! shares its `op_envelope_to_alloy`
 //! helper so the "which OP tx variants are preconf-eligible" decision
 //! stays in one place.
 //!
@@ -27,15 +27,18 @@
 
 use std::{marker::PhantomData, sync::Arc};
 
+use alloy_primitives::Address;
 use async_trait::async_trait;
 use op_alloy_consensus::OpTxEnvelope;
+use reth_prune_types::PruneSegment;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
+use reth_storage_api::{DatabaseProviderFactory, PruneCheckpointReader, TransactionsProvider};
 use reth_transaction_pool::{
     PoolPooledTx, PoolTransaction, TransactionOrigin, TransactionPool, error::PoolErrorKind,
 };
 
 use super::preconf_pool_listener::op_envelope_to_alloy;
-use crate::journal::{RestorePool, RestoredEnvelope};
+use crate::journal::{CommitmentChainView, OnChain, RestorePool, RestoreSkip, RestoredEnvelope};
 
 /// Adapter that lets a live [`TransactionPool`] play the [`RestorePool`]
 /// role during startup restore.
@@ -93,13 +96,18 @@ where
         let _ = self.pool.remove_transactions(hashes);
     }
 
+    fn recover_slot(&self, tx_rlp: &alloy_primitives::Bytes) -> Option<(Address, u64)> {
+        let recovered = recover_raw_transaction::<PoolPooledTx<P>>(tx_rlp.as_ref()).ok()?;
+        Some((recovered.signer(), alloy_consensus::Transaction::nonce(recovered.inner())))
+    }
+
     async fn add_envelope(
         &self,
         tx_rlp: &alloy_primitives::Bytes,
-    ) -> Result<RestoredEnvelope, String> {
+    ) -> Result<RestoredEnvelope, RestoreSkip> {
         // Decode + recover — same pipeline the RPC handler uses.
         let recovered = recover_raw_transaction::<PoolPooledTx<P>>(tx_rlp.as_ref())
-            .map_err(|e| format!("decode/recover failed: {e}"))?;
+            .map_err(|e| RestoreSkip::Rejected(format!("decode/recover failed: {e}")))?;
         let sender = recovered.signer();
 
         // Extract the alloy `TxEnvelope` for fifo push. Deposit /
@@ -108,18 +116,33 @@ where
         // defensively — matches the listener's filter.
         let consensus = <Tx as PoolTransaction>::pooled_into_consensus(recovered.inner().clone());
         let op_env: OpTxEnvelope = consensus.into();
-        let envelope = op_envelope_to_alloy(op_env)
-            .ok_or_else(|| "non-preconf-eligible variant (Deposit / PostExec)".to_string())?;
+        let envelope = op_envelope_to_alloy(op_env).ok_or_else(|| {
+            RestoreSkip::Rejected("non-preconf-eligible variant (Deposit / PostExec)".to_string())
+        })?;
 
-        // Attempt to admit. `AlreadyImported` is expected and benign:
-        // reth's own local-tx backup may have restored the same tx
-        // from disk before we ran. The restore path still needs the
-        // recovered envelope regardless.
+        // Attempt to admit. `AlreadyImported` is benign: the restore path needs
+        // the recovered envelope either way. It is defensive rather than expected
+        // — `cli::node` runs restore before `spawn_maintenance_tasks` spawns
+        // reth's local-tx backup loader, so that loader cannot be what put the
+        // tx there.
         let pool_tx = <Tx as PoolTransaction>::from_pooled(recovered);
         match self.pool.add_transaction(TransactionOrigin::External, pool_tx).await {
             Ok(_) => {}
             Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
-            Err(e) => return Err(format!("pool rejected: {}", e.kind)),
+            // The sender's nonce has moved past this transaction — which is
+            // **not** the same as "this transaction is on chain".
+            // `is_nonce_too_low` reduces to
+            // `NonceNotConsistent { tx, state } => tx < state`, and
+            // `validate_sender_nonce` compares the tx's nonce against the
+            // *account's* nonce, never the hash: a different transaction on the
+            // same nonce yields a byte-identical error. So don't conclude — the
+            // caller asks the chain; all this arm can report is that the nonce is
+            // gone.
+            Err(e) if matches!(&e.kind, PoolErrorKind::InvalidTransaction(err) if err.is_nonce_too_low()) =>
+            {
+                return Err(RestoreSkip::NonceConsumed(format!("{}", e.kind)));
+            }
+            Err(e) => return Err(RestoreSkip::Rejected(format!("pool rejected: {}", e.kind))),
         }
 
         Ok(RestoredEnvelope { envelope, from: sender })
@@ -132,3 +155,62 @@ where
 // through this module is convenient.
 #[allow(dead_code)]
 type _ArcHint<P, Tx, Cons> = Arc<RestorePoolAdapter<P, Tx, Cons>>;
+
+/// Lets a node provider answer the restore path's chain question — whether a
+/// commitment whose nonce is gone is the transaction that consumed it.
+///
+/// A wrapper rather than a blanket impl, which would forbid the scripted stubs
+/// the restore tests need (coherence cannot prove a local type does *not*
+/// implement the bounds).
+///
+/// Both halves are plain provider reads and every node provider has them —
+/// `FullProvider` requires `BlockReaderIdExt` (⊃ `BlockReader` ⊃
+/// `TransactionsProvider`) on the handle itself, and `PruneCheckpointReader` on
+/// its `DatabaseProviderFactory::Provider`; see the where-clause below.
+#[derive(Debug, Clone)]
+pub struct ProviderChainView<P>(P);
+
+impl<P> ProviderChainView<P> {
+    /// Wrap a provider for use with [`crate::restore_preconf_state`].
+    pub const fn new(provider: P) -> Self {
+        Self(provider)
+    }
+}
+
+impl<P> CommitmentChainView for ProviderChainView<P>
+where
+    // Exactly what `FullProvider` guarantees, so
+    // callers need no extra where-clause of
+    // their own. See the type docs.
+    P: TransactionsProvider
+        + DatabaseProviderFactory<Provider: PruneCheckpointReader>
+        + Send
+        + Sync,
+{
+    /// `Unknown` on any miss once the transaction-lookup segment has **ever** been pruned:
+    /// `JournalEntry::block_height` is only a prediction, so "the prune missed it" cannot be
+    /// decided. Pruning is thus incompatible with preconf; until it first runs, a miss reads `No`.
+    fn commitment_on_chain(&self, hash: &alloy_primitives::TxHash) -> OnChain {
+        // `_with_meta` rather than the plain lookup: the caller needs the block
+        // number to start the retention clock, and it sits on the same trait, so
+        // this costs no extra bound and no second query.
+        match self.0.transaction_by_hash_with_meta(*hash) {
+            Ok(Some((_, meta))) => OnChain::Yes { height: meta.block_number },
+            Ok(None) => {
+                // Only on a miss, and a miss only happens for an entry whose
+                // nonce is already gone — so at most once per lost commitment,
+                // once per process start.
+                let pruned = self
+                    .0
+                    .database_provider_ro()
+                    .and_then(|db| db.get_prune_checkpoint(PruneSegment::TransactionLookup));
+                match pruned {
+                    Ok(None) => OnChain::No,
+                    // Pruned, or we cannot even tell whether it was pruned.
+                    Ok(Some(_)) | Err(_) => OnChain::Unknown,
+                }
+            }
+            Err(_) => OnChain::Unknown,
+        }
+    }
+}

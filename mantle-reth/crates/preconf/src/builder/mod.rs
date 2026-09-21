@@ -9,7 +9,7 @@
 //!
 //! - [`payload_builder`] — the fork itself: struct + `async build_payload` (deposits → sequencer
 //!   txs → preconf select! loop → SDM post-exec → finalize).
-//! - [`dispatch`] — the select! loop's per-event fifo state machine (`apply_one_preconf`) plus the
+//! - `dispatch` — the select! loop's per-event fifo state machine (`apply_one_preconf`) plus the
 //!   same-sender cascade state (`LoopState`), separated so the state-machine invariants are
 //!   unit-testable without standing up the full EVM stack. Block-capacity admission
 //!   (`preconf_admission` / `admit_and_dispatch`) lives in [`payload_builder`] where the block

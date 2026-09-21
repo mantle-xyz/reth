@@ -70,7 +70,8 @@ impl<Attrs, Payload> PreconfPayloadJob<Attrs, Payload> {
     /// Construct a new job bound to a spawned build task.
     ///
     /// Typically called from
-    /// [`PreconfPayloadJobGenerator::new_payload_job`](crate::builder::payload_job_generator::PreconfPayloadJobGenerator::new_payload_job)
+    /// `PreconfPayloadJobGenerator`'s
+    /// [`new_payload_job`](reth_payload_builder::PayloadJobGenerator::new_payload_job)
     /// after spawning the build future. Tests can call this directly
     /// to inject a pre-filled `watch::Receiver`.
     pub fn new(

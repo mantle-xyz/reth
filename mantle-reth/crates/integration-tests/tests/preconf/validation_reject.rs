@@ -11,12 +11,15 @@
 //!
 //! ### Preconf-specific rejections
 //!
-//! - **Whitelist gate** (`is_preconf_tx`, `rpc.rs`) — rejects non-whitelisted `(sender, to)` before
-//!   `attach_responder`.
+//! - **Whitelist gate** (`PreconfClassifier::preview_eligibility`, `rpc.rs`) — rejects
+//!   non-whitelisted `(sender, to)` before `attach_responder`.
 //! - **Nonce-gap gate** (`rpc.rs`) — rejects `tx.nonce > pending_nonce` before `attach_responder`
 //!   and before `pool.add_transaction`.
-//! - **Preconf per-tx gas ceiling** (`PreconfAwareValidator`, pool layer) — rejects `tx.gas_limit >
-//!   preconf_max_gas_per_tx` at pool admission with a typed `PreconfGasLimitExceeded`.
+//! - **Preconf per-tx gas ceiling** (`rpc.rs` Step 3b) — rejects `tx.gas_limit >
+//!   preconf_max_gas_per_tx` before the verdict is written and before the pool is asked, with a
+//!   typed `PreconfError::PreconfGasLimitExceeded`. `PreconfAwareValidator` carries the same
+//!   ceiling as defence in depth, but it gates on an already-frozen eligible verdict and so cannot
+//!   be reached through this RPC — see `per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool`.
 //!
 //! ### Generic pool-validator rejections
 //!
@@ -171,18 +174,23 @@ async fn nonce_gap_rejected_synchronously() {
     );
 }
 
-/// Per-tx gas ceiling is enforced at **pool admission**.
+/// Per-tx gas ceiling is enforced at the **RPC**, before the pool is asked.
 ///
-/// Setup: `max_gas_per_tx = 20_000`. Submit a 21k-gas transfer. The
-/// `PreconfAwareValidator` rejects the tx with `PreconfGasLimitExceeded`
-/// **before** it enters the pool; the RPC handler's
-/// `pool.add_transaction` call fails and surfaces as
-/// `PreconfError::PoolRejected(...)`.
+/// Setup: `max_gas_per_tx = 20_000`. Submit a 21k-gas transfer. `rpc.rs`
+/// Step 3b checks the ceiling before it writes the verdict and before
+/// `pool.add_transaction`, so the client gets
+/// `PreconfError::PreconfGasLimitExceeded`.
 ///
-/// No fifo entry is created, no responder is parked → the failure is
-/// synchronous (well under `preconf_timeout`).
+/// Hence the negative assertion below: `PreconfAwareValidator` carries its own copy of the
+/// ceiling as defence in depth (see `validator.rs`), and both Displays mention
+/// `preconf_max_gas_per_tx` — so matching the substring the two arms share proves nothing,
+/// and the test must also state which arm did *not* produce it.
+///
+/// The failure is synchronous (well under `preconf_timeout`): no fifo entry
+/// is created, and the responder attached at Step 3 is cancelled on the way
+/// out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn per_tx_gas_ceiling_pool_rejects_before_fifo() {
+async fn per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
@@ -212,13 +220,26 @@ async fn per_tx_gas_ceiling_pool_rejects_before_fifo() {
     match err {
         ClientError::Call(ref e) => {
             let msg = e.message().to_lowercase();
-            // The pool wraps the validator's error into
-            // `PreconfError::PoolRejected("{PreconfGasLimitExceeded}")`
-            // whose Display is
-            // "preconf-eligible tx gas limit exceeds `preconf_max_gas_per_tx`".
+            // `PreconfError::PreconfGasLimitExceeded`'s Display —
+            // "preconf gas limit exceeded: tx gas limit {n} exceeds
+            // preconf_max_gas_per_tx {max}". It names both numbers, so pin
+            // them: the RPC knows the request's own gas limit, whereas the
+            // validator's `PreconfGasLimitExceeded` carries neither.
             assert!(
-                msg.contains("preconf-eligible") || msg.contains("preconf_max_gas_per_tx"),
-                "unexpected error message: {}",
+                msg.contains("preconf gas limit exceeded"),
+                "expected the RPC's own ceiling error; got {}",
+                e.message(),
+            );
+            assert!(
+                msg.contains("21000") && msg.contains("20000"),
+                "the RPC error must name the offending limit and the cap; got {}",
+                e.message(),
+            );
+            // The discriminating half. Without it, the validator's copy of the
+            // ceiling firing instead would read as a pass.
+            assert!(
+                !msg.contains("pool rejected"),
+                "the pool must never have been asked; got {}",
                 e.message(),
             );
         }
@@ -381,11 +402,14 @@ async fn insufficient_funds_pool_rejects() {
 /// NOT catch this first — the underlying pool validator's block-gas-limit
 /// check is what fires.
 ///
-/// Distinct from `per_tx_gas_ceiling_pool_rejects_before_fifo` (which
-/// tests the preconf-specific `PreconfGasLimitExceeded`); this test
-/// pins the wire surface for the reth-native `ExceedsGasLimit`-flavoured
-/// error, which SDKs cannot distinguish from other pool rejections
-/// without message parsing.
+/// Distinct from `per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool`, and the
+/// contrast is the point: there the preconf-specific ceiling fires at the RPC
+/// *before the pool is ever asked*, so the client gets
+/// `PreconfError::PreconfGasLimitExceeded`. Here both preconf caps are lifted
+/// out of the way on purpose, so the transaction reaches the pool and comes back
+/// wrapped in `PoolRejected` — the reth-native `ExceedsGasLimit` flavour, which
+/// SDKs cannot distinguish from any other pool rejection without parsing the
+/// message. The two tests pin the two sides of that boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn block_gas_limit_exceeded_pool_rejects() {
     let recipient: Address = RECIPIENT.parse().unwrap();

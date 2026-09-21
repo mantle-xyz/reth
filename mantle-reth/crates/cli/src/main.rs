@@ -59,13 +59,14 @@ fn main() {
                         );
                     }
                     let journal = cfg.journal_path.clone();
+                    let whitelist = cfg.whitelist_contract;
                     let svc = PreconfServiceBuilder::from_config(cfg)
                         .await
                         .map_err(|e| eyre::eyre!("preconf service init: {e}"))?;
                     node = node.with_preconf(svc);
                     info!(
                         target: "reth::cli",
-                        "Mantle preconf ENABLED (all_preconfs={all}, journal={journal:?})",
+                        "Mantle preconf ENABLED (all_preconfs={all}, whitelist_contract={whitelist:?}, journal={journal:?})",
                     );
                 }
                 None => {
@@ -88,6 +89,13 @@ fn main() {
 /// Without the flag this is the plain launch path. With it, the ExEx (write side), the
 /// `eth_getProof` / `debug_*` RPC overrides (read side), and the storage metrics task are
 /// wired up against a shared MDBX sidecar handle.
+///
+/// The preconf whitelist cold start + watcher deliberately do **not** live in the
+/// `on_node_started` hooks below. Those run once the RPC server, payload builder and
+/// consensus engine are already accepting work, and a preconf tx admitted before the
+/// allowlists have loaded would have its verdict frozen as ineligible for good — a verdict
+/// is immutable for the life of the transaction. They run inside
+/// `MantlePoolBuilder::build_pool` instead; see the comment there.
 async fn launch_node(
     builder: WithLaunchContext<NodeBuilder<DatabaseEnv, OpChainSpec>>,
     node: MantleNode,

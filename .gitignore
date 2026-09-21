@@ -2,3 +2,7 @@
 **/*.rs.bk
 *.pdb
 .env
+
+docs
+logs
+.zcode

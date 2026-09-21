@@ -4,9 +4,9 @@
 //!
 //! ## Lifecycle (per slot)
 //!
-//! 1. CL hits `engine_forkchoiceUpdatedVx`. The payload service calls [`Self::new_payload_job`]
-//!    with the new [`BuildNewPayload<Attrs>`].
-//! 2. The generator looks up the parent header via [`BlockReaderIdExt::sealed_header_by_hash`] and
+//! 1. CL hits `engine_forkchoiceUpdatedVx`. The payload service calls
+//!    [`PayloadJobGenerator::new_payload_job`] with the new [`BuildNewPayload<Attrs>`].
+//! 2. The generator looks up the parent header via [`HeaderProvider::sealed_header_by_hash`] and
 //!    assembles a [`BuildArguments`] in the upstream shape (so we can reuse the fork's
 //!    `build_payload` signature verbatim).
 //! 3. A fresh [`JobCancel`] and a `watch::channel(None)` are created. A tokio task is spawned that
@@ -21,14 +21,14 @@
 //!
 //! ## `ensure_only_one_payload`
 //!
-//! [`Self::new_payload_job`] signal-cancels the previously spawned build, keeping **at most one
-//! live**. Otherwise a build that is never resolved (`getPayload`) nor evicted (reorg `Drop`) would
-//! linger forever — still subscribed to the shared [`PreconfTxSet`] broadcast — and could apply
-//! preconf txs into a block that never commits, stealing them from the job that will. It is a no-op
-//! in steady state (the previous job was already cancelled by its own `resolve_kind`); it only
-//! matters for abandoned / superseded jobs. Upstream [`BasicPayloadJobGenerator`] instead bounds
-//! job lifetime with a per-job deadline, which we avoid — it would cut a slow build short and break
-//! the preconf must-land SLA.
+//! [`PayloadJobGenerator::new_payload_job`] signal-cancels the previously spawned build, keeping
+//! **at most one live**. Otherwise a build that is never resolved (`getPayload`) nor evicted (reorg
+//! `Drop`) would linger forever — still subscribed to the shared [`PreconfTxSet`] broadcast — and
+//! could apply preconf txs into a block that never commits, stealing them from the job that will.
+//! It is a no-op in steady state (the previous job was already cancelled by its own
+//! `resolve_kind`); it only matters for abandoned / superseded jobs. Upstream
+//! [`BasicPayloadJobGenerator`] instead bounds job lifetime with a per-job deadline, which we avoid
+//! — it would cut a slow build short and break the preconf must-land SLA.
 //!
 //! ## What this generator does NOT do (yet)
 //!
@@ -40,7 +40,7 @@
 //!
 //! [`PayloadJobGenerator`]: reth_payload_builder::PayloadJobGenerator
 //! [`PreconfPayloadBuilder::build_payload`]: crate::builder::payload_builder::PreconfPayloadBuilder::build_payload
-//! [`BlockReaderIdExt::sealed_header_by_hash`]: reth_storage_api::BlockReaderIdExt::sealed_header_by_hash
+//! [`HeaderProvider::sealed_header_by_hash`]: reth_storage_api::HeaderProvider::sealed_header_by_hash
 
 use std::{
     marker::PhantomData,

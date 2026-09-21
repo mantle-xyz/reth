@@ -42,16 +42,51 @@ use std::sync::Arc;
 use tracing::debug;
 
 /// Preconfirmation transaction event returned by `eth_sendRawTransactionWithPreconf`.
+///
+/// # What a preconfirmation does and does not promise
+///
+/// This event is produced the moment the sequencer applies the transaction to the
+/// block it is **currently building** — before that block is sealed, and long
+/// before it is canonical. So it is a prediction, not a record:
+///
+/// - **`tx_hash` is binding.** The sequencer has committed to landing *this* transaction, and holds
+///   the `(sender, nonce)` it occupies against any other transaction for as long as the commitment
+///   stands. The one exception is a breach: if the transaction later proves un-appliable (its nonce
+///   was consumed elsewhere, its balance spent), the sequencer releases the nonce so the sender is
+///   not wedged, and logs `COMMITMENT BROKEN` / `preconf.tx.commitment_broken_total`. A client that
+///   re-submits the same hash then gets `CommitmentBroken` — the only channel through which the
+///   breach is reported.
+/// - **Everything else is a prediction of one particular build.** If that in-flight block is
+///   discarded (a competing block takes the height, the payload job is superseded, the process
+///   restarts), the sequencer re-applies the transaction to a *later* block — honouring the
+///   promise, but against different state. `block_height`, `status` and `receipt.logs` are all
+///   recomputed then, and the client is **not** sent a corrected event: the response to this call
+///   has already been delivered.
+///
+/// Consequently, **do not reconcile on the fields of this event**. Treat it as
+/// "accepted, will land", and read the authoritative outcome from
+/// `eth_getTransactionReceipt` once the transaction is on chain. In particular a
+/// `Success` here can be followed by a failed on-chain receipt if the
+/// transaction reverts when replayed against later state.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreconfTxEvent {
-    /// Transaction hash
+    /// Transaction hash. The one field that is binding — see the type docs.
     pub tx_hash: B256,
-    /// Preconfirmation status
+    /// Preconfirmation status, as evaluated against the in-flight block.
+    ///
+    /// **May differ from the eventual on-chain receipt.** A cross-block replay
+    /// re-executes against different state, so a `Success` here can end up as a
+    /// reverted on-chain receipt (and vice versa). Not a reconciliation source.
     pub status: PreconfStatus,
     /// Optional failure message
     pub reason: String,
-    /// Predicted L2 block number (hex-encoded quantity)
+    /// **Predicted** L2 block number (hex-encoded quantity).
+    ///
+    /// Computed as `parent_number + 1` for the block being built when this
+    /// preconfirmation was issued. If that block is discarded the transaction
+    /// lands at a **later** height and this value is never corrected. Use
+    /// `eth_getTransactionReceipt` for the authoritative height.
     #[serde(with = "alloy_serde::quantity")]
     pub block_height: u64,
     /// Preconfirmation transaction receipt
@@ -102,10 +137,12 @@ pub struct PreconfTxReceipt {
     /// wire (`invalid type: null, expected a sequence`) *and* would re-serialize an empty result
     /// as `[]`, diverging from geth. `Option<Vec<_>>` deserializes null→None and re-serializes
     /// None→null, so a forwarding reth node returns byte-identical shape to the geth sequencer.
+    /// The `null` / `[]` distinction is the one described on the type above.
     ///
-    /// (Internally the preconf handler also uses this: `None` ⇒ no EVM apply happened —
-    /// Timeout / server pre-apply reject — while `Some(vec![])` ⇒ apply happened but emitted
-    /// no logs.)
+    /// Like every other field of [`PreconfTxEvent`] except `tx_hash`, these are
+    /// the logs of one particular in-flight execution. A cross-block replay
+    /// re-executes against different state and can emit different logs, with no
+    /// corrected event sent. Read `eth_getTransactionReceipt` to reconcile.
     #[serde(default)]
     pub logs: Option<Vec<PreconfLog>>,
 }
