@@ -14,6 +14,16 @@ const MANTLE_MAINNET_GENESIS_HASH: alloy_primitives::B256 =
     alloy_primitives::b256!("0xcd3253817bbf6ae83c9839c362a0688a83d59d2fabeb9463b348cc98c4b056aa");
 
 /// The Mantle Mainnet spec with hardcoded Mantle hardfork timestamps.
+///
+/// Its genesis header is the synthetic block zero used to identify databases created by Mantle's
+/// supported mid-chain import workflow, not the public historical block zero. Its raw and sealed
+/// hashes must remain equal and stable: changing this identity makes existing MDBX databases fail
+/// the genesis compatibility check at startup.
+///
+/// This identity does not drive historical block derivation. `init-state --without-evm` inserts a
+/// supplied post-Skadi anchor header and state, filling earlier heights only for storage
+/// continuity, and `import-op` imports subsequent blocks directly. Those imported blocks therefore
+/// do not depend on this synthetic header matching Mantle's public historical block zero.
 pub static MANTLE_MAINNET: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
     let genesis = create_mantle_mainnet_genesis();
     let mut spec = crate::from_mantle_genesis(genesis);
@@ -24,6 +34,10 @@ pub static MANTLE_MAINNET: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
 });
 
 fn create_mantle_mainnet_genesis() -> alloy_genesis::Genesis {
+    // Keep the legacy lowercase `extradata` key in `mantle.json` exactly as shipped. It is not
+    // deserialized by `alloy-genesis`, leaving the synthetic header's `extra_data` empty. This is
+    // intentional: normalizing it to `extraData` changes the raw genesis hash and would require a
+    // new database identity that existing MDBX databases reject at startup.
     let mut genesis: alloy_genesis::Genesis =
         serde_json::from_str(include_str!("../res/genesis/mantle.json"))
             .expect("invalid Mantle mainnet genesis JSON");
@@ -51,15 +65,19 @@ mod tests {
     }
 
     #[test]
-    fn verify_mantle_mainnet_genesis_hash() {
+    fn verify_mantle_mainnet_genesis_raw_hash() {
         let header = MANTLE_MAINNET.genesis_header();
-        assert_eq!(
-            MANTLE_MAINNET.genesis_hash(),
-            alloy_primitives::b256!(
-                "0xcd3253817bbf6ae83c9839c362a0688a83d59d2fabeb9463b348cc98c4b056aa"
-            )
+        assert_eq!(header.hash_slow(), MANTLE_MAINNET_GENESIS_HASH);
+        assert_eq!(MANTLE_MAINNET.genesis_hash(), MANTLE_MAINNET_GENESIS_HASH);
+
+        // The built-in genesis is a database identity for the supported mid-chain import flow,
+        // not Mantle's public historical block zero. `init-state --without-evm` inserts the
+        // supplied post-Skadi anchor, and `import-op` imports later blocks directly, so those
+        // historical blocks are not derived from this synthetic header and the hashes may differ.
+        let public_block_zero_hash = alloy_primitives::b256!(
+            "0x0a0eb32c4b024b28da5bf83356f7987c1b0612bbfbc9156186c59c834bfcd013"
         );
-        let _ = header;
+        assert_ne!(MANTLE_MAINNET_GENESIS_HASH, public_block_zero_hash);
     }
 
     #[test]
