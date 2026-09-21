@@ -23,6 +23,7 @@ reth-storage-errors.workspace = true
 reth-trie-common.workspace = true
 
 # op-reth
+op-alloy-consensus.workspace = true
 reth-optimism-forks.workspace = true
 reth-optimism-primitives.workspace = true
 
@@ -50,7 +51,6 @@ alloy-chains.workspace = true
 alloy-hardforks.workspace = true
 alloy-op-hardforks.workspace = true
 
-op-alloy-consensus.workspace = true
 mantle-reth-chainspec.workspace = true
 
 [features]
