@@ -43,9 +43,9 @@ use tracing::{debug, trace, warn};
 use reth_payload_builder_primitives::PayloadBuilderError;
 
 use crate::{
-    ApplyHold, PreconfConfig, PreconfTxSet,
+    ApplyHold, PreconfConfig, PreconfTxSet, SuccessOutcome,
     apply::ApplyError,
-    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
+    types::{PreconfError, PreconfReceipt, PreconfSource},
 };
 
 /// How a sender's preconf chain is blocked for the rest of the current slot
@@ -312,8 +312,9 @@ where
     // been promised yet. Once a receipt has gone out — whether this round
     // (`Success`) or in an earlier one (`Replay`) — refusing the tx here would
     // silently break that promise, so both bypass them.
-    let is_promised =
-        entry.status == PreconfStatus::Success || entry.source == PreconfSource::Replay;
+    // `Rpc` is the only source that carries no promise; `Applied` and `Replay`
+    // both mean a receipt has gone out.
+    let is_promised = entry.source != PreconfSource::Rpc;
 
     // Pre-apply deadline check — see crate-level docs. `cfg.safety_margin`
     // (default 40ms, see `DEFAULT_SAFETY_MARGIN`) is sized to slightly
@@ -414,16 +415,18 @@ where
             loop_state.preconf_gas_used =
                 loop_state.preconf_gas_used.saturating_add(receipt.gas_used);
             // No quorum: a success is a promise carryover keeps even if this
-            // block is discarded. `finish_success` refuses only when the
-            // deadline already finalised the entry — the sole way to preempt an
-            // in-flight success — and the receipt is then discarded.
+            // block is discarded.
             if let Some(hold) = loop_state.take_hold(&hash) &&
-                !fifo.finish_success(hold, receipt).await
+                fifo.finish_success(hold, receipt).await == SuccessOutcome::Gone
             {
+                // The deadline finalised it while we were applying — the one
+                // way an in-flight success is preempted. The tx is in this
+                // block regardless; the client was already told `Timeout`,
+                // which means "unknown", so nothing is owed here.
                 trace!(
                     target: "mantle::preconf::dispatch",
                     ?hash,
-                    "entry already finalised; success not recorded"
+                    "entry finalised during apply; receipt discarded"
                 );
             }
         }
@@ -471,6 +474,8 @@ where
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use crate::types::PreconfStatus;
 
     use alloy_consensus::{Signed, Transaction, TxLegacy};
     use alloy_primitives::{Address, B256, Bytes, Signature};
@@ -975,7 +980,10 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let hold = fifo.register(&hash).await.unwrap();
-        assert!(fifo.finish_success(hold, synthetic_receipt(hash)).await);
+        assert_eq!(
+            fifo.finish_success(hold, synthetic_receipt(hash)).await,
+            SuccessOutcome::Recorded,
+        );
         assert!(resp_rx.try_recv().is_ok(), "the first success delivered the receipt");
 
         let mut state = LoopState::new(1);

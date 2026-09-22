@@ -110,6 +110,22 @@ fn release_one(count: &AtomicUsize) -> usize {
         .saturating_sub(1)
 }
 
+/// What [`PreconfTxSet::finish_success`] did with a build's successful apply.
+/// `Redundant` is not a no-op — it re-arms the one-block protection — so it
+/// must not be lumped in with `Gone`, where nothing at all was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessOutcome {
+    /// First success on this entry: `Waiting → Success` and the receipt was
+    /// handed to the waiting client.
+    Recorded,
+    /// Already promised. The receipt is redundant and dropped, but the source
+    /// is re-armed to `Applied` so no failure quorum can bury it this round.
+    Redundant,
+    /// The entry is gone — the deadline finalised it first. Nothing recorded;
+    /// the responder belongs to whoever finalised it.
+    Gone,
+}
+
 /// Why [`PreconfTxSet::finalize_timeout`] did or did not act. `Absent` is
 /// distinct from `Exempt` because only the former leaves the caller holding
 /// cleanup it must do itself — a parked responder and a pool entry no build
@@ -414,10 +430,7 @@ impl PreconfTxSet {
         let mut inner = self.inner.lock().await;
         let mut demoted = 0;
         for entry in inner.entries.values_mut() {
-            if entry.status == PreconfStatus::Success &&
-                entry.source == PreconfSource::Rpc &&
-                !landed.contains(&entry.hash)
-            {
+            if entry.source == PreconfSource::Applied && !landed.contains(&entry.hash) {
                 entry.source = PreconfSource::Replay;
                 demoted += 1;
             }
@@ -455,28 +468,31 @@ impl PreconfTxSet {
         Some(ApplyHold { hash: *hash, applying: entry.applying.clone(), consumed: false })
     }
 
-    /// Record a successful apply: `Waiting → Success`, responder answered. No
-    /// quorum — carryover can still keep the promise if this block is dropped.
-    /// Returns `false` when the deadline already finalised the entry, the one
-    /// way an in-flight success is preempted; the receipt is then discarded and
-    /// the responder left to whoever finalised it.
-    pub async fn finish_success(&self, hold: ApplyHold, receipt: PreconfReceipt) -> bool {
+    /// Record a successful apply: `Waiting → Success`, responder answered, and
+    /// the source re-armed to `Applied`. No quorum — carryover can still keep
+    /// the promise if this block is dropped. See [`SuccessOutcome`] for the
+    /// other two cases.
+    pub async fn finish_success(&self, hold: ApplyHold, receipt: PreconfReceipt) -> SuccessOutcome {
         let hash = hold.hash();
         let mut inner = self.inner.lock().await;
         let _ = hold.take();
-        let Some(entry) = inner.entries.get_mut(&hash) else { return false };
-        if entry.status != PreconfStatus::Waiting {
-            // Another build already promised it; this one's receipt is
-            // redundant and its responder is not ours to answer.
-            return false;
+        let Some(entry) = inner.entries.get_mut(&hash) else { return SuccessOutcome::Gone };
+        if entry.status == PreconfStatus::Success {
+            // The receipt is redundant, but a build applied it *now*: re-arm
+            // the protection. Without this the success would leave no trace and
+            // a later failure quorum could bury a tx sitting in this round's
+            // block.
+            entry.source = PreconfSource::Applied;
+            return SuccessOutcome::Redundant;
         }
         entry.status = PreconfStatus::Success;
+        entry.source = PreconfSource::Applied;
         let responder = entry.responder.take();
         drop(inner);
         if let Some(r) = responder {
             let _ = r.send(Ok(receipt));
         }
-        true
+        SuccessOutcome::Recorded
     }
 
     /// Record a failing verdict — the build **tried** this tx and the builder
@@ -496,16 +512,13 @@ impl PreconfTxSet {
                 let _ = hold.take();
                 return false;
             };
-            // A success from *this* round is protected for one block: it has a
-            // real chance of being the adopted one. `canon_handler` demotes it
-            // to `Replay` once a canonical block has gone by without it, and
-            // from then on it is overturnable like anything else.
-            if entry.status == PreconfStatus::Success && entry.source == PreconfSource::Rpc {
+            // Applied this round: protected for one block, since it has a real
+            // chance of being the adopted one.
+            if entry.source == PreconfSource::Applied {
                 let _ = hold.take();
                 return false;
             }
-            let was_promised =
-                entry.status == PreconfStatus::Success || entry.source == PreconfSource::Replay;
+            let was_promised = entry.source != PreconfSource::Rpc;
             if hold.take() > 0 {
                 return false;
             }
@@ -544,7 +557,7 @@ impl PreconfTxSet {
         let responder = {
             let mut inner = self.inner.lock().await;
             let Some(entry) = inner.entries.get(hash) else { return TimeoutOutcome::Absent };
-            if entry.status != PreconfStatus::Waiting || entry.source == PreconfSource::Replay {
+            if entry.status != PreconfStatus::Waiting || entry.source != PreconfSource::Rpc {
                 return TimeoutOutcome::Exempt;
             }
             // Pool eviction shares the critical section with the removal — see
@@ -895,7 +908,7 @@ mod tests {
     /// Record a successful apply the way a build does.
     async fn succeed(set: &PreconfTxSet, hash: &TxHash) {
         let hold = set.register(hash).await.expect("entry present");
-        assert!(set.finish_success(hold, receipt(0)).await, "must record Success");
+        assert_eq!(set.finish_success(hold, receipt(0)).await, SuccessOutcome::Recorded);
     }
 
     // ============ Build holds & verdicts ============
@@ -953,7 +966,7 @@ mod tests {
         let w = set.find_by_hash(waiting.tx_hash()).await.unwrap();
         assert_eq!((w.status, w.source), (PreconfStatus::Waiting, PreconfSource::Rpc));
         let p = set.find_by_hash(promised.tx_hash()).await.unwrap();
-        assert_eq!((p.status, p.source), (PreconfStatus::Success, PreconfSource::Rpc));
+        assert_eq!((p.status, p.source), (PreconfStatus::Success, PreconfSource::Applied));
     }
 
     #[tokio::test]
@@ -994,7 +1007,7 @@ mod tests {
         let b = set.register(&hash).await.unwrap();
         assert_eq!(set.applying_count(&hash).await, Some(2));
 
-        assert!(set.finish_success(a, receipt(1)).await);
+        assert_eq!(set.finish_success(a, receipt(1)).await, SuccessOutcome::Recorded);
         assert_eq!(set.applying_count(&hash).await, Some(1), "B still holds it");
 
         assert!(!set.finish_failure(b, some_err()).await, "Rpc-sourced success is protected");
@@ -1014,8 +1027,47 @@ mod tests {
 
         let a = set.register(&hash).await.unwrap();
         let _b = set.register(&hash).await.unwrap();
-        assert!(set.finish_success(a, receipt(1)).await, "recorded despite a second holder");
+        assert_eq!(
+            set.finish_success(a, receipt(1)).await,
+            SuccessOutcome::Recorded,
+            "recorded despite a second holder",
+        );
         assert_eq!(set.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Success);
+    }
+
+    /// The interleaving that made `Applied` necessary: a build succeeds on an
+    /// entry that is *already* `Success`, so it writes no status — without
+    /// re-arming the source, the later failures would reach zero and bury a tx
+    /// that is sitting in this round's block.
+    #[tokio::test]
+    async fn a_success_on_an_already_promised_entry_re_arms_protection() {
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        let hash = *tx.tx_hash();
+        set.push_if_absent(tx, addr(1), PreconfSource::Replay).await;
+
+        // An earlier round promised it, then a canonical block went by.
+        succeed(&set, &hash).await;
+        assert_eq!(set.demote_unlanded_promises(&HashSet::new()).await, 1);
+        assert_eq!(set.find_by_hash(&hash).await.unwrap().source, PreconfSource::Replay);
+
+        let a = set.register(&hash).await.unwrap();
+        let b = set.register(&hash).await.unwrap();
+        let c = set.register(&hash).await.unwrap();
+
+        // A applies it again this round. Status is already `Success`, so the
+        // only trace it can leave is the source.
+        assert_eq!(
+            set.finish_success(a, receipt(1)).await,
+            SuccessOutcome::Redundant,
+            "receipt is redundant, but the protection is re-armed",
+        );
+        assert_eq!(set.find_by_hash(&hash).await.unwrap().source, PreconfSource::Applied);
+
+        // B and C fail. The count reaches zero, but A's success protects it.
+        assert!(!set.finish_failure(b, some_err()).await);
+        assert!(!set.finish_failure(c, some_err()).await);
+        assert!(set.contains(&hash).await, "a tx in this round's block must not be buried");
     }
 
     /// A success from this round is protected: it has a real chance of being
@@ -1069,7 +1121,11 @@ mod tests {
 
         let hold = set.register(&hash).await.unwrap();
         assert_eq!(set.finalize_timeout(&hash, Duration::ZERO).await, TimeoutOutcome::Finalised);
-        assert!(!set.finish_success(hold, receipt(1)).await, "entry already finalised");
+        assert_eq!(
+            set.finish_success(hold, receipt(1)).await,
+            SuccessOutcome::Gone,
+            "entry already finalised",
+        );
         assert!(!set.contains(&hash).await);
     }
 
@@ -1082,7 +1138,7 @@ mod tests {
         set.push_if_absent(done.clone(), addr(1), PreconfSource::Rpc).await;
         set.push_if_absent(replay.clone(), addr(2), PreconfSource::Replay).await;
         let hold = set.register(done.tx_hash()).await.unwrap();
-        assert!(set.finish_success(hold, receipt(1)).await);
+        assert_eq!(set.finish_success(hold, receipt(1)).await, SuccessOutcome::Recorded);
 
         assert_eq!(
             set.finalize_timeout(done.tx_hash(), Duration::ZERO).await,
@@ -1834,7 +1890,7 @@ mod proptest_model {
             }
             Op::Succeed(id) => {
                 if let Some(hold) = set.register(&id.hash()).await {
-                    set.finish_success(hold, receipt(id.hash_byte())).await;
+                    let _ = set.finish_success(hold, receipt(id.hash_byte())).await;
                 }
             }
             Op::Fail(id) => {
@@ -2150,7 +2206,7 @@ mod proptest_responder_model {
     /// handed the receipt.
     async fn succeed(set: &PreconfTxSet, model: &mut [HashState], b: u8) {
         if let Some(hold) = set.register(&h(b)).await {
-            set.finish_success(hold, receipt(b)).await;
+            let _ = set.finish_success(hold, receipt(b)).await;
         }
         let st = &mut model[b as usize];
         if st.entry == Some(PreconfStatus::Waiting) {

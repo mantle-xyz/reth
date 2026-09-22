@@ -58,7 +58,7 @@ use crate::{
     PreconfConfig, PreconfTxSet,
     apply::{ApplyError, apply_preconf_tx},
     builder::{cancel::JobCancel, dispatch},
-    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
+    types::{PreconfError, PreconfReceipt, PreconfSource},
 };
 
 // Replicated from upstream private helper
@@ -422,7 +422,7 @@ where
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
     // A promise already made — this round or an earlier one. The gates below
     // must not refuse it on this build's authority.
-    let is_promised = entry.status == PreconfStatus::Success || source == PreconfSource::Replay;
+    let is_promised = source != PreconfSource::Rpc;
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     drop(entry);

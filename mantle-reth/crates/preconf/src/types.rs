@@ -123,11 +123,17 @@ pub enum PreconfStatus {
 ///       They remain subject to the status / dedup gates and the underlying block gas limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
-    /// Live RPC submission — subject to all pre-apply gates.
+    /// Live RPC submission, nothing promised yet — subject to every pre-apply
+    /// gate. The only value a push can start with, alongside `Replay`.
     Rpc,
-    /// Replay of a previously-promised commitment (startup journal
-    /// restore or pool reorg reinject). Bypasses deadline and
-    /// gas-budget gates so promised txs are guaranteed to land.
+    /// A build applied it **this round** and the receipt went out. Protected:
+    /// no failure quorum may bury it until a canonical block has gone by
+    /// without it, at which point `canon_handler` demotes it to `Replay`.
+    /// Only reachable by transition, never by a push.
+    Applied,
+    /// A promise from an earlier round — journal restore, reorg reinject, or a
+    /// demoted `Applied`. Still must-land, so it bypasses the deadline and
+    /// gas-budget gates, but every build failing it can end it.
     Replay,
 }
 
