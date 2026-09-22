@@ -23,7 +23,7 @@ use reth_transaction_pool::{
     TransactionValidator, error::InvalidPoolTransactionError,
 };
 
-use crate::{config::PreconfConfig, preconf_tx_set::PreconfTxSet, types::PreconfStatus};
+use crate::{config::PreconfConfig, preconf_tx_set::PreconfTxSet};
 
 /// Replacement attempt blocked because an active preconf commitment already
 /// occupies `(sender, nonce)`.
@@ -140,30 +140,17 @@ where
         let to = Transaction::to(&transaction);
         let is_preconf_eligible = self.cfg.is_preconf_tx(&sender, to.as_ref());
 
-        // Replacement guard: only reclaimable terminal states release
-        // the (sender, nonce) slot — `Timeout` (client deadline),
-        // `Canceled` (block-gas-budget pre-apply reject), and `Failed` (reth builder
-        // pre-execute reject; tx NOT on chain). `Waiting` / `Success`
-        // block replacement (`Success` is on-chain or in-flight, so
-        // replacement would double-apply).
+        // While an entry exists the `(sender, nonce)` slot is taken and no
+        // replacement is possible: with several builds in flight over it, none
+        // has the standing to decide the incumbent is dead. The slot frees when
+        // the entry is finalised, bounded by `preconf_timeout`.
         if let Some(existing) = self.fifo.find_by_sender_nonce(&sender, nonce).await &&
             existing.hash != tx_hash
         {
-            if !matches!(
-                existing.status,
-                PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
-            ) {
-                return TransactionValidationOutcome::Invalid(
-                    transaction,
-                    InvalidPoolTransactionError::Other(Box::new(ReplaceActivePreconf)),
-                );
-            }
-            // Slot is reclaimable — evict the stale entry. `remove_reclaimable`
-            // re-checks under lock: if it was revived to `Waiting` or is
-            // mid-apply since the read above, it's left intact and the later
-            // `push_if_absent` returns `ConflictActive`. We don't re-push; the
-            // listener picks the new tx up from the pool.
-            self.fifo.remove_reclaimable(&existing.hash).await;
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Other(Box::new(ReplaceActivePreconf)),
+            );
         }
 
         // Per-tx gas ceiling: applies only to preconf-eligible txs.

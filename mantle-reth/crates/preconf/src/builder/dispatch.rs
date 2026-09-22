@@ -43,7 +43,7 @@ use tracing::{debug, trace, warn};
 use reth_payload_builder_primitives::PayloadBuilderError;
 
 use crate::{
-    PreconfConfig, PreconfTxSet,
+    ApplyHold, PreconfConfig, PreconfTxSet,
     apply::ApplyError,
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
@@ -96,6 +96,12 @@ pub(super) struct LoopState {
     /// predecessor's outcome instead of being applied out of order (which
     /// would nonce-too-high fail). Slot-local — reset each build.
     blocked_senders: HashMap<Address, (u64, BlockKind)>,
+    /// This build's registered holds, keyed by hash. Consumed by a verdict, or
+    /// released for whatever is left at exit. Ownership rules out a double
+    /// release, and this map being the *only* source of releasable hashes rules
+    /// out decrementing an entry this build never registered — such as one
+    /// pushed mid-build that never reached this build's loop arm.
+    holds: HashMap<TxHash, ApplyHold>,
 }
 
 impl LoopState {
@@ -108,7 +114,30 @@ impl LoopState {
             predicted_height,
             preconf_gas_used: 0,
             blocked_senders: HashMap::new(),
+            holds: HashMap::new(),
         }
+    }
+
+    /// Record a freshly registered hold. Replaces any existing hold for the
+    /// same hash (the displaced one decrements on drop).
+    pub(super) fn insert_hold(&mut self, hold: ApplyHold) {
+        self.holds.insert(hold.hash(), hold);
+    }
+
+    /// `true` when this build has registered `hash`.
+    pub(super) fn holds_hash(&self, hash: &TxHash) -> bool {
+        self.holds.contains_key(hash)
+    }
+
+    /// Take the hold for `hash` so it can be consumed by a verdict.
+    pub(super) fn take_hold(&mut self, hash: &TxHash) -> Option<ApplyHold> {
+        self.holds.remove(hash)
+    }
+
+    /// Drain every hold this build still owns — the build is exiting without
+    /// a verdict for these entries.
+    pub(super) fn drain_holds(&mut self) -> Vec<ApplyHold> {
+        self.holds.drain().map(|(_, h)| h).collect()
     }
 
     /// Record that `sender`'s preconf chain is blocked from `nonce` onward
@@ -279,32 +308,12 @@ where
         return Ok(());
     };
 
-    if entry.status != PreconfStatus::Waiting {
-        // Already terminal — either a prior iteration finished it or
-        // the RPC timeout flipped it. Record so the next broadcast
-        // event short-circuits at the dedup gate above; the reason is
-        // derived from the terminal status since we did not run the
-        // gate ourselves.
-        let reason = match entry.status {
-            PreconfStatus::Timeout => {
-                PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
-            }
-            other => PreconfError::Internal(format!(
-                "preconf entry already terminal ({other:?}) at dispatch entry"
-            )),
-        };
-        loop_state.record_excluded(hash, reason);
-        return Ok(());
-    }
-
-    // The deadline and per-block gas budget gates below only apply to
-    // RPC-sourced entries. Journal-replayed entries bypass both to
-    // honor the mantle preconf SLA: "once a receipt has been returned
-    // to the client, the tx must land on chain". Rejecting them here
-    // would silently break that commitment. They remain subject to the
-    // status / dedup gates above and to the underlying block gas limit
-    // enforced by the block builder.
-    let is_rpc = entry.source == PreconfSource::Rpc;
+    // The deadline and gas-budget gates below apply only to entries nobody has
+    // been promised yet. Once a receipt has gone out — whether this round
+    // (`Success`) or in an earlier one (`Replay`) — refusing the tx here would
+    // silently break that promise, so both bypass them.
+    let is_promised =
+        entry.status == PreconfStatus::Success || entry.source == PreconfSource::Replay;
 
     // Pre-apply deadline check — see crate-level docs. `cfg.safety_margin`
     // (default 40ms, see `DEFAULT_SAFETY_MARGIN`) is sized to slightly
@@ -325,12 +334,12 @@ where
     // their `inserted_at` reflects a journal restore, not the client's
     // clock.
     let elapsed_at_gate = entry.inserted_at.elapsed();
-    if is_rpc {
+    if !is_promised {
         metrics::histogram!("preconf.dispatch.elapsed_at_gate_ms")
             .record(elapsed_at_gate.as_millis() as f64);
     }
 
-    if is_rpc && elapsed_at_gate + margin >= cfg.preconf_timeout {
+    if !is_promised && elapsed_at_gate + margin >= cfg.preconf_timeout {
         debug!(
             target: "mantle::preconf::dispatch",
             ?hash,
@@ -338,9 +347,14 @@ where
             "pre-apply deadline passed; aborting"
         );
         metrics::counter!("preconf.dispatch.deadline_skipped_total").increment(1);
-        let _ = fifo.mark_timeout(&hash).await;
+        // The one place that already walks every entry — carryover, the
+        // broadcast arm and a `Lagged` re-scan all funnel through here — so a
+        // separate sweeper would just repeat the traversal. `finalize_timeout`
+        // answers the responder and removes the entry; the hold is therefore
+        // dropped rather than consumed, so nothing finalises twice.
+        fifo.finalize_timeout(&hash, cfg.preconf_timeout).await;
+        drop(loop_state.take_hold(&hash));
         let reason = PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
-        fifo.cancel_responder(&hash, reason.clone()).await;
         loop_state.record_excluded(hash, reason);
         return Ok(());
     }
@@ -356,7 +370,7 @@ where
     // chain) — semantically distinct from `Failed` (EVM apply ran and
     // reverted, tx on chain).
     let tx_gas_limit = alloy_consensus::Transaction::gas_limit(entry.tx.as_ref());
-    if is_rpc &&
+    if !is_promised &&
         loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
     {
         debug!(
@@ -368,56 +382,17 @@ where
             "block gas budget exhausted; aborting apply"
         );
         metrics::counter!("preconf.dispatch.gas_budget_skipped_total").increment(1);
-        let _ = fifo.mark_canceled(&hash).await;
         let reason = PreconfError::BlockGasBudgetExceeded {
             max: cfg.preconf_max_gas_per_block,
             used: loop_state.preconf_gas_used,
             limit: tx_gas_limit,
         };
-        fifo.cancel_responder(&hash, reason.clone()).await;
-        loop_state.record_excluded(hash, reason);
-        return Ok(());
-    }
-
-    // ── Point of no return begins here ────────────────────────────────
-    //
-    // Acquire the per-entry `apply_lock` before running `apply_fn`.
-    // Held through the entire commit path (`apply_fn` + mark_* + send)
-    // so the RPC deadline branch in `rpc::handle_inner` cannot mark
-    // this entry `Timeout` while its receipt is on its way to the
-    // client. Guarantees "wire Timeout ⇒ tx not committed to builder
-    // state".
-    let Some(_apply_guard) = fifo.lock_for_apply(&hash).await else {
-        // Entry vanished between the gate reads above and this
-        // acquisition — very rare (raced with `drop_hash`). Skip.
-        loop_state.record_excluded(
-            hash,
-            PreconfError::Internal("preconf entry vanished before apply_lock".into()),
-        );
-        return Ok(());
-    };
-
-    // Re-check status under lock. The RPC deadline branch may have
-    // already transitioned the entry to `Timeout` in the window between
-    // our earlier gate reads and this acquisition; running `apply_fn`
-    // now would violate the invariant "committed to builder state ⇒
-    // wire not Timeout".
-    if let Some(re_entry) = fifo.find_by_hash(&hash).await &&
-        re_entry.status != PreconfStatus::Waiting
-    {
-        trace!(
-            target: "mantle::preconf::dispatch",
-            ?hash, status = ?re_entry.status,
-            "status flipped before we acquired apply_lock; skipping apply"
-        );
-        let reason = match re_entry.status {
-            PreconfStatus::Timeout => {
-                PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
-            }
-            other => PreconfError::Internal(format!(
-                "preconf entry flipped to {other:?} before apply_lock"
-            )),
-        };
+        // A local verdict: this build's preconf budget is spent, which says
+        // nothing about any other in-flight build. Only terminal once this was
+        // the last holder.
+        if let Some(hold) = loop_state.take_hold(&hash) {
+            fifo.finish_failure(hold, reason.clone()).await;
+        }
         loop_state.record_excluded(hash, reason);
         return Ok(());
     }
@@ -438,18 +413,18 @@ where
             loop_state.record_committed(hash);
             loop_state.preconf_gas_used =
                 loop_state.preconf_gas_used.saturating_add(receipt.gas_used);
-            if let Err(e) = fifo.mark_succeeded(&hash).await {
-                // Lost a race with clean_timeout / cancel — entry already
-                // gone or in a non-Waiting state. Log and continue; the
-                // responder still gets the receipt if it exists.
+            // No quorum: a success is a promise carryover keeps even if this
+            // block is discarded. `finish_success` refuses only when the
+            // deadline already finalised the entry — the sole way to preempt an
+            // in-flight success — and the receipt is then discarded.
+            if let Some(hold) = loop_state.take_hold(&hash) &&
+                !fifo.finish_success(hold, receipt).await
+            {
                 trace!(
                     target: "mantle::preconf::dispatch",
-                    ?hash, ?e,
-                    "mark_succeeded lost race"
+                    ?hash,
+                    "entry already finalised; success not recorded"
                 );
-            }
-            if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Ok(receipt));
             }
         }
         // Per-tx rejection: the tx itself is invalid. Mark the entry
@@ -463,15 +438,12 @@ where
             );
             metrics::counter!("preconf.tx.failure_total").increment(1);
             loop_state.record_excluded(hash, err.clone());
-            if let Err(e) = fifo.mark_failed(&hash).await {
-                trace!(
-                    target: "mantle::preconf::dispatch",
-                    ?hash, ?e,
-                    "mark_failed lost race"
-                );
-            }
-            if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Err(err));
+            // `InvalidTx` is judged against *this* build's in-flight state —
+            // nonce and balance both depend on what preceded it in this block.
+            // Another build may apply the same tx cleanly, so the verdict is
+            // terminal only once this was the last holder.
+            if let Some(hold) = loop_state.take_hold(&hash) {
+                fifo.finish_failure(hold, err).await;
             }
         }
         // Fatal, non-tx-specific execution error (DB / header / fatal
@@ -556,6 +528,40 @@ mod tests {
     /// using `tx.gas_limit()` as the reported `gas_used`. Mirrors the
     /// semantics of the retired `PromiseApplier`, kept here to exercise
     /// the dispatch state machine without standing up a real EVM.
+    /// Test entry point mirroring production: `admit_and_dispatch` registers
+    /// this build's hold before calling `apply_one_preconf`, so a test that
+    /// skipped it would silently exercise a state the builder never produces
+    /// (no hold ⇒ no verdict ⇒ the responder is never answered).
+    async fn dispatch_one<F>(
+        fifo: &PreconfTxSet,
+        cfg: &PreconfConfig,
+        hash: TxHash,
+        loop_state: &mut LoopState,
+        apply_fn: F,
+    ) -> Result<(), PayloadBuilderError>
+    where
+        F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, ApplyError>,
+    {
+        if !loop_state.holds_hash(&hash) &&
+            let Some(hold) = fifo.register(&hash).await
+        {
+            loop_state.insert_hold(hold);
+        }
+        apply_one_preconf(fifo, cfg, hash, loop_state, apply_fn).await
+    }
+
+    fn synthetic_receipt(hash: TxHash) -> PreconfReceipt {
+        PreconfReceipt {
+            tx_hash: hash,
+            block_height: 0,
+            status: true,
+            logs: Vec::new(),
+            gas_used: 0,
+            reason: String::new(),
+            revert_data: alloy_primitives::Bytes::new(),
+        }
+    }
+
     fn synthetic_ok(
         tx: Arc<TxEnvelope>,
         hash: TxHash,
@@ -604,7 +610,7 @@ mod tests {
         ));
 
         let mut state = LoopState::new(42);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         // Responder got the synthetic receipt.
         let receipt = resp_rx.await.expect("responder closed").expect("synthetic ok");
@@ -624,7 +630,6 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_hit_skips_second_apply() {
-        use std::cell::Cell;
         let fifo = PreconfTxSet::new(8);
         let cfg = PreconfConfig::default();
         let tx = make_tx(0x22);
@@ -635,17 +640,17 @@ mod tests {
         // `Cell` so the assert_eq below can read while the FnMut
         // closure still mutably borrows it (Cell uses interior
         // mutability with `&self`).
-        let call_count = Cell::new(0u32);
+        let call_count = std::cell::Cell::new(0u32);
         let mut counting_apply = |tx, h, height| {
             call_count.set(call_count.get() + 1);
             synthetic_ok(tx, h, height)
         };
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
         assert_eq!(call_count.get(), 1);
         assert_eq!(state.committed_len(), 1);
 
         // Second call: dedup guard fires before apply_fn is invoked.
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, &mut counting_apply).await.unwrap();
         assert_eq!(call_count.get(), 1, "apply closure must not be called twice");
         assert_eq!(state.committed_len(), 1);
     }
@@ -670,14 +675,13 @@ mod tests {
         // sleep of 60ms also exceeds `preconf_timeout` (50ms) on its own.
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        use std::cell::Cell;
         let mut state = LoopState::new(7);
-        let apply_called = Cell::new(false);
+        let apply_called = std::cell::Cell::new(false);
         let mut tracking_apply = |tx, h, height| {
             apply_called.set(true);
             synthetic_ok(tx, h, height)
         };
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut tracking_apply).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, &mut tracking_apply).await.unwrap();
 
         // apply closure must NOT have been invoked — deadline gate fires
         // earlier so the in-flight builder is untouched.
@@ -691,25 +695,15 @@ mod tests {
         assert_eq!(state.committed_len(), 0);
         assert_eq!(state.excluded_len(), 1);
 
-        // Fifo entry is now Timeout.
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Timeout);
+        // Finalised: the entry is removed, freeing the slot at once.
+        assert!(!fifo.contains(&hash).await);
     }
 
-    /// Simulates a same-slot client resubmit after a Timeout:
-    /// 1. First dispatch: deadline gate fires, records `Timeout` excluded.
-    /// 2. Client resubmits: `attach_responder` refreshes `inserted_at`, `push_if_absent` revives
-    ///    fifo entry back to `Waiting`.
-    /// 3. Second dispatch: dedup finds the prior `Timeout` reason but **clears** it (since the
-    ///    deadline gate is tied to the entry's `inserted_at`, which is now fresh) and falls through
-    ///    to re-evaluate the gates. With fresh insertion time well under `preconf_timeout`, the
-    ///    gate does not fire and apply proceeds. The fresh responder observes the receipt.
-    ///
-    /// Locks the "Timeout is not a stable exclusion" invariant: a
-    /// regression that forwards stored Timeout via `cancel_responder`
-    /// would deny service to a legitimately re-eligible tx.
+    /// A resubmit after a timeout is a brand-new entry, not a revived one:
+    /// the timeout removed the old entry outright. So the second attempt is
+    /// judged entirely on its own `inserted_at` and applies normally.
     #[tokio::test]
-    async fn dedup_timeout_re_evaluates_gate_on_fresh_inserted_at() {
+    async fn resubmit_after_timeout_is_a_fresh_entry() {
         use std::time::Instant;
 
         let cfg = PreconfConfig {
@@ -720,39 +714,28 @@ mod tests {
         let tx = make_tx(0x55);
         let hash = *tx.tx_hash();
 
-        // Step 1: initial insert; sleep past deadline so the gate fires.
         let (resp_tx1, resp_rx1) = oneshot::channel();
         fifo.attach_responder(hash, Instant::now(), resp_tx1).await.unwrap();
         fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await;
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
-        // First dispatch: Timeout via deadline gate.
+        dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
         let err = resp_rx1.await.expect("responder closed").expect_err("must be Timeout");
         assert!(matches!(err, PreconfError::Timeout { .. }));
-        assert_eq!(state.excluded_len(), 1);
-        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Timeout,);
+        assert!(!fifo.contains(&hash).await, "the timeout removed the entry");
 
-        // Step 2: client resubmit — refresh `inserted_at`, revive to Waiting.
+        // The resubmit inserts afresh — no revive branch is involved.
         let (resp_tx2, resp_rx2) = oneshot::channel();
         fifo.attach_responder(hash, Instant::now(), resp_tx2).await.unwrap();
-        fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
         assert_eq!(
-            fifo.find_by_hash(&hash).await.unwrap().status,
-            PreconfStatus::Waiting,
-            "revive must flip status back to Waiting",
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted,
         );
 
-        // Step 3: second dispatch. Dedup CLEARS the stale Timeout and
-        // falls through; deadline gate reads fresh inserted_at (< 50ms)
-        // and passes; apply succeeds.
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
-
-        assert_eq!(state.excluded_len(), 0, "stale Timeout exclusion must be cleared");
-        assert_eq!(state.committed_len(), 1, "second dispatch must apply successfully");
-
-        // Fresh responder observes the receipt from the successful apply.
+        let mut state2 = LoopState::new(1);
+        dispatch_one(&fifo, &cfg, hash, &mut state2, synthetic_ok).await.unwrap();
+        assert_eq!(state2.committed_len(), 1, "the fresh entry applies normally");
         let receipt = resp_rx2.await.expect("responder closed").expect("must be Ok");
         assert!(receipt.status);
     }
@@ -769,7 +752,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(99);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_err).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_err).await.unwrap();
 
         // Responder got the apply error verbatim.
         let err = resp_rx.await.expect("responder closed").expect_err("must be Err");
@@ -779,9 +762,10 @@ mod tests {
         assert_eq!(state.committed_len(), 0);
         assert_eq!(state.excluded_len(), 1);
 
-        // Fifo entry transitioned to Failed (not Success).
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Failed);
+        // Sole holder, so the rejection is terminal: the entry is removed
+        // outright rather than parked in a terminal state, freeing the
+        // `(sender, nonce)` slot for an immediate resubmit.
+        assert!(!fifo.contains(&hash).await, "a finalised rejection removes the entry");
     }
 
     /// A FATAL apply error (DB / header / fatal precompile) must abort the
@@ -804,7 +788,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(7);
-        let out = apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_fatal).await;
+        let out = dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_fatal).await;
 
         // 1. Propagates as a build-aborting error.
         assert!(out.is_err(), "fatal apply must abort the build (return Err)");
@@ -859,7 +843,7 @@ mod tests {
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         let receipt = resp_rx.await.expect("responder closed").expect("must succeed at boundary");
         assert_eq!(receipt.gas_used, 21_000);
@@ -891,7 +875,7 @@ mod tests {
         fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
 
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         // Responder got the typed error with all three fields.
         let err = resp_rx.await.expect("responder closed").expect_err("must be Err");
@@ -909,10 +893,9 @@ mod tests {
         assert_eq!(state.excluded_len(), 1);
         assert_eq!(state.preconf_gas_used(), 21_000);
 
-        // Fifo entry flipped to Canceled — server pre-apply rejected,
-        // no EVM state change, tx will NOT land on chain.
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Canceled);
+        // Server pre-apply rejection by the sole holder — no EVM state
+        // change, and the entry is gone so nothing will retry it.
+        assert!(!fifo.contains(&hash).await);
     }
 
     /// Cumulative tracking: successful applies increment
@@ -933,7 +916,7 @@ mod tests {
             let tx = make_tx_with_gas(0x77 + i as u8, i as u64, gas);
             let hash = *tx.tx_hash();
             fifo.push_if_absent(tx, Address::from([i as u8 + 1; 20]), PreconfSource::Rpc).await;
-            apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+            dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
             expected_total += gas;
             assert_eq!(
                 state.preconf_gas_used(),
@@ -957,18 +940,17 @@ mod tests {
     ///   normally)
     #[tokio::test]
     async fn missing_fifo_entry_is_silent_noop() {
-        use std::cell::Cell;
         let fifo = PreconfTxSet::new(8);
         let cfg = PreconfConfig::default();
         let mut state = LoopState::new(1);
-        let call_count = Cell::new(0u32);
+        let call_count = std::cell::Cell::new(0u32);
         let mut apply_fn = |tx, h, height| {
             call_count.set(call_count.get() + 1);
             synthetic_ok(tx, h, height)
         };
 
         // hash never seen — no push_if_absent, no attach_responder.
-        apply_one_preconf(&fifo, &cfg, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn)
+        dispatch_one(&fifo, &cfg, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn)
             .await
             .unwrap();
 
@@ -977,68 +959,40 @@ mod tests {
         assert_eq!(state.excluded_len(), 0, "must NOT record excluded — future re-push allowed");
         assert_eq!(state.preconf_gas_used(), 0);
     }
-
-    /// Gate ③ — `entry.status != Waiting`. Terminal / reclaimable
-    /// entries reach `apply_one_preconf` when a stale broadcast event
-    /// fires post-transition. They must be recorded as excluded (so the
-    /// next broadcast for the same hash short-circuits at gate ①) and
-    /// must NOT invoke `apply_fn` or touch responders.
-    ///
-    /// Run once per non-Waiting variant so any future state added to
-    /// `PreconfStatus` gets caught if it's not handled by the gate.
+    /// A `Success` entry is applied like any other: every build puts it into
+    /// its own block, because any of those blocks may be the adopted one. Its
+    /// receipt is redundant, so `finish_success` refuses and drops it — the
+    /// client already holds one.
     #[tokio::test]
-    async fn non_waiting_status_records_excluded_and_skips_apply() {
-        use std::cell::Cell;
-        for pre_status in [
+    async fn a_promised_entry_is_applied_again_by_this_build() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0xee);
+        let hash = *tx.tx_hash();
+
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
+        fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+
+        let hold = fifo.register(&hash).await.unwrap();
+        assert!(fifo.finish_success(hold, synthetic_receipt(hash)).await);
+        assert!(resp_rx.try_recv().is_ok(), "the first success delivered the receipt");
+
+        let mut state = LoopState::new(1);
+        let call_count = std::cell::Cell::new(0u32);
+        let mut apply_fn = |tx, h, height| {
+            call_count.set(call_count.get() + 1);
+            synthetic_ok(tx, h, height)
+        };
+        dispatch_one(&fifo, &cfg, hash, &mut state, &mut apply_fn).await.unwrap();
+
+        assert_eq!(call_count.get(), 1, "a promised entry is still applied here");
+        assert_eq!(state.committed_len(), 1);
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.unwrap().status,
             PreconfStatus::Success,
-            PreconfStatus::Failed,
-            PreconfStatus::Timeout,
-            PreconfStatus::Canceled,
-        ] {
-            let fifo = PreconfTxSet::new(8);
-            let cfg = PreconfConfig::default();
-            let tx = make_tx(0xee);
-            let hash = *tx.tx_hash();
-
-            let (resp_tx, mut resp_rx) = oneshot::channel();
-            fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
-            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
-
-            // Drive the entry into the target non-Waiting state.
-            match pre_status {
-                PreconfStatus::Success => fifo.mark_succeeded(&hash).await.unwrap(),
-                PreconfStatus::Failed => fifo.mark_failed(&hash).await.unwrap(),
-                PreconfStatus::Timeout => fifo.mark_timeout(&hash).await.unwrap(),
-                PreconfStatus::Canceled => fifo.mark_canceled(&hash).await.unwrap(),
-                _ => unreachable!(),
-            }
-
-            let mut state = LoopState::new(1);
-            let call_count = Cell::new(0u32);
-            let mut apply_fn = |tx, h, height| {
-                call_count.set(call_count.get() + 1);
-                synthetic_ok(tx, h, height)
-            };
-
-            apply_one_preconf(&fifo, &cfg, hash, &mut state, &mut apply_fn).await.unwrap();
-
-            assert_eq!(call_count.get(), 0, "apply_fn must not run when status={pre_status:?}",);
-            assert_eq!(state.committed_len(), 0);
-            assert_eq!(state.excluded_len(), 1, "must record_excluded for status={pre_status:?}");
-            // Responder untouched — the entry's terminal transition path
-            // (mark_succeeded/failed/timeout/canceled) is responsible for
-            // resolving the responder; the dispatch loop must NOT double-send.
-            assert!(
-                resp_rx.try_recv().is_err(),
-                "responder must NOT be touched by dispatch for status={pre_status:?}"
-            );
-
-            // Fifo entry still there, still in the pre-transitioned status
-            // (except Failed/Success which the test doesn't remove; forward
-            // cleanup handles that later).
-            let entry = fifo.find_by_hash(&hash).await.unwrap();
-            assert_eq!(entry.status, pre_status);
-        }
+            "status unchanged",
+        );
     }
 
     // ── Source-differentiated gate tests (mantle preconf SLA: journal
@@ -1064,7 +1018,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut state = LoopState::new(1);
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal-replayed tx must apply despite deadline");
         assert_eq!(state.excluded_len(), 0);
@@ -1091,7 +1045,7 @@ mod tests {
         let hash = *tx.tx_hash();
         fifo.push_if_absent(tx, Address::from([1; 20]), PreconfSource::Replay).await;
 
-        apply_one_preconf(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
+        dispatch_one(&fifo, &cfg, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal tx must apply despite over-budget");
         assert_eq!(state.excluded_len(), 0);
@@ -1122,116 +1076,25 @@ mod tests {
         let j_tx = make_tx_with_gas(0xe2, 0, 30_000);
         let j_hash = *j_tx.tx_hash();
         fifo.push_if_absent(j_tx, Address::from([1; 20]), PreconfSource::Replay).await;
-        apply_one_preconf(&fifo, &cfg, j_hash, &mut state, synthetic_ok).await.unwrap();
+        dispatch_one(&fifo, &cfg, j_hash, &mut state, synthetic_ok).await.unwrap();
         assert_eq!(state.preconf_gas_used(), 30_000);
 
         // RPC tx: 21_000 gas. 30_000 + 21_000 = 51_000 > 40_000 → rejected.
         let r_tx = make_tx_with_gas(0xe3, 0, 21_000);
         let r_hash = *r_tx.tx_hash();
         fifo.push_if_absent(r_tx, Address::from([2; 20]), PreconfSource::Rpc).await;
-        apply_one_preconf(&fifo, &cfg, r_hash, &mut state, synthetic_ok).await.unwrap();
+        dispatch_one(&fifo, &cfg, r_hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "only the journal tx committed");
         assert_eq!(state.excluded_len(), 1, "RPC tx was gated out");
         let j_entry = fifo.find_by_hash(&j_hash).await.unwrap();
         assert_eq!(j_entry.status, PreconfStatus::Success);
-        let r_entry = fifo.find_by_hash(&r_hash).await.unwrap();
-        assert_eq!(r_entry.status, PreconfStatus::Canceled);
+        assert!(!fifo.contains(&r_hash).await, "the gated-out RPC tx was finalised away");
     }
 
-    /// Race regression: an RPC-side timeout deadline fires **while**
-    /// `apply_one_preconf` is inside `apply_fn`. The per-entry
-    /// `apply_lock` acquired by dispatch before `apply_fn` must block
-    /// the RPC's `lock_for_apply` acquisition until dispatch finishes
-    /// `mark_succeeded` + `resp.send(...)`. When the RPC finally
-    /// acquires the lock, fifo status is `Success` and `resp_rx` has
-    /// the receipt queued — so `try_recv` returns it, and the client
-    /// sees `Success`, not `Timeout`.
-    ///
-    /// Regression guard for the SLA invariant "wire `Timeout` ⇒ tx not
-    /// committed to builder state". Without the `apply_lock` scheme,
-    /// the RPC deadline branch would previously flip the entry to
-    /// `Timeout` while dispatch had already committed the tx to the
-    /// in-flight builder, producing an on-chain landing under a
-    /// Timeout wire response.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn apply_lock_blocks_rpc_timeout_race_and_yields_success() {
-        let fifo = Arc::new(PreconfTxSet::new(8));
-        let cfg = PreconfConfig::default();
-        let tx = make_tx(0x99);
-        let hash = *tx.tx_hash();
-
-        let (resp_tx, mut resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
-        assert!(matches!(
-            fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await,
-            PushResult::Inserted
-        ));
-
-        // Slow apply closure — `std::thread::sleep` blocks the worker
-        // that dispatch runs on but leaves other workers free (test
-        // uses multi_thread). Simulates a ~200ms EVM apply.
-        const APPLY_DURATION: Duration = Duration::from_millis(200);
-        let slow_apply = |tx: Arc<TxEnvelope>, h: TxHash, height: u64| {
-            std::thread::sleep(APPLY_DURATION);
-            Ok(PreconfReceipt {
-                tx_hash: h,
-                block_height: height,
-                status: true,
-                logs: Vec::new(),
-                gas_used: alloy_consensus::Transaction::gas_limit(tx.as_ref()),
-                reason: String::new(),
-                revert_data: Bytes::new(),
-            })
-        };
-
-        // Spawn dispatch — will grab apply_lock and run slow_apply for
-        // ~200ms before releasing.
-        let fifo_clone = fifo.clone();
-        let cfg_clone = cfg.clone();
-        let dispatch_task = tokio::spawn(async move {
-            let mut state = LoopState::new(7);
-            apply_one_preconf(&fifo_clone, &cfg_clone, hash, &mut state, slow_apply).await.unwrap();
-        });
-
-        // Give dispatch time to enter `apply_fn` (holding apply_lock).
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Simulate the RPC-side deadline branch: acquire apply_lock.
-        // Dispatch is inside apply_fn → this must block until dispatch
-        // finishes mark_succeeded + send + drop guard.
-        let acquire_start = std::time::Instant::now();
-        let guard = fifo.lock_for_apply(&hash).await;
-        let acquire_duration = acquire_start.elapsed();
-        assert!(guard.is_some(), "lock_for_apply must return Some for the pushed entry");
-
-        // Must have waited for dispatch to finish (~150ms remaining
-        // after our 50ms head start).
-        assert!(
-            acquire_duration >= Duration::from_millis(100),
-            "RPC lock acquisition should have blocked on dispatch's apply_lock; \
-             waited {acquire_duration:?} but expected ≥ 100ms",
-        );
-
-        // Under the lock, fifo status must be final and the receipt
-        // must be queued in resp_rx (dispatch's `resp.send(...)`
-        // completed inside the critical section).
-        let final_status = fifo.find_by_hash(&hash).await.map(|e| e.status);
-        assert_eq!(
-            final_status,
-            Some(PreconfStatus::Success),
-            "dispatch must have finished mark_succeeded before releasing apply_lock",
-        );
-
-        match resp_rx.try_recv() {
-            Ok(Ok(receipt)) => {
-                assert_eq!(receipt.tx_hash, hash);
-                assert!(receipt.status);
-            }
-            other => panic!("resp_rx must have queued receipt; got {other:?}"),
-        }
-
-        drop(guard);
-        dispatch_task.await.expect("dispatch task join");
-    }
+    // `apply_lock` is gone: the deadline no longer waits for an in-flight
+    // apply, so a tx may land under a `Timeout` answer — which is why `Timeout`
+    // means "unknown, check the chain". The narrower replacement lives in the
+    // fifo: `finish_success` refuses once the entry is finalised, covered by
+    // `preconf_tx_set::tests::the_deadline_sweep_preempts_a_late_success`.
 }

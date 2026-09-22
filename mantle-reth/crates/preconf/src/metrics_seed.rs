@@ -19,6 +19,7 @@ const COUNTERS: &[&str] = &[
     "preconf.tx.success_total",
     "preconf.tx.failure_total",
     "preconf.tx.fatal_total",
+    "preconf.tx.commitment_broken_total",
     "preconf.build.panic_total",
     "preconf.build.watchdog_cancel_total",
     "preconf.fifo.da_rejected_total",
