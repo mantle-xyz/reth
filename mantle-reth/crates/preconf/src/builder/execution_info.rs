@@ -10,9 +10,49 @@ use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::Address;
 use reth_optimism_payload_builder::builder::ExecutionInfo as OpExecutionInfo;
+use reth_optimism_primitives::OpTransaction;
 use reth_primitives_traits::SignedTransaction;
 
-use crate::{journal::JournalEntry, unlanded::Announced};
+use crate::{journal::JournalEntry, preconf_tx_set::PreconfTxSet, unlanded::Announced};
+
+/// Whether this transaction's nonce field is its sender's account nonce.
+///
+/// Deposits and the post-execution transaction are not. Both advance the
+/// sender's account nonce when they execute, but neither carries the
+/// resulting value: `TxDeposit::nonce()` returns a hard `0`, and the
+/// post-execution transaction is synthesised with `Address::ZERO` as its
+/// signer. They are counted rather than read — recording the `0` they report
+/// would put a sender sitting at nonce 50 down as next-at-1.
+fn carries_its_senders_nonce<T: OpTransaction>(tx: &T) -> bool {
+    !tx.is_deposit() && tx.as_post_exec().is_none()
+}
+
+/// Record a transaction the block executor has committed: into the block's
+/// running tally, and into the account view the admission path reads.
+///
+/// Both together, because an account view that lags the block by one
+/// transaction is a nonce gap refused to a transaction that was in order.
+/// Every execution goes through here for that reason; nothing in the type
+/// system enforces it.
+pub(crate) fn record_executed<T: SignedTransaction + OpTransaction>(
+    info: &mut ExecutionInfo<T>,
+    fifo: &PreconfTxSet,
+    tx: Recovered<T>,
+    journalable: bool,
+) {
+    let signer = tx.signer();
+    if carries_its_senders_nonce(tx.inner()) {
+        fifo.observe_executed(signer, tx.nonce());
+    } else {
+        fifo.observe_nonceless(signer);
+    }
+
+    if journalable {
+        info.record_journalable(tx);
+    } else {
+        info.record(tx);
+    }
+}
 
 /// The upstream execution counters, plus what slicing a block needs on top.
 ///
@@ -180,8 +220,8 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
 #[cfg(test)]
 mod tests {
     use alloy_consensus::{Signed, Transaction as _, TxLegacy, transaction::Recovered};
-    use alloy_primitives::{Address, Signature, TxKind, U256};
-    use op_alloy_consensus::OpTxEnvelope;
+    use alloy_primitives::{Address, B256, Sealable, Signature, TxKind, U256};
+    use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
 
     use super::{ExecutionInfo, OpExecutionInfo};
 
@@ -370,6 +410,38 @@ mod tests {
 
         assert_eq!(info.executed_sender_nonces().get(&sender(0xaa)), Some(&5));
         assert_eq!(info.executed_sender_nonces().get(&sender(0xbb)), Some(&2));
+    }
+
+    /// The ordinary case: the nonce field means what it says.
+    #[test]
+    fn an_ordinary_transaction_carries_its_senders_nonce() {
+        assert!(super::carries_its_senders_nonce(tx(sender(0xaa), 5).inner()));
+    }
+
+    /// A deposit reports `0` however far along its sender actually is, so the
+    /// account view must count it rather than read it. Were this to return
+    /// `true`, a sender at nonce 50 receiving a deposit would be recorded as
+    /// next-at-1 and every transaction it sent would read as a nonce gap.
+    #[test]
+    fn a_deposit_does_not_carry_its_senders_nonce() {
+        let deposit = OpTxEnvelope::Deposit(
+            TxDeposit {
+                source_hash: B256::repeat_byte(0x11),
+                from: sender(0xaa),
+                to: TxKind::Call(Address::ZERO),
+                mint: 0,
+                value: U256::ZERO,
+                gas_limit: 21_000,
+                is_system_transaction: false,
+                input: Default::default(),
+                eth_value: 0,
+                eth_tx_value: None,
+            }
+            .seal_slow(),
+        );
+
+        assert_eq!(deposit.nonce(), 0, "the premise: it reports zero, not the real value");
+        assert!(!super::carries_its_senders_nonce(&deposit));
     }
 
     /// The upstream counters stay the one place block totals live, reachable

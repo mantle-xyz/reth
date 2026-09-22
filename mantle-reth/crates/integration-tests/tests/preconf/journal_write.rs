@@ -4,7 +4,7 @@
 //! journal → restore → land). This module covers the *write* half — the
 //! part the RPC handler owns — plus the persistence scope: **every RPC-path
 //! commitment that lands on chain is journaled, whether it succeeded or
-//! reverted**; only the plain-listener path (no waiting client) is excluded.
+//! reverted**; an ordinary submission, which promised nobody anything, is excluded.
 //!
 //! - `rpc_success_appends_to_journal_file` — a live `eth_sendRawTransactionWithPreconf` that
 //!   returns `Success` must leave a matching `JournalEntry` on disk. Guards `rpc.rs`'s
@@ -12,10 +12,10 @@
 //! - `rpc_revert_but_sealed_is_journaled` — a preconf tx that **reverts** but still lands must ALSO
 //!   be journaled. Regression guard: the write used to be gated on wire `Success`, which dropped
 //!   reverted-but-sealed commitments.
-//! - `listener_path_preconf_not_journaled` — a whitelisted tx admitted via the **plain**
-//!   `eth_sendRawTransaction` path (listener → fifo, no RPC responder) lands on chain but must
-//!   **not** be journaled. Guards the "only the RPC path persists" scope: the listener path has no
-//!   1:1 waiting client, so there is no commitment to protect.
+//! - `an_ordinary_submission_is_not_journaled` — a whitelisted tx submitted through the **plain**
+//!   `eth_sendRawTransaction` path lands on chain by the pool arm but must **not** be journaled.
+//!   Guards the "only a commitment persists" scope: nobody was promised anything, so there is
+//!   nothing to protect.
 //!
 //! Together these pin the write side end-to-end without needing to
 //! actually restart a process (the disk file is the observable boundary).
@@ -252,11 +252,11 @@ async fn rpc_revert_but_sealed_is_journaled() {
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
-/// A whitelisted tx admitted via the **plain** `eth_sendRawTransaction`
-/// path lands on chain (listener → fifo → apply) but must NOT be
-/// journaled — only the RPC-preconf + Success path persists commitments.
+/// A whitelisted tx submitted through the **plain** `eth_sendRawTransaction`
+/// path lands on chain by the pool arm but must NOT be journaled — only a
+/// preconf commitment that reached `Success` persists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn listener_path_preconf_not_journaled() {
+async fn an_ordinary_submission_is_not_journaled() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let chain_id = mantle_test_chain_spec().chain().id();
     let sender = Wallet::default().with_chain_id(chain_id).inner.address();
@@ -270,9 +270,8 @@ async fn listener_path_preconf_not_journaled() {
 
     let (mut node, _http, wallet, _chain_id) = launch_preconf_node!(cfg).await;
 
-    // Plain sendRawTransaction — no preconf responder, so the RPC handler
-    // (the only journal writer) is never invoked. The whitelisted tx still
-    // reaches the fifo via the pool listener and lands on chain.
+    // Plain sendRawTransaction — this never reaches admission, which is the
+    // only journal writer. The whitelisted tx still lands, by the pool arm.
     let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
     let tx_hash: B256 =
         node.rpc.inject_tx(raw_tx.clone()).await.expect("plain sendRawTransaction accepted");
@@ -305,10 +304,10 @@ async fn listener_path_preconf_not_journaled() {
         payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(
         sealed.contains(&tx_hash),
-        "listener-path whitelisted tx must land on chain; sealed={sealed:?}"
+        "the whitelisted tx must land on chain by the pool arm; sealed={sealed:?}"
     );
 
-    // Persistence scope: the listener path must NOT journal the commitment.
+    // Persistence scope: an ordinary submission must NOT be journaled.
     let entries = read_journal(&journal_file);
     assert!(
         !entries.iter().any(|e| e.hash == tx_hash),

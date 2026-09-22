@@ -15,10 +15,15 @@
 
 pub mod helpers;
 
+mod account_view;
+mod basefee_threshold;
 mod canon_cleanup;
 mod chain_id_pair;
 mod classifier_freeze;
 mod da_footprint;
+mod delegated_sender;
+mod dual_channel_nonce;
+mod dual_channel_same_hash;
 mod gas_budgets;
 mod happy_path;
 mod insufficient_funds;
@@ -27,6 +32,7 @@ mod journal_size_rotation;
 mod journal_write;
 mod no_tx_pool;
 mod predeploy_genesis;
+mod queue_gas_ceiling;
 mod race_pool_arm;
 mod reorg_dropped_payload;
 mod reorg_multi_block_relands;
@@ -40,5 +46,7 @@ mod replay_transient_defer;
 mod restart_replay;
 mod single_payload;
 mod timeout;
+mod tx_type_whitelist;
 mod validation_reject;
+mod validator_error_mapping;
 mod whitelist_onchain;

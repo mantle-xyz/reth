@@ -216,9 +216,9 @@ where
     // same-slot resubmit sees the first attempt's error instead of waiting out
     // `preconf_timeout`.
     //
-    // A prior `Timeout` is the exception: `attach_responder` refreshes
-    // `inserted_at` on a same-hash resubmit, so the deadline that fired for the
-    // first submission does not bind the second. Forwarding it would deny
+    // A prior `Timeout` is the exception: admission refreshes `inserted_at` on
+    // a same-hash resubmit, so the deadline that fired for the first submission
+    // does not bind the second. Forwarding it would deny
     // service to a legitimately re-eligible tx, so drop the stale exclusion and
     // let the gate below re-decide against the fresh clock.
     if loop_state.is_committed(&hash) {
@@ -432,7 +432,7 @@ where
             }
             // Persist before the receipt goes anywhere. The commitment is made
             // by the transaction landing, not by a client hearing about it:
-            // a listener-pushed entry has no responder at all, and a client
+            // a replayed entry has no responder at all, and a client
             // that timed out has stopped listening — both are still in the
             // block, and with slicing both have been broadcast.
             //
@@ -648,8 +648,8 @@ mod tests {
     /// Persisting a commitment hangs off the transaction landing, not off a
     /// client being there to hear about it.
     ///
-    /// `take_responder` returns `None` for entries the pool listener pushed,
-    /// and `resp.send` fails for a client that already gave up — in both cases
+    /// `take_responder` returns `None` for replayed entries, and `resp.send`
+    /// fails for a client that already gave up — in both cases
     /// the transaction is still in the block, and with slicing it has been
     /// broadcast. Journaling from the receipt path missed exactly those.
     #[tokio::test]
@@ -659,7 +659,7 @@ mod tests {
         let (_dir, journal) = temp_journal().await;
         let tx = make_tx(0x21);
         let hash = *tx.tx_hash();
-        // Deliberately no `attach_responder`.
+        // Deliberately no responder.
         assert!(matches!(
             fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
             PushResult::Inserted
@@ -747,11 +747,11 @@ mod tests {
         let hash = *tx.tx_hash();
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         assert!(matches!(
             fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await,
             PushResult::Inserted
         ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
         let mut state = LoopState::new(42);
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
@@ -813,8 +813,8 @@ mod tests {
         let hash = *tx.tx_hash();
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
         // Sleep past the deadline. `SAFETY_MARGIN` is a hard 40ms but the
         // sleep of 60ms also exceeds `preconf_timeout` (50ms) on its own.
@@ -868,8 +868,8 @@ mod tests {
 
         // Step 1: initial insert; sleep past deadline so the gate fires.
         let (resp_tx1, resp_rx1) = oneshot::channel();
-        fifo.attach_responder(hash, Instant::now(), resp_tx1).await.unwrap();
         fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, Instant::now(), resp_tx1).await);
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         let mut state = LoopState::new(1);
@@ -882,8 +882,8 @@ mod tests {
 
         // Step 2: client resubmit — refresh `inserted_at`, revive to Waiting.
         let (resp_tx2, resp_rx2) = oneshot::channel();
-        fifo.attach_responder(hash, Instant::now(), resp_tx2).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, Instant::now(), resp_tx2).await);
         assert_eq!(
             fifo.find_by_hash(&hash).await.unwrap().status,
             PreconfStatus::Waiting,
@@ -911,8 +911,8 @@ mod tests {
         let hash = *tx.tx_hash();
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
         let mut state = LoopState::new(99);
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err).await.unwrap();
@@ -1016,33 +1016,6 @@ mod tests {
         );
     }
 
-    /// A broken commitment is evicted from the pool, like every other
-    /// non-on-chain terminal transition (`mark_succeeded` does not evict).
-    /// Leaving it there would let it land later, after the slot was already
-    /// released and possibly taken by a different transaction.
-    #[tokio::test]
-    async fn a_broken_commitment_is_evicted_from_the_pool() {
-        use std::sync::Mutex as StdMutex;
-
-        let fifo = PreconfTxSet::new(8);
-        let cfg = PreconfConfig::default();
-        let evicted: Arc<StdMutex<Vec<TxHash>>> = Arc::new(StdMutex::new(Vec::new()));
-        let sink = evicted.clone();
-        fifo.set_pool_eviction_callback(Arc::new(move |h| sink.lock().unwrap().push(h)));
-
-        let hash = push_replayed(&fifo, make_tx(0x92)).await;
-        let mut state = LoopState::new(7);
-        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err)
-            .await
-            .expect("a per-tx rejection keeps the build going; no Fatal here");
-
-        assert_eq!(
-            evicted.lock().unwrap().as_slice(),
-            &[hash],
-            "a broken commitment must leave the pool",
-        );
-    }
-
     /// A broken commitment must not be applied by later jobs — dispatch's
     /// status gate treats it as terminal and reports the breach reason.
     #[tokio::test]
@@ -1090,8 +1063,8 @@ mod tests {
         let hash = *tx.tx_hash();
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
         let mut state = LoopState::new(7);
         let out = apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_fatal).await;
@@ -1145,8 +1118,8 @@ mod tests {
         let hash = *tx.tx_hash();
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
         let mut state = LoopState::new(1);
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
@@ -1178,8 +1151,8 @@ mod tests {
         let tx = make_tx_with_gas(0x66, 0, 21_000);
         let hash = *tx.tx_hash();
         let (resp_tx, resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
@@ -1257,7 +1230,7 @@ mod tests {
             synthetic_ok(tx, h, height)
         };
 
-        // hash never seen — no push_if_absent, no attach_responder.
+        // hash never seen — nothing was ever queued for it.
         apply_one_preconf(&fifo, &cfg, None, TxHash::from([0xdd; 32]), &mut state, &mut apply_fn)
             .await
             .unwrap();
@@ -1291,8 +1264,8 @@ mod tests {
             let hash = *tx.tx_hash();
 
             let (resp_tx, mut resp_rx) = oneshot::channel();
-            fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
             fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+            assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
             // Drive the entry into the target non-Waiting state.
             match pre_status {
@@ -1452,11 +1425,11 @@ mod tests {
         let hash = *tx.tx_hash();
 
         let (resp_tx, mut resp_rx) = oneshot::channel();
-        fifo.attach_responder(hash, std::time::Instant::now(), resp_tx).await.unwrap();
         assert!(matches!(
             fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await,
             PushResult::Inserted
         ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
 
         // Slow apply closure — `std::thread::sleep` blocks the worker
         // that dispatch runs on but leaves other workers free (test

@@ -69,6 +69,7 @@ use crate::{
         ExecutionInfo,
         cancel::{CancelReason, JobCancel},
         dispatch,
+        execution_info::record_executed,
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
     },
     classifier::{Verdict, Whitelist},
@@ -107,6 +108,7 @@ use crate::{
 fn execute_sequencer_transactions_watching_whitelist<N, B>(
     sequencer_txs: &[WithEncoded<TxTy<N>>],
     builder: &mut B,
+    fifo: &PreconfTxSet,
     whitelist_contract: Option<Address>,
 ) -> Result<(ExecutionInfo<N::SignedTx>, Vec<WhitelistDelta>), PayloadBuilderError>
 where
@@ -185,7 +187,11 @@ where
         }
 
         info.cumulative_gas_used += gas_used.tx_gas_used();
-        info.record(recovered);
+        // Deposits dominate here, and the account view only counts those. On a
+        // derivation build (`no_tx_pool=true`) the batched user transactions
+        // arrive this way too, and those it reads outright — which is why this
+        // stage is on the funnel at all.
+        record_executed(&mut info, fifo, recovered, false);
     }
 
     Ok((info, deltas))
@@ -527,9 +533,11 @@ fn preconf_admission(
 /// DA + footprint bounds against the same `info.cumulative_da_bytes_used`
 /// (unchanged in the single-task window between admission and apply), and only
 /// dispatches on `Admit`. A gate here would be dead code.
+#[allow(clippy::too_many_arguments)]
 fn apply_preconf_with_da<N, B>(
     builder: &mut B,
     info: &mut ExecutionInfo<N::SignedTx>,
+    fifo: &PreconfTxSet,
     limits: BuildConstraints,
     tx: Arc<TxEnvelope>,
     hash: TxHash,
@@ -547,7 +555,7 @@ where
     let (receipt, recovered) = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
     info.cumulative_da_bytes_used = info.cumulative_da_bytes_used.saturating_add(tx_da);
     info.cumulative_gas_used += receipt.gas_used;
-    info.record(recovered);
+    record_executed(info, fifo, recovered, false);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
     // `blockValue` and `is_better_payload` ignore preconf-sourced revenue.
@@ -681,8 +689,9 @@ where
     let gas_used = info.cumulative_gas_used;
     match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source) {
         Admission::Admit => {
-            let mut apply_fn =
-                |tx, h, height| apply_preconf_with_da::<N, _>(builder, info, limits, tx, h, height);
+            let mut apply_fn = |tx, h, height| {
+                apply_preconf_with_da::<N, _>(builder, info, fifo, limits, tx, h, height)
+            };
             // Propagate a fatal apply error to abort the whole build; a
             // per-tx rejection resolves inside `apply_one_preconf` and
             // returns `Ok(())`.
@@ -769,7 +778,6 @@ where
 /// `apply_one_preconf`'s dedup gate prevents double-apply if a carryover hash is
 /// also observed via broadcast later. Returning a plan (rather than applying
 /// inline) keeps this helper free of EVM/builder types and unit-testable.
-///
 async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
     use crate::types::PreconfStatus;
     let mut carryover: Vec<TxEntryView> = Vec::new();
@@ -848,6 +856,7 @@ fn apply_one_best_tx<N, Builder>(
     >,
     builder: &mut Builder,
     info: &mut ExecutionInfo<N::SignedTx>,
+    fifo: &PreconfTxSet,
     constraints: &BuildConstraints,
     pacer: &mut AdmissionPacer,
 ) -> Result<BestTxStep, PayloadBuilderError>
@@ -858,26 +867,23 @@ where
     let Some(tx) = best_txs.next(()) else {
         return Ok(BestTxStep::Done);
     };
-    // Preconf-eligible txs are applied EXCLUSIVELY via the preconf arm. Without
-    // this filter the pool arm could grab one whose fifo entry the async
-    // listener has not pushed yet: the tx lands via the pool path while its
-    // client sees Timeout/Failed, responder never called.
+    // A transaction the preconf arm owns is left to it. Both containers can hold
+    // one hash now that either channel accepts it, and this arm's snapshot is
+    // taken before the verdict is necessarily frozen. If this arm applied it,
+    // the transaction would land while its client was told `Timeout`.
     //
-    // Skipping does not drop the tx, it only constrains it to the preconf
-    // ordering — which holds because `PreconfAwareValidator`'s replacement guard
-    // refuses a second preconf tx on a `(sender, nonce)` one already occupies,
-    // so a tx the pool accepted cannot collide and be refused a fifo entry
-    // (`push_if_absent` → `ConflictActive`).
-    //
-    // One exception: a `Verdict::Promised` tx is exempt from that guard (journal
-    // restore re-admits an acknowledged commitment unconditionally), so it can
-    // lose the fifo slot. Intended — the fifo keeps the fresher entry, and the
-    // pool drops the restored tx once the winner's nonce lands.
+    // Skipping does not drop it: admission holds the `(sender, nonce)`, so the
+    // preconf arm is the only one that can apply it.
     //
     // The predicate is the **frozen verdict**, never a live allowlist read:
     // re-deriving eligibility here would let an allowlist update between the two
-    // decisions strand the tx with neither arm applying it (Case A / Case B of
-    // the classifier design).
+    // decisions strand the transaction with neither arm applying it.
+    //
+    // Removing this is not detectable by the suite — the biased `select!` puts
+    // preconf dispatch ahead of this arm, and a commitment older than the build
+    // arrives through the carryover preamble, so the preconf arm has got there
+    // first every time. That is a reading of the loop, not a property anything
+    // checks, which is why the guard stays.
     if classifier.verdict(tx.hash()).is_some_and(Verdict::is_preconf) {
         best_txs.mark_invalid(tx.sender(), tx.nonce());
         return Ok(BestTxStep::Continue);
@@ -965,7 +971,7 @@ where
     // deposits arrive with the attributes, a preconf commitment is journaled
     // when its receipt goes out, and the post-execution transaction is made by
     // the executor rather than sent by anyone.
-    info.record_journalable(recovered);
+    record_executed(info, fifo, recovered, true);
     Ok(BestTxStep::Continue)
 }
 
@@ -1538,6 +1544,23 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             PayloadBuilderError::Internal(err.into())
         })?;
 
+        // Read here rather than with the other per-block constants below,
+        // because the account view has to be reset before the block's first
+        // transaction executes and Stage 2 is that transaction. One read, one
+        // value: `constraints` reuses it.
+        let base_fee = builder.evm_mut().block().basefee();
+
+        // The previous build's account view ends here. Cleared rather than
+        // re-seeded: a build that is cancelled or never sealed must not leave
+        // a sender pinned at a nonce the chain will never reach, and a sender
+        // the view has forgotten simply falls back to chain state.
+        //
+        // Unconditional, including derivation builds (`no_tx_pool=true`), for
+        // the same reason `sync_fifo_forward_to_head` is: it reads nothing
+        // into the block, and those builds execute the batched user
+        // transactions the admission path most needs to know about.
+        self.fifo.reset_accounts(base_fee);
+
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
         //
         // Not `ctx.execute_sequencer_transactions` — see the replicated
@@ -1545,6 +1568,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let (mut info, whitelist_deltas) = execute_sequencer_transactions_watching_whitelist::<N, _>(
             ctx.attributes().sequencer_transactions(),
             &mut builder,
+            &self.fifo,
             crate::whitelist::wants_whitelist(&self.cfg),
         )?;
 
@@ -1586,7 +1610,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         }
         let block_da_limit = self.builder_config.da_config.max_da_block_size();
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
-        let base_fee = builder.evm_mut().block().basefee();
         let attrs_timestamp = ctx.attributes().timestamp();
         // Post-Jovian DA footprint scalar is a per-block constant set by
         // the Stage 2 L1 info tx — read once, reuse across all admissions.
@@ -2004,6 +2027,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         iter,
                         &mut builder,
                         &mut info,
+                        &self.fifo,
                         &constraints,
                         &mut pool_pacer,
                     )? {
@@ -2048,7 +2072,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     // short of the sealed block; leaving its gas out would make
                     // `info` stop being the block's running total.
                     info.cumulative_gas_used += tx_gas_used;
-                    info.record(recorded);
+                    record_executed(&mut info, &self.fifo, recorded, false);
                     tx_gas_used
                 })
             })?;
@@ -2161,7 +2185,6 @@ mod tests {
         let hash = B256::from([byte; 32]);
         Arc::new(TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)))
     }
-
 
     /// `replay_fifo_carryover` returns `Waiting` + `Success` hashes (each a
     /// carryover source) in insertion order and skips terminal-non-success
@@ -2636,5 +2659,4 @@ mod tests {
             "while a fresh snapshot sees the revocation"
         );
     }
-
 }

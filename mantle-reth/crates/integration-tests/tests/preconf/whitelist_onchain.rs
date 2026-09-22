@@ -143,9 +143,9 @@ const POLL_TICKS: usize = 200;
 /// * the slot arithmetic matches real reth storage as written by the genesis loader — the unit
 ///   tests hand-populate a mock map using the same code that computes the slots, so they prove
 ///   nothing about the layout;
-/// * the load happens early enough. Cold start runs inside `build_pool`, ahead of the pool
-///   listener, the RPC server and the payload builder, so there is no window in which a tx could be
-///   admitted — and have its verdict frozen — against empty allowlists.
+/// * the load happens early enough. Cold start runs inside `build_pool`, ahead of the RPC server
+///   and the payload builder, so there is no window in which a tx could be admitted — and have its
+///   verdict frozen — against empty allowlists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_start_loads_genesis_whitelist_before_the_node_is_up() {
     let sender = wallet_address();
@@ -674,8 +674,7 @@ async fn a_governance_deposit_in_this_block_bars_its_own_commitment() {
     let http_c = http.clone();
     let rpc_task = tokio::spawn(async move { send_preconf(&http_c, preconf_tx).await });
 
-    // Long enough for the RPC handler to attach its responder and the pool
-    // listener to create the fifo entry.
+    // Long enough for admission to create the fifo entry.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // The governance deposit: addressed at WL, revoking exactly the pair the

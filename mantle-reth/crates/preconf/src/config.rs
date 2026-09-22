@@ -35,6 +35,22 @@ pub const DEFAULT_SLOT_DURATION: Duration = Duration::from_secs(2);
 /// preconf path).
 pub const DEFAULT_PRECONF_MAX_GAS_PER_TX: u64 = 2_000_000;
 
+/// Default backlog the preconf queue will hold, in blocks' worth of
+/// [`DEFAULT_PRECONF_MAX_GAS_PER_BLOCK`] — `8`.
+///
+/// **A backstop against a flood, not a restatement of the per-block budget.**
+/// Overflowing a single block is ordinary and already has a handler: dispatch
+/// refuses the transaction with `BlockGasBudgetExceeded`, marks it `Canceled`,
+/// and a resubmit revives it in the next slot. Refusing that at admission
+/// instead would remove a recovery path that exists on purpose.
+///
+/// What this catches is the case the entry and byte ceilings cannot see. A
+/// hundred transactions at the per-tx cap is thirty-odd blocks of backlog and
+/// nowhere near ten thousand entries, so the queue reads as nearly empty while
+/// holding more work than it can drain within any client's deadline. Eight
+/// blocks leaves normal bursts untouched and still refuses that.
+pub const DEFAULT_PRECONF_QUEUE_GAS_BLOCKS: u64 = 8;
+
 /// Default cumulative preconf gas budget per block — `6_000_000`.
 ///
 /// Caps how much of a block's gas can be spent on the preconf fast-path,
@@ -86,8 +102,7 @@ pub const DEFAULT_BROADCAST_CAP: usize = 65536;
 #[derive(Debug, Clone)]
 pub struct PreconfConfig {
     /// Master switch: false → entire preconf subsystem stays inactive
-    /// (RPC handler returns `NotPreconfEligible` immediately, pool listener
-    /// task does not spawn).
+    /// (no RPC handler is built, and no preconf task spawns).
     pub enabled: bool,
 
     /// Address of the L2 `PreconfWhitelist` contract — the sole source of
@@ -134,6 +149,19 @@ pub struct PreconfConfig {
     /// Default `6_000_000` (see [`DEFAULT_PRECONF_MAX_GAS_PER_BLOCK`]).
     pub preconf_max_gas_per_block: u64,
 
+    /// How much backlog the queue will hold, in blocks' worth of
+    /// [`preconf_max_gas_per_block`](Self::preconf_max_gas_per_block).
+    ///
+    /// A multiplier rather than an absolute ceiling so that retuning the
+    /// per-block budget carries the queue ceiling with it.
+    ///
+    /// Lowering it towards `1` does not make the queue stricter in a useful
+    /// way — it makes admission pre-empt the dispatch-time budget gate, whose
+    /// `Canceled` outcome is revivable where a refusal is not.
+    ///
+    /// See [`DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`].
+    pub preconf_queue_gas_blocks: u64,
+
     // ===== Journal persistence =====
     /// Journal path. `None` ⇒ use the datadir-relative default
     /// (`<datadir>/mantle-preconf/journal.jsonl`), resolved at the CLI layer
@@ -169,6 +197,7 @@ impl Default for PreconfConfig {
             slot_duration: DEFAULT_SLOT_DURATION,
             preconf_max_gas_per_tx: DEFAULT_PRECONF_MAX_GAS_PER_TX,
             preconf_max_gas_per_block: DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
+            preconf_queue_gas_blocks: DEFAULT_PRECONF_QUEUE_GAS_BLOCKS,
             journal_path: None,
             rejournal_interval: DEFAULT_REJOURNAL_INTERVAL,
             journal_max_size: DEFAULT_JOURNAL_MAX_SIZE,
@@ -213,6 +242,10 @@ pub enum PreconfConfigError {
     /// `preconf_max_gas_per_block == 0`.
     #[error("preconf_max_gas_per_block must be > 0")]
     InvalidPreconfMaxGasPerBlock,
+    /// `preconf_queue_gas_blocks == 0` — the queue could hold nothing, so
+    /// every submission would be refused.
+    #[error("preconf_queue_gas_blocks must be > 0")]
+    InvalidPreconfQueueGasBlocks,
     /// `preconf_max_gas_per_block < preconf_max_gas_per_tx` — a single tx
     /// could never fit the block budget.
     #[error("preconf_max_gas_per_block ({block}) must be >= preconf_max_gas_per_tx ({per_tx})")]
@@ -264,6 +297,9 @@ impl PreconfConfig {
         }
         if self.preconf_max_gas_per_block == 0 {
             return Err(PreconfConfigError::InvalidPreconfMaxGasPerBlock);
+        }
+        if self.preconf_queue_gas_blocks == 0 {
+            return Err(PreconfConfigError::InvalidPreconfQueueGasBlocks);
         }
         if self.preconf_max_gas_per_block < self.preconf_max_gas_per_tx {
             return Err(PreconfConfigError::BlockBudgetSmallerThanPerTx {
@@ -362,6 +398,19 @@ mod tests {
         let mut cfg = PreconfConfig::default();
         cfg.preconf_max_gas_per_block = 0;
         assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidPreconfMaxGasPerBlock)));
+    }
+
+    /// The ceiling is a multiple of the per-block budget, so zero blocks means
+    /// a queue that can hold nothing and refuses every submission.
+    #[test]
+    fn a_queue_that_can_hold_nothing_is_refused_at_startup() {
+        let cfg = PreconfConfig {
+            enabled: true,
+            all_preconfs: true,
+            preconf_queue_gas_blocks: 0,
+            ..Default::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidPreconfQueueGasBlocks)));
     }
 
     #[test]

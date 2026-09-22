@@ -1,16 +1,9 @@
 //! Replacement / resubmission semantics for preconf-eligible txs.
 //!
-//! Four axes, because the first alone left real gaps:
+//! Two axes, because the first alone left a real gap:
 //!
 //! 1. {existing fifo state} × {new submission kind} — the 2×2 below.
-//! 2. **{incumbent has a fifo entry} × {incumbent has only a frozen verdict}** —
-//!    `a_landed_commitment_still_owns_its_nonce_with_no_fifo_entry`. The guard keys on the
-//!    classifier's slot index, not on fifo membership, because the fifo entry is created
-//!    asynchronously.
-//! 3. **{sender's eligibility unchanged} × {sender de-allowlisted mid-flight}** —
-//!    `replacement_is_refused_after_sender_leaves_the_allowlist`. The newcomer's *own* verdict must
-//!    not gate the guard, or the two arms end up holding one tx each for the same nonce.
-//! 4. **{replacement passes its own checks} × {replacement is itself rejected}** —
+//! 2. **{replacement passes its own checks} × {replacement is itself rejected}** —
 //!    `rejected_replacement_leaves_the_reclaimable_holder_intact`. Deciding a holder is reclaimable
 //!    must not tear it down before the newcomer has cleared its own gates.
 //!
@@ -21,17 +14,14 @@
 //! **Same-hash resubmit**:
 //!
 //! - `active_hash_resubmit_returns_already_in_progress` — a `Waiting` fifo entry **blocks**
-//!   same-hash replacement at `attach_responder`; the RPC returns `AlreadyInProgress` synchronously
-//!   without touching the pool.
+//!   same-hash replacement at admission; the RPC returns `AlreadyInProgress` synchronously.
 //!
 //! **Different-hash, same `(sender, nonce)`**:
 //!
 //! - `waiting_slot_blocks_different_hash_replacement` — a `Waiting` fifo entry **blocks**
-//!   different-hash replacement at the pool validator
-//!   (`PreconfAwareValidator::ReplaceActivePreconf`); wire surfaces as `Err(Call { "pool rejected:
-//!   cannot replace active preconf commitment..." })`. Safety-critical: prevents a malicious client
-//!   from evicting an in-flight preconf commitment by submitting a low-value same-`(sender, nonce)`
-//!   tx.
+//!   different-hash replacement at admission; wire surfaces as `Err(Call { "pool rejected: cannot
+//!   replace active preconf commitment..." })`. Safety-critical: prevents a malicious client from
+//!   evicting an in-flight preconf commitment by submitting a low-value same-`(sender, nonce)` tx.
 //! - `timeout_slot_replaceable_by_different_hash` — `Timeout` entries are reclaimable, releasing
 //!   the slot; a differently-signed tx for the same slot admits and lands on chain.
 //! - `canceled_slot_replaceable_by_different_hash` — symmetric to Timeout: budget-Canceled entries
@@ -45,12 +35,30 @@
 //!   arm applies nonce=0, so reth's builder sees `tx.nonce=1 > expected 0` and rejects → fifo
 //!   `Failed`.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf, wait_pending_nonce};
-use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_classifier};
+//! ## Two cases removed with the pool-side guard
+//!
+//! `a_landed_commitment_still_owns_its_nonce_with_no_fifo_entry` and
+//! `replacement_is_refused_after_sender_leaves_the_allowlist` both submitted
+//! their replacement through `eth_sendRawTransaction` and asserted the
+//! *transaction pool* refused it on a preconf commitment's behalf. That
+//! protection is gone by design: the pool no longer knows preconf exists, so
+//! an ordinary transaction on a committed nonce is refused by nonce rules or
+//! not at all. op-geth still has the guard; reth deliberately does not.
+//!
+//! What survived of their intent lives closer to the decision:
+//! `preconf_tx_set`'s admission tests cover a commitment holding its nonce
+//! with no entry left, and a refused replacement leaving the incumbent
+//! untouched — both against the queue directly, where the rule now is.
+
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_fifo_entry};
+use crate::{
+    canonicalize_payload, launch_preconf_node, launch_preconf_node_with_classifier,
+    launch_preconf_node_with_fifo,
+};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use jsonrpsee::core::{ClientError, client::ClientT};
+use jsonrpsee::core::ClientError;
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
@@ -120,8 +128,8 @@ async fn active_hash_resubmit_returns_already_in_progress() {
     let raw_first = raw_tx.clone();
     let first = tokio::spawn(async move { send_preconf(&http_first, raw_first).await });
 
-    // Give the RPC handler time to complete step "attach_responder" before
-    // the second call races it.
+    // Give admission time to record the first submission before the second
+    // call races it.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let err = send_preconf(&http, raw_tx)
@@ -239,10 +247,8 @@ async fn timeout_slot_replaceable_by_different_hash() {
 
 /// A `Waiting` fifo entry (client's first preconf submission actively
 /// awaiting apply) must NOT be replaceable by a different-hash tx with
-/// the same `(sender, nonce)`. The pool validator's
-/// [`PreconfAwareValidator`] replacement guard rejects with
-/// `ReplaceActivePreconf`, which the RPC handler wraps as
-/// `PreconfError::PoolRejected(...)` — client sees
+/// the same `(sender, nonce)`. Admission refuses with
+/// `PreconfError::ReplaceActiveCommitment` — client sees
 /// `Err(Call { "pool rejected: cannot replace active preconf
 /// commitment..." })`.
 ///
@@ -251,8 +257,8 @@ async fn timeout_slot_replaceable_by_different_hash() {
 /// a same-`(sender, nonce)` tx with different content. The first
 /// submitter's receipt would then be silently dropped, breaking the
 /// preconf SLA. This test pins the wire signature so a regression in
-/// the validator's release set (currently `Timeout | Canceled |
-/// Failed`) is caught before it ships.
+/// the replaceable set (currently `Timeout | Canceled | Failed`) is
+/// caught before it ships.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn waiting_slot_blocks_different_hash_replacement() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -273,9 +279,8 @@ async fn waiting_slot_blocks_different_hash_replacement() {
     let raw_first = tx_a.clone();
     let first = tokio::spawn(async move { send_preconf(&http_first, raw_first).await });
 
-    // Give the RPC handler time to complete Step 0-4 (decode, whitelist,
-    // nonce, attach_responder, pool.add). By the time this sleep ends
-    // the fifo has a `Waiting` entry for tx_A.
+    // Give admission time to run (decode, whitelist, gas, verdict, queue).
+    // By the time this sleep ends the fifo has a `Waiting` entry for tx_A.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // tx_B: same sender + same nonce, but different `value` → different
@@ -301,26 +306,21 @@ async fn waiting_slot_blocks_different_hash_replacement() {
         .expect_err("different-hash submission against active Waiting slot must be rejected");
     let elapsed = start.elapsed();
 
+    // The refusal moved — the queue itself now says the nonce is spoken for,
+    // where the pool's validator used to — but the wording did not, because
+    // this is what clients already parse.
     match err {
         ClientError::Call(ref e) => {
-            let msg = e.message().to_lowercase();
-            assert!(
-                msg.contains("pool rejected"),
-                "expected `PreconfError::PoolRejected(...)` wrapping; got {}",
+            assert_eq!(
                 e.message(),
-            );
-            assert!(
-                msg.contains("cannot replace active preconf") ||
-                    msg.contains("replace active preconf"),
-                "expected `ReplaceActivePreconf` Display substring; got {}",
-                e.message(),
+                "pool rejected: cannot replace active preconf commitment for the same \
+                 (sender, nonce)",
             );
         }
         other => panic!("expected Call error, got {other:?}"),
     }
 
-    // Pool-validator rejection is synchronous; no responder was parked
-    // for tx_B, no fifo entry created.
+    // Refused synchronously; no responder parked, no entry created.
     assert!(
         elapsed < std::time::Duration::from_millis(500),
         "replacement rejection must fail fast (< 500ms); took {elapsed:?}",
@@ -341,7 +341,7 @@ async fn waiting_slot_blocks_different_hash_replacement() {
 /// txs against a 50k block cap; the third gets Canceled. Then a
 /// different-hash tx replaces it after canon.
 ///
-/// Two determinism gates keep this stable under load: `wait_pending_nonce`
+/// Two determinism gates keep this stable under load: `wait_fifo_entry`
 /// (slot-1 nonce-gap) and `canonize!` (slot-1 canon-progress — otherwise the
 /// slot-2 job re-applies the still-`Success` tx0/tx1 and exhausts the budget
 /// before the replacement lands).
@@ -358,7 +358,7 @@ async fn canceled_slot_replaceable_by_different_hash() {
         .preconf_timeout_ms(3_000)
         .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // ── Slot 1: tx0/tx1 land, tx2 budget-rejected (Canceled) ─────────────
     let attrs = node.payload.next_attributes();
@@ -384,10 +384,10 @@ async fn canceled_slot_replaceable_by_different_hash() {
     // async admission and is rejected as a gap under load.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    wait_pending_nonce(&http, wallet_addr, 1).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    wait_pending_nonce(&http, wallet_addr, 2).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2_canceled).await });
 
@@ -492,13 +492,12 @@ async fn canceled_slot_replaceable_by_different_hash() {
 ///
 /// 1. Whitelist only `(wallet, RECIPIENT_A)`. A "shadow" non-preconf- eligible tx to `RECIPIENT_B`
 ///    is injected at nonce=0 via `inject_tx` (plain `eth_sendRawTransaction`). Pool admits it to
-///    `Pending`, but the preconf listener filters it out — a plain submission freezes no eligible
-///    verdict — so no fifo entry is created for nonce=0.
+///    `Pending`. An ordinary submission never reaches the preconf queue, so no fifo entry exists
+///    for nonce=0.
 ///
-/// 2. A preconf tx to `RECIPIENT_A` at nonce=1 is submitted via `send_preconf`. RPC's Step-2
-///    nonce-gap gate reads `get_highest_consecutive_transaction_by_sender` → returns the pending
-///    nonce=0 → `pending_nonce = 1`, so tx.nonce=1 is NOT a gap and passes. Listener sees this
-///    preconf-eligible tx and pushes it into the fifo (Waiting).
+/// 2. A preconf tx to `RECIPIENT_A` at nonce=1 is submitted via `send_preconf`. Admission's
+///    nonce-gap check reads the queue's account view layered on the chain, which has nothing at
+///    nonce=0 to object to, so nonce=1 passes and the entry is queued (Waiting).
 ///
 /// 3. Build loop's `biased` select! prioritises `fifo_rx.recv` over the pool arm, whose gate
 ///    `pool_gas_used < pool_quota` is blocked at build start because `pool_quota = 0` until the
@@ -515,10 +514,9 @@ async fn canceled_slot_replaceable_by_different_hash() {
 ///    nonce of 1).
 ///
 /// 5. Slot 2: the client submits a **replacement** preconf tx: same sender, nonce=1, but different
-///    `value` (⇒ different hash). The pool validator's
-///    `PreconfAwareValidator::ReplaceActivePreconf` release-set `Timeout | Canceled | Failed`
-///    admits it (drops old Failed entry, admits new). Fresh sender nonce=1 now matches; the preconf
-///    tx lands on chain in block 2.
+///    `value` (⇒ different hash). The replaceable set `Timeout | Canceled | Failed` admits it
+///    (drops old Failed entry, admits new). Fresh sender nonce=1 now matches; the preconf tx lands
+///    on chain in block 2.
 ///
 /// Guards the "Failed is in the replacement release set" invariant
 /// end-to-end — the unit test
@@ -592,8 +590,7 @@ async fn failed_slot_replaceable_by_different_hash() {
         .await
         .expect("shadow tx admitted via plain sendRawTransaction");
 
-    // Let the pool digest and the (non-)preconf listener finish its
-    // filter step before submitting the preconf tx.
+    // Let the pool digest the shadow tx before submitting the preconf one.
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
     // Preconf tx: nonce=1 to RECIPIENT_A (whitelist hit). Different
@@ -603,7 +600,7 @@ async fn failed_slot_replaceable_by_different_hash() {
     let http_c = http.clone();
     let preconf_task = tokio::spawn(async move { send_preconf(&http_c, preconf_tx).await });
 
-    // Wait long enough for: preconf listener to push fifo entry (~10ms),
+    // Wait long enough for: admission to queue the entry,
     // dispatch to run apply_one_preconf and fail at builder (~few ms),
     // sweep_ticker to fire (default 200ms), pool arm to apply shadow tx.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -726,170 +723,6 @@ async fn failed_slot_replaceable_by_different_hash() {
         sealed_2.contains(&replacement_hash),
         "replacement of Failed entry must land in block 2; sealed={sealed_2:?}",
     );
-}
-
-/// **The state the fifo cannot see**: a transaction that owns its
-/// `(sender, nonce)` while having no fifo entry at all.
-///
-/// Reaching it is the whole reason the guard's occupancy check is the
-/// classifier's slot index rather than the fifo. The window the index exists for
-/// — between `validate_transaction` claiming the slot and the pool listener
-/// pushing the entry — is sub-millisecond and not reachable from a test. The
-/// **retention window** is the same state held open deterministically: once a
-/// commitment lands, `forward()` removes its fifo entry the moment its nonce
-/// advances, but the slot is kept for `SEAL_DEPTH` persisted blocks so a reorg
-/// cannot hand the nonce away.
-///
-/// So: get a commitment on chain, then try to take its nonce. The guard runs
-/// **before** the inner validator, so a refusal here says `ReplaceActivePreconf`
-/// rather than nonce-too-low — which is what makes the assertion discriminating
-/// rather than merely true.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_landed_commitment_still_owns_its_nonce_with_no_fifo_entry() {
-    let recipient: Address = RECIPIENT.parse().unwrap();
-    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
-
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .preconf_timeout_ms(5_000)
-        .build();
-
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
-
-    // ── Slot 1: a preconf commitment at nonce 0, applied and sealed.
-    let attrs = node.payload.next_attributes();
-    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
-    let payload_id = node
-        .inner
-        .add_ons_handle
-        .beacon_engine_handle
-        .fork_choice_updated(fcu_state, Some(attrs))
-        .await
-        .expect("FCU must succeed")
-        .payload_id
-        .expect("payload_id must be present when attributes are supplied");
-
-    let tx = signed_transfer(chain_id, &wallet, 0).await;
-    let http_c = http.clone();
-    let committed = tokio::spawn(async move { send_preconf(&http_c, tx).await });
-
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let payload = node
-        .inner
-        .payload_builder_handle
-        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
-        .await
-        .expect("resolve_kind")
-        .expect("payload");
-    let _ = committed.await.expect("join").expect("the commitment must succeed");
-
-    // Canonicalise it. The on-chain nonce advances to 1, so the next payload
-    // job's `sync_fifo_forward_to_head` drops the entry for nonce 0 — while the
-    // classifier keeps the slot for the retention window.
-    let _new_head = canonicalize_payload!(node, payload).await;
-
-    // Open the next job, which is what runs the forward.
-    let attrs_2 = node.payload.next_attributes();
-    let fcu_state_2 = node.current_forkchoice_state().expect("forkchoice state 2");
-    let _ = node
-        .inner
-        .add_ons_handle
-        .beacon_engine_handle
-        .fork_choice_updated(fcu_state_2, Some(attrs_2))
-        .await
-        .expect("FCU 2 must succeed");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // ── Now take the nonce. Different hash, and a fee bump so reth's own
-    //    price rule cannot be the thing that refuses it.
-    let replacement =
-        signed_transfer_bumped(chain_id, &wallet, 0, U256::from(2u64), 40e9 as u128).await;
-    let err = ClientT::request::<alloy_primitives::B256, _>(
-        &http,
-        "eth_sendRawTransaction",
-        vec![replacement.to_string()],
-    )
-    .await
-    .expect_err("a nonce held through the retention window must not be handed away");
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("cannot replace active preconf commitment"),
-        "expected ReplaceActivePreconf — nonce-too-low would mean the guard never ran; got: {msg}",
-    );
-}
-
-/// **Eligibility can change mid-flight, and the guard must not care.**
-///
-/// The sequence a user can actually produce:
-///
-/// 1. `A` submits `a` through the preconf RPC while allowlisted — `a` is frozen `Eligible`, owns
-///    `(A, nonce)`, and gets a fifo entry.
-/// 2. Governance revokes the rule that covered `A`.
-/// 3. `A` submits `b`: same nonce, higher fee. It is judged against the *new* allowlist, so its own
-///    verdict is `NotEligible`.
-///
-/// If the guard only ran for preconf-eligible newcomers, `b` would be admitted
-/// as an ordinary transaction: `a` would sit on the preconf arm (the fifo holds
-/// its envelope, so it executes even though the pool evicted it) while `b` sat
-/// on the pool arm, for the same nonce. Whichever arm ran first would silently
-/// kill the other — `a`'s client seeing `Failed`, or `b` never landing with no
-/// error at all. Which one loses depends on the builder's internal arm ordering,
-/// which is not a guarantee.
-///
-/// op-geth cannot reach this state: its guard reads only the incumbent's preconf
-/// status (`legacypool.go`, `ErrPreconfInProcess`), never the newcomer's
-/// eligibility. This test pins reth to the same rule.
-///
-/// Discriminating power was verified by restoring the `verdict.is_preconf()`
-/// gate around the slot check: `b` is then accepted and this test fails.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replacement_is_refused_after_sender_leaves_the_allowlist() {
-    let recipient: Address = RECIPIENT.parse().unwrap();
-    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
-
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .preconf_timeout_ms(5_000)
-        .build();
-
-    let (_node, http, wallet, chain_id, classifier) =
-        launch_preconf_node_with_classifier!(cfg, crate::helpers::mantle_test_chain_spec()).await;
-
-    // 1. `a` parks a responder and takes the slot.
-    let tx_a = signed_transfer(chain_id, &wallet, 0).await;
-    let http_a = http.clone();
-    let a = tokio::spawn(async move { send_preconf(&http_a, tx_a).await });
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    // 2. Governance revokes the rule covering `A`; `a`'s verdict stays frozen `Eligible`. A rule
-    //    for a *different* sender is left in place on purpose: refusing `b` must follow from the
-    //    allowlist no longer covering this sender, not from the allowlist being empty.
-    classifier.update_whitelist(
-        [(Address::from([0xA1; 20]), recipient)].into_iter().collect(),
-        Default::default(),
-        Default::default(),
-    );
-
-    // 3. `b`: same nonce, higher fee, and now judged NotEligible.
-    let tx_b = signed_transfer_bumped(chain_id, &wallet, 0, U256::from(2u64), 40e9 as u128).await;
-    let err = ClientT::request::<alloy_primitives::B256, _>(
-        &http,
-        "eth_sendRawTransaction",
-        vec![tx_b.to_string()],
-    )
-    .await
-    .expect_err("a de-whitelisted replacement must not be able to evict an in-flight commitment");
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("cannot replace active preconf commitment"),
-        "expected ReplaceActivePreconf, got: {msg}",
-    );
-
-    a.abort();
 }
 
 /// **A replacement that is itself rejected must not destroy the holder it was

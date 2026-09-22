@@ -29,8 +29,8 @@ use mantle_reth_preconf::{
     FlashblockProducerConfig, FlashblockProducerConfigError, PreconfConfig,
     config::{
         DEFAULT_BROADCAST_CAP, DEFAULT_JOURNAL_MAX_SIZE, DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
-        DEFAULT_PRECONF_MAX_GAS_PER_TX, DEFAULT_PRECONF_TIMEOUT, DEFAULT_REJOURNAL_INTERVAL,
-        DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
+        DEFAULT_PRECONF_MAX_GAS_PER_TX, DEFAULT_PRECONF_QUEUE_GAS_BLOCKS, DEFAULT_PRECONF_TIMEOUT,
+        DEFAULT_REJOURNAL_INTERVAL, DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
     },
     flashblocks::{
         DEFAULT_FLASHBLOCK_ADDR, DEFAULT_FLASHBLOCK_BLOCK_TIME, DEFAULT_FLASHBLOCK_LEEWAY,
@@ -265,8 +265,7 @@ pub struct PreconfArgs {
     /// Enable the mantle preconfirmation subsystem.
     ///
     /// When absent (default), the node behaves exactly like upstream
-    /// `op-reth` — no preconf validator, listener, canon handler, or RPC
-    /// method registration.
+    /// `op-reth` — no admission, canon handler, or RPC method registration.
     #[arg(long = "preconf.enable")]
     pub enable: bool,
 
@@ -323,6 +322,13 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.max-gas-per-block")]
     pub max_gas_per_block: Option<u64>,
 
+    /// How much backlog the preconf queue will hold, in blocks' worth of
+    /// `preconf.max-gas-per-block`. Default `1` — a request queued behind more
+    /// than that cannot land before its own deadline, so it is refused on
+    /// arrival rather than left to time out.
+    #[arg(long = "preconf.queue-gas-blocks")]
+    pub queue_gas_blocks: Option<u64>,
+
     /// Journal rotation interval, in seconds. Default 60s. Only meaningful
     /// when `--preconf.journal-path` is set.
     #[arg(long = "preconf.rejournal-interval-secs")]
@@ -375,6 +381,9 @@ impl PreconfArgs {
             preconf_max_gas_per_block: self
                 .max_gas_per_block
                 .unwrap_or(DEFAULT_PRECONF_MAX_GAS_PER_BLOCK),
+            preconf_queue_gas_blocks: self
+                .queue_gas_blocks
+                .unwrap_or(DEFAULT_PRECONF_QUEUE_GAS_BLOCKS),
             journal_path: self.journal_path,
             rejournal_interval: self
                 .rejournal_interval_secs

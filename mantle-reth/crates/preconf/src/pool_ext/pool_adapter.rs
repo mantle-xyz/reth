@@ -1,12 +1,9 @@
-//! Bridge from a live [`TransactionPool`] to the [`crate::RestorePool`]
+//! Bridge from a live [`TransactionPool`] to the [`crate::RestoreSource`]
 //! trait so [`crate::restore_preconf_state`] can re-admit and decode
 //! journal-persisted commitments at node startup.
 //!
-//! The adapter is generic over the same three type parameters as
-//! [`crate::pool_ext::preconf_pool_listener::PreconfPoolListener`] and
-//! shares its `op_envelope_to_alloy`
-//! helper so the "which OP tx variants are preconf-eligible" decision
-//! stays in one place.
+//! It shares admission's `op_envelope_to_alloy` helper so the "which OP tx
+//! variants are preconf-eligible" decision stays in one place.
 //!
 //! ## `add_envelope` semantics
 //!
@@ -25,79 +22,69 @@
 //! post-restart state, etc.) surface as `Err(reason)`. The restore
 //! helper logs and skips those entries.
 
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 use alloy_primitives::Address;
 use async_trait::async_trait;
 use op_alloy_consensus::OpTxEnvelope;
 use reth_prune_types::PruneSegment;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
-use reth_storage_api::{DatabaseProviderFactory, PruneCheckpointReader, TransactionsProvider};
-use reth_transaction_pool::{
-    PoolPooledTx, PoolTransaction, TransactionOrigin, TransactionPool, error::PoolErrorKind,
+use reth_storage_api::{
+    DatabaseProviderFactory, PruneCheckpointReader, StateProvider, StateProviderFactory,
+    TransactionsProvider,
+};
+use reth_transaction_pool::PoolTransaction;
+
+use crate::{
+    admission::op_envelope_to_alloy,
+    journal::{CommitmentChainView, OnChain, RestoreSkip, RestoreSource, RestoredEnvelope},
 };
 
-use super::preconf_pool_listener::op_envelope_to_alloy;
-use crate::journal::{CommitmentChainView, OnChain, RestorePool, RestoreSkip, RestoredEnvelope};
-
-/// Adapter that lets a live [`TransactionPool`] play the [`RestorePool`]
-/// role during startup restore.
+/// Turns journal bytes back into something the queue can hold.
 ///
-/// Generic over the pool `P`, the pool's `Transaction` type `Tx`, and
-/// the tx's consensus form `Cons` — matching the layout used by
-/// [`crate::pool_ext::preconf_pool_listener::PreconfPoolListener`].
-/// Cheap to hold: single-arc pool + zero-sized phantom markers.
+/// Holds nothing. What this replaces wrapped a live `TransactionPool`,
+/// because restore used to re-admit every commitment there and read the
+/// verdict off the pool's validator. Commitments do not enter the pool any
+/// more, so all that is left of the job is decoding — and the questions the
+/// pool used to answer as a side effect are now asked of the chain directly.
+///
+/// Still generic over the pool's `Transaction` type: the journal holds wire
+/// bytes, and decoding them needs a pooled envelope type to decode *into*.
+/// That is a type-level dependency, not a handle — nothing is held.
 #[derive(Clone)]
-pub struct RestorePoolAdapter<P, Tx, Cons>
-where
-    P: Clone,
-{
-    pool: P,
+pub struct RestoreDirect<Tx, Cons> {
     _tx: PhantomData<fn() -> Tx>,
     _cons: PhantomData<fn() -> Cons>,
 }
 
-// Manual `Debug`: skips the pool (would force `P: Debug` on every
-// call-site) and the phantom markers (which carry no runtime info).
-impl<P, Tx, Cons> std::fmt::Debug for RestorePoolAdapter<P, Tx, Cons>
-where
-    P: Clone,
-{
+impl<Tx, Cons> std::fmt::Debug for RestoreDirect<Tx, Cons> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RestorePoolAdapter").finish_non_exhaustive()
+        f.debug_struct("RestoreDirect").finish_non_exhaustive()
     }
 }
 
-impl<P, Tx, Cons> RestorePoolAdapter<P, Tx, Cons>
-where
-    P: Clone,
-{
-    /// Wrap a pool handle for use with [`crate::restore_preconf_state`].
-    pub const fn new(pool: P) -> Self {
-        Self { pool, _tx: PhantomData, _cons: PhantomData }
+impl<Tx, Cons> Default for RestoreDirect<Tx, Cons> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Tx, Cons> RestoreDirect<Tx, Cons> {
+    /// For use with [`crate::restore_preconf_state`].
+    pub const fn new() -> Self {
+        Self { _tx: PhantomData, _cons: PhantomData }
     }
 }
 
 #[async_trait]
-impl<P, Tx, Cons> RestorePool for RestorePoolAdapter<P, Tx, Cons>
+impl<Tx, Cons> RestoreSource for RestoreDirect<Tx, Cons>
 where
-    P: TransactionPool<Transaction = Tx> + Clone + Send + Sync + 'static,
     Tx: PoolTransaction<Consensus = Cons> + Send + Sync + 'static,
     Cons: Clone + Into<OpTxEnvelope> + Send + Sync + 'static,
 {
-    async fn contains(&self, hash: &alloy_primitives::TxHash) -> bool {
-        self.pool.get(hash).is_some()
-    }
-
-    fn remove_transactions(&self, hashes: Vec<alloy_primitives::TxHash>) {
-        // reth's `remove_transactions` returns a `Vec<Arc<...>>` of the
-        // removed pool txs; we discard it here. Absent hashes are a
-        // no-op (empty return). Same-thread mutex; no `.await`.
-        let _ = self.pool.remove_transactions(hashes);
-    }
-
     fn recover_slot(&self, tx_rlp: &alloy_primitives::Bytes) -> Option<(Address, u64)> {
-        let recovered = recover_raw_transaction::<PoolPooledTx<P>>(tx_rlp.as_ref()).ok()?;
+        let recovered =
+            recover_raw_transaction::<<Tx as PoolTransaction>::Pooled>(tx_rlp.as_ref()).ok()?;
         Some((recovered.signer(), alloy_consensus::Transaction::nonce(recovered.inner())))
     }
 
@@ -105,56 +92,24 @@ where
         &self,
         tx_rlp: &alloy_primitives::Bytes,
     ) -> Result<RestoredEnvelope, RestoreSkip> {
-        // Decode + recover — same pipeline the RPC handler uses.
-        let recovered = recover_raw_transaction::<PoolPooledTx<P>>(tx_rlp.as_ref())
+        // Decode + recover — same pipeline admission uses.
+        let recovered = recover_raw_transaction::<<Tx as PoolTransaction>::Pooled>(tx_rlp.as_ref())
             .map_err(|e| RestoreSkip::Rejected(format!("decode/recover failed: {e}")))?;
         let sender = recovered.signer();
 
         // Extract the alloy `TxEnvelope` for fifo push. Deposit /
         // PostExec variants should never appear in the journal (only
         // preconf-RPC-submitted txs are persisted), but drop them
-        // defensively — matches the listener's filter.
+        // defensively — matches admission's own filter.
         let consensus = <Tx as PoolTransaction>::pooled_into_consensus(recovered.inner().clone());
         let op_env: OpTxEnvelope = consensus.into();
         let envelope = op_envelope_to_alloy(op_env).ok_or_else(|| {
             RestoreSkip::Rejected("non-preconf-eligible variant (Deposit / PostExec)".to_string())
         })?;
 
-        // Attempt to admit. `AlreadyImported` is benign: the restore path needs
-        // the recovered envelope either way. It is defensive rather than expected
-        // — `cli::node` runs restore before `spawn_maintenance_tasks` spawns
-        // reth's local-tx backup loader, so that loader cannot be what put the
-        // tx there.
-        let pool_tx = <Tx as PoolTransaction>::from_pooled(recovered);
-        match self.pool.add_transaction(TransactionOrigin::External, pool_tx).await {
-            Ok(_) => {}
-            Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
-            // The sender's nonce has moved past this transaction — which is
-            // **not** the same as "this transaction is on chain".
-            // `is_nonce_too_low` reduces to
-            // `NonceNotConsistent { tx, state } => tx < state`, and
-            // `validate_sender_nonce` compares the tx's nonce against the
-            // *account's* nonce, never the hash: a different transaction on the
-            // same nonce yields a byte-identical error. So don't conclude — the
-            // caller asks the chain; all this arm can report is that the nonce is
-            // gone.
-            Err(e) if matches!(&e.kind, PoolErrorKind::InvalidTransaction(err) if err.is_nonce_too_low()) =>
-            {
-                return Err(RestoreSkip::NonceConsumed(format!("{}", e.kind)));
-            }
-            Err(e) => return Err(RestoreSkip::Rejected(format!("pool rejected: {}", e.kind))),
-        }
-
         Ok(RestoredEnvelope { envelope, from: sender })
     }
 }
-
-// Keep the `Arc` import reachable from downstream call-sites even
-// though this module doesn't use it directly — some downstream
-// callers construct `Arc<RestorePoolAdapter<...>>` and importing it
-// through this module is convenient.
-#[allow(dead_code)]
-type _ArcHint<P, Tx, Cons> = Arc<RestorePoolAdapter<P, Tx, Cons>>;
 
 /// Lets a node provider answer the restore path's chain question — whether a
 /// commitment whose nonce is gone is the transaction that consumed it.
@@ -184,12 +139,17 @@ where
     // their own. See the type docs.
     P: TransactionsProvider
         + DatabaseProviderFactory<Provider: PruneCheckpointReader>
+        + StateProviderFactory
         + Send
         + Sync,
 {
     /// `Unknown` on any miss once the transaction-lookup segment has **ever** been pruned:
     /// `JournalEntry::block_height` is only a prediction, so "the prune missed it" cannot be
     /// decided. Pruning is thus incompatible with preconf; until it first runs, a miss reads `No`.
+    fn account_nonce(&self, sender: &Address) -> Option<u64> {
+        self.0.latest().ok()?.account_nonce(sender).ok().flatten()
+    }
+
     fn commitment_on_chain(&self, hash: &alloy_primitives::TxHash) -> OnChain {
         // `_with_meta` rather than the plain lookup: the caller needs the block
         // number to start the retention clock, and it sits on the same trait, so

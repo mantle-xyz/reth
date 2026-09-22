@@ -11,8 +11,8 @@ use mantle_reth_flashblocks::{
     FlashblocksState, FlashblocksSubscriber,
 };
 use mantle_reth_preconf::{
-    MantlePreconfServiceBuilder, PreconfAwareValidator, PreconfClassifier, PreconfConfig,
-    PreconfPoolListener, PreconfServiceBuilder, PreconfTxSet, bootstrap_whitelist,
+    MantlePreconfServiceBuilder, PreconfAdmission, PreconfClassifier, PreconfConfig,
+    PreconfServiceBuilder, PreconfTxSet, admission::capacity_from_pool_config, bootstrap_whitelist,
     run_whitelist_watcher,
 };
 use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
@@ -51,21 +51,20 @@ use reth_optimism_node::{OpEngineApiBuilder, OpEngineValidatorBuilder};
 /// Same structure as `OpTransactionPool` but the inner validator chain is:
 ///
 /// ```text
-/// PreconfAwareValidator<MantleTransactionValidator<OpTransactionValidator<...>>>
+/// MantleTransactionValidator<OpTransactionValidator<...>>
 /// ```
 ///
-/// The outermost [`PreconfAwareValidator`] is always present in the type;
-/// when preconf is not wired up via [`MantlePoolBuilder::with_preconf`], it
-/// holds a default-disabled `PreconfConfig` and an empty `PreconfTxSet` —
-/// effectively a no-op layer (both replacement guard and gas-ceiling check
-/// short-circuit on the empty / disabled state).
+/// The pool knows nothing about preconf. It used to carry a decorating layer
+/// that enforced the preconf replacement guard and per-tx gas ceiling on
+/// every transaction the node saw, sequencer or not; those judgements belong
+/// to `PreconfAdmission` now, on a path the pool is not part of. The same
+/// chain is shared with admission rather than duplicated, so both give one
+/// answer to "is this transaction valid".
 pub type MantleTransactionPool<Client, S, Evm, T = OpPooledTransaction> = OpPool<
     Pool<
         TransactionValidationTaskExecutor<
-            PreconfAwareValidator<
-                MantleTransactionValidator<
-                    reth_optimism_txpool::OpTransactionValidator<Client, T, Evm>,
-                >,
+            MantleTransactionValidator<
+                reth_optimism_txpool::OpTransactionValidator<Client, T, Evm>,
             >,
         >,
         CoinbaseTipOrdering<T>,
@@ -84,11 +83,9 @@ pub type MantleTransactionPool<Client, S, Evm, T = OpPooledTransaction> = OpPool
 pub struct MantlePoolBuilder<T = OpPooledTransaction> {
     pool_config_overrides: PoolBuilderConfigOverrides,
     enable_tx_conditional: bool,
-    /// Optional preconfirmation wiring. `None` ⇒ preconf disabled; the
-    /// validator chain still includes a `PreconfAwareValidator`, but it
-    /// receives a default-disabled config and an empty fifo so its checks
-    /// short-circuit. `Some(_)` ⇒ both validator and pool listener are
-    /// driven by the provided `cfg` / `fifo`.
+    /// Optional preconfirmation wiring. `None` ⇒ preconf disabled and the pool
+    /// is built exactly as upstream builds it. `Some(_)` ⇒ the journal restore
+    /// that runs once the pool is up is driven by the provided `cfg` / `fifo`.
     preconf: Option<PreconfWiring>,
     _pd: core::marker::PhantomData<T>,
 }
@@ -109,9 +106,9 @@ pub struct PreconfWiring {
     /// Handle to the application-level service builder — used by
     /// [`MantlePoolBuilder::build_pool`] to run [`PreconfServiceBuilder::start`]
     /// immediately after the pool is up, replaying any journaled commitments
-    /// into the fifo before any pool listener / canon handler / payload builder
-    /// task is spawned. `None` when preconf is disabled on the node (the default
-    /// pass-through path).
+    /// into the fifo before the canon handler or the payload builder is spawned.
+    /// `None` when preconf is disabled on the node (the default pass-through
+    /// path).
     pub svc: Option<Arc<PreconfServiceBuilder>>,
 }
 
@@ -143,9 +140,8 @@ impl<T> MantlePoolBuilder<T> {
     }
 
     /// Enable preconfirmation: thread `cfg`, `fifo`, and the service builder
-    /// handle into the validator decoration chain + startup restore + pool
-    /// listener spawn. The journal is mandatory and carried by `svc` (read
-    /// via [`PreconfServiceBuilder::journal`] where the listener needs it).
+    /// handle into admission and the startup restore. The journal is mandatory
+    /// and carried by `svc` (read via [`PreconfServiceBuilder::journal`]).
     pub fn with_preconf(
         mut self,
         cfg: Arc<PreconfConfig>,
@@ -163,11 +159,10 @@ where
     N: FullNodeTypes<Types: NodeTypes<ChainSpec: OpHardforks>>,
     T: EthPoolTransaction<Consensus = TxTy<N::Types>> + OpPooledTx,
     Evm: ConfigureEvm<Primitives = PrimitivesTy<N::Types>> + Clone + 'static,
-    // PreconfPoolListener bridges the pool's consensus tx into `OpTxEnvelope`
-    // (and drops Deposit / PostExec). This bound makes the conversion path
+    // Admission converts the pool's consensus transaction into `OpTxEnvelope`
+    // before it reaches the queue. This bound makes the conversion path
     // discoverable to the compiler; for any OP-stack `NodePrimitives` it is
-    // satisfied by `impl From<OpTransactionSigned> for OpTxEnvelope` in
-    // `op-reth/crates/primitives/src/transaction/signed.rs`.
+    // satisfied by `impl From<OpTransactionSigned> for OpTxEnvelope`.
     OpTxEnvelope: From<TxTy<N::Types>>,
 {
     type Pool = MantleTransactionPool<N::Provider, DiskFileBlobStore, Evm, T>;
@@ -179,11 +174,9 @@ where
     ) -> eyre::Result<Self::Pool> {
         let blob_store = reth_node_builder::components::create_blob_store(ctx)?;
 
-        // Resolve preconf wiring once for both the validator decoration
-        // and the optional listener spawn below. When no caller has wired
-        // up preconf (`with_preconf` not invoked), supply default-disabled
-        // handles so the `PreconfAwareValidator` layer becomes a cheap
-        // pass-through (empty fifo + disabled cfg).
+        // Resolve preconf wiring once. When no caller has wired up preconf
+        // (`with_preconf` not invoked), supply default-disabled handles so the
+        // journal restore below is a no-op (empty fifo + disabled cfg).
         // No journal handle is pulled out here: nothing in this scope needs one —
         // rotation reaches it through `svc.journal()` below.
         let (preconf_cfg, preconf_classifier, preconf_fifo, preconf_svc) =
@@ -196,12 +189,6 @@ where
                     (Arc::new(cfg), classifier, fifo, None)
                 }
             };
-        // Clones moved into the validator-build closure. The listener
-        // (spawned later) takes a separate clone of the same Arcs.
-        let validator_cfg = preconf_cfg.clone();
-        let validator_classifier = preconf_classifier.clone();
-        let validator_fifo = preconf_fifo.clone();
-
         let validator =
             TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
                 .no_eip4844()
@@ -222,21 +209,20 @@ where
                     // Enforce `--rpc.txfeecap` for all RPC-submitted txs (op-geth parity);
                     // see MantleTransactionValidator docs for why this can't live in the
                     // inner (upstream) validator. Same config source as `set_tx_fee_cap` above.
-                    let mantle_validator = MantleTransactionValidator::new(
-                        op_validator,
-                        ctx.config().rpc.rpc_tx_fee_cap,
-                    );
-                    // Wrap with the preconf replacement/gas guard.
-                    // `.map` takes `FnMut`; clone the Arcs on every call.
-                    PreconfAwareValidator::new(
-                        mantle_validator,
-                        validator_cfg.clone(),
-                        validator_classifier.clone(),
-                        validator_fifo.clone(),
-                    )
+                    MantleTransactionValidator::new(op_validator, ctx.config().rpc.rpc_tx_fee_cap)
                 });
 
         let final_pool_config = self.pool_config_overrides.apply(ctx.pool_config());
+
+        // Admission validates through the *same* chain the pool does, so the
+        // two cannot disagree about what is valid — and so the chain's
+        // head-tracking is driven once, by pool maintenance, for both. The
+        // clone shares the instance rather than making a second one.
+        //
+        // Taken here because this is where the chain exists; the RPC handler
+        // is assembled in a later phase, and the service builder is what
+        // carries the result across.
+        let admission_validator = validator.clone();
 
         let inner_pool = TxPoolBuilder::new(ctx)
             .with_validator(validator)
@@ -281,15 +267,25 @@ where
         // events. Two ordering constraints:
         // - Must run before `spawn_maintenance_tasks` (which spawns reth's local-tx backup loader)
         //   so the loader and the restore path don't race on the pool mutex.
-        // - Must run before the pool listener is spawned so the restore helper's fifo pushes are
+        // - Must run before admission is reachable so the restore helper's fifo pushes are
         //   attributed to the restart path, not to a fresh RPC submission.
         if let Some(svc) = preconf_svc.as_ref() {
-            use mantle_reth_preconf::{ProviderChainView, RestorePoolAdapter};
-            let adapter = RestorePoolAdapter::<_, T, TxTy<N::Types>>::new(transaction_pool.clone());
-            // The provider answers restore's chain question — whether a
-            // commitment whose nonce is gone is the transaction that consumed it.
-            // The pool cannot: its only chain-derived signal is the account
-            // nonce. See `CommitmentChainView`.
+            svc.set_admission(Arc::new(PreconfAdmission::new(
+                admission_validator,
+                ctx.provider().clone(),
+                preconf_fifo.clone(),
+                preconf_classifier.clone(),
+                preconf_cfg.clone(),
+                capacity_from_pool_config(&final_pool_config, &preconf_cfg),
+            )));
+
+            use mantle_reth_preconf::{ProviderChainView, RestoreDirect};
+            let adapter = RestoreDirect::<T, TxTy<N::Types>>::new();
+            // The provider answers both of restore's chain questions: whether
+            // a commitment's nonce is still its sender's next one, and — only
+            // when it is not — whether the transaction that took it was this
+            // one. The pool used to answer the first as a side effect of
+            // refusing the transaction; it no longer sees these at all.
             let chain_view = ProviderChainView::new(ctx.provider().clone());
             svc.start(&adapter, &chain_view)
                 .await
@@ -302,23 +298,6 @@ where
             transaction_pool.clone(),
             &final_pool_config,
         )?;
-
-        // Spawn the pool listener only when preconf is actually enabled — when
-        // `with_preconf` was not called, `preconf_cfg.enabled` is false and the
-        // listener would sit idle skipping every tx for want of a verdict.
-        // Skipping the spawn saves a task.
-        if preconf_cfg.enabled {
-            // No journal handle: the listener asks the classifier instead — see
-            // `PreconfPoolListener::run`.
-            let listener = PreconfPoolListener::new(
-                transaction_pool.clone(),
-                preconf_cfg.clone(),
-                preconf_classifier.clone(),
-                preconf_fifo.clone(),
-            );
-            ctx.task_executor().spawn_critical_task("mantle-preconf-pool-listener", listener.run());
-            info!(target: "reth::cli", "Mantle preconf pool listener spawned");
-        }
 
         if self.enable_tx_conditional {
             let chain_events = ctx.provider().canonical_state_stream();
@@ -374,10 +353,9 @@ pub struct MantleNode {
     /// Underlying OP node configuration.
     pub op_node: reth_optimism_node::OpNode,
     /// Optional preconfirmation subsystem handle. `None` ⇒ preconf
-    /// disabled (default); the node behaves exactly like the
-    /// underlying OP node. `Some` ⇒ the validator chain, pool listener,
-    /// canonical-state cleaner, and RPC handler all get wired up to
-    /// the shared `cfg` / `fifo` held by the builder.
+    /// disabled (default); the node behaves exactly like the underlying OP
+    /// node. `Some` ⇒ admission, the canonical-state cleaner and the RPC handler
+    /// all get wired up to the shared `cfg` / `fifo` held by the builder.
     pub preconf: Option<Arc<PreconfServiceBuilder>>,
     /// Optional flashblock consumer configuration. `None` ⇒ the `pending` tag
     /// keeps its standard local-mempool semantics.
@@ -408,12 +386,11 @@ impl MantleNode {
         self
     }
 
-    /// Enable the preconfirmation subsystem on this node. The provided
-    /// builder owns the shared `cfg` / `fifo` handles; the same handles
-    /// thread into the validator chain, the pool listener (spawned by
-    /// [`MantlePoolBuilder::build_pool`]), the canonical-state handler
-    /// (spawned in [`MantleNode::add_ons`]), and the RPC handler
-    /// (injected into [`MantleRpcExt`]).
+    /// Enable the preconfirmation subsystem on this node. The provided builder
+    /// owns the shared `cfg` / `fifo` handles; the same handles thread into
+    /// admission, the canonical-state handler (spawned in
+    /// [`MantleNode::add_ons`]), and the RPC handler (injected into
+    /// [`MantleRpcExt`]).
     pub fn with_preconf(mut self, builder: PreconfServiceBuilder) -> Self {
         self.preconf = Some(Arc::new(builder));
         self
@@ -426,9 +403,8 @@ impl MantleNode {
     {
         let args = &self.op_node.args;
 
-        // Activate pool-side preconf wiring (validator decoration + spawned
-        // pool listener inside `build_pool`) if the node was configured
-        // for preconf. Otherwise the pool builder stays in its default
+        // Hand the pool builder the preconf handles it needs to run the journal
+        // restore once the pool is up. Otherwise it stays in its default
         // pass-through state.
         let mut pool_builder =
             MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional);
@@ -544,9 +520,7 @@ where
                 .map_err(|e| eyre::eyre!("failed to create SequencerClient: {e}"))?;
 
             // If preconf is enabled, spin up the canonical-state handler and
-            // build the RPC handler. The pool listener is already spawned
-            // by `MantlePoolBuilder::build_pool` when its `with_preconf`
-            // was called during `components()`.
+            // build the RPC handler.
             let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
                 preconf.as_ref().map(|svc| {
                     let canon =
@@ -599,8 +573,12 @@ where
                     );
                     info!(target: "reth::cli", "Mantle preconf journal rotation loop spawned");
 
-                    let handler =
-                        svc.rpc_handler(ctx.node().pool().clone(), ctx.node().provider().clone());
+                    // Handed over while the pool was being built; see
+                    // `PreconfServiceBuilder::set_admission`.
+                    let admission = svc
+                        .admission()
+                        .expect("preconf admission is wired in build_pool before this runs");
+                    let handler = svc.rpc_handler(admission);
                     Arc::new(handler) as Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>
                 });
 

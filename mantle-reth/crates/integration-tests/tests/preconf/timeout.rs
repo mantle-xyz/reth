@@ -12,16 +12,6 @@
 //!   while dispatch is mid-apply; `rpc.rs`'s `lock_for_apply` + `try_recv` fallback harvests the
 //!   receipt so the client sees `Success`. Exercises the branch by disabling `safety_margin` (which
 //!   would otherwise preemptively abort dispatch and hide the race).
-//! - `basefee_orphan_returns_timeout_and_clears_responder` — tx routed to the pool's `BaseFee`
-//!   sub-pool never enters the fifo (listener only subscribes to `Pending`); RPC deadline fires
-//!   with `final_status == None` and hits `mark_timeout`'s `NotFound` fallback, but must still
-//!   clear `pending_responders` so a same- hash resubmit is not permanently wedged with
-//!   `AlreadyInProgress`.
-//! - `basefee_orphan_evicted_from_pool_on_timeout` — same `BaseFee`-orphan path, but pins the SLA
-//!   half the other test omits: because no fifo entry exists, `mark_timeout` returns `NotFound` and
-//!   its pool-eviction callback never fires, so the RPC handler must remove the tx from the pool
-//!   itself. Otherwise the orphan lingers in `BaseFee` and gets mined once the base fee drops —
-//!   after the client already saw `Timeout`.
 //!
 //! Timeout entry releasing the `(sender, nonce)` slot for a differently-
 //! signed tx is a **replacement** semantic and lives in
@@ -58,8 +48,7 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 ///
 /// Send a whitelisted preconf tx but never trigger an FCU. The
 /// responder is parked; after `preconf_timeout` the RPC handler:
-/// 1. flips the fifo entry to `Timeout` (or reports `NotFound` when the pool listener routed the tx
-///    to `BaseFee` / `Queued`),
+/// 1. flips the fifo entry to `Timeout` (or reports `NotFound` if it was swept in between),
 /// 2. cancels the pending responder, and
 /// 3. returns `Ok(PreconfTxEvent { status: Timeout, receipt.logs: None, ... })`.
 ///
@@ -70,8 +59,8 @@ async fn deadline_elapsed_returns_timeout_and_evicts_pool() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    // 150ms deadline — enough for pool.add_transaction to complete but
-    // short enough that the test finishes fast when the deadline fires.
+    // 150ms deadline — enough for admission to complete but short enough
+    // that the test finishes fast when the deadline fires.
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(wallet_addr)
         .whitelist_to(recipient)
@@ -112,14 +101,11 @@ async fn deadline_elapsed_returns_timeout_and_evicts_pool() {
         event.reason,
     );
 
-    // SLA guard: "wire Timeout ⇒ this tx MUST NOT land on chain".
-    // Two mechanisms combine to enforce this:
-    //   1. `mark_timeout` synchronously evicts the tx from the pool via the pool-eviction callback
-    //      registered by the service builder.
-    //   2. `replay_fifo_carryover` skips `Timeout` entries in subsequent builds so the preconf arm
-    //      cannot resurrect the tx either.
-    // If either regresses, the pool arm here would pack the stale tx and
-    // violate the client's "not-landing" contract.
+    // SLA guard: "wire Timeout ⇒ this tx MUST NOT land on chain". What
+    // enforces it is that `replay_fifo_carryover` skips `Timeout` entries in
+    // subsequent builds, and that the transaction is in no other container to
+    // be picked up from. A regression in the first would let the preconf arm
+    // resurrect it.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool).total,
@@ -159,12 +145,10 @@ async fn deadline_elapsed_returns_timeout_and_evicts_pool() {
 }
 
 /// A tx that timed out on the first call must be revivable by a
-/// same-hash resubmission. The reclaimable-state branch in
-/// `push_if_absent` flips the fifo entry Timeout → Waiting when the
-/// pool listener re-observes the tx, and `attach_responder` refreshes
-/// the deadline clock so dispatch's pre-apply gate ticks from the
-/// second submission (not the already-expired first). This is the
-/// client-side "timeout, then retry" contract.
+/// same-hash resubmission. Admission flips the fifo entry Timeout →
+/// Waiting and refreshes the deadline clock, so dispatch's pre-apply gate
+/// ticks from the second submission rather than the already-expired
+/// first. This is the client-side "timeout, then retry" contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_recovered_by_same_hash_resubmit() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -373,11 +357,28 @@ async fn race_resolution_returns_success_when_apply_completes_after_deadline() {
 /// RPC's own 200ms deadline and aborts the tx pre-execute, so the tx is
 /// neither sealed nor left in the pool.
 ///
-/// Setup: `preconf_timeout = 200ms`. Spawn the RPC and sleep 165ms —
-/// dispatch is delayed by not starting a build until then. When the
-/// build finally runs, `apply_one_preconf`'s gate sees `elapsed ≈ 165ms
-/// + margin 40ms ≥ 200ms` and short-circuits with mark_timeout, closing
-/// the responder BEFORE the RPC layer's own 200ms deadline arrives.
+/// Setup: `preconf_timeout = 600ms` with an explicit `safety_margin = 400ms`,
+/// putting the gate boundary at 200ms. Spawn the RPC, sleep 250ms, then start
+/// the build: `apply_one_preconf`'s gate sees `elapsed ≈ 250ms + margin 400ms
+/// ≥ 600ms` and short-circuits with `mark_timeout`, closing the responder well
+/// before the RPC layer's own 600ms deadline.
+///
+/// # Why the margin is widened rather than the sleep tuned
+///
+/// The window this test must land in is `[timeout - margin, timeout)`, whose
+/// width **is** the margin — 40ms at the default. That is not enough, because
+/// the clock the gate reads (`TxEntry.inserted_at`) is stamped *inside the
+/// spawned RPC task*, not at `tokio::spawn`. Under the load of the full suite
+/// the task can start tens of milliseconds late, so a sleep sized against the
+/// spawn was really measuring `elapsed - (task start delay)` and could land
+/// under the boundary — at which point dispatch happily applies the
+/// transaction and the test fails with `got Success`.
+///
+/// Raising the margin to 400ms makes the window 400ms wide, which swallows any
+/// plausible scheduling delay. Overshooting into the RPC layer's own deadline
+/// stays benign: both layers surface `Ok(status: Timeout)`, so the assertions
+/// below still hold — see the note above about the two paths being
+/// indistinguishable on the wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dispatch_safety_margin_marks_timeout_before_apply() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -386,7 +387,8 @@ async fn dispatch_safety_margin_marks_timeout_before_apply() {
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(wallet_addr)
         .whitelist_to(recipient)
-        .preconf_timeout_ms(200)
+        .preconf_timeout_ms(600)
+        .safety_margin_ms(400)
         .build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
@@ -399,11 +401,11 @@ async fn dispatch_safety_margin_marks_timeout_before_apply() {
     let http_c = http.clone();
     let rpc_task = tokio::spawn(async move { send_preconf(&http_c, raw_tx).await });
 
-    // Sleep past `preconf_timeout - SAFETY_MARGIN` = 160ms so dispatch
-    // sees the gate as "already too close to the deadline to apply",
-    // but well under the 200ms RPC deadline. 165ms leaves 5ms of buffer
-    // over the gate boundary.
-    tokio::time::sleep(std::time::Duration::from_millis(165)).await;
+    // Sleep past the gate boundary (`preconf_timeout - safety_margin` =
+    // 200ms), with 50ms to spare, and still 350ms clear of the RPC
+    // deadline. See the doc comment for why the slack lives in the margin
+    // rather than in this number.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     let attrs = node.payload.next_attributes();
     let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
@@ -462,206 +464,5 @@ async fn dispatch_safety_margin_marks_timeout_before_apply() {
         reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool).total,
         0,
         "dispatch-layer Timeout must also trigger pool eviction",
-    );
-}
-
-/// BaseFee-orphan timeout — a tx whose `max_fee_per_gas` is below the
-/// current block base fee is routed by the pool to its `BaseFee` sub-
-/// pool. `PreconfPoolListener` only subscribes to `Pending`, so the
-/// fifo never sees the tx. When the RPC's `preconf_timeout` fires,
-/// `rpc.rs::handle_inner`'s `None` branch runs `mark_timeout(hash)`
-/// which returns `NotFound` (no fifo entry), then falls through to
-/// `build_timeout_event` and — crucially — `cancel_responder` on the
-/// no-fifo-entry case.
-///
-/// Guards: (a) the wire result is `Ok(TimeoutEvent)` (not stuck /
-/// panicking); (b) same-hash resubmit is not permanently wedged with
-/// `AlreadyInProgress` — the responder cleanup path must run even
-/// when no fifo entry existed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn basefee_orphan_returns_timeout_and_clears_responder() {
-    use jsonrpsee::core::ClientError;
-
-    let recipient: Address = RECIPIENT.parse().unwrap();
-    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
-
-    // Genesis base fee is 1 gwei; we set the tx's fee cap to 0.5 gwei so
-    // the pool routes to `BaseFee` sub-pool (below block base fee ⇒
-    // never eligible for the current block).
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .preconf_timeout_ms(150)
-        .build();
-
-    let (_node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
-
-    // Fee cap below base fee — pool accepts to `BaseFee`, listener
-    // (which filters to `Pending`) skips it, fifo stays empty.
-    let raw_tx: alloy_primitives::Bytes = {
-        let request = TransactionRequest {
-            chain_id: Some(chain_id),
-            nonce: Some(0),
-            to: Some(TxKind::Call(recipient)),
-            gas: Some(21_000),
-            // 0.5 gwei — below the 1 gwei genesis base fee.
-            max_fee_per_gas: Some(500_000_000u128),
-            max_priority_fee_per_gas: Some(500_000_000u128),
-            value: Some(U256::from(1u64)),
-            input: TransactionInput::default(),
-            ..Default::default()
-        };
-        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
-    };
-
-    // First call: sub-basefee routing → orphan timeout path.
-    let outcome1 = send_preconf(&http, raw_tx.clone()).await;
-    match outcome1 {
-        Ok(event) => {
-            assert!(
-                matches!(event.status, PreconfStatus::Timeout),
-                "BaseFee-orphaned tx must surface as Timeout event, got {:?}",
-                event.status,
-            );
-            assert!(
-                event.receipt.logs.is_none(),
-                "orphan Timeout must carry `None` logs (no EVM apply happened)",
-            );
-        }
-        Err(ClientError::Call(e)) => {
-            let msg = e.message().to_lowercase();
-            // Some pool validators reject sub-basefee txs outright with
-            // an `underpriced` / `fee cap below base fee` error, which
-            // is a different (also legitimate) rejection path. If that
-            // happens, this test doesn't apply — bail out with a note.
-            if msg.contains("underpriced") || msg.contains("base fee") || msg.contains("fee cap") {
-                eprintln!(
-                    "SKIP: pool validator rejected sub-basefee tx synchronously with '{}' — \
-                     BaseFee orphan path is not reachable via this fee-cap approach on this build",
-                    e.message()
-                );
-                return;
-            }
-            panic!("unexpected error from sub-basefee send: {e:?}");
-        }
-        Err(other) => panic!("expected Call error or Ok, got {other:?}"),
-    }
-
-    // Second call same hash — must NOT be locked out with
-    // `AlreadyInProgress`. The responder cleanup after the first
-    // timeout is the invariant we're guarding.
-    let outcome2 = send_preconf(&http, raw_tx).await;
-    match outcome2 {
-        Ok(event) => {
-            // Another orphan timeout is fine — proves the loop can
-            // re-run cleanly.
-            assert!(
-                !matches!(event.status, PreconfStatus::Success),
-                "no build was triggered, cannot land",
-            );
-        }
-        Err(ClientError::Call(e)) => {
-            let msg = e.message().to_lowercase();
-            assert!(
-                !msg.contains("already in progress") && !msg.contains("in progress"),
-                "second submission after BaseFee-orphan timeout must not be AlreadyInProgress; \
-                 got: {}",
-                e.message(),
-            );
-        }
-        Err(other) => panic!("unexpected error kind on resubmit: {other:?}"),
-    }
-}
-
-/// BaseFee-orphan SLA: a timed-out orphan must be **evicted from the pool**.
-///
-/// A sub-basefee tx parks in the `BaseFee` sub-pool and never gets a fifo entry
-/// (the listener only subscribes to `Pending`), so the RPC deadline's
-/// `mark_timeout` returns `NotFound` and its pool-eviction callback never fires.
-/// Unless the handler evicts the tx itself, the orphan is mined once the base fee
-/// drops — after the client saw `Timeout`.
-///
-/// Reaching `BaseFee` needs a positive pool base-fee threshold, which a fresh
-/// Mantle node lacks (`pending_basefee` starts at 0). So we first mine two blocks
-/// with a 1 gwei Jovian `min_base_fee` floor (lifting the threshold to 1 gwei),
-/// then submit a 0.5 gwei tx — above the `MIN_PROTOCOL_BASE_FEE` chain floor (so
-/// it's admitted) yet below base fee (so it parks in `BaseFee`, not `Pending`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn basefee_orphan_evicted_from_pool_on_timeout() {
-    let recipient: Address = RECIPIENT.parse().unwrap();
-    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
-
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .preconf_timeout_ms(200)
-        .build();
-
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
-
-    // Lift the pool's `BaseFee`-subpool threshold to 1 gwei via two `min_base_fee`
-    // = 1 gwei blocks (Jovian floors the next block's base fee at the parent's
-    // encoded `min_base_fee`).
-    for _ in 0..2 {
-        let head = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
-        let mut attrs = node.payload.next_attributes();
-        attrs.0.min_base_fee = Some(1_000_000_000);
-        let pid = crate::fcu_v3_start!(node, head, attrs);
-        let payload = crate::get_payload_v5!(node, pid);
-        let _ = crate::canonize_built!(node, payload);
-    }
-    assert_eq!(
-        reth_transaction_pool::TransactionPool::block_info(&node.inner.pool).pending_basefee,
-        1_000_000_000,
-        "test setup: pool base-fee threshold must be 1 gwei before the sub-basefee submission",
-    );
-
-    // Fee cap 0.5 gwei: >= MIN_PROTOCOL_BASE_FEE (admitted) but < 1 gwei base fee
-    // (parks in `BaseFee`, so the `Pending`-only listener never creates a fifo entry).
-    let raw_tx: alloy_primitives::Bytes = {
-        let request = TransactionRequest {
-            chain_id: Some(chain_id),
-            nonce: Some(0),
-            to: Some(TxKind::Call(recipient)),
-            gas: Some(21_000),
-            max_fee_per_gas: Some(500_000_000u128),
-            max_priority_fee_per_gas: Some(500_000_000u128),
-            value: Some(U256::from(1u64)),
-            input: TransactionInput::default(),
-            ..Default::default()
-        };
-        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
-    };
-
-    // Drive the send on a task so we can observe the pool while the RPC blocks on
-    // its deadline: the tx must be parked in `BaseFee` with no fifo entry.
-    let http_c = http.clone();
-    let rpc_task = tokio::spawn(async move { send_preconf(&http_c, raw_tx).await });
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-    let mid = reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool);
-    assert_eq!(
-        (mid.total, mid.basefee, mid.pending),
-        (1, 1, 0),
-        "test setup: the 0.5 gwei tx must park in the BaseFee sub-pool (orphan), not Pending",
-    );
-
-    let event = rpc_task
-        .await
-        .expect("rpc join")
-        .expect("BaseFee-orphan timeout must surface as Ok(Timeout event), not an RPC error");
-    assert!(
-        matches!(event.status, PreconfStatus::Timeout),
-        "BaseFee-orphaned tx must surface as Timeout, got {:?}",
-        event.status,
-    );
-
-    // SLA: once the client has been told `Timeout`, the orphan must not linger in
-    // the pool where a later (lower-base-fee) build would still mine it.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(
-        reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool).total,
-        0,
-        "SLA violation: BaseFee-orphaned tx still in pool after Timeout — it will be mined once \
-         the base fee drops, despite the client having seen Timeout",
     );
 }

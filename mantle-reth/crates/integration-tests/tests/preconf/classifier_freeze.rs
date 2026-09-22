@@ -134,8 +134,7 @@ async fn an_allowlist_flip_bars_the_outstanding_commitment_and_spares_the_plain_
     let http_c = http.clone();
     let rpc_task = tokio::spawn(async move { send_preconf(&http_c, preconf_tx).await });
 
-    // Long enough for the RPC handler to attach its responder and the pool
-    // listener to create the fifo entry.
+    // Long enough for admission to create the fifo entry.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // ── 3. One flip, both directions.
