@@ -39,7 +39,7 @@ pub use pool_ext::{
     PreconfAwareValidator, PreconfGasLimitExceeded, PreconfPoolListener, ReplaceActivePreconf,
     RestorePoolAdapter,
 };
-pub use preconf_tx_set::{PreconfTxSet, TxEntry};
+pub use preconf_tx_set::{ApplyHold, PreconfTxSet, SuccessOutcome, TimeoutOutcome, TxEntry};
 pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
 pub use types::{AttachError, MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult};

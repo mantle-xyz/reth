@@ -123,11 +123,17 @@ pub enum PreconfStatus {
 ///       They remain subject to the status / dedup gates and the underlying block gas limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
-    /// Live RPC submission — subject to all pre-apply gates.
+    /// Live RPC submission, nothing promised yet — subject to every pre-apply
+    /// gate. The only value a push can start with, alongside `Replay`.
     Rpc,
-    /// Replay of a previously-promised commitment (startup journal
-    /// restore or pool reorg reinject). Bypasses deadline and
-    /// gas-budget gates so promised txs are guaranteed to land.
+    /// A build applied it **this round** and the receipt went out. Protected:
+    /// no failure quorum may bury it until a canonical block has gone by
+    /// without it, at which point `canon_handler` demotes it to `Replay`.
+    /// Only reachable by transition, never by a push.
+    Applied,
+    /// A promise from an earlier round — journal restore, reorg reinject, or a
+    /// demoted `Applied`. Still must-land, so it bypasses the deadline and
+    /// gas-budget gates, but every build failing it can end it.
     Replay,
 }
 
@@ -166,22 +172,6 @@ pub enum PushResult {
     /// Same hash already present and in an active status
     /// (`Waiting` / `Success` / `Failed`) — idempotent no-op.
     AlreadyExists,
-    /// Same hash was in a **reclaimable** terminal state
-    /// (`Timeout` / `Canceled`) and has been revived back to `Waiting`.
-    /// Any fresh responder that the RPC handler attached to
-    /// `pending_responders` is now installed on the entry, and the
-    /// entry's insertion clock is refreshed to the fresh submission
-    /// time — so dispatch's deadline gate measures against the second
-    /// submission, not the (already-expired) first.
-    ///
-    /// This closes the "same-hash resubmit after timeout" loop that
-    /// would otherwise wedge under the pool-eviction callback: the
-    /// second `pool.add_transaction` returns `Ok(_)` (fresh admission)
-    /// rather than `Err(AlreadyImported)`, so any RPC-side revive
-    /// logic keyed on `AlreadyImported` never fires — but the pool
-    /// listener still ends up calling `push_if_absent`, which now
-    /// revives the reclaimable entry here and broadcasts.
-    Revived,
     /// Different hash but same (sender, nonce) in an active status —
     /// blocks the replacement attempt (carrying the existing hash so callers
     /// can inspect / log it).

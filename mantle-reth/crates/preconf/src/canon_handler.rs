@@ -41,7 +41,6 @@ use futures::StreamExt;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_execution_types::Chain;
 use reth_primitives_traits::NodePrimitives;
-use reth_transaction_pool::TransactionPool;
 use tracing::{debug, warn};
 
 use crate::{PreconfJournal, preconf_tx_set::PreconfTxSet};
@@ -59,14 +58,8 @@ const PENDING_RESPONDER_TTL: Duration = Duration::from_secs(60);
 /// parameter is `Pr::Primitives` — kept as a separate type parameter so
 /// trait bounds on the transaction type (`Transaction`, recovery) can
 /// be expressed without re-projecting `<Pr::Primitives as ...>` everywhere.
-pub struct PreconfCanonHandler<Pr, P, N> {
+pub struct PreconfCanonHandler<Pr, N> {
     provider: Pr,
-    /// Transaction pool. Used to `remove_transactions` the hashes evicted
-    /// by [`PreconfTxSet::clean_reclaimable`] so a Timeout or Canceled
-    /// preconf tx does NOT quietly land on chain later (which would
-    /// violate the client's bookkeeping — see design note in the run
-    /// loop).
-    pool: P,
     fifo: Arc<PreconfTxSet>,
     /// Commitment journal (mandatory). Every sealed tx is marked via
     /// [`PreconfJournal::mark_sealed`] so periodic rotation can drop the
@@ -76,31 +69,25 @@ pub struct PreconfCanonHandler<Pr, P, N> {
     _n: PhantomData<fn() -> N>,
 }
 
-// Manual `Debug` impl: skip the provider / pool (which would force
-// `Pr: Debug` / `P: Debug` on every call site) and the phantom marker.
-impl<Pr, P, N> std::fmt::Debug for PreconfCanonHandler<Pr, P, N> {
+// Manual `Debug` impl: skip the provider (which would force `Pr: Debug` on
+// every call site) and the phantom marker.
+impl<Pr, N> std::fmt::Debug for PreconfCanonHandler<Pr, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfCanonHandler").field("fifo", &self.fifo).finish_non_exhaustive()
     }
 }
 
-impl<Pr, P, N> PreconfCanonHandler<Pr, P, N>
+impl<Pr, N> PreconfCanonHandler<Pr, N>
 where
     Pr: CanonStateSubscriptions<Primitives = N> + 'static,
-    P: TransactionPool + 'static,
     N: NodePrimitives,
     N::SignedTx: Transaction + TxHashRef,
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
     /// The `journal` is mandatory — it drives sealed-set bookkeeping and
     /// the reverted-chain `reorg_drift` signal.
-    pub const fn new(
-        provider: Pr,
-        pool: P,
-        fifo: Arc<PreconfTxSet>,
-        journal: Arc<PreconfJournal>,
-    ) -> Self {
-        Self { provider, pool, fifo, journal, _n: PhantomData }
+    pub const fn new(provider: Pr, fifo: Arc<PreconfTxSet>, journal: Arc<PreconfJournal>) -> Self {
+        Self { provider, fifo, journal, _n: PhantomData }
     }
 
     /// Run the listener loop. Returns when the canonical-state stream
@@ -141,43 +128,26 @@ where
             // can drop them on its next tick.
             self.journal.mark_sealed_batch(sealed_hashes.iter().copied()).await;
 
-            // Housekeeping: evict `Timeout` / `Canceled` / `Failed`
-            // entries in one pass — all three are "not on chain,
-            // reclaimable" and must NOT linger, or the (sender, nonce)
-            // slot they hold would block future preconf submissions
-            // from the same sender. `sync_fifo_forward_to_head` at
-            // PayloadJob start only drops entries whose nonce trails
-            // the sealed frontier; reclaimable entries whose sender
-            // never posts another nonce would otherwise stay
-            // indefinitely. Running per-notification (~ per sealed
-            // block, so ~2s on OP L2) matches op-geth's cadence without
-            // requiring a separate background task.
-            //
-            // Pool-side removal mirrors op-geth: after fifo eviction we
-            // `remove_transactions` the same hashes from the pool so a
-            // preconf tx that already surfaced Timeout or Canceled to
-            // the client CANNOT quietly land on chain later. That silent
-            // late-inclusion would break off-chain reconciliation
-            // (client accounts it as "failed", chain shows "success").
-            //
-            // The two calls are not atomic: between fifo eviction and
-            // pool removal a concurrent build_payload could theoretically
-            // pick up an evicted tx from the pool iterator. The window
-            // is µs-scale (both are same-task sequential calls, no await
-            // between them beyond mutex acquisition) and has not been
-            // observed in devnet — a followup tracks it.
-            let evicted = self.fifo.clean_reclaimable().await;
-            if !evicted.is_empty() {
-                let pool_removed = self.pool.remove_transactions(evicted.clone());
+            // A `Success` entry that survived this block without landing was
+            // carried by a builder block nobody adopted. Demote it so it stops
+            // being untouchable: still must-land, but now overturnable if every
+            // build fails it, which is what keeps a wedged promise from pinning
+            // its `(sender, nonce)` slot forever.
+            let landed: std::collections::HashSet<_> = sealed_hashes.iter().copied().collect();
+            let demoted = self.fifo.demote_unlanded_promises(&landed).await;
+            if demoted > 0 {
                 debug!(
                     target: "mantle::preconf::canon",
-                    fifo_count = evicted.len(),
-                    pool_count = pool_removed.len(),
-                    "clean_reclaimable evicted {} fifo entries; removed {} from pool",
-                    evicted.len(),
-                    pool_removed.len(),
+                    demoted,
+                    "demoted {demoted} unadopted preconf commitments to replay"
                 );
             }
+
+            // No reclaimable sweep here any more: a terminal outcome removes
+            // the entry in the same critical section that records it, so only
+            // `Waiting` and `Success` persist. The build's pre-apply deadline
+            // gate is what bounds how long a stuck `Waiting` entry holds its
+            // `(sender, nonce)` slot.
 
             // Backstop GC for orphaned RPC responders (see
             // `PreconfTxSet::expire_pending_responders`).

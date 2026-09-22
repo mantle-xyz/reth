@@ -263,15 +263,15 @@ enum Admission {
 /// Classification rule = *"does this tx fit an empty block?"*:
 /// - **Permanent** (exceeds a per-tx / per-block bound even alone) → `Reject`.
 /// - **Fits** the current block's remaining headroom → `Admit`.
-/// - **Transient** (fits an empty block, but the current block is too full) → `Defer` for `Replay`,
-///   `Reject` for `Rpc`.
+/// - **Transient** (fits an empty block, but the current block is too full) → `Defer` when already
+///   promised, `Reject` otherwise.
 fn preconf_admission(
     tx_da: u64,
     tx_gas_limit: u64,
     da_used: u64,
     gas_used: u64,
     limits: BuildConstraints,
-    source: PreconfSource,
+    is_promised: bool,
 ) -> Admission {
     // ── Permanent: does the tx fit an *empty* block (da_used = gas_used = 0)? ──
     // A tx that alone exceeds a per-tx / per-block bound can never be included
@@ -312,29 +312,28 @@ fn preconf_admission(
 
     if over_block_da || over_footprint || over_gas {
         // Transient: fits an empty block, but the current block is too full.
-        return match source {
-            // Replay is a must-land commitment — keep it Waiting and retry
-            // next slot (fresh block DA/gas budget). Handled by the caller as
-            // "do not dispatch"; the fifo entry is never marked terminal.
-            PreconfSource::Replay => Admission::Defer,
-            // RPC does not defer (client is waiting); reject so it can resubmit.
-            PreconfSource::Rpc => {
-                let reason = if over_gas && !over_block_da && !over_footprint {
-                    PreconfError::BuilderRejected(format!(
-                        "block gas headroom exhausted: used {gas_used}, need {tx_gas_limit}, \
-                         block limit {}",
-                        limits.block_gas_limit
-                    ))
-                } else {
-                    PreconfError::DaLimitExceeded {
-                        used: da_used,
-                        tx_da,
-                        limit: limits.block_da_limit.unwrap_or(limits.block_gas_limit),
-                    }
-                };
-                Admission::Reject(reason)
+        if is_promised {
+            // A must-land commitment — leave it for the next slot's fresh
+            // DA/gas budget. The caller treats this as "do not dispatch"; the
+            // entry is never finalised here.
+            return Admission::Defer;
+        }
+        // Nobody has been promised anything yet and the client is waiting —
+        // reject so it can resubmit rather than sit out the slot.
+        let reason = if over_gas && !over_block_da && !over_footprint {
+            PreconfError::BuilderRejected(format!(
+                "block gas headroom exhausted: used {gas_used}, need {tx_gas_limit}, \
+                 block limit {}",
+                limits.block_gas_limit
+            ))
+        } else {
+            PreconfError::DaLimitExceeded {
+                used: da_used,
+                tx_da,
+                limit: limits.block_da_limit.unwrap_or(limits.block_gas_limit),
             }
         };
+        return Admission::Reject(reason);
     }
 
     Admission::Admit
@@ -412,7 +411,18 @@ where
     B: BlockBuilder<Primitives = N>,
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
+    // Register this build's interest exactly once per hash. Carryover, the
+    // broadcast arm and a `Lagged` re-scan all funnel through here and may
+    // present the same hash repeatedly, so the hold is keyed on `loop_state`
+    // rather than taken blindly.
+    if !loop_state.holds_hash(&hash) {
+        let Some(hold) = fifo.register(&hash).await else { return Ok(()) };
+        loop_state.insert_hold(hold);
+    }
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
+    // A promise already made — this round or an earlier one. The gates below
+    // must not refuse it on this build's authority.
+    let is_promised = source != PreconfSource::Rpc;
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     drop(entry);
@@ -420,9 +430,7 @@ where
     // (1) Same-sender cascade — Replay entries only. A successor inherits the
     // predecessor's non-admission outcome; it cannot execute before the
     // predecessor lands.
-    if source == PreconfSource::Replay &&
-        let Some(kind) = loop_state.sender_blocked_at(&sender, nonce)
-    {
+    if is_promised && let Some(kind) = loop_state.sender_blocked_at(&sender, nonce) {
         match kind {
             dispatch::BlockKind::Defer => {
                 metrics::counter!("preconf.fifo.replay_deferred_total").increment(1);
@@ -434,16 +442,16 @@ where
                 return Ok(());
             }
             dispatch::BlockKind::Reject => {
-                // Server pre-apply rejection (predecessor can't land → nonce
-                // gap) — never handed to the builder, so `Canceled`, not
-                // `Failed`.
-                let _ = fifo.mark_canceled(&hash).await;
-                loop_state.record_excluded(
-                    hash,
-                    PreconfError::BuilderRejected(
-                        "preconf predecessor from same sender rejected (nonce gap)".into(),
-                    ),
+                // The predecessor cannot land, so this one never can either —
+                // but that is still only *this* build's reading of the chain,
+                // so it goes through the same quorum as any other failure.
+                let reason = PreconfError::BuilderRejected(
+                    "preconf predecessor from same sender rejected (nonce gap)".into(),
                 );
+                if let Some(hold) = loop_state.take_hold(&hash) {
+                    fifo.finish_failure(hold, reason.clone()).await;
+                }
+                loop_state.record_excluded(hash, reason);
                 return Ok(());
             }
         }
@@ -453,7 +461,7 @@ where
     // borrow of `*info` ends before the `&mut info` closure below.
     let da_used = info.cumulative_da_bytes_used;
     let gas_used = info.cumulative_gas_used;
-    match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source) {
+    match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, is_promised) {
         Admission::Admit => {
             let mut apply_fn =
                 |tx, h, height| apply_preconf_with_da::<N, _>(builder, info, limits, tx, h, height);
@@ -474,13 +482,12 @@ where
         Admission::Reject(e) => {
             loop_state.block_sender(sender, nonce, dispatch::BlockKind::Reject);
             metrics::counter!("preconf.fifo.da_rejected_total").increment(1);
-            // Server pre-apply capacity rejection (DA / real block gas) — the
-            // tx never reaches the builder, so `Canceled` (like the preconf
-            // block-gas-budget gate), not `Failed` (which means the builder ran
-            // and rejected it).
-            let _ = fifo.mark_canceled(&hash).await;
-            if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Err(e.clone()));
+            // Capacity rejection against *this* build's block — another build
+            // with a different fill may still take it, so it goes through the
+            // same quorum as any other failure rather than answering the
+            // client on this build's authority alone.
+            if let Some(hold) = loop_state.take_hold(&hash) {
+                fifo.finish_failure(hold, e.clone()).await;
             }
             loop_state.record_excluded(hash, e);
         }
@@ -490,7 +497,7 @@ where
 
 /// Synchronous canon-forward — drops fifo entries whose nonce has
 /// already been sealed as of the parent block. Called at
-/// `build_payload` start, **before** [`replay_fifo_carryover`]; the
+/// `build_payload` start, **before** the carryover dispatch; the
 /// pair together replace the async `canon_handler::forward()` sweep
 /// that used to race with new payload jobs (FCU for slot N+1 fires
 /// before / during / after `canon_handler`'s notification handler for
@@ -514,42 +521,6 @@ where
         let on_chain_nonce = state_provider.account_nonce(&sender).ok().flatten().unwrap_or(0);
         fifo.forward(&sender, on_chain_nonce).await;
     }
-}
-
-/// Preamble that walks the fifo snapshot in insertion order and returns the
-/// carryover hashes to (re)dispatch for this build, in order:
-///
-/// - **`Waiting`** — journal-restored or dead-window RPC pushes whose broadcast never reached this
-///   job's subscriber. Returned with the original `source` intact so genuinely stale `Rpc` entries
-///   get timed out by the deadline gate.
-/// - **`Success`** — stale in-flight from a discarded prior job. A canon'd entry would have been
-///   removed by the immediately-preceding [`sync_fifo_forward_to_head`], so any Success reaching
-///   here is an un-canon'd in-flight (client already got a receipt; must land).
-///   `reset_success_to_waiting` promotes the source to `Replay` so gates bypass and the
-///   previously-returned receipt is honored; then the hash is returned for dispatch.
-/// - **`Failed` / `Timeout` / `Canceled`** — skipped (terminal).
-///
-/// The caller dispatches each returned hash through [`admit_and_dispatch`]
-/// **before** draining the broadcast / pool arms, so carryover lands ahead of
-/// any concurrently-queued fresh RPC pushes. `apply_one_preconf`'s dedup gate
-/// prevents double-apply if a carryover hash is also observed via broadcast
-/// later. Returning the hash list (rather than applying inline) keeps this
-/// helper free of EVM/builder types and unit-testable.
-async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
-    use crate::types::PreconfStatus;
-    let mut carryover_hashes = Vec::new();
-    for view in fifo.entries().await {
-        match view.status {
-            PreconfStatus::Waiting => carryover_hashes.push(view.hash),
-            PreconfStatus::Success => {
-                if fifo.reset_success_to_waiting(&view.hash).await.is_ok() {
-                    carryover_hashes.push(view.hash);
-                }
-            }
-            PreconfStatus::Failed | PreconfStatus::Timeout | PreconfStatus::Canceled => {}
-        }
-    }
-    carryover_hashes
 }
 
 /// Derived schedule for the adaptive-N pool quota — see
@@ -783,7 +754,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///      consumes the new headroom.
     ///
     ///    Before the loop, a **carryover replay preamble**
-    ///    ([`replay_fifo_carryover`]) applies any stale in-flight or
+    ///    (the list `register_all` returns) applies any stale in-flight or
     ///    journal-restored entries directly (bypassing the broadcast
     ///    queue) so they land ahead of concurrently-queued RPC pushes.
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).
@@ -1004,7 +975,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         sync_fifo_forward_to_head(&self.fifo, state_provider_for_finish.as_ref()).await;
 
         // Carryover replay preamble — apply stale in-flight / journal-
-        // restored entries directly (see `replay_fifo_carryover`). The
+        // restored entries directly. The
         // block scope drops `apply_fn` so its `&mut builder` borrow is
         // released before the select! loop's arms.
         //
@@ -1012,11 +983,28 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // (including Replay-sourced ones with `must-land` SLA) remain
         // in the fifo and get dispatched on the next normal-slot build.
         if allow_preconf {
-            // Dispatch carryover entries through the admission gate before the
-            // select! loop's arms, so they land ahead of any concurrently
-            // queued fresh RPC pushes. `admit_and_dispatch` builds the apply
-            // closure (which folds gas/DA into `info`) internally per hash.
-            for hash in replay_fifo_carryover(&self.fifo).await {
+            // Sign up for every entry that exists right now, in one shot,
+            // before any filtering or apply — a concurrent build's rejection
+            // then cannot be terminal on its own authority. The same pass
+            // yields the carryover list in fifo order, so there is no second
+            // traversal and no window between the two.
+            let carryover: Vec<TxHash> = self
+                .fifo
+                .register_all()
+                .await
+                .into_iter()
+                .map(|hold| {
+                    let hash = hold.hash();
+                    loop_state.insert_hold(hold);
+                    hash
+                })
+                .collect();
+
+            // Dispatch them through the admission gate before the select!
+            // loop's arms, so they land ahead of any concurrently queued fresh
+            // RPC pushes. `admit_and_dispatch` builds the apply closure (which
+            // folds gas/DA into `info`) internally per hash.
+            for hash in carryover {
                 admit_and_dispatch::<N, _>(
                     &self.fifo,
                     &self.cfg,
@@ -1111,6 +1099,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             }
         }
 
+        // Everything registered but never decided — deferred for capacity, cut
+        // off by the cascade, or simply not reached before the loop ended.
+        // Dropping the holds releases the count **without voting**: a build
+        // that never tried the tx has no verdict to cast, and treating its exit
+        // as a rejection would kill a tx that was only waiting for room.
+        drop(loop_state.drain_holds());
+
         // ── Stage 4: SDM post-exec refund tx ───────────────────────────
         // `take_post_exec_entries` collects entries from ALL prior applies
         // uniformly (sequencer / pool / preconf) — preconf-tx contributions
@@ -1154,9 +1149,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PreconfSource, PreconfStatus};
-    use alloy_consensus::{Signed, TxLegacy};
-    use alloy_primitives::{B256, Signature};
+    use crate::types::PreconfStatus;
 
     #[derive(Clone, Debug)]
     struct DummyPool;
@@ -1186,127 +1179,6 @@ mod tests {
         // Smoke: PreconfStatus is reachable from this module via crate root
         // re-exports, no need to also test accessor traversals here.
         let _ = PreconfStatus::Waiting;
-    }
-
-    fn tx(byte: u8, nonce: u64) -> Arc<TxEnvelope> {
-        let inner = TxLegacy { nonce, gas_limit: 21_000, ..Default::default() };
-        let sig = Signature::test_signature();
-        let hash = B256::from([byte; 32]);
-        Arc::new(TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)))
-    }
-
-    /// `replay_fifo_carryover` returns `Waiting` + `Success` hashes (each a
-    /// carryover source) in insertion order and skips terminal-non-success
-    /// statuses (`Failed` / `Timeout` / `Canceled`). `Success` entries are
-    /// promoted back to `Waiting` with source `Replay`; `Waiting` entries are
-    /// left untouched. Dispatch (admission + apply) is done by the caller.
-    #[tokio::test]
-    async fn replay_fifo_carryover_plans_waiting_and_success_only() {
-        let fifo = PreconfTxSet::new(16);
-        // Five entries covering every non-transient status.
-        let t_wait = tx(0xa1, 0);
-        let t_succ = tx(0xa2, 0);
-        let t_fail = tx(0xa3, 0);
-        let t_to = tx(0xa4, 0);
-        let t_cancel = tx(0xa5, 0);
-        fifo.push_if_absent(t_wait.clone(), Address::from([1; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_succ.clone(), Address::from([2; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_fail.clone(), Address::from([3; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_to.clone(), Address::from([4; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_cancel.clone(), Address::from([5; 20]), PreconfSource::Rpc).await;
-        fifo.mark_succeeded(t_succ.tx_hash()).await.unwrap();
-        fifo.mark_failed(t_fail.tx_hash()).await.unwrap();
-        fifo.mark_timeout(t_to.tx_hash()).await.unwrap();
-        fifo.mark_canceled(t_cancel.tx_hash()).await.unwrap();
-
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
-
-        // Only Waiting + Success, in insertion order.
-        assert_eq!(carryover_hashes, vec![*t_wait.tx_hash(), *t_succ.tx_hash()]);
-        // Waiting entry untouched.
-        assert_eq!(
-            fifo.find_by_hash(t_wait.tx_hash()).await.unwrap().status,
-            PreconfStatus::Waiting,
-        );
-        // Success entry promoted to Waiting + Replay.
-        let succ = fifo.find_by_hash(t_succ.tx_hash()).await.unwrap();
-        assert_eq!(succ.status, PreconfStatus::Waiting);
-        assert_eq!(succ.source, PreconfSource::Replay);
-        // Terminal-non-success entries untouched.
-        assert_eq!(
-            fifo.find_by_hash(t_fail.tx_hash()).await.unwrap().status,
-            PreconfStatus::Failed,
-        );
-        assert_eq!(fifo.find_by_hash(t_to.tx_hash()).await.unwrap().status, PreconfStatus::Timeout,);
-        assert_eq!(
-            fifo.find_by_hash(t_cancel.tx_hash()).await.unwrap().status,
-            PreconfStatus::Canceled,
-        );
-    }
-
-    /// Waiting entries keep their original `source` — the helper only
-    /// upgrades source on the `Success → Waiting` reset path, not on entries
-    /// that were already `Waiting`. Intentional: Rpc-sourced Waiting entries
-    /// must still respect the deadline gate downstream.
-    #[tokio::test]
-    async fn replay_fifo_carryover_preserves_waiting_source() {
-        let fifo = PreconfTxSet::new(16);
-        let t_rpc = tx(0xb0, 0);
-        let t_journal = tx(0xb1, 0);
-        fifo.push_if_absent(t_rpc.clone(), Address::from([1; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_journal.clone(), Address::from([2; 20]), PreconfSource::Replay).await;
-
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
-
-        assert_eq!(carryover_hashes, vec![*t_rpc.tx_hash(), *t_journal.tx_hash()]);
-        assert_eq!(fifo.find_by_hash(t_rpc.tx_hash()).await.unwrap().source, PreconfSource::Rpc,);
-        assert_eq!(
-            fifo.find_by_hash(t_journal.tx_hash()).await.unwrap().source,
-            PreconfSource::Replay,
-        );
-    }
-
-    /// Carryover returns entries in fifo insertion order — critical for SLA
-    /// determinism vs concurrent RPC pushes that might race the preamble.
-    #[tokio::test]
-    async fn replay_fifo_carryover_preserves_fifo_order() {
-        let fifo = PreconfTxSet::new(16);
-        let mut expected = Vec::new();
-        for i in 0..3u8 {
-            let t = tx(0xc0 + i, 0);
-            expected.push(*t.tx_hash());
-            fifo.push_if_absent(t, Address::from([i + 1; 20]), PreconfSource::Rpc).await;
-            fifo.mark_succeeded(&expected[i as usize]).await.unwrap();
-        }
-
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
-        assert_eq!(carryover_hashes, expected, "carryover must respect FIFO insertion order");
-    }
-
-    /// Stale `Success` entries are promoted to `Waiting` + `Replay` so the
-    /// downstream dispatch bypasses the RPC-only deadline / gas gates and the
-    /// previously-returned receipt is honored (SLA: must land).
-    #[tokio::test]
-    async fn replay_fifo_carryover_promotes_success_to_replay() {
-        let fifo = PreconfTxSet::new(16);
-        let t = tx(0xd0, 0);
-        let hash = *t.tx_hash();
-        fifo.push_if_absent(t, Address::from([1; 20]), PreconfSource::Rpc).await;
-        fifo.mark_succeeded(&hash).await.unwrap();
-
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
-
-        assert_eq!(carryover_hashes, vec![hash]);
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Waiting);
-        assert_eq!(entry.source, PreconfSource::Replay);
-    }
-
-    /// Empty fifo — helper returns an empty list, no error.
-    #[tokio::test]
-    async fn replay_fifo_carryover_on_empty_fifo_is_noop() {
-        let fifo = PreconfTxSet::new(16);
-        assert!(replay_fifo_carryover(&fifo).await.is_empty());
     }
 
     // ============ try_include_post_exec_tx ============
@@ -1517,7 +1389,7 @@ mod tests {
     #[test]
     fn preconf_admission_within_headroom_admits() {
         let limits = da_limits(Some(10_000), Some(1_000), None);
-        for src in [PreconfSource::Replay, PreconfSource::Rpc] {
+        for src in [true, false] {
             assert!(
                 matches!(preconf_admission(100, 21_000, 0, 0, limits, src), Admission::Admit),
                 "src={src:?}"
@@ -1526,11 +1398,11 @@ mod tests {
     }
 
     /// Per-tx DA over-limit is permanent (empty block can't hold it) →
-    /// `Reject` for both sources, never `Defer`.
+    /// `Reject` either way, never `Defer`.
     #[test]
     fn preconf_admission_per_tx_da_over_is_permanent_reject() {
         let limits = da_limits(Some(10_000), Some(1_000), None);
-        for src in [PreconfSource::Replay, PreconfSource::Rpc] {
+        for src in [true, false] {
             match preconf_admission(1_001, 21_000, 0, 0, limits, src) {
                 Admission::Reject(PreconfError::DaLimitExceeded { limit, .. }) => {
                     assert_eq!(limit, 1_000);
@@ -1541,11 +1413,11 @@ mod tests {
     }
 
     /// tx gas limit above the real block gas limit is permanent → `Reject`
-    /// for both sources.
+    /// either way.
     #[test]
     fn preconf_admission_gas_over_block_limit_is_permanent_reject() {
         let limits = da_limits(None, None, None); // BLOCK_GAS = 30_000_000
-        for src in [PreconfSource::Replay, PreconfSource::Rpc] {
+        for src in [true, false] {
             match preconf_admission(100, BLOCK_GAS + 1, 0, 0, limits, src) {
                 Admission::Reject(PreconfError::BuilderRejected(_)) => {}
                 other => panic!("src={src:?}: expected Reject(BuilderRejected), got {other:?}"),
@@ -1554,35 +1426,32 @@ mod tests {
     }
 
     /// Transient DA (tx fits an empty block, but cumulative overflows the
-    /// per-block limit): `Replay` → `Defer`, `Rpc` → `Reject`.
+    /// per-block limit): promised → `Defer`, otherwise `Reject`.
     #[test]
     fn preconf_admission_transient_da_defers_replay_rejects_rpc() {
         let limits = da_limits(Some(1_000), Some(1_000), None);
         // tx_da 200 ≤ per-tx & block limits (fits empty block), but
         // da_used 900 + 200 = 1100 > 1000 block limit (current block full).
+        assert!(matches!(preconf_admission(200, 21_000, 900, 0, limits, true), Admission::Defer));
         assert!(matches!(
-            preconf_admission(200, 21_000, 900, 0, limits, PreconfSource::Replay),
-            Admission::Defer
-        ));
-        assert!(matches!(
-            preconf_admission(200, 21_000, 900, 0, limits, PreconfSource::Rpc),
+            preconf_admission(200, 21_000, 900, 0, limits, false),
             Admission::Reject(_)
         ));
     }
 
     /// Transient gas (tx fits an empty block, but cumulative overflows the
-    /// real block gas limit): `Replay` → `Defer`, `Rpc` → `Reject`.
+    /// real block gas limit): promised → `Defer`, otherwise `Reject`.
     #[test]
     fn preconf_admission_transient_gas_defers_replay_rejects_rpc() {
         let limits = da_limits(None, None, None); // BLOCK_GAS = 30_000_000
         let tx_gas = 2_000_000; // ≤ block gas (fits empty block)
         let gas_used = BLOCK_GAS - 1_000_000; // remaining 1M < 2M needed
         assert!(matches!(
-            preconf_admission(100, tx_gas, 0, gas_used, limits, PreconfSource::Replay),
+            preconf_admission(100, tx_gas, 0, gas_used, limits, true),
             Admission::Defer
         ));
         assert!(matches!(
-            preconf_admission(100, tx_gas, 0, gas_used, limits, PreconfSource::Rpc),
+            preconf_admission(100, tx_gas, 0, gas_used, limits, false),
             Admission::Reject(_)
         ));
     }
@@ -1593,10 +1462,7 @@ mod tests {
     fn preconf_admission_cumulative_boundary_admits() {
         let limits = da_limits(Some(1_000), Some(1_000), None);
         // 900 + 100 == 1000 block limit → fits.
-        assert!(matches!(
-            preconf_admission(100, 21_000, 900, 0, limits, PreconfSource::Replay),
-            Admission::Admit
-        ));
+        assert!(matches!(preconf_admission(100, 21_000, 900, 0, limits, true), Admission::Admit));
     }
 
     // ============ PoolPacer (Adaptive-N pool admission pacing) ============
