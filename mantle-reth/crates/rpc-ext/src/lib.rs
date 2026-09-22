@@ -27,23 +27,19 @@ use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
+use reth_errors::RethError;
 use reth_optimism_evm::extract_l1_info;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_rpc::SequencerClient;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_rpc_eth_api::{
-    EthApiTypes,
-    FromEthApiError,
-    FullEthApiTypes,
+    EthApiTypes, FromEthApiError, FullEthApiTypes,
     helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState},
 };
+use reth_rpc_eth_types::EthApiError;
 use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{
-    BlockIdReader,
-    BlockReaderIdExt,
-    StateProofProvider,
-    StateProviderBox,
-    StateProviderFactory,
+    BlockIdReader, BlockReaderIdExt, StateProofProvider, StateProviderBox, StateProviderFactory,
     errors::ProviderResult,
 };
 use reth_trie_common::AccountProof;
@@ -565,6 +561,23 @@ where
         keys: Vec<JsonStorageKey>,
         block_number: Option<BlockId>,
     ) -> RpcResult<EIP1186AccountProofResponse> {
+        // [MANTLE] Concurrency parity with the standard `EthState::get_proof` (reth aef8d3e,
+        // rpc-eth-api/src/helpers/state.rs): acquire the tracing permit *first* and hold it
+        // for the whole operation. It is the only concurrency bound on proof generation —
+        // `spawn_blocking_io_fut` queues on the io pool without its own admission control,
+        // while the tracing semaphore is what operators size via `--rpc.max-tracing-requests`.
+        // `let _permit` (not `let _`, which would drop — and so release — it immediately)
+        // keeps the permit alive until the response completes. The acquire only errors when
+        // the semaphore is closed (node shutdown).
+        let _permit = self
+            .eth_api()
+            .acquire_owned_tracing()
+            .await
+            .map_err(RethError::other)
+            .map_err(EthApiError::Internal)
+            .map_err(<EthApi as EthApiTypes>::Error::from_eth_err)
+            .map_err(ErrorObject::from)?;
+
         // `None` is the RPC-level "block parameter omitted" case. Per the EIP-1898 convention
         // geth applies (`len(args) < 3` → `LatestBlockNumber`) and the standard reth
         // `get_proof`, an omitted block parameter means the latest state:
@@ -892,6 +905,12 @@ mod tests {
     // across its three observable branches: nonexistent account, existing account with
     // bytecode, and existing EOA. Expected values are geth's documented behavior
     // (go-ethereum#28357), cross-checked live against op-geth on the rde-v3 devnet.
+    //
+    // Scope note: these pin the *conversion semantics only* — they call
+    // `into_eip1186_response_with` directly and do not exercise the `get_proof` handler or
+    // its RPC registration (they would pass even if the override were deleted). The
+    // end-to-end regression guard — override wired, registered, and served — is the
+    // `eth_getProof_nonexistent_contract` case in the external rpc-compat suite.
 
     #[test]
     fn get_proof_nonexistent_account_is_zeroed_geth_shape() {
