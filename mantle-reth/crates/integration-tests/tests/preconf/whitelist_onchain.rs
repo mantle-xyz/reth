@@ -144,8 +144,8 @@ const POLL_TICKS: usize = 200;
 ///   tests hand-populate a mock map using the same code that computes the slots, so they prove
 ///   nothing about the layout;
 /// * the load happens early enough. Cold start runs inside `build_pool`, ahead of the RPC server
-///   and the payload builder, so there is no window in which a tx could be admitted — and have its
-///   verdict frozen — against empty allowlists.
+///   and the payload builder, so there is no window in which a tx could be judged against empty
+///   allowlists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_start_loads_genesis_whitelist_before_the_node_is_up() {
     let sender = wallet_address();

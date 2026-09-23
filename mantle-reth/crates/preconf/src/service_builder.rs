@@ -80,7 +80,7 @@ pub enum PreconfStartError {}
 #[derive(Debug)]
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
-    /// Owns the allowlists and the frozen per-tx verdicts. Built
+    /// Owns the allowlists and the per-tx commitment records. Built
     /// here so every consumer — admission, payload builder, canon handler —
     /// shares one instance; two classifiers would mean two answers.
     classifier: Arc<PreconfClassifier>,
@@ -128,7 +128,7 @@ impl PreconfServiceBuilder {
             cfg.journal_path.clone().ok_or(PreconfServiceError::MissingJournalPath)?;
         let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size).await?;
         // Built from the validated config, before it is shared: the classifier
-        // reads `all_preconfs` and the verdict grace period off it.
+        // reads `all_preconfs` and the record grace period off it.
         let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
@@ -197,9 +197,9 @@ impl PreconfServiceBuilder {
     {
         restore_preconf_state(&self.journal, pool, chain, &self.fifo, &self.classifier).await;
 
-        // Every fifo removal path also drops the frozen verdict: on most of
-        // them, once the commitment record is gone there is nothing left for
-        // the verdict to protect. `forward` is the exception — it removes on
+        // Every fifo removal path also drops the commitment record: on most
+        // of them, once the entry is gone there is nothing left for the record
+        // to protect. `forward` is the exception — it removes on
         // "the sender's nonce moved past this entry", which neither identifies
         // the tx that advanced the nonce nor is irrevocable, so the commitment
         // may still be live.
@@ -207,7 +207,7 @@ impl PreconfServiceBuilder {
         // stays ignorant of the classifier (the sweep in the other
         // direction is driven by the canonical-state handler, which holds both).
         let classifier_for_evict = self.classifier.clone();
-        self.fifo.set_verdict_eviction_callback(Arc::new(move |hash| {
+        self.fifo.set_record_eviction_callback(Arc::new(move |hash| {
             classifier_for_evict.release_unless_committed(&hash);
         }));
 

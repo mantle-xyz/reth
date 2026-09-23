@@ -73,15 +73,15 @@ async fn signed_transfer_from(
 /// unrelated flakiness and one does not.
 ///
 /// Sequence:
-/// 1. `other` (not allowlisted) submits a plain tx → validator freezes `NotEligible`.
+/// 1. `other` (not allowlisted) submits a plain tx → nothing is recorded for it.
 /// 2. `wallet` (allowlisted) submits through the preconf RPC with **no payload job open** → the
-///    fifo entry parks in `Waiting`, verdict frozen `Eligible`.
+///    fifo entry parks in `Waiting`, with a commitment record.
 /// 3. Flip the allowlists as above.
 /// 4. FCU to start the job, build, and read both outcomes off one block.
 ///
 /// ## What each half proves
 ///
-/// **Case B — the frozen verdict keeps the plain tx alive.** This is the discriminating
+/// **Case B — the commitment record keeps the plain tx alive.** This is the discriminating
 /// half: reverting `apply_one_best_tx` to a live allowlist lookup makes the `other`
 /// assertion fail with `sealed = []`, because the pool arm re-derives "eligible" from the
 /// widened list and skips a tx the preconf arm has no fifo entry for.
@@ -90,13 +90,13 @@ async fn signed_transfer_from(
 /// `barred_by_allowlist` is asked of every entry against the allowlist pinned for the
 /// block, so a commitment admitted under the old lists is refused once governance revokes
 /// its sender. The client is told `NotPreconfEligible` instead of being left to time out,
-/// and the tx reaches neither arm — the pool arm still skips it, its frozen verdict still
+/// and the tx reaches neither arm — the pool arm still skips it, its commitment record still
 /// being `Eligible`. A preconf submission that policy will not authorize fails rather than
 /// silently degrading into an ordinary transaction.
 ///
-/// The two are not in tension: the verdict records *which RPC the tx arrived on* — a fact
+/// The two are not in tension: the record records *which RPC the tx arrived on* — a fact
 /// no allowlist supplies, pinned by the classifier unit test
-/// `verdict_is_frozen_when_allowlist_shrinks` — while whether policy still authorizes it
+/// `record_is_frozen_when_allowlist_shrinks` — while whether policy still authorizes it
 /// is a separate question that only Case A's subject fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_allowlist_flip_bars_the_outstanding_commitment_and_spares_the_plain_tx() {
@@ -122,7 +122,7 @@ async fn an_allowlist_flip_bars_the_outstanding_commitment_and_spares_the_plain_
 
     // ── 1. Case B subject: plain `eth_sendRawTransaction` from a sender that is
     // not allowlisted. The validator classifies synchronously during admission,
-    // so the verdict is frozen by the time this returns.
+    // so the record is frozen by the time this returns.
     let other_tx = signed_transfer_from(other_signer, chain_id, 0).await;
     let other_hash: B256 =
         node.rpc.inject_tx(other_tx).await.expect("plain sendRawTransaction accepted");
@@ -193,7 +193,7 @@ async fn an_allowlist_flip_bars_the_outstanding_commitment_and_spares_the_plain_
     assert!(
         !sealed.contains(&preconf_hash),
         "a refused commitment must reach neither arm — the preconf arm barred it and the pool \
-         arm skips it for holding a preconf verdict. sealed = {sealed:?}",
+         arm skips it for holding a commitment record. sealed = {sealed:?}",
     );
     assert!(
         sealed.contains(&other_hash),

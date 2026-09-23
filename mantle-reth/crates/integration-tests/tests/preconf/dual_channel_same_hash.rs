@@ -10,7 +10,7 @@
 //!
 //! | order | refused by | why it went away |
 //! |---|---|---|
-//! | ordinary first, then preconf | the frozen verdict: the ordinary admission latched `NotEligible`, and a verdict is immutable, so `claim_preconf` refused | nothing latches a verdict for ordinary transactions once the pool decoration is gone |
+//! | ordinary first, then preconf | the ordinary path used to leave a frozen classification behind, and it was immutable, so `claim_preconf` refused | nothing records anything for ordinary transactions once the pool decoration is gone |
 //! | preconf first, then ordinary | the pool's own hash dedup — the preconf transaction was *in* the pool, so resubmitting it was "already known" | preconf transactions no longer enter the pool, so the hash is new to it |
 //!
 //! Accepting both is a deliberate loosening, on the grounds that whatever lands
@@ -21,7 +21,7 @@
 //! **What must not loosen** is what every test here asserts: the transaction
 //! lands **exactly once** and consumes its nonce **exactly once**. Two separate
 //! things hold that — the pool arm skips a transaction carrying a preconf
-//! verdict, and an execution that slips past consumes the nonce so the second
+//! record, and an execution that slips past consumes the nonce so the second
 //! attempt is dropped as nonce-too-low — so it is pinned directly rather than
 //! argued from either.
 //!
@@ -87,7 +87,7 @@ async fn assert_landed_exactly_once(
 /// Ordinary submission first, preconf second.
 ///
 /// The preconf call used to be refused outright, because the ordinary admission
-/// had already frozen a non-preconf verdict for this hash. It is accepted now,
+/// had already frozen a classification for this hash. It is accepted now,
 /// and races the pool arm for the same transaction — one of them lands it, and
 /// the other is dropped at execution as nonce-too-low.
 ///
@@ -127,7 +127,7 @@ async fn ordinary_then_preconf_is_no_longer_refused() {
     let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw).await });
 
     // The assertion this test exists for: the preconf submission reached the
-    // queue. Under the frozen-verdict rule it never would have.
+    // queue. Under the old frozen-classification rule it never would have.
     wait_fifo_entry(&fifo, sender, 0).await;
 
     let payload = node
@@ -219,9 +219,9 @@ async fn preconf_then_ordinary_is_no_longer_refused() {
 ///
 /// The pool arm iterates a snapshot taken when the build starts. In the other
 /// two tests the second submission arrives after that snapshot, so the pool arm
-/// never sees a transaction carrying a preconf verdict and the filter that
+/// never sees a transaction carrying a commitment record and the filter that
 /// would skip it never runs. Here it does: the transaction is in the pool, its
-/// verdict is already `Eligible`, and the snapshot contains it.
+/// record is already `Eligible`, and the snapshot contains it.
 ///
 /// What the filter buys is the client's receipt. Both arms could execute this
 /// transaction and only one can — whichever goes first consumes the nonce. If
@@ -230,7 +230,7 @@ async fn preconf_then_ordinary_is_no_longer_refused() {
 /// route. Asserting `Success` alongside "landed exactly once" is what separates
 /// the two outcomes; "landed exactly once" alone holds either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_pooled_transaction_with_a_preconf_verdict_is_left_to_the_preconf_arm() {
+async fn a_pooled_transaction_with_a_preconf_record_is_left_to_the_preconf_arm() {
     use mantle_reth_rpc_ext::PreconfStatus;
 
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -250,7 +250,7 @@ async fn a_pooled_transaction_with_a_preconf_verdict_is_left_to_the_preconf_arm(
     let http_clone = http.clone();
     let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw).await });
 
-    // The premise: the verdict is frozen and the entry exists *before* the
+    // The premise: the record is frozen and the entry exists *before* the
     // build opens, so the snapshot the pool arm takes already contains a
     // transaction the preconf arm owns.
     wait_fifo_entry(&fifo, sender, 0).await;

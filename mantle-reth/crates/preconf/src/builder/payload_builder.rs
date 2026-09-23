@@ -72,7 +72,7 @@ use crate::{
         execution_info::record_executed,
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
     },
-    classifier::{Verdict, Whitelist},
+    classifier::Whitelist,
     flashblocks::{
         BlockInvariants, FlashblocksProducer, SenderBalances, SliceHeader, SliceLimits,
         build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
@@ -569,7 +569,7 @@ where
 /// Asked of **every** entry, against the allowlist pinned when this block's
 /// build began plus whatever governance update the block itself carried —
 /// policy may have moved at any point between admission and build, not only
-/// inside this block. The frozen verdict cannot answer it: that records
+/// inside this block. The commitment record cannot answer it: that records
 /// eligibility as of admission, not whether policy still authorizes the tx.
 ///
 /// `all_preconfs` must be checked **ahead of** the lists: that mode never reads
@@ -869,22 +869,24 @@ where
     };
     // A transaction the preconf arm owns is left to it. Both containers can hold
     // one hash now that either channel accepts it, and this arm's snapshot is
-    // taken before the verdict is necessarily frozen. If this arm applied it,
+    // taken before the record is necessarily frozen. If this arm applied it,
     // the transaction would land while its client was told `Timeout`.
     //
     // Skipping does not drop it: admission holds the `(sender, nonce)`, so the
     // preconf arm is the only one that can apply it.
     //
-    // The predicate is the **frozen verdict**, never a live allowlist read:
-    // re-deriving eligibility here would let an allowlist update between the two
-    // decisions strand the transaction with neither arm applying it.
+    // The predicate is the **record written at admission**, never a live
+    // allowlist read: re-deriving eligibility here would let an allowlist update
+    // between the two decisions strand the transaction with neither arm
+    // applying it. A record exists exactly for a transaction the preconf arm
+    // owns, so its presence is the whole answer.
     //
     // Removing this is not detectable by the suite — the biased `select!` puts
     // preconf dispatch ahead of this arm, and a commitment older than the build
     // arrives through the carryover preamble, so the preconf arm has got there
     // first every time. That is a reading of the loop, not a property anything
     // checks, which is why the guard stays.
-    if classifier.verdict(tx.hash()).is_some_and(Verdict::is_preconf) {
+    if classifier.is_tracked(tx.hash()) {
         best_txs.mark_invalid(tx.sender(), tx.nonce());
         return Ok(BestTxStep::Continue);
     }

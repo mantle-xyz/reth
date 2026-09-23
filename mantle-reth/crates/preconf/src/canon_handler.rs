@@ -61,7 +61,7 @@ pub struct PreconfCanonHandler<Pr, P, N> {
     /// loop).
     pool: P,
     fifo: Arc<PreconfTxSet>,
-    /// Verdict cache. Swept once per canonical notification against the
+    /// Record cache. Swept once per canonical notification against the
     /// fifo's live set — see [`PreconfClassifier::sweep`]. This handler is the
     /// only place that holds both, which is why the sweep lives here.
     classifier: Arc<PreconfClassifier>,
@@ -189,7 +189,7 @@ where
                 );
             }
 
-            // Verdict-cache sweep. Runs unconditionally: its target is the leak
+            // Record-cache sweep. Runs unconditionally: its target is the leak
             // `drop_hash` cannot reach — a tx classified at admission that sits
             // in `Queued`, never emits a `Pending` event, and so never gets a
             // fifo entry at all. Criterion is fifo membership plus a grace
@@ -210,7 +210,7 @@ where
                     target: "mantle::preconf::canon",
                     dropped,
                     live = live.len(),
-                    "swept stale preconf verdicts",
+                    "swept stale commitment records",
                 );
             }
         }

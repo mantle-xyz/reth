@@ -35,7 +35,7 @@ pub use builder::{
     ResolvePayloadFuture,
 };
 pub use canon_handler::PreconfCanonHandler;
-pub use classifier::{DEFAULT_VERDICT_CACHE_CAP, PreconfClassifier, Verdict, Whitelist};
+pub use classifier::{DEFAULT_COMMITMENT_CACHE_CAP, PreconfClassifier, Whitelist};
 pub use config::{DEFAULT_PRECONF_QUEUE_GAS_BLOCKS, DEFAULT_SAFETY_MARGIN, PreconfConfig};
 pub use flashblocks::{
     FlashblockProducerConfig, FlashblockProducerConfigError, FlashblocksProducer,

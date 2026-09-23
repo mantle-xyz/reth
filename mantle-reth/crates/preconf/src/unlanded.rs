@@ -17,7 +17,7 @@
 //!
 //! Deliberately ignorant. It does not read the chain, does not touch the disk,
 //! and holds no opinion about which entries are still owed — the caller reads
-//! the chain and hands the verdict in. That keeps the judgement with the only
+//! the chain and hands the judgement in. That keeps it with the only
 //! component that can make it and leaves this type exhaustively unit-testable.
 //!
 //! # What it cannot recover

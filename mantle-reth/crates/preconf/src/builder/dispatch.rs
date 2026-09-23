@@ -507,7 +507,7 @@ where
         // only moment that fact is observable.
         //
         // No retry: every transient cause is already filtered out before apply,
-        // so a second attempt would only re-derive the same verdict. Transient
+        // so a second attempt would only re-derive the same answer. Transient
         // capacity becomes `Defer` (unbounded, not a retry budget), and a
         // successor of a blocked predecessor is deferred or canceled — both in
         // `payload_builder::admit_and_dispatch`, neither reaching apply; `Fatal`

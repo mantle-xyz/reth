@@ -857,10 +857,10 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
 ///
 /// Order matters:
 ///
-/// 1. Mark **every** loaded hash [`Verdict::Promised`] up front, before admitting any of them. This
-///    is what carries "a receipt for this tx already went out to a client" across the restart, and
-///    it has to happen first: it is what claims the `(sender, nonce)` each commitment was issued
-///    against, before anything else can take it.
+/// 1. Mark **every** loaded hash promised up front, before admitting any of them. This is what
+///    carries "a receipt for this tx already went out to a client" across the restart, and it has
+///    to happen first: it is what claims the `(sender, nonce)` each commitment was issued against,
+///    before anything else can take it.
 /// 2. Decode via [`RestoreSource::add_envelope`], then ask the chain whether the commitment is
 ///    still owed — the sender's nonce first, and only if that is gone, whether this transaction is
 ///    the one that took it.
@@ -878,16 +878,14 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
 /// rejecting commitments a client was already told had succeeded — silently,
 /// since restore skips and logs.
 ///
-/// [`Verdict::Promised`] makes the exemption explicit: the claim is
-/// get-or-insert, so the verdict installed here survives step 2, and the
+/// The `promised` flag makes the exemption explicit: the claim is
+/// get-or-insert, so the record installed here survives step 2, and the
 /// validator returns a promised transaction straight to its inner validator —
 /// ahead of the ceiling and every other preconf gate. The pre-pass loop carries
 /// the rest of the argument.
 ///
 /// Non-recoverable failures (corrupt bytes, a type the preconf path does not
 /// carry) are logged and skipped — best-effort restore, never block startup.
-///
-/// [`Verdict::Promised`]: crate::classifier::Verdict::Promised
 pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     journal: &PreconfJournal,
     pool: &P,
@@ -921,10 +919,9 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     // Step 1 — a pre-pass: every hash becomes a live commitment owning its nonce before any is
     // admitted. Two reasons it is not folded into the loop below.
     //
-    // **The verdict.** `add_envelope` hands the tx to the pool, whose validator classifies
-    // whatever is not yet marked. Two journal entries sharing a `(sender, nonce)` are enough to
-    // matter: admitting the first would classify the *second* against the current allowlists and
-    // put it through the replacement guard instead of treating it as the commitment it is.
+    // **The record.** Two journal entries sharing a `(sender, nonce)` are enough to matter:
+    // admitting the first would put the *second* through the replacement guard instead of
+    // treating it as the commitment it is.
     //
     // **The slot.** `mark_promised` both records "a receipt for this went out in a previous
     // process" and claims the `(sender, nonce)`, from what `recover_slot` hands it. Back-filling
@@ -2207,21 +2204,21 @@ mod tests {
     }
 
     /// **The ordering invariant of C4.** Every entry must already carry
-    /// `Verdict::Promised` **before the first one is offered to the pool**, not
+    /// promised **before the first one is offered to the pool**, not
     /// merely before its own admission. Asserted from inside `add_envelope`, i.e.
     /// at exactly the moment the real validator would run. See the pre-pass in
     /// `restore_preconf_state` for why the stronger form is the one that matters.
     #[tokio::test]
     async fn restore_marks_every_entry_promised_before_admitting_any() {
-        /// Pool that, on each tx it is handed, snapshots the verdicts of **all**
+        /// Pool that, on each tx it is handed, snapshots the promise flag of **all**
         /// journal hashes — including the ones not offered yet.
-        struct VerdictSpyPool {
+        struct RecordSpyPool {
             classifier: Arc<PreconfClassifier>,
             hashes: Vec<TxHash>,
-            seen: std::sync::Mutex<Vec<Vec<Option<crate::classifier::Verdict>>>>,
+            seen: std::sync::Mutex<Vec<Vec<bool>>>,
         }
         #[async_trait::async_trait]
-        impl RestoreSource for VerdictSpyPool {
+        impl RestoreSource for RecordSpyPool {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((Address::from([seed; 20]), u64::from(seed)))
@@ -2237,7 +2234,7 @@ mod tests {
                 self.seen
                     .lock()
                     .unwrap()
-                    .push(self.hashes.iter().map(|h| self.classifier.verdict(h)).collect());
+                    .push(self.hashes.iter().map(|h| self.classifier.is_promised(h)).collect());
                 Ok(RestoredEnvelope {
                     envelope: TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)),
                     from: Address::from([seed; 20]),
@@ -2247,14 +2244,14 @@ mod tests {
 
         let (_dir, j) = fresh_journal().await;
         // `entry(byte, height)` keys both the journal hash and the stub's
-        // fabricated envelope off the same byte, so the spy can look the verdict
+        // fabricated envelope off the same byte, so the spy can look the record
         // up by hash.
         j.append_promised(&entry(1, 10)).await.unwrap();
         j.append_promised(&entry(2, 11)).await.unwrap();
         j.append_promised(&entry(3, 12)).await.unwrap();
 
         let classifier = Arc::new(empty_classifier());
-        let pool = VerdictSpyPool {
+        let pool = RecordSpyPool {
             classifier: classifier.clone(),
             hashes: (1u8..=3).map(|b| TxHash::from([b; 32])).collect(),
             seen: std::sync::Mutex::new(vec![]),
@@ -2269,7 +2266,7 @@ mod tests {
         // each entry just before its own admission satisfies "this one is
         // Promised" but leaves those two `None` — that arrangement fails here.
         assert!(
-            seen[0].iter().all(|v| *v == Some(crate::classifier::Verdict::Promised)),
+            seen[0].iter().all(|promised| *promised),
             "all entries must be Promised before the first admission, including \
              those not yet admitted; got {:?}",
             seen[0],
@@ -2338,7 +2335,7 @@ mod tests {
         let classifier = Arc::new(PreconfClassifier::new(
             false,
             std::time::Duration::from_secs(3600),
-            crate::classifier::DEFAULT_VERDICT_CACHE_CAP,
+            crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP,
         ));
         let pool = SlotSpyPool {
             classifier: classifier.clone(),
@@ -2411,8 +2408,8 @@ mod tests {
     /// a fifo entry for a `(sender, nonce)` it does not own.
     ///
     /// Restore is the one place that pushes entries without going through
-    /// admission, and the one place that mints `Verdict::Promised` — the
-    /// verdict the guard waves past its occupancy check. So it is the only
+    /// admission, and the one place that mints a promise — the
+    /// record the guard waves past its occupancy check. So it is the only
     /// candidate for producing the violating state, and it needs two journal
     /// records on one `(sender, nonce)` to try.
     ///

@@ -12,8 +12,8 @@
 //! Cheapest judgement first, and two placements are deliberate rather than
 //! incidental:
 //!
-//! * the **verdict claim** comes before the validator, because a verdict has to be frozen before
-//!   any step that can fail expensively — otherwise every failure path owes a rollback;
+//! * **recording the commitment** comes before the validator, because the record has to exist
+//!   before any step that can fail expensively — otherwise every failure path owes a rollback;
 //! * the **queue's own rules** come last, because they are the only ones needing its lock, and
 //!   holding it for a request already doomed is time no other request can use.
 //!
@@ -281,7 +281,7 @@ where
             return Err(PreconfError::NotPreconfEligible);
         }
 
-        // From here every failure owes the verdict back, or the sender's nonce
+        // From here every failure owes the record back, or the sender's nonce
         // stays claimed by a transaction that is not going anywhere.
         match self.decide(pool_tx, sender, hash, origin_instant, responder).await {
             Ok(outcome) => Ok(AdmittedTx { outcome, hash, sender, nonce }),
@@ -302,9 +302,9 @@ where
         }
     }
 
-    /// Everything after the verdict is frozen: the validator, then the queue.
+    /// Everything after the record exists: the validator, then the queue.
     ///
-    /// Split out so the caller has one place to release the verdict from,
+    /// Split out so the caller has one place to release the record from,
     /// rather than a release on every branch that can fail.
     async fn decide(
         &self,
@@ -400,21 +400,20 @@ pub fn capacity_from_pool_config(
 }
 
 #[cfg(test)]
-mod verdict_release_tests {
+mod record_release_tests {
     //! What a refused admission owes back.
     //!
-    //! Freezing the verdict happens before the validator runs, so every path
-    //! that fails after it has to hand the record back — otherwise the hash
-    //! keeps an eligible verdict for a transaction that is going nowhere, and
-    //! a verdict is immutable for the life of the transaction. The sender
-    //! could never get those bytes preconfirmed again.
+    //! The record is written before the validator runs, so every path that
+    //! fails after it has to hand it back — otherwise the hash keeps a
+    //! commitment record for a transaction that is going nowhere, and the
+    //! sender could never get those bytes preconfirmed again.
     //!
     //! One exception, and it is the whole reason the release is not
     //! unconditional: a commitment whose receipt has already gone out keeps
     //! its record and its nonce.
 
     use super::*;
-    use crate::classifier::{DEFAULT_VERDICT_CACHE_CAP, Verdict};
+    use crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP;
     use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{B256, U256};
@@ -461,7 +460,7 @@ mod verdict_release_tests {
         let classifier = Arc::new(PreconfClassifier::new(
             false,
             std::time::Duration::from_secs(3600),
-            DEFAULT_VERDICT_CACHE_CAP,
+            DEFAULT_COMMITMENT_CACHE_CAP,
         ));
         classifier.update_whitelist(
             [(signer.address(), RECIPIENT)].into_iter().collect(),
@@ -515,7 +514,7 @@ mod verdict_release_tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_hands_back_the_verdict_it_froze() {
+    async fn a_refusal_hands_back_the_record_it_froze() {
         let f = fixture();
         let (raw, hash) = signed_raw(&f.signer, 0);
         let (resp, _rx) = oneshot::channel();
@@ -525,7 +524,7 @@ mod verdict_release_tests {
             .await
             .expect_err("the validator refuses everything");
 
-        assert_eq!(f.classifier.verdict(&hash), None, "the frozen verdict must be released");
+        assert!(!f.classifier.is_tracked(&hash), "the record must be released");
         assert!(!f.fifo.contains(&hash).await, "and nothing may be left queued");
     }
 
@@ -535,8 +534,8 @@ mod verdict_release_tests {
     /// that window is re-validated and can fail on account state alone, since
     /// Mantle recomputes the L1 and operator fees every time.
     ///
-    /// The assertions key on `is_promised`, not on the verdict variant:
-    /// `mark_promised` sets the flag without rewriting the verdict, so the
+    /// The assertions key on `is_promised`, not on the record's presence:
+    /// `mark_promised` sets the flag on whatever record is there, so the
     /// ordinary flow leaves `Eligible` + promised — exactly the records that
     /// must survive.
     #[tokio::test]
@@ -548,11 +547,7 @@ mod verdict_release_tests {
 
         assert_eq!(f.classifier.claim_preconf(hash, &sender, Some(&RECIPIENT)), Ok(()));
         assert_eq!(f.classifier.mark_promised(hash, &sender, 0, 0), Ok(()));
-        assert_eq!(
-            f.classifier.verdict(&hash),
-            Some(Verdict::Eligible),
-            "precondition: the flag is set without rewriting the verdict",
-        );
+        assert!(f.classifier.is_promised(&hash), "precondition: the commitment is acknowledged",);
 
         f.admission
             .admit(&raw, std::time::Instant::now(), resp)
@@ -567,7 +562,7 @@ mod verdict_release_tests {
         );
     }
 
-    /// The type gate runs before the verdict is frozen, so there is nothing
+    /// The type gate runs before anything is recorded, so there is nothing
     /// to hand back — and nothing must be left behind either.
     #[tokio::test]
     async fn a_type_refused_transaction_never_froze_anything() {
@@ -579,7 +574,7 @@ mod verdict_release_tests {
         assert!(!accepts(TxType::Eip7702));
         f.admission.admit(&raw, std::time::Instant::now(), resp).await.expect_err("refused");
 
-        assert_eq!(f.classifier.verdict(&hash), None);
+        assert!(!f.classifier.is_tracked(&hash));
     }
 }
 

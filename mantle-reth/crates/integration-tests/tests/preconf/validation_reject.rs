@@ -15,7 +15,7 @@
 //!   `(sender, to)` before anything is recorded.
 //! - **Nonce-gap gate** — rejects `tx.nonce > pending_nonce` before an entry is created.
 //! - **Preconf per-tx gas ceiling** — rejects `tx.gas_limit > preconf_max_gas_per_tx` before the
-//!   verdict is written, with a typed `PreconfError::PreconfGasLimitExceeded`. See
+//!   record is written, with a typed `PreconfError::PreconfGasLimitExceeded`. See
 //!   `per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool`.
 //!
 //! ### Generic validator rejections live in `validator_error_mapping.rs`
@@ -76,7 +76,7 @@ async fn signed_transfer(
 }
 
 /// Non-whitelisted (sender, to) returns typed `NotPreconfEligible` error,
-/// with nothing recorded: no queue entry, no frozen verdict.
+/// with nothing recorded: no queue entry, no commitment record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn non_whitelisted_returns_not_eligible() {
     // Placeholder whitelist satisfies `enabled=true` validation while
@@ -172,7 +172,7 @@ async fn nonce_gap_rejected_synchronously() {
 /// Per-tx gas ceiling is enforced at the **RPC**, before the pool is asked.
 ///
 /// Setup: `max_gas_per_tx = 20_000`. Submit a 21k-gas transfer. `rpc.rs`
-/// Admission checks the ceiling before it writes the verdict, so the client
+/// Admission checks the ceiling before it writes the record, so the client
 /// gets `PreconfError::PreconfGasLimitExceeded` naming both numbers.
 ///
 /// The failure is synchronous (well under `preconf_timeout`): nothing is

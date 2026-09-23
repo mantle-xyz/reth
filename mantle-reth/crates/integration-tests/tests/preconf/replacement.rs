@@ -279,7 +279,7 @@ async fn waiting_slot_blocks_different_hash_replacement() {
     let raw_first = tx_a.clone();
     let first = tokio::spawn(async move { send_preconf(&http_first, raw_first).await });
 
-    // Give admission time to run (decode, whitelist, gas, verdict, queue).
+    // Give admission time to run (decode, whitelist, gas, record, queue).
     // By the time this sleep ends the fifo has a `Waiting` entry for tx_A.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -739,7 +739,7 @@ async fn failed_slot_replaceable_by_different_hash() {
 /// above `--preconf.max-gas-per-tx`, so it is rejected *after* that decision.
 ///
 /// Asserted through the classifier rather than the wire, because that is where
-/// the difference is visible: with an eager teardown `a`'s verdict is forgotten
+/// the difference is visible: with an eager teardown `a`'s record is forgotten
 /// and its slot handed to `b` (then released again when `b` is rejected);
 /// deferred, `a` keeps both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -798,10 +798,9 @@ async fn rejected_replacement_leaves_the_reclaimable_holder_intact() {
     );
 
     // The holder must be untouched.
-    assert_eq!(
-        classifier.verdict(&a_hash),
-        Some(mantle_reth_preconf::Verdict::Eligible),
-        "`a`'s frozen verdict must survive a failed replacement attempt",
+    assert!(
+        classifier.is_tracked(&a_hash),
+        "`a`'s record must survive a failed replacement attempt",
     );
     assert_eq!(
         classifier.slot_owner(&wallet_addr, 0),

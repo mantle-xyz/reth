@@ -236,9 +236,9 @@ where
         //
         // Ordering is load-bearing twice over. This cannot live in the binary's
         // `on_node_started` hook, which runs only once the RPC server, payload
-        // builder and consensus engine are up: a verdict is frozen at admission,
-        // so anything admitted against empty allowlists would stay `NotEligible`
-        // for the rest of that tx's life. It must also precede journal restore,
+        // builder and consensus engine are up: the record is written at
+        // admission, so anything admitted against empty allowlists would be
+        // refused and never get a second chance. It must also precede journal restore,
         // which pushes promised envelopes through the validator.
         //
         // Fatal on a code-less address — `build_pool` returns `eyre::Result`, so

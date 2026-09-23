@@ -44,7 +44,7 @@ use crate::{
 ///
 /// Holds nothing. What this replaces wrapped a live `TransactionPool`,
 /// because restore used to re-admit every commitment there and read the
-/// verdict off the pool's validator. Commitments do not enter the pool any
+/// outcome off the pool's validator. Commitments do not enter the pool any
 /// more, so all that is left of the job is decoding — and the questions the
 /// pool used to answer as a side effect are now asked of the chain directly.
 ///

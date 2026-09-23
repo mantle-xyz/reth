@@ -53,7 +53,7 @@ pub struct PreconfRpcHandler {
     admission: Arc<dyn DynAdmission>,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
-    /// Owns the allowlists and every frozen verdict. The single decider of
+    /// Owns the allowlists and every commitment record. The single decider of
     /// preconf eligibility, shared with the validator and the builder.
     classifier: Arc<PreconfClassifier>,
 }
@@ -460,7 +460,7 @@ mod tests {
     use mantle_reth_rpc_ext::PreconfStatus as WireStatus;
     use std::{collections::HashSet, time::Duration};
 
-    use crate::{admission::AdmittedTx, classifier::DEFAULT_VERDICT_CACHE_CAP};
+    use crate::{admission::AdmittedTx, classifier::DEFAULT_COMMITMENT_CACHE_CAP};
 
     fn sample_log(addr_byte: u8, topic_byte: u8, data_byte: u8) -> Log {
         let data = LogData::new_unchecked(
@@ -597,7 +597,7 @@ mod tests {
         let classifier = Arc::new(PreconfClassifier::new(
             false,
             Duration::from_secs(3600),
-            DEFAULT_VERDICT_CACHE_CAP,
+            DEFAULT_COMMITMENT_CACHE_CAP,
         ));
         classifier.update_whitelist(
             [(sender, RECIPIENT)].into_iter().collect(),

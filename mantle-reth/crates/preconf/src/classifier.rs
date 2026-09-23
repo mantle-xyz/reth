@@ -48,22 +48,22 @@
 //! allowlist it means**. A snapshot answers "who would be eligible under these
 //! lists"; it cannot answer the question this module owns — "what was this
 //! *already-admitted* transaction classified as" — because that answer is not a
-//! function of any list. It lives in the verdict cache, and every consumer that
+//! function of any list. It lives in the commitment cache, and every consumer that
 //! needs the partition to hold reads it from there.
 //!
 //! ## Locking
 //!
-//! The verdict store is read from the builder's apply hook, a sync `fn` that
+//! The commitment store is read from the builder's apply hook, a sync `fn` that
 //! never receives the fifo, so it has to be **synchronously readable** — hence
 //! `parking_lot` here, where every `PreconfTxSet` lookup is `async` behind a
 //! `tokio::sync::Mutex`.
 //!
 //! Two independent locks, deliberately: the allowlists are read-often /
-//! written-almost-never, while the verdict cache takes one write per admitted
+//! written-almost-never, while the commitment cache takes one write per admitted
 //! transaction. They are never held at the same time — [`PreconfClassifier::claim_preconf`],
 //! the only caller that needs both, finishes with the allowlist before taking the
-//! verdict lock — so no lock order exists to get wrong. As everywhere else in this crate, a guard
-//! is never held across an `.await`; [`PreconfClassifier::verdict`] hands back a `Copy`
+//! record lock — so no lock order exists to get wrong. As everywhere else in this crate, a guard
+//! is never held across an `.await`; [`PreconfClassifier::record`] hands back a `Copy`
 //! value, so callers cannot accidentally do so.
 
 use alloy_primitives::{
@@ -125,18 +125,18 @@ impl Whitelist {
     }
 }
 
-/// Safety bound on the verdict cache — 100k entries.
+/// Safety bound on the commitment cache — 100k entries.
 ///
-/// Each entry costs its hash key plus a `CachedVerdict`, and a preconf verdict
+/// Each entry costs its hash key plus a `Commitment`, and a commitment record
 /// additionally owns a `by_slot` entry; the bound assumes every entry is
 /// preconf. Tens of MB at the ceiling, which only a stuck sweep can reach.
 ///
 /// Not a limit that is enforced by deleting: see
 /// [`PreconfClassifier::sweep`] for why exceeding it only warns.
-pub const DEFAULT_VERDICT_CACHE_CAP: usize = 100_000;
+pub const DEFAULT_COMMITMENT_CACHE_CAP: usize = 100_000;
 
 /// How many **persisted** blocks must be stacked on top of a commitment's block
-/// before its tracking (frozen verdict + `(sender, nonce)` slot) may be released
+/// before its tracking (commitment record + `(sender, nonce)` slot) may be released
 /// — 32.
 ///
 /// This is the one ruler shared by the retention period here and the journal's
@@ -149,7 +149,7 @@ pub const DEFAULT_VERDICT_CACHE_CAP: usize = 100_000;
 ///   includes in-memory canonical blocks) — an un-persisted block is lost on a non-graceful exit,
 ///   so counting it would let a commitment be forgotten before it is durable;
 /// * it is a block *depth*, not a duration. Time-based grace (what [`PreconfClassifier::sweep`]
-///   uses for un-committed verdicts) says nothing about how deep a reorg can reach.
+///   uses for un-committed records) says nothing about how deep a reorg can reach.
 ///
 /// **Why 32 and not less.** The cost of holding a slot longer is close to zero:
 /// the nonce has been consumed on chain, so any *other* transaction for it is
@@ -163,69 +163,34 @@ pub const DEFAULT_VERDICT_CACHE_CAP: usize = 100_000;
 /// whose derivation pipeline has not started, pinning every slot indefinitely.
 pub const SEAL_DEPTH: u64 = 32;
 
-/// A transaction's preconf eligibility. Decided once at admission, never
-/// changed afterwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// Matched the allowlists at admission time.
-    Eligible,
-    /// Did not match the allowlists at admission time.
-    NotEligible,
-    /// The verdict a commitment restored from the journal gets — restore is the
-    /// one path that creates a record without ever seeing an admission.
-    ///
-    /// **The variant itself grants nothing.** The "a receipt went out" marker,
-    /// and the thing every exemption keys on (the validator's admission-time
-    /// policy gates, [`PreconfClassifier::release_preconf_claim`]), is the
-    /// `promised` flag on `CachedVerdict` — which
-    /// [`PreconfClassifier::mark_promised`] sets *without* rewriting the
-    /// verdict. So the ordinary RPC flow leaves `Eligible` + promised, and only
-    /// restore ever writes `Promised`; nothing reads this variant as such. The
-    /// two stay separate to keep `verdict` write-once, which every consumer
-    /// relies on.
-    ///
-    /// The exemption is owed: the receipt went out before the restart, so the
-    /// transaction must come back whatever the current policy says. Without it,
-    /// lowering `--preconf.max-gas-per-tx` and restarting would silently drop an
-    /// already-acknowledged commitment.
-    Promised,
-}
-
-impl Verdict {
-    /// Whether this transaction belongs to the preconf arm. This is *the*
-    /// partition predicate: the pool arm skips exactly these.
-    pub const fn is_preconf(self) -> bool {
-        matches!(self, Self::Eligible | Self::Promised)
-    }
-}
-
-/// A frozen verdict plus the instant it was frozen, for the grace period in
-/// [`PreconfClassifier::sweep`].
+/// One commitment this node has made, plus the instant it was recorded — the
+/// latter for the grace period in [`PreconfClassifier::sweep`].
 ///
-/// `slot` is the reverse link into [`VerdictStore::by_slot`], so every removal
-/// path can release the claim without scanning the index.
+/// A record exists exactly for a transaction the preconf arm owns; there is no
+/// "not preconf" record, so the record's **presence is the answer**.
+///
+/// `slot` is the reverse link into [`CommitmentStore::by_slot`], so every
+/// removal path can release the claim without scanning the index.
 ///
 /// It is `Option` because the claim may not be *ours*, not because it happens
-/// later: both writers insert the record and then call `VerdictStore::claim`
-/// under the same lock, which back-fills the field. A non-preconf verdict never
-/// claims a slot at all, and a claim that loses to an incumbent returns
-/// `Err(owner)` while the record itself stays (see
+/// later: both writers insert the record and then call `CommitmentStore::claim`
+/// under the same lock, which back-fills the field. A claim that loses to an
+/// incumbent returns `Err(owner)` while the record itself stays (see
 /// `mark_promised_does_not_displace_an_existing_owner`).
 ///
 /// The invariant is exact: **`slot` is `Some(key)` iff this hash may own
 /// `by_slot[key]`.**
 ///
 /// `promised` / `committed_height` carry commitment-tracking state as fields
-/// rather than [`Verdict`] variants, because the three have different lifetimes:
-/// `verdict` is written once and never rewritten, `promised` is set once when a
+/// rather than one value, because the three have different lifetimes:
+/// `record` is written once and never rewritten, `promised` is set once when a
 /// receipt goes out, and `committed_height` is the only reversible one —
 /// `uncommit` clears it on a reorg while the promise stands. See
-/// [`Verdict::Promised`] for why the flag and the variant are not the same thing.
+/// the `promised` flag for why a record and a promise are not the same thing.
 #[derive(Debug, Clone, Copy)]
-struct CachedVerdict {
-    verdict: Verdict,
+struct Commitment {
     at: Instant,
-    /// The `(sender, nonce)` slot this verdict claimed, if it claimed one.
+    /// The `(sender, nonce)` slot this record claimed, if it claimed one.
     slot: Option<(Address, u64)>,
     /// A `Success` receipt for this hash has been returned to a client.
     ///
@@ -251,11 +216,10 @@ struct CachedVerdict {
     promised_height: Option<u64>,
 }
 
-impl CachedVerdict {
-    /// A freshly frozen verdict: nothing promised, nothing committed yet.
-    fn new(verdict: Verdict, slot: Option<(Address, u64)>) -> Self {
+impl Commitment {
+    /// A freshly recorded commitment: nothing promised, nothing committed yet.
+    fn new(slot: Option<(Address, u64)>) -> Self {
         Self {
-            verdict,
             at: Instant::now(),
             slot,
             promised: false,
@@ -265,30 +229,26 @@ impl CachedVerdict {
     }
 }
 
-/// The frozen verdicts, plus the `(sender, nonce)` → hash index that makes the
-/// replacement guard race-free.
+/// The commitment records, plus the `(sender, nonce)` → hash index that makes
+/// the replacement guard race-free.
 ///
 /// ## Why both indexes share one lock
 ///
-/// They are two views of one fact ("this transaction was classified"), and every
+/// They are two views of one fact ("this transaction is a commitment"), and every
 /// mutation touches both. Splitting them would mean either a documented lock
 /// order (this type currently has none to get wrong — see the module docs) or a
-/// window in which a verdict exists without its slot claim. Under one lock,
-/// freezing a verdict and claiming its slot happen in a single critical section,
+/// window in which a record exists without its slot claim. Under one lock,
+/// freezing a record and claiming its slot happen in a single critical section,
 /// which is precisely what closes the race between the two.
 #[derive(Debug, Default)]
-struct VerdictStore {
-    /// Frozen verdict per transaction hash.
-    by_hash: HashMap<TxHash, CachedVerdict>,
+struct CommitmentStore {
+    /// One record per commitment, keyed by transaction hash.
+    by_hash: HashMap<TxHash, Commitment>,
     /// Which transaction currently owns each `(sender, nonce)` slot.
-    ///
-    /// Only populated for verdicts where [`Verdict::is_preconf`] holds: a
-    /// non-preconf transaction makes no claim the preconf arm cares about, so
-    /// letting it occupy a slot would reject replacements for no reason.
     by_slot: HashMap<(Address, u64), TxHash>,
 }
 
-impl VerdictStore {
+impl CommitmentStore {
     /// Removes `hash` and, if it owned its `(sender, nonce)` slot, releases it.
     ///
     /// Guarded by an equality check because the slot may already have been
@@ -309,20 +269,18 @@ impl VerdictStore {
     /// restore that has just decoded the sender and nonce), and two copies of
     /// the predicate below would be two places to narrow it by mistake.
     ///
-    /// Checking and claiming are decoupled:
-    ///
-    /// * the answer is computed for **every** transaction, whatever its own verdict, because the
-    ///   slot records that a preconf transaction is in flight for this `(sender, nonce)` and a
-    ///   replacement is just as fatal when it arrives as an ordinary transaction;
-    /// * only a **preconf** transaction claims. A non-preconf one has no arm to defend, so
-    ///   occupying the slot would reject later replacements for nothing.
-    fn claim(&mut self, key: (Address, u64), hash: TxHash, is_preconf: bool) -> SlotClaim {
+    /// Checking and claiming are decoupled: the incumbent is reported to
+    /// **every** caller, because a replacement is just as fatal whoever sends
+    /// it, but only a hash that already has a record may take the slot. One
+    /// without a record has no arm to defend, so occupying it would reject
+    /// later replacements for nothing.
+    fn claim(&mut self, key: (Address, u64), hash: TxHash, has_record: bool) -> SlotClaim {
         let claim = match self.by_slot.entry(key) {
             // Same hash re-entering (retry / re-validation): idempotent.
             Entry::Occupied(slot) if *slot.get() == hash => Ok(()),
             Entry::Occupied(slot) => Err(*slot.get()),
             Entry::Vacant(slot) => {
-                if is_preconf {
+                if has_record {
                     slot.insert(hash);
                 }
                 Ok(())
@@ -334,7 +292,7 @@ impl VerdictStore {
         // with `slot: None` and rely on this back-fill; neither ever writes the
         // field itself.
         if claim.is_ok() &&
-            is_preconf &&
+            has_record &&
             let Some(cached) = self.by_hash.get_mut(&hash)
         {
             cached.slot = Some(key);
@@ -368,7 +326,7 @@ impl VerdictStore {
         expected: &TxHash,
         key: (Address, u64),
         hash: TxHash,
-        is_preconf: bool,
+        has_record: bool,
     ) -> SlotClaim {
         match self.by_slot.get(&key) {
             // Already ours (re-validation of the same hash): idempotent.
@@ -377,7 +335,7 @@ impl VerdictStore {
             _ => {}
         }
 
-        if is_preconf {
+        if has_record {
             self.by_slot.insert(key, hash);
             if let Some(cached) = self.by_hash.get_mut(&hash) {
                 cached.slot = Some(key);
@@ -394,7 +352,7 @@ impl VerdictStore {
 
     /// Releases `cached`'s slot iff it claimed one and `hash` is still the
     /// recorded owner.
-    fn release_slot_of(&mut self, hash: &TxHash, cached: &CachedVerdict) {
+    fn release_slot_of(&mut self, hash: &TxHash, cached: &Commitment) {
         let Some(key) = cached.slot else { return };
         if self.by_slot.get(&key) == Some(hash) {
             self.by_slot.remove(&key);
@@ -423,7 +381,7 @@ pub type SlotClaim = Result<(), TxHash>;
 /// Decides preconf eligibility once per transaction and remembers the answer.
 ///
 /// Held as `Arc<PreconfClassifier>` and shared by admission (the only writer of
-/// new verdicts), the payload builder and the canon handler.
+/// new records), the payload builder and the canon handler.
 #[derive(Debug)]
 pub struct PreconfClassifier {
     /// Mirrors `PreconfConfig::enabled`. When false this node runs no preconf
@@ -449,16 +407,16 @@ pub struct PreconfClassifier {
     /// copying them — see there for why that has to be a refcount bump.
     whitelist: RwLock<Arc<Whitelist>>,
 
-    /// The frozen verdicts and the `(sender, nonce)` slot index.
+    /// The commitment records and the `(sender, nonce)` slot index.
     /// `parking_lot` ⇒ synchronous reads, usable from the builder's sync apply
-    /// hook. Both indexes share this one lock — see [`VerdictStore`].
-    verdicts: RwLock<VerdictStore>,
+    /// hook. Both indexes share this one lock — see [`CommitmentStore`].
+    commitments: RwLock<CommitmentStore>,
 
-    /// Minimum age before a verdict may be swept. Protects the window between
-    /// the verdict being frozen and the entry existing.
+    /// Minimum age before a record may be swept. Protects the window between
+    /// the record being frozen and the entry existing.
     grace: Duration,
 
-    /// Warning threshold for the verdict cache. Never enforced by deleting.
+    /// Warning threshold for the commitment cache. Never enforced by deleting.
     capacity: usize,
 
     /// Whether we are currently above [`Self::capacity`]. Tracked so the
@@ -490,7 +448,7 @@ impl PreconfClassifier {
             enabled: true,
             all_preconfs,
             whitelist: RwLock::new(Arc::new(Whitelist::default())),
-            verdicts: RwLock::new(VerdictStore::default()),
+            commitments: RwLock::new(CommitmentStore::default()),
             grace,
             capacity,
             over_capacity: AtomicBool::new(false),
@@ -506,7 +464,7 @@ impl PreconfClassifier {
     /// `grace` is `max(2 × slot_duration, preconf_timeout)`. It has to cover two
     /// different windows, and the larger of the two wins:
     ///
-    /// * **`2 × slot_duration`** — the gap between the verdict being frozen and the entry existing.
+    /// * **`2 × slot_duration`** — the gap between the record being frozen and the entry existing.
     ///   Admission does both, so this is now sub-millisecond; the headroom is generous.
     /// * **`preconf_timeout`** — the whole period in which a client may still be waiting on its
     ///   responder. Sweeping inside it turns a transaction that was about to be preconfirmed into a
@@ -517,16 +475,16 @@ impl PreconfClassifier {
     /// operator-settable (`--preconf.slot-duration-ms` / `--preconf.timeout-ms`)
     /// and `PreconfConfig::validate` relates neither to the other, so
     /// `preconf_timeout = 10s` with `slot_duration = 2s` — a config it accepts —
-    /// would leave a 6s window in which a waiting client's verdict is sweepable.
+    /// would leave a 6s window in which a waiting client's record is sweepable.
     ///
     /// Note this bounds *spurious timeouts*, not broken commitments: an actual
     /// commitment implies a fifo entry, and [`Self::sweep`] provably never drops
-    /// a verdict whose hash is in the fifo (see its docs).
+    /// a record whose hash is in the fifo (see its docs).
     pub fn from_config(cfg: &PreconfConfig) -> Self {
         let grace = (cfg.slot_duration * 2).max(cfg.preconf_timeout);
         Self {
             enabled: cfg.enabled,
-            ..Self::new(cfg.all_preconfs, grace, DEFAULT_VERDICT_CACHE_CAP)
+            ..Self::new(cfg.all_preconfs, grace, DEFAULT_COMMITMENT_CACHE_CAP)
         }
     }
 
@@ -538,16 +496,16 @@ impl PreconfClassifier {
     /// — which RPC method this is — exists at all. One layer down the two
     /// methods are indistinguishable.
     ///
-    /// # The claim is exclusive, and the verdict store is the lock
+    /// # The claim is exclusive, and the commitment store is the lock
     ///
     /// Get-or-insert, so whoever writes first wins, under the same lock every
-    /// other verdict write takes.
+    /// other record write takes.
     ///
-    /// `Ok(())` on an existing `Eligible` verdict is deliberate: that is the
+    /// `Ok(())` on an existing `Eligible` record is deliberate: that is the
     /// documented same-hash retry after `Timeout` / `Canceled` / `Failed`, and
     /// re-asking must be idempotent rather than an error.
     ///
-    /// There is no case for an existing *non*-preconf verdict. Only this method
+    /// There is no case for an existing *non*-commitment record. Only this method
     /// and [`Self::mark_promised`] write records, and both write a preconf one,
     /// so an ordinary transaction leaves nothing behind to collide with.
     ///
@@ -562,17 +520,15 @@ impl PreconfClassifier {
         from: &Address,
         to: Option<&Address>,
     ) -> Result<(), PreconfClaimError> {
-        if !self.enabled {
-            return Err(PreconfClaimError::NotAllowlisted);
-        }
-        // Evaluated before the lock, so the allowlist lock and the verdict lock
-        // are never held together.
-        if !self.evaluate_whitelist(from, to).is_preconf() {
+        // Evaluated before the lock, so the allowlist lock and the record lock
+        // are never held together. `enabled` is folded into the predicate: a
+        // node that never opted in matches nothing.
+        if !self.evaluate_whitelist(from, to) {
             return Err(PreconfClaimError::NotAllowlisted);
         }
 
-        let mut store = self.verdicts.write();
-        store.by_hash.entry(hash).or_insert(CachedVerdict::new(Verdict::Eligible, None));
+        let mut store = self.commitments.write();
+        store.by_hash.entry(hash).or_insert(Commitment::new(None));
         let len = store.by_hash.len();
         drop(store);
 
@@ -590,7 +546,7 @@ impl PreconfClassifier {
     ///
     /// Called while the fifo's own lock is held, so that checking the slot and
     /// taking it cannot be split by a concurrent request. That direction —
-    /// fifo first, verdicts second — is the one every fifo removal already
+    /// fifo first, records second — is the one every fifo removal already
     /// takes, through `drop_hash`'s eviction callback.
     ///
     /// `replacing` names the incumbent the caller has just judged replaceable,
@@ -616,11 +572,11 @@ impl PreconfClassifier {
             return Ok(());
         }
         let key = (*sender, nonce);
-        let mut store = self.verdicts.write();
-        let is_preconf = store.by_hash.get(&hash).is_some_and(|cached| cached.verdict.is_preconf());
+        let mut store = self.commitments.write();
+        let has_record = store.by_hash.contains_key(&hash);
         match replacing {
-            Some(incumbent) => store.replace(&incumbent, key, hash, is_preconf),
-            None => store.claim(key, hash, is_preconf),
+            Some(incumbent) => store.replace(&incumbent, key, hash, has_record),
+            None => store.claim(key, hash, has_record),
         }
     }
 
@@ -634,7 +590,7 @@ impl PreconfClassifier {
     /// validator when its own gates or the inner validator refuse — and they
     /// must agree, because for one transaction the two are the same record.
     ///
-    /// The guard is the `promised` flag, never the [`Verdict::Promised`] variant:
+    /// The guard is the `promised` flag, never the record's mere presence:
     /// keying on the variant would release the `Eligible` + promised records the
     /// ordinary RPC flow leaves behind, i.e. exactly the ones that must survive.
     /// [`Self::release_unless_committed`] underneath does not catch those either
@@ -683,17 +639,17 @@ impl PreconfClassifier {
     ///
     /// **Why here and not at canonical time.** A canonical notification hands us
     /// bare transaction hashes for the whole block. To pick out our commitments
-    /// it needs a record that already exists — and the frozen verdict cannot
+    /// it needs a record that already exists — and the commitment record cannot
     /// serve, because `forward → release_unless_committed` races the notification
     /// and may already have dropped it. A receipt, by contrast, necessarily
     /// precedes the block, so a record written here is in place before either
     /// event can happen. See [`Self::mark_committed`].
     ///
-    /// There used to be a case here for a transaction whose verdict said it
+    /// There used to be a case here for a transaction whose record said it
     /// was not preconf: the claim was skipped, because such a transaction had
     /// no arm to defend the nonce with. It is unreachable now. The only
     /// writers of a record are this method and `claim_preconf`, and both write
-    /// a preconf verdict — nothing stores [`Verdict::NotEligible`] any more,
+    /// a commitment — a transaction the door refused leaves no record at all,
     /// and every caller of this method is answering for a commitment that
     /// went through the door.
     ///
@@ -716,21 +672,19 @@ impl PreconfClassifier {
             return Ok(());
         }
         let key = (*sender, nonce);
-        let mut store = self.verdicts.write();
+        let mut store = self.commitments.write();
 
         // Get-or-insert, then set `promised`. The insert case is journal restore
         // (this process has never seen the hash); the update case is the RPC
         // handler, where `claim_preconf` froze `Eligible` on the way in. Either
-        // way the verdict itself is left alone — see `Verdict::Promised`.
-        let cached = store
-            .by_hash
-            .entry(hash)
-            .or_insert_with(|| CachedVerdict::new(Verdict::Promised, None));
+        // way the record itself is left alone; only `promised` flips.
+        let cached = store.by_hash.entry(hash).or_insert_with(|| Commitment::new(None));
         cached.promised = true;
         cached.promised_height = Some(promised_height);
-        let is_preconf = cached.verdict.is_preconf();
 
-        let claim = store.claim(key, hash, is_preconf);
+        // The record is there either way — inserted just above, or already
+        // present from admission — so the slot is claimable.
+        let claim = store.claim(key, hash, true);
         let len = store.by_hash.len();
         drop(store);
 
@@ -755,7 +709,7 @@ impl PreconfClassifier {
         if !self.enabled {
             return false;
         }
-        let mut store = self.verdicts.write();
+        let mut store = self.commitments.write();
         match store.by_hash.get_mut(hash) {
             Some(cached) if cached.promised => {
                 cached.committed_height = Some(height);
@@ -782,7 +736,7 @@ impl PreconfClassifier {
         if !self.enabled {
             return false;
         }
-        let mut store = self.verdicts.write();
+        let mut store = self.commitments.write();
         store.by_hash.get_mut(hash).and_then(|cached| cached.committed_height.take()).is_some()
     }
 
@@ -791,8 +745,8 @@ impl PreconfClassifier {
     /// **Synchronous** — which is the point: the validator decides slot
     /// ownership on a sync path and so cannot reach for the journal's
     /// `contains(&hash).await`.
-    pub fn is_promised(&self, hash: &TxHash) -> bool {
-        self.verdicts.read().by_hash.get(hash).is_some_and(|cached| cached.promised)
+    pub(crate) fn is_promised(&self, hash: &TxHash) -> bool {
+        self.commitments.read().by_hash.get(hash).is_some_and(|cached| cached.promised)
     }
 
     /// Whether this hash's commitment record may be dropped: it has to have been
@@ -810,28 +764,20 @@ impl PreconfClassifier {
     /// was made for, and [`Self::release_unless_committed`] releases it when a
     /// build gives the commitment up. Keying rotation on this makes the two
     /// halves of commitment tracking unable to disagree.
-    pub fn is_tracked(&self, hash: &TxHash) -> bool {
-        self.verdicts.read().by_hash.contains_key(hash)
-    }
-
-    /// The one query for every downstream consumer. Synchronous.
     ///
-    /// `None` means "no record", which consumers must read as **not preconf** —
-    /// no record ⟺ the preconf arm makes no claim, so the pool arm takes it.
-    /// That default is safe rather than merely convenient: classification
-    /// happens inside `validate_transaction`, synchronously, *before* the
-    /// transaction enters the pool, so by the time any other component can
-    /// observe the transaction a verdict necessarily exists.
-    pub fn verdict(&self, hash: &TxHash) -> Option<Verdict> {
-        self.verdicts.read().by_hash.get(hash).map(|cached| cached.verdict)
+    /// This is also *the* partition predicate the pool arm reads: a record
+    /// exists exactly for a transaction the preconf arm owns, so no record
+    /// means the pool arm takes it. Synchronous, because that arm cannot wait.
+    pub fn is_tracked(&self, hash: &TxHash) -> bool {
+        self.commitments.read().by_hash.contains_key(hash)
     }
 
     /// Which transaction currently owns `(sender, nonce)`, if any.
     ///
-    /// Only preconf verdicts ever own a slot, so `None` means "no in-flight
+    /// Only commitment records ever own a slot, so `None` means "no in-flight
     /// preconf claim on this nonce".
     pub fn slot_owner(&self, sender: &Address, nonce: u64) -> Option<TxHash> {
-        self.verdicts.read().by_slot.get(&(*sender, nonce)).copied()
+        self.commitments.read().by_slot.get(&(*sender, nonce)).copied()
     }
 
     /// Publishes the current **persisted** block height — the reading of the
@@ -856,7 +802,7 @@ impl PreconfClassifier {
         committed_height.saturating_add(SEAL_DEPTH) <= self.persisted_height.load(Ordering::Relaxed)
     }
 
-    /// Drops one verdict and releases the slot it owned — **unless the
+    /// Drops one record and releases the slot it owned — **unless the
     /// transaction has been observed on chain and is not yet buried
     /// [`SEAL_DEPTH`] deep**, in which case the record is kept.
     ///
@@ -878,7 +824,7 @@ impl PreconfClassifier {
     ///
     /// Returns whether the record was actually released.
     pub fn release_unless_committed(&self, hash: &TxHash) -> bool {
-        let mut store = self.verdicts.write();
+        let mut store = self.commitments.write();
         let retained = store
             .by_hash
             .get(hash)
@@ -891,7 +837,7 @@ impl PreconfClassifier {
         true
     }
 
-    /// Drops verdicts that are **absent from `live`** and **older than the grace
+    /// Drops records that are **absent from `live`** and **older than the grace
     /// period**. Returns how many were dropped.
     ///
     /// ## What it can never drop
@@ -900,11 +846,11 @@ impl PreconfClassifier {
     /// the fifo's `order` deque, and `order` is only ever mutated alongside
     /// `entries` under a single lock — `push_if_absent` inserts into both,
     /// `drop_hash` removes from both. So `live` cannot miss a transaction that
-    /// has a fifo entry, and a verdict backing an **actual commitment** is
+    /// has a fifo entry, and a record backing an **actual commitment** is
     /// therefore unsweepable regardless of age: a commitment implies a fifo
     /// entry, and a fifo entry implies membership in `live`.
     ///
-    /// The grace period covers the other direction — a verdict that does *not*
+    /// The grace period covers the other direction — a record that does *not*
     /// yet have a fifo entry. See [`Self::from_config`] for why it is
     /// `max(2 × slot_duration, preconf_timeout)` rather than the slot term alone.
     ///
@@ -917,7 +863,7 @@ impl PreconfClassifier {
     /// One residual race, stated rather than closed: `live` is captured by the
     /// caller before this call, so a transaction that is older than `grace` and
     /// gets pushed into the fifo in the microseconds between the snapshot and
-    /// the `retain` below loses its verdict while holding a fifo entry. Reaching
+    /// the `retain` below loses its record while holding a fifo entry. Reaching
     /// it requires a transaction that sat without an entry for longer than
     /// `grace` (i.e. parked in `Queued`) being promoted at exactly that instant;
     /// its client has necessarily long since timed out, so the outcome is a fifo
@@ -940,15 +886,15 @@ impl PreconfClassifier {
     pub fn sweep(&self, live: &HashSet<TxHash>) -> usize {
         let now = Instant::now();
 
-        let mut store = self.verdicts.write();
+        let mut store = self.commitments.write();
         let before = store.by_hash.len();
 
         // Collect first, then release: `retain`'s closure cannot borrow
         // `by_slot` mutably while `by_hash` is being iterated. Both live under
         // the same lock, so the two steps are still one critical section — no
-        // one can observe a dropped verdict whose slot is still claimed.
+        // one can observe a dropped record whose slot is still claimed.
         let persisted = self.persisted_height.load(Ordering::Relaxed);
-        let mut released: Vec<(TxHash, CachedVerdict)> = Vec::new();
+        let mut released: Vec<(TxHash, Commitment)> = Vec::new();
         store.by_hash.retain(|hash, cached| {
             // Held by block depth, not by the time-based grace above — see the
             // third criterion in this method's docs.
@@ -981,9 +927,9 @@ impl PreconfClassifier {
         let slots = store.by_slot.len();
         drop(store);
 
-        metrics::gauge!("preconf.classifier.verdicts").set(len as f64);
+        metrics::gauge!("preconf.classifier.records").set(len as f64);
         // Published because a leaked slot is harder to diagnose from outside than
-        // a leaked verdict — it looks like "that account's transaction is
+        // a leaked record — it looks like "that account's transaction is
         // mysteriously rejected".
         //
         // Read it as a **lower bound** on in-flight preconf transactions, not as
@@ -1001,7 +947,7 @@ impl PreconfClassifier {
     /// single policy and a reader must never see a mix of old and new. The
     /// watcher reads them from one state view for the same reason.
     ///
-    /// Affects **only transactions admitted after this point** — every verdict
+    /// Affects **only transactions admitted after this point** — every record
     /// already frozen stays as it is. That is the whole guarantee.
     pub fn update_whitelist(
         &self,
@@ -1030,22 +976,24 @@ impl PreconfClassifier {
         self.whitelist.read().clone()
     }
 
-    /// Number of frozen verdicts — for logging, metrics and assertions.
-    pub fn verdict_count(&self) -> usize {
-        self.verdicts.read().by_hash.len()
+    /// Number of commitment records — for logging, metrics and assertions.
+    #[cfg(test)]
+    fn commitment_count(&self) -> usize {
+        self.commitments.read().by_hash.len()
     }
 
     /// Number of claimed `(sender, nonce)` slots — for assertions. Always
-    /// `<= verdict_count()`, since only preconf verdicts claim a slot.
-    pub fn slot_count(&self) -> usize {
-        self.verdicts.read().by_slot.len()
+    /// `<= record_count()`, since only commitment records claim a slot.
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.commitments.read().by_slot.len()
     }
 
     /// **Non-authoritative** eligibility preview, for the RPC handler's early
     /// rejection only. Does not write the cache, so it cannot pre-empt the
-    /// verdict the validator will freeze a moment later.
+    /// record the validator will freeze a moment later.
     pub fn preview_eligibility(&self, from: &Address, to: Option<&Address>) -> bool {
-        self.evaluate_whitelist(from, to).is_preconf()
+        self.evaluate_whitelist(from, to)
     }
 
     /// The allowlist rule itself. Private, and the only reader of
@@ -1083,22 +1031,15 @@ impl PreconfClassifier {
     /// distinct from a creation. It simply can never match on the `to` side: the
     /// contract refuses to store the zero address, which it reserves as the
     /// calldata marker that routes a rule to a wildcard set.
-    fn evaluate_whitelist(&self, from: &Address, to: Option<&Address>) -> Verdict {
-        if !self.enabled {
-            return Verdict::NotEligible;
-        }
-        if self.all_preconfs {
-            return Verdict::Eligible;
-        }
-        let hit = self.whitelist.read().is_eligible(from, to);
-        if hit { Verdict::Eligible } else { Verdict::NotEligible }
+    fn evaluate_whitelist(&self, from: &Address, to: Option<&Address>) -> bool {
+        self.enabled && (self.all_preconfs || self.whitelist.read().is_eligible(from, to))
     }
 
     /// Tracks whether the cache is over [`Self::capacity`], warning on the upward
     /// crossing. Never deletes.
     ///
     /// Deleting under pressure would break commitments, and would not even be the
-    /// useful thing to do: a verdict is a hash, an enum, an `Instant` and an
+    /// useful thing to do: a record is a hash, an enum, an `Instant` and an
     /// optional slot key, while a fifo entry holds a whole `Arc<TxEnvelope>` and
     /// the fifo has no bound of its own — its removal is entirely canon-driven, so
     /// a stalled chain grows it without limit. If memory is the problem, the fifo
@@ -1114,7 +1055,7 @@ impl PreconfClassifier {
                 target: "mantle::preconf::classifier",
                 len,
                 capacity = self.capacity,
-                "verdict cache above capacity — chain likely stalled (fifo eviction is canon-driven)"
+                "commitment cache above capacity — chain likely stalled (fifo eviction is canon-driven)"
             );
         }
         metrics::gauge!("preconf.classifier.over_capacity").set(f64::from(u8::from(over)));
@@ -1131,7 +1072,7 @@ mod tests {
 
     impl PreconfClassifier {
         /// Admits `hash` the way a **preconf RPC** submission does: claim the
-        /// verdict at the RPC boundary, then claim the nonce.
+        /// record at the RPC boundary, then claim the nonce.
         ///
         /// Two calls, because that is what production does and the order is
         /// the whole point. Nothing else classifies a transaction any more: a
@@ -1143,7 +1084,7 @@ mod tests {
             hash: TxHash,
             from: &Address,
             nonce: u64,
-        ) -> (Verdict, SlotClaim) {
+        ) -> (bool, SlotClaim) {
             self.admit_via_preconf_rpc_to(hash, from, Some(&addr(2)), nonce)
         }
 
@@ -1155,24 +1096,24 @@ mod tests {
             from: &Address,
             to: Option<&Address>,
             nonce: u64,
-        ) -> (Verdict, SlotClaim) {
+        ) -> (bool, SlotClaim) {
             let _ = self.claim_preconf(hash, from, to);
             let claim = self.claim_admission_slot(hash, from, nonce, None);
-            (self.verdict(&hash).unwrap_or(Verdict::NotEligible), claim)
+            (self.is_tracked(&hash), claim)
         }
 
-        /// [`Self::admit_via_preconf_rpc`] for the verdict-only shim above.
-        fn classify_verdict_via_preconf_rpc(&self, hash: TxHash, from: &Address) -> Verdict {
+        /// [`Self::admit_via_preconf_rpc`] reduced to "did it leave a record".
+        fn registered_via_preconf_rpc(&self, hash: TxHash, from: &Address) -> bool {
             self.admit_via_preconf_rpc(hash, from, u64::from(hash.0[0])).0
         }
 
-        /// [`Self::classify_verdict_via_preconf_rpc`] with an explicit recipient.
-        fn classify_verdict_to(
+        /// [`Self::registered_via_preconf_rpc`] with an explicit recipient.
+        fn registered_via_preconf_rpc_to(
             &self,
             hash: TxHash,
             from: &Address,
             to: Option<&Address>,
-        ) -> Verdict {
+        ) -> bool {
             self.admit_via_preconf_rpc_to(hash, from, to, u64::from(hash.0[0])).0
         }
     }
@@ -1209,13 +1150,13 @@ mod tests {
     /// exact rule, no wildcards — so a test that wants "not eligible" only has
     /// to change one half of the pair.
     fn classifier(grace: Duration) -> PreconfClassifier {
-        let c = PreconfClassifier::new(false, grace, DEFAULT_VERDICT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, grace, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), HashSet::default(), HashSet::default());
         c
     }
 
     // ===== Retention: a commitment that has been observed on chain keeps its
-    // ===== verdict and its nonce until the block is buried `SEAL_DEPTH` deep.
+    // ===== record and its nonce until the block is buried `SEAL_DEPTH` deep.
 
     /// Height used by the retention tests. Arbitrary, but non-zero so that
     /// "buried enough" is not accidentally true at watermark 0.
@@ -1235,7 +1176,7 @@ mod tests {
     /// away, or a same-nonce replacement could take the nonce and earn a second
     /// receipt.
     #[test]
-    fn a_committed_verdict_survives_the_fifo_forward() {
+    fn a_committed_record_survives_the_fifo_forward() {
         let c = classifier(LONG_GRACE);
         committed_commitment(&c);
 
@@ -1243,7 +1184,7 @@ mod tests {
         c.observe_persisted(AT + 1);
         assert!(!c.release_unless_committed(&hash(1)), "must refuse to release");
 
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible), "verdict kept");
+        assert!(c.is_tracked(&hash(1)), "record kept");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and so is the nonce");
     }
 
@@ -1251,14 +1192,14 @@ mod tests {
     /// commitment is irrevocable and tracking it costs a pinned nonce for
     /// nothing.
     #[test]
-    fn a_committed_verdict_is_released_once_it_is_deep_enough() {
+    fn a_committed_record_is_released_once_it_is_deep_enough() {
         let c = classifier(LONG_GRACE);
         committed_commitment(&c);
 
         c.observe_persisted(AT + SEAL_DEPTH);
         assert!(c.release_unless_committed(&hash(1)));
 
-        assert_eq!(c.verdict(&hash(1)), None);
+        assert!(!c.is_tracked(&hash(1)));
         assert_eq!(c.slot_owner(&addr(1), 7), None);
     }
 
@@ -1283,7 +1224,7 @@ mod tests {
     /// advanced the nonce — the ambiguity that makes `forward` unable to decide
     /// this itself.
     #[test]
-    fn an_uncommitted_verdict_is_released_immediately() {
+    fn an_uncommitted_record_is_released_immediately() {
         let c = classifier(LONG_GRACE);
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
@@ -1302,7 +1243,7 @@ mod tests {
         // Classified and holding a slot, but no receipt ever went out.
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         // And a hash the classifier has never seen at all.
-        assert!(!c.mark_committed(&hash(1), AT), "a mere verdict is not a promise");
+        assert!(!c.mark_committed(&hash(1), AT), "a mere record is not a promise");
         assert!(!c.mark_committed(&hash(9), AT), "and an unknown hash is nothing");
 
         // Neither earns a retention period.
@@ -1453,15 +1394,14 @@ mod tests {
         let c = PreconfClassifier::from_config(&cfg);
 
         for i in 1..=50u8 {
-            assert_eq!(
-                c.classify_verdict_via_preconf_rpc(hash(i), &addr(1)),
-                Verdict::NotEligible,
+            assert!(
+                !c.registered_via_preconf_rpc(hash(i), &addr(1)),
                 "nothing is preconf-eligible on a node with preconf off",
             );
         }
 
-        assert_eq!(c.verdict_count(), 0, "a disabled node must not retain any verdict");
-        assert_eq!(c.verdict(&hash(1)), None, "and must report no record downstream");
+        assert_eq!(c.commitment_count(), 0, "a disabled node must not retain any record");
+        assert!(!c.is_tracked(&hash(1)), "and must report no record downstream");
     }
 
     /// Same rule for the non-authoritative preview the RPC layer uses: an
@@ -1474,38 +1414,24 @@ mod tests {
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), HashSet::default(), HashSet::default());
 
         assert!(!c.preview_eligibility(&addr(1), Some(&addr(2))));
-        assert_eq!(c.verdict_count(), 0);
-    }
-
-    /// `is_preconf` is *the* partition predicate — the pool arm skips exactly
-    /// these — so all three variants are pinned.
-    ///
-    /// There is deliberately no companion predicate for "exempt from
-    /// admission-time policy gates": that exemption keys on the `promised` flag,
-    /// not on any verdict, and is applied once by an early return rather than
-    /// gate by gate.
-    #[test]
-    fn verdict_predicates_are_pinned() {
-        assert!(Verdict::Eligible.is_preconf());
-        assert!(Verdict::Promised.is_preconf());
-        assert!(!Verdict::NotEligible.is_preconf());
+        assert_eq!(c.commitment_count(), 0);
     }
 
     #[test]
-    fn unknown_hash_has_no_verdict() {
+    fn unknown_hash_has_no_record() {
         let c = classifier(LONG_GRACE);
-        assert_eq!(c.verdict(&hash(9)), None);
-        assert_eq!(c.verdict_count(), 0);
+        assert!(!c.is_tracked(&hash(9)));
+        assert_eq!(c.commitment_count(), 0);
     }
 
     #[test]
     fn a_preconf_request_is_matched_against_the_allowlist() {
         let c = classifier(LONG_GRACE);
-        assert_eq!(c.classify_verdict_to(hash(1), &addr(1), Some(&addr(2))), Verdict::Eligible);
+        assert!(c.registered_via_preconf_rpc_to(hash(1), &addr(1), Some(&addr(2))));
         // Sender not allowlisted.
-        assert_eq!(c.classify_verdict_to(hash(2), &addr(3), Some(&addr(2))), Verdict::NotEligible);
+        assert!(!c.registered_via_preconf_rpc_to(hash(2), &addr(3), Some(&addr(2))));
         // Recipient not allowlisted.
-        assert_eq!(c.classify_verdict_to(hash(3), &addr(1), Some(&addr(9))), Verdict::NotEligible);
+        assert!(!c.registered_via_preconf_rpc_to(hash(3), &addr(1), Some(&addr(9))));
     }
 
     /// **Nothing classifies a transaction except the preconf RPC.** A
@@ -1513,16 +1439,16 @@ mod tests {
     /// `eth_sendRawTransaction`, p2p, the pool's own reorg reinject — leaves
     /// no record here at all, and consumers read "no record" as not preconf.
     ///
-    /// There used to be a second door: the pool's validator latched every
-    /// transaction it saw as `NotEligible`. With it gone there is nothing to
-    /// latch, which is why this asserts absence rather than a verdict.
+    /// There used to be a second door: the pool's validator recorded every
+    /// transaction it saw. With it gone there is nothing to record, which is
+    /// why this asserts absence.
     #[test]
     fn a_transaction_that_never_asked_for_preconf_has_no_record() {
         let c = classifier(LONG_GRACE);
         // `addr(1) -> addr(2)` is exactly the allowlisted pair, so this is not
         // about eligibility — it is about never having been asked.
-        assert_eq!(c.verdict(&hash(1)), None);
-        assert_eq!(c.verdict_count(), 0);
+        assert!(!c.is_tracked(&hash(1)));
+        assert_eq!(c.commitment_count(), 0);
         assert_eq!(c.slot_count(), 0);
     }
 
@@ -1531,27 +1457,27 @@ mod tests {
         let c = classifier(LONG_GRACE);
         // The fixture allowlists the pair `addr(1) -> addr(2)` and no wildcards,
         // and a creation has no recipient for the pair to match against.
-        assert_eq!(c.classify_verdict_to(hash(1), &addr(1), None), Verdict::NotEligible);
+        assert!(!c.registered_via_preconf_rpc_to(hash(1), &addr(1), None));
     }
 
     #[test]
     fn all_preconfs_ignores_allowlists_including_contract_creation() {
-        let c = PreconfClassifier::new(true, LONG_GRACE, DEFAULT_VERDICT_CACHE_CAP);
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(7)), Verdict::Eligible);
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(2), &addr(7)), Verdict::Eligible);
+        let c = PreconfClassifier::new(true, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
+        assert!(c.registered_via_preconf_rpc(hash(1), &addr(7)));
+        assert!(c.registered_via_preconf_rpc(hash(2), &addr(7)));
     }
 
     /// Case A: eligible at admission, then the sender is removed from the
-    /// allowlist. The verdict must not flip, or the commitment breaks.
+    /// allowlist. The record must not flip, or the commitment breaks.
     #[test]
-    fn verdict_is_frozen_when_allowlist_shrinks() {
+    fn record_is_frozen_when_allowlist_shrinks() {
         let c = classifier(LONG_GRACE);
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(1)), Verdict::Eligible);
+        assert!(c.registered_via_preconf_rpc(hash(1), &addr(1)));
 
         c.update_whitelist(HashSet::default(), HashSet::default(), HashSet::default());
 
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible));
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(1)), Verdict::Eligible);
+        assert!(c.is_tracked(&hash(1)));
+        assert!(c.registered_via_preconf_rpc(hash(1), &addr(1)));
     }
 
     /// Case B: refused at the door, then the sender is added to the allowlist.
@@ -1562,12 +1488,12 @@ mod tests {
     /// then it is eligible.
     ///
     /// Only the shrinking direction has something to freeze — see
-    /// `verdict_is_frozen_when_allowlist_shrinks`.
+    /// `record_is_frozen_when_allowlist_shrinks`.
     #[test]
     fn a_refusal_leaves_nothing_for_a_wider_allowlist_to_flip() {
         let c = classifier(LONG_GRACE);
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(3)), Verdict::NotEligible);
-        assert_eq!(c.verdict(&hash(1)), None, "refused at the door, so nothing was recorded");
+        assert!(!c.registered_via_preconf_rpc(hash(1), &addr(3)));
+        assert!(!c.is_tracked(&hash(1)), "refused at the door, so nothing was recorded");
 
         c.update_whitelist(
             pair_set(&[(addr(1), addr(2)), (addr(3), addr(2))]),
@@ -1576,7 +1502,7 @@ mod tests {
         );
 
         // The same bytes, sent again, are now eligible.
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(3)), Verdict::Eligible);
+        assert!(c.registered_via_preconf_rpc(hash(1), &addr(3)));
     }
 
     #[test]
@@ -1586,15 +1512,18 @@ mod tests {
 
         // Restore pushes the envelope through the validator with an allowlist
         // that no longer contains the sender.
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(9)), Verdict::Promised);
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::Promised));
+        assert!(
+            c.registered_via_preconf_rpc(hash(1), &addr(9)),
+            "the record survives a door that now refuses its sender",
+        );
+        assert!(c.is_promised(&hash(1)), "and it is still a promise");
     }
 
     /// The journal-restore path in one call: record the promise **and** claim the
     /// nonce it was acknowledged for.
     ///
     /// The release at the end is the real assertion. A claim recorded in
-    /// `by_slot` without its reverse link in `CachedVerdict::slot` is
+    /// `by_slot` without its reverse link in `Commitment::slot` is
     /// unreleasable, so the nonce would stay blocked until the next sweep — a
     /// leak that no "is the slot claimed?" assertion would catch.
     #[test]
@@ -1604,11 +1533,7 @@ mod tests {
 
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
         assert!(c.is_promised(&hash(1)));
-        assert_eq!(
-            c.verdict(&hash(1)),
-            Some(Verdict::Promised),
-            "an unseen hash restores as Promised"
-        );
+        assert!(c.is_tracked(&hash(1)), "an unseen hash restores with a record of its own");
 
         c.release_unless_committed(&hash(1));
         assert_eq!(c.slot_owner(&addr(1), 7), None, "the claim must be releasable");
@@ -1623,7 +1548,7 @@ mod tests {
     fn mark_promised_does_not_displace_an_existing_owner() {
         let c = classifier(LONG_GRACE);
         // A live admission takes (addr(1), 7) first.
-        assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(1), 7), (Verdict::Eligible, Ok(())));
+        assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(1), 7), (true, Ok(())));
 
         assert_eq!(
             c.mark_promised(hash(1), &addr(1), 7, 0),
@@ -1634,10 +1559,10 @@ mod tests {
         assert!(c.is_promised(&hash(1)), "the promise is still recorded — only the claim lost");
     }
 
-    /// **`mark_promised` must not overwrite an existing verdict with
+    /// **`mark_promised` must not overwrite an existing record with
     /// `Promised`**, and this pins that. Overwriting would not change which
     /// transactions are exempt (that keys on the `promised` flag — see
-    /// [`Verdict::Promised`]); it would only make a value the rest of the code
+    /// promised); it would only make a value the rest of the code
     /// treats as frozen start changing mid-life.
     ///
     /// The state this test constructs is reachable only from the RPC path, where
@@ -1645,26 +1570,26 @@ mod tests {
     /// anything in the process can classify, so its record is always a fresh
     /// insert (asserted in `mark_promised_claims_the_slot_*`).
     #[test]
-    fn mark_promised_records_the_promise_without_rewriting_the_verdict() {
+    fn mark_promised_records_the_promise_without_rewriting_the_record() {
         let c = classifier(LONG_GRACE);
-        assert_eq!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).0, Verdict::Eligible);
+        assert!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).0);
 
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible), "verdict untouched");
+        assert!(c.is_tracked(&hash(1)), "record untouched");
         assert!(c.is_promised(&hash(1)), "but the promise is recorded");
     }
 
     #[test]
-    fn forget_drops_only_the_named_verdict() {
+    fn forget_drops_only_the_named_record() {
         let c = classifier(LONG_GRACE);
-        c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
-        c.classify_verdict_via_preconf_rpc(hash(2), &addr(1));
+        c.registered_via_preconf_rpc(hash(1), &addr(1));
+        c.registered_via_preconf_rpc(hash(2), &addr(1));
 
         c.release_unless_committed(&hash(1));
 
-        assert_eq!(c.verdict(&hash(1)), None);
-        assert_eq!(c.verdict(&hash(2)), Some(Verdict::Eligible));
+        assert!(!c.is_tracked(&hash(1)));
+        assert!(c.is_tracked(&hash(2)));
     }
 
     #[test]
@@ -1672,55 +1597,55 @@ mod tests {
         let c = classifier(Duration::ZERO);
         // Both allowlisted, so both leave a record to sweep. A refused
         // submission would leave none.
-        c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
-        c.classify_verdict_via_preconf_rpc(hash(2), &addr(1));
+        c.registered_via_preconf_rpc(hash(1), &addr(1));
+        c.registered_via_preconf_rpc(hash(2), &addr(1));
 
         assert_eq!(c.sweep(&HashSet::default()), 2);
-        assert_eq!(c.verdict_count(), 0);
+        assert_eq!(c.commitment_count(), 0);
     }
 
     #[test]
     fn sweep_keeps_entries_within_grace() {
-        // The window between the verdict being frozen and the entry existing
+        // The window between the record being frozen and the entry existing
         // entry: absent from `live`, but too young to drop.
         let c = classifier(LONG_GRACE);
-        c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
+        c.registered_via_preconf_rpc(hash(1), &addr(1));
 
         assert_eq!(c.sweep(&HashSet::default()), 0);
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible));
+        assert!(c.is_tracked(&hash(1)));
     }
 
     #[test]
     fn sweep_keeps_live_entries_regardless_of_age() {
         let c = classifier(Duration::ZERO);
-        c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
+        c.registered_via_preconf_rpc(hash(1), &addr(1));
         assert_eq!(c.mark_promised(hash(2), &addr(2), 0, 0), Ok(()));
 
         assert_eq!(c.sweep(&hashes(&[hash(1), hash(2)])), 0);
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible));
-        assert_eq!(c.verdict(&hash(2)), Some(Verdict::Promised));
+        assert!(c.is_tracked(&hash(1)));
+        assert!(c.is_tracked(&hash(2)));
     }
 
     #[test]
     fn sweep_keeps_live_and_drops_the_rest() {
         let c = classifier(Duration::ZERO);
-        c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
-        c.classify_verdict_via_preconf_rpc(hash(2), &addr(1));
-        c.classify_verdict_via_preconf_rpc(hash(3), &addr(1));
+        c.registered_via_preconf_rpc(hash(1), &addr(1));
+        c.registered_via_preconf_rpc(hash(2), &addr(1));
+        c.registered_via_preconf_rpc(hash(3), &addr(1));
 
         assert_eq!(c.sweep(&hashes(&[hash(2)])), 2);
-        assert_eq!(c.verdict(&hash(2)), Some(Verdict::Eligible));
-        assert_eq!(c.verdict_count(), 1);
+        assert!(c.is_tracked(&hash(2)));
+        assert_eq!(c.commitment_count(), 1);
     }
 
     #[test]
     fn over_capacity_flags_but_never_deletes() {
         let c = PreconfClassifier::new(true, LONG_GRACE, 2);
         for i in 1..=4 {
-            c.classify_verdict_via_preconf_rpc(hash(i), &addr(1));
+            c.registered_via_preconf_rpc(hash(i), &addr(1));
         }
 
-        assert_eq!(c.verdict_count(), 4, "entries above capacity must be kept");
+        assert_eq!(c.commitment_count(), 4, "entries above capacity must be kept");
         assert!(c.over_capacity.load(Ordering::Relaxed));
 
         // Falling back under the threshold clears the flag.
@@ -1735,7 +1660,7 @@ mod tests {
     /// A classifier holding one of each rule form:
     /// `(1 -> 2)` exact, `3` a from wildcard, `4` a to wildcard.
     fn or_classifier() -> PreconfClassifier {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_VERDICT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), set(&[addr(3)]), set(&[addr(4)]));
         c
     }
@@ -1774,7 +1699,7 @@ mod tests {
     /// precedence rule.
     #[test]
     fn a_wildcard_still_covers_traffic_whose_exact_rule_was_revoked() {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_VERDICT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), set(&[addr(1)]), HashSet::default());
         assert!(c.preview_eligibility(&addr(1), Some(&addr(2))));
 
@@ -1820,7 +1745,7 @@ mod tests {
     /// hand-building an allowlist the production path cannot produce.
     #[test]
     fn a_transfer_to_the_zero_address_is_judged_like_any_other() {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_VERDICT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), set(&[addr(3)]), HashSet::default());
 
         assert!(
@@ -1841,7 +1766,7 @@ mod tests {
         assert!(!c.preview_eligibility(&addr(3), Some(&addr(2))));
         assert!(!c.preview_eligibility(&addr(1), None));
 
-        assert_eq!(c.verdict_count(), 0, "preview must not freeze anything");
+        assert_eq!(c.commitment_count(), 0, "preview must not freeze anything");
     }
 
     #[test]
@@ -1879,9 +1804,9 @@ mod tests {
             "precondition: the default config is the side where the slot term wins",
         );
         assert_eq!(c.grace, cfg.slot_duration * 2);
-        assert_eq!(c.capacity, DEFAULT_VERDICT_CACHE_CAP);
+        assert_eq!(c.capacity, DEFAULT_COMMITMENT_CACHE_CAP);
         assert_eq!(c.whitelist_counts(), (0, 0, 0));
-        assert_eq!(c.verdict_count(), 0);
+        assert_eq!(c.commitment_count(), 0);
         assert!(!c.all_preconfs);
     }
 
@@ -1921,7 +1846,7 @@ mod tests {
 
         assert!(c.enabled);
         assert!(c.all_preconfs);
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(200)), Verdict::Eligible);
+        assert!(c.registered_via_preconf_rpc(hash(1), &addr(200)));
     }
 
     // ===================== (sender, nonce) slot index =====================
@@ -1939,11 +1864,11 @@ mod tests {
         let c = classifier(LONG_GRACE);
 
         let (v1, claim1) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert_eq!(v1, Verdict::Eligible);
+        assert!(v1);
         assert_eq!(claim1, Ok(()), "first eligible tx must own the slot");
 
         let (v2, claim2) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
-        assert_eq!(v2, Verdict::Eligible, "the verdict is still frozen normally");
+        assert!(v2, "a newcomer is still recorded normally");
         assert_eq!(claim2, Err(hash(1)), "and the claim names the incumbent");
     }
 
@@ -1959,12 +1884,12 @@ mod tests {
         assert_eq!(c.slot_count(), 1);
     }
 
-    /// **The slot is checked whatever the newcomer's own verdict is.**
+    /// **The slot is checked whatever the newcomer's own record is.**
     ///
     /// Reached by an allowlist update landing between two same-`(sender, nonce)`
-    /// submissions: the first is `Eligible` and owns the slot, the second is
-    /// judged `NotEligible` because the sender was removed in between. Gating
-    /// the check on the newcomer's verdict would let it through, and the pool
+    /// submissions: the first is recorded and owns the slot, the second is
+    /// refused because the sender was removed in between. Gating
+    /// the check on the newcomer's record would let it through, and the pool
     /// would then hold one transaction on each arm for the same nonce —
     /// whichever executes first silently kills the other.
     #[test]
@@ -1972,21 +1897,21 @@ mod tests {
         let c = classifier(LONG_GRACE);
 
         let (v1, claim1) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert_eq!(v1, Verdict::Eligible);
+        assert!(v1);
         assert_eq!(claim1, Ok(()));
 
-        // Governance revokes the rule; the incumbent's verdict stays frozen.
+        // Governance revokes the rule; the incumbent's record stays frozen.
         c.update_whitelist(HashSet::default(), HashSet::default(), HashSet::default());
 
         let (v2, claim2) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
-        assert_eq!(v2, Verdict::NotEligible, "newcomer is judged under the new allowlist");
+        assert!(!v2, "newcomer is judged under the new allowlist");
         assert_eq!(
             claim2,
             Err(hash(1)),
             "but it must still be told the slot is taken — otherwise both arms end up \
              holding a transaction for the same nonce",
         );
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::Eligible), "incumbent unaffected");
+        assert!(c.is_tracked(&hash(1)), "incumbent unaffected");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
     }
 
@@ -2008,9 +1933,10 @@ mod tests {
         // A journal entry for a *different* hash on the same (sender, nonce):
         // its claim loses, so it ends up Promised with no slot of its own.
         assert_eq!(c.mark_promised(hash(2), &addr(1), 7, 0), Err(hash(1)));
-        let (verdict, claim) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
+        let (registered, claim) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
 
-        assert_eq!(verdict, Verdict::Promised);
+        assert!(registered, "the losing commitment keeps its record");
+        assert!(c.is_promised(&hash(2)), "and it is still a promise");
         assert_eq!(claim, Err(hash(1)), "the incumbent is reported, not silently overwritten");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps the slot");
     }
@@ -2019,16 +1945,16 @@ mod tests {
     /// replacements the preconf arm has no stake in.
     ///
     /// It leaves no record either, which is a stronger position than the one
-    /// this used to assert — there was a `NotEligible` verdict to keep out of
-    /// the slot index back when the pool's validator wrote one.
+    /// this used to assert — back when the pool's validator recorded every
+    /// transaction, there was one to keep out of the slot index.
     #[test]
     fn a_refused_tx_claims_no_slot_and_leaves_no_record() {
         let c = classifier(LONG_GRACE);
 
-        let (verdict, claim) = c.admit_via_preconf_rpc(hash(1), &addr(9), 7);
-        assert_eq!(verdict, Verdict::NotEligible, "reported as not preconf");
+        let (registered, claim) = c.admit_via_preconf_rpc(hash(1), &addr(9), 7);
+        assert!(!registered, "the door refused it, so no record");
         assert_eq!(claim, Ok(()), "and it claims nothing");
-        assert_eq!(c.verdict_count(), 0, "nor is anything recorded");
+        assert_eq!(c.commitment_count(), 0, "nor is anything recorded");
         assert_eq!(c.slot_count(), 0);
 
         // …so an eligible tx on the same (sender, nonce) is unobstructed.
@@ -2078,23 +2004,23 @@ mod tests {
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)), "new owner survives");
     }
 
-    /// Sweeping a verdict must release its slot in the same critical section —
+    /// Sweeping a record must release its slot in the same critical section —
     /// a leaked slot blocks that nonce for as long as the process lives.
     #[test]
-    fn sweep_releases_slots_of_dropped_verdicts() {
+    fn sweep_releases_slots_of_dropped_records() {
         let c = classifier(Duration::ZERO);
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.slot_count(), 1);
 
         assert_eq!(c.sweep(&hashes(&[])), 1);
-        assert_eq!(c.verdict_count(), 0);
-        assert_eq!(c.slot_count(), 0, "slot released with the verdict");
+        assert_eq!(c.commitment_count(), 0);
+        assert_eq!(c.slot_count(), 0, "slot released with the record");
     }
 
-    /// The mirror of the above: a verdict the sweep keeps must keep its slot.
+    /// The mirror of the above: a record the sweep keeps must keep its slot.
     #[test]
-    fn sweep_keeps_slots_of_surviving_verdicts() {
+    fn sweep_keeps_slots_of_surviving_records() {
         let c = classifier(Duration::ZERO);
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
@@ -2131,21 +2057,21 @@ mod tests {
     /// `disabled_node_classifies_without_caching`.
     #[test]
     fn disabled_node_claims_no_slots() {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_VERDICT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
         let disabled = PreconfClassifier { enabled: false, ..c };
 
         for i in 0..20u8 {
             assert_eq!(disabled.admit_via_preconf_rpc(hash(i), &addr(1), 7).1, Ok(()));
         }
-        assert_eq!(disabled.verdict_count(), 0);
+        assert_eq!(disabled.commitment_count(), 0);
         assert_eq!(disabled.slot_count(), 0);
     }
 
-    /// A handover to a hash with no verdict would create a claim nothing can
-    /// release — the reverse link lives on the verdict. The CAS still succeeds
+    /// A handover to a hash with no record would create a claim nothing can
+    /// release — the reverse link lives on the record. The CAS still succeeds
     /// (we *were* entitled to evict the holder); only the claim is skipped.
     #[test]
-    fn a_handover_to_a_hash_without_a_verdict_claims_nothing() {
+    fn a_handover_to_a_hash_without_a_record_claims_nothing() {
         let c = classifier(LONG_GRACE);
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
 
@@ -2153,7 +2079,7 @@ mod tests {
         assert_eq!(c.slot_count(), 0, "holder released, nothing claimed in its place");
     }
 
-    /// **The handover is a compare-and-swap** — see `VerdictStore::replace` for
+    /// **The handover is a compare-and-swap** — see `CommitmentStore::replace` for
     /// why. Two same-nonce transactions can both observe the same reclaimable
     /// holder before either reaches the inner validator (it is `async`), so both
     /// come back to take the slot; exactly one may win.
@@ -2212,8 +2138,8 @@ mod tests {
         let c = classifier(LONG_GRACE);
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        // addr(9) is not allowlisted ⇒ NotEligible.
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(2), &addr(9)), Verdict::NotEligible);
+        // addr(9) is not allowlisted, so the door refuses it.
+        assert!(!c.registered_via_preconf_rpc(hash(2), &addr(9)));
 
         assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
         assert_eq!(c.slot_owner(&addr(1), 7), None, "released, not taken over");

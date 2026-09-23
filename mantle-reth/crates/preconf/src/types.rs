@@ -319,7 +319,7 @@ pub enum PreconfError {
     /// The transaction's own `gas_limit` exceeds `preconf_max_gas_per_tx`, the
     /// operator's per-transaction ceiling for the preconf fast path.
     ///
-    /// Applied before the verdict is written, so no transaction is ever both
+    /// Applied before anything is recorded, so no transaction is ever both
     /// `Eligible` and over the cap.
     #[error(
         "preconf gas limit exceeded: tx gas limit {gas_limit} exceeds preconf_max_gas_per_tx {max}"

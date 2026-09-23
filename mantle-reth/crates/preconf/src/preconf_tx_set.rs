@@ -211,7 +211,7 @@ pub struct AdmitRequest {
     /// Computed by the caller because the fee part comes from the current L1
     /// block info, not from the transaction.
     pub cost: U256,
-    /// The sender's on-chain code hash, from the validator's verdict. Neither
+    /// The sender's on-chain code hash, from the validator's outcome. Neither
     /// absent nor `KECCAK_EMPTY` means it carries an EIP-7702 delegation.
     pub bytecode_hash: Option<B256>,
 }
@@ -250,22 +250,22 @@ struct PreconfTxSetInner {
     /// answers each by scanning every entry in the fifo.
     by_sender: HashMap<Address, BTreeMap<u64, TxHash>>,
 
-    /// Verdict-cache eviction callback, fired from [`Self::drop_hash`].
+    /// Record-eviction callback, fired from [`Self::drop_hash`].
     ///
-    /// The **same** `OnceLock` as [`PreconfTxSet::verdict_evict`] — held here
+    /// The **same** `OnceLock` as [`PreconfTxSet::record_evict`] — held here
     /// too because `drop_hash` is a method on the inner type and cannot reach
     /// the outer one. Sharing the cell (rather than copying the closure) keeps
     /// registration a single lock-free `set` on the outer handle.
-    verdict_evict: Arc<OnceLock<EvictFn>>,
+    record_evict: Arc<OnceLock<EvictFn>>,
 }
 
 impl PreconfTxSetInner {
-    fn new(verdict_evict: Arc<OnceLock<EvictFn>>) -> Self {
+    fn new(record_evict: Arc<OnceLock<EvictFn>>) -> Self {
         Self {
             order: VecDeque::new(),
             entries: HashMap::new(),
             by_sender: HashMap::new(),
-            verdict_evict,
+            record_evict,
         }
     }
 
@@ -342,7 +342,7 @@ impl PreconfTxSetInner {
             });
         }
 
-        // The frozen verdict goes with the entry: it exists to stop the pool arm
+        // The commitment record goes with the entry: it exists to stop the pool arm
         // grabbing a tx that still has a live commitment, and on most removal
         // paths there no longer is one.
         //
@@ -353,7 +353,7 @@ impl PreconfTxSetInner {
         //
         // Runs under the inner mutex, so the callback must be cheap,
         // non-blocking, and must never re-enter the fifo.
-        if let Some(f) = self.verdict_evict.get() {
+        if let Some(f) = self.record_evict.get() {
             f(*hash);
         }
         entry
@@ -382,7 +382,7 @@ enum NonceBasis {
 /// admission path asks about.
 ///
 /// Held under `parking_lot::RwLock` **beside** the `tokio::sync::Mutex` on
-/// `inner`, never inside it, for the same reason the classifier's verdict
+/// `inner`, never inside it, for the same reason the classifier's record
 /// store is (see `classifier.rs` "Locking"): the writer is the build loop, a
 /// sync `fn` that cannot `.await`.
 ///
@@ -469,11 +469,11 @@ pub struct PreconfTxSet {
 
     notifier: broadcast::Sender<TxHash>,
 
-    /// Verdict-cache eviction callback — see
-    /// [`Self::set_verdict_eviction_callback`]. The same cell is held by
+    /// Record-eviction callback — see
+    /// [`Self::set_record_eviction_callback`]. The same cell is held by
     /// `PreconfTxSetInner`, which is what actually fires it (from
     /// `drop_hash`).
-    verdict_evict: Arc<OnceLock<EvictFn>>,
+    record_evict: Arc<OnceLock<EvictFn>>,
 }
 
 impl PreconfTxSet {
@@ -485,12 +485,12 @@ impl PreconfTxSet {
         let (notifier, _) = broadcast::channel(broadcast_cap);
         // Register the gauge at 0 so it has a baseline from startup.
         metrics::gauge!("preconf.fifo.pending").set(0.0);
-        let verdict_evict = Arc::new(OnceLock::new());
+        let record_evict = Arc::new(OnceLock::new());
         Self {
-            inner: Mutex::new(PreconfTxSetInner::new(verdict_evict.clone())),
+            inner: Mutex::new(PreconfTxSetInner::new(record_evict.clone())),
             accounts: RwLock::new(AccountView::default()),
             notifier,
-            verdict_evict,
+            record_evict,
         }
     }
 
@@ -550,7 +550,7 @@ impl PreconfTxSet {
         metrics::gauge!("preconf.fifo.gas_used").set(gas as f64);
     }
 
-    /// Register the verdict-cache eviction callback fired from `drop_hash`,
+    /// Register the record-eviction callback fired from `drop_hash`,
     /// i.e. on **every** fifo removal path. Called once by
     /// [`crate::PreconfServiceBuilder::start`] with a closure forwarding to
     /// `PreconfClassifier::release_unless_committed`.
@@ -559,10 +559,10 @@ impl PreconfTxSet {
     /// classifier. Neither type references the other.
     ///
     /// Idempotent (`OnceLock::set`, first registration wins). Leaving it
-    /// unregistered is valid — removals then don't touch the verdict cache,
+    /// unregistered is valid — removals then don't touch the commitment cache,
     /// which is what test / pass-through paths want.
-    pub fn set_verdict_eviction_callback(&self, f: EvictFn) {
-        let _ = self.verdict_evict.set(f);
+    pub fn set_record_eviction_callback(&self, f: EvictFn) {
+        let _ = self.record_evict.set(f);
     }
 
     // ============ Admission ============
@@ -585,7 +585,7 @@ impl PreconfTxSet {
     ///
     /// The slot claim reaches into the classifier while this lock is held. That
     /// is the direction every fifo removal already takes — `drop_hash` fires
-    /// the verdict eviction from inside here — so it adds no new order.
+    /// the record eviction from inside here — so it adds no new order.
     pub async fn admit(
         &self,
         classifier: &PreconfClassifier,
@@ -1392,7 +1392,7 @@ mod admit_tests {
         }
     }
 
-    /// Admission has to claim the verdict before it can claim a nonce, which
+    /// Admission has to record the commitment before it can claim a nonce, which
     /// is the order the real path runs in.
     async fn admit(
         set: &PreconfTxSet,
@@ -2109,21 +2109,21 @@ mod tests {
         Arc::new(TxEnvelope::Eip1559(Signed::new_unchecked(inner, sig, hash)))
     }
 
-    /// Every fifo removal path must drop the frozen verdict, because
+    /// Every fifo removal path must drop the commitment record, because
     /// `drop_hash` is the single point they all converge on. Asserted through
     /// two different public entry points so the hook is proven to sit at that
     /// convergence point rather than on one route.
     #[tokio::test]
-    async fn removal_paths_fire_the_verdict_eviction_callback() {
+    async fn removal_paths_fire_the_record_eviction_callback() {
         let set = PreconfTxSet::new(16);
         let seen: Arc<std::sync::Mutex<Vec<TxHash>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        set.set_verdict_eviction_callback(Arc::new(move |hash| sink.lock().unwrap().push(hash)));
+        set.set_record_eviction_callback(Arc::new(move |hash| sink.lock().unwrap().push(hash)));
 
         // Route 1 — explicit removal. `remove_reclaimable` is the only explicit
         // removal the fifo exposes, and it drops an entry solely in a
         // reclaimable state, so flip it to `Timeout` first. That CAS does not go
-        // through `drop_hash`, so it fires no verdict eviction of its own — the
+        // through `drop_hash`, so it fires no record eviction of its own — the
         // expected sequence below still names each hash exactly once.
         set.push_if_absent(make_tx(0, 1), addr(1), PreconfSource::Rpc).await;
         assert!(set.mark_timeout(&h(1)).await.is_ok());
@@ -2145,7 +2145,7 @@ mod tests {
     /// Leaving the callback unregistered must stay valid — that is the test /
     /// pass-through path, and `drop_hash` runs on every removal.
     #[tokio::test]
-    async fn removal_without_verdict_callback_is_a_noop() {
+    async fn removal_without_record_callback_is_a_noop() {
         let set = PreconfTxSet::new(16);
         set.push_if_absent(make_tx(0, 1), addr(1), PreconfSource::Rpc).await;
         assert!(set.mark_timeout(&h(1)).await.is_ok());

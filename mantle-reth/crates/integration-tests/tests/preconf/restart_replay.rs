@@ -133,7 +133,7 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
 ///
 /// The tx below asks for 21 000 gas while the restarted node caps preconf txs at
 /// 20 000. The cap is an admission-time check, so restore's `add_envelope` runs
-/// straight into it — unless the entry is already `Verdict::Promised`, which the
+/// straight into it — unless the entry is already promised, which the
 /// validator waves past every preconf gate. Without that exemption `add_envelope`
 /// returns `Err`, restore logs and skips, and the commitment is **silently
 /// dropped**: the client was told it succeeded and nothing lands.

@@ -82,7 +82,7 @@ const GAUGES: &[&str] = &[
     "preconf.fifo.gas_used",
     "preconf.journal.pending_entries",
     "preconf.journal.size_bytes",
-    "preconf.classifier.verdicts",
+    "preconf.classifier.records",
     "preconf.classifier.slots",
     "preconf.classifier.over_capacity",
     "preconf.classifier.persisted_height",

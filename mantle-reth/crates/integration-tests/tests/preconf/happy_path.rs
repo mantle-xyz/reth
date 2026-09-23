@@ -78,8 +78,8 @@ async fn signed_creation(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 /// from any other arm.
 ///
 /// The creation is the one genuinely new end-to-end path. Everything downstream
-/// of classification reads only the frozen `Verdict` — admission and the
-/// payload builder both go through `verdict(..).is_preconf()` — so *which* arm
+/// of classification reads only the frozen `Record` — admission and the
+/// payload builder both go through `record(..).is_preconf()` — so *which* arm
 /// matched is invisible to them, and
 /// the rest of this suite covers them equally well with pairs. What none of it
 /// covered is a transaction with no `to` travelling the whole pipeline, because
