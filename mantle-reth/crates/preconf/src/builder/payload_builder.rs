@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 use alloy_consensus::{
     BlockHeader, Sealable, Transaction, TxEnvelope, TxReceipt, Typed2718, transaction::Recovered,
 };
-use alloy_eips::eip2718::Encodable2718;
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_evm::{
     Evm,
     block::{BlockExecutor as _, TxResult},
@@ -33,7 +33,7 @@ use reth_evm::execute::{
     BlockAssembler as _, BlockBuilder, BlockBuilderOutcome, BlockExecutionError,
     BlockValidationError,
 };
-use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
+use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult, ChangedAccount};
 use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpBuiltPayload;
@@ -69,6 +69,7 @@ use crate::{
         ExecutionInfo,
         cancel::{CancelReason, JobCancel},
         dispatch,
+        execution_info::record_executed,
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
     },
     classifier::{Verdict, Whitelist},
@@ -107,6 +108,7 @@ use crate::{
 fn execute_sequencer_transactions_watching_whitelist<N, B>(
     sequencer_txs: &[WithEncoded<TxTy<N>>],
     builder: &mut B,
+    fifo: &PreconfTxSet,
     whitelist_contract: Option<Address>,
 ) -> Result<(ExecutionInfo<N::SignedTx>, Vec<WhitelistDelta>), PayloadBuilderError>
 where
@@ -185,7 +187,11 @@ where
         }
 
         info.cumulative_gas_used += gas_used.tx_gas_used();
-        info.record(recovered);
+        // Deposits dominate here, and the account view only counts those. On a
+        // derivation build (`no_tx_pool=true`) the batched user transactions
+        // arrive this way too, and those it reads outright — which is why this
+        // stage is on the funnel at all.
+        record_executed(&mut info, fifo, recovered, false);
     }
 
     Ok((info, deltas))
@@ -527,9 +533,11 @@ fn preconf_admission(
 /// DA + footprint bounds against the same `info.cumulative_da_bytes_used`
 /// (unchanged in the single-task window between admission and apply), and only
 /// dispatches on `Admit`. A gate here would be dead code.
+#[allow(clippy::too_many_arguments)]
 fn apply_preconf_with_da<N, B>(
     builder: &mut B,
     info: &mut ExecutionInfo<N::SignedTx>,
+    fifo: &PreconfTxSet,
     limits: BuildConstraints,
     tx: Arc<TxEnvelope>,
     hash: TxHash,
@@ -547,7 +555,7 @@ where
     let (receipt, recovered) = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
     info.cumulative_da_bytes_used = info.cumulative_da_bytes_used.saturating_add(tx_da);
     info.cumulative_gas_used += receipt.gas_used;
-    info.record(recovered);
+    record_executed(info, fifo, recovered, false);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
     // `blockValue` and `is_better_payload` ignore preconf-sourced revenue.
@@ -681,8 +689,9 @@ where
     let gas_used = info.cumulative_gas_used;
     match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source) {
         Admission::Admit => {
-            let mut apply_fn =
-                |tx, h, height| apply_preconf_with_da::<N, _>(builder, info, limits, tx, h, height);
+            let mut apply_fn = |tx, h, height| {
+                apply_preconf_with_da::<N, _>(builder, info, fifo, limits, tx, h, height)
+            };
             // Propagate a fatal apply error to abort the whole build; a
             // per-tx rejection resolves inside `apply_one_preconf` and
             // returns `Ok(())`.
@@ -763,15 +772,15 @@ where
 ///   previously-returned receipt is honored; then the hash is returned for dispatch.
 /// - **`Failed` / `Timeout` / `Canceled`** — skipped (terminal).
 ///
-/// The caller dispatches each returned hash through [`admit_and_dispatch`]
-/// **before** draining the broadcast / pool arms, so carryover lands ahead of
-/// any concurrently-queued fresh RPC pushes. `apply_one_preconf`'s dedup gate
-/// prevents double-apply if a carryover hash is also observed via broadcast
-/// later. Returning the hash list (rather than applying inline) keeps this
-/// helper free of EVM/builder types and unit-testable.
+/// The caller dispatches each hash through [`admit_and_dispatch`] **before**
+/// draining the broadcast / pool arms, so carryover lands ahead of any
+/// concurrently-queued fresh RPC pushes.
+/// `apply_one_preconf`'s dedup gate prevents double-apply if a carryover hash is
+/// also observed via broadcast later. Returning a plan (rather than applying
+/// inline) keeps this helper free of EVM/builder types and unit-testable.
 async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
     use crate::types::PreconfStatus;
-    let mut carryover = Vec::new();
+    let mut carryover: Vec<TxEntryView> = Vec::new();
     for view in fifo.entries().await {
         match view.status {
             PreconfStatus::Waiting => carryover.push(view),
@@ -806,12 +815,9 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
 /// rejected as invalid, and for a carried-over entry that rejection is terminal
 /// — a commitment broken with no second attempt.
 ///
-/// Only the carryover preamble needs this. It is the sole way a restored entry
-/// reaches dispatch: restore runs before any build, so its fifo notifications
-/// reach no subscriber, and by the time the broadcast arm's `Lagged` rescan sees
-/// those entries the preamble has already decided them and the dedup gate
-/// short-circuits. Entries pushed during a build arrive one at a time, in the
-/// order the pool admitted them.
+/// This is also what orders a recovered pool transaction against a commitment
+/// from the same sender: the unlanded index hands its survivors to the fifo
+/// before the preamble reads it, so by here there is one source, not two.
 fn ordered_for_dispatch(carryover: &[TxEntryView]) -> Vec<TxHash> {
     let mut first_seen: HashMap<Address, usize> = HashMap::new();
     let mut ordered: Vec<(usize, u64, TxHash)> = Vec::with_capacity(carryover.len());
@@ -850,6 +856,7 @@ fn apply_one_best_tx<N, Builder>(
     >,
     builder: &mut Builder,
     info: &mut ExecutionInfo<N::SignedTx>,
+    fifo: &PreconfTxSet,
     constraints: &BuildConstraints,
     pacer: &mut AdmissionPacer,
 ) -> Result<BestTxStep, PayloadBuilderError>
@@ -860,26 +867,23 @@ where
     let Some(tx) = best_txs.next(()) else {
         return Ok(BestTxStep::Done);
     };
-    // Preconf-eligible txs are applied EXCLUSIVELY via the preconf arm. Without
-    // this filter the pool arm could grab one whose fifo entry the async
-    // listener has not pushed yet: the tx lands via the pool path while its
-    // client sees Timeout/Failed, responder never called.
+    // A transaction the preconf arm owns is left to it. Both containers can hold
+    // one hash now that either channel accepts it, and this arm's snapshot is
+    // taken before the verdict is necessarily frozen. If this arm applied it,
+    // the transaction would land while its client was told `Timeout`.
     //
-    // Skipping does not drop the tx, it only constrains it to the preconf
-    // ordering — which holds because `PreconfAwareValidator`'s replacement guard
-    // refuses a second preconf tx on a `(sender, nonce)` one already occupies,
-    // so a tx the pool accepted cannot collide and be refused a fifo entry
-    // (`push_if_absent` → `ConflictActive`).
-    //
-    // One exception: a `Verdict::Promised` tx is exempt from that guard (journal
-    // restore re-admits an acknowledged commitment unconditionally), so it can
-    // lose the fifo slot. Intended — the fifo keeps the fresher entry, and the
-    // pool drops the restored tx once the winner's nonce lands.
+    // Skipping does not drop it: admission holds the `(sender, nonce)`, so the
+    // preconf arm is the only one that can apply it.
     //
     // The predicate is the **frozen verdict**, never a live allowlist read:
     // re-deriving eligibility here would let an allowlist update between the two
-    // decisions strand the tx with neither arm applying it (Case A / Case B of
-    // the classifier design).
+    // decisions strand the transaction with neither arm applying it.
+    //
+    // Removing this is not detectable by the suite — the biased `select!` puts
+    // preconf dispatch ahead of this arm, and a commitment older than the build
+    // arrives through the carryover preamble, so the preconf arm has got there
+    // first every time. That is a reading of the loop, not a property anything
+    // checks, which is why the guard stays.
     if classifier.verdict(tx.hash()).is_some_and(Verdict::is_preconf) {
         best_txs.mark_invalid(tx.sender(), tx.nonce());
         return Ok(BestTxStep::Continue);
@@ -967,7 +971,7 @@ where
     // deposits arrive with the attributes, a preconf commitment is journaled
     // when its receipt goes out, and the post-execution transaction is made by
     // the executor rather than sent by anyone.
-    info.record_journalable(recovered);
+    record_executed(info, fifo, recovered, true);
     Ok(BestTxStep::Continue)
 }
 
@@ -1222,6 +1226,7 @@ impl SliceState {
     /// slice because a disk write failed — trades a subscriber's whole view of
     /// the block for a durability guarantee it never had (this is `flush`, not
     /// `sync_all`).
+    #[allow(clippy::too_many_arguments)]
     async fn journal_and_publish<N, Evm, ChainSpec, Attrs, B, P>(
         &mut self,
         ctx: &OpPayloadBuilderCtx<Evm, ChainSpec, Attrs>,
@@ -1244,7 +1249,12 @@ impl SliceState {
     {
         // Before the publish below, always. See this function's docs.
         if let Some(journal) = journal {
-            let entries = info.take_journal_records(ctx.parent().number() + 1);
+            let height = ctx.parent().number() + 1;
+            let (entries, announced) = info.take_journal_records(height);
+            // The index first: whether a transaction was announced does not
+            // depend on whether its record reached the disk, and the disk write
+            // is allowed to fail and retry.
+            journal.note_announced(height, &announced);
             // The one part of a slice that touches the disk, and the one that
             // could put a tick over its interval.
             let started = std::time::Instant::now();
@@ -1426,10 +1436,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///      so it goes last; cancel, the ticker and preconf all get a preempt chance between every
     ///      pool tx via biased priority.
     ///
-    ///    Before the loop: the **index 0 slice** (deposits and system txs only), then a **carryover
-    ///    replay preamble** (`replay_fifo_carryover`) applying stale in-flight / journal-restored
-    ///    entries directly, bypassing the broadcast queue so they land ahead of concurrently-queued
-    ///    RPC pushes.
+    ///    Before the loop, in order: a sweep of what the last build announced and the chain has
+    ///    not taken (which also puts those senders' pool nonces back where the chain has them);
+    ///    the **index 0 slice** (deposits and system txs only); then the **carryover preamble** —
+    ///    stale in-flight / journal-restored commitments and the unlanded pool transactions the
+    ///    sweep handed to the fifo, all dispatched through [`admit_and_dispatch`]. They bypass the
+    ///    broadcast queue and the pool arm, so they land ahead of concurrently-queued RPC pushes
+    ///    and fresh pool traffic.
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).
     /// 6. **Stage 5** — `builder.finish` → seal + wrap into `OpBuiltPayload`.
     ///
@@ -1531,6 +1544,23 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             PayloadBuilderError::Internal(err.into())
         })?;
 
+        // Read here rather than with the other per-block constants below,
+        // because the account view has to be reset before the block's first
+        // transaction executes and Stage 2 is that transaction. One read, one
+        // value: `constraints` reuses it.
+        let base_fee = builder.evm_mut().block().basefee();
+
+        // The previous build's account view ends here. Cleared rather than
+        // re-seeded: a build that is cancelled or never sealed must not leave
+        // a sender pinned at a nonce the chain will never reach, and a sender
+        // the view has forgotten simply falls back to chain state.
+        //
+        // Unconditional, including derivation builds (`no_tx_pool=true`), for
+        // the same reason `sync_fifo_forward_to_head` is: it reads nothing
+        // into the block, and those builds execute the batched user
+        // transactions the admission path most needs to know about.
+        self.fifo.reset_accounts(base_fee);
+
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
         //
         // Not `ctx.execute_sequencer_transactions` — see the replicated
@@ -1538,6 +1568,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let (mut info, whitelist_deltas) = execute_sequencer_transactions_watching_whitelist::<N, _>(
             ctx.attributes().sequencer_transactions(),
             &mut builder,
+            &self.fifo,
             crate::whitelist::wants_whitelist(&self.cfg),
         )?;
 
@@ -1579,7 +1610,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         }
         let block_da_limit = self.builder_config.da_config.max_da_block_size();
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
-        let base_fee = builder.evm_mut().block().basefee();
         let attrs_timestamp = ctx.attributes().timestamp();
         // Post-Jovian DA footprint scalar is a per-block constant set by
         // the Stage 2 L1 info tx — read once, reuse across all admissions.
@@ -1717,6 +1747,118 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // aligned with chain state) during derivation builds too.
         sync_fifo_forward_to_head(&self.fifo, state_provider_for_finish.as_ref()).await;
 
+        // The same question, asked of what slicing announced from the pool:
+        // did it land? Nothing else answers it — the block never entered the
+        // canonical chain, so no reorg happened and the pool's own reinjection
+        // never sees it. Asking the chain at the start of the next build is the
+        // race-free way, and it replaces asking why the last build ended:
+        // `Resolved` is not proof the consensus layer used the payload.
+        //
+        // Survivors go to the fifo rather than back to the pool. A transaction
+        // subscribers were already shown has a stronger claim on the block than
+        // a new one, and the fifo is where must-land work already lives: from
+        // there `replay_fifo_carryover` dispatches it ahead of the pool arm, and
+        // `ordered_for_dispatch` puts it in nonce order against any commitment
+        // from the same sender — a pairing the allowlist makes possible, since
+        // it is keyed on `(from, to)` and one sender can hold both kinds.
+        //
+        // Not gated on slicing. This only reads state and moves bookkeeping, and
+        // skipping it on a derivation build would leave the staging list behind
+        // a sealed hash no later parent matches, so the next real build would
+        // sweep accounts for transactions the chain had long since taken.
+        if let Some(journal) = self.journal.as_deref() {
+            if journal.parent_is_ours(parent_hash) {
+                // The chain built on what this node sealed, so everything staged
+                // went with it. One comparison, no state reads — this is the
+                // healthy path, and it is why the list is worth keeping.
+                journal.clear_unlanded();
+            } else if !journal.unlanded_is_empty() {
+                metrics::counter!("flashblock.unlanded_sweep_slow_total").increment(1);
+                let balances = ProviderBalances(state_provider_for_finish.as_ref());
+                let mut heads: HashMap<Address, u64> = HashMap::new();
+                let mut changed: Vec<ChangedAccount> = Vec::new();
+                for sender in journal.unlanded_senders() {
+                    let nonce = match state_provider_for_finish.account_nonce(&sender) {
+                        // An account with no state is a reading, not a failure:
+                        // it sits at nonce 0, which is what both the staging
+                        // list and the pool should be told.
+                        Ok(nonce) => nonce.unwrap_or(0),
+                        // A failed read is not a nonce, and must not be spent as
+                        // one. What follows is written into the pool, where
+                        // telling it a sender at chain nonce 30 is back at 0
+                        // parks every pending transaction they hold until a real
+                        // canonical update arrives. Skipping costs little:
+                        // `take_unlanded` keeps the entries of any sender it was
+                        // given no nonce for, so they are handed to the fifo all
+                        // the same and asked about again next build.
+                        Err(err) => {
+                            metrics::counter!("flashblock.unlanded_nonce_unreadable_total")
+                                .increment(1);
+                            warn!(
+                                target: "mantle::preconf::flashblocks",
+                                %sender, ?err,
+                                "chain nonce unreadable; leaving this sender's pool record as it stands",
+                            );
+                            continue;
+                        }
+                    };
+                    heads.insert(sender, nonce);
+                    // Put the pool's record back where the chain has it. The
+                    // slice boundary advanced it on the strength of a block that
+                    // did not land, and the pool discards rather than parks
+                    // anything below the nonce it holds — so leaving it raised
+                    // costs this sender everything they send until a real block
+                    // corrects it.
+                    //
+                    // An unreadable balance is the one thing still guessed here,
+                    // downwards, as pool maintenance guesses it: zero parks the
+                    // sender for a block, where guessing upwards would admit an
+                    // unfunded transaction. The nonce is the half worth having.
+                    changed.push(ChangedAccount {
+                        address: sender,
+                        nonce,
+                        balance: balances.balance_of(sender).unwrap_or(U256::ZERO),
+                    });
+                }
+                self.pool.update_accounts(changed);
+
+                // Hand the survivors over. `Replay` is what lets a transaction
+                // the allowlist would refuse through the preconf path at all
+                // (`barred_by_allowlist`), and what keeps the deadline gates off
+                // an entry with no client waiting on it. `ConflictActive` means a
+                // live commitment already holds that `(sender, nonce)`; the
+                // fresher entry wins and this one is simply not staged again.
+                let mut handed = 0u64;
+                for entry in journal.take_unlanded(&heads) {
+                    let Ok(envelope) = TxEnvelope::decode_2718(&mut entry.rlp.as_ref()) else {
+                        // The bytes came from this process's own `encoded_2718`,
+                        // so this is unreachable short of memory corruption —
+                        // counted rather than ignored, because a silent `continue`
+                        // here would drop a transaction with nothing to show for it.
+                        metrics::counter!("flashblock.unlanded_undecodable_total").increment(1);
+                        continue;
+                    };
+                    let _ = self
+                        .fifo
+                        .push_if_absent(
+                            Arc::new(envelope),
+                            entry.sender,
+                            crate::types::PreconfSource::Replay,
+                        )
+                        .await;
+                    handed += 1;
+                }
+                if handed > 0 {
+                    metrics::counter!("flashblock.unlanded_replayed_total").increment(handed);
+                    debug!(
+                        target: "mantle::preconf::flashblocks",
+                        handed,
+                        "handed unlanded transactions to the fifo for replay",
+                    );
+                }
+            }
+        }
+
         // ── Slice publishing state ────────────────────────────────────
         //
         // Gated on `allow_preconf`: a derivation build has to reproduce what
@@ -1749,13 +1891,17 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         }
 
         // Carryover replay preamble — apply stale in-flight / journal-
-        // restored entries directly (see `replay_fifo_carryover`). The
-        // block scope drops `apply_fn` so its `&mut builder` borrow is
-        // released before the select! loop's arms.
+        // restored entries directly (see `replay_fifo_carryover`), including
+        // the unlanded pool transactions the sweep above just handed over. The
+        // block scope drops `apply_fn` so its `&mut builder` borrow is released
+        // before the select! loop's arms.
         //
-        // Skipped entirely when `!allow_preconf` — the fifo entries
-        // (including Replay-sourced ones with `must-land` SLA) remain
-        // in the fifo and get dispatched on the next normal-slot build.
+        // Skipped entirely when `!allow_preconf` — the fifo entries (including
+        // Replay-sourced ones with `must-land` SLA) remain in the fifo and get
+        // dispatched on the next normal-slot build. That is also what keeps a
+        // derivation build from replaying anything: it has to execute exactly
+        // what its attributes name, or the block it derives will not match the
+        // sequencer's.
         if allow_preconf {
             // Dispatch carryover entries through the admission gate before the
             // select! loop's arms, so they land ahead of any concurrently
@@ -1881,6 +2027,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         iter,
                         &mut builder,
                         &mut info,
+                        &self.fifo,
                         &constraints,
                         &mut pool_pacer,
                     )? {
@@ -1902,39 +2049,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             metrics::histogram!("flashblock.slices_per_block").record(state.next_index as f64);
         }
 
-        // ── Stage 3b: hand back what a build nobody used took ──────────
-        // Slicing prunes each slice's transactions as it goes out, half a slot
-        // before the block could be canonical, and tells the pool their senders
-        // have moved on. Both are true only if this block lands. When the job
-        // was thrown away instead, nothing else undoes either: the transactions
-        // are in no block and no pool, and the raised nonce makes the pool
-        // discard — not park — everything those senders send until a real block
-        // corrects it.
-        //
-        // Re-admitting them settles the nonce too. Admission overwrites the
-        // sender's record with the nonce the validator reads from the chain,
-        // which is the one this build's advance was pretending to be ahead of —
-        // the same overwrite that makes the slice boundary's ordering
-        // load-bearing, used here in the other direction.
-        if slices.is_some() && cancel.reason() == Some(CancelReason::Abandoned) {
-            let returning: Vec<Pool::Transaction> = info
-                .from_the_pool()
-                .filter_map(|tx| Pool::Transaction::try_from_consensus(tx.clone()).ok())
-                .collect();
-            if !returning.is_empty() {
-                let handed_back = returning.len();
-                metrics::counter!("flashblock.returned_to_pool_total")
-                    .increment(handed_back as u64);
-                // Best effort: the pool may refuse some of them on its own
-                // terms, which is its right — being asked is what matters.
-                let _ = self.pool.add_external_transactions(returning).await;
-                debug!(
-                    target: "mantle::preconf::flashblocks",
-                    handed_back,
-                    "build abandoned; returned its pruned transactions to the pool",
-                );
-            }
-        }
+        // No hand-back stage here, deliberately. How a build ended is not
+        // evidence about where its transactions went: `Resolved` only says the
+        // consensus layer took the payload, not that it used it. What the index
+        // records is settled at the start of the next build, against the one
+        // thing that can answer — the chain.
 
         // ── Stage 4: SDM post-exec refund tx ───────────────────────────
         // `take_post_exec_entries` collects entries from ALL prior applies
@@ -1953,7 +2072,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     // short of the sealed block; leaving its gas out would make
                     // `info` stop being the block's running total.
                     info.cumulative_gas_used += tx_gas_used;
-                    info.record(recorded);
+                    record_executed(&mut info, &self.fifo, recorded, false);
                     tx_gas_used
                 })
             })?;
@@ -1990,6 +2109,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             builder.finish(state_provider_for_finish, None)?;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
+        // The hash the next build compares its parent against. If it matches,
+        // everything this build announced is on chain and the whole group goes
+        // without a single state read — which is the healthy path, and the
+        // reason the sweep costs nothing on a chain that is working.
+        if let Some(journal) = self.journal.as_deref() {
+            journal.note_sealed(sealed_block.hash());
+        }
         debug!(
             target: "mantle::preconf::payload_builder",
             id = %ctx.attributes().payload_id(),
@@ -2084,10 +2210,10 @@ mod tests {
         fifo.mark_timeout(t_to.tx_hash()).await.unwrap();
         fifo.mark_canceled(t_cancel.tx_hash()).await.unwrap();
 
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
+        let planned = replay_fifo_carryover(&fifo).await;
 
         // Only Waiting + Success, in insertion order.
-        assert_eq!(carryover_hashes, vec![*t_wait.tx_hash(), *t_succ.tx_hash()]);
+        assert_eq!(planned, vec![*t_wait.tx_hash(), *t_succ.tx_hash()]);
         // Waiting entry untouched.
         assert_eq!(
             fifo.find_by_hash(t_wait.tx_hash()).await.unwrap().status,
@@ -2121,9 +2247,9 @@ mod tests {
         fifo.push_if_absent(t_rpc.clone(), Address::from([1; 20]), PreconfSource::Rpc).await;
         fifo.push_if_absent(t_journal.clone(), Address::from([2; 20]), PreconfSource::Replay).await;
 
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
+        let planned = replay_fifo_carryover(&fifo).await;
 
-        assert_eq!(carryover_hashes, vec![*t_rpc.tx_hash(), *t_journal.tx_hash()]);
+        assert_eq!(planned, vec![*t_rpc.tx_hash(), *t_journal.tx_hash()]);
         assert_eq!(fifo.find_by_hash(t_rpc.tx_hash()).await.unwrap().source, PreconfSource::Rpc,);
         assert_eq!(
             fifo.find_by_hash(t_journal.tx_hash()).await.unwrap().source,
@@ -2221,8 +2347,8 @@ mod tests {
             fifo.mark_succeeded(&expected[i as usize]).await.unwrap();
         }
 
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
-        assert_eq!(carryover_hashes, expected, "carryover must respect FIFO insertion order");
+        let planned = replay_fifo_carryover(&fifo).await;
+        assert_eq!(planned, expected, "carryover must respect FIFO insertion order");
     }
 
     /// Stale `Success` entries are promoted to `Waiting` + `Replay` so the
@@ -2236,9 +2362,9 @@ mod tests {
         fifo.push_if_absent(t, Address::from([1; 20]), PreconfSource::Rpc).await;
         fifo.mark_succeeded(&hash).await.unwrap();
 
-        let carryover_hashes = replay_fifo_carryover(&fifo).await;
+        let planned = replay_fifo_carryover(&fifo).await;
 
-        assert_eq!(carryover_hashes, vec![hash]);
+        assert_eq!(planned, vec![hash]);
         let entry = fifo.find_by_hash(&hash).await.unwrap();
         assert_eq!(entry.status, PreconfStatus::Waiting);
         assert_eq!(entry.source, PreconfSource::Replay);

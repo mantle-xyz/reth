@@ -9,11 +9,11 @@
 //! preconf-eligible transaction may only be applied by the preconf arm, and the
 //! pool arm must skip it (`builder::payload_builder` Stage 3). The pool arm is
 //! only safe to skip because the preconf arm is expected to pick the transaction
-//! up — which requires a fifo entry, created by the pool listener using the
-//! allowlists *as they were at admission*.
+//! up — which requires a fifo entry, created by admission using the allowlists
+//! *as they were at the moment it ran*.
 //!
-//! If the listener and the builder read different allowlists, the partition
-//! breaks in both directions:
+//! If admission and the builder read different allowlists, the partition breaks
+//! in both directions:
 //!
 //! * **eligible → not eligible**: a fifo entry exists and the client already holds a
 //!   preconfirmation receipt, but the pool arm no longer skips the transaction. It lands via the
@@ -275,8 +275,7 @@ impl CachedVerdict {
 /// order (this type currently has none to get wrong — see the module docs) or a
 /// window in which a verdict exists without its slot claim. Under one lock,
 /// freezing a verdict and claiming its slot happen in a single critical section,
-/// which is precisely what closes the race described on
-/// [`PreconfClassifier::admit_and_claim`].
+/// which is precisely what closes the race between the two.
 #[derive(Debug, Default)]
 struct VerdictStore {
     /// Frozen verdict per transaction hash.
@@ -304,7 +303,7 @@ impl VerdictStore {
     /// Claims `key` for `hash` when the slot is free, and records the reverse
     /// link so every removal path can release it again.
     ///
-    /// The two callers — [`PreconfClassifier::admit_and_claim`] and
+    /// The two callers — [`PreconfClassifier::claim_admission_slot`] and
     /// [`PreconfClassifier::mark_promised`] — share this body deliberately: they
     /// reach it from different directions (a live admission versus a journal
     /// restore that has just decoded the sender and nonce), and two copies of
@@ -403,72 +402,37 @@ impl VerdictStore {
     }
 }
 
-/// Did [`PreconfClassifier::admit_and_claim`] **create** the record, or
-/// find one already there?
-///
-/// It decides who may destroy it when the admission fails. `add_transaction`
-/// validates *before* the hash-dedup that answers `AlreadyImported` — that check
-/// lives in `TxPool::add_transaction` and takes a `ValidPoolTransaction`, so it
-/// only runs where validation already succeeded. An ordinary
-/// `eth_sendRawTransaction` resubmit therefore re-runs the whole validation path
-/// against a record that belongs to an **earlier, successful** admission. (A p2p
-/// re-announcement does not: `retain_unknown` drops already-pooled hashes first.)
-///
-/// If that re-run happens to fail — `NonceNotConsistent` once the transaction has
-/// landed, or `InsufficientFunds`, which on Mantle flips on its own (see
-/// [`PreconfClassifier::release_preconf_claim`]) — releasing the record would
-/// strand a live fifo entry without its slot, or hand back the nonce of a
-/// commitment that is on chain and still inside its retention window.
-///
-/// So the rule is narrow and structural: **a call may only release what it
-/// created.**
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Admission {
-    /// This call inserted the record. A failed admission may release it.
-    Fresh,
-    /// The record was already there. This call must leave it alone.
-    Existing,
-}
-
 /// Why [`PreconfClassifier::claim_preconf`] refused a request.
 ///
-/// Two failures that look alike from outside and must not be conflated in what
-/// the client is told: one is about *who* the sender is, the other about *when*
-/// they asked.
+/// One variant, kept named rather than collapsed to a `bool` so a second reason
+/// can be told apart from the first if one ever arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreconfClaimError {
     /// The allowlist does not cover this `(from, to)` — or preconf is off on
     /// this node entirely.
     NotAllowlisted,
-    /// The hash already carries a frozen non-preconf verdict, so this request
-    /// can never be satisfied: the same raw transaction reached the pool by the
-    /// ordinary route first. Carries the verdict that won.
-    AlreadyClassified(Verdict),
 }
 
 /// Outcome of trying to claim a `(sender, nonce)` slot at admission.
 ///
 /// `Err` carries the hash that already owns the slot so the caller can ask the
 /// fifo what state that transaction is in — the claim itself deliberately knows
-/// nothing about fifo status (see `PreconfAwareValidator`).
+/// nothing about fifo status.
 pub type SlotClaim = Result<(), TxHash>;
 
 /// Decides preconf eligibility once per transaction and remembers the answer.
 ///
-/// Held as `Arc<PreconfClassifier>` and shared by the pool validator (the only
-/// writer of new verdicts), the pool listener, the payload builder and the RPC
-/// handler.
+/// Held as `Arc<PreconfClassifier>` and shared by admission (the only writer of
+/// new verdicts), the payload builder and the canon handler.
 #[derive(Debug)]
 pub struct PreconfClassifier {
     /// Mirrors `PreconfConfig::enabled`. When false this node runs no preconf
-    /// machinery at all, so nothing is classified and **nothing is cached** —
-    /// see [`Self::admit_and_claim`].
+    /// machinery at all, so nothing is classified and **nothing is cached**.
     ///
-    /// Load-bearing, not an optimisation: the validator decoration is present in
-    /// the pool type on *every* node, sequencer or not, while the two things that
-    /// remove cached verdicts (the fifo eviction callback and the canonical-state
-    /// sweep) are only wired up when preconf is enabled. Caching on a node that
-    /// never sweeps is an unbounded leak.
+    /// The leak this originally guarded against is gone — a node that has not
+    /// opted in no longer builds the RPC handler, so nothing reaches the
+    /// classifier to cache anything. Refusing here anyway keeps the invariant
+    /// the classifier's own, rather than a consequence of how it is wired.
     enabled: bool,
 
     /// Mirrors `PreconfConfig::all_preconfs`: bypass the allowlists entirely.
@@ -491,7 +455,7 @@ pub struct PreconfClassifier {
     verdicts: RwLock<VerdictStore>,
 
     /// Minimum age before a verdict may be swept. Protects the window between
-    /// classification and the listener creating the fifo entry.
+    /// the verdict being frozen and the entry existing.
     grace: Duration,
 
     /// Warning threshold for the verdict cache. Never enforced by deleting.
@@ -542,12 +506,11 @@ impl PreconfClassifier {
     /// `grace` is `max(2 × slot_duration, preconf_timeout)`. It has to cover two
     /// different windows, and the larger of the two wins:
     ///
-    /// * **`2 × slot_duration`** — the async hop from `validate_transaction` to the listener
-    ///   creating the fifo entry. Sub-millisecond in practice; this is generous headroom.
+    /// * **`2 × slot_duration`** — the gap between the verdict being frozen and the entry existing.
+    ///   Admission does both, so this is now sub-millisecond; the headroom is generous.
     /// * **`preconf_timeout`** — the whole period in which a client may still be waiting on its
     ///   responder. Sweeping inside it turns a transaction that was about to be preconfirmed into a
-    ///   spurious `Timeout`: the listener would ask [`Self::verdict`] afterwards, get `None`, and
-    ///   never create the fifo entry.
+    ///   spurious `Timeout`.
     ///
     /// Taking the max makes that invariant hold **by construction**. Deriving it
     /// from `slot_duration` alone does not: both knobs are independently
@@ -567,138 +530,32 @@ impl PreconfClassifier {
         }
     }
 
-    /// Latches a transaction's classification on pool admission and claims its
-    /// `(sender, nonce)` slot.
-    ///
-    /// **This does not decide eligibility, and deliberately cannot.** The
-    /// allowlists are not consulted here and the recipient is not even a
-    /// parameter, because a transaction is preconf-eligible only if its client
-    /// asked for that through `eth_sendRawTransactionWithPreconf` — and this
-    /// call cannot tell which RPC it is serving. Both methods reach the pool
-    /// with `TransactionOrigin::External`, and the p2p, reorg-reinject and
-    /// journal-restore paths reach it with no RPC at all.
-    ///
-    /// What it does instead is **latch**: get-or-insert, inserting
-    /// [`Verdict::NotEligible`]. An existing verdict is returned untouched, so
-    /// the two callers that *do* have the authority to say "preconf" —
-    /// [`Self::claim_preconf`] at the RPC boundary and [`Self::mark_promised`]
-    /// for a commitment already acknowledged — get there first and win.
-    ///
-    /// # Why latch, rather than leave non-preconf transactions unrecorded
-    ///
-    /// Writing nothing looks equivalent — every consumer treats a missing verdict
-    /// as `NotEligible` — but the two differ **over time**: `NotEligible` is
-    /// frozen, while absence is merely *undecided* and can still become
-    /// `Eligible`.
-    ///
-    /// The pool listener is where that bites. It reads the verdict when it
-    /// *processes* the pending event, not when the pool emits it, and the two
-    /// are separated by a task scheduling delay. With no record, a plain
-    /// transaction admitted at t0 could be stamped `Eligible` at t1 by a preconf
-    /// request naming the same hash, and the listener waking at t2 would hand a
-    /// transaction that passed none of the preconf gates a fifo entry. Latching
-    /// closes that by construction: this write happens inside `validate()`,
-    /// which completes before the insertion that emits the event.
-    ///
-    /// # Why the slot claim lives here
-    ///
-    /// The replacement guard needs to answer "does an in-flight preconf
-    /// transaction already own this `(sender, nonce)`?". Asking the fifo cannot
-    /// answer it correctly: the fifo entry is created asynchronously by the pool
-    /// listener, so between this call and that push the slot looks free and a
-    /// same-nonce replacement slips past the guard. The pool cannot be asked
-    /// either — this layer decorates the *validator*, which runs before the pool
-    /// takes its write lock, so any answer it gave would be stale by the time the
-    /// insertion happens.
-    ///
-    /// Claiming here fixes that by construction: the claim is made in the same
-    /// critical section that freezes the verdict, so two concurrent admissions
-    /// of the same `(sender, nonce)` serialize on this lock and exactly one
-    /// wins. The loser gets the winner's hash back and asks the fifo only for
-    /// that transaction's *status*.
-    ///
-    /// Returns the frozen verdict plus the claim outcome. `Ok(())` means the
-    /// slot is ours (or we already owned it, or we are not preconf and make no
-    /// claim); `Err(owner)` means `owner` holds it.
-    pub fn admit_and_claim(
-        &self,
-        hash: TxHash,
-        from: &Address,
-        nonce: u64,
-    ) -> (Verdict, SlotClaim, Admission) {
-        // Preconf off ⇒ nothing is eligible and, crucially, nothing is cached —
-        // see `Self::enabled` for why that is load-bearing rather than an
-        // optimisation.
-        if !self.enabled {
-            return (Verdict::NotEligible, Ok(()), Admission::Existing);
-        }
-
-        let key = (*from, nonce);
-        let mut store = self.verdicts.write();
-        // Whether *this* call created the record decides who may destroy it on a
-        // failed admission — see [`Admission`].
-        let admission =
-            if store.by_hash.contains_key(&hash) { Admission::Existing } else { Admission::Fresh };
-        // `NotEligible` is the *only* verdict this call ever writes. Anything
-        // preconf-eligible was recorded by `claim_preconf` or `mark_promised`
-        // before the transaction reached the pool, and `or_insert` leaves it be.
-        let verdict = store
-            .by_hash
-            .entry(hash)
-            .or_insert(CachedVerdict::new(Verdict::NotEligible, None))
-            .verdict;
-
-        // Checking and claiming are decoupled — see `VerdictStore::claim`, which
-        // both this and `mark_promised` go through. In particular the check does
-        // **not** depend on the incoming transaction's own verdict: a plain
-        // submission arriving on a nonce an in-flight commitment owns is
-        // `NotEligible`, and gating on that would let exactly that case through,
-        // leaving one transaction on each arm.
-        let claim = store.claim(key, hash, verdict.is_preconf());
-
-        let len = store.by_hash.len();
-        drop(store);
-
-        self.observe_len(len);
-        (verdict, claim, admission)
-    }
-
     /// **Where preconf eligibility is decided.** Claims `hash` for the preconf
     /// fast path, on behalf of a client that asked for it through
     /// `eth_sendRawTransactionWithPreconf`.
     ///
-    /// Called from the RPC handler *before* the transaction is offered to the
-    /// pool, because that is the only place the deciding fact — which RPC method
-    /// this is — exists at all. By the time [`Self::admit_and_claim`] runs, the
-    /// two methods are indistinguishable.
+    /// Called from admission, because that is the only place the deciding fact
+    /// — which RPC method this is — exists at all. One layer down the two
+    /// methods are indistinguishable.
     ///
     /// # The claim is exclusive, and the verdict store is the lock
     ///
     /// Get-or-insert, so whoever writes first wins, under the same lock every
-    /// other verdict write takes. `Err(existing)` means the hash was already
-    /// classified and this request can never be satisfied — verdicts are frozen
-    /// for life (see the module docs).
-    ///
-    /// In practice `Err(NotEligible)` means the same raw transaction was already
-    /// submitted through plain `eth_sendRawTransaction` (or arrived over p2p).
-    /// The caller should surface that as
-    /// [`PreconfError::AlreadyPooledWithoutPreconf`](crate::types::PreconfError::AlreadyPooledWithoutPreconf),
-    /// not as "not eligible" — the sender may well be allowlisted; the
-    /// transaction is simply already in motion by the ordinary route.
+    /// other verdict write takes.
     ///
     /// `Ok(())` on an existing `Eligible` verdict is deliberate: that is the
     /// documented same-hash retry after `Timeout` / `Canceled` / `Failed`, and
     /// re-asking must be idempotent rather than an error.
     ///
+    /// There is no case for an existing *non*-preconf verdict. Only this method
+    /// and [`Self::mark_promised`] write records, and both write a preconf one,
+    /// so an ordinary transaction leaves nothing behind to collide with.
+    ///
     /// # What it does *not* do
     ///
-    /// It does not claim the `(sender, nonce)` slot. That stays in
-    /// [`Self::admit_and_claim`], which runs under the pool's own admission and
-    /// so cannot hand a nonce to a transaction the pool then refuses. The
-    /// reverse link is back-filled there by `VerdictStore::claim`.
-    ///
-    /// Returns `Ok(())` without recording anything when preconf is disabled, for
-    /// the same reason [`Self::admit_and_claim`] caches nothing there.
+    /// It does not claim the `(sender, nonce)` slot — that is
+    /// [`Self::claim_admission_slot`], which runs under the queue's own lock so
+    /// the slot and the entry are taken together.
     pub fn claim_preconf(
         &self,
         hash: TxHash,
@@ -709,26 +566,61 @@ impl PreconfClassifier {
             return Err(PreconfClaimError::NotAllowlisted);
         }
         // Evaluated before the lock, so the allowlist lock and the verdict lock
-        // are never held together — the same discipline `admit_and_claim`
-        // followed while it still consulted the allowlists.
+        // are never held together.
         if !self.evaluate_whitelist(from, to).is_preconf() {
             return Err(PreconfClaimError::NotAllowlisted);
         }
 
         let mut store = self.verdicts.write();
-        let verdict = store
-            .by_hash
-            .entry(hash)
-            .or_insert(CachedVerdict::new(Verdict::Eligible, None))
-            .verdict;
+        store.by_hash.entry(hash).or_insert(CachedVerdict::new(Verdict::Eligible, None));
         let len = store.by_hash.len();
         drop(store);
 
         self.observe_len(len);
-        if verdict.is_preconf() {
-            Ok(())
-        } else {
-            Err(PreconfClaimError::AlreadyClassified(verdict))
+        Ok(())
+    }
+
+    /// Claim `(sender, nonce)` for a hash [`Self::claim_preconf`] has already
+    /// classified. `Err(incumbent)` when a different transaction owns it.
+    ///
+    /// The slot used to be claimed a layer down, on the pool's behalf.
+    /// Admission decides the same question earlier, and has to: it hands the
+    /// client a promise, so it cannot leave a later layer to discover the nonce
+    /// was spoken for.
+    ///
+    /// Called while the fifo's own lock is held, so that checking the slot and
+    /// taking it cannot be split by a concurrent request. That direction —
+    /// fifo first, verdicts second — is the one every fifo removal already
+    /// takes, through `drop_hash`'s eviction callback.
+    ///
+    /// `replacing` names the incumbent the caller has just judged replaceable,
+    /// making this a hand-over rather than a fresh claim: the slot changes
+    /// hands only if that incumbent is still the one holding it. Passing `None`
+    /// requires the slot to be free or already ours.
+    ///
+    /// # Why the fifo's own index is not enough
+    ///
+    /// A slot outlives the fifo entry that took it. A commitment whose receipt
+    /// has gone out keeps its nonce through the retention window even after the
+    /// entry is gone, which is the whole point of the window — the transaction
+    /// is on chain, or about to be, and a second one on that nonce would either
+    /// be refused by the EVM or displace it.
+    pub fn claim_admission_slot(
+        &self,
+        hash: TxHash,
+        sender: &Address,
+        nonce: u64,
+        replacing: Option<TxHash>,
+    ) -> SlotClaim {
+        if !self.enabled {
+            return Ok(());
+        }
+        let key = (*sender, nonce);
+        let mut store = self.verdicts.write();
+        let is_preconf = store.by_hash.get(&hash).is_some_and(|cached| cached.verdict.is_preconf());
+        match replacing {
+            Some(incumbent) => store.replace(&incumbent, key, hash, is_preconf),
+            None => store.claim(key, hash, is_preconf),
         }
     }
 
@@ -797,8 +689,15 @@ impl PreconfClassifier {
     /// precedes the block, so a record written here is in place before either
     /// event can happen. See [`Self::mark_committed`].
     ///
-    /// The slot claim **never displaces an existing owner** — not even the way
-    /// [`Self::replace_slot`] does with an expected one. If the slot is taken,
+    /// There used to be a case here for a transaction whose verdict said it
+    /// was not preconf: the claim was skipped, because such a transaction had
+    /// no arm to defend the nonce with. It is unreachable now. The only
+    /// writers of a record are this method and `claim_preconf`, and both write
+    /// a preconf verdict — nothing stores [`Verdict::NotEligible`] any more,
+    /// and every caller of this method is answering for a commitment that
+    /// went through the door.
+    ///
+    /// The slot claim **never displaces an existing owner**. If the slot is taken,
     /// the honest answer is that the incumbent owns the nonce; who wins is
     /// decided one layer down by `push_if_absent`. Seizing it here for a
     /// commitment that is about to lose it would make the guard refuse later
@@ -913,40 +812,6 @@ impl PreconfClassifier {
     /// halves of commitment tracking unable to disagree.
     pub fn is_tracked(&self, hash: &TxHash) -> bool {
         self.verdicts.read().by_hash.contains_key(hash)
-    }
-
-    /// Hands the `(sender, nonce)` slot from `expected_owner` to `hash`, **only
-    /// if `expected_owner` still holds it**. `Err(current)` means we lost the
-    /// race and `current` owns the nonce now.
-    ///
-    /// The reclaimable-replacement handover. The caller established, *before*
-    /// running the inner validator, that `expected_owner` was in a terminal
-    /// not-on-chain state and its nonce could therefore be taken; the inner
-    /// validator is `async`, so another same-nonce transaction may have made the
-    /// same observation meanwhile. See `VerdictStore::replace` for why that has
-    /// to be a compare-and-swap.
-    ///
-    /// On `Ok`, and only then, may the caller tear `expected_owner` down (drop
-    /// its fifo entry and verdict): exactly one replacement gets to do that.
-    ///
-    /// No-op returning `Ok(())` when `hash` has no verdict, or has one that is
-    /// not [`Verdict::is_preconf`] — as in `VerdictStore::claim`, there would be
-    /// nothing to hang the reverse link on. The CAS is still performed in the
-    /// non-preconf case: such a transaction does not want the nonce, but it does
-    /// need to know it is the one entitled to evict the holder.
-    pub fn replace_slot(
-        &self,
-        expected_owner: &TxHash,
-        sender: &Address,
-        nonce: u64,
-        hash: TxHash,
-    ) -> SlotClaim {
-        if !self.enabled {
-            return Ok(());
-        }
-        let mut store = self.verdicts.write();
-        let is_preconf = store.by_hash.get(&hash).is_some_and(|cached| cached.verdict.is_preconf());
-        store.replace(expected_owner, (*sender, nonce), hash, is_preconf)
     }
 
     /// The one query for every downstream consumer. Synchronous.
@@ -1123,8 +988,7 @@ impl PreconfClassifier {
         //
         // Read it as a **lower bound** on in-flight preconf transactions, not as
         // a count of them: a restored commitment admitted under the promised
-        // exemption (see `PreconfAwareValidator`) can hold a fifo entry without
-        // owning a slot.
+        // exemption can hold a fifo entry without owning a slot.
         metrics::gauge!("preconf.classifier.slots").set(slots as f64);
         self.observe_len(len);
         before - len
@@ -1267,19 +1131,19 @@ mod tests {
 
     impl PreconfClassifier {
         /// Admits `hash` the way a **preconf RPC** submission does: claim the
-        /// verdict at the RPC boundary first, then latch and claim through the
-        /// validator.
+        /// verdict at the RPC boundary, then claim the nonce.
         ///
-        /// Two calls, because that is what production does and the order is the
-        /// whole point — `admit_and_claim` alone can only ever produce
-        /// `NotEligible`. A test that wants an eligible transaction has to say
-        /// so through the same door a client would.
+        /// Two calls, because that is what production does and the order is
+        /// the whole point. Nothing else classifies a transaction any more: a
+        /// plain `eth_sendRawTransaction` leaves no record here at all, so a
+        /// test that wants an eligible transaction has to say so through the
+        /// same door a client would.
         fn admit_via_preconf_rpc(
             &self,
             hash: TxHash,
             from: &Address,
             nonce: u64,
-        ) -> (Verdict, SlotClaim, Admission) {
+        ) -> (Verdict, SlotClaim) {
             self.admit_via_preconf_rpc_to(hash, from, Some(&addr(2)), nonce)
         }
 
@@ -1291,9 +1155,10 @@ mod tests {
             from: &Address,
             to: Option<&Address>,
             nonce: u64,
-        ) -> (Verdict, SlotClaim, Admission) {
+        ) -> (Verdict, SlotClaim) {
             let _ = self.claim_preconf(hash, from, to);
-            self.admit_and_claim(hash, from, nonce)
+            let claim = self.claim_admission_slot(hash, from, nonce, None);
+            (self.verdict(&hash).unwrap_or(Verdict::NotEligible), claim)
         }
 
         /// [`Self::admit_via_preconf_rpc`] for the verdict-only shim above.
@@ -1580,10 +1445,7 @@ mod tests {
     }
 
     /// **Preconf is a sequencer-only mechanism**, and a node that has not opted
-    /// in must carry none of its state: `PreconfAwareValidator` is in the pool
-    /// type on *every* node (see `MantleTransactionPool`), so `admit_and_claim`
-    /// runs for every transaction a verifier ever sees while nothing on that node
-    /// ever sweeps — see the `enabled` field.
+    /// in must carry none of its state — see the `enabled` field.
     #[test]
     fn disabled_node_classifies_without_caching() {
         let cfg = PreconfConfig::default();
@@ -1620,8 +1482,8 @@ mod tests {
     ///
     /// There is deliberately no companion predicate for "exempt from
     /// admission-time policy gates": that exemption keys on the `promised` flag,
-    /// not on any verdict, and is applied once by an early return in
-    /// `PreconfAwareValidator` rather than gate by gate. See `pool_ext::validator`.
+    /// not on any verdict, and is applied once by an early return rather than
+    /// gate by gate.
     #[test]
     fn verdict_predicates_are_pinned() {
         assert!(Verdict::Eligible.is_preconf());
@@ -1646,18 +1508,21 @@ mod tests {
         assert_eq!(c.classify_verdict_to(hash(3), &addr(1), Some(&addr(9))), Verdict::NotEligible);
     }
 
-    /// **The allowlist is consulted at the RPC boundary, never at admission.**
-    /// A transaction that reaches the pool without a preconf request — plain
-    /// `eth_sendRawTransaction`, p2p, the pool's own reorg reinject — is
-    /// `NotEligible` however well allowlisted its sender is.
+    /// **Nothing classifies a transaction except the preconf RPC.** A
+    /// transaction that reaches the node any other way — plain
+    /// `eth_sendRawTransaction`, p2p, the pool's own reorg reinject — leaves
+    /// no record here at all, and consumers read "no record" as not preconf.
+    ///
+    /// There used to be a second door: the pool's validator latched every
+    /// transaction it saw as `NotEligible`. With it gone there is nothing to
+    /// latch, which is why this asserts absence rather than a verdict.
     #[test]
-    fn admission_alone_never_produces_an_eligible_verdict() {
+    fn a_transaction_that_never_asked_for_preconf_has_no_record() {
         let c = classifier(LONG_GRACE);
-        // `addr(1) -> addr(2)` is exactly the allowlisted pair.
-        let (verdict, claim, admission) = c.admit_and_claim(hash(1), &addr(1), 7);
-        assert_eq!(verdict, Verdict::NotEligible);
-        assert_eq!(admission, Admission::Fresh, "the record is this call's");
-        assert_eq!(claim, Ok(()), "and it claims no slot, having nothing to defend");
+        // `addr(1) -> addr(2)` is exactly the allowlisted pair, so this is not
+        // about eligibility — it is about never having been asked.
+        assert_eq!(c.verdict(&hash(1)), None);
+        assert_eq!(c.verdict_count(), 0);
         assert_eq!(c.slot_count(), 0);
     }
 
@@ -1689,13 +1554,20 @@ mod tests {
         assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(1)), Verdict::Eligible);
     }
 
-    /// Case B: not eligible at admission, then the sender is added. The verdict
-    /// must not flip, or the pool arm starts skipping a transaction the preconf
-    /// arm has no entry for and it stalls silently.
+    /// Case B: refused at the door, then the sender is added to the allowlist.
+    ///
+    /// There is nothing frozen to protect here, and that is the point: a
+    /// refused submission leaves no record at all, so the allowlist growing
+    /// cannot flip anything. The transaction simply has to be sent again, and
+    /// then it is eligible.
+    ///
+    /// Only the shrinking direction has something to freeze — see
+    /// `verdict_is_frozen_when_allowlist_shrinks`.
     #[test]
-    fn verdict_is_frozen_when_allowlist_grows() {
+    fn a_refusal_leaves_nothing_for_a_wider_allowlist_to_flip() {
         let c = classifier(LONG_GRACE);
         assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(3)), Verdict::NotEligible);
+        assert_eq!(c.verdict(&hash(1)), None, "refused at the door, so nothing was recorded");
 
         c.update_whitelist(
             pair_set(&[(addr(1), addr(2)), (addr(3), addr(2))]),
@@ -1703,10 +1575,8 @@ mod tests {
             HashSet::default(),
         );
 
-        assert_eq!(c.verdict(&hash(1)), Some(Verdict::NotEligible));
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(3)), Verdict::NotEligible);
-        // A *different* transaction admitted after the update does see it.
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(2), &addr(3)), Verdict::Eligible);
+        // The same bytes, sent again, are now eligible.
+        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(1), &addr(3)), Verdict::Eligible);
     }
 
     #[test]
@@ -1753,12 +1623,7 @@ mod tests {
     fn mark_promised_does_not_displace_an_existing_owner() {
         let c = classifier(LONG_GRACE);
         // A live admission takes (addr(1), 7) first.
-        // `Existing`, not `Fresh`: the record was created at the RPC boundary by
-        // `claim_preconf`, so the validator's call only found it.
-        assert_eq!(
-            c.admit_via_preconf_rpc(hash(2), &addr(1), 7),
-            (Verdict::Eligible, Ok(()), Admission::Existing)
-        );
+        assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(1), 7), (Verdict::Eligible, Ok(())));
 
         assert_eq!(
             c.mark_promised(hash(1), &addr(1), 7, 0),
@@ -1767,20 +1632,6 @@ mod tests {
         );
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
         assert!(c.is_promised(&hash(1)), "the promise is still recorded — only the claim lost");
-    }
-
-    /// A non-preconf verdict has no arm to defend, so it must not occupy the
-    /// slot: there would be nothing to hang the reverse link on and the nonce
-    /// would leak until the next sweep.
-    #[test]
-    fn mark_promised_claims_nothing_for_a_non_preconf_verdict() {
-        let c = classifier(LONG_GRACE);
-        assert_eq!(c.classify_verdict_via_preconf_rpc(hash(3), &addr(9)), Verdict::NotEligible);
-
-        assert_eq!(c.mark_promised(hash(3), &addr(9), 7, 0), Ok(()));
-
-        assert_eq!(c.slot_owner(&addr(9), 7), None);
-        assert_eq!(c.slot_count(), 0);
     }
 
     /// **`mark_promised` must not overwrite an existing verdict with
@@ -1819,8 +1670,10 @@ mod tests {
     #[test]
     fn sweep_drops_entries_absent_from_live_and_past_grace() {
         let c = classifier(Duration::ZERO);
+        // Both allowlisted, so both leave a record to sweep. A refused
+        // submission would leave none.
         c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
-        c.classify_verdict_via_preconf_rpc(hash(2), &addr(3));
+        c.classify_verdict_via_preconf_rpc(hash(2), &addr(1));
 
         assert_eq!(c.sweep(&HashSet::default()), 2);
         assert_eq!(c.verdict_count(), 0);
@@ -1828,7 +1681,7 @@ mod tests {
 
     #[test]
     fn sweep_keeps_entries_within_grace() {
-        // The window between classification and the listener creating the fifo
+        // The window between the verdict being frozen and the entry existing
         // entry: absent from `live`, but too young to drop.
         let c = classifier(LONG_GRACE);
         c.classify_verdict_via_preconf_rpc(hash(1), &addr(1));
@@ -2073,11 +1926,10 @@ mod tests {
 
     // ===================== (sender, nonce) slot index =====================
     //
-    // The slot index exists for one reason: the replacement guard must be able
-    // to answer "is an in-flight preconf transaction already using this nonce?"
-    // *at admission time*, before the pool listener has had a chance to create
-    // the fifo entry. Asking the fifo cannot answer that — hence these tests
-    // never touch a fifo.
+    // The slot index exists because the queue cannot answer "is this nonce
+    // spoken for?" on its own: a commitment whose receipt has gone out keeps its
+    // nonce through the retention window with no entry left behind. Hence these
+    // tests never touch a fifo.
 
     /// The whole point: a second hash on the same `(sender, nonce)` is told who
     /// holds the slot, **with no fifo involved**. This is the case the
@@ -2086,11 +1938,11 @@ mod tests {
     fn second_tx_on_same_sender_nonce_is_refused_the_slot() {
         let c = classifier(LONG_GRACE);
 
-        let (v1, claim1, _) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
+        let (v1, claim1) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(v1, Verdict::Eligible);
         assert_eq!(claim1, Ok(()), "first eligible tx must own the slot");
 
-        let (v2, claim2, _) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
+        let (v2, claim2) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
         assert_eq!(v2, Verdict::Eligible, "the verdict is still frozen normally");
         assert_eq!(claim2, Err(hash(1)), "and the claim names the incumbent");
     }
@@ -2119,14 +1971,14 @@ mod tests {
     fn de_whitelisted_replacement_is_still_refused_the_slot() {
         let c = classifier(LONG_GRACE);
 
-        let (v1, claim1, _) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
+        let (v1, claim1) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(v1, Verdict::Eligible);
         assert_eq!(claim1, Ok(()));
 
         // Governance revokes the rule; the incumbent's verdict stays frozen.
         c.update_whitelist(HashSet::default(), HashSet::default(), HashSet::default());
 
-        let (v2, claim2, _) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
+        let (v2, claim2) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
         assert_eq!(v2, Verdict::NotEligible, "newcomer is judged under the new allowlist");
         assert_eq!(
             claim2,
@@ -2143,9 +1995,9 @@ mod tests {
     /// guard, not here.
     ///
     /// Keeping the report honest matters: if this returned `Ok(())` the index
-    /// would silently disagree with reality, and `PreconfAwareValidator` could
-    /// no longer tell "nobody holds this nonce" from "a commitment is being
-    /// restored over someone else's claim".
+    /// would silently disagree with reality, and the caller could no longer
+    /// tell "nobody holds this nonce" from "a commitment is being restored over
+    /// someone else's claim".
     #[test]
     fn promised_is_told_the_truth_about_a_taken_slot() {
         let c = classifier(LONG_GRACE);
@@ -2156,24 +2008,28 @@ mod tests {
         // A journal entry for a *different* hash on the same (sender, nonce):
         // its claim loses, so it ends up Promised with no slot of its own.
         assert_eq!(c.mark_promised(hash(2), &addr(1), 7, 0), Err(hash(1)));
-        let (verdict, claim, _) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
+        let (verdict, claim) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
 
         assert_eq!(verdict, Verdict::Promised);
         assert_eq!(claim, Err(hash(1)), "the incumbent is reported, not silently overwritten");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps the slot");
     }
 
-    /// A non-preconf transaction must not occupy a slot: it would reject
-    /// replacements that the preconf arm has no stake in.
+    /// A transaction the door refused must not occupy a slot: it would reject
+    /// replacements the preconf arm has no stake in.
+    ///
+    /// It leaves no record either, which is a stronger position than the one
+    /// this used to assert — there was a `NotEligible` verdict to keep out of
+    /// the slot index back when the pool's validator wrote one.
     #[test]
-    fn non_preconf_tx_claims_no_slot() {
+    fn a_refused_tx_claims_no_slot_and_leaves_no_record() {
         let c = classifier(LONG_GRACE);
 
-        let (verdict, claim, _) = c.admit_via_preconf_rpc(hash(1), &addr(9), 7);
-        assert_eq!(verdict, Verdict::NotEligible);
-        assert_eq!(claim, Ok(()));
-        assert_eq!(c.verdict_count(), 1, "the verdict is still frozen");
-        assert_eq!(c.slot_count(), 0, "but no slot is claimed");
+        let (verdict, claim) = c.admit_via_preconf_rpc(hash(1), &addr(9), 7);
+        assert_eq!(verdict, Verdict::NotEligible, "reported as not preconf");
+        assert_eq!(claim, Ok(()), "and it claims nothing");
+        assert_eq!(c.verdict_count(), 0, "nor is anything recorded");
+        assert_eq!(c.slot_count(), 0);
 
         // …so an eligible tx on the same (sender, nonce) is unobstructed.
         assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(9), 7).1, Ok(()));
@@ -2215,7 +2071,7 @@ mod tests {
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         // Hand the slot over the way the reclaimable-replacement path does.
         let _ = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(2)), Ok(()));
+        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
 
         c.release_unless_committed(&hash(1));
@@ -2285,15 +2141,15 @@ mod tests {
         assert_eq!(disabled.slot_count(), 0);
     }
 
-    /// `replace_slot` for a hash with no verdict would create a claim nothing can
+    /// A handover to a hash with no verdict would create a claim nothing can
     /// release — the reverse link lives on the verdict. The CAS still succeeds
     /// (we *were* entitled to evict the holder); only the claim is skipped.
     #[test]
-    fn replace_slot_without_a_verdict_claims_nothing() {
+    fn a_handover_to_a_hash_without_a_verdict_claims_nothing() {
         let c = classifier(LONG_GRACE);
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
 
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(9)), Ok(()));
+        assert_eq!(c.claim_admission_slot(hash(9), &addr(1), 7, Some(hash(1))), Ok(()));
         assert_eq!(c.slot_count(), 0, "holder released, nothing claimed in its place");
     }
 
@@ -2302,7 +2158,7 @@ mod tests {
     /// holder before either reaches the inner validator (it is `async`), so both
     /// come back to take the slot; exactly one may win.
     #[test]
-    fn replace_slot_refuses_when_the_holder_already_lost_the_slot() {
+    fn a_handover_is_refused_when_the_holder_already_lost_the_slot() {
         let c = classifier(LONG_GRACE);
 
         // A holds the nonce; B and C both classify while it still does.
@@ -2311,36 +2167,40 @@ mod tests {
         assert_eq!(c.admit_via_preconf_rpc(hash(3), &addr(1), 7).1, Err(hash(1)));
 
         // B wins the race.
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(2)), Ok(()));
+        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
 
         // C comes back expecting A and must be told it lost, to B.
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(3)), Err(hash(2)));
+        assert_eq!(c.claim_admission_slot(hash(3), &addr(1), 7, Some(hash(1))), Err(hash(2)));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)), "the winner keeps it");
     }
 
     /// Re-validation of the same hash must not be mistaken for a lost race.
     #[test]
-    fn replace_slot_is_idempotent_for_the_current_owner() {
+    fn a_handover_is_idempotent_for_the_current_owner() {
         let c = classifier(LONG_GRACE);
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         let _ = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(2)), Ok(()));
+        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
 
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(2)), Ok(()), "already ours");
+        assert_eq!(
+            c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))),
+            Ok(()),
+            "already ours"
+        );
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
     }
 
     /// A vacant slot is nobody's, so there is nothing to lose the race to.
     #[test]
-    fn replace_slot_takes_a_vacant_slot() {
+    fn a_handover_takes_a_vacant_slot() {
         let c = classifier(LONG_GRACE);
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         c.release_unless_committed(&hash(1));
 
         let _ = c.admit_via_preconf_rpc(hash(2), &addr(1), 8);
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(2)), Ok(()));
+        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
     }
 
@@ -2348,14 +2208,14 @@ mod tests {
     /// occupy the nonce — it has no arm to defend, so holding it would refuse
     /// later replacements for nothing.
     #[test]
-    fn replace_slot_releases_without_claiming_for_a_non_preconf_tx() {
+    fn a_handover_releases_without_claiming_for_a_non_preconf_tx() {
         let c = classifier(LONG_GRACE);
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         // addr(9) is not allowlisted ⇒ NotEligible.
         assert_eq!(c.classify_verdict_via_preconf_rpc(hash(2), &addr(9)), Verdict::NotEligible);
 
-        assert_eq!(c.replace_slot(&hash(1), &addr(1), 7, hash(2)), Ok(()));
+        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
         assert_eq!(c.slot_owner(&addr(1), 7), None, "released, not taken over");
     }
 }

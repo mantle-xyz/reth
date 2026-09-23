@@ -25,6 +25,12 @@ use crate::helpers::{PreconfCfgBuilder, send_preconf};
 
 const RECIPIENT: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
 
+/// A second payee, deliberately left out of every allowlist these tests set up.
+/// A transfer to it from an allowlisted sender is an ordinary pool transaction,
+/// which is what lets one sender hold both kinds at once — the allowlist is
+/// keyed on the `(from, to)` pair, not on the sender alone.
+const OTHER: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
+
 /// Slice fast enough that a held-open block produces several, and let the OS
 /// pick the endpoint port so concurrent tests never collide.
 fn flashblocks_cfg() -> FlashblockProducerConfig {
@@ -55,10 +61,14 @@ fn read_journal(path: &std::path::Path) -> Vec<JournalEntry> {
 }
 
 async fn signed_transfer(wallet: &Wallet, chain_id: u64, nonce: u64) -> Bytes {
+    signed_transfer_to(wallet, chain_id, nonce, RECIPIENT).await
+}
+
+async fn signed_transfer_to(wallet: &Wallet, chain_id: u64, nonce: u64, to: Address) -> Bytes {
     let request = TransactionRequest {
         chain_id: Some(chain_id),
         nonce: Some(nonce),
-        to: Some(TxKind::Call(RECIPIENT)),
+        to: Some(TxKind::Call(to)),
         gas: Some(21_000),
         max_fee_per_gas: Some(20e9 as u128),
         max_priority_fee_per_gas: Some(20e9 as u128),
@@ -348,14 +358,69 @@ async fn a_build_nobody_used_gives_back_the_senders_nonce() {
     std::fs::remove_dir_all(&journal_dir).ok();
 }
 
-/// A build that was used hands nothing back.
+/// A payload the consensus layer took and then did not use hands back too.
 ///
-/// Its transactions are in a block on its way to the consensus layer, and the
-/// senders really have moved on. Handing them back would put a block's worth of
-/// transactions into the pool for the next canonical update to take out again,
-/// every block.
+/// `getPayload` is not proof the block lands. The consensus layer can answer
+/// `SYNCING` or `INVALID`, fail over to another sequencer, or reorg its unsafe
+/// head — and in every one of those the transactions this build pruned are in
+/// no block and no pool, with the senders' pool nonces left a step ahead of the
+/// chain. The pool *discards* what sits below the nonce it holds rather than
+/// parking it, so leaving it there costs those senders everything they send
+/// until a real block corrects it.
+///
+/// What says the payload went nowhere is the next job's parent: if the
+/// consensus layer had built on what it was given, that parent would be this
+/// block. Here it is not, which is exactly what this harness reproduces by
+/// never making the first block canonical.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_build_that_was_used_hands_nothing_back() {
+async fn a_payload_the_consensus_layer_did_not_use_hands_back() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let first = build_one_block!(node, Duration::from_millis(500));
+    assert!(
+        ordinary_transactions(&first).contains(&hash),
+        "precondition: the transaction is in the payload the consensus layer asked for, \
+         so the build pruned it from the pool",
+    );
+
+    // Deliberately not canonized: the next job starts from the same parent, so
+    // the block above went nowhere.
+    let second = build_one_block!(node, Duration::from_millis(500));
+    assert!(
+        ordinary_transactions(&second).contains(&hash),
+        "a payload that went nowhere must give its transactions back; \
+         otherwise they are in no block and no pool",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// A build the consensus layer did build on hands nothing back.
+///
+/// The healthy path: the block is canonical, the senders really have moved on,
+/// and the canonical update is what maintains the pool from here.
+///
+/// What this can and cannot show: once the block is canonical a hand-back would
+/// be *wasteful* rather than wrong — `add_external_transactions` re-validates,
+/// and a transaction already mined is refused on its nonce — so this cannot
+/// distinguish "did not hand back" from "handed back and was refused". It pins
+/// the outcome that matters, that the healthy path still lands each transaction
+/// exactly once. The decision itself is pinned where it is observable, by
+/// `payload_job_generator::went_nowhere_tests`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_the_consensus_layer_used_hands_nothing_back() {
     let sender = Wallet::default().inner.address();
     let (journal_file, journal_dir) = shared_journal_path();
     let cfg = PreconfCfgBuilder::new()
@@ -376,12 +441,14 @@ async fn a_build_that_was_used_hands_nothing_back() {
         "precondition: the transaction is in the payload the consensus layer asked for",
     );
 
-    // The next build starts from the same parent — this harness never makes the
-    // first block canonical — so a transaction handed back would reappear here.
+    // The consensus layer builds on it, so the next job's parent is this block
+    // and nothing is owed back.
+    crate::canonize_built!(node, first.clone());
+
     let second = build_one_block!(node, Duration::from_millis(500));
     assert!(
         !ordinary_transactions(&second).contains(&hash),
-        "a used build must not put its transactions back for the next one to take again",
+        "a transaction that landed must not be mined twice",
     );
 
     std::fs::remove_dir_all(&journal_dir).ok();
@@ -503,6 +570,235 @@ async fn a_build_a_reorg_threw_away_gives_back_what_it_pruned() {
         sealed.contains(&hash),
         "a transaction the reorged-away build pruned must be back for the rebuild; \
          sealed={sealed:?}",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// A superseded build's announcement is settled exactly once.
+///
+/// Two builds at one height: the first announces and prunes a transaction, then
+/// is superseded; the second seals the block that lands and goes canonical.
+///
+/// **What this test actually exercises today is the landed branch**: the second
+/// build has room and takes the transaction, so what is pinned is that the next
+/// build does not hand it out again. Without that, a transaction that reached
+/// the canonical block would be replayed into the one after it and mined twice.
+///
+/// **It does not cover the whole-group-clear hole.** The bug that shape guards
+/// against — `drop_landed_groups` clearing the entire index instead of only the
+/// group whose sealed hash matches `parent_hash` — is only observable when the
+/// second build cannot carry the transaction, and nothing in this fixture fills
+/// the block, so that branch never runs. The `landed_in_second == false` arm is
+/// written out because the invariant is stated for both, not because this
+/// harness reaches it. **Anyone looking for coverage of the grouping hole has
+/// not found it here**: its guard is the unit test
+/// `a_group_that_did_not_seal_the_parent_survives_and_needs_checking` in
+/// `mantle-reth/crates/preconf/src/unlanded.rs`.
+///
+/// Making the branch reachable means packing the first build's block to near
+/// capacity so the second has no room. That is a deliberate follow-up, deferred
+/// as an expensive and timing-sensitive fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_builds_announcement_outlives_the_block_that_replaced_it() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // First build announces and prunes it, then is superseded.
+    hold_a_block_open!(node, Duration::from_millis(500));
+
+    let announced: Vec<B256> = read_journal(&journal_file).iter().map(|e| e.hash).collect();
+    assert!(
+        announced.contains(&hash),
+        "precondition: the superseded build must have announced it, else it was never \
+         pruned and there is nothing to recover; journaled={announced:?}",
+    );
+
+    // The build that replaces it seals a block and that block becomes canonical.
+    let second = build_one_block!(node, Duration::from_millis(500));
+    crate::canonize_built!(node, second.clone());
+
+    // Whether the second build happened to carry it does not matter; what must
+    // not happen is the transaction being neither in a block nor recoverable —
+    // nor, on the other side, being handed out again after it has landed.
+    let landed_in_second = ordinary_transactions(&second).contains(&hash);
+    let third = build_one_block!(node, Duration::from_millis(500));
+    let in_third = ordinary_transactions(&third).contains(&hash);
+    if landed_in_second {
+        assert!(
+            !in_third,
+            "the canonical block already carries it; replaying it again would mine it twice",
+        );
+    } else {
+        assert!(
+            in_third,
+            "a superseded build's announcement must still be recoverable after \
+             the replacing block goes canonical; landed_in_second=false",
+        );
+    }
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// A derivation build replays nothing.
+///
+/// `no_tx_pool` means "execute exactly what the attributes name". A block
+/// derived with an extra transaction folded in would not match the one the
+/// sequencer built, which is the whole point of deriving it — the safe head
+/// would fork.
+///
+/// The build that follows is what keeps this from passing for the wrong reason:
+/// an empty derivation block proves nothing on its own if the index were empty,
+/// or if replay had been switched off everywhere. Asserting that the very next
+/// ordinary build does carry the transaction says the index was loaded and
+/// willing, and that the derivation build declined on purpose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_derivation_build_replays_no_unlanded_transaction() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Leave an announced, unlanded transaction behind.
+    hold_a_block_open!(node, Duration::from_millis(500));
+
+    let announced: Vec<B256> = read_journal(&journal_file).iter().map(|e| e.hash).collect();
+    assert!(
+        announced.contains(&hash),
+        "precondition: there must be something in the index for the derivation build to \
+         refuse; journaled={announced:?}",
+    );
+
+    // A derivation slot: attributes with `no_tx_pool` set.
+    let mut attrs = node.payload.next_attributes();
+    attrs.0.no_tx_pool = Some(true);
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let derived = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    assert!(
+        !ordinary_transactions(&derived).contains(&hash),
+        "a derivation build must carry only what its attributes name",
+    );
+
+    // …and the refusal is a decision about this build, not the end of the debt.
+    let ordinary = build_one_block!(node, Duration::from_millis(500));
+    assert!(
+        ordinary_transactions(&ordinary).contains(&hash),
+        "the next ordinary build must still replay it, or the assertion above only \
+         proved the index was empty",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// One sender's nonces are ordered across both sources of the preamble.
+///
+/// The allowlist is keyed on a `(from, to)` pair, so a single sender can hold a
+/// preconf commitment and an ordinary pool transaction at consecutive nonces —
+/// the commitment reaches the next build through the fifo's carryover, the pool
+/// transaction through the unlanded index. Dispatching one source fully before
+/// the other offers the commitment's higher nonce first, the EVM refuses it for
+/// the gap, and for a carried-over entry that refusal is terminal: the
+/// commitment is broken with no second attempt, and no later arm picks it up
+/// because a preconf-eligible transaction is barred from the pool arm.
+///
+/// Nothing else catches that. `order_preamble`'s own unit tests call it
+/// directly, so they stay green when the call site stops using it; this is the
+/// only place the two sources are populated by the node itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_senders_nonces_are_ordered_across_both_preamble_sources() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    // Only `sender → RECIPIENT` is preconf-eligible. `sender → OTHER` is not,
+    // which is what puts the two transactions on two different paths.
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    // Nonce 0 to the unallowlisted payee: an ordinary pool transaction.
+    let pooled = signed_transfer_to(&wallet, chain_id, 0, OTHER).await;
+    let pooled_hash = keccak256(&pooled);
+    node.rpc.inject_tx(pooled).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Held open long enough for the ticker to execute nonce 0, announce it and
+    // prune it — which is what puts it in the unlanded index. This build is
+    // never sealed, so the index still owes it.
+    hold_a_block_open!(node, Duration::from_millis(400));
+
+    // Nonce 1 to the allowlisted payee, committed against the in-flight build.
+    // It is applied there and so ends up `Success` in the fifo; the build then
+    // goes nowhere, the chain nonce never moves, and the entry survives
+    // `sync_fifo_forward_to_head` into the next build's carryover.
+    let committed = signed_transfer_to(&wallet, chain_id, 1, RECIPIENT).await;
+    let committed_hash = keccak256(&committed);
+    let event = send_preconf(&http, committed).await.expect("the commitment is accepted");
+    assert_eq!(event.tx_hash, committed_hash);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let announced: Vec<B256> = read_journal(&journal_file).iter().map(|e| e.hash).collect();
+    assert!(
+        announced.contains(&pooled_hash),
+        "precondition: nonce 0 must have been announced and pruned, else it is still in \
+         the pool and the two sources never meet; journaled={announced:?}",
+    );
+
+    // The build that has to reconcile the two.
+    let payload = build_one_block!(node, Duration::from_millis(600));
+    let landed = ordinary_transactions(&payload);
+
+    assert!(
+        landed.contains(&pooled_hash),
+        "the unlanded pool transaction must land; landed={landed:?}",
+    );
+    assert!(
+        landed.contains(&committed_hash),
+        "and so must the carried-over commitment — offered before its predecessor it is \
+         refused for the nonce gap, terminally; landed={landed:?}",
+    );
+    assert!(
+        landed.iter().position(|h| *h == pooled_hash) <
+            landed.iter().position(|h| *h == committed_hash),
+        "nonce 0 before nonce 1, whichever source each came from; landed={landed:?}",
     );
 
     std::fs::remove_dir_all(&journal_dir).ok();

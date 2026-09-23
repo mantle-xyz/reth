@@ -9,9 +9,12 @@
 
 use super::helpers::{
     PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, mantle_test_chain_spec, send_preconf,
-    wait_pending_nonce,
+    wait_fifo_entry,
 };
-use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_classifier};
+use crate::{
+    canonicalize_payload, launch_preconf_node, launch_preconf_node_with_classifier,
+    launch_preconf_node_with_fifo,
+};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, TxKind, U256, bytes};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -75,9 +78,9 @@ async fn signed_creation(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 /// from any other arm.
 ///
 /// The creation is the one genuinely new end-to-end path. Everything downstream
-/// of classification reads only the frozen `Verdict` — the listener, the
-/// validator, the RPC handler and the payload builder all go through
-/// `verdict(..).is_preconf()` — so *which* arm matched is invisible to them, and
+/// of classification reads only the frozen `Verdict` — admission and the
+/// payload builder both go through `verdict(..).is_preconf()` — so *which* arm
+/// matched is invisible to them, and
 /// the rest of this suite covers them equally well with pairs. What none of it
 /// covered is a transaction with no `to` travelling the whole pipeline, because
 /// until now `to == None` was refused at classification and never got in.
@@ -323,7 +326,7 @@ async fn multi_nonce_same_sender_land_in_one_block() {
 
     let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     let attrs = node.payload.next_attributes();
     let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
@@ -351,10 +354,10 @@ async fn multi_nonce_same_sender_land_in_one_block() {
     // dictates the sealed-block index order asserted below.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    wait_pending_nonce(&http, wallet_addr, 1).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    wait_pending_nonce(&http, wallet_addr, 2).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2).await });
 

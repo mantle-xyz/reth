@@ -29,19 +29,19 @@
 //! it consumes the same `cfg` and `fifo` handles via
 //! [`PreconfServiceBuilder::cfg`] / [`PreconfServiceBuilder::fifo`].
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::NodePrimitives;
-use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::TransactionPool;
 
 use crate::{
     PreconfCanonHandler, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfRpcHandler,
     PreconfTxSet,
+    admission::DynAdmission,
     config::PreconfConfigError,
     flashblocks::{FlashblockProducerConfig, FlashblocksProducerHandles},
-    journal::{JournalError, RestorePool, restore_preconf_state},
+    journal::{JournalError, RestoreSource, restore_preconf_state},
 };
 use thiserror::Error;
 
@@ -81,8 +81,8 @@ pub enum PreconfStartError {}
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
     /// Owns the allowlists and the frozen per-tx verdicts. Built
-    /// here so every consumer — validator, pool listener, payload builder, RPC
-    /// handler — shares one instance; two classifiers would mean two answers.
+    /// here so every consumer — admission, payload builder, canon handler —
+    /// shares one instance; two classifiers would mean two answers.
     classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
     /// Commitment journal — always present. Opened at construction from
@@ -95,6 +95,17 @@ pub struct PreconfServiceBuilder {
     /// Behind an `Arc` so the payload service layer can hold the endpoint open
     /// for as long as it serves it, without holding this whole builder.
     flashblocks: Option<Arc<FlashblocksProducerHandles>>,
+    /// Handed over by the pool-building phase, picked up by the RPC phase.
+    ///
+    /// Admission needs the validator chain, which only exists once the pool
+    /// is being built; the RPC handler is assembled later, from a different
+    /// context. This is the one thing both phases can reach, so it is what
+    /// carries the handle between them.
+    ///
+    /// A trait object because the concrete type is parameterised by that
+    /// validator chain and by the state provider, neither of which this
+    /// builder can name.
+    admission: OnceLock<Arc<dyn DynAdmission>>,
 }
 
 impl PreconfServiceBuilder {
@@ -121,7 +132,14 @@ impl PreconfServiceBuilder {
         let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
-        Ok(Self { cfg, classifier, fifo, journal: Arc::new(journal), flashblocks: None })
+        Ok(Self {
+            cfg,
+            classifier,
+            fifo,
+            journal: Arc::new(journal),
+            flashblocks: None,
+            admission: OnceLock::new(),
+        })
     }
 
     /// Bind the flashblocks endpoint and take ownership of it.
@@ -167,28 +185,17 @@ impl PreconfServiceBuilder {
         &self.journal
     }
 
-    /// Startup hook: replay the journal into the fifo and register the
-    /// fifo → pool eviction callback.
+    /// Startup hook: replay the journal into the fifo.
     ///
-    /// Call once from the pool builder after the pool is up, **before**
-    /// the pool listener + canon handler are spawned so the fifo state
-    /// is populated when they start consuming events.
+    /// Call once from the pool builder after the pool is up, **before** the
+    /// canon handler is spawned, so the fifo state is populated when it starts
+    /// consuming events.
     pub async fn start<P, C>(&self, pool: &P, chain: &C) -> Result<(), PreconfStartError>
     where
-        P: RestorePool + Clone + 'static,
+        P: RestoreSource + Clone + 'static,
         C: crate::journal::CommitmentChainView,
     {
         restore_preconf_state(&self.journal, pool, chain, &self.fifo, &self.classifier).await;
-
-        // Every non-on-chain terminal transition (mark_timeout /
-        // mark_canceled / mark_failed) synchronously removes the tx
-        // from the pool, closing the window where a client-observed
-        // failure could be contradicted by a later on-chain landing
-        // via the pool iterator.
-        let pool_for_evict = pool.clone();
-        self.fifo.set_pool_eviction_callback(Arc::new(move |hash| {
-            pool_for_evict.remove_transactions(vec![hash]);
-        }));
 
         // Every fifo removal path also drops the frozen verdict: on most of
         // them, once the commitment record is gone there is nothing left for
@@ -228,21 +235,33 @@ impl PreconfServiceBuilder {
         P: TransactionPool + 'static,
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
+        // The reverted branch puts commitments back in the queue, which holds
+        // alloy envelopes — see `PreconfCanonHandler`.
+        op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
     {
         PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.classifier.clone())
+    }
+
+    /// Hand admission over from the pool-building phase.
+    ///
+    /// First call wins; a second is dropped. Both the enabled and disabled
+    /// wiring paths run through the same code, and only one of them has a
+    /// validator chain to build admission from.
+    pub fn set_admission(&self, admission: Arc<dyn DynAdmission>) {
+        let _ = self.admission.set(admission);
+    }
+
+    /// Admission, if the pool-building phase got far enough to hand it over.
+    pub fn admission(&self) -> Option<Arc<dyn DynAdmission>> {
+        self.admission.get().cloned()
     }
 
     /// Construct the local-sequencer RPC handler. Returned by value so
     /// the caller can decide whether to wrap in `Arc` (the path through
     /// `MantleRpcExt::new` expects `Arc<dyn DynPreconfHandler>`).
-    pub fn rpc_handler<P, Pr>(&self, pool: P, provider: Pr) -> PreconfRpcHandler<P, Pr>
-    where
-        P: TransactionPool + 'static,
-        Pr: StateProviderFactory + 'static,
-    {
+    pub fn rpc_handler(&self, admission: Arc<dyn DynAdmission>) -> PreconfRpcHandler {
         PreconfRpcHandler::new(
-            pool,
-            provider,
+            admission,
             self.fifo.clone(),
             self.cfg.clone(),
             self.classifier.clone(),
@@ -391,7 +410,7 @@ mod tests {
 
     /// Stub pool used to exercise `PreconfServiceBuilder::start` without
     /// standing up a real reth pool. `start`'s only interaction with the
-    /// pool is via [`RestorePool::add_envelope`], which
+    /// pool is via [`RestoreSource::add_envelope`], which
     /// [`restore_preconf_state`] calls once per journal entry. Since
     /// tests here use empty journals, the stub can panic if reached —
     /// the empty-journal branch never invokes it.
@@ -399,20 +418,24 @@ mod tests {
     struct UnreachablePool;
 
     /// Same reasoning for the chain view: with an empty journal there is no entry
-    /// whose nonce could have been consumed, so nothing asks.
+    /// whose landing could need checking, so the hash is never looked up.
     struct UnreachableChain;
 
     impl crate::journal::CommitmentChainView for UnreachableChain {
+        // Not unreachable: restore asks this for every decoded entry now.
+        // `None` reads as "nonce still free", which is the still-owed path —
+        // exactly what this test wants for its journaled commitment.
+        fn account_nonce(&self, _sender: &alloy_primitives::Address) -> Option<u64> {
+            None
+        }
+
         fn commitment_on_chain(&self, _hash: &alloy_primitives::TxHash) -> crate::journal::OnChain {
             unreachable!("empty journal → restore_preconf_state must not consult the chain")
         }
     }
 
     #[async_trait::async_trait]
-    impl RestorePool for UnreachablePool {
-        async fn contains(&self, _hash: &alloy_primitives::TxHash) -> bool {
-            unreachable!("empty journal → restore_preconf_state must not call the pool")
-        }
+    impl RestoreSource for UnreachablePool {
         fn recover_slot(
             &self,
             _tx_rlp: &alloy_primitives::Bytes,
@@ -424,10 +447,6 @@ mod tests {
             _tx_rlp: &alloy_primitives::Bytes,
         ) -> Result<crate::journal::RestoredEnvelope, crate::journal::RestoreSkip> {
             unreachable!("empty journal → restore_preconf_state must not call the pool")
-        }
-        fn remove_transactions(&self, _hashes: Vec<alloy_primitives::TxHash>) {
-            // No mark_* fires in these tests; the setup asserts only
-            // on fifo state.
         }
     }
 
@@ -468,10 +487,7 @@ mod tests {
             add_calls: Arc<std::sync::Mutex<Vec<Bytes>>>,
         }
         #[async_trait::async_trait]
-        impl RestorePool for RecordingPool {
-            async fn contains(&self, _hash: &TxHash) -> bool {
-                false
-            }
+        impl RestoreSource for RecordingPool {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(alloy_primitives::Address, u64)> {
                 // Same `(from, nonce)` `add_envelope` fabricates below.
                 let seed = tx_rlp.first().copied().unwrap_or(0);
@@ -496,10 +512,6 @@ mod tests {
                     envelope: alloy_consensus::TxEnvelope::Legacy(signed),
                     from: alloy_primitives::Address::from([seed; 20]),
                 })
-            }
-            fn remove_transactions(&self, _hashes: Vec<TxHash>) {
-                // No mark_* fires in this restore-only test; keep
-                // no-op to satisfy the trait.
             }
         }
 
@@ -559,17 +571,13 @@ mod tests {
         struct RejectingPool;
 
         #[async_trait::async_trait]
-        impl RestorePool for RejectingPool {
-            async fn contains(&self, _hash: &TxHash) -> bool {
-                false
-            }
+        impl RestoreSource for RejectingPool {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 Some((Address::from([0xB1; 20]), u64::from(tx_rlp[0])))
             }
             async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
                 Err(RestoreSkip::Rejected("stub refuses to admit".into()))
             }
-            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
         }
 
         let dir = tempfile::TempDir::new().unwrap();

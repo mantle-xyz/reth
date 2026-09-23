@@ -267,6 +267,62 @@ pub fn mantle_chain_spec_with_reverting_contract(chain_id: u64, addr: Address) -
     Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
 }
 
+/// The EIP-7702 delegation designator prefix. An account whose code is
+/// `0xef0100 ‖ <address>` executes that address's code when called, and is
+/// still allowed to send transactions of its own (EIP-3607 carves 7702 out).
+pub const DELEGATION_PREFIX: [u8; 3] = [0xef, 0x01, 0x00];
+
+/// Builds a chainspec in which `account` is an EIP-7702 **delegated** EOA
+/// pointing at `delegate`, and `delegate` holds a trivial contract.
+///
+/// Why genesis rather than a real `SetCode` transaction: a delegation
+/// established by transaction only exists once that transaction is canonical,
+/// which ties every test using one to block-production timing. Writing the
+/// designator into genesis gives the same on-chain state — a non-empty
+/// `bytecode_hash` on `account` — with none of the sequencing.
+///
+/// **The account's genesis balance is preserved.** This matters and is the
+/// reason [`mantle_chain_spec_with_account`] cannot be reused: that helper
+/// replaces the whole alloc entry with `balance: 0x0`, which would leave a
+/// delegated test wallet unable to pay for anything.
+///
+/// `delegate` gets `0x00` (`STOP`) — enough to be a valid call target, and
+/// deliberately inert so a test asserting on a delegated account's *transaction*
+/// is not also asserting on what the delegate does.
+pub fn mantle_chain_spec_with_delegated_account(
+    chain_id: u64,
+    account: Address,
+    delegate: Address,
+) -> Arc<OpChainSpec> {
+    let mut value = patched_genesis_value(chain_id);
+    let alloc = value["alloc"].as_object_mut().expect("genesis.json `alloc` must be an object");
+
+    let designator = {
+        let mut bytes = DELEGATION_PREFIX.to_vec();
+        bytes.extend_from_slice(delegate.as_slice());
+        Bytes::from(bytes)
+    };
+
+    // Merge, not replace: keep whatever balance the fixture funded this
+    // account with. A fresh entry (the `unwrap_or_else` arm) has no balance
+    // to keep, so it gets zero — callers wanting a funded delegated account
+    // must pass one the fixture already funds.
+    let existing = alloc.get(&format!("{account:#x}")).cloned();
+    let balance = existing
+        .as_ref()
+        .and_then(|e| e.get("balance").cloned())
+        .unwrap_or_else(|| serde_json::Value::from("0x0"));
+    alloc.insert(
+        format!("{account:#x}"),
+        serde_json::json!({ "balance": balance, "code": format!("{designator:#x}") }),
+    );
+
+    alloc.insert(format!("{delegate:#x}"), serde_json::json!({ "balance": "0x0", "code": "0x00" }));
+
+    let genesis: Genesis = serde_json::from_value(value).expect("patched genesis deserialises");
+    Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
+}
+
 /// Payload attributes generator for Mantle test chains — matches the
 /// shared helper in `tests/helpers.rs` but scoped to this test binary.
 pub fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
@@ -360,6 +416,7 @@ pub struct PreconfCfgBuilder {
     safety_margin_ms: u64,
     max_gas_per_tx: u64,
     max_gas_per_block: u64,
+    queue_gas_blocks: u64,
     journal_path: Option<PathBuf>,
     journal_max_size: u64,
     whitelist_contract: Address,
@@ -378,6 +435,7 @@ impl Default for PreconfCfgBuilder {
             safety_margin_ms: 40,
             max_gas_per_tx: 2_000_000,
             max_gas_per_block: 6_000_000,
+            queue_gas_blocks: mantle_reth_preconf::DEFAULT_PRECONF_QUEUE_GAS_BLOCKS,
             journal_path: None,
             journal_max_size: PreconfConfig::default().journal_max_size,
             whitelist_contract: WHITELIST_CONTRACT_SENTINEL,
@@ -473,6 +531,12 @@ impl PreconfCfgBuilder {
         self
     }
 
+    /// How many blocks' worth of gas the queue will hold before refusing.
+    pub fn queue_gas_blocks(mut self, blocks: u64) -> Self {
+        self.queue_gas_blocks = blocks;
+        self
+    }
+
     /// Enable the on-disk journal at `path`. Callers are responsible for
     /// choosing a unique tempfile per test.
     pub fn journal_path(mut self, path: PathBuf) -> Self {
@@ -509,6 +573,7 @@ impl PreconfCfgBuilder {
             safety_margin: std::time::Duration::from_millis(self.safety_margin_ms),
             preconf_max_gas_per_tx: self.max_gas_per_tx,
             preconf_max_gas_per_block: self.max_gas_per_block,
+            preconf_queue_gas_blocks: self.queue_gas_blocks,
             journal_path: self.journal_path,
             journal_max_size: self.journal_max_size,
             ..PreconfConfig::default()
@@ -662,24 +727,29 @@ pub async fn send_normal(
     http.request("eth_sendRawTransaction", vec![tx_rlp.to_string()]).await
 }
 
-/// Poll `eth_getTransactionCount(sender, "pending")` until it reaches `want`.
+/// Poll until the preconf queue holds `sender`'s entry at `nonce`.
 ///
-/// Gates same-sender multi-tx submission on observed pool state instead of a
-/// fixed sleep: the pool admits asynchronously, so under load a follow-up tx's
-/// nonce-gap pre-check can run before the prior tx is pending and reject it as a
-/// gap. Panics if the nonce never advances within ~2s.
-pub async fn wait_pending_nonce(http: &HttpClient, sender: Address, want: u64) {
+/// What this replaces waited on `eth_getTransactionCount(sender, "pending")`,
+/// which no longer moves for a preconf transaction: they do not enter the
+/// transaction pool, and the pool's pending nonce is driven by what it holds.
+/// The queue is where they are, so ask it — one hop shorter, and it cannot be
+/// satisfied by anything else.
+///
+/// Gates the case where a test submits one transaction and then a second on
+/// the next nonce: without it, the second can reach admission before the first
+/// is queued and be refused as a nonce gap. Panics if it never arrives.
+pub async fn wait_fifo_entry(
+    fifo: &mantle_reth_preconf::PreconfTxSet,
+    sender: Address,
+    nonce: u64,
+) {
     for _ in 0..100 {
-        let n: U256 = http
-            .request("eth_getTransactionCount", vec![sender.to_string(), "pending".to_string()])
-            .await
-            .expect("eth_getTransactionCount");
-        if n >= U256::from(want) {
+        if fifo.find_by_sender_nonce(&sender, nonce).await.is_some() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    panic!("pending nonce for {sender:?} never reached {want}");
+    panic!("the preconf queue never took {sender:?} nonce {nonce}");
 }
 
 /// Poll `eth_getTransactionCount(sender, "latest")` until it reaches `want` —
@@ -742,7 +812,7 @@ macro_rules! launch_preconf_node {
     };
     ($cfg:expr, $chain_spec:expr) => {
         async {
-            let (node, http, wallet, chain_id, _classifier, _fb) =
+            let (node, http, wallet, chain_id, _classifier, _fifo, _fb) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
@@ -756,7 +826,7 @@ macro_rules! launch_preconf_node {
     // per-block DA limit. `$da` is any `OpDAConfig` expression.
     ($cfg:expr, $chain_spec:expr, da_config = $da:expr) => {
         async {
-            let (node, http, wallet, chain_id, _classifier, _fb) =
+            let (node, http, wallet, chain_id, _classifier, _fifo, _fb) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default()
@@ -809,6 +879,7 @@ macro_rules! launch_preconf_node {
                 .await
                 .expect("preconf svc init");
             let classifier = svc.classifier().clone();
+            let fifo = svc.fifo().clone();
             // Between construction and the move into the node: binding needs
             // `&mut svc`, and the address has to be read out before `svc` is
             // gone, because the port was left to the OS.
@@ -823,7 +894,7 @@ macro_rules! launch_preconf_node {
             )
             .await;
 
-            (node_ctx, http, wallet, chain_id, classifier, flashblocks_addr)
+            (node_ctx, http, wallet, chain_id, classifier, fifo, flashblocks_addr)
         }
     }};
 }
@@ -1190,13 +1261,37 @@ macro_rules! reorg_to {
 macro_rules! launch_preconf_node_with_classifier {
     ($cfg:expr, $chain_spec:expr) => {
         async {
-            let (node, http, wallet, chain_id, classifier, _fb) =
+            let (node, http, wallet, chain_id, classifier, _fifo, _fb) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
                 )
                 .await;
             (node, http, wallet, chain_id, classifier)
+        }
+    };
+}
+
+/// Same as [`launch_preconf_node!`] but also yields the node's
+/// `Arc<PreconfTxSet>` as a fifth element.
+///
+/// For tests that assert on fifo state the RPC surface does not expose — the
+/// account view above all, which by design has no reader outside the crate
+/// until admission consults it.
+#[macro_export]
+macro_rules! launch_preconf_node_with_fifo {
+    ($cfg:expr) => {
+        $crate::launch_preconf_node_with_fifo!($cfg, $crate::helpers::mantle_test_chain_spec())
+    };
+    ($cfg:expr, $chain_spec:expr) => {
+        async {
+            let (node, http, wallet, chain_id, _classifier, fifo, _fb) =
+                $crate::launch_preconf_node!(
+                    @build $cfg, $chain_spec,
+                    |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc)
+                )
+                .await;
+            (node, http, wallet, chain_id, fifo)
         }
     };
 }
@@ -1212,7 +1307,7 @@ macro_rules! launch_flashblocks_node {
     };
     ($cfg:expr, $chain_spec:expr, $fb:expr) => {
         async {
-            let (node, http, wallet, chain_id, _classifier, fb_addr) =
+            let (node, http, wallet, chain_id, _classifier, _fifo, fb_addr) =
                 $crate::launch_preconf_node!(
                     @build $cfg, $chain_spec,
                     |svc| mantle_reth_cli::node::MantleNode::default().with_preconf(svc),

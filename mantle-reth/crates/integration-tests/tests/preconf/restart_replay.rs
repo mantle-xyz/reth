@@ -29,7 +29,7 @@
 //! restart a process.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec};
-use crate::launch_preconf_node;
+use crate::{launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -229,15 +229,13 @@ fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::Pa
 /// mid-replay must not be able to destroy the commitment by timing out.
 ///
 /// Shape: journal restore leaves the entry in the fifo as `Waiting` /
-/// `PreconfSource::Replay` with no responder. `attach_responder` therefore
-/// accepts a same-hash resubmit onto it (see
-/// `preconf_tx_set::tests::attach_responder_accepts_a_resubmit_onto_a_replaying_entry`),
-/// and that resubmit's `handle_inner` reaches the deadline branch with
+/// `PreconfSource::Replay` with no responder. Admission therefore accepts a
+/// same-hash resubmit onto it, and that resubmit's `handle_inner` reaches the
+/// deadline branch with
 /// `final_status == Some(Waiting)`. That branch used to run `mark_timeout`
-/// unconditionally, which makes the commitment replaceable by any same-nonce tx,
-/// sweepable by `clean_reclaimable`, **and** evicts it from the pool — so a
-/// promise whose receipt went out in the previous process would silently never
-/// land.
+/// unconditionally, which makes the commitment replaceable by any same-nonce tx
+/// and sweepable by `clean_reclaimable` — so a promise whose receipt went out in
+/// the previous process would silently never land.
 ///
 /// No payload build is driven until after the deadline, so the RPC call is
 /// guaranteed to hit the deadline path. Two observables, either of which the
@@ -272,7 +270,8 @@ async fn an_rpc_deadline_does_not_time_out_a_replaying_commitment() {
         .preconf_timeout_ms(150)
         .build();
 
-    let (mut node, http, _node_wallet, _launched_chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, _node_wallet, _launched_chain_id, fifo) =
+        launch_preconf_node_with_fifo!(cfg).await;
 
     // Restore has already re-injected the tx and pushed a `Replay` fifo entry.
     // Resubmitting the same hash attaches a fresh responder to that live entry;
@@ -284,11 +283,12 @@ async fn an_rpc_deadline_does_not_time_out_a_replaying_commitment() {
         "this client's request times out — that part is expected",
     );
 
-    // Observable 1: the commitment is still in the pool. `mark_timeout` fires the
-    // pool-eviction hook, so a regression empties it.
-    assert_eq!(
-        reth_transaction_pool::TransactionPool::pool_size(&node.inner.pool).total,
-        1,
+    // Observable 1: the commitment is still queued. This used to read the
+    // transaction pool, because restore put a copy there and `mark_timeout`
+    // evicted it; commitments do not enter the pool any more, so the queue is
+    // the only place the survival is visible — and the more direct one.
+    assert!(
+        fifo.contains(&tx_hash).await,
         "the replaying commitment must survive this client's timeout",
     );
 
@@ -619,9 +619,8 @@ async fn empty_journal_file_starts_normally() {
     assert_eq!(launched_chain_id, chain_id);
 
     // Sanity-check: startup completed and the RPC still accepts a
-    // fresh preconf tx. If restore-of-empty-file corrupted anything
-    // (e.g. left `pending_responders` in a weird state), this would
-    // fail either at the RPC layer or during dispatch.
+    // fresh preconf tx. If restore-of-empty-file corrupted any of the queue's
+    // state, this would fail either at the RPC layer or during dispatch.
     let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
     let expected_hash = keccak256(&raw_tx);
 

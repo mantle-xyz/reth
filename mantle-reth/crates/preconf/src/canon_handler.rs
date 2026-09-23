@@ -16,37 +16,34 @@
 //!   fanout of `CanonStateNotification` races the next FCU — a new job could otherwise observe a
 //!   stale `Success` entry and replay it via `reset_success_to_waiting`.
 //! - **Reverted chain**: `classifier.uncommit` withdraws the "seen on chain" observation for every
-//!   reverted transaction, **keeping the promise record and the `(sender, nonce)` slot** — the
-//!   commitment is live again and must still refuse a same-nonce replacement. Its return value is
-//!   the `reorg_drift` signal. No recovery action is taken here: reorg reinject is delegated to the
-//!   reth pool's own reset flow (`transaction-pool/src/maintain.rs` re-admits pruned txs via
-//!   `add_external_transactions`), which the preconf pool listener picks up on the next new-pending
-//!   event and pushes into the fifo with `PreconfSource::Replay`. The client-observed
-//!   `block_height` may drift for reorged commitments; op-geth has the same behavior.
+//!   reverted transaction, **keeping the promise record and the `(sender, nonce)` slot**, and every
+//!   commitment among them is pushed back into the queue as a replay. The commitment is live again
+//!   and must still refuse a same-nonce replacement. Its return value is the `reorg_drift` signal.
+//!   Re-injection happens here: each commitment the reverted chain carried is pushed back with
+//!   `PreconfSource::Replay`. The client-observed `block_height` may drift for reorged commitments;
+//!   op-geth has the same behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
 //! then spawned as a `spawn_critical_task` on the reth task executor.
 //! Returns when the broadcast subscription's sender side closes (typically
 //! at node shutdown).
 
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, sync::Arc};
 
 use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
 use futures::StreamExt;
+use op_alloy_consensus::OpTxEnvelope;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_execution_types::Chain;
 use reth_primitives_traits::NodePrimitives;
 use reth_storage_api::BlockNumReader;
 use reth_transaction_pool::TransactionPool;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
-use crate::{PreconfClassifier, preconf_tx_set::PreconfTxSet};
-
-/// Max age for an unconsumed `pending_responders` slot before the canon sweep
-/// drops it. Well beyond any realistic `preconf_timeout` so an in-flight
-/// responder is never evicted early (see
-/// [`PreconfTxSet::expire_pending_responders`]).
-const PENDING_RESPONDER_TTL: Duration = Duration::from_secs(60);
+use crate::{
+    PreconfClassifier, admission::op_envelope_to_alloy, preconf_tx_set::PreconfTxSet,
+    types::PreconfSource,
+};
 
 /// Long-running async task bridging `CanonStateNotification` events to
 /// [`PreconfTxSet`] cleanup.
@@ -85,6 +82,10 @@ where
     P: TransactionPool + 'static,
     N: NodePrimitives,
     N::SignedTx: Transaction + TxHashRef,
+    // The queue holds alloy envelopes; a reverted commitment has to be
+    // converted before it can go back in. Satisfied for any OP-stack
+    // primitives by `impl From<OpTransactionSigned> for OpTxEnvelope`.
+    OpTxEnvelope: From<N::SignedTx>,
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
     ///
@@ -188,17 +189,6 @@ where
                 );
             }
 
-            // Backstop GC for orphaned RPC responders (see
-            // `PreconfTxSet::expire_pending_responders`).
-            let expired = self.fifo.expire_pending_responders(PENDING_RESPONDER_TTL).await;
-            if expired > 0 {
-                debug!(
-                    target: "mantle::preconf::canon",
-                    expired,
-                    "swept orphaned pending preconf responders",
-                );
-            }
-
             // Verdict-cache sweep. Runs unconditionally: its target is the leak
             // `drop_hash` cannot reach — a tx classified at admission that sits
             // in `Queued`, never emits a `Pending` event, and so never gets a
@@ -253,6 +243,39 @@ where
                      re-applied (reorg_drift)"
                 );
                 metrics::counter!("preconf.canon.reorg_drift_total").increment(1);
+
+                // And put it back, because nothing else will. The queue entry
+                // is gone by now — it was removed when the commitment landed —
+                // so `uncommit` alone would leave a promise nobody is going to
+                // keep.
+                //
+                // The transaction comes from the reverted chain itself, which
+                // carries it whole; there is no need to ask the journal, and
+                // no window in which the chain has dropped it but the journal
+                // has not caught up.
+                //
+                // `Replay`, not `Rpc`: the receipt went out before the reorg,
+                // so this is a commitment being honoured rather than a fresh
+                // request, and the dispatch gates that protect a waiting
+                // client must not apply to it.
+                let signer = recovered.signer();
+                let (signed, _) = recovered.into_parts();
+                match op_envelope_to_alloy(OpTxEnvelope::from(signed)) {
+                    Some(envelope) => {
+                        self.fifo
+                            .push_if_absent(Arc::new(envelope), signer, PreconfSource::Replay)
+                            .await;
+                    }
+                    // A commitment is always one of the user types, so this
+                    // says the reverted block held a system transaction we had
+                    // somehow recorded as ours. Loud rather than silent: it
+                    // would mean the promise bookkeeping is wrong.
+                    None => error!(
+                        target: "mantle::preconf::canon",
+                        ?hash,
+                        "a reverted commitment is not a user transaction; not replaying it"
+                    ),
+                }
             }
         }
     }

@@ -11,9 +11,27 @@
 //! (`get_pending_nonce_and_cumulative_cost`) rejects it before pool
 //! admission — the same "surface it synchronously" contract as the nonce-gap
 //! pre-check.
+//!
+//! ## Both transactions are preconf, and that is load-bearing
+//!
+//! The cumulative sum is over the sender's *preconf* chain. Today that happens
+//! to be computed from the pool, which also holds the sender's ordinary
+//! transactions; in the direct-admission design it is computed from the preconf
+//! queue alone. **This test is unaffected** — both transactions are preconf
+//! either way — which is why it carries no `#[ignore]`.
+//!
+//! The mixed case (an *ordinary* transaction eating the balance, then a preconf
+//! one) is not covered here, and not by omission. It is unreachable through the
+//! RPC: an ordinary transaction the preconf view cannot see also makes the
+//! nonce after it read as a gap, so the nonce rule refuses the submission
+//! before the balance is ever consulted. The one window where the two come
+//! apart — the ordinary transaction already executed in the block being built,
+//! so the nonce has moved but the on-chain balance has not — needs a mid-block
+//! observation point that only the flashblocks harness provides, and belongs
+//! with the cumulative-cost computation itself rather than here.
 
 use super::helpers::{PreconfCfgBuilder, send_preconf};
-use crate::launch_preconf_node;
+use crate::launch_preconf_node_with_fifo;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -61,7 +79,7 @@ async fn cumulative_balance_shortfall_rejects_second_tx() {
         .preconf_timeout_ms(10_000)
         .build();
 
-    let (_node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (_node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // On-chain balance `B`. Each tx carries `value ≈ 0.6 B`: affordable alone
     // (`0.6 B < B`), but two together (`1.2 B`) exceed `B`.
@@ -75,30 +93,15 @@ async fn cumulative_balance_shortfall_rejects_second_tx() {
     let tx0 = signed_transfer_value(chain_id, &wallet, 0, value_each).await;
     let tx1 = signed_transfer_value(chain_id, &wallet, 1, value_each).await;
 
-    // tx0 in-flight: admitted to the pool's pending sub-pool (affordable, next
-    // nonce) and blocks awaiting a commitment we never build. Poll until the
-    // pending nonce reflects it, so tx1's step-2 pre-check sees tx0's cost as
-    // already-committed rather than treating tx1 as a nonce gap.
+    // tx0 in-flight: queued and blocking on a commitment we never build.
+    // Waiting for it to be queued is what makes tx1 a successor whose cost
+    // adds to tx0's, rather than a nonce gap.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
+    super::helpers::wait_fifo_entry(&fifo, sender, 0).await;
 
-    let mut tx0_pending = false;
-    for _ in 0..40 {
-        let pending_nonce: U256 = http
-            .request("eth_getTransactionCount", vec![sender.to_string(), "pending".to_string()])
-            .await
-            .expect("eth_getTransactionCount");
-        if pending_nonce == U256::from(1) {
-            tx0_pending = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(tx0_pending, "tx0 must be pending before tx1 is submitted");
-
-    // tx1: cumulative cost (tx0 + tx1 ≈ 1.2 B) exceeds `B`. Step-2 rejects
-    // synchronously with `InsufficientFunds`, before pool admission — the
-    // client does not wait out `preconf_timeout`.
+    // tx1: the two together (≈1.2 B) exceed `B`. Refused synchronously, so
+    // the client does not wait out `preconf_timeout`.
     let err = send_preconf(&http, tx1)
         .await
         .expect_err("tx1 must be rejected for insufficient cumulative funds");

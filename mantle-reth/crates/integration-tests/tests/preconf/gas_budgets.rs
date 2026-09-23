@@ -9,13 +9,12 @@
 //! revivable in the next slot via `push_if_absent`'s reclaimable-
 //! revive branch (mirrors Timeout recovery in `timeout.rs`).
 //!
-//! The per-tx ceiling (`cfg.preconf_max_gas_per_tx`, enforced by
-//! `PreconfAwareValidator` before the fifo) lives in
-//! `validation_reject.rs` — it's a pre-fifo rejection path, not part
-//! of the dispatch-time budget accounting.
+//! The per-tx ceiling (`cfg.preconf_max_gas_per_tx`, enforced at admission
+//! before the fifo) lives in `validation_reject.rs` — it's a pre-fifo
+//! rejection path, not part of the dispatch-time budget accounting.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf, wait_pending_nonce};
-use crate::{canonicalize_payload, launch_preconf_node};
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_fifo_entry};
+use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -72,7 +71,7 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
         .max_gas_per_block(50_000)
         .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // Start the build so the RPCs have a running payload job to dispatch into.
     let attrs = node.payload.next_attributes();
@@ -99,10 +98,10 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
     // `PoolRejected(nonce gap)` instead of the block-gas-budget gate under test.
     let http_clone = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_clone, tx0).await });
-    wait_pending_nonce(&http, wallet_addr, 1).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_clone = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_clone, tx1).await });
-    wait_pending_nonce(&http, wallet_addr, 2).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_clone = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_clone, tx2).await });
 
@@ -161,11 +160,9 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
         other => panic!("expected Call error, got {other:?}"),
     }
 
-    // SLA guard: tx0/tx1 must land, tx2 must NOT — the per-block gas
-    // budget gate marks tx2 `Canceled` (`dispatch.rs`
-    // `apply_one_preconf`), which fires the fifo-layer pool-eviction
-    // callback. A regression in either step would let the pool arm pack
-    // the rejected tx into the block despite the client seeing an Err.
+    // SLA guard: tx0/tx1 must land, tx2 must NOT — the per-block gas budget
+    // gate marks tx2 `Canceled` (`dispatch.rs`, `apply_one_preconf`), and a
+    // `Canceled` entry is skipped by carryover in every later build.
     let sealed: Vec<alloy_primitives::B256> = payload
         .block()
         .body()
@@ -179,11 +176,10 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
         "SLA violation: budget-gate-rejected tx2 {tx2_hash:?} must NOT land in the block; sealed={sealed:?}",
     );
 
-    // first-layer SLA guard: tx2 must be gone from the pool. The
-    // pool-eviction callback fires from `mark_canceled` inside
-    // `apply_one_preconf`'s block-gas-budget gate; if it ever regresses,
-    // this asserts before the pool arm has a chance to reseat tx2 into
-    // a later block.
+    // Trivially true now — preconf transactions never enter the pool — and
+    // kept for exactly that reason: it is what would go red if anything
+    // started putting them there, which is the one way the pool arm could
+    // reseat a canceled commitment into a later block.
     assert!(
         reth_transaction_pool::TransactionPool::get(&node.inner.pool, &tx2_hash).is_none(),
         "block-gas-budget-canceled tx2 {tx2_hash:?} must be evicted from the pool",
@@ -198,7 +194,7 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
 /// deadline. Guards the must-land SLA's promise that Canceled is not terminal.
 ///
 /// Two determinism gates keep this stable under parallel load:
-/// `wait_pending_nonce` (slot-1 nonce-gap race) and `wait_latest_nonce`
+/// `wait_fifo_entry` (slot-1 nonce-gap race) and `wait_latest_nonce`
 /// (slot-2 canon-settlement race — without it the slot-2 job re-applies the
 /// still-`Success` tx0/tx1 before canon-`forward` drops them, exhausting the
 /// budget before tx2's retry).
@@ -218,7 +214,7 @@ async fn canceled_tx_recoverable_in_next_slot() {
         .preconf_timeout_ms(3_000)
         .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // ── Slot 1: tx0/tx1 land, tx2 rejected (Canceled) ────────────────
     let attrs = node.payload.next_attributes();
@@ -243,10 +239,10 @@ async fn canceled_tx_recoverable_in_next_slot() {
     // pool's async admission and reject it as a gap under load.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    wait_pending_nonce(&http, wallet_addr, 1).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    wait_pending_nonce(&http, wallet_addr, 2).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_c = http.clone();
     let tx2_first_send = tx2.clone();
     let t2_first = tokio::spawn(async move { send_preconf(&http_c, tx2_first_send).await });
@@ -503,7 +499,7 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
         .preconf_timeout_ms(1_500)
         .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     let attrs = node.payload.next_attributes();
     let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
@@ -527,10 +523,10 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     // admission and is rejected as a gap under load.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    wait_pending_nonce(&http, wallet_addr, 1).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    wait_pending_nonce(&http, wallet_addr, 2).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_c = http.clone();
     let tx2_first = tx2.clone();
     let t2_first = tokio::spawn(async move { send_preconf(&http_c, tx2_first).await });
