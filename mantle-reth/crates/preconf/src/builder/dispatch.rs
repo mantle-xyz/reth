@@ -4,10 +4,10 @@
 //! The select! main loop inside `build_payload` calls these helpers
 //! one hash at a time. Four invariants are enforced for every hash:
 //!
-//! - **Dedup**: a hash already in `committed` or `excluded` is short-circuited before any fifo /
-//!   EVM work.
-//! - **Status gate**: only `Waiting` entries proceed; terminal entries are recorded as excluded and
-//!   skipped.
+//! - **Dedup**: a hash already committed in this build is short-circuited before any fifo / EVM
+//!   work, so it cannot enter the same block twice.
+//! - **Status gate**: only `Waiting` entries proceed; terminal entries are skipped. A same-hash
+//!   resubmit revives a reclaimable entry and is judged afresh.
 //! - **Pre-apply deadline**: when `entry.inserted_at.elapsed() + safety_margin >= preconf_timeout`,
 //!   the tx is *not* applied; the fifo entry is flipped to `Timeout` and the responder is cancelled
 //!   directly here. This closes the race where the RPC client has already given up but the builder
@@ -72,10 +72,6 @@ pub(super) enum BlockKind {
 pub(super) struct LoopState {
     /// Hashes already committed to the in-flight block.
     committed: HashSet<TxHash>,
-    /// Hashes excluded — terminal-non-success, deadline-skip, etc., mapped to
-    /// the reason recorded the first time. Read by the dedup gate in
-    /// `apply_one_preconf`.
-    excluded: HashMap<TxHash, PreconfError>,
     /// Predicted L2 block height for this slot. Stamped onto every
     /// receipt as `PreconfReceipt::block_height`.
     predicted_height: u64,
@@ -96,7 +92,6 @@ impl LoopState {
     pub(super) fn new(predicted_height: u64) -> Self {
         Self {
             committed: HashSet::new(),
-            excluded: HashMap::new(),
             predicted_height,
             preconf_gas_used: 0,
             blocked_senders: HashMap::new(),
@@ -138,19 +133,9 @@ impl LoopState {
         self.preconf_gas_used
     }
 
-    /// `true` iff the hash was recorded as committed (apply succeeded).
-    /// Callers use this to distinguish "already applied, silently skip"
-    /// from "already excluded, forward the recorded rejection reason".
+    /// `true` iff this build already applied the hash into its in-flight block.
     pub(super) fn is_committed(&self, hash: &TxHash) -> bool {
         self.committed.contains(hash)
-    }
-
-    /// If `hash` was previously excluded in this loop instance, return the
-    /// stored rejection reason. `None` when the hash is unseen or was
-    /// committed. See `apply_one_preconf`'s dedup gate for what callers do
-    /// with it.
-    pub(super) fn excluded_reason(&self, hash: &TxHash) -> Option<&PreconfError> {
-        self.excluded.get(hash)
     }
 
     /// Mark hash as committed. Idempotent.
@@ -158,28 +143,10 @@ impl LoopState {
         self.committed.insert(hash);
     }
 
-    /// Mark hash as excluded with the rejection reason. The first exclusion
-    /// wins, so the reason a client sees stays stable across the build.
-    pub(super) fn record_excluded(&mut self, hash: TxHash, reason: PreconfError) {
-        self.excluded.entry(hash).or_insert(reason);
-    }
-
-    /// Drop a hash from the excluded map — only for the stale-`Timeout` case
-    /// in `apply_one_preconf`'s dedup gate.
-    pub(super) fn clear_excluded(&mut self, hash: &TxHash) {
-        self.excluded.remove(hash);
-    }
-
     /// Number of committed hashes — used by tests/metrics.
     #[cfg(test)]
     pub(super) fn committed_len(&self) -> usize {
         self.committed.len()
-    }
-
-    /// Number of excluded hashes — used by tests/metrics.
-    #[cfg(test)]
-    pub(super) fn excluded_len(&self) -> usize {
-        self.excluded.len()
     }
 }
 
@@ -210,67 +177,24 @@ pub(super) async fn apply_one_preconf<F>(
 where
     F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, ApplyError>,
 {
-    // Dedup — short-circuit if we've already decided on this hash in this
-    // build. Committed hashes return silently (their responder was consumed by
-    // `take_responder`); excluded hashes forward the stored reason so a
-    // same-slot resubmit sees the first attempt's error instead of waiting out
-    // `preconf_timeout`.
-    //
-    // A prior `Timeout` is the exception: admission refreshes `inserted_at` on
-    // a same-hash resubmit, so the deadline that fired for the first submission
-    // does not bind the second. Forwarding it would deny
-    // service to a legitimately re-eligible tx, so drop the stale exclusion and
-    // let the gate below re-decide against the fresh clock.
+    // A hash already applied into this block must not enter it twice. Rejections
+    // are not remembered here: they belong to the fifo entry, and a resubmit
+    // that revives the entry is a new attempt.
     if loop_state.is_committed(&hash) {
         trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; already committed");
         return Ok(());
     }
-    if let Some(reason) = loop_state.excluded_reason(&hash).cloned() {
-        if matches!(reason, PreconfError::Timeout { .. }) {
-            trace!(
-                target: "mantle::preconf::dispatch",
-                ?hash,
-                "prior exclusion was Timeout; clearing to re-evaluate against refreshed inserted_at"
-            );
-            loop_state.clear_excluded(&hash);
-            // Fall through to gate evaluation.
-        } else {
-            trace!(
-                target: "mantle::preconf::dispatch",
-                ?hash, ?reason,
-                "dedup hit; forwarding prior rejection to any pending responder"
-            );
-            fifo.cancel_responder(&hash, reason).await;
-            return Ok(());
-        }
-    }
-
     let Some(entry) = fifo.find_by_hash(&hash).await else {
         trace!(target: "mantle::preconf::dispatch", ?hash, "no fifo entry; skipping");
         return Ok(());
     };
 
     if entry.status != PreconfStatus::Waiting {
-        // Already terminal — either a prior iteration finished it or
-        // the RPC timeout flipped it. Record so the next broadcast
-        // event short-circuits at the dedup gate above; the reason is
-        // derived from the terminal status since we did not run the
-        // gate ourselves.
-        let reason = match entry.status {
-            PreconfStatus::Timeout => {
-                PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
-            }
-            // A `Replay`-source `Failed` is a commitment we could not honour;
-            // an `Rpc`-source one is a rejection its client is still waiting to
-            // hear about. The source is what tells the two apart.
-            PreconfStatus::Failed if entry.source == PreconfSource::Replay => {
-                PreconfError::CommitmentBroken
-            }
-            other => PreconfError::Internal(format!(
-                "preconf entry already terminal ({other:?}) at dispatch entry"
-            )),
-        };
-        loop_state.record_excluded(hash, reason);
+        trace!(
+            target: "mantle::preconf::dispatch",
+            ?hash, status = ?entry.status,
+            "entry no longer Waiting; skipping"
+        );
         return Ok(());
     }
 
@@ -317,8 +241,7 @@ where
         metrics::counter!("preconf.dispatch.deadline_skipped_total").increment(1);
         let _ = fifo.mark_timeout(&hash).await;
         let reason = PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
-        fifo.cancel_responder(&hash, reason.clone()).await;
-        loop_state.record_excluded(hash, reason);
+        fifo.cancel_responder(&hash, reason).await;
         return Ok(());
     }
 
@@ -351,8 +274,7 @@ where
             used: loop_state.preconf_gas_used,
             limit: tx_gas_limit,
         };
-        fifo.cancel_responder(&hash, reason.clone()).await;
-        loop_state.record_excluded(hash, reason);
+        fifo.cancel_responder(&hash, reason).await;
         return Ok(());
     }
 
@@ -365,12 +287,8 @@ where
     // client. Guarantees "wire Timeout ⇒ tx not committed to builder
     // state".
     let Some(_apply_guard) = fifo.lock_for_apply(&hash).await else {
-        // Entry vanished between the gate reads above and this
-        // acquisition — very rare (raced with `drop_hash`). Skip.
-        loop_state.record_excluded(
-            hash,
-            PreconfError::Internal("preconf entry vanished before apply_lock".into()),
-        );
+        // Entry vanished between the gate reads above and this acquisition.
+        trace!(target: "mantle::preconf::dispatch", ?hash, "entry vanished before apply_lock");
         return Ok(());
     };
 
@@ -387,20 +305,6 @@ where
             ?hash, status = ?re_entry.status,
             "status flipped before we acquired apply_lock; skipping apply"
         );
-        let reason = match re_entry.status {
-            PreconfStatus::Timeout => {
-                PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 }
-            }
-            // See the same split at dispatch entry: a `Replay`-source `Failed`
-            // is a commitment we could not honour, not an RPC rejection.
-            PreconfStatus::Failed if re_entry.source == PreconfSource::Replay => {
-                PreconfError::CommitmentBroken
-            }
-            other => PreconfError::Internal(format!(
-                "preconf entry flipped to {other:?} before apply_lock"
-            )),
-        };
-        loop_state.record_excluded(hash, reason);
         return Ok(());
     }
 
@@ -471,7 +375,6 @@ where
                 "preconf apply rejected tx; marking entry as Failed"
             );
             metrics::counter!("preconf.tx.failure_total").increment(1);
-            loop_state.record_excluded(hash, err.clone());
             if let Err(e) = fifo.mark_failed(&hash).await {
                 trace!(
                     target: "mantle::preconf::dispatch",
@@ -527,9 +430,6 @@ where
                 "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
             );
             metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
-            // Load-bearing: without it a later broadcast event — or the
-            // `Lagged` arm's snapshot re-scan — would re-apply it in this block.
-            loop_state.record_excluded(hash, PreconfError::CommitmentBroken);
             if let Err(e) = fifo.mark_failed(&hash).await {
                 trace!(
                     target: "mantle::preconf::dispatch",
@@ -765,7 +665,6 @@ mod tests {
 
         // Loop state recorded.
         assert_eq!(state.committed_len(), 1);
-        assert_eq!(state.excluded_len(), 0);
 
         // Fifo entry transitioned to Success.
         let entry = fifo.find_by_hash(&hash).await.unwrap();
@@ -837,9 +736,8 @@ mod tests {
         let err = resp_rx.await.expect("responder closed").expect_err("must be Timeout");
         assert!(matches!(err, PreconfError::Timeout { .. }));
 
-        // Loop state recorded exclusion (not commit).
+        // The transaction was not committed.
         assert_eq!(state.committed_len(), 0);
-        assert_eq!(state.excluded_len(), 1);
 
         // Fifo entry is now Timeout.
         let entry = fifo.find_by_hash(&hash).await.unwrap();
@@ -848,8 +746,7 @@ mod tests {
 
     /// Same-slot client resubmit after a Timeout: the deadline gate fires, the
     /// client resubmits (refreshing `inserted_at`), and the second dispatch
-    /// clears the stale exclusion and applies successfully. Steps are marked in
-    /// the body.
+    /// judges the revived entry afresh and applies successfully.
     ///
     /// Locks the "Timeout is not a stable exclusion" invariant — a regression
     /// that forwarded the stored Timeout via `cancel_responder` would deny
@@ -877,7 +774,6 @@ mod tests {
         // First dispatch: Timeout via deadline gate.
         let err = resp_rx1.await.expect("responder closed").expect_err("must be Timeout");
         assert!(matches!(err, PreconfError::Timeout { .. }));
-        assert_eq!(state.excluded_len(), 1);
         assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Timeout,);
 
         // Step 2: client resubmit — refresh `inserted_at`, revive to Waiting.
@@ -890,17 +786,45 @@ mod tests {
             "revive must flip status back to Waiting",
         );
 
-        // Step 3: second dispatch. Dedup CLEARS the stale Timeout and
-        // falls through; deadline gate reads fresh inserted_at (< 50ms)
-        // and passes; apply succeeds.
+        // Step 3: the revived entry is judged against the fresh clock.
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
-        assert_eq!(state.excluded_len(), 0, "stale Timeout exclusion must be cleared");
         assert_eq!(state.committed_len(), 1, "second dispatch must apply successfully");
 
         // Fresh responder observes the receipt from the successful apply.
         let receipt = resp_rx2.await.expect("responder closed").expect("must be Ok");
         assert!(receipt.status);
+    }
+
+    #[tokio::test]
+    async fn a_resubmit_after_rejection_gets_a_fresh_result() {
+        use std::time::Instant;
+
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x7a);
+        let hash = *tx.tx_hash();
+        let (first_resp, first_rx) = oneshot::channel();
+        fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, Instant::now(), first_resp).await);
+
+        let mut state = LoopState::new(1);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err).await.unwrap();
+        assert!(matches!(first_rx.await.unwrap(), Err(PreconfError::BuilderRejected(_))));
+        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Failed);
+
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Revived
+        ));
+        let (second_resp, second_rx) = oneshot::channel();
+        assert!(fifo.set_responder(hash, Instant::now(), second_resp).await);
+
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
+
+        let receipt = second_rx.await.unwrap().expect("the retry must get its own result");
+        assert_eq!(receipt.tx_hash, hash);
+        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Success);
     }
 
     #[tokio::test]
@@ -921,9 +845,8 @@ mod tests {
         let err = resp_rx.await.expect("responder closed").expect_err("must be Err");
         assert!(matches!(err, PreconfError::BuilderRejected(_)));
 
-        // Loop state recorded exclusion, NOT commit.
+        // The transaction was not committed.
         assert_eq!(state.committed_len(), 0);
-        assert_eq!(state.excluded_len(), 1);
 
         // Fifo entry transitioned to Failed (not Success). Both sources land
         // there; only the reporting differs — see
@@ -968,11 +891,7 @@ mod tests {
         assert_eq!(entry.status, PreconfStatus::Failed, "terminal on the first failure");
         assert!(entry.status.is_replaceable(), "and the nonce is released");
         assert_eq!(entry.source, PreconfSource::Replay, "the source is what marks it a breach");
-        // Recorded as excluded so a second broadcast in *this* block cannot try
-        // to apply it again.
-        assert_eq!(state.excluded_len(), 1);
         assert_eq!(state.committed_len(), 0);
-        assert!(matches!(state.excluded_reason(&hash), Some(PreconfError::CommitmentBroken)));
     }
 
     /// A `Fatal` apply error must **not** break the commitment.
@@ -1009,11 +928,6 @@ mod tests {
             entry.status.is_active(),
             "a fatal environment error must leave the commitment live, not broken",
         );
-        assert_eq!(
-            state.excluded_len(),
-            0,
-            "nor exclude it from this slot — the build is being abandoned, not the tx",
-        );
     }
 
     /// A broken commitment must not be applied by later jobs — dispatch's
@@ -1044,7 +958,7 @@ mod tests {
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
         assert_eq!(calls.get(), 0, "a broken commitment must not be re-applied");
-        assert!(matches!(next_state.excluded_reason(&hash), Some(PreconfError::CommitmentBroken),));
+        assert_eq!(next_state.committed_len(), 0);
     }
 
     /// A FATAL apply error (DB / header / fatal precompile) must abort the
@@ -1080,9 +994,8 @@ mod tests {
             "fatal must not mark the entry terminal — it stays revivable for retry"
         );
 
-        // 3. Neither committed nor excluded — the commitment is untouched.
+        // 3. The commitment is untouched.
         assert_eq!(state.committed_len(), 0);
-        assert_eq!(state.excluded_len(), 0, "fatal must not record the tx as excluded");
 
         // 4. Responder still attached (not consumed) so the client keeps waiting for the retry
         //    rather than receiving a spurious error.
@@ -1128,7 +1041,6 @@ mod tests {
         assert_eq!(receipt.gas_used, 21_000);
         assert_eq!(state.preconf_gas_used(), 21_000);
         assert_eq!(state.committed_len(), 1);
-        assert_eq!(state.excluded_len(), 0);
     }
 
     /// Over budget: `used + tx.gas_limit > preconf_max_gas_per_block`
@@ -1167,9 +1079,8 @@ mod tests {
             other => panic!("expected BlockGasBudgetExceeded, got {other:?}"),
         }
 
-        // Loop state: excluded, NOT committed. preconf_gas_used unchanged.
+        // Not committed; preconf_gas_used is unchanged.
         assert_eq!(state.committed_len(), 0);
-        assert_eq!(state.excluded_len(), 1);
         assert_eq!(state.preconf_gas_used(), 21_000);
 
         // Fifo entry flipped to Canceled — server pre-apply rejected,
@@ -1237,20 +1148,17 @@ mod tests {
 
         assert_eq!(call_count.get(), 0, "apply_fn must not be invoked when entry missing");
         assert_eq!(state.committed_len(), 0);
-        assert_eq!(state.excluded_len(), 0, "must NOT record excluded — future re-push allowed");
         assert_eq!(state.preconf_gas_used(), 0);
     }
 
     /// Gate ③ — `entry.status != Waiting`. Terminal / reclaimable
-    /// entries reach `apply_one_preconf` when a stale broadcast event
-    /// fires post-transition. They must be recorded as excluded (so the
-    /// next broadcast for the same hash short-circuits at gate ①) and
-    /// must NOT invoke `apply_fn` or touch responders.
+    /// entries reach `apply_one_preconf` when a stale broadcast event fires
+    /// post-transition. They must not invoke `apply_fn` or touch responders.
     ///
     /// Run once per non-Waiting variant so any future state added to
     /// `PreconfStatus` gets caught if it's not handled by the gate.
     #[tokio::test]
-    async fn non_waiting_status_records_excluded_and_skips_apply() {
+    async fn non_waiting_status_skips_apply_and_leaves_the_responder_alone() {
         use std::cell::Cell;
         for pre_status in [
             PreconfStatus::Success,
@@ -1287,7 +1195,6 @@ mod tests {
 
             assert_eq!(call_count.get(), 0, "apply_fn must not run when status={pre_status:?}",);
             assert_eq!(state.committed_len(), 0);
-            assert_eq!(state.excluded_len(), 1, "must record_excluded for status={pre_status:?}");
             // Responder untouched — the entry's terminal transition path
             // (mark_succeeded/failed/timeout/canceled) is responsible for
             // resolving the responder; the dispatch loop must NOT double-send.
@@ -1330,7 +1237,6 @@ mod tests {
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal-replayed tx must apply despite deadline");
-        assert_eq!(state.excluded_len(), 0);
         let entry = fifo.find_by_hash(&hash).await.unwrap();
         assert_eq!(entry.status, PreconfStatus::Success);
     }
@@ -1357,7 +1263,6 @@ mod tests {
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "journal tx must apply despite over-budget");
-        assert_eq!(state.excluded_len(), 0);
         assert_eq!(
             state.preconf_gas_used(),
             42_000,
@@ -1395,7 +1300,6 @@ mod tests {
         apply_one_preconf(&fifo, &cfg, None, r_hash, &mut state, synthetic_ok).await.unwrap();
 
         assert_eq!(state.committed_len(), 1, "only the journal tx committed");
-        assert_eq!(state.excluded_len(), 1, "RPC tx was gated out");
         let j_entry = fifo.find_by_hash(&j_hash).await.unwrap();
         assert_eq!(j_entry.status, PreconfStatus::Success);
         let r_entry = fifo.find_by_hash(&r_hash).await.unwrap();

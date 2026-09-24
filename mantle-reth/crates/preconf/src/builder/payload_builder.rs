@@ -79,7 +79,7 @@ use crate::{
     },
     journal::PreconfJournal,
     preconf_tx_set::TxEntryView,
-    types::{PreconfError, PreconfReceipt, PreconfSource},
+    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
 };
 
@@ -594,6 +594,13 @@ fn barred_by_allowlist(
     !cfg.all_preconfs && source != PreconfSource::Replay && !whitelist.is_eligible(from, to)
 }
 
+/// Admission gates have work only for a live entry that this build has not
+/// already applied. The gates mutate `blocked_senders`, so running them for a
+/// settled hash can incorrectly block its same-sender successors.
+fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: PreconfStatus) -> bool {
+    status == PreconfStatus::Waiting && !loop_state.is_committed(hash)
+}
+
 /// Block-capacity admission + same-sender cascade for a single preconf hash,
 /// run **before** dispatching to [`dispatch::apply_one_preconf`] (which drives
 /// the [`PreconfTxSet`] entry status machine). This is the one funnel all
@@ -626,10 +633,15 @@ where
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
+    let status = entry.status;
     let to = crate::rpc::tx_kind_to_address(entry.tx.kind());
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     drop(entry);
+
+    if !needs_admission(loop_state, &hash, status) {
+        return Ok(());
+    }
 
     // (1) Policy no longer authorizes this sender.
     if barred_by_allowlist(cfg, whitelist, source, &sender, to.as_ref()) {
@@ -647,7 +659,6 @@ where
         if let Some(resp) = fifo.take_responder(&hash).await {
             let _ = resp.send(Err(PreconfError::NotPreconfEligible));
         }
-        loop_state.record_excluded(hash, PreconfError::NotPreconfEligible);
         return Ok(());
     }
 
@@ -672,12 +683,6 @@ where
                 // gap) — never handed to the builder, so `Canceled`, not
                 // `Failed`.
                 let _ = fifo.mark_canceled(&hash).await;
-                loop_state.record_excluded(
-                    hash,
-                    PreconfError::BuilderRejected(
-                        "preconf predecessor from same sender rejected (nonce gap)".into(),
-                    ),
-                );
                 return Ok(());
             }
         }
@@ -716,9 +721,8 @@ where
             // and rejected it).
             let _ = fifo.mark_canceled(&hash).await;
             if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Err(e.clone()));
+                let _ = resp.send(Err(e));
             }
-            loop_state.record_excluded(hash, e);
         }
     }
     Ok(())
@@ -1993,7 +1997,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             // Broadcast overflow — re-scan the fifo snapshot and
                             // run every hash through the admission gate. Dedup
                             // (loop_state) inside `apply_one_preconf` skips any
-                            // already committed/excluded this build.
+                            // already settled or committed in this build.
                             warn!(
                                 target: "mantle::preconf::dispatch",
                                 skipped = n,
@@ -2186,6 +2190,25 @@ mod tests {
         let sig = Signature::test_signature();
         let hash = B256::from([byte; 32]);
         Arc::new(TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)))
+    }
+
+    #[test]
+    fn admission_is_needed_only_for_a_waiting_uncommitted_entry() {
+        let hash = B256::from([1u8; 32]);
+        let mut state = dispatch::LoopState::new(1);
+
+        assert!(needs_admission(&state, &hash, PreconfStatus::Waiting));
+        for terminal in [
+            PreconfStatus::Success,
+            PreconfStatus::Failed,
+            PreconfStatus::Timeout,
+            PreconfStatus::Canceled,
+        ] {
+            assert!(!needs_admission(&state, &hash, terminal), "{terminal:?} is settled");
+        }
+
+        state.record_committed(hash);
+        assert!(!needs_admission(&state, &hash, PreconfStatus::Waiting));
     }
 
     /// `replay_fifo_carryover` returns `Waiting` + `Success` hashes (each a

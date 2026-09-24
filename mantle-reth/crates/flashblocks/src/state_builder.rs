@@ -511,7 +511,7 @@ mod tests {
             value: U256::ZERO,
             gas_limit: 21_000,
             is_system_transaction: false,
-            eth_value: 0,
+            eth_value: U256::ZERO,
             input: Default::default(),
             eth_tx_value: None,
         };

@@ -200,7 +200,7 @@ pub fn filler_deposit(seed: u64) -> Bytes {
         gas_limit: 100_000,
         is_system_transaction: false,
         input: Bytes::default(),
-        eth_value: 0,
+        eth_value: U256::ZERO,
         eth_tx_value: None,
     }
     .encoded_2718()
@@ -385,7 +385,7 @@ pub fn l1_info_deposit(origin: u64) -> Bytes {
         // Regolith removed system transactions; a `true` here halts the deposit.
         is_system_transaction: false,
         input: data.into(),
-        eth_value: 0,
+        eth_value: U256::ZERO,
         eth_tx_value: None,
     }
     .encoded_2718()

@@ -633,13 +633,30 @@ impl PreconfTxSet {
         // already queued, and the builder has already been told.
         //
         // A live entry that *does* have a responder is the genuine duplicate.
+        // `Success` is also settled even after its responder was consumed: a
+        // new request cannot reconstruct the receipt and must not install a
+        // responder that nobody will answer.
         if let Some(existing) = inner.entries.get_mut(&hash) {
             let revivable = existing.status.is_revivable_by_same_hash();
-            if !revivable && existing.responder.is_some() {
-                return Err(PreconfError::AlreadyInProgress);
+            match existing.status {
+                PreconfStatus::Success => return Err(PreconfError::AlreadyInProgress),
+                PreconfStatus::Waiting if existing.responder.is_some() => {
+                    return Err(PreconfError::AlreadyInProgress);
+                }
+                PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed
+                    if existing.responder.as_ref().is_some_and(|resp| !resp.is_closed()) =>
+                {
+                    return Err(PreconfError::AlreadyInProgress);
+                }
+                _ => {}
             }
             if revivable {
                 existing.status = PreconfStatus::Waiting;
+                // Closed debris does not own the slot and must not survive the
+                // revived attempt when no replacement responder is supplied.
+                if existing.responder.as_ref().is_some_and(oneshot::Sender::is_closed) {
+                    existing.responder = None;
+                }
             }
             if let Some((origin_instant, resp)) = responder {
                 existing.responder = Some(resp);
@@ -1822,6 +1839,68 @@ mod admit_tests {
         let out = admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), cap()).await;
 
         assert!(matches!(out, Err(PreconfError::AlreadyInProgress)), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn a_revivable_entry_does_not_replace_a_live_responder() {
+        let set = PreconfTxSet::new(8);
+        let c = classifier();
+        let hash = B256::from([1u8; 32]);
+        let (first_resp, mut first_rx) = oneshot::channel();
+        let mut first = Req::new(tx(0, 1, 0), addr(1));
+        first.0.responder = Some((Instant::now(), first_resp));
+        admit(&set, &c, first, cap()).await.unwrap();
+        set.mark_failed(&hash).await.unwrap();
+
+        let (second_resp, second_rx) = oneshot::channel();
+        let mut second = Req::new(tx(0, 1, 0), addr(1));
+        second.0.responder = Some((Instant::now(), second_resp));
+        let out = admit(&set, &c, second, cap()).await;
+
+        assert!(matches!(out, Err(PreconfError::AlreadyInProgress)), "{out:?}");
+        assert!(matches!(first_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(second_rx.await.is_err(), "the refused responder must be dropped");
+        set.cancel_responder(&hash, PreconfError::NotPreconfEligible).await;
+        assert_eq!(first_rx.await.unwrap(), Err(PreconfError::NotPreconfEligible));
+    }
+
+    #[tokio::test]
+    async fn a_revivable_entry_replaces_a_closed_responder() {
+        let set = PreconfTxSet::new(8);
+        let c = classifier();
+        let hash = B256::from([1u8; 32]);
+        let (first_resp, first_rx) = oneshot::channel();
+        let mut first = Req::new(tx(0, 1, 0), addr(1));
+        first.0.responder = Some((Instant::now(), first_resp));
+        admit(&set, &c, first, cap()).await.unwrap();
+        set.mark_timeout(&hash).await.unwrap();
+        drop(first_rx);
+
+        let (second_resp, second_rx) = oneshot::channel();
+        let mut second = Req::new(tx(0, 1, 0), addr(1));
+        second.0.responder = Some((Instant::now(), second_resp));
+
+        assert_eq!(admit(&set, &c, second, cap()).await.unwrap(), Admitted::Revived);
+        set.cancel_responder(&hash, PreconfError::NotPreconfEligible).await;
+        assert_eq!(second_rx.await.unwrap(), Err(PreconfError::NotPreconfEligible));
+    }
+
+    #[tokio::test]
+    async fn a_successful_entry_does_not_accept_a_new_responder() {
+        let set = PreconfTxSet::new(8);
+        let c = classifier();
+        let hash = B256::from([1u8; 32]);
+        admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), cap()).await.unwrap();
+        set.mark_succeeded(&hash).await.unwrap();
+
+        let (resp, rx) = oneshot::channel();
+        let mut again = Req::new(tx(0, 1, 0), addr(1));
+        again.0.responder = Some((Instant::now(), resp));
+        let out = admit(&set, &c, again, cap()).await;
+
+        assert!(matches!(out, Err(PreconfError::AlreadyInProgress)), "{out:?}");
+        assert!(rx.await.is_err(), "the completed entry must not retain a responder");
+        assert_eq!(set.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Success);
     }
 
     /// A replaying commitment is queued with its responder already consumed —
