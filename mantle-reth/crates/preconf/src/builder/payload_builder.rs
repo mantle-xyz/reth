@@ -1552,9 +1552,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         })?;
 
         // Read here rather than with the other per-block constants below,
-        // because the account view has to be reset before the block's first
-        // transaction executes and Stage 2 is that transaction. One read, one
-        // value: `constraints` reuses it.
+        // because Stage 2 borrows the builder mutably. One read, one value:
+        // `constraints` reuses it.
         let base_fee = builder.evm_mut().block().basefee();
 
         // The previous build's account view ends here. Cleared rather than
@@ -1562,11 +1561,14 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // a sender pinned at a nonce the chain will never reach, and a sender
         // the view has forgotten simply falls back to chain state.
         //
+        // Must precede the block's first transaction, and Stage 2 is that
+        // transaction.
+        //
         // Unconditional, including derivation builds (`no_tx_pool=true`), for
         // the same reason `sync_fifo_forward_to_head` is: it reads nothing
         // into the block, and those builds execute the batched user
         // transactions the admission path most needs to know about.
-        self.fifo.reset_accounts(base_fee);
+        self.fifo.reset_accounts();
 
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
         //

@@ -1,26 +1,30 @@
-//! The base-fee floor the preconf path admits against.
+//! Which base fee a preconf transaction is held to, and who holds it there.
 //!
-//! A transaction whose `max_fee_per_gas` is under the base fee of the block
-//! being built cannot execute in it. The transaction pool handles this by
-//! *parking* — the transaction waits in the `BaseFee` sub-pool and is promoted
-//! if the base fee later falls in its favour.
+//! A transaction whose `max_fee_per_gas` is under the base fee of the block it
+//! executes in cannot execute in it. The question is only ever *which* block,
+//! and the queue cannot answer it: between payload jobs the most recent base
+//! fee it has seen belongs to the block already sealed, not to the one the
+//! transaction will go into. Mantle's EIP-1559 denominator is 8, so those two
+//! differ by up to 12.5% — enough to refuse a transaction that would have
+//! executed perfectly well.
 //!
-//! Parking is wrong for a preconfirmation. A parked transaction is not a
-//! candidate for the block being built, so nobody applies it and the client
-//! discovers this only when `preconf_timeout` expires. The client waited the full budget to be told
-//! nothing happened — and the transaction is then evicted anyway.
+//! So the queue holds no opinion and the EVM decides, against the block it is
+//! actually building. Two things have to hold for that to be workable, and
+//! there is a test for each:
 //!
-//! So the preconf path refuses instead of parking, and does so synchronously.
-//! Two things have to hold for that to be an improvement rather than a
-//! reshuffle, and there is a test for each:
+//! - the refusal must still **name the base fee**, so a client knows to raise its cap rather than
+//!   to retry unchanged. It reaches them as `BaseFeeTooLow` either way — see
+//!   `apply::BuilderRejected`.
+//! - the judgement must **track the chain**: the same bytes refused against one block must be
+//!   accepted once the base fee falls below their cap. A threshold captured once would refuse them
+//!   forever.
 //!
-//! - it must be **fast** — the whole point is not waiting out the timeout;
-//! - the floor must **track the block being built**, not a value captured once at startup. A floor
-//!   that went stale would refuse transactions that later became perfectly valid, which is the
-//!   parking problem again with worse ergonomics.
+//! Both tests therefore drive a build. That is the cost of the change: with no
+//! build open there is nobody to refuse the transaction yet, and it waits in
+//! the queue until one opens.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf};
-use crate::{canonicalize_payload, launch_preconf_node};
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_fifo_entry};
+use crate::launch_preconf_node_with_fifo;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -67,67 +71,65 @@ async fn head_base_fee(http: &HttpClient) -> u128 {
     u128::from_str_radix(raw.trim_start_matches("0x"), 16).expect("hex base fee")
 }
 
-/// Build and canonicalise one empty block, so the base fee decays.
-macro_rules! advance_empty_block {
-    ($node:expr) => {{
-        let attrs = $node.payload.next_attributes();
-        let fcu_state = $node.current_forkchoice_state().expect("forkchoice state");
-        let payload_id = $node
-            .inner
-            .add_ons_handle
-            .beacon_engine_handle
-            .fork_choice_updated(fcu_state, Some(attrs))
-            .await
-            .expect("FCU must succeed")
-            .payload_id
-            .expect("payload_id present");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let payload = $node
-            .inner
-            .payload_builder_handle
-            .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
-            .await
-            .expect("resolve_kind")
-            .expect("payload build");
-        canonicalize_payload!($node, payload).await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }};
-}
-
-/// A transaction under the base fee is refused immediately, not parked.
+/// A transaction under the base fee is queued, then refused by the builder —
+/// and the refusal names the base fee.
 ///
-/// This replaces the outcome pinned by
-/// `timeout::basefee_orphan_returns_timeout_and_clears_responder`, which
-/// asserts today's behaviour: no queue entry, client waits out
-/// `preconf_timeout`, `Ok(Timeout)`.
-///
-/// The elapsed-time assertion is the substance of the test. Without it an
-/// implementation that still parks the transaction and let it time out would
-/// satisfy the error match as soon as `Timeout` were reported as an `Err`.
+/// Both halves are the substance. The `wait_fifo_entry` before any build is
+/// driven pins that the queue really did take it: a reinstated admission-time
+/// threshold would refuse it there and the entry would never appear. The error
+/// assertion pins that moving the judgement to the EVM did not cost the client
+/// the reason — `GasPriceLessThanBasefee` carries neither figure, so a
+/// regression in `apply::classify` surfaces here as a generic
+/// `builder rejected: ...`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_sub_basefee_tx_is_refused_synchronously() {
+async fn a_sub_basefee_tx_is_refused_by_the_builder() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let sender = Wallet::default().with_chain_id(1).inner.address();
 
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        // Deliberately wide: a regression that parks the transaction shows up
-        // as a slow failure the elapsed assertion below catches, rather than
-        // as a fast pass.
+        // Wide enough that the build below comfortably beats the client's
+        // deadline; a narrow one would turn a correct refusal into a timeout.
         .preconf_timeout_ms(3_000)
         .build();
 
-    let (_node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // 0.5 gwei against a 1 gwei genesis base fee.
     let raw_tx = signed_transfer_with_fee(chain_id, &wallet, 0, 500_000_000).await;
 
-    let start = std::time::Instant::now();
-    let err = send_preconf(&http, raw_tx)
+    let http_clone = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
+
+    // Before any build: the queue took it. Nothing has judged the fee cap yet,
+    // because nothing yet knows which block it would go into.
+    wait_fifo_entry(&fifo, sender, 0).await;
+
+    // Now give it a block to be judged against.
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
         .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    let _payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let err = rpc_task
+        .await
+        .expect("rpc join")
         .expect_err("a transaction under the base fee cannot execute and must be refused");
-    let elapsed = start.elapsed();
 
     match err {
         ClientError::Call(ref e) => {
@@ -140,27 +142,25 @@ async fn a_sub_basefee_tx_is_refused_synchronously() {
         }
         other => panic!("expected Call error, got {other:?}"),
     }
-
-    assert!(
-        elapsed < std::time::Duration::from_millis(500),
-        "refusing instead of parking is only an improvement if it is immediate; \
-         took {elapsed:?} against a 3s timeout — is the transaction still being parked?",
-    );
 }
 
-/// The floor follows the chain: a transaction refused against one block's base
-/// fee is admitted once the base fee falls below it.
+/// A cap under the **head's** base fee but over the **next block's** is
+/// applied, because the next block is the one that decides.
 ///
-/// Directly exercises "the threshold is refreshed as blocks are produced". A
-/// floor captured once — at startup, or at the first build — would leave this
-/// transaction refused forever.
+/// This is the case a queue-held threshold gets wrong, and the reason the
+/// threshold moved. The queue can only know a base fee a build published, so
+/// between jobs its newest value belongs to the block already sealed. The
+/// block being built has its own, and on a chain below its gas target that one
+/// is lower — by up to 12.5% at Mantle's EIP-1559 denominator of 8. Anything
+/// the client bids into that gap executes perfectly well and used to be
+/// refused.
 ///
-/// The fee cap is derived from the observed base fee rather than hard-coded, so
-/// the test does not depend on the genesis EIP-1559 parameters: one empty block
-/// decays the base fee by a fixed fraction, which is always enough to cross a
-/// threshold set one wei below it.
+/// Set up with no arithmetic about the decay: the head is genesis, which is
+/// empty, so the block built below is guaranteed to carry a lower base fee
+/// than the cap derived from it. The assertion is that the transaction lands —
+/// a reinstated threshold refuses it, and the test says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_basefee_floor_follows_the_chain() {
+async fn a_cap_the_head_would_refuse_but_the_next_block_accepts_is_applied() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let sender = Wallet::default().with_chain_id(1).inner.address();
 
@@ -170,33 +170,18 @@ async fn the_basefee_floor_follows_the_chain() {
         .preconf_timeout_ms(3_000)
         .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
-    // One wei under the current floor: refused now, and comfortably above
-    // what the floor becomes after a single empty block.
-    let base_before = head_base_fee(&http).await;
-    let fee_cap = base_before - 1;
-
+    // One wei under the head's base fee — the exact shape a threshold taken
+    // from the head refuses.
+    let head_base = head_base_fee(&http).await;
+    let fee_cap = head_base - 1;
     let raw_tx = signed_transfer_with_fee(chain_id, &wallet, 0, fee_cap).await;
-    let err = send_preconf(&http, raw_tx.clone())
-        .await
-        .expect_err("one wei under the floor must be refused");
-    assert!(
-        matches!(&err, ClientError::Call(e) if e.message().to_lowercase().contains("base fee")),
-        "expected a base-fee refusal, got {err:?}"
-    );
 
-    // An empty block decays the base fee.
-    advance_empty_block!(node);
+    let http_clone = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
+    wait_fifo_entry(&fifo, sender, 0).await;
 
-    let base_after = head_base_fee(&http).await;
-    assert!(
-        base_after <= fee_cap,
-        "test setup: one empty block must bring the base fee ({base_after}) to or below \
-         the fee cap ({fee_cap}); the chain's EIP-1559 parameters may have changed"
-    );
-
-    // Same transaction, unchanged bytes — only the floor moved.
     let attrs = node.payload.next_attributes();
     let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
     let payload_id = node
@@ -208,12 +193,7 @@ async fn the_basefee_floor_follows_the_chain() {
         .expect("FCU must succeed")
         .payload_id
         .expect("payload_id present");
-
-    let http_clone = http.clone();
-    let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let _payload = node
+    let payload = node
         .inner
         .payload_builder_handle
         .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
@@ -221,8 +201,21 @@ async fn the_basefee_floor_follows_the_chain() {
         .expect("resolve_kind")
         .expect("payload build");
 
-    rpc_task.await.expect("rpc join").expect(
-        "once the base fee has fallen below the fee cap the same transaction must be \
-         admitted — the floor is refreshed per build, not captured once",
+    let event = rpc_task.await.expect("rpc join").expect(
+        "a cap over the base fee of the block being built must be applied, however the \
+         head's own base fee compares to it",
     );
+
+    // The premise, stated rather than assumed: the built block really does
+    // carry a lower base fee than the head it extends. Without it the test
+    // would pass for the wrong reason on a chain that was not decaying.
+    let built_base =
+        payload.block().base_fee_per_gas.expect("post-London block carries a base fee");
+    assert!(
+        u128::from(built_base) <= fee_cap,
+        "test premise: the block being built ({built_base}) must sit at or below the cap \
+         ({fee_cap}) taken from the head ({head_base}); genesis is empty, so this holds \
+         unless the chain's EIP-1559 parameters changed",
+    );
+    assert_eq!(event.status, mantle_reth_rpc_ext::PreconfStatus::Success);
 }

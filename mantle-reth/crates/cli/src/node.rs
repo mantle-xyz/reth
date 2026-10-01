@@ -5,7 +5,6 @@
 //! validation on top of the OP stack checks.
 
 use crate::txpool::MantleTransactionValidator;
-use alloy_consensus::BlockHeader;
 use mantle_reth_flashblocks::{
     EthApiExt as FlashblocksEthApiExt, EthApiOverrideServer as _,
     EthPubSub as FlashblocksEthPubSub, EthPubSubApiServer as _, FlashblocksConfig,
@@ -36,7 +35,7 @@ use reth_optimism_payload_builder::config::{OpBuilderConfig, OpDAConfig, OpGasLi
 use reth_optimism_primitives::OpPrimitives;
 use reth_optimism_storage::OpStorage;
 use reth_optimism_txpool::{OpPool, OpPooledTransaction, OpPooledTx};
-use reth_provider::{BlockReaderIdExt, CanonStateSubscriptions};
+use reth_provider::CanonStateSubscriptions;
 use reth_transaction_pool::{
     CoinbaseTipOrdering, EthPoolTransaction, Pool, TransactionValidationTaskExecutor,
     blobstore::DiskFileBlobStore,
@@ -271,21 +270,6 @@ where
         // - Must run before admission is reachable so the restore helper's fifo pushes are
         //   attributed to the restart path, not to a fresh RPC submission.
         if let Some(svc) = preconf_svc.as_ref() {
-            // The queue's fee floor, before the first payload job sets it from
-            // the block it is building. Admission reads no chain state of its
-            // own, so this one read is where the floor comes from in that
-            // window — without it a transaction under the base fee would be
-            // queued rather than refused. Must precede `set_admission`, which
-            // is what makes the queue reachable.
-            //
-            // Best effort: a header the provider cannot answer for leaves the
-            // floor to the first build, a few hundred milliseconds later.
-            if let Ok(Some(header)) = ctx.provider().latest_header() &&
-                let Some(base_fee) = header.base_fee_per_gas()
-            {
-                preconf_fifo.seed_base_fee(base_fee);
-            }
-
             svc.set_admission(Arc::new(PreconfAdmission::new(
                 admission_validator,
                 preconf_fifo.clone(),

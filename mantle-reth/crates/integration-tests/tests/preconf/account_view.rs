@@ -135,14 +135,6 @@ async fn both_arms_advance_the_account_view_in_one_block() {
         1,
         "the pool arm must too — it is the one that goes through record_journalable",
     );
-
-    let block_base_fee =
-        payload.block().base_fee_per_gas.expect("post-London block carries a base fee");
-    assert_eq!(
-        fifo.build_base_fee(),
-        Some(block_base_fee),
-        "the view must be opened for this block, with this block's base fee",
-    );
 }
 
 /// **Stage 2, and the ordering the reset depends on.**

@@ -396,19 +396,12 @@ enum NonceBasis {
 struct AccountView {
     /// Only senders this build has touched. Absent ⇒ ask the chain.
     basis: HashMap<Address, NonceBasis>,
-    /// The base fee of the block being built, constant across it.
-    ///
-    /// `None` means no build has run in this process yet. Distinct from a
-    /// base fee that genuinely is zero: a plain `0` would make a base-fee
-    /// floor silently admit everything until the first build.
-    base_fee: Option<u64>,
 }
 
 impl AccountView {
-    /// Start of a build: forget the previous one, pin this block's base fee.
-    fn reset(&mut self, base_fee: u64) {
+    /// Start of a build: forget the previous one.
+    fn reset(&mut self) {
         self.basis.clear();
-        self.base_fee = Some(base_fee);
     }
 
     /// A transaction carrying its own nonce has executed.
@@ -496,23 +489,8 @@ impl PreconfTxSet {
     // Sync throughout: the writers are the build loop, which cannot `.await`.
 
     /// Start of a build job — see [`AccountView::reset`].
-    pub fn reset_accounts(&self, base_fee: u64) {
-        self.accounts.write().reset(base_fee);
-    }
-
-    /// Give the fee floor a starting value, from the chain's tip at startup.
-    ///
-    /// Admission holds no chain state, so between node start and the first
-    /// payload job the queue would otherwise have no floor to hold a fee cap
-    /// to — and a transaction that cannot execute would be queued rather than
-    /// refused, which is the parking behaviour this path exists to avoid.
-    ///
-    /// Only ever fills an absent value. A build's own base fee is the floor
-    /// its transactions are actually measured against, and a seed landing
-    /// after one opened would pull the floor back to the chain's tip — the
-    /// stale-low direction, which refuses transactions that were in order.
-    pub fn seed_base_fee(&self, base_fee: u64) {
-        self.accounts.write().base_fee.get_or_insert(base_fee);
+    pub fn reset_accounts(&self) {
+        self.accounts.write().reset();
     }
 
     /// Note a transaction the build executed that carried its own nonce.
@@ -532,12 +510,6 @@ impl PreconfTxSet {
     /// state for its own reasons; this only layers the in-flight block on top.
     pub fn next_nonce(&self, sender: &Address, chain_nonce: u64) -> u64 {
         self.accounts.read().next_nonce(sender, chain_nonce)
-    }
-
-    /// Base fee of the block being built; `None` before the first build of
-    /// this process.
-    pub fn build_base_fee(&self) -> Option<u64> {
-        self.accounts.read().base_fee
     }
 
     /// Sample the queue's occupancy into gauges. Called once per payload build
@@ -589,8 +561,16 @@ impl PreconfTxSet {
     ///
     /// The caller has already decoded the transaction, established that the
     /// sender may use the preconf path, and put it through the validator; what
-    /// is left are the rules that depend on what this queue already holds, plus
-    /// the base fee of the block being built.
+    /// is left are exactly the rules that depend on what this queue already
+    /// holds.
+    ///
+    /// **Not among them: the fee cap.** A transaction is measured against the
+    /// base fee of the block it executes in, and only the EVM knows which block
+    /// that is — the queue would be judging against whichever build happened to
+    /// run last, which is the previous block whenever no build is open. The
+    /// refusal still reaches the client as
+    /// [`PreconfError::BaseFeeTooLow`](crate::types::PreconfError::BaseFeeTooLow),
+    /// from the builder; see [`crate::apply::BuilderRejected`].
     ///
     /// Ordering within the lock is by cost, cheapest first, so a request that
     /// is going to be refused holds the lock for as little as possible.
@@ -622,11 +602,6 @@ impl PreconfTxSet {
         // Read before the lock: the account view is a different lock, and
         // taking them in this order is the one the module's "Lock order"
         // allows.
-        // The floor is the base fee of the block being built, and there is no
-        // substitute for it: admission holds no chain state to invent one
-        // from. `None` is therefore only ever "this process has not built
-        // anything yet" — see the check below.
-        let build_base_fee = self.build_base_fee();
         let next_nonce = self.next_nonce(&from, chain_nonce);
 
         let mut inner = self.inner.lock().await;
@@ -728,25 +703,6 @@ impl PreconfTxSet {
                 in_use: held.map_or(0, BTreeMap::len) as u64,
                 max: capacity.max_account_slots as u64,
             });
-        }
-
-        // ── Base fee ───────────────────────────────────────────────────
-        // Refused here rather than parked, which is the whole difference from
-        // the ordinary pool: a parked transaction is not a candidate for the
-        // block being built, so the client would wait out the full timeout to
-        // be told nothing happened.
-        //
-        // Before this process has built anything there is no floor to hold it
-        // to, and the queue has nowhere else to get one. That window is from
-        // node start to the first payload job; the value is sticky afterwards,
-        // so every later request is judged against the most recent block. A
-        // transaction admitted in that window is refused by the EVM at the
-        // first build, under this same name — see `apply::BuilderRejected`.
-        if let Some(base_fee) = build_base_fee &&
-            tx.max_fee_per_gas() < u128::from(base_fee)
-        {
-            metrics::counter!("preconf.admit.rejected_base_fee_total").increment(1);
-            return Err(PreconfError::BaseFeeTooLow { tx_max_fee: tx.max_fee_per_gas(), base_fee });
         }
 
         // ── Nonce continuity ───────────────────────────────────────────
@@ -1605,111 +1561,37 @@ mod admit_tests {
     }
 
     // ── Base fee ───────────────────────────────────────────────────────
+    //
+    // The queue holds no opinion on it. Whichever base fee a transaction is
+    // measured against belongs to the block it executes in, and only the EVM
+    // knows that block — so the fee cap is not a queue rule at all. See the
+    // `admit` rustdoc.
 
+    /// A fee cap far under any plausible base fee is still queued. The refusal
+    /// comes from the EVM, as `BuilderRejected::BaseFeeTooLow`, and reaches the
+    /// client under the same name it used to carry from here.
     #[tokio::test]
-    async fn a_fee_cap_under_the_blocks_base_fee_is_refused_outright() {
+    async fn a_fee_cap_under_any_base_fee_is_still_queued() {
         let set = PreconfTxSet::new(8);
         let c = classifier();
-        set.reset_accounts(1_000_000_000);
-
-        let out = admit(&set, &c, Req::new(tx(0, 1, 500_000_000), addr(1)), cap()).await;
-
-        assert!(
-            matches!(
-                out,
-                Err(PreconfError::BaseFeeTooLow {
-                    tx_max_fee: 500_000_000,
-                    base_fee: 1_000_000_000
-                })
-            ),
-            "{out:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn a_fee_cap_at_the_base_fee_clears_it() {
-        let set = PreconfTxSet::new(8);
-        let c = classifier();
-        set.reset_accounts(1_000_000_000);
-
-        let out = admit(&set, &c, Req::new(tx(0, 1, 1_000_000_000), addr(1)), cap()).await;
-
-        assert_eq!(out.unwrap(), Admitted::Inserted, "the floor is inclusive");
-    }
-
-    /// The floor before the first build is the one startup seeded from the
-    /// chain's tip — admission has no chain state of its own to fall back on,
-    /// so without the seed there would be no floor at all in that window.
-    #[tokio::test]
-    async fn the_seeded_floor_applies_before_any_build_has_run() {
-        let set = PreconfTxSet::new(8);
-        let c = classifier();
-        set.seed_base_fee(1_000_000_000);
-
-        let out = admit(&set, &c, Req::new(tx(0, 1, 500_000_000), addr(1)), cap()).await;
-
-        assert!(
-            matches!(out, Err(PreconfError::BaseFeeTooLow { base_fee: 1_000_000_000, .. })),
-            "{out:?}",
-        );
-    }
-
-    /// And the first build takes it over: the seed is a starting value, not a
-    /// second floor competing with the block being built.
-    #[tokio::test]
-    async fn the_first_build_supersedes_the_seeded_floor() {
-        let set = PreconfTxSet::new(8);
-        let c = classifier();
-        set.seed_base_fee(1_000_000_000);
-        set.reset_accounts(100);
-
-        let out = admit(&set, &c, Req::new(tx(0, 1, 500), addr(1)), cap()).await;
-
-        assert_eq!(out.unwrap(), Admitted::Inserted, "judged against 100, not the seed");
-    }
-
-    /// A seed arriving late must not pull the floor back to the chain's tip
-    /// while a build is open — that is the stale-low direction, which refuses
-    /// transactions that were in order.
-    #[tokio::test]
-    async fn a_late_seed_cannot_displace_an_open_builds_floor() {
-        let set = PreconfTxSet::new(8);
-        set.reset_accounts(100);
-
-        set.seed_base_fee(1_000_000_000);
-
-        assert_eq!(set.build_base_fee(), Some(100));
-    }
-
-    /// With no build and no seed there is no floor. Not reachable through the
-    /// node — startup seeds before admission is wired — but stated so the
-    /// absence is a decision rather than an oversight: the EVM refuses such a
-    /// transaction at the first build, under this same name.
-    #[tokio::test]
-    async fn without_a_build_or_a_seed_there_is_no_floor() {
-        let set = PreconfTxSet::new(8);
-        let c = classifier();
-        assert_eq!(set.build_base_fee(), None, "the premise");
 
         let out = admit(&set, &c, Req::new(tx(0, 1, 1), addr(1)), cap()).await;
 
         assert_eq!(out.unwrap(), Admitted::Inserted);
     }
 
-    /// And once a build has run, its floor keeps applying between builds —
-    /// the value is pinned at the start of each job, not cleared at its end.
+    /// And a build running makes no difference — there is no floor for it to
+    /// publish. Pins that the judgement really did move rather than merely
+    /// changing where its input comes from.
     #[tokio::test]
-    async fn the_last_builds_floor_still_applies_after_it_ends() {
+    async fn an_open_build_does_not_give_the_queue_a_floor() {
         let set = PreconfTxSet::new(8);
         let c = classifier();
-        set.reset_accounts(1_000_000_000);
+        set.reset_accounts();
 
-        let out = admit(&set, &c, Req::new(tx(0, 1, 500_000_000), addr(1)), cap()).await;
+        let out = admit(&set, &c, Req::new(tx(0, 1, 1), addr(1)), cap()).await;
 
-        assert!(
-            matches!(out, Err(PreconfError::BaseFeeTooLow { base_fee: 1_000_000_000, .. })),
-            "{out:?}",
-        );
+        assert_eq!(out.unwrap(), Admitted::Inserted);
     }
 
     // ── Nonce continuity ───────────────────────────────────────────────
@@ -1752,7 +1634,7 @@ mod admit_tests {
         let set = PreconfTxSet::new(8);
         let c = classifier();
         let alice = addr(1);
-        set.reset_accounts(0);
+        set.reset_accounts();
 
         let before = admit(&set, &c, Req::new(tx(1, 1, 0), alice).chain_nonce(0), cap()).await;
         assert!(matches!(before, Err(PreconfError::NonceGap { .. })), "{before:?}");
@@ -2199,29 +2081,15 @@ mod account_view_tests {
     /// Clearing, not re-seeding: a cancelled build must not be able to pin a
     /// sender at a nonce the chain will never reach.
     #[test]
-    fn reset_forgets_every_sender_and_pins_the_new_base_fee() {
+    fn reset_forgets_every_sender() {
         let mut view = AccountView::default();
         view.observe_executed(addr(0xaa), 7);
         view.observe_nonceless(addr(0xbb));
 
-        view.reset(1_000_000_000);
+        view.reset();
 
         assert_eq!(view.next_nonce(&addr(0xaa), 3), 3);
         assert_eq!(view.next_nonce(&addr(0xbb), 3), 3);
-        assert_eq!(view.base_fee, Some(1_000_000_000));
-    }
-
-    /// `None` rather than `0`: a base-fee floor reading a plain zero would
-    /// admit everything in the window between startup and the first build,
-    /// and never know it was doing so.
-    #[test]
-    fn the_base_fee_is_absent_until_a_build_has_run() {
-        let mut view = AccountView::default();
-        assert_eq!(view.base_fee, None);
-
-        view.reset(0);
-
-        assert_eq!(view.base_fee, Some(0), "zero is a base fee, not the absence of one");
     }
 
     #[test]

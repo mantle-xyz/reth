@@ -402,11 +402,17 @@ pub enum PreconfError {
     /// The transaction's fee cap is below the base fee of the block being built,
     /// so it cannot execute in it.
     ///
+    /// Raised by the builder, from the EVM's own refusal — see
+    /// [`crate::apply::BuilderRejected`]. The queue does not pre-empt it,
+    /// because only the EVM knows which block the transaction is being measured
+    /// against: between payload jobs the newest base fee the queue has seen
+    /// belongs to the block already sealed, and the two differ by up to a full
+    /// EIP-1559 adjustment.
+    ///
     /// The transaction pool would park such a transaction in its `BaseFee`
     /// sub-pool and promote it if the base fee later fell. This path has no
-    /// parking: a commitment that cannot be honoured *now* is refused now,
-    /// because the alternative is a client waiting out the full
-    /// `preconf_timeout` for a transaction that was never a candidate.
+    /// parking: the client is told, so it can raise its cap rather than wait
+    /// out `preconf_timeout` for a transaction that was never a candidate.
     #[error("max fee per gas {tx_max_fee} is below the block base fee {base_fee}")]
     BaseFeeTooLow {
         /// The transaction's `max_fee_per_gas`.
