@@ -13,14 +13,17 @@
 //! [`BlockBuilder::execute_transaction_with_result_closure`]: reth_evm::execute::BlockBuilder::execute_transaction_with_result_closure
 
 use crate::types::{PreconfError, PreconfReceipt};
-use alloy_evm::block::TxResult;
-use alloy_primitives::{Bytes, TxHash};
+use alloy_evm::{Evm, block::TxResult};
+use alloy_primitives::{Bytes, TxHash, U256};
 use alloy_sol_types::{Revert, SolError};
 use core::any::Any;
 use op_revm::OpHaltReason;
 use reth_evm::execute::{BlockBuilder, BlockExecutionError, BlockValidationError, ExecutorTx};
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_revm::context::result::{ExecutionResult, HaltReason, OutOfGasError};
+use reth_revm::context::{
+    Block as _,
+    result::{ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError},
+};
 
 /// Outcome of a failed preconf apply, classified so the caller can decide
 /// between rejecting a single commitment and aborting the whole build.
@@ -36,7 +39,7 @@ pub enum ApplyError {
     /// executor (bad signature / nonce / balance / etc.). Builder state is
     /// left unchanged. The caller rejects **just this commitment**
     /// (`mark_failed` + pool eviction + client error) and keeps building.
-    Rejected(PreconfError),
+    Rejected(BuilderRejected),
     /// A fatal, non-tx-specific execution error — anything that is **not**
     /// `Validation(InvalidTx)` (DB / header / fatal precompile, or the
     /// executor closure was never invoked). The execution environment has
@@ -44,6 +47,80 @@ pub enum ApplyError {
     /// (mirroring the pool arm) and leaves the commitment `Waiting` for a
     /// retry on the next build cycle rather than reneging on it.
     Fatal(PayloadBuilderError),
+}
+
+/// Why the EVM refused a transaction, as fields rather than a message.
+///
+/// Two of the EVM's refusals have a name the client already knows, because
+/// the same judgement used to be made at admission against chain state:
+/// insufficient funds and a fee cap under the base fee. Rendering them to a
+/// string here would hand the client a different error for the same fact,
+/// depending only on which stage happened to catch it. Everything else the
+/// EVM can refuse has no admission-time counterpart and stays a message.
+///
+/// The classification is on the error's own variant, never on its text —
+/// `Display` output is not an interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuilderRejected {
+    /// The sender cannot pay for the transaction against the state this build
+    /// has reached — which is the balance that decides, not the canonical one
+    /// admission saw.
+    InsufficientFunds {
+        /// The sender's balance, as the EVM read it.
+        balance: U256,
+        /// What paying for this transaction would have required.
+        required: U256,
+    },
+    /// The fee cap is under the base fee of the block being built.
+    BaseFeeTooLow {
+        /// The transaction's `max_fee_per_gas`.
+        tx_max_fee: u128,
+        /// Base fee of the block being built.
+        base_fee: u64,
+    },
+    /// Any other refusal — kept as the error's own message.
+    Other(String),
+}
+
+impl From<BuilderRejected> for PreconfError {
+    fn from(rejected: BuilderRejected) -> Self {
+        match rejected {
+            BuilderRejected::InsufficientFunds { balance, required } => {
+                Self::InsufficientFunds { balance, required }
+            }
+            BuilderRejected::BaseFeeTooLow { tx_max_fee, base_fee } => {
+                Self::BaseFeeTooLow { tx_max_fee, base_fee }
+            }
+            BuilderRejected::Other(msg) => Self::BuilderRejected(msg),
+        }
+    }
+}
+
+/// The two figures revm's base-fee refusal does not carry.
+///
+/// `InvalidTransaction::GasPriceLessThanBasefee` is a unit variant: it says
+/// the fee cap was under the floor and nothing about either number. They are
+/// supplied by the caller, which holds both — the transaction and the block
+/// being built.
+#[derive(Debug, Clone, Copy)]
+pub struct FeeFacts {
+    /// The transaction's `max_fee_per_gas`.
+    pub tx_max_fee: u128,
+    /// Base fee of the block being built.
+    pub base_fee: u64,
+}
+
+/// Classify an EVM transaction refusal — see [`BuilderRejected`].
+fn classify(error: &dyn alloy_evm::InvalidTxError, fees: FeeFacts) -> BuilderRejected {
+    match error.as_invalid_tx_err() {
+        Some(InvalidTransaction::LackOfFundForMaxFee { fee, balance }) => {
+            BuilderRejected::InsufficientFunds { balance: **balance, required: **fee }
+        }
+        Some(InvalidTransaction::GasPriceLessThanBasefee) => {
+            BuilderRejected::BaseFeeTooLow { tx_max_fee: fees.tx_max_fee, base_fee: fees.base_fee }
+        }
+        _ => BuilderRejected::Other(error.to_string()),
+    }
 }
 
 /// Apply a single transaction via the supplied [`BlockBuilder`] and produce a
@@ -67,19 +144,25 @@ pub fn apply_preconf_tx<B>(
     tx: impl ExecutorTx<B::Executor>,
     tx_hash: TxHash,
     block_height: u64,
+    tx_max_fee: u128,
 ) -> Result<PreconfReceipt, ApplyError>
 where
     B: BlockBuilder,
 {
+    // Read before the borrow the execution takes, and off the block being
+    // built rather than from the caller: it is the floor the EVM is about to
+    // judge against, so the two cannot disagree.
+    let fees = FeeFacts { tx_max_fee, base_fee: builder.evm_mut().block().basefee() };
+
     let mut captured: Option<PreconfReceipt> = None;
     let exec_result = builder.execute_transaction_with_result_closure(tx, |res| {
         let ras = res.result();
         captured = Some(build_receipt(tx_hash, block_height, &ras.result));
     });
     // Route the raw `BlockExecutionError` (variant intact) into the
-    // classifier — stringifying here would erase the InvalidTx-vs-fatal
-    // distinction the caller needs.
-    interpret_apply_result(exec_result.map(|_| ()), captured)
+    // classifier — stringifying here would erase both the InvalidTx-vs-fatal
+    // distinction and the refusal's own reason.
+    interpret_apply_result(exec_result.map(|_| ()), captured, fees)
 }
 
 /// Pure interpretation of the `(execute_result, captured_receipt)` pair —
@@ -101,6 +184,7 @@ where
 fn interpret_apply_result(
     exec_result: Result<(), BlockExecutionError>,
     captured: Option<PreconfReceipt>,
+    fees: FeeFacts,
 ) -> Result<PreconfReceipt, ApplyError> {
     match exec_result {
         Ok(()) => captured.ok_or_else(|| {
@@ -110,7 +194,7 @@ fn interpret_apply_result(
             ApplyError::Fatal(BlockExecutionError::msg("BlockBuilder closure not invoked").into())
         }),
         Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { error, .. })) => {
-            Err(ApplyError::Rejected(PreconfError::BuilderRejected(error.to_string())))
+            Err(ApplyError::Rejected(classify(error.as_ref(), fees)))
         }
         // DB / header / fatal precompile / any other executor error — the
         // execution environment is untrustworthy. Surface as fatal so the
@@ -456,7 +540,7 @@ mod tests {
     #[test]
     fn interpret_apply_result_ok_with_captured_returns_receipt() {
         let receipt = sample_receipt();
-        let out = interpret_apply_result(Ok(()), Some(receipt.clone()));
+        let out = interpret_apply_result(Ok(()), Some(receipt.clone()), fees());
         assert_eq!(out.expect("ok path returns the captured receipt"), receipt);
     }
 
@@ -466,7 +550,7 @@ mod tests {
     /// build) rather than a per-tx rejection based on our own bug.
     #[test]
     fn interpret_apply_result_ok_without_captured_returns_fatal() {
-        match interpret_apply_result(Ok(()), None) {
+        match interpret_apply_result(Ok(()), None, fees()) {
             Err(ApplyError::Fatal(_)) => {}
             other => panic!("expected Fatal, got {other:?}"),
         }
@@ -484,12 +568,93 @@ mod tests {
             ),
             B256::ZERO,
         );
-        match interpret_apply_result(Err(err), None) {
-            Err(ApplyError::Rejected(PreconfError::BuilderRejected(msg))) => {
+        match interpret_apply_result(Err(err), None, fees()) {
+            Err(ApplyError::Rejected(BuilderRejected::Other(msg))) => {
                 assert!(!msg.is_empty(), "rejection must carry the concrete cause");
             }
-            other => panic!("expected Rejected(BuilderRejected), got {other:?}"),
+            other => panic!("expected Rejected(Other), got {other:?}"),
         }
+    }
+
+    /// The fee figures the caller contributes — see [`FeeFacts`].
+    fn fees() -> FeeFacts {
+        FeeFacts { tx_max_fee: 500_000_000, base_fee: 1_000_000_000 }
+    }
+
+    fn invalid_tx(err: InvalidTransaction) -> BlockExecutionError {
+        BlockExecutionError::evm(
+            EVMError::<DummyDbErr, InvalidTransaction>::Transaction(err),
+            B256::ZERO,
+        )
+    }
+
+    /// revm already knows both figures for a balance refusal, so they are read
+    /// off the error rather than recomputed — a second computation here could
+    /// disagree with the one that actually refused the transaction.
+    #[test]
+    fn a_balance_refusal_carries_the_evms_own_figures() {
+        let err = invalid_tx(InvalidTransaction::LackOfFundForMaxFee {
+            fee: Box::new(U256::from(150u64)),
+            balance: Box::new(U256::from(100u64)),
+        });
+
+        match interpret_apply_result(Err(err), None, fees()) {
+            Err(ApplyError::Rejected(BuilderRejected::InsufficientFunds { balance, required })) => {
+                assert_eq!(balance, U256::from(100u64));
+                assert_eq!(required, U256::from(150u64));
+            }
+            other => panic!("expected InsufficientFunds, got {other:?}"),
+        }
+    }
+
+    /// `GasPriceLessThanBasefee` is a unit variant — it says *that* the fee cap
+    /// was under the floor and nothing about either number. Both come from the
+    /// caller, which holds the transaction and the block being built.
+    #[test]
+    fn a_base_fee_refusal_takes_its_figures_from_the_caller() {
+        let err = invalid_tx(InvalidTransaction::GasPriceLessThanBasefee);
+
+        match interpret_apply_result(Err(err), None, fees()) {
+            Err(ApplyError::Rejected(BuilderRejected::BaseFeeTooLow { tx_max_fee, base_fee })) => {
+                assert_eq!(tx_max_fee, 500_000_000);
+                assert_eq!(base_fee, 1_000_000_000);
+            }
+            other => panic!("expected BaseFeeTooLow, got {other:?}"),
+        }
+    }
+
+    /// The wording is what clients already parse, so a refusal that moved from
+    /// admission to the builder has to arrive under its original name and
+    /// message — the classification exists for exactly this.
+    #[test]
+    fn the_classified_refusals_reach_the_client_as_their_admission_errors() {
+        assert_eq!(
+            PreconfError::from(BuilderRejected::InsufficientFunds {
+                balance: U256::from(100u64),
+                required: U256::from(150u64),
+            }),
+            PreconfError::InsufficientFunds {
+                balance: U256::from(100u64),
+                required: U256::from(150u64)
+            },
+        );
+        assert_eq!(
+            PreconfError::from(BuilderRejected::BaseFeeTooLow {
+                tx_max_fee: 500_000_000,
+                base_fee: 1_000_000_000,
+            }),
+            PreconfError::BaseFeeTooLow { tx_max_fee: 500_000_000, base_fee: 1_000_000_000 },
+        );
+    }
+
+    /// And everything the classification does not recognise keeps its message
+    /// under the generic name, rather than being forced into one of the two.
+    #[test]
+    fn an_unclassified_refusal_stays_generic() {
+        assert_eq!(
+            PreconfError::from(BuilderRejected::Other("nonce too low".to_string())),
+            PreconfError::BuilderRejected("nonce too low".to_string()),
+        );
     }
 
     /// The `Err` branch shadows any captured receipt — even if the closure
@@ -505,7 +670,7 @@ mod tests {
             ),
             B256::ZERO,
         );
-        let out = interpret_apply_result(Err(err), Some(receipt));
+        let out = interpret_apply_result(Err(err), Some(receipt), fees());
         assert!(
             matches!(out, Err(ApplyError::Rejected(_))),
             "Err path must ignore captured receipt, got {out:?}"
@@ -526,7 +691,7 @@ mod tests {
             B256::ZERO,
         );
         assert!(
-            matches!(interpret_apply_result(Err(err), None), Err(ApplyError::Fatal(_))),
+            matches!(interpret_apply_result(Err(err), None, fees()), Err(ApplyError::Fatal(_))),
             "Internal(EVM) executor error must be Fatal"
         );
     }
@@ -536,7 +701,7 @@ mod tests {
     fn interpret_apply_result_other_internal_error_is_fatal() {
         assert!(
             matches!(
-                interpret_apply_result(Err(BlockExecutionError::msg("boom")), None),
+                interpret_apply_result(Err(BlockExecutionError::msg("boom")), None, fees()),
                 Err(ApplyError::Fatal(_))
             ),
             "Internal(Other) executor error must be Fatal"

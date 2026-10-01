@@ -44,10 +44,29 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 
 use crate::{
     PreconfConfig, PreconfTxSet,
-    apply::ApplyError,
+    apply::{ApplyError, BuilderRejected},
     journal::{JournalEntry, PreconfJournal},
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
+
+/// Count an EVM refusal under the reason the client is told.
+///
+/// Its own namespace rather than the `preconf.admit.*` counters: those say a
+/// request never reached the builder, and folding both into one series would
+/// make "refused for funds" unanswerable as to *when*.
+fn count_rejection(rejected: &BuilderRejected) {
+    match rejected {
+        BuilderRejected::InsufficientFunds { .. } => {
+            metrics::counter!("preconf.execute.rejected_funds_total").increment(1);
+        }
+        BuilderRejected::BaseFeeTooLow { .. } => {
+            metrics::counter!("preconf.execute.rejected_base_fee_total").increment(1);
+        }
+        BuilderRejected::Other(_) => {
+            metrics::counter!("preconf.execute.rejected_other_total").increment(1);
+        }
+    }
+}
 
 /// How a sender's preconf chain is blocked for the rest of the current slot
 /// once one of its txs cannot enter the in-flight block. Same-sender entries
@@ -368,13 +387,15 @@ where
         //
         // Guarded on `is_rpc`: an already-acknowledged commitment must not take
         // this path — see the `Rejected` arm below.
-        Err(ApplyError::Rejected(err)) if is_rpc => {
+        Err(ApplyError::Rejected(rejected)) if is_rpc => {
             warn!(
                 target: "mantle::preconf::dispatch",
-                ?hash, ?err,
+                ?hash, ?rejected,
                 "preconf apply rejected tx; marking entry as Failed"
             );
             metrics::counter!("preconf.tx.failure_total").increment(1);
+            count_rejection(&rejected);
+            let err = PreconfError::from(rejected);
             if let Err(e) = fifo.mark_failed(&hash).await {
                 trace!(
                     target: "mantle::preconf::dispatch",
@@ -420,16 +441,17 @@ where
         // in-memory; only preconf txs are journaled). So this is terminal on the
         // first failure, and an ordinary `Failed` releasing the
         // `(sender, nonce)` — see [`crate::types::PreconfStatus`].
-        Err(ApplyError::Rejected(err)) => {
+        Err(ApplyError::Rejected(rejected)) => {
             // This line and the counter below are the only trace a breach
             // leaves: the responder went with the receipt, and the node exposes
             // no status query. Keep both.
             error!(
                 target: "mantle::preconf::dispatch",
-                ?hash, ?err,
+                ?hash, ?rejected,
                 "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
             );
             metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+            count_rejection(&rejected);
             if let Err(e) = fifo.mark_failed(&hash).await {
                 trace!(
                     target: "mantle::preconf::dispatch",
@@ -523,7 +545,7 @@ mod tests {
     /// Test apply closure that reports a per-tx REJECTION — exercises the
     /// `ApplyError::Rejected` → `mark_failed` + `take_responder(Err)` branch.
     fn synthetic_err(_: Arc<TxEnvelope>, _: TxHash, _: u64) -> Result<PreconfReceipt, ApplyError> {
-        Err(ApplyError::Rejected(PreconfError::BuilderRejected("synthetic error for test".into())))
+        Err(ApplyError::Rejected(BuilderRejected::Other("synthetic error for test".into())))
     }
 
     /// Test apply closure that reports a FATAL execution error — exercises

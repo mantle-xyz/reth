@@ -64,7 +64,7 @@ use tracing::{debug, warn};
 
 use crate::{
     PreconfClassifier, PreconfConfig, PreconfTxSet,
-    apply::{ApplyError, apply_preconf_tx},
+    apply::{ApplyError, BuilderRejected, apply_preconf_tx},
     builder::{
         ExecutionInfo,
         cancel::{CancelReason, JobCancel},
@@ -370,18 +370,19 @@ where
 {
     // Conversion / ec-recover failures are per-tx faults (a malformed
     // envelope can never land) → `Rejected`, not `Fatal`.
+    // Read off the envelope before it is consumed: the EVM's base-fee refusal
+    // does not carry the fee cap that tripped it — see `apply::FeeFacts`.
+    let tx_max_fee = alloy_consensus::Transaction::max_fee_per_gas(tx.as_ref());
     let envelope = (*tx).clone();
     let signed: N::SignedTx = envelope.try_into().map_err(|_| {
-        ApplyError::Rejected(PreconfError::BuilderRejected(
+        ApplyError::Rejected(BuilderRejected::Other(
             "TxEnvelope → N::SignedTx conversion failed".into(),
         ))
     })?;
     let recovered: Recovered<N::SignedTx> = signed.try_into_recovered().map_err(|_| {
-        ApplyError::Rejected(PreconfError::BuilderRejected(
-            "ec-recover failed for preconf tx".into(),
-        ))
+        ApplyError::Rejected(BuilderRejected::Other("ec-recover failed for preconf tx".into()))
     })?;
-    let receipt = apply_preconf_tx(builder, recovered.clone(), hash, height)?;
+    let receipt = apply_preconf_tx(builder, recovered.clone(), hash, height, tx_max_fee)?;
 
     Ok((receipt, recovered))
 }

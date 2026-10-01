@@ -49,6 +49,11 @@ const COUNTERS: &[&str] = &[
     "preconf.fifo.replay_deferred_total",
     "preconf.dispatch.deadline_skipped_total",
     "preconf.dispatch.gas_budget_skipped_total",
+    // What the EVM refused, under the reason the client is told — the
+    // builder-stage counterpart of the `preconf.admit.rejected_*` pair.
+    "preconf.execute.rejected_funds_total",
+    "preconf.execute.rejected_base_fee_total",
+    "preconf.execute.rejected_other_total",
     // Commitment retention + on-chain allowlist governance.
     "preconf.canon.reorg_drift_total",
     "preconf.tx.commitment_broken_total",

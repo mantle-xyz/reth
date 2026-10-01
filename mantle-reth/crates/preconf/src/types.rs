@@ -233,27 +233,36 @@ pub enum PreconfError {
         /// Pool's reported pending nonce for the sender.
         pending_nonce: u64,
     },
-    /// Cumulative cost across the sender's queued preconf transactions exceeds
-    /// its balance. Refused rather than queued, same as [`Self::NonceGap`]: a
-    /// transaction that cannot be paid for is a full timeout the client would
-    /// otherwise wait out. Best-effort — the builder's gates are the final
-    /// authority.
+    /// The sender cannot pay for the transaction.
+    ///
+    /// Raised at admission when the cumulative cost across the sender's queued
+    /// preconf transactions exceeds its canonical balance — refused rather than
+    /// queued, same as [`Self::NonceGap`]: a transaction that cannot be paid
+    /// for is a full timeout the client would otherwise wait out. That check is
+    /// best-effort; the EVM is the final authority and raises this same error
+    /// against the state the build has actually reached.
     #[error(
         "insufficient funds: sender balance {balance} < required {required} \
          (cumulative cost across the sender's pending txs)"
     )]
     InsufficientFunds {
-        /// Sender's on-chain balance.
+        /// The sender's balance — canonical at admission, as the build had
+        /// left it when the EVM raises it.
         balance: U256,
-        /// Cumulative cost required to promote this tx: the sum of
+        /// What paying would have required: at admission the sum of
         /// `cost + extra_balance_cost` over the sender's gapless pending
-        /// chain, including this tx.
+        /// chain including this tx; from the EVM, this transaction's own
+        /// cost. The wording of the message says the former for both, because
+        /// it is what clients already parse.
         required: U256,
     },
     /// Pool rejected the transaction (validator error / underpriced / etc.).
     #[error("pool rejected: {0}")]
     PoolRejected(String),
-    /// Builder apply returned a terminal `Failed` status.
+    /// The EVM refused the transaction for a reason with no name of its own
+    /// here — see [`crate::apply::BuilderRejected`]. The refusals that *do*
+    /// have one (funds, base fee) arrive as those variants instead, so a
+    /// client is told the same thing whichever stage caught it.
     #[error("builder rejected: {0}")]
     BuilderRejected(String),
     /// A commitment whose receipt was already returned could not be landed: the
