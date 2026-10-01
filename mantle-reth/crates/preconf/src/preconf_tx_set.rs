@@ -1088,18 +1088,29 @@ impl PreconfTxSet {
         self.inner.lock().await.by_sender.keys().copied().collect()
     }
 
-    /// Evicts every entry in a [`PreconfStatus::is_replaceable`] state, returning
-    /// the evicted hashes. Broader than op-geth's `FIFOTxSet::CleanTimeout`,
-    /// which only clears the timeout case: this fifo splits "not on chain" into
-    /// three states and all must be swept, or a stale entry pins its
-    /// `(sender, nonce)` forever. An abandoned commitment is swept like the rest
-    /// — see [`crate::types::PreconfStatus`].
+    /// Evicts every entry in a [`PreconfStatus::is_replaceable`] state that is
+    /// not mid-apply, returning the evicted hashes. Broader than op-geth's
+    /// `FIFOTxSet::CleanTimeout`, which only clears the timeout case: this fifo
+    /// splits "not on chain" into three states and all must be swept, or a
+    /// stale entry pins its `(sender, nonce)` forever. An abandoned commitment
+    /// is swept like the rest — see [`crate::types::PreconfStatus`].
+    ///
+    /// The `try_lock` is the same guard [`Self::remove_reclaimable`] holds, and
+    /// for the same reason: a terminal status is set *before* the responder is
+    /// taken, so an entry whose `apply_lock` is held is one dispatch has
+    /// classified but not yet answered for. Dropping it there discards the
+    /// responder, and a client owed a concrete reason gets a closed channel
+    /// instead — which `rpc.rs` can only report as an internal error.
+    ///
+    /// Non-blocking on purpose: a blocking acquire under `inner` would invert
+    /// the `apply_lock → inner` order and deadlock. An entry skipped here is
+    /// taken by the next sweep, one canonical block later.
     pub async fn clean_reclaimable(&self) -> Vec<TxHash> {
         let mut inner = self.inner.lock().await;
         let to_drop: Vec<TxHash> = inner
             .entries
             .iter()
-            .filter(|(_, e)| e.status.is_replaceable())
+            .filter(|(_, e)| e.status.is_replaceable() && e.apply_lock.try_lock().is_ok())
             .map(|(h, _)| *h)
             .collect();
         inner.drop_hashes(&to_drop);
@@ -2253,6 +2264,36 @@ mod tests {
 
         drop(guard);
         assert!(set.remove_reclaimable(tx.tx_hash()).await, "removable once lock released");
+        assert!(!set.contains(tx.tx_hash()).await);
+    }
+
+    /// Same rule, and the sweep is the path that actually runs: a reclaimable
+    /// entry whose `apply_lock` is held is mid-finalisation, and dispatch has
+    /// not handed its responder the error yet.
+    ///
+    /// Sweeping it there drops the responder on the floor, and the client — who
+    /// was owed a concrete `InsufficientFunds` or `BaseFeeTooLow` — gets a
+    /// closed channel, which `rpc.rs` can only report as an internal error.
+    #[tokio::test]
+    async fn clean_reclaimable_declines_while_apply_lock_held() {
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        set.mark_failed(tx.tx_hash()).await.unwrap();
+
+        let guard = set.lock_for_apply(tx.tx_hash()).await.expect("entry present");
+        assert!(
+            set.clean_reclaimable().await.is_empty(),
+            "the sweep must leave an entry dispatch is still finalising"
+        );
+        assert!(set.contains(tx.tx_hash()).await);
+
+        drop(guard);
+        assert_eq!(
+            set.clean_reclaimable().await,
+            vec![*tx.tx_hash()],
+            "and take it on the next pass, once dispatch is done with it"
+        );
         assert!(!set.contains(tx.tx_hash()).await);
     }
 

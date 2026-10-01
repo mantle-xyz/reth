@@ -311,20 +311,29 @@ where
         return Ok(());
     };
 
-    // Re-check status under lock. The RPC deadline branch may have
-    // already transitioned the entry to `Timeout` in the window between
-    // our earlier gate reads and this acquisition; running `apply_fn`
-    // now would violate the invariant "committed to builder state ⇒
-    // wire not Timeout".
-    if let Some(re_entry) = fifo.find_by_hash(&hash).await &&
-        re_entry.status != PreconfStatus::Waiting
-    {
-        trace!(
-            target: "mantle::preconf::dispatch",
-            ?hash, status = ?re_entry.status,
-            "status flipped before we acquired apply_lock; skipping apply"
-        );
-        return Ok(());
+    // Re-check under the lock. The RPC deadline branch may have already
+    // transitioned the entry to `Timeout` in the window between our earlier
+    // gate reads and this acquisition; running `apply_fn` now would violate the
+    // invariant "committed to builder state ⇒ wire not Timeout".
+    //
+    // **Absent counts as changed.** `lock_for_apply` clones the lock's handle
+    // under `inner` and then awaits outside it — it has to, or waiters would
+    // hold the queue's lock — so a removal that does not consult `apply_lock`
+    // (`forward_all`, whose predicate is the sender's nonce moving past this
+    // entry) can take the entry in that gap and leave us holding a mutex that
+    // belongs to nothing. Reading `None` as "nothing changed" applies the
+    // snapshot taken before the gates, which is the one case the lock is here
+    // to prevent.
+    match fifo.find_by_hash(&hash).await {
+        Some(re_entry) if re_entry.status == PreconfStatus::Waiting => {}
+        other => {
+            trace!(
+                target: "mantle::preconf::dispatch",
+                ?hash, status = ?other.map(|e| e.status),
+                "entry changed or vanished before we acquired apply_lock; skipping apply"
+            );
+            return Ok(());
+        }
     }
 
     // ── Apply via caller-supplied closure (real EVM in production,
@@ -526,6 +535,77 @@ mod tests {
     /// Test apply closure that fabricates an always-success receipt using
     /// `tx.gas_limit()` as the reported `gas_used`, so the dispatch state
     /// machine can be exercised without standing up a real EVM.
+    /// The entry can go while dispatch is between "I have the lock's handle"
+    /// and "I have the lock".
+    ///
+    /// `lock_for_apply` clones the `Arc<Mutex<_>>` under `inner`, drops `inner`,
+    /// and only then awaits — it has to, or waiters would hold the queue's lock.
+    /// `forward_all` takes `inner` in that gap and removes the entry without
+    /// consulting `apply_lock`, so what dispatch finally acquires is a mutex
+    /// belonging to nothing.
+    ///
+    /// The re-read under the lock must therefore treat **absent** as a stop,
+    /// not as "nothing has changed". Reading it the other way applies the
+    /// snapshot taken before the gates — a transaction the client was already
+    /// told had timed out, committed into the block anyway, which is exactly
+    /// the invariant the lock exists to hold.
+    ///
+    /// Driven through `forward_all` rather than the reclaimable sweep because
+    /// the sweep declines while the lock is held; `forward_all` does not, which
+    /// is what keeps this window open.
+    #[tokio::test]
+    async fn an_entry_removed_while_dispatch_waited_for_the_lock_is_not_applied() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fifo = Arc::new(PreconfTxSet::new(8));
+        let tx = make_tx(0x5e);
+        let hash = *tx.tx_hash();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+
+        // Stands in for the RPC deadline branch, which holds this same lock
+        // while it decides what to tell the client.
+        let guard = fifo.lock_for_apply(&hash).await.expect("entry present");
+
+        let applied = Arc::new(AtomicBool::new(false));
+        let flag = applied.clone();
+        let dispatch_fifo = fifo.clone();
+        let task = tokio::spawn(async move {
+            let mut state = LoopState::new(1);
+            apply_one_preconf(
+                &dispatch_fifo,
+                &PreconfConfig::default(),
+                None,
+                hash,
+                &mut state,
+                move |tx, h, height| {
+                    flag.store(true, Ordering::SeqCst);
+                    synthetic_ok(tx, h, height)
+                },
+            )
+            .await
+        });
+
+        // Long enough to clear the gates and block on the lock.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The sender's nonce moved past this entry — a different transaction
+        // took it — so the queue drops it. Nothing here waits for dispatch.
+        fifo.forward_all(&HashMap::from([(Address::ZERO, 1u64)])).await;
+        assert!(!fifo.contains(&hash).await, "the premise: the entry is gone");
+
+        drop(guard);
+        task.await.expect("join").expect("removal is not a fatal execution error");
+
+        assert!(
+            !applied.load(Ordering::SeqCst),
+            "the entry was gone by the time the lock was acquired; applying the pre-gate \
+             snapshot puts a transaction in the block that nothing is tracking",
+        );
+    }
+
     fn synthetic_ok(
         tx: Arc<TxEnvelope>,
         hash: TxHash,
