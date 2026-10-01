@@ -25,18 +25,23 @@
 //! refused. A pool handle here would make that invariant unenforceable, so
 //! there is nothing to hold one.
 //!
+//! No state provider either, for a narrower reason: the validator already
+//! read the sender's account to judge the transaction, and says what it read.
+//! A second read here would be two answers to one question, and which one the
+//! queue got would turn on whether a canonical head happened to land between
+//! them.
+//!
 //! The validator chain is shared with the pool rather than duplicated: both
 //! paths must give one answer to "is this transaction valid", and the chain's
 //! own head-tracking is driven once, by pool maintenance, for both.
 
 use std::sync::Arc;
 
-use alloy_consensus::{BlockHeader, Transaction, TxEnvelope, TxType};
+use alloy_consensus::{Transaction, TxEnvelope, TxType};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
-use reth_storage_api::{BlockReaderIdExt, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
     PoolTransaction, TransactionOrigin, TransactionValidationOutcome, TransactionValidator,
     error::InvalidPoolTransactionError,
@@ -153,12 +158,11 @@ pub trait DynAdmission: Send + Sync + std::fmt::Debug {
 }
 
 #[async_trait::async_trait]
-impl<V, Pr> DynAdmission for PreconfAdmission<V, Pr>
+impl<V> DynAdmission for PreconfAdmission<V>
 where
     V: TransactionValidator + std::fmt::Debug + 'static,
     V::Transaction: PoolTransaction<Pooled: Decodable2718>,
     OpTxEnvelope: From<<V::Transaction as PoolTransaction>::Consensus>,
-    Pr: StateProviderFactory + BlockReaderIdExt + std::fmt::Debug + 'static,
 {
     async fn admit(
         &self,
@@ -173,10 +177,9 @@ where
 /// Decides whether a transaction may join the preconf queue, and puts it
 /// there if so.
 ///
-/// Holds no pool; see the module docs.
-pub struct PreconfAdmission<V, Pr> {
+/// Holds no pool and no state provider; see the module docs.
+pub struct PreconfAdmission<V> {
     validator: V,
-    provider: Pr,
     fifo: Arc<PreconfTxSet>,
     classifier: Arc<PreconfClassifier>,
     cfg: Arc<PreconfConfig>,
@@ -185,7 +188,7 @@ pub struct PreconfAdmission<V, Pr> {
     capacity: Capacity,
 }
 
-impl<V, Pr> std::fmt::Debug for PreconfAdmission<V, Pr> {
+impl<V> std::fmt::Debug for PreconfAdmission<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfAdmission")
             .field("cfg", &self.cfg)
@@ -194,22 +197,20 @@ impl<V, Pr> std::fmt::Debug for PreconfAdmission<V, Pr> {
     }
 }
 
-impl<V, Pr> PreconfAdmission<V, Pr> {
-    /// Bind admission to the validator chain, chain state and queue it works
-    /// against.
+impl<V> PreconfAdmission<V> {
+    /// Bind admission to the validator chain and queue it works against.
     pub const fn new(
         validator: V,
-        provider: Pr,
         fifo: Arc<PreconfTxSet>,
         classifier: Arc<PreconfClassifier>,
         cfg: Arc<PreconfConfig>,
         capacity: Capacity,
     ) -> Self {
-        Self { validator, provider, fifo, classifier, cfg, capacity }
+        Self { validator, fifo, classifier, cfg, capacity }
     }
 }
 
-impl<V, Pr> PreconfAdmission<V, Pr>
+impl<V> PreconfAdmission<V>
 where
     V: TransactionValidator + 'static,
     V::Transaction: PoolTransaction<Pooled: Decodable2718>,
@@ -217,7 +218,6 @@ where
     // same relation: for any OP-stack primitives the two coincide, but the
     // bound the compiler can see is the `From` impl.
     OpTxEnvelope: From<<V::Transaction as PoolTransaction>::Consensus>,
-    Pr: StateProviderFactory + BlockReaderIdExt + 'static,
 {
     /// Decide on `bytes`, and queue them if they pass.
     ///
@@ -323,9 +323,16 @@ where
         let Some(envelope) = op_envelope_to_alloy(op_envelope) else {
             return Err(PreconfError::Internal("unsupported envelope past the type gate".into()));
         };
-        let bytecode_hash =
+        // The account state the queue's baseline is measured against comes
+        // from here, and only from here. The validator has just read the
+        // sender's account to judge this transaction and reports what it read;
+        // reading it again through a provider would be two answers to one
+        // question, with a canonical head landing in between deciding which.
+        let (chain_nonce, chain_balance, bytecode_hash) =
             match self.validator.validate_transaction(TransactionOrigin::External, pool_tx).await {
-                TransactionValidationOutcome::Valid { bytecode_hash, .. } => bytecode_hash,
+                TransactionValidationOutcome::Valid {
+                    state_nonce, balance, bytecode_hash, ..
+                } => (state_nonce, balance, bytecode_hash),
                 TransactionValidationOutcome::Invalid(_, err) => {
                     debug!(target: "mantle::preconf::admission", ?hash, %err, "validator refused");
                     return Err(refusal(&err));
@@ -334,29 +341,6 @@ where
                     return Err(PreconfError::Internal(err.to_string()));
                 }
             };
-
-        // Read once, from the state the queue's own baseline is measured
-        // against.
-        let state = self.provider.latest().map_err(|e| PreconfError::Internal(e.to_string()))?;
-        let chain_nonce = state
-            .account_nonce(&sender)
-            .map_err(|e| PreconfError::Internal(e.to_string()))?
-            .unwrap_or(0);
-        let chain_balance = state
-            .account_balance(&sender)
-            .map_err(|e| PreconfError::Internal(e.to_string()))?
-            .unwrap_or_default();
-
-        // The floor a transaction has to clear. While a build is running the
-        // queue knows it exactly; between builds the chain's own tip is the
-        // closest honest answer, and it is what makes the floor track the
-        // chain rather than whatever the last build happened to leave behind.
-        let chain_base_fee = self
-            .provider
-            .latest_header()
-            .map_err(|e| PreconfError::Internal(e.to_string()))?
-            .and_then(|header| header.base_fee_per_gas())
-            .unwrap_or_default();
 
         self.fifo
             .admit(
@@ -368,7 +352,6 @@ where
                     responder: Some((origin_instant, responder)),
                     chain_nonce,
                     chain_balance,
-                    chain_base_fee,
                     cost: U256::from(cost),
                     bytecode_hash,
                 },
@@ -421,7 +404,6 @@ mod record_release_tests {
     use alloy_signer_local::PrivateKeySigner;
     use reth_optimism_primitives::OpBlock;
     use reth_optimism_txpool::OpPooledTransaction;
-    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::error::InvalidPoolTransactionError;
     use std::collections::HashSet;
 
@@ -448,7 +430,7 @@ mod record_release_tests {
     }
 
     struct Fixture {
-        admission: PreconfAdmission<AlwaysRefuses, MockEthProvider>,
+        admission: PreconfAdmission<AlwaysRefuses>,
         classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
         signer: PrivateKeySigner,
@@ -468,9 +450,6 @@ mod record_release_tests {
             HashSet::default(),
         );
 
-        let provider = MockEthProvider::default();
-        provider.add_account(signer.address(), ExtendedAccount::new(0, U256::from(1u64)));
-
         let fifo = Arc::new(PreconfTxSet::new(16));
         let cfg = PreconfConfig {
             enabled: true,
@@ -479,7 +458,6 @@ mod record_release_tests {
         };
         let admission = PreconfAdmission::new(
             AlwaysRefuses,
-            provider,
             fifo.clone(),
             classifier.clone(),
             Arc::new(cfg),
@@ -575,6 +553,134 @@ mod record_release_tests {
         f.admission.admit(&raw, std::time::Instant::now(), resp).await.expect_err("refused");
 
         assert!(!f.classifier.is_tracked(&hash));
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    //! Where the queue's baseline comes from.
+    //!
+    //! The validator reads the sender's account to judge the transaction, and
+    //! says what it read. Reading it a second time here would be two answers
+    //! to one question, and a canonical head landing between them decides
+    //! which — so the one the validator used is the one the queue is measured
+    //! against.
+
+    use super::*;
+    use crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP;
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{B256, U256};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
+    use reth_optimism_primitives::OpBlock;
+    use reth_optimism_txpool::OpPooledTransaction;
+    use reth_transaction_pool::validate::ValidTransaction;
+    use std::collections::HashSet;
+
+    const RECIPIENT: Address = Address::new([0x43; 20]);
+
+    /// Accepts everything, reporting the account state it claims to have read.
+    #[derive(Debug)]
+    struct AcceptsAt {
+        state_nonce: u64,
+    }
+
+    impl TransactionValidator for AcceptsAt {
+        type Transaction = OpPooledTransaction;
+        type Block = OpBlock;
+
+        async fn validate_transaction(
+            &self,
+            _origin: TransactionOrigin,
+            transaction: Self::Transaction,
+        ) -> TransactionValidationOutcome<Self::Transaction> {
+            TransactionValidationOutcome::Valid {
+                balance: U256::MAX,
+                state_nonce: self.state_nonce,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(transaction),
+                propagate: false,
+                authorities: None,
+            }
+        }
+    }
+
+    fn signed(signer: &PrivateKeySigner, nonce: u64) -> Bytes {
+        let tx = TxEip1559 {
+            chain_id: 10,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(RECIPIENT),
+            value: U256::from(1u64),
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).expect("in-memory signer");
+        TxEnvelope::Eip1559(tx.into_signed(signature)).encoded_2718().into()
+    }
+
+    fn admission_at(state_nonce: u64) -> (PreconfAdmission<AcceptsAt>, PrivateKeySigner) {
+        let signer =
+            PrivateKeySigner::from_bytes(&B256::from([0x12; 32])).expect("valid secp256k1 scalar");
+        let classifier = Arc::new(PreconfClassifier::new(
+            false,
+            std::time::Duration::from_secs(3600),
+            DEFAULT_COMMITMENT_CACHE_CAP,
+        ));
+        classifier.update_whitelist(
+            [(signer.address(), RECIPIENT)].into_iter().collect(),
+            HashSet::default(),
+            HashSet::default(),
+        );
+
+        let cfg = PreconfConfig {
+            enabled: true,
+            preconf_max_gas_per_tx: 1_000_000,
+            ..Default::default()
+        };
+        let admission = PreconfAdmission::new(
+            AcceptsAt { state_nonce },
+            Arc::new(PreconfTxSet::new(16)),
+            classifier,
+            Arc::new(cfg),
+            Capacity {
+                max_txs: 16,
+                max_size: 1 << 20,
+                max_account_slots: 16,
+                max_inflight_delegated: 1,
+                max_queued_gas: u64::MAX,
+            },
+        );
+        (admission, signer)
+    }
+
+    /// The validator says the sender sits at 7, so 7 is the nonce that may be
+    /// queued — nothing else is consulted for it.
+    #[tokio::test]
+    async fn the_validators_state_nonce_is_the_baseline() {
+        let (admission, signer) = admission_at(7);
+        let (resp, _rx) = oneshot::channel();
+
+        let out = admission.admit(&signed(&signer, 7), std::time::Instant::now(), resp).await;
+
+        assert_eq!(out.expect("nonce 7 is the sender's next").nonce, 7);
+    }
+
+    /// And the gap is measured from it too: one past the validator's answer is
+    /// a gap, not a queueable transaction.
+    #[tokio::test]
+    async fn a_nonce_past_the_validators_answer_is_a_gap() {
+        let (admission, signer) = admission_at(7);
+        let (resp, _rx) = oneshot::channel();
+
+        let out = admission.admit(&signed(&signer, 8), std::time::Instant::now(), resp).await;
+
+        assert!(
+            matches!(out, Err(PreconfError::NonceGap { tx_nonce: 8, pending_nonce: 7 })),
+            "{out:?}",
+        );
     }
 }
 

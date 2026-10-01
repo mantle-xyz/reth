@@ -204,9 +204,6 @@ pub struct AdmitRequest {
     pub chain_nonce: u64,
     /// The sender's balance as of the parent block.
     pub chain_balance: U256,
-    /// The base fee to hold the transaction to when no build is open. The
-    /// queue prefers the block being built when there is one.
-    pub chain_base_fee: u64,
     /// Value plus the full gas allowance plus Mantle's L1 and operator fees.
     /// Computed by the caller because the fee part comes from the current L1
     /// block info, not from the transaction.
@@ -503,6 +500,21 @@ impl PreconfTxSet {
         self.accounts.write().reset(base_fee);
     }
 
+    /// Give the fee floor a starting value, from the chain's tip at startup.
+    ///
+    /// Admission holds no chain state, so between node start and the first
+    /// payload job the queue would otherwise have no floor to hold a fee cap
+    /// to — and a transaction that cannot execute would be queued rather than
+    /// refused, which is the parking behaviour this path exists to avoid.
+    ///
+    /// Only ever fills an absent value. A build's own base fee is the floor
+    /// its transactions are actually measured against, and a seed landing
+    /// after one opened would pull the floor back to the chain's tip — the
+    /// stale-low direction, which refuses transactions that were in order.
+    pub fn seed_base_fee(&self, base_fee: u64) {
+        self.accounts.write().base_fee.get_or_insert(base_fee);
+    }
+
     /// Note a transaction the build executed that carried its own nonce.
     pub fn observe_executed(&self, signer: Address, nonce: u64) {
         self.accounts.write().observe_executed(signer, nonce);
@@ -599,7 +611,6 @@ impl PreconfTxSet {
             responder,
             chain_nonce,
             chain_balance,
-            chain_base_fee,
             bytecode_hash,
             cost,
         } = req;
@@ -611,9 +622,11 @@ impl PreconfTxSet {
         // Read before the lock: the account view is a different lock, and
         // taking them in this order is the one the module's "Lock order"
         // allows.
-        // The block being built when there is one, the chain's tip otherwise
-        // — a floor that is absent admits everything, which is not a floor.
-        let base_fee = self.build_base_fee().unwrap_or(chain_base_fee);
+        // The floor is the base fee of the block being built, and there is no
+        // substitute for it: admission holds no chain state to invent one
+        // from. `None` is therefore only ever "this process has not built
+        // anything yet" — see the check below.
+        let build_base_fee = self.build_base_fee();
         let next_nonce = self.next_nonce(&from, chain_nonce);
 
         let mut inner = self.inner.lock().await;
@@ -718,7 +731,20 @@ impl PreconfTxSet {
         }
 
         // ── Base fee ───────────────────────────────────────────────────
-        if tx.max_fee_per_gas() < u128::from(base_fee) {
+        // Refused here rather than parked, which is the whole difference from
+        // the ordinary pool: a parked transaction is not a candidate for the
+        // block being built, so the client would wait out the full timeout to
+        // be told nothing happened.
+        //
+        // Before this process has built anything there is no floor to hold it
+        // to, and the queue has nowhere else to get one. That window is from
+        // node start to the first payload job; the value is sticky afterwards,
+        // so every later request is judged against the most recent block. A
+        // transaction admitted in that window is refused by the EVM at the
+        // first build, under this same name — see `apply::BuilderRejected`.
+        if let Some(base_fee) = build_base_fee &&
+            tx.max_fee_per_gas() < u128::from(base_fee)
+        {
             metrics::counter!("preconf.admit.rejected_base_fee_total").increment(1);
             return Err(PreconfError::BaseFeeTooLow { tx_max_fee: tx.max_fee_per_gas(), base_fee });
         }
@@ -987,8 +1013,12 @@ impl PreconfTxSet {
     /// on `apply_lock` (non-blocking — a blocking acquire under `inner` would
     /// invert the `inner → apply_lock` order and deadlock) skips an entry
     /// dispatch is still finalizing, so its receipt is never stranded.
-    /// Idempotent; the only public eviction path (unconditional removal stays
-    /// internal to `drop_hash`).
+    /// Idempotent.
+    ///
+    /// No production caller: the sweep that runs per canonical block is
+    /// [`Self::clean_reclaimable`], which does **not** hold to the `apply_lock`
+    /// half of this. Kept because that asymmetry is a known defect, and this is
+    /// where the rule it breaks is written down and tested.
     pub async fn remove_reclaimable(&self, hash: &TxHash) -> bool {
         let mut inner = self.inner.lock().await;
         let safe_to_drop = match inner.entries.get(hash) {
@@ -1025,7 +1055,13 @@ impl PreconfTxSet {
             .collect()
     }
 
-    /// Replacement-check lookup at admission — O(1) via `by_sender`.
+    /// Look up an entry by its `(sender, nonce)` slot — O(1) via `by_sender`.
+    ///
+    /// The queue's own rules read that index directly, under `inner`; this is
+    /// the only way to read it from outside, and the only reason it is public.
+    /// `entries` and `snapshot` are both built from `order`, so neither can
+    /// observe `by_sender` drifting out of step with them — the divergence the
+    /// admission and push paths log and self-heal rather than trust.
     pub async fn find_by_sender_nonce(&self, addr: &Address, nonce: u64) -> Option<TxEntryView> {
         let inner = self.inner.lock().await;
         let hash = inner.by_sender.get(addr)?.get(&nonce)?;
@@ -1386,7 +1422,6 @@ mod admit_tests {
                 responder: None,
                 chain_nonce: 0,
                 chain_balance: U256::MAX,
-                chain_base_fee: 0,
                 cost: U256::ZERO,
                 bytecode_hash: None,
             })
@@ -1602,19 +1637,16 @@ mod admit_tests {
         assert_eq!(out.unwrap(), Admitted::Inserted, "the floor is inclusive");
     }
 
-    /// Between builds the chain's own floor applies. Skipping the check
-    /// while no build is open would admit everything in that window, which is
-    /// most of the time on an idle node — and the transaction still could not
-    /// execute.
+    /// The floor before the first build is the one startup seeded from the
+    /// chain's tip — admission has no chain state of its own to fall back on,
+    /// so without the seed there would be no floor at all in that window.
     #[tokio::test]
-    async fn between_builds_the_chains_floor_still_applies() {
+    async fn the_seeded_floor_applies_before_any_build_has_run() {
         let set = PreconfTxSet::new(8);
         let c = classifier();
-        assert_eq!(set.build_base_fee(), None, "the premise: no build has run");
+        set.seed_base_fee(1_000_000_000);
 
-        let mut req = Req::new(tx(0, 1, 500_000_000), addr(1));
-        req.0.chain_base_fee = 1_000_000_000;
-        let out = admit(&set, &c, req, cap()).await;
+        let out = admit(&set, &c, Req::new(tx(0, 1, 500_000_000), addr(1)), cap()).await;
 
         assert!(
             matches!(out, Err(PreconfError::BaseFeeTooLow { base_fee: 1_000_000_000, .. })),
@@ -1622,19 +1654,62 @@ mod admit_tests {
         );
     }
 
-    /// And the block being built wins over the chain when there is one: it is
-    /// the floor the transaction will actually be measured against.
+    /// And the first build takes it over: the seed is a starting value, not a
+    /// second floor competing with the block being built.
     #[tokio::test]
-    async fn an_open_build_supersedes_the_chains_floor() {
+    async fn the_first_build_supersedes_the_seeded_floor() {
         let set = PreconfTxSet::new(8);
         let c = classifier();
+        set.seed_base_fee(1_000_000_000);
         set.reset_accounts(100);
 
-        let mut req = Req::new(tx(0, 1, 500), addr(1));
-        req.0.chain_base_fee = 1_000_000_000;
-        let out = admit(&set, &c, req, cap()).await;
+        let out = admit(&set, &c, Req::new(tx(0, 1, 500), addr(1)), cap()).await;
 
-        assert_eq!(out.unwrap(), Admitted::Inserted, "judged against 100, not the stale tip");
+        assert_eq!(out.unwrap(), Admitted::Inserted, "judged against 100, not the seed");
+    }
+
+    /// A seed arriving late must not pull the floor back to the chain's tip
+    /// while a build is open — that is the stale-low direction, which refuses
+    /// transactions that were in order.
+    #[tokio::test]
+    async fn a_late_seed_cannot_displace_an_open_builds_floor() {
+        let set = PreconfTxSet::new(8);
+        set.reset_accounts(100);
+
+        set.seed_base_fee(1_000_000_000);
+
+        assert_eq!(set.build_base_fee(), Some(100));
+    }
+
+    /// With no build and no seed there is no floor. Not reachable through the
+    /// node — startup seeds before admission is wired — but stated so the
+    /// absence is a decision rather than an oversight: the EVM refuses such a
+    /// transaction at the first build, under this same name.
+    #[tokio::test]
+    async fn without_a_build_or_a_seed_there_is_no_floor() {
+        let set = PreconfTxSet::new(8);
+        let c = classifier();
+        assert_eq!(set.build_base_fee(), None, "the premise");
+
+        let out = admit(&set, &c, Req::new(tx(0, 1, 1), addr(1)), cap()).await;
+
+        assert_eq!(out.unwrap(), Admitted::Inserted);
+    }
+
+    /// And once a build has run, its floor keeps applying between builds —
+    /// the value is pinned at the start of each job, not cleared at its end.
+    #[tokio::test]
+    async fn the_last_builds_floor_still_applies_after_it_ends() {
+        let set = PreconfTxSet::new(8);
+        let c = classifier();
+        set.reset_accounts(1_000_000_000);
+
+        let out = admit(&set, &c, Req::new(tx(0, 1, 500_000_000), addr(1)), cap()).await;
+
+        assert!(
+            matches!(out, Err(PreconfError::BaseFeeTooLow { base_fee: 1_000_000_000, .. })),
+            "{out:?}",
+        );
     }
 
     // ── Nonce continuity ───────────────────────────────────────────────
