@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use alloy_consensus::{Transaction, TxEnvelope, TxType};
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_primitives::{Address, Bytes, TxKind};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
 use reth_transaction_pool::{
@@ -314,25 +314,24 @@ where
         origin_instant: std::time::Instant,
         responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
     ) -> Result<Admitted, PreconfError> {
-        // The same chain the pool puts its own transactions through, so the
-        // two paths cannot disagree about what is valid.
-        let cost = pool_tx.cost().saturating_add(pool_tx.extra_balance_cost());
         // The type gate ran first, so this is one of the three it lets
         // through and the conversion cannot fail.
         let op_envelope = OpTxEnvelope::from(pool_tx.clone_into_consensus().into_inner());
         let Some(envelope) = op_envelope_to_alloy(op_envelope) else {
             return Err(PreconfError::Internal("unsupported envelope past the type gate".into()));
         };
-        // The account state the queue's baseline is measured against comes
-        // from here, and only from here. The validator has just read the
-        // sender's account to judge this transaction and reports what it read;
-        // reading it again through a provider would be two answers to one
-        // question, with a canonical head landing in between deciding which.
-        let (chain_nonce, chain_balance, bytecode_hash) =
+        // The same chain the pool puts its own transactions through, so the two
+        // paths cannot disagree about what is valid — and the account state the
+        // queue's baseline is measured against comes from here, and only from
+        // here. The validator has just read the sender's account to judge this
+        // transaction and reports what it read; reading it again through a
+        // provider would be two answers to one question, with a canonical head
+        // landing in between deciding which.
+        let (chain_nonce, bytecode_hash) =
             match self.validator.validate_transaction(TransactionOrigin::External, pool_tx).await {
-                TransactionValidationOutcome::Valid {
-                    state_nonce, balance, bytecode_hash, ..
-                } => (state_nonce, balance, bytecode_hash),
+                TransactionValidationOutcome::Valid { state_nonce, bytecode_hash, .. } => {
+                    (state_nonce, bytecode_hash)
+                }
                 TransactionValidationOutcome::Invalid(_, err) => {
                     debug!(target: "mantle::preconf::admission", ?hash, %err, "validator refused");
                     return Err(refusal(&err));
@@ -351,8 +350,6 @@ where
                     source: PreconfSource::Rpc,
                     responder: Some((origin_instant, responder)),
                     chain_nonce,
-                    chain_balance,
-                    cost: U256::from(cost),
                     bytecode_hash,
                 },
                 self.capacity,

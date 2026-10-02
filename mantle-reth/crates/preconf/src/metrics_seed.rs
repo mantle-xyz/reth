@@ -26,7 +26,6 @@ const COUNTERS: &[&str] = &[
     "preconf.admit.rejected_bytes_total",
     "preconf.admit.rejected_gas_total",
     "preconf.admit.rejected_account_slots_total",
-    "preconf.admit.rejected_funds_total",
     "preconf.admit.rejected_delegated_total",
     "flashblock.deadline_already_passed_total",
     "flashblock.dropped_after_abandon_total",

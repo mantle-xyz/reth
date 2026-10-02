@@ -1,39 +1,44 @@
-//! A preconf tx whose cost — cumulative across the sender's already-pending
-//! txs — exceeds the on-chain balance is rejected **synchronously** with
-//! `InsufficientFunds`, rather than admitted, parked by the pool on
-//! `!ENOUGH_BALANCE`, and left to block the client for the full
-//! `preconf_timeout` with no commitment.
+//! A sender's chain can total more than its balance, and the EVM is what says
+//! so.
 //!
-//! Scenario: a sender with on-chain balance `B` submits tx0 carrying value
-//! `~0.6 B` (affordable alone → pending) then tx1 carrying value `~0.6 B`.
-//! tx1 passes per-tx validation (`0.6 B < B`), but its cumulative cost
-//! (`~1.2 B`) exceeds `B`, so the RPC's step-2 balance pre-check
-//! (`get_pending_nonce_and_cumulative_cost`) rejects it before pool
-//! admission — the same "surface it synchronously" contract as the nonce-gap
-//! pre-check.
+//! Scenario: a sender with on-chain balance `B` submits tx0 and tx1, each
+//! carrying value `~0.6 B`. Either is affordable alone (`0.6 B < B`), so the
+//! validator admits both; together (`~1.2 B`) they are not. The queue takes
+//! both, the block executes tx0, and tx1 is refused against the balance tx0
+//! left behind — `~0.4 B`.
+//!
+//! ## Why the queue does not pre-empt that
+//!
+//! It cannot do it correctly. Summing a sender's queued costs against its
+//! canonical balance is wrong in both directions: the block being built may
+//! already have spent that balance (so the sum reads low) or credited it (so
+//! the sum reads high and refuses a transaction that was in order). Neither is
+//! visible from the queue, and journal-replayed entries carry no cost figure at
+//! all. There was such a check; it was written for an earlier shape of this
+//! path, where a preconf transaction went through the transaction pool and the
+//! pool would park it on `!ENOUGH_BALANCE` — a parked transaction never reaching
+//! `Pending` got no queue entry, and the client waited out the whole timeout for
+//! nothing. The preconf path no longer goes through the pool, so there is
+//! nothing to park and nothing to predict.
+//!
+//! What the client is told does not change: `InsufficientFunds`, with the same
+//! wording, from the builder instead of from admission — see
+//! `apply::BuilderRejected`.
 //!
 //! ## Both transactions are preconf, and that is load-bearing
 //!
-//! The cumulative sum is over the sender's *preconf* chain. Today that happens
-//! to be computed from the pool, which also holds the sender's ordinary
-//! transactions; in the direct-admission design it is computed from the preconf
-//! queue alone. **This test is unaffected** — both transactions are preconf
-//! either way — which is why it carries no `#[ignore]`.
-//!
 //! The mixed case (an *ordinary* transaction eating the balance, then a preconf
-//! one) is not covered here, and not by omission. It is unreachable through the
-//! RPC: an ordinary transaction the preconf view cannot see also makes the
-//! nonce after it read as a gap, so the nonce rule refuses the submission
-//! before the balance is ever consulted. The one window where the two come
-//! apart — the ordinary transaction already executed in the block being built,
-//! so the nonce has moved but the on-chain balance has not — needs a mid-block
-//! observation point that only the flashblocks harness provides, and belongs
-//! with the cumulative-cost computation itself rather than here.
+//! one) is not covered here, and not by omission: an ordinary transaction the
+//! preconf queue cannot see also makes the nonce after it read as a gap, so the
+//! nonce rule refuses the submission before balance is ever reached. The one
+//! window where the two come apart — the ordinary transaction already executed
+//! in the block being built, so the nonce has moved but the canonical balance
+//! has not — is now handled by the same EVM check this test exercises.
 
 use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::launch_preconf_node_with_fifo;
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{Address, TxKind, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use jsonrpsee::core::{ClientError, client::ClientT};
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
@@ -63,23 +68,32 @@ async fn signed_transfer_value(
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
 }
 
-/// tx1 is rejected with `InsufficientFunds` because tx0 + tx1 together exceed
-/// the sender's balance, even though each is individually affordable.
+/// tx0 lands, tx1 is refused against what tx0 left behind, and the block
+/// carries exactly one of them.
+///
+/// Three assertions, and each would survive the other two failing:
+///
+/// - **both are queued.** `wait_fifo_entry` for nonce 1 before any build runs is what a reinstated
+///   admission-time balance check breaks — it refuses tx1 there and the entry never appears.
+/// - **the client is told why.** The wording is the one it was told before the judgement moved, so
+///   a regression in `apply::classify` shows up here as a generic `builder rejected: ...`.
+/// - **the block agrees.** tx0 in, tx1 out — a refusal that still committed the transaction would
+///   satisfy the error assertion and nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cumulative_balance_shortfall_rejects_second_tx() {
+async fn a_chain_over_the_balance_lands_as_far_as_the_balance_reaches() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let sender = Wallet::default().with_chain_id(1).inner.address();
 
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        // Long enough that tx0's in-flight request stays `Waiting` (pending in
-        // the pool) throughout — if tx0 timed out and were evicted, tx1 would
-        // read as a nonce gap instead of an insufficient-funds shortfall.
+        // Comfortably longer than the build driven below; both requests are
+        // in flight across it, and a deadline firing first would turn a refusal
+        // into a timeout.
         .preconf_timeout_ms(10_000)
         .build();
 
-    let (_node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // On-chain balance `B`. Each tx carries `value ≈ 0.6 B`: affordable alone
     // (`0.6 B < B`), but two together (`1.2 B`) exceed `B`.
@@ -92,34 +106,64 @@ async fn cumulative_balance_shortfall_rejects_second_tx() {
 
     let tx0 = signed_transfer_value(chain_id, &wallet, 0, value_each).await;
     let tx1 = signed_transfer_value(chain_id, &wallet, 1, value_each).await;
+    let hash0 = keccak256(&tx0);
+    let hash1 = keccak256(&tx1);
 
-    // tx0 in-flight: queued and blocking on a commitment we never build.
-    // Waiting for it to be queued is what makes tx1 a successor whose cost
-    // adds to tx0's, rather than a nonce gap.
+    // Queued in nonce order, both before any build opens. Waiting on tx0's
+    // entry first is what makes tx1 a successor rather than a nonce gap.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
     super::helpers::wait_fifo_entry(&fifo, sender, 0).await;
 
-    // tx1: the two together (≈1.2 B) exceed `B`. Refused synchronously, so
-    // the client does not wait out `preconf_timeout`.
-    let err = send_preconf(&http, tx1)
+    let http_c = http.clone();
+    let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
+    super::helpers::wait_fifo_entry(&fifo, sender, 1).await;
+
+    // Only now is there a balance to judge against: the one tx0 leaves.
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
         .await
-        .expect_err("tx1 must be rejected for insufficient cumulative funds");
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    t0.await.expect("rpc join").expect("tx0 is affordable on its own and must land");
+
+    let err = t1
+        .await
+        .expect("rpc join")
+        .expect_err("tx1 cannot be paid for out of what tx0 left behind");
     match err {
         ClientError::Call(ref e) => {
             let msg = e.message().to_lowercase();
-            // `cumulative` pins this to the preconf `InsufficientFunds` variant
-            // — distinct from reth's per-tx "insufficient funds for gas ..."
-            // (which tx1 would not trip, since it is affordable alone).
+            // `cumulative` is part of the wire wording this error has always
+            // carried — kept verbatim so a client parsing it does not have to
+            // care which stage refused — and it is what separates this from
+            // reth's per-tx "insufficient funds for gas ...", which tx1 does
+            // not trip because it is affordable alone.
             assert!(
                 msg.contains("insufficient funds") && msg.contains("cumulative"),
-                "expected a cumulative insufficient-funds rejection, got: {}",
+                "expected an insufficient-funds rejection, got: {}",
                 e.message(),
             );
         }
         other => panic!("expected a Call error, got {other:?}"),
     }
 
-    // tx0 was only ever pending (never committed); drop its in-flight RPC.
-    t0.abort();
+    let sealed: Vec<B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(sealed.contains(&hash0), "tx0 must be in the block; sealed = {sealed:?}");
+    assert!(!sealed.contains(&hash1), "tx1 must not be; sealed = {sealed:?}");
 }

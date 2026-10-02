@@ -46,7 +46,7 @@ use alloy_eips::eip2718::Encodable2718;
 // Address); matches the allowlist sets in `whitelist.rs`.
 // `HashMapExt` brings `::new()` / `::with_capacity()` into scope.
 use alloy_primitives::{
-    Address, B256, KECCAK256_EMPTY, TxHash, U256,
+    Address, B256, KECCAK256_EMPTY, TxHash,
     map::foldhash::{HashMap, HashMapExt},
 };
 use parking_lot::RwLock;
@@ -79,19 +79,6 @@ pub struct TxEntry {
     pub from: Address,
     /// Sender nonce.
     pub nonce: u64,
-    /// What this transaction can take from the sender's balance: value plus
-    /// the full gas allowance, plus Mantle's L1 and operator fees.
-    ///
-    /// Carried rather than derived because the fee part is not a function of
-    /// the transaction — it is recomputed from the current L1 block info — so
-    /// the only honest figure is the one admission saw. Summing a sender's
-    /// chain is what the cumulative-balance check does, and it does it under
-    /// the lock, where there is no asking anyone.
-    ///
-    /// Zero on entries that did not come through admission — journal replay
-    /// and reorg re-injection. Those undercount a later admission's sum; the
-    /// alternative is inventing a figure for them.
-    pub cost: U256,
     /// Encoded size in bytes, against the queue's byte ceiling. Kept rather
     /// than re-encoded: the ceiling is checked on every admission and the
     /// figure never changes.
@@ -202,12 +189,6 @@ pub struct AdmitRequest {
     /// The sender's nonce as of the parent block. The queue layers the block
     /// being built on top of it — see [`PreconfTxSet::next_nonce`].
     pub chain_nonce: u64,
-    /// The sender's balance as of the parent block.
-    pub chain_balance: U256,
-    /// Value plus the full gas allowance plus Mantle's L1 and operator fees.
-    /// Computed by the caller because the fee part comes from the current L1
-    /// block info, not from the transaction.
-    pub cost: U256,
     /// The sender's on-chain code hash, from the validator's outcome. Neither
     /// absent nor `KECCAK_EMPTY` means it carries an EIP-7702 delegation.
     pub bytecode_hash: Option<B256>,
@@ -564,12 +545,16 @@ impl PreconfTxSet {
     /// is left are exactly the rules that depend on what this queue already
     /// holds.
     ///
-    /// **Not among them: the fee cap.** A transaction is measured against the
-    /// base fee of the block it executes in, and only the EVM knows which block
-    /// that is — the queue would be judging against whichever build happened to
-    /// run last, which is the previous block whenever no build is open. The
-    /// refusal still reaches the client as
-    /// [`PreconfError::BaseFeeTooLow`](crate::types::PreconfError::BaseFeeTooLow),
+    /// **Not among them: what the transaction costs.** Neither the fee cap nor
+    /// the balance it draws on is a queue rule, and for one reason — both are
+    /// measured against the block the transaction executes in, and only the EVM
+    /// knows that block. The queue would be judging a fee cap against whichever
+    /// build last published a base fee (the previous block, whenever no build
+    /// is open) and a balance against canonical state (which the block being
+    /// built may already have spent or credited). Both refusals still reach the
+    /// client under their own names —
+    /// [`BaseFeeTooLow`](crate::types::PreconfError::BaseFeeTooLow) and
+    /// [`InsufficientFunds`](crate::types::PreconfError::InsufficientFunds) —
     /// from the builder; see [`crate::apply::BuilderRejected`].
     ///
     /// Ordering within the lock is by cost, cheapest first, so a request that
@@ -584,16 +569,7 @@ impl PreconfTxSet {
         req: AdmitRequest,
         capacity: Capacity,
     ) -> Result<Admitted, PreconfError> {
-        let AdmitRequest {
-            tx,
-            from,
-            source,
-            responder,
-            chain_nonce,
-            chain_balance,
-            bytecode_hash,
-            cost,
-        } = req;
+        let AdmitRequest { tx, from, source, responder, chain_nonce, bytecode_hash } = req;
         let hash = *tx.tx_hash();
         let nonce = tx.nonce();
         let size = tx.encoded_2718().len();
@@ -725,23 +701,6 @@ impl PreconfTxSet {
             return Err(PreconfError::NonceGap { tx_nonce: nonce, pending_nonce: expected });
         }
 
-        // ── Cumulative balance ─────────────────────────────────────────
-        // Only what this queue holds. The ordinary pool's claim on the same
-        // balance is deliberately not counted: it is not visible from here,
-        // and reaching for it would put a read of the pool back into a path
-        // that exists to no longer have one.
-        let committed: U256 = held.map_or(U256::ZERO, |nonces| {
-            nonces
-                .range(next_nonce..nonce)
-                .filter_map(|(_, h)| inner.entries.get(h))
-                .fold(U256::ZERO, |sum, e| sum.saturating_add(e.cost))
-        });
-        let required = committed.saturating_add(cost);
-        if required > chain_balance {
-            metrics::counter!("preconf.admit.rejected_funds_total").increment(1);
-            return Err(PreconfError::InsufficientFunds { balance: chain_balance, required });
-        }
-
         // ── The (sender, nonce) slot ───────────────────────────────────
         // Two indices answer this, and both have to. The queue knows who is
         // waiting on the nonce; the classifier knows who *owns* it, which
@@ -824,7 +783,6 @@ impl PreconfTxSet {
                 tx,
                 from,
                 nonce,
-                cost,
                 size,
                 inserted_at,
                 status: PreconfStatus::Waiting,
@@ -943,8 +901,6 @@ impl PreconfTxSet {
             tx,
             from,
             nonce,
-            // Not an admission, so no figure was ever computed — see the field.
-            cost: U256::ZERO,
             size,
             inserted_at,
             status: PreconfStatus::Waiting,
@@ -1388,21 +1344,11 @@ mod admit_tests {
                 source: PreconfSource::Rpc,
                 responder: None,
                 chain_nonce: 0,
-                chain_balance: U256::MAX,
-                cost: U256::ZERO,
                 bytecode_hash: None,
             })
         }
         fn chain_nonce(mut self, n: u64) -> Self {
             self.0.chain_nonce = n;
-            self
-        }
-        fn balance(mut self, b: u64) -> Self {
-            self.0.chain_balance = U256::from(b);
-            self
-        }
-        fn cost(mut self, c: u64) -> Self {
-            self.0.cost = U256::from(c);
             self
         }
         fn delegated(mut self) -> Self {
@@ -1656,35 +1602,27 @@ mod admit_tests {
         assert_eq!(after.unwrap(), Admitted::Inserted, "nonce 0 has run, so nonce 1 is next");
     }
 
-    // ── Cumulative balance ─────────────────────────────────────────────
+    // ── Balance ────────────────────────────────────────────────────────
+    //
+    // Not a queue rule either, and for the same reason the fee cap is not:
+    // what a sender can pay for depends on what the block being built has
+    // already done to its balance, which only the EVM knows. See the `admit`
+    // rustdoc.
 
-    /// Each transaction is affordable alone; the chain is not. That is the
-    /// case the ordinary pool parks silently and this refuses outright.
+    /// Each transaction is affordable alone; the chain is not. Both are queued
+    /// — the EVM refuses the second, as `BuilderRejected::InsufficientFunds`,
+    /// and the client is told under the same name either way.
     #[tokio::test]
-    async fn a_senders_queued_chain_must_fit_its_balance_as_a_whole() {
+    async fn a_senders_chain_may_total_more_than_its_balance() {
         let set = PreconfTxSet::new(8);
         let c = classifier();
         let alice = addr(1);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice).balance(100).cost(60), cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(1, 2, 0), alice).balance(100).cost(60), cap()).await;
-
-        assert!(
-            matches!(out, Err(PreconfError::InsufficientFunds { required, .. }) if required == U256::from(120)),
-            "60 + 60 against 100; got {out:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn a_chain_that_fits_is_not_refused_for_its_total() {
-        let set = PreconfTxSet::new(8);
-        let c = classifier();
-        let alice = addr(1);
-
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice).balance(100).cost(40), cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(1, 2, 0), alice).balance(100).cost(40), cap()).await;
+        admit(&set, &c, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        let out = admit(&set, &c, Req::new(tx(1, 2, 0), alice), cap()).await;
 
         assert_eq!(out.unwrap(), Admitted::Inserted);
+        assert_eq!(set.snapshot().await.len(), 2, "both are the builder's to judge");
     }
 
     // ── The (sender, nonce) slot ───────────────────────────────────────
@@ -2810,7 +2748,6 @@ mod tests {
             tx: make_tx(0, 1),
             from: addr(2),
             nonce: 0,
-            cost: U256::ZERO,
             size: 0,
             inserted_at: Instant::now(),
             status: PreconfStatus::Waiting,
