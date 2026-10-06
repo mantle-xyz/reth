@@ -418,11 +418,7 @@ mod record_release_tests {
     fn fixture() -> Fixture {
         let signer =
             PrivateKeySigner::from_bytes(&B256::from([0x11; 32])).expect("valid secp256k1 scalar");
-        let classifier = Arc::new(PreconfClassifier::new(
-            false,
-            std::time::Duration::from_secs(3600),
-            DEFAULT_COMMITMENT_CACHE_CAP,
-        ));
+        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
         classifier.update_whitelist(
             [(signer.address(), RECIPIENT)].into_iter().collect(),
             HashSet::default(),
@@ -600,11 +596,7 @@ mod baseline_tests {
     fn admission_at(state_nonce: u64) -> (PreconfAdmission<AcceptsAt>, PrivateKeySigner) {
         let signer =
             PrivateKeySigner::from_bytes(&B256::from([0x12; 32])).expect("valid secp256k1 scalar");
-        let classifier = Arc::new(PreconfClassifier::new(
-            false,
-            std::time::Duration::from_secs(3600),
-            DEFAULT_COMMITMENT_CACHE_CAP,
-        ));
+        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
         classifier.update_whitelist(
             [(signer.address(), RECIPIENT)].into_iter().collect(),
             HashSet::default(),

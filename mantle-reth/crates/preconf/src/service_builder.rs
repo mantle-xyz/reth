@@ -127,7 +127,7 @@ impl PreconfServiceBuilder {
             cfg.journal_path.clone().ok_or(PreconfServiceError::MissingJournalPath)?;
         let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size).await?;
         // Built from the validated config, before it is shared: the classifier
-        // reads `all_preconfs` and the record grace period off it.
+        // reads `all_preconfs` off it.
         let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));

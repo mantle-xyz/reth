@@ -407,7 +407,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, B256, Bytes as PrimBytes, Log, LogData};
     use mantle_reth_rpc_ext::PreconfStatus as WireStatus;
-    use std::{collections::HashSet, time::Duration};
+    use std::collections::HashSet;
 
     use crate::{admission::AdmittedTx, classifier::DEFAULT_COMMITMENT_CACHE_CAP};
 
@@ -543,11 +543,7 @@ mod tests {
 
     fn harness() -> Harness {
         let sender = Address::from([0x11; 20]);
-        let classifier = Arc::new(PreconfClassifier::new(
-            false,
-            Duration::from_secs(3600),
-            DEFAULT_COMMITMENT_CACHE_CAP,
-        ));
+        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
         classifier.update_whitelist(
             [(sender, RECIPIENT)].into_iter().collect(),
             HashSet::default(),

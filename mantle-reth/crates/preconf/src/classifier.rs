@@ -61,12 +61,9 @@ use alloy_primitives::{
     },
 };
 use parking_lot::RwLock;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tracing::warn;
 
@@ -135,8 +132,8 @@ pub const DEFAULT_COMMITMENT_CACHE_CAP: usize = 100_000;
 /// * it is measured against `last_block_number()` (**on disk**), not `best_block_number()` (which
 ///   includes in-memory canonical blocks) — an un-persisted block is lost on a non-graceful exit,
 ///   so counting it would let a commitment be forgotten before it is durable;
-/// * it is a block *depth*, not a duration. Time-based grace (what [`PreconfClassifier::sweep`]
-///   uses for un-committed records) says nothing about how deep a reorg can reach.
+/// * it is a block *depth*, not a duration — a duration says nothing about how deep a reorg can
+///   reach, which is the only thing the retention period defends against.
 ///
 /// **Why 32 and not less.** The cost of holding a slot longer is close to zero:
 /// the nonce has been consumed on chain, so any *other* transaction for it is
@@ -150,8 +147,10 @@ pub const DEFAULT_COMMITMENT_CACHE_CAP: usize = 100_000;
 /// whose derivation pipeline has not started, pinning every slot indefinitely.
 pub const SEAL_DEPTH: u64 = 32;
 
-/// One commitment this node has made, plus the instant it was recorded — the
-/// latter for the grace period in [`PreconfClassifier::sweep`].
+/// One commitment this node has made. A record exists exactly for a hash whose
+/// receipt has gone out, so its **presence is the answer** to "do we still owe
+/// this one"; [`PreconfClassifier::mark_promised`] is the only thing that
+/// creates one.
 ///
 /// A record exists exactly for a transaction the preconf arm owns; there is no
 /// "not preconf" record, so the record's **presence is the answer**.
@@ -176,43 +175,25 @@ pub const SEAL_DEPTH: u64 = 32;
 /// the `promised` flag for why a record and a promise are not the same thing.
 #[derive(Debug, Clone, Copy)]
 struct Commitment {
-    at: Instant,
     /// The `(sender, nonce)` slot this record claimed, if it claimed one.
     slot: Option<(Address, u64)>,
-    /// A `Success` receipt for this hash has been returned to a client.
-    ///
-    /// Set by [`PreconfClassifier::mark_promised`], from the two places that
-    /// write the journal: the RPC handler at receipt time, and journal restore
-    /// (where the receipt went out in a previous process). It is therefore the
-    /// in-memory half of "is there a journal record for this hash", and the
-    /// filter [`PreconfClassifier::mark_committed`] needs — a canonical block
-    /// hands us bare hashes, and without this we could not tell our commitments
-    /// from every other transaction in the block.
-    promised: bool,
     /// Height of the canonical block this commitment was observed in, if it has
     /// been observed at all.
     ///
-    /// `Some` is what earns the retention period: only a commitment that has
-    /// actually been seen on chain is held past its fifo entry's removal, and it
-    /// is released once [`SEAL_DEPTH`] persisted blocks sit on top. Cleared by
-    /// [`PreconfClassifier::uncommit`] when a reorg takes that block back.
+    /// The only reversible field: [`PreconfClassifier::uncommit`] clears it when
+    /// a reorg takes that block back, while the promise stands.
     committed_height: Option<u64>,
-    /// Height the commitment was promised for — the bound on a promise that never lands, since a
-    /// receipt already out must not be swept on age. Past `promised_height + SEAL_DEPTH` no reorg
-    /// can still land it there; a replaying one holds a fifo entry and is covered by `live`.
-    promised_height: Option<u64>,
+    /// Height the commitment was promised for — what bounds a promise that never
+    /// lands. Past `promised_height + SEAL_DEPTH` no reorg can still land it
+    /// there; a replaying one holds a fifo entry and is covered by `live`.
+    promised_height: u64,
 }
 
 impl Commitment {
-    /// A freshly recorded commitment: nothing promised, nothing committed yet.
-    fn new(slot: Option<(Address, u64)>) -> Self {
-        Self {
-            at: Instant::now(),
-            slot,
-            promised: false,
-            committed_height: None,
-            promised_height: None,
-        }
+    /// A freshly recorded commitment, promised for `promised_height` and not yet
+    /// seen on chain.
+    const fn new(promised_height: u64) -> Self {
+        Self { slot: None, committed_height: None, promised_height }
     }
 }
 
@@ -329,10 +310,6 @@ pub struct PreconfClassifier {
     /// hook. Both indexes share this one lock — see [`CommitmentStore`].
     commitments: RwLock<CommitmentStore>,
 
-    /// Minimum age before a record may be swept. Protects the window between
-    /// the record being frozen and the entry existing.
-    grace: Duration,
-
     /// Warning threshold for the commitment cache. Never enforced by deleting.
     capacity: usize,
 
@@ -356,17 +333,14 @@ pub struct PreconfClassifier {
 impl PreconfClassifier {
     /// Builds an **enabled** classifier with explicit parameters.
     ///
-    /// `grace` is injected rather than derived so tests can pin both sides of
-    /// the sweep predicate without sleeping. The disabled shape is only
-    /// reachable through [`Self::from_config`], which is also the only way
-    /// production builds one.
-    pub fn new(all_preconfs: bool, grace: Duration, capacity: usize) -> Self {
+    /// The disabled shape is only reachable through [`Self::from_config`],
+    /// which is also the only way production builds one.
+    pub fn new(all_preconfs: bool, capacity: usize) -> Self {
         Self {
             enabled: true,
             all_preconfs,
             whitelist: RwLock::new(Arc::new(Whitelist::default())),
             commitments: RwLock::new(CommitmentStore::default()),
-            grace,
             capacity,
             over_capacity: AtomicBool::new(false),
             persisted_height: AtomicU64::new(0),
@@ -376,33 +350,9 @@ impl PreconfClassifier {
     /// Builds a classifier from validated config.
     ///
     /// The allowlists start **empty** — they are filled by `bootstrap_whitelist`
-    /// before anything that can classify a transaction comes up.
-    ///
-    /// `grace` is `max(2 × slot_duration, preconf_timeout)`. It has to cover two
-    /// different windows, and the larger of the two wins:
-    ///
-    /// * **`2 × slot_duration`** — the gap between the record being frozen and the entry existing.
-    ///   Admission does both, so this is now sub-millisecond; the headroom is generous.
-    /// * **`preconf_timeout`** — the whole period in which a client may still be waiting on its
-    ///   responder. Sweeping inside it turns a transaction that was about to be preconfirmed into a
-    ///   spurious `Timeout`.
-    ///
-    /// Taking the max makes that invariant hold **by construction**. Deriving it
-    /// from `slot_duration` alone does not: both knobs are independently
-    /// operator-settable (`--preconf.slot-duration-ms` / `--preconf.timeout-ms`)
-    /// and `PreconfConfig::validate` relates neither to the other, so
-    /// `preconf_timeout = 10s` with `slot_duration = 2s` — a config it accepts —
-    /// would leave a 6s window in which a waiting client's record is sweepable.
-    ///
-    /// Note this bounds *spurious timeouts*, not broken commitments: an actual
-    /// commitment implies a fifo entry, and [`Self::sweep`] provably never drops
-    /// a record whose hash is in the fifo (see its docs).
+    /// before anything that can reach the classifier comes up.
     pub fn from_config(cfg: &PreconfConfig) -> Self {
-        let grace = (cfg.slot_duration * 2).max(cfg.preconf_timeout);
-        Self {
-            enabled: cfg.enabled,
-            ..Self::new(cfg.all_preconfs, grace, DEFAULT_COMMITMENT_CACHE_CAP)
-        }
+        Self { enabled: cfg.enabled, ..Self::new(cfg.all_preconfs, DEFAULT_COMMITMENT_CACHE_CAP) }
     }
 
     /// **The one same-nonce refusal the queue cannot make for itself.**
@@ -485,9 +435,8 @@ impl PreconfClassifier {
         // (this process has never seen the hash); the update case is the RPC
         // handler, where an earlier receipt for the same hash may already have
         // written it. Either way the record itself is left alone.
-        let cached = store.by_hash.entry(hash).or_insert_with(|| Commitment::new(None));
-        cached.promised = true;
-        cached.promised_height = Some(promised_height);
+        let cached = store.by_hash.entry(hash).or_insert(Commitment::new(promised_height));
+        cached.promised_height = promised_height;
 
         // The record is there either way — inserted just above, or already
         // present from admission — so the slot is claimable.
@@ -518,11 +467,11 @@ impl PreconfClassifier {
         }
         let mut store = self.commitments.write();
         match store.by_hash.get_mut(hash) {
-            Some(cached) if cached.promised => {
+            Some(cached) => {
                 cached.committed_height = Some(height);
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -630,58 +579,26 @@ impl PreconfClassifier {
         true
     }
 
-    /// Drops records that are **absent from `live`** and **older than the grace
-    /// period**. Returns how many were dropped.
+    /// Drops records that are **absent from `live`** and whose commitment can
+    /// no longer be affected by a reorg. Returns how many were dropped.
     ///
-    /// ## What it can never drop
+    /// Two criteria, and both are block *depth* rather than age — see
+    /// [`SEAL_DEPTH`]:
     ///
-    /// `live` is [`PreconfTxSet::snapshot`](crate::PreconfTxSet::snapshot), i.e.
-    /// the fifo's `order` deque, and `order` is only ever mutated alongside
-    /// `entries` under a single lock — `push_if_absent` inserts into both,
-    /// `drop_hash` removes from both. So `live` cannot miss a transaction that
-    /// has a fifo entry, and a record backing an **actual commitment** is
-    /// therefore unsweepable regardless of age: a commitment implies a fifo
-    /// entry, and a fifo entry implies membership in `live`.
+    /// * a commitment **seen on chain** is held until [`SEAL_DEPTH`] persisted blocks sit on top of
+    ///   its `committed_height`, because until then a reorg can hand it back its nonce;
+    /// * a commitment **promised but never seen** is held until the same depth past its
+    ///   `promised_height` — past that no reorg can still land it where it was promised. Restore's
+    ///   "nonce taken" and "cannot tell" arms deliberately leave such a record without a fifo
+    ///   entry, so dropping it any earlier would strand its journal line with nothing tracking it.
     ///
-    /// The grace period covers the other direction — a record that does *not*
-    /// yet have a fifo entry. See [`Self::from_config`] for why it is
-    /// `max(2 × slot_duration, preconf_timeout)` rather than the slot term alone.
+    /// `live` is [`PreconfTxSet::snapshot`](crate::PreconfTxSet::snapshot), the
+    /// fifo's `order` deque, which is only ever mutated alongside `entries`
+    /// under one lock — so it cannot miss a transaction that has an entry.
     ///
-    /// A **committed** commitment has neither protection — `forward()` dropped
-    /// its fifo entry as soon as its nonce advanced, and `grace` expires long
-    /// before a reorg window closes — so it is held by a third criterion that
-    /// overrides both: [`SEAL_DEPTH`] persisted blocks on top of its
-    /// `committed_height`.
-    ///
-    /// One residual race, stated rather than closed: `live` is captured by the
-    /// caller before this call, so a record older than `grace` whose entry is
-    /// inserted between the snapshot and the `retain` below loses that record
-    /// while holding a fifo entry.
-    ///
-    /// The gap it needs is between [`Self::mark_promised`], which writes the
-    /// record, and the entry it belongs to — and since a record is only written
-    /// for a commitment whose event has gone out, that entry is already there.
-    /// It self-heals regardless: `mark_promised` get-or-inserts, so the next
-    /// receipt writes the record back. Closing it properly would mean taking the fifo's
-    /// async lock from this sync path, which is the dependency the whole
-    /// callback/sweep split exists to avoid.
-    ///
-    /// ## What would otherwise leak
-    ///
-    /// Records outlive entries on purpose in two places, and neither reaches
-    /// `drop_hash` again: a promise whose commitment never landed (the receipt
-    /// is out, so `release_unless_committed` keeps the record when the entry
-    /// goes), and the restore arms that deliberately leave a record with no
-    /// entry at all. Depth holds both first — `promise_recoverable` below — and
-    /// once that lapses this sweep is the only thing that can reclaim them.
-    ///
-    /// Called from the canonical-state handler, next to the fifo cleanup — once
-    /// per canonical notification (≈ one block), nowhere near the admission hot
-    /// path, and at that cadence the cache stays small enough to need no
-    /// capacity-triggered eviction.
+    /// Called once per canonical notification (≈ one block), nowhere near the
+    /// admission hot path.
     pub fn sweep(&self, live: &HashSet<TxHash>) -> usize {
-        let now = Instant::now();
-
         let mut store = self.commitments.write();
         let before = store.by_hash.len();
 
@@ -694,22 +611,10 @@ impl PreconfClassifier {
         store.by_hash.retain(|hash, cached| {
             // Held by block depth, not by the time-based grace above — see the
             // third criterion in this method's docs.
-            let retained_for_reorg = cached
-                .committed_height
-                .is_some_and(|height| height.saturating_add(SEAL_DEPTH) > persisted);
-            // A promise that has not landed is held by depth too. `grace` must
-            // not decide it: the receipt is out, and restore's "nonce taken" and
-            // "cannot tell" arms deliberately leave such a record without a fifo
-            // entry, so age alone would drop a commitment we still owe and strand
-            // its journal line with nothing tracking it.
-            let promise_recoverable = cached.committed_height.is_none() &&
-                cached
-                    .promised_height
-                    .is_some_and(|height| height.saturating_add(SEAL_DEPTH) > persisted);
-            let keep = retained_for_reorg ||
-                promise_recoverable ||
-                live.contains(hash) ||
-                now.saturating_duration_since(cached.at) < self.grace;
+            // Whichever height still has reorg reach over this commitment: the
+            // block it landed in, or the one it was promised for.
+            let reachable = cached.committed_height.unwrap_or(cached.promised_height);
+            let keep = reachable.saturating_add(SEAL_DEPTH) > persisted || live.contains(hash);
             if !keep {
                 released.push((*hash, *cached));
             }
@@ -936,9 +841,6 @@ mod tests {
         s
     }
 
-    /// Grace long enough that nothing is ever sweepable during a test.
-    const LONG_GRACE: Duration = Duration::from_secs(3600);
-
     /// A set of exact `(from, to)` rules.
     fn pair_set(entries: &[(Address, Address)]) -> HashSet<(Address, Address)> {
         entries.iter().copied().collect()
@@ -947,8 +849,8 @@ mod tests {
     /// A classifier that allows `addr(1)` → `addr(2)` and nothing else. One
     /// exact rule, no wildcards — so a test that wants "not eligible" only has
     /// to change one half of the pair.
-    fn classifier(grace: Duration) -> PreconfClassifier {
-        let c = PreconfClassifier::new(false, grace, DEFAULT_COMMITMENT_CACHE_CAP);
+    fn classifier() -> PreconfClassifier {
+        let c = PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), HashSet::default(), HashSet::default());
         c
     }
@@ -975,7 +877,7 @@ mod tests {
     /// receipt.
     #[test]
     fn a_committed_record_survives_the_fifo_forward() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         committed_commitment(&c);
 
         // Shallow: one block on top is nowhere near `SEAL_DEPTH`.
@@ -991,7 +893,7 @@ mod tests {
     /// nothing.
     #[test]
     fn a_committed_record_is_released_once_it_is_deep_enough() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         committed_commitment(&c);
 
         c.observe_persisted(AT + SEAL_DEPTH);
@@ -1006,7 +908,7 @@ mod tests {
     /// above, which sits exactly on it).
     #[test]
     fn one_block_short_of_the_depth_is_still_held() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         committed_commitment(&c);
 
         c.observe_persisted(AT + SEAL_DEPTH - 1);
@@ -1023,7 +925,7 @@ mod tests {
     /// this itself.
     #[test]
     fn an_uncommitted_record_is_released_immediately() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
         c.observe_persisted(AT + SEAL_DEPTH);
@@ -1037,7 +939,7 @@ mod tests {
     /// overwhelming majority are ordinary user transactions.
     #[test]
     fn mark_committed_is_a_noop_for_a_hash_with_no_record() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
 
         assert!(!c.mark_committed(&hash(9), AT), "an unknown hash is nothing");
@@ -1056,14 +958,14 @@ mod tests {
     #[test]
     fn the_release_and_the_canonical_observation_commute() {
         // Order 1: canonical first, then the fifo removal.
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         committed_commitment(&c);
         c.observe_persisted(AT + 1);
         assert!(!c.release_unless_committed(&hash(1)));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
 
         // Order 2: the fifo removal arrives before the canonical notification.
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
         c.observe_persisted(AT + 1);
@@ -1080,7 +982,7 @@ mod tests {
     /// replacement. The return value is the `reorg_drift` predicate.
     #[test]
     fn uncommit_stops_the_clock_reports_drift_and_keeps_the_slot() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         committed_commitment(&c);
 
         assert!(c.uncommit(&hash(1)), "we had observed it on chain — that is drift");
@@ -1100,22 +1002,22 @@ mod tests {
     /// reorg. Guards the metric against counting every reverted transaction.
     #[test]
     fn uncommit_reports_nothing_for_a_transaction_we_never_committed() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert!(!c.uncommit(&hash(1)));
         assert!(!c.uncommit(&hash(9)));
     }
 
     /// The sweep runs on the same cadence and would otherwise undo the scheme:
-    /// both of its other criteria (fifo membership, `grace`) have already expired
-    /// for a committed commitment — see [`PreconfClassifier::sweep`].
+    /// a committed commitment has already lost its fifo entry, so depth is the
+    /// only thing left holding it — see [`PreconfClassifier::sweep`].
     #[test]
-    fn sweep_holds_a_committed_commitment_past_its_grace() {
-        let c = classifier(Duration::ZERO);
+    fn sweep_holds_a_committed_commitment_until_it_is_buried() {
+        let c = classifier();
         committed_commitment(&c);
         c.observe_persisted(AT + 1);
 
-        assert_eq!(c.sweep(&HashSet::default()), 0, "not in the fifo, past grace, still held");
+        assert_eq!(c.sweep(&HashSet::default()), 0, "not in the fifo, not yet buried");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
 
         c.observe_persisted(AT + SEAL_DEPTH);
@@ -1123,22 +1025,22 @@ mod tests {
         assert_eq!(c.slot_count(), 0);
     }
 
-    /// A promise that has **not** landed is held by depth too, not by `grace`.
+    /// A promise that has **not** landed is held by depth as well.
     ///
     /// Restore's "nonce taken" and "cannot tell" arms leave exactly this state —
-    /// promised, no fifo entry, never observed on chain — and `grace` is seconds.
-    /// Were age allowed to decide it, the record would vanish while the
+    /// promised, no fifo entry, never observed on chain. Were age allowed to
+    /// decide it, the record would vanish while the
     /// commitment was still owed, stranding its journal line with nothing
     /// tracking it. That divergence is what the journal used to need its own
     /// wall-clock rule to paper over.
     #[test]
     fn sweep_holds_an_unlanded_promise_until_its_block_is_out_of_reach() {
-        let c = classifier(Duration::ZERO);
+        let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, AT), Ok(()));
 
         c.observe_persisted(AT + SEAL_DEPTH - 1);
-        assert_eq!(c.sweep(&HashSet::default()), 0, "not in the fifo, past grace, still held");
+        assert_eq!(c.sweep(&HashSet::default()), 0, "not in the fifo, not yet buried");
         assert!(c.is_tracked(&hash(1)));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
 
@@ -1155,7 +1057,7 @@ mod tests {
     /// `live` outranks the depth rule however far the chain has moved on.
     #[test]
     fn sweep_keeps_an_unreachable_promise_that_is_still_being_replayed() {
-        let c = classifier(Duration::ZERO);
+        let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, AT), Ok(()));
 
@@ -1171,7 +1073,7 @@ mod tests {
     /// is not.
     #[test]
     fn the_persisted_watermark_never_moves_backwards() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         committed_commitment(&c);
 
         assert!(!c.release_unless_committed(&hash(1)), "nothing is deep enough at watermark 0");
@@ -1215,14 +1117,14 @@ mod tests {
 
     #[test]
     fn unknown_hash_has_no_record() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert!(!c.is_tracked(&hash(9)));
         assert_eq!(c.commitment_count(), 0);
     }
 
     #[test]
     fn a_preconf_request_is_matched_against_the_allowlist() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert!(c.registered_via_preconf_rpc_to(hash(1), &addr(1), Some(&addr(2))));
         // Sender not allowlisted.
         assert!(!c.registered_via_preconf_rpc_to(hash(2), &addr(3), Some(&addr(2))));
@@ -1240,7 +1142,7 @@ mod tests {
     /// why this asserts absence.
     #[test]
     fn a_transaction_that_never_asked_for_preconf_has_no_record() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         // `addr(1) -> addr(2)` is exactly the allowlisted pair, so this is not
         // about eligibility — it is about never having been asked.
         assert!(!c.is_tracked(&hash(1)));
@@ -1250,7 +1152,7 @@ mod tests {
 
     #[test]
     fn contract_creation_is_not_eligible_without_a_sender_wildcard() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         // The fixture allowlists the pair `addr(1) -> addr(2)` and no wildcards,
         // and a creation has no recipient for the pair to match against.
         assert!(!c.registered_via_preconf_rpc_to(hash(1), &addr(1), None));
@@ -1258,7 +1160,7 @@ mod tests {
 
     #[test]
     fn all_preconfs_ignores_allowlists_including_contract_creation() {
-        let c = PreconfClassifier::new(true, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
+        let c = PreconfClassifier::new(true, DEFAULT_COMMITMENT_CACHE_CAP);
         assert!(c.registered_via_preconf_rpc(hash(1), &addr(7)));
         assert!(c.registered_via_preconf_rpc(hash(2), &addr(7)));
     }
@@ -1267,7 +1169,7 @@ mod tests {
     /// allowlist. The record must not flip, or the commitment breaks.
     #[test]
     fn record_is_frozen_when_allowlist_shrinks() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert!(c.registered_via_preconf_rpc(hash(1), &addr(1)));
 
         c.update_whitelist(HashSet::default(), HashSet::default(), HashSet::default());
@@ -1287,7 +1189,7 @@ mod tests {
     /// `record_is_frozen_when_allowlist_shrinks`.
     #[test]
     fn a_refusal_leaves_nothing_for_a_wider_allowlist_to_flip() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert!(!c.registered_via_preconf_rpc(hash(1), &addr(3)));
         assert!(!c.is_tracked(&hash(1)), "refused at the door, so nothing was recorded");
 
@@ -1303,7 +1205,7 @@ mod tests {
 
     #[test]
     fn promised_survives_later_classification() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         // Restore pushes the envelope through the validator with an allowlist
@@ -1322,7 +1224,7 @@ mod tests {
     /// leak that no "is the slot claimed?" assertion would catch.
     #[test]
     fn mark_promised_claims_the_slot_and_records_the_reverse_link() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
@@ -1340,7 +1242,7 @@ mod tests {
     /// behalf of a transaction that never gets applied.
     #[test]
     fn mark_promised_does_not_displace_an_existing_owner() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         // A live admission takes (addr(1), 7) first.
         assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(1), 7), (true, Ok(())));
 
@@ -1365,7 +1267,7 @@ mod tests {
     /// fresh insert.
     #[test]
     fn mark_promised_records_the_promise_without_rewriting_the_record() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).0);
 
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
@@ -1376,7 +1278,7 @@ mod tests {
 
     #[test]
     fn forget_drops_only_the_named_record() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         c.registered_via_preconf_rpc(hash(1), &addr(1));
         c.registered_via_preconf_rpc(hash(2), &addr(1));
 
@@ -1387,13 +1289,12 @@ mod tests {
     }
 
     #[test]
-    fn sweep_drops_entries_absent_from_live_and_past_grace() {
-        let c = classifier(Duration::ZERO);
+    fn sweep_drops_records_absent_from_live_and_out_of_reorg_reach() {
+        let c = classifier();
         // Both allowlisted, so both leave a record to sweep. A refused
         // submission would leave none.
         c.registered_via_preconf_rpc(hash(1), &addr(1));
         c.registered_via_preconf_rpc(hash(2), &addr(1));
-        // Past the depth that holds an unlanded promise, so `grace` decides.
         c.observe_persisted(SEAL_DEPTH + 1);
 
         assert_eq!(c.sweep(&HashSet::default()), 2);
@@ -1401,10 +1302,10 @@ mod tests {
     }
 
     #[test]
-    fn sweep_keeps_entries_within_grace() {
+    fn sweep_keeps_a_promise_still_in_reorg_reach() {
         // The window between the record being frozen and the entry existing
         // entry: absent from `live`, but too young to drop.
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         c.registered_via_preconf_rpc(hash(1), &addr(1));
 
         assert_eq!(c.sweep(&HashSet::default()), 0);
@@ -1413,7 +1314,7 @@ mod tests {
 
     #[test]
     fn sweep_keeps_live_entries_regardless_of_age() {
-        let c = classifier(Duration::ZERO);
+        let c = classifier();
         c.registered_via_preconf_rpc(hash(1), &addr(1));
         assert_eq!(c.mark_promised(hash(2), &addr(2), 0, 0), Ok(()));
 
@@ -1424,7 +1325,7 @@ mod tests {
 
     #[test]
     fn sweep_keeps_live_and_drops_the_rest() {
-        let c = classifier(Duration::ZERO);
+        let c = classifier();
         c.registered_via_preconf_rpc(hash(1), &addr(1));
         c.registered_via_preconf_rpc(hash(2), &addr(1));
         c.registered_via_preconf_rpc(hash(3), &addr(1));
@@ -1437,7 +1338,7 @@ mod tests {
 
     #[test]
     fn over_capacity_flags_but_never_deletes() {
-        let c = PreconfClassifier::new(true, LONG_GRACE, 2);
+        let c = PreconfClassifier::new(true, 2);
         for i in 1..=4 {
             c.registered_via_preconf_rpc(hash(i), &addr(1));
         }
@@ -1457,7 +1358,7 @@ mod tests {
     /// A classifier holding one of each rule form:
     /// `(1 -> 2)` exact, `3` a from wildcard, `4` a to wildcard.
     fn or_classifier() -> PreconfClassifier {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), set(&[addr(3)]), set(&[addr(4)]));
         c
     }
@@ -1496,7 +1397,7 @@ mod tests {
     /// precedence rule.
     #[test]
     fn a_wildcard_still_covers_traffic_whose_exact_rule_was_revoked() {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), set(&[addr(1)]), HashSet::default());
         assert!(c.preview_eligibility(&addr(1), Some(&addr(2))));
 
@@ -1542,7 +1443,7 @@ mod tests {
     /// hand-building an allowlist the production path cannot produce.
     #[test]
     fn a_transfer_to_the_zero_address_is_judged_like_any_other() {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP);
         c.update_whitelist(pair_set(&[(addr(1), addr(2))]), set(&[addr(3)]), HashSet::default());
 
         assert!(
@@ -1557,7 +1458,7 @@ mod tests {
 
     #[test]
     fn preview_eligibility_does_not_cache() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         assert!(c.preview_eligibility(&addr(1), Some(&addr(2))));
         assert!(!c.preview_eligibility(&addr(3), Some(&addr(2))));
@@ -1568,7 +1469,7 @@ mod tests {
 
     #[test]
     fn update_whitelist_replaces_wholesale_and_accessors_follow() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
         assert_eq!(c.whitelist_counts(), (1, 0, 0));
 
         c.update_whitelist(
@@ -1587,48 +1488,17 @@ mod tests {
         assert!(!c.preview_eligibility(&addr(1), Some(&addr(2))));
     }
 
-    /// `from_config`'s defaults, and the **slot-derived side** of `grace`'s
-    /// `max`. Paired with [`grace_never_undercuts_the_client_deadline`], which
-    /// covers the deadline side — neither test alone pins the rule, and this one
-    /// on its own passes whether or not the `max` is there.
+    /// `from_config`'s defaults: an empty allowlist, nothing recorded, and the
+    /// shared cache bound.
     #[test]
-    fn from_config_defaults_take_the_slot_derived_grace() {
+    fn from_config_starts_empty() {
         let cfg = PreconfConfig::default();
         let c = PreconfClassifier::from_config(&cfg);
 
-        assert!(
-            cfg.slot_duration * 2 > cfg.preconf_timeout,
-            "precondition: the default config is the side where the slot term wins",
-        );
-        assert_eq!(c.grace, cfg.slot_duration * 2);
         assert_eq!(c.capacity, DEFAULT_COMMITMENT_CACHE_CAP);
         assert_eq!(c.whitelist_counts(), (0, 0, 0));
         assert_eq!(c.commitment_count(), 0);
         assert!(!c.all_preconfs);
-    }
-
-    /// The **deadline side** of `grace`'s `max`: it must never be shorter than
-    /// the client deadline. Paired with
-    /// [`from_config_defaults_take_the_slot_derived_grace`]; see
-    /// [`PreconfClassifier::from_config`] for what the shortfall would cost.
-    ///
-    /// The pairing below is one `PreconfConfig::validate` accepts without
-    /// relating the two knobs, which is why the invariant cannot be delegated to
-    /// it.
-    #[test]
-    fn grace_never_undercuts_the_client_deadline() {
-        let mut cfg = PreconfConfig::default();
-        cfg.slot_duration = Duration::from_secs(2);
-        cfg.preconf_timeout = Duration::from_secs(10);
-        // Precondition of the test: validate() genuinely accepts this pairing,
-        // so the invariant cannot be delegated to config validation.
-        cfg.enabled = true;
-        cfg.whitelist_contract = Some(addr(7));
-        assert!(cfg.clone().validate().is_ok(), "validate() does not relate these two knobs");
-
-        let c = PreconfClassifier::from_config(&cfg);
-        assert_eq!(c.grace, Duration::from_secs(10), "the deadline term must win here");
-        assert!(c.grace >= cfg.preconf_timeout);
     }
 
     #[test]
@@ -1658,7 +1528,7 @@ mod tests {
     /// fifo-membership guard misses.
     #[test]
     fn second_tx_on_same_sender_nonce_is_refused_the_slot() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         let (v1, claim1) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert!(v1);
@@ -1674,7 +1544,7 @@ mod tests {
     /// reorg re-inject).
     #[test]
     fn reclaiming_the_slot_with_the_same_hash_is_idempotent() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         assert_eq!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).1, Ok(()));
         assert_eq!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).1, Ok(()));
@@ -1691,7 +1561,7 @@ mod tests {
     /// whichever executes first silently kills the other.
     #[test]
     fn de_whitelisted_replacement_is_still_refused_the_slot() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         let (v1, claim1) = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert!(v1);
@@ -1720,7 +1590,7 @@ mod tests {
     /// someone else's claim".
     #[test]
     fn promised_is_told_the_truth_about_a_taken_slot() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
@@ -1744,7 +1614,7 @@ mod tests {
     /// transaction, there was one to keep out of the slot index.
     #[test]
     fn a_refused_tx_claims_no_slot_and_leaves_no_record() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         let (registered, claim) = c.admit_via_preconf_rpc(hash(1), &addr(9), 7);
         assert!(!registered, "the door refused it, so no record");
@@ -1759,7 +1629,7 @@ mod tests {
     /// Different nonces from one sender are independent slots.
     #[test]
     fn slots_are_keyed_by_nonce_not_just_sender() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         assert_eq!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).1, Ok(()));
         assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(1), 8).1, Ok(()));
@@ -1771,7 +1641,7 @@ mod tests {
     /// until the next sweep.
     #[test]
     fn forget_releases_the_slot() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         assert_eq!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).1, Ok(()));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
@@ -1786,7 +1656,7 @@ mod tests {
     /// a leaked slot blocks that nonce for as long as the process lives.
     #[test]
     fn sweep_releases_slots_of_dropped_records() {
-        let c = classifier(Duration::ZERO);
+        let c = classifier();
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.slot_count(), 1);
@@ -1800,7 +1670,7 @@ mod tests {
     /// The mirror of the above: a record the sweep keeps must keep its slot.
     #[test]
     fn sweep_keeps_slots_of_surviving_records() {
-        let c = classifier(Duration::ZERO);
+        let c = classifier();
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         // In `live` ⇒ unsweepable regardless of age.
@@ -1817,7 +1687,7 @@ mod tests {
     /// the pool, and the receipt goes out a moment later.
     #[test]
     fn a_promise_on_a_classified_hash_keeps_its_slot() {
-        let c = classifier(LONG_GRACE);
+        let c = classifier();
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(
@@ -1836,7 +1706,7 @@ mod tests {
     /// `disabled_node_classifies_without_caching`.
     #[test]
     fn disabled_node_claims_no_slots() {
-        let c = PreconfClassifier::new(false, LONG_GRACE, DEFAULT_COMMITMENT_CACHE_CAP);
+        let c = PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP);
         let disabled = PreconfClassifier { enabled: false, ..c };
 
         for i in 0..20u8 {

@@ -2622,7 +2622,7 @@ mod tests {
     fn a_whitelist_snapshot_is_pinned_against_a_mid_build_refresh() {
         use alloy_primitives::map::foldhash::HashSet;
 
-        let c = PreconfClassifier::new(false, std::time::Duration::from_secs(4), 128);
+        let c = PreconfClassifier::new(false, 128);
         let sender = Address::from([1u8; 20]);
         let to = Address::from([2u8; 20]);
         c.update_whitelist(

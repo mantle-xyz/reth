@@ -2340,7 +2340,6 @@ mod tests {
 
         let classifier = Arc::new(PreconfClassifier::new(
             false,
-            std::time::Duration::from_secs(3600),
             crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP,
         ));
         let pool = SlotSpyPool {
