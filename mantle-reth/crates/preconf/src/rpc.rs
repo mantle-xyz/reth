@@ -290,10 +290,14 @@ impl PreconfRpcHandler {
         // is over. Removing the entry would mean it never lands.
         let replaying = entry.as_ref().is_some_and(|e| e.source == PreconfSource::Replay);
 
-        if replaying || self.fifo.complete_failure(hash, timed_out.clone()).await.is_err() {
-            // Either the commitment outlives this client, or something ended it
-            // between the read above and now. Answer without a transition.
+        if replaying {
+            // The commitment outlives this client, so only the wait ends.
             self.fifo.cancel_responder(hash, timed_out).await;
+        } else {
+            // `Err` means something ended it between the read above and now,
+            // and whatever did answered this client on the way out. Nothing
+            // left to do either way.
+            let _ = self.fifo.complete_failure(hash, timed_out).await;
         }
         Ok(build_timeout_event(*hash, preconf_timeout))
     }

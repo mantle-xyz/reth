@@ -17,7 +17,7 @@
 //! It shares admission's `op_envelope_to_alloy` helper so the "which OP tx
 //! variants are preconf-eligible" decision stays in one place.
 //!
-//! ## What `add_envelope` refuses
+//! ## What `recover_envelope` refuses
 //!
 //! `RestoreSkip::Rejected` for bytes that will not decode, and for the
 //! `Deposit` / `PostExec` variants — which should never reach the journal, since only
@@ -91,7 +91,7 @@ where
         Some((recovered.signer(), alloy_consensus::Transaction::nonce(recovered.inner())))
     }
 
-    async fn add_envelope(
+    async fn recover_envelope(
         &self,
         tx_rlp: &alloy_primitives::Bytes,
     ) -> Result<RestoredEnvelope, RestoreSkip> {

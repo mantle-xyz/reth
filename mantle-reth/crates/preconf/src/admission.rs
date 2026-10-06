@@ -94,7 +94,7 @@ fn peek_tx_type(bytes: &[u8]) -> Option<u8> {
 /// User-submitted variants (`Legacy` / `Eip1559` / `Eip2930` / `Eip7702`) are
 /// passed through unchanged.
 ///
-/// Shared with [`crate::pool_ext::pool_adapter::RestoreDirect`] so admission
+/// Shared with [`crate::restore::RestoreDirect`] so admission
 /// and the restore-time adapter agree on which OP tx variants are
 /// preconf-eligible.
 pub(crate) fn op_envelope_to_alloy(op_tx: OpTxEnvelope) -> Option<TxEnvelope> {
