@@ -33,7 +33,6 @@ use std::sync::{Arc, OnceLock};
 
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::NodePrimitives;
-use reth_transaction_pool::TransactionPool;
 
 use crate::{
     PreconfCanonHandler, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfRpcHandler,
@@ -214,32 +213,28 @@ impl PreconfServiceBuilder {
         Ok(())
     }
 
-    /// Construct a canonical-state handler bound to `provider` + `pool`.
-    /// The caller is responsible for spawning the returned handler's
+    /// Construct a canonical-state handler bound to `provider`. The caller is
+    /// responsible for spawning the returned handler's
     /// [`run`](PreconfCanonHandler::run) future on its task executor.
     ///
     /// The generic `N` matches `Pr::Primitives` — for OP-stack nodes
     /// this is `OpPrimitives`; the bound `N::SignedTx: Transaction +
-    /// TxHashRef` is satisfied automatically. `P` is the transaction
-    /// pool; the handler uses it to `remove_transactions` on hashes
-    /// evicted by `PreconfTxSet::clean_reclaimable`, so a Timeout / Canceled preconf
-    /// tx cannot land on chain after the client already saw `Timeout`.
+    /// TxHashRef` is satisfied automatically.
     ///
     /// `Pr` must also be a `BlockNumReader`: the handler publishes
     /// `last_block_number()` (the **persisted** tip) to the classifier each
     /// notification, which is the ruler the retention period is measured
     /// against — see `classifier::SEAL_DEPTH`.
-    pub fn canon_handler<Pr, P, N>(&self, provider: Pr, pool: P) -> PreconfCanonHandler<Pr, P, N>
+    pub fn canon_handler<Pr, N>(&self, provider: Pr) -> PreconfCanonHandler<Pr, N>
     where
         Pr: CanonStateSubscriptions<Primitives = N> + reth_storage_api::BlockNumReader + 'static,
-        P: TransactionPool + 'static,
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
         // The reverted branch puts commitments back in the queue, which holds
         // alloy envelopes — see `PreconfCanonHandler`.
         op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
     {
-        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.classifier.clone())
+        PreconfCanonHandler::new(provider, self.fifo.clone(), self.classifier.clone())
     }
 
     /// Hand admission over from the pool-building phase.

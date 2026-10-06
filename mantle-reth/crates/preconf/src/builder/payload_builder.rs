@@ -60,7 +60,7 @@ use reth_revm::{
 };
 use reth_transaction_pool::{BestTransactions, PoolTransaction};
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     PreconfClassifier, PreconfConfig, PreconfTxSet,
@@ -419,23 +419,21 @@ fn estimated_tx_da_size(tx: &TxEnvelope) -> u64 {
 
 /// Outcome of the pre-dispatch block-capacity admission check for a preconf
 /// tx. Decided **before** the hash is dispatched to
-/// [`dispatch::apply_one_preconf`], which drives the [`PreconfTxSet`] entry
-/// status machine (`Waiting → Success`/`Failed`). Keeps admission policy (can
-/// this tx enter the current block?) separate from the execution result (did
-/// it succeed once admitted?).
+/// [`dispatch::apply_one_preconf`], which either applies the entry or ends it.
+/// Keeps admission policy (can this tx enter the current block?) separate from
+/// the execution result (did it succeed once admitted?).
 #[derive(Debug)]
 enum Admission {
     /// The tx fits the current in-flight block's remaining DA + gas → dispatch.
     Admit,
     /// The tx fits an *empty* block but not the current one (transient
     /// capacity). Only returned for [`PreconfSource::Replay`]: the entry is
-    /// left `Waiting` and retried next slot. Never marks the fifo terminal.
+    /// left `Waiting` and retried next slot. Never ends the commitment.
     Defer,
     /// The tx cannot enter a block: it exceeds a per-tx/per-block limit even
     /// in an empty block (permanent), or it is transient-over but RPC-sourced
     /// (RPC does not defer). A server pre-apply rejection — the tx never
-    /// reaches the builder, so dispatch maps this to `mark_canceled` (like the
-    /// preconf block-gas-budget gate), not `mark_failed`.
+    /// reaches the builder, and the commitment ends here.
     Reject(PreconfError),
 }
 
@@ -498,7 +496,7 @@ fn preconf_admission(
         return match source {
             // Replay is a must-land commitment — keep it Waiting and retry
             // next slot (fresh block DA/gas budget). Handled by the caller as
-            // "do not dispatch"; the fifo entry is never marked terminal.
+            // "do not dispatch"; the commitment is never ended.
             PreconfSource::Replay => Admission::Defer,
             // RPC does not defer (client is waiting); reject so it can resubmit.
             PreconfSource::Rpc => {
@@ -652,14 +650,9 @@ where
             ?hash, ?sender, ?to,
             "allowlist no longer authorizes this sender; rejecting before the commitment is applied"
         );
-        // `Canceled`, not `Failed`: the builder never saw it, which is the same
-        // shape as the capacity rejection below. It also stays revivable by a
-        // same-hash resubmit, so a client whose authorization is restored can
-        // retry without a new transaction.
-        let _ = fifo.mark_canceled(&hash).await;
-        if let Some(resp) = fifo.take_responder(&hash).await {
-            let _ = resp.send(Err(PreconfError::NotPreconfEligible));
-        }
+        // The builder never saw it, which is the same shape as the capacity
+        // rejection below: the commitment ends and the client is told why.
+        let _ = fifo.complete_failure(&hash, PreconfError::NotPreconfEligible).await;
         return Ok(());
     }
 
@@ -680,10 +673,17 @@ where
                 return Ok(());
             }
             dispatch::BlockKind::Reject => {
-                // Server pre-apply rejection (predecessor can't land → nonce
-                // gap) — never handed to the builder, so `Canceled`, not
-                // `Failed`.
-                let _ = fifo.mark_canceled(&hash).await;
+                // The predecessor is over a bound no block can clear, so this
+                // successor can never reach its nonce. Both are `Replay`, so
+                // both were already promised, and neither can be kept.
+                error!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?sender, nonce,
+                    "COMMITMENT BROKEN: a permanently rejected predecessor leaves this \
+                     replayed commitment unable to reach its nonce"
+                );
+                metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+                let _ = fifo.complete_failure(&hash, PreconfError::CommitmentBroken).await;
                 return Ok(());
             }
         }
@@ -717,13 +717,8 @@ where
             loop_state.block_sender(sender, nonce, dispatch::BlockKind::Reject);
             metrics::counter!("preconf.fifo.da_rejected_total").increment(1);
             // Server pre-apply capacity rejection (DA / real block gas) — the
-            // tx never reaches the builder, so `Canceled` (like the preconf
-            // block-gas-budget gate), not `Failed` (which means the builder ran
-            // and rejected it).
-            let _ = fifo.mark_canceled(&hash).await;
-            if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Err(e));
-            }
+            // tx never reaches the builder, and the commitment ends here.
+            let _ = fifo.complete_failure(&hash, e).await;
         }
     }
     Ok(())
@@ -775,7 +770,8 @@ where
 ///   here is an un-canon'd in-flight (client already got a receipt; must land).
 ///   `reset_success_to_waiting` promotes the source to `Replay` so gates bypass and the
 ///   previously-returned receipt is honored; then the hash is returned for dispatch.
-/// - **`Failed` / `Timeout` / `Canceled`** — skipped (terminal).
+///
+/// There is no third case: a commitment that ended is not in the queue to be carried over.
 ///
 /// The caller dispatches each hash through [`admit_and_dispatch`] **before**
 /// draining the broadcast / pool arms, so carryover lands ahead of any
@@ -794,11 +790,6 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
                     carryover.push(view);
                 }
             }
-            // Terminal for carryover purposes: dispatch gave up on these after
-            // the apply was rejected, so retrying them every subsequent job
-            // would spin forever. Only a same-hash resubmit revives any of them
-            // (`push_if_absent`).
-            PreconfStatus::Failed | PreconfStatus::Timeout | PreconfStatus::Canceled => {}
         }
     }
     ordered_for_dispatch(&carryover)
@@ -2201,46 +2192,31 @@ mod tests {
         let mut state = dispatch::LoopState::new(1);
 
         assert!(needs_admission(&state, &hash, PreconfStatus::Waiting));
-        for terminal in [
-            PreconfStatus::Success,
-            PreconfStatus::Failed,
-            PreconfStatus::Timeout,
-            PreconfStatus::Canceled,
-        ] {
-            assert!(!needs_admission(&state, &hash, terminal), "{terminal:?} is settled");
-        }
+        assert!(
+            !needs_admission(&state, &hash, PreconfStatus::Success),
+            "an applied entry is settled",
+        );
 
         state.record_committed(hash);
         assert!(!needs_admission(&state, &hash, PreconfStatus::Waiting));
     }
 
     /// `replay_fifo_carryover` returns `Waiting` + `Success` hashes (each a
-    /// carryover source) in insertion order and skips terminal-non-success
-    /// statuses (`Failed` / `Timeout` / `Canceled`). `Success` entries are
-    /// promoted back to `Waiting` with source `Replay`; `Waiting` entries are
-    /// left untouched. Dispatch (admission + apply) is done by the caller.
+    /// carryover source) in insertion order. `Success` entries are promoted
+    /// back to `Waiting` with source `Replay`; `Waiting` entries are left
+    /// untouched. Dispatch (admission + apply) is done by the caller.
     #[tokio::test]
     async fn replay_fifo_carryover_plans_waiting_and_success_only() {
         let fifo = PreconfTxSet::new(16);
-        // Five entries covering every non-transient status.
         let t_wait = tx(0xa1, 0);
         let t_succ = tx(0xa2, 0);
-        let t_fail = tx(0xa3, 0);
-        let t_to = tx(0xa4, 0);
-        let t_cancel = tx(0xa5, 0);
         fifo.push_if_absent(t_wait.clone(), Address::from([1; 20]), PreconfSource::Rpc).await;
         fifo.push_if_absent(t_succ.clone(), Address::from([2; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_fail.clone(), Address::from([3; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_to.clone(), Address::from([4; 20]), PreconfSource::Rpc).await;
-        fifo.push_if_absent(t_cancel.clone(), Address::from([5; 20]), PreconfSource::Rpc).await;
         fifo.mark_succeeded(t_succ.tx_hash()).await.unwrap();
-        fifo.mark_failed(t_fail.tx_hash()).await.unwrap();
-        fifo.mark_timeout(t_to.tx_hash()).await.unwrap();
-        fifo.mark_canceled(t_cancel.tx_hash()).await.unwrap();
 
         let planned = replay_fifo_carryover(&fifo).await;
 
-        // Only Waiting + Success, in insertion order.
+        // Both, in insertion order.
         assert_eq!(planned, vec![*t_wait.tx_hash(), *t_succ.tx_hash()]);
         // Waiting entry untouched.
         assert_eq!(
@@ -2251,16 +2227,6 @@ mod tests {
         let succ = fifo.find_by_hash(t_succ.tx_hash()).await.unwrap();
         assert_eq!(succ.status, PreconfStatus::Waiting);
         assert_eq!(succ.source, PreconfSource::Replay);
-        // Terminal-non-success entries untouched.
-        assert_eq!(
-            fifo.find_by_hash(t_fail.tx_hash()).await.unwrap().status,
-            PreconfStatus::Failed,
-        );
-        assert_eq!(fifo.find_by_hash(t_to.tx_hash()).await.unwrap().status, PreconfStatus::Timeout,);
-        assert_eq!(
-            fifo.find_by_hash(t_cancel.tx_hash()).await.unwrap().status,
-            PreconfStatus::Canceled,
-        );
     }
 
     /// Waiting entries keep their original `source` — the helper only

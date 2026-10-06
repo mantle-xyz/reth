@@ -725,25 +725,17 @@ async fn failed_slot_replaceable_by_different_hash() {
     );
 }
 
-/// **A replacement that is itself rejected must not destroy the holder it was
-/// allowed to reclaim.**
+/// **Ending a commitment releases its `(sender, nonce)`, and a submission that
+/// is then rejected leaves nothing behind.**
 ///
-/// The guard decides "this holder is reclaimable" before the per-tx gas ceiling
-/// and the inner validator have had their say. If the teardown ran at that
-/// point, a replacement that then fails its own checks would leave the sender
-/// with neither transaction: the holder's fifo entry gone (so its same-hash
-/// retry can no longer revive it) and the replacement not admitted either.
-///
-/// Setup: `a` times out (a reclaimable state, so the guard would let `b`
-/// through), then `b` arrives for the same `(sender, nonce)` with a gas limit
-/// above `--preconf.max-gas-per-tx`, so it is rejected *after* that decision.
+/// Two facts, since there is no longer a holder to reclaim: the slot really is
+/// free once the commitment ends, and a rejected submission really does leave
+/// no record of its own.
 ///
 /// Asserted through the classifier rather than the wire, because that is where
-/// the difference is visible: with an eager teardown `a`'s record is forgotten
-/// and its slot handed to `b` (then released again when `b` is rejected);
-/// deferred, `a` keeps both.
+/// slot ownership and commitment records live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rejected_replacement_leaves_the_reclaimable_holder_intact() {
+async fn ending_a_commitment_releases_its_slot_and_a_rejected_successor_adds_nothing() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
@@ -759,23 +751,25 @@ async fn rejected_replacement_leaves_the_reclaimable_holder_intact() {
     let (_node, http, wallet, chain_id, classifier) =
         launch_preconf_node_with_classifier!(cfg, crate::helpers::mantle_test_chain_spec()).await;
 
-    // `a` parks and times out — reclaimable, and still owns the slot.
+    // `a` parks and times out. The deadline ends the commitment, and ending it
+    // is what removes the entry and hands the slot back.
     let tx_a = signed_transfer(chain_id, &wallet, 0).await;
     let a_hash = alloy_primitives::keccak256(&tx_a);
     let first = send_preconf(&http, tx_a).await.expect("first call Ok");
     assert!(
         matches!(first.status, PreconfStatus::Timeout),
-        "setup: `a` must reach a reclaimable state; got {:?}",
+        "setup: `a` must time out; got {:?}",
         first.status,
     );
     assert_eq!(
         classifier.slot_owner(&wallet_addr, 0),
-        Some(a_hash),
-        "setup: `a` must still own the slot",
+        None,
+        "a commitment that ended without a receipt must not keep its slot",
     );
+    assert!(!classifier.is_tracked(&a_hash), "nor its record");
 
-    // `b`: same (sender, nonce), reclaim would be allowed — but its gas limit
-    // trips the per-tx ceiling, so it is rejected after that point.
+    // `b`: same (sender, nonce), but its gas limit trips the per-tx ceiling, so
+    // it is rejected. Nothing of it may survive the refusal.
     let tx_b: alloy_primitives::Bytes = {
         let request = TransactionRequest {
             chain_id: Some(chain_id),
@@ -790,6 +784,7 @@ async fn rejected_replacement_leaves_the_reclaimable_holder_intact() {
         };
         TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
     };
+    let b_hash = alloy_primitives::keccak256(&tx_b);
     let err = send_preconf(&http, tx_b).await.expect_err("`b` must trip the per-tx gas ceiling");
     let msg = err.to_string();
     assert!(
@@ -797,14 +792,10 @@ async fn rejected_replacement_leaves_the_reclaimable_holder_intact() {
         "expected the gas ceiling to be what rejects `b`, got: {msg}",
     );
 
-    // The holder must be untouched.
-    assert!(
-        classifier.is_tracked(&a_hash),
-        "`a`'s record must survive a failed replacement attempt",
-    );
+    assert!(!classifier.is_tracked(&b_hash), "a refused submission leaves no record");
     assert_eq!(
         classifier.slot_owner(&wallet_addr, 0),
-        Some(a_hash),
-        "`a` must still own its slot after a failed replacement attempt",
+        None,
+        "and claims no slot — the nonce stays free for whatever the sender sends next",
     );
 }

@@ -63,8 +63,8 @@
 //! transaction. They are never held at the same time — [`PreconfClassifier::claim_preconf`],
 //! the only caller that needs both, finishes with the allowlist before taking the
 //! record lock — so no lock order exists to get wrong. As everywhere else in this crate, a guard
-//! is never held across an `.await`; [`PreconfClassifier::record`] hands back a `Copy`
-//! value, so callers cannot accidentally do so.
+//! is never held across an `.await`; every accessor here returns an owned value and drops its
+//! guard before returning, so callers cannot accidentally hold one.
 
 use alloy_primitives::{
     Address, TxHash,
@@ -252,8 +252,8 @@ impl CommitmentStore {
     /// Removes `hash` and, if it owned its `(sender, nonce)` slot, releases it.
     ///
     /// Guarded by an equality check because the slot may already have been
-    /// handed to a different transaction (the reclaimable-replacement path);
-    /// dropping it unconditionally would evict the new owner's claim.
+    /// claimed by a different transaction; dropping it unconditionally would
+    /// evict the new owner's claim.
     fn remove(&mut self, hash: &TxHash) {
         if let Some(cached) = self.by_hash.remove(hash) {
             self.release_slot_of(hash, &cached);
@@ -299,55 +299,6 @@ impl CommitmentStore {
         }
 
         claim
-    }
-
-    /// Compare-and-swap: hands `key` from `expected` to `hash`, but **only if
-    /// `expected` still holds it**.
-    ///
-    /// This is the reclaimable-replacement handover. It has to be a CAS rather
-    /// than a plain overwrite because the decision "the holder is in a
-    /// reclaimable state, so I may take its nonce" is made *before* the inner
-    /// validator runs, and that validator is `async`: two same-nonce
-    /// transactions can both observe the same reclaimable holder and both come
-    /// back to take the slot. An unconditional write makes the later one win the
-    /// index silently, while the pool (price) and the fifo (event order) each
-    /// pick a winner by their own rule — three layers, three possible answers,
-    /// and the transaction the pool accepted can end up skipped by both build
-    /// arms. The CAS makes exactly one of them succeed.
-    ///
-    /// A vacant slot also succeeds: nobody owns the nonce, so there is nothing
-    /// to conflict with.
-    ///
-    /// `is_preconf` describes **us**: a non-preconf replacement still needs the
-    /// CAS (to be sure it is the one tearing the holder down) but must not take
-    /// the slot afterwards, so on success the mapping is simply released.
-    fn replace(
-        &mut self,
-        expected: &TxHash,
-        key: (Address, u64),
-        hash: TxHash,
-        has_record: bool,
-    ) -> SlotClaim {
-        match self.by_slot.get(&key) {
-            // Already ours (re-validation of the same hash): idempotent.
-            Some(current) if *current == hash => return Ok(()),
-            Some(current) if current != expected => return Err(*current),
-            _ => {}
-        }
-
-        if has_record {
-            self.by_slot.insert(key, hash);
-            if let Some(cached) = self.by_hash.get_mut(&hash) {
-                cached.slot = Some(key);
-            }
-        } else {
-            // Nothing of ours to hang the reverse link on — release instead of
-            // occupying, for the same reason `claim` does not claim for a
-            // non-preconf transaction.
-            self.by_slot.remove(&key);
-        }
-
-        Ok(())
     }
 
     /// Releases `cached`'s slot iff it claimed one and `hash` is still the
@@ -501,9 +452,9 @@ impl PreconfClassifier {
     /// Get-or-insert, so whoever writes first wins, under the same lock every
     /// other record write takes.
     ///
-    /// `Ok(())` on an existing `Eligible` record is deliberate: that is the
-    /// documented same-hash retry after `Timeout` / `Canceled` / `Failed`, and
-    /// re-asking must be idempotent rather than an error.
+    /// `Ok(())` on an existing `Eligible` record is deliberate: a record
+    /// outlives its queue entry, so a resubmit after the first attempt ended
+    /// finds one still here. Re-asking must be idempotent.
     ///
     /// There is no case for an existing *non*-commitment record. Only this method
     /// and [`Self::mark_promised`] write records, and both write a preconf one,
@@ -549,10 +500,9 @@ impl PreconfClassifier {
     /// fifo first, records second — is the one every fifo removal already
     /// takes, through `drop_hash`'s eviction callback.
     ///
-    /// `replacing` names the incumbent the caller has just judged replaceable,
-    /// making this a hand-over rather than a fresh claim: the slot changes
-    /// hands only if that incumbent is still the one holding it. Passing `None`
-    /// requires the slot to be free or already ours.
+    /// The slot must be free or already ours — never taken from someone else,
+    /// since an incumbent holding a nonce is a commitment that still has to
+    /// land.
     ///
     /// # Why the fifo's own index is not enough
     ///
@@ -561,23 +511,14 @@ impl PreconfClassifier {
     /// entry is gone, which is the whole point of the window — the transaction
     /// is on chain, or about to be, and a second one on that nonce would either
     /// be refused by the EVM or displace it.
-    pub fn claim_admission_slot(
-        &self,
-        hash: TxHash,
-        sender: &Address,
-        nonce: u64,
-        replacing: Option<TxHash>,
-    ) -> SlotClaim {
+    pub fn claim_admission_slot(&self, hash: TxHash, sender: &Address, nonce: u64) -> SlotClaim {
         if !self.enabled {
             return Ok(());
         }
         let key = (*sender, nonce);
         let mut store = self.commitments.write();
         let has_record = store.by_hash.contains_key(&hash);
-        match replacing {
-            Some(incumbent) => store.replace(&incumbent, key, hash, has_record),
-            None => store.claim(key, hash, has_record),
-        }
+        store.claim(key, hash, has_record)
     }
 
     /// Undo the effect of an admission that did not take: drop `hash`'s record
@@ -861,23 +802,27 @@ impl PreconfClassifier {
     /// `committed_height`.
     ///
     /// One residual race, stated rather than closed: `live` is captured by the
-    /// caller before this call, so a transaction that is older than `grace` and
-    /// gets pushed into the fifo in the microseconds between the snapshot and
-    /// the `retain` below loses its record while holding a fifo entry. Reaching
-    /// it requires a transaction that sat without an entry for longer than
-    /// `grace` (i.e. parked in `Queued`) being promoted at exactly that instant;
-    /// its client has necessarily long since timed out, so the outcome is a fifo
-    /// entry whose apply fails on nonce and is reclaimed by
-    /// `clean_reclaimable` — never a broken promise. Closing it would mean
-    /// taking the fifo's async lock from this sync path, which is the dependency
-    /// the whole callback/sweep split exists to avoid.
+    /// caller before this call, so a record older than `grace` whose entry is
+    /// inserted between the snapshot and the `retain` below loses that record
+    /// while holding a fifo entry.
     ///
-    /// ## Why this is also the only fix for the main leak
+    /// The gap it needs is the one between [`Self::claim_preconf`], which writes
+    /// the record, and `PreconfTxSet::admit`, which inserts the entry — a single
+    /// validator call. Since `grace` is at least `preconf_timeout`, reaching the
+    /// race takes a validator slower than the client's entire deadline. Even
+    /// then it self-heals: [`Self::mark_promised`] get-or-inserts, so a receipt
+    /// writes the record back. Closing it properly would mean taking the fifo's
+    /// async lock from this sync path, which is the dependency the whole
+    /// callback/sweep split exists to avoid.
     ///
-    /// A transaction classified at admission that then sits in the `Queued`
-    /// sub-pool, never emits a `Pending` event and never gets a fifo entry will
-    /// never reach `drop_hash`. This sweep is the only thing that can reclaim
-    /// it: absent from `live`, past grace.
+    /// ## What would otherwise leak
+    ///
+    /// Records outlive entries on purpose in two places, and neither reaches
+    /// `drop_hash` again: a promise whose commitment never landed (the receipt
+    /// is out, so `release_unless_committed` keeps the record when the entry
+    /// goes), and the restore arms that deliberately leave a record with no
+    /// entry at all. Depth holds both first — `promise_recoverable` below — and
+    /// once that lapses this sweep is the only thing that can reclaim them.
     ///
     /// Called from the canonical-state handler, next to the fifo cleanup — once
     /// per canonical notification (≈ one block), nowhere near the admission hot
@@ -1098,7 +1043,7 @@ mod tests {
             nonce: u64,
         ) -> (bool, SlotClaim) {
             let _ = self.claim_preconf(hash, from, to);
-            let claim = self.claim_admission_slot(hash, from, nonce, None);
+            let claim = self.claim_admission_slot(hash, from, nonce);
             (self.is_tracked(&hash), claim)
         }
 
@@ -1987,23 +1932,6 @@ mod tests {
         assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(1), 7).1, Ok(()));
     }
 
-    /// Forgetting a transaction that has already lost the slot to someone else
-    /// must not evict the new owner — otherwise a late `drop_hash` for the old
-    /// hash would silently unblock the nonce.
-    #[test]
-    fn forget_does_not_evict_a_slot_already_handed_over() {
-        let c = classifier(LONG_GRACE);
-
-        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        // Hand the slot over the way the reclaimable-replacement path does.
-        let _ = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
-        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
-        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
-
-        c.release_unless_committed(&hash(1));
-        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)), "new owner survives");
-    }
-
     /// Sweeping a record must release its slot in the same critical section —
     /// a leaked slot blocks that nonce for as long as the process lives.
     #[test]
@@ -2065,83 +1993,5 @@ mod tests {
         }
         assert_eq!(disabled.commitment_count(), 0);
         assert_eq!(disabled.slot_count(), 0);
-    }
-
-    /// A handover to a hash with no record would create a claim nothing can
-    /// release — the reverse link lives on the record. The CAS still succeeds
-    /// (we *were* entitled to evict the holder); only the claim is skipped.
-    #[test]
-    fn a_handover_to_a_hash_without_a_record_claims_nothing() {
-        let c = classifier(LONG_GRACE);
-        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-
-        assert_eq!(c.claim_admission_slot(hash(9), &addr(1), 7, Some(hash(1))), Ok(()));
-        assert_eq!(c.slot_count(), 0, "holder released, nothing claimed in its place");
-    }
-
-    /// **The handover is a compare-and-swap** — see `CommitmentStore::replace` for
-    /// why. Two same-nonce transactions can both observe the same reclaimable
-    /// holder before either reaches the inner validator (it is `async`), so both
-    /// come back to take the slot; exactly one may win.
-    #[test]
-    fn a_handover_is_refused_when_the_holder_already_lost_the_slot() {
-        let c = classifier(LONG_GRACE);
-
-        // A holds the nonce; B and C both classify while it still does.
-        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert_eq!(c.admit_via_preconf_rpc(hash(2), &addr(1), 7).1, Err(hash(1)));
-        assert_eq!(c.admit_via_preconf_rpc(hash(3), &addr(1), 7).1, Err(hash(1)));
-
-        // B wins the race.
-        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
-        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
-
-        // C comes back expecting A and must be told it lost, to B.
-        assert_eq!(c.claim_admission_slot(hash(3), &addr(1), 7, Some(hash(1))), Err(hash(2)));
-        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)), "the winner keeps it");
-    }
-
-    /// Re-validation of the same hash must not be mistaken for a lost race.
-    #[test]
-    fn a_handover_is_idempotent_for_the_current_owner() {
-        let c = classifier(LONG_GRACE);
-
-        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        let _ = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
-        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
-
-        assert_eq!(
-            c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))),
-            Ok(()),
-            "already ours"
-        );
-        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
-    }
-
-    /// A vacant slot is nobody's, so there is nothing to lose the race to.
-    #[test]
-    fn a_handover_takes_a_vacant_slot() {
-        let c = classifier(LONG_GRACE);
-        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        c.release_unless_committed(&hash(1));
-
-        let _ = c.admit_via_preconf_rpc(hash(2), &addr(1), 8);
-        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
-        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
-    }
-
-    /// A non-preconf replacement is entitled to evict the holder but must not
-    /// occupy the nonce — it has no arm to defend, so holding it would refuse
-    /// later replacements for nothing.
-    #[test]
-    fn a_handover_releases_without_claiming_for_a_non_preconf_tx() {
-        let c = classifier(LONG_GRACE);
-
-        let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        // addr(9) is not allowlisted, so the door refuses it.
-        assert!(!c.registered_via_preconf_rpc(hash(2), &addr(9)));
-
-        assert_eq!(c.claim_admission_slot(hash(2), &addr(1), 7, Some(hash(1))), Ok(()));
-        assert_eq!(c.slot_owner(&addr(1), 7), None, "released, not taken over");
     }
 }
