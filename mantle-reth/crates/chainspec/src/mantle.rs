@@ -84,6 +84,11 @@ pub(crate) fn configure_mantle_genesis(
     genesis: &mut Genesis,
     mantle_genesis_info: MantleGenesisInfo,
 ) {
+    // Keep London active at the synthetic block zero. When `baseFeePerGas` is absent,
+    // `reth_chainspec::make_genesis_header` deliberately supplies the EIP-1559 initial base fee of
+    // 1 gwei. The resulting `base_fee_per_gas` is part of the built-in chainspec identity; removing
+    // it would require a new genesis hash and make existing MDBX databases fail the startup
+    // compatibility check.
     genesis.config.london_block.get_or_insert(0);
     genesis.config.arrow_glacier_block.get_or_insert(0);
     genesis.config.gray_glacier_block.get_or_insert(0);

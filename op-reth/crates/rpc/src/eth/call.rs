@@ -1,9 +1,9 @@
 use crate::{OpEthApi, OpEthApiError, eth::RpcNodeCore};
-use alloy_consensus::BlockHeader;
-use alloy_eips::BlockId;
+use alloy_consensus::{BlockHeader, SignableTransaction, TxEip1559};
+use alloy_eips::{BlockId, eip2718::Encodable2718};
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{TxKind, U256};
-use alloy_rpc_types_eth::state::StateOverride;
+use alloy_primitives::{Signature, TxKind, U256};
+use alloy_rpc_types_eth::{TransactionRequest, state::StateOverride};
 use reth_chainspec::{ChainSpecProvider, MIN_TRANSACTION_GAS};
 use reth_evm::{ConfigureEvm, Evm, EvmEnvFor, TransactionEnvMut, overrides::apply_state_overrides};
 use reth_optimism_evm::extract_l1_info;
@@ -106,13 +106,11 @@ where
                 let Ok(Some(block)) = self.provider().block_by_id(at) &&
                 chain_spec.is_mantle_arsia_active_at_timestamp(block.header().timestamp())
             {
-                let fee_cap = U256::from(
-                    request
-                        .as_ref()
-                        .max_fee_per_gas
-                        .unwrap_or(request.as_ref().gas_price.unwrap_or(0)),
-                );
-                if !fee_cap.is_zero() &&
+                let fee_cap = request
+                    .as_ref()
+                    .max_fee_per_gas
+                    .unwrap_or(request.as_ref().gas_price.unwrap_or(0));
+                if fee_cap != 0 &&
                     let Ok(mut l1_block_info) = extract_l1_info(block.body()) &&
                     let Ok(state) = self.provider().state_by_block_id(at) &&
                     let Some(from) = request.as_ref().from
@@ -126,16 +124,17 @@ where
                     let balance = from_override_balance
                         .or_else(|| state.account_balance(&from).ok().flatten())
                         .unwrap_or(U256::ZERO);
-                    let input = request.as_ref().input.input().cloned().unwrap_or_default();
+                    let gas_limit = estimate.try_into().unwrap_or(u64::MAX);
+                    let tx_envelope = build_arsia_funds_check_envelope(request.as_ref(), gas_limit);
 
                     if let Err(e) = mantle_reth_eth_api::mantle_arsia_check_funds(
                         &mantle_reth_eth_api::ArsiaFundsCheck {
-                            gas_limit: estimate.try_into().unwrap_or(u64::MAX),
-                            fee_cap,
+                            gas_limit,
+                            fee_cap: U256::from(fee_cap),
                             value: request.as_ref().value.unwrap_or(U256::ZERO),
                             from_balance: balance,
                             l1_block_info: &l1_block_info,
-                            tx_input: &input,
+                            tx_envelope: &tx_envelope,
                             chain_spec: chain_spec.as_ref(),
                             timestamp: block.header().timestamp(),
                         },
@@ -149,6 +148,62 @@ where
 
             Ok(estimate)
         }
+    }
+}
+
+/// Encodes the proxy transaction that op-geth prices in `mantleArsiaCheckFunds`.
+///
+/// op-geth intentionally constructs a dynamic-fee transaction from only the message fields used
+/// here. Its chain ID and recipient are nil, and its access list is empty. Zero-valued signature
+/// fields make the result an EIP-2718 envelope without pretending it is a sendable transaction.
+fn build_arsia_funds_check_envelope(request: &TransactionRequest, gas_limit: u64) -> Vec<u8> {
+    let (max_fee_per_gas, max_priority_fee_per_gas) = request.gas_price.map_or_else(
+        || {
+            (
+                request.max_fee_per_gas.unwrap_or_default(),
+                request.max_priority_fee_per_gas.unwrap_or_default(),
+            )
+        },
+        |gas_price| (gas_price, gas_price),
+    );
+    TxEip1559 {
+        chain_id: 0,
+        nonce: request.nonce.unwrap_or_default(),
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        to: TxKind::Create,
+        value: request.value.unwrap_or_default(),
+        access_list: Default::default(),
+        input: request.input.input().cloned().unwrap_or_default(),
+    }
+    .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
+    .encoded_2718()
+}
+
+#[cfg(test)]
+mod arsia_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn eip1559_request_without_priority_fee_encodes_zero_tip() {
+        let request = TransactionRequest { max_fee_per_gas: Some(100), ..Default::default() };
+        let actual = build_arsia_funds_check_envelope(&request, 21_000);
+        let expected = TxEip1559 {
+            chain_id: 0,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        }
+        .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
+        .encoded_2718();
+
+        assert_eq!(actual, expected);
     }
 }
 

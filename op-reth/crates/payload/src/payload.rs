@@ -676,6 +676,7 @@ mod tests {
     use alloy_consensus::BlockBody;
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{FixedBytes, TxKind, address, b256, bytes};
+    use alloy_rlp::Decodable;
     use alloy_rpc_types_engine::PayloadAttributes;
     use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
     use reth_optimism_primitives::OpTransactionSigned;
@@ -844,6 +845,24 @@ mod tests {
             OpTxEnvelope::Deposit(deposit) => deposit.eth_tx_value,
             other => panic!("expected a deposit transaction, got {other:?}"),
         }
+    }
+
+    /// Pins the mechanism the two tests below guard against, so they cannot pass vacuously: the
+    /// value is only decodable because the field is `U256`. Reading the very same RLP bytes into
+    /// the old `u128` still fails — `alloy_rlp`'s `static_left_pad::<16>` reports `Overflow`
+    /// rather than truncating, which is why the narrow type stalled the node instead of silently
+    /// diverging from op-geth.
+    #[test]
+    fn eth_tx_value_above_u128_is_only_decodable_as_u256() {
+        let eth_tx_value = U256::from(1u8) << 128usize;
+        let mut field = Vec::new();
+        eth_tx_value.encode(&mut field);
+
+        assert_eq!(U256::decode(&mut field.as_slice()).unwrap(), eth_tx_value);
+        assert!(matches!(
+            <u128 as Decodable>::decode(&mut field.as_slice()),
+            Err(alloy_rlp::Error::Overflow)
+        ));
     }
 
     /// Sequencer side: `OpPayloadBuilderAttributes::try_new` decodes the sequencer transactions
