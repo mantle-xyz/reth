@@ -3,6 +3,8 @@
 mod helpers;
 
 mod cumulative_balance;
+mod deposit_value;
+mod estimate_gas_l1_fee;
 mod estimate_total_fee_token_ratio;
 mod fill_transaction;
 mod gas_estimation;
