@@ -159,6 +159,10 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
     ///
     /// Separate from the publish cursor because the two diverge: a slice dropped
     /// by the cancel guard was handed over all the same.
+    ///
+    /// Only the slice path calls this, so with slicing off nothing drains what
+    /// `record_journalable` marked — see the pool arm in
+    /// `builder::payload_builder` for what that costs and why it stands.
     pub fn take_journal_records(
         &mut self,
         block_height: u64,

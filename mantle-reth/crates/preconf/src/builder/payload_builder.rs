@@ -955,9 +955,17 @@ where
         .expect("fee is always valid; execution succeeded");
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
     // The one class of transaction nothing else brings back after a restart:
-    // deposits arrive with the attributes, a preconf commitment is journaled
-    // when its receipt goes out, and the post-execution transaction is made by
+    // deposits arrive with the attributes, a preconf commitment is journaled by
+    // the apply that commits it, and the post-execution transaction is made by
     // the executor rather than sent by anyone.
+    //
+    // Marking it is not the same as persisting it. Only the slice path drains
+    // these (`SliceState::journal_and_publish`), so **with slicing off they are
+    // marked and never written** — the restart then replays commitments without
+    // the ordinary transactions they ran after, which is the failure this
+    // marking exists to prevent. Known, and left that way: writing them at the
+    // end of the build instead would put a disk write on the `engine_getPayload`
+    // path to cover a much narrower crash window.
     record_executed(info, fifo, recovered, true);
     Ok(BestTxStep::Continue)
 }

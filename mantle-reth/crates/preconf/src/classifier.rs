@@ -20,6 +20,17 @@
 //! refuses a replacement, the retention state behind [`SEAL_DEPTH`], and the
 //! journal's eviction question ([`PreconfClassifier::is_tracked`]).
 //!
+//! **The journal is written elsewhere**, from the apply and from each slice, so
+//! "has a journal line" is the wider set. A line with no record here is
+//! slot-scoped — it survives a restart inside the slot and goes at the next
+//! rotation — which is right for the ordinary transactions a slice carries.
+//! It also catches a commitment whose client disconnected before its event,
+//! and that one is not in the pool to be recovered from, so a crash after a
+//! rotation and before the block is canonical loses it. Narrow, and stated
+//! here rather than closed: closing it means establishing the record where the
+//! journal line is written, which is a different place from where a client is
+//! answered.
+//!
 //! ## Why the allowlists live here and not on `PreconfConfig`
 //!
 //! The lists are private to [`PreconfClassifier`], and there is deliberately no
@@ -385,15 +396,19 @@ impl PreconfClassifier {
     /// receipt for `hash` has gone out to a client, and claims the
     /// `(sender, nonce)` it was issued against.
     ///
-    /// Exactly two callers, and they are the two places that write the journal:
+    /// Two callers: the RPC handler, the instant it hands a client an event,
+    /// and journal restore's pre-pass, where the event went out in a previous
+    /// process.
     ///
-    /// * the RPC handler, next to `append_promised`, the instant the receipt is returned;
-    /// * journal restore's pre-pass, rebuilding the same state after a restart — the receipt there
-    ///   went out in a *previous* process, so nothing else in this one would know.
-    ///
-    /// Calling it from both is what makes the classifier's promised set and the
-    /// journal's contents agree by construction rather than by two independent
-    /// judgements.
+    /// **Not in lockstep with the journal.** A record is what keeps a journal
+    /// line alive — rotation's only rule is [`Self::is_tracked`] — but the two
+    /// are written in different places: the journal from the apply
+    /// (`builder::dispatch`) and from each slice. A line whose hash never
+    /// reaches here is therefore slot-scoped: it survives a restart inside the
+    /// slot and is dropped at the next rotation. That is what the slice's
+    /// ordinary transactions want, and it is also what a commitment whose
+    /// client disconnected before its event gets, which is the narrower case —
+    /// see the module docs on what that leaves exposed.
     ///
     /// **Why here and not at canonical time.** A canonical notification hands us
     /// bare transaction hashes for the whole block. To pick out our commitments

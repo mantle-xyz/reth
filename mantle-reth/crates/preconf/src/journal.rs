@@ -23,9 +23,25 @@
 //! `PreconfClassifier::is_tracked` directly. This is the sole statement of that
 //! division; the rest of the file assumes it.
 //!
-//! The journal exposes `append_promised` / `load` / `rotate` for the durability
-//! path, plus the startup helper [`restore_preconf_state`] and the background
-//! rotation loop [`spawn_rejournal_loop`].
+//! **Two writers, and only one of them creates the record that keeps a line.**
+//! [`PreconfJournal::append_promised`] takes one commitment from the apply;
+//! [`PreconfJournal::append_batch`] takes a whole slice, ordinary transactions
+//! included. The classifier record that `retain` reads is established
+//! elsewhere, when a client is handed its event — so a line whose hash never
+//! gets one is slot-scoped: good for a restart inside the slot, gone at the
+//! next rotation. For the slice's ordinary transactions that is the intent;
+//! see `PreconfClassifier::mark_promised` for the case where it is not.
+//!
+//! **The second writer only exists when slicing does.** With flashblocks off,
+//! what reaches this file is commitments and nothing else, so a restart replays
+//! them without the ordinary transactions they executed after — a commitment
+//! that needed an approve ahead of it fails on replay. See
+//! `builder::payload_builder`'s pool arm for why that is left as it is.
+//!
+//! The journal exposes `append_promised` / `append_batch` / `load` / `rotate`
+//! for the durability path, plus [`PreconfJournal::note_announced`], the
+//! startup helper [`restore_preconf_state`] and the background rotation loop
+//! [`spawn_rejournal_loop`].
 
 use std::{
     future::Future,
