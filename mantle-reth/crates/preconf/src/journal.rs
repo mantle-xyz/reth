@@ -3,9 +3,9 @@
 //! When the RPC handler returns a successful preconf event to a client,
 //! the sequencer has made a promise — "this transaction will be in a
 //! sealed block." If the node crashes before the tx is sealed, we owe
-//! the client honest replay on restart: the tx must re-enter the pool,
-//! the fifo must be re-populated, and the canonical-state handler must
-//! be ready to forward-clean it once it does land.
+//! the client honest replay on restart: the commitment must go back in
+//! the queue, and the canonical-state handler must be ready to
+//! forward-clean it once it does land.
 //!
 //! [`PreconfJournal`] is the on-disk substrate for that promise. The
 //! file format is **JSON Lines**: one [`JournalEntry`] per line, append
@@ -19,13 +19,29 @@
 //! [`PreconfClassifier`] is the single owner of "this commitment is over",
 //! because the only notion this layer could form — *canonical once* — is one a
 //! reorg can undo. Rotation receives that decision as the `retain` predicate
-//! [`PreconfJournal::rotate`] takes, and the pool listener asks
-//! `PreconfClassifier::is_promised` directly. This is the sole statement of that
+//! [`PreconfJournal::rotate`] takes, and restore asks
+//! `PreconfClassifier::is_tracked` directly. This is the sole statement of that
 //! division; the rest of the file assumes it.
 //!
-//! The journal exposes `append_promised` / `load` / `rotate` for the durability
-//! path, plus the startup helper [`restore_preconf_state`] and the background
-//! rotation loop [`spawn_rejournal_loop`].
+//! **Two writers, and only one of them creates the record that keeps a line.**
+//! [`PreconfJournal::append_promised`] takes one commitment from the apply;
+//! [`PreconfJournal::append_batch`] takes a whole slice, ordinary transactions
+//! included. The classifier record that `retain` reads is established
+//! elsewhere, when a client is handed its event — so a line whose hash never
+//! gets one is slot-scoped: good for a restart inside the slot, gone at the
+//! next rotation. For the slice's ordinary transactions that is the intent;
+//! see `PreconfClassifier::mark_promised` for the case where it is not.
+//!
+//! **The second writer only exists when slicing does.** With flashblocks off,
+//! what reaches this file is commitments and nothing else, so a restart replays
+//! them without the ordinary transactions they executed after — a commitment
+//! that needed an approve ahead of it fails on replay. See
+//! `builder::payload_builder`'s pool arm for why that is left as it is.
+//!
+//! The journal exposes `append_promised` / `append_batch` / `load` / `rotate`
+//! for the durability path, plus [`PreconfJournal::note_announced`], the
+//! startup helper [`restore_preconf_state`] and the background rotation loop
+//! [`spawn_rejournal_loop`].
 
 use std::{
     future::Future,
@@ -40,10 +56,10 @@ use std::{
 
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, Bytes, TxHash};
+use alloy_primitives::{Address, B256, Bytes, TxHash};
 use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
@@ -57,14 +73,14 @@ use tracing::{debug, error, info, warn};
 use crate::{PreconfClassifier, PreconfTxSet};
 
 /// One persisted preconf commitment. Carries everything needed to
-/// re-inject the transaction into the pool on restart and to recognise
+/// put the transaction back in the queue on restart and to recognise
 /// it later when it appears on chain.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JournalEntry {
     /// Transaction hash — primary key.
     pub hash: TxHash,
     /// RLP-encoded transaction bytes. Used to re-inject the tx into
-    /// the pool on startup if the pool's own journal lost it.
+    /// the queue on startup.
     pub tx_rlp: Bytes,
     /// Predicted L2 block height the commitment was promised for.
     /// Informational on restart; the canonical chain is authoritative.
@@ -179,9 +195,14 @@ pub enum JournalError {
 /// (rotation). All writes serialise through an async `Mutex` around the file
 /// handle.
 ///
-/// It holds **no** view of which commitments are still owed (see the module
-/// docs); that decision reaches rotation through the `retain` predicate
+/// It holds **no** view of which preconf commitments are still owed (see the
+/// module docs); that decision reaches rotation through the `retain` predicate
 /// [`Self::rotate`] takes.
+///
+/// It does hold an index of pool transactions announced in a flashblock and not
+/// yet seen on chain (see [`crate::unlanded::Unlanded`]) — but the judgement is
+/// still the caller's: the chain nonces the sweep runs on are read by the build
+/// and handed in. This type never reads the chain.
 #[derive(Debug)]
 pub struct PreconfJournal {
     /// Path to the journal file. Stored for rotation, which writes a
@@ -217,6 +238,10 @@ pub struct PreconfJournal {
     pending: SyncMutex<VecDeque<Vec<u8>>>,
     /// Running size of `pending`, so the byte fuse costs no walk.
     pending_bytes: AtomicUsize,
+    /// What this node announced in a flashblock and has not yet seen on chain.
+    /// See [`crate::unlanded::Unlanded`] — the journal owns it because every
+    /// component that needs it already holds the journal.
+    unlanded: crate::unlanded::Unlanded,
 }
 
 impl PreconfJournal {
@@ -252,6 +277,7 @@ impl PreconfJournal {
             rotate_notify: Notify::new(),
             pending: SyncMutex::new(VecDeque::new()),
             pending_bytes: AtomicUsize::new(0),
+            unlanded: crate::unlanded::Unlanded::new(),
         };
         // Nothing in memory to seed from the file: recognising a post-restart
         // commitment as ours is `restore_preconf_state`'s job.
@@ -275,6 +301,56 @@ impl PreconfJournal {
     /// is how they stop being.
     pub async fn append_promised(&self, entry: &JournalEntry) -> Result<(), JournalError> {
         self.append_batch(std::slice::from_ref(entry)).await
+    }
+
+    /// Record what a slice announced. See [`Unlanded::note_announced`].
+    ///
+    /// [`Unlanded::note_announced`]: crate::unlanded::Unlanded::note_announced
+    pub fn note_announced(&self, height: u64, txs: &[crate::unlanded::Announced]) {
+        self.unlanded.note_announced(height, txs);
+    }
+
+    /// Record the block this build sealed. See [`Unlanded::note_sealed`].
+    ///
+    /// [`Unlanded::note_sealed`]: crate::unlanded::Unlanded::note_sealed
+    pub fn note_sealed(&self, block: B256) {
+        self.unlanded.note_sealed(block);
+    }
+
+    /// Whether the chain built on the block this node last sealed.
+    /// See [`Unlanded::parent_is_ours`].
+    ///
+    /// [`Unlanded::parent_is_ours`]: crate::unlanded::Unlanded::parent_is_ours
+    pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
+        self.unlanded.parent_is_ours(parent_hash)
+    }
+
+    /// Drop everything staged. See [`Unlanded::clear`].
+    ///
+    /// [`Unlanded::clear`]: crate::unlanded::Unlanded::clear
+    pub fn clear_unlanded(&self) {
+        self.unlanded.clear();
+    }
+
+    /// Whether anything is staged. See [`Unlanded::is_empty`].
+    ///
+    /// [`Unlanded::is_empty`]: crate::unlanded::Unlanded::is_empty
+    pub fn unlanded_is_empty(&self) -> bool {
+        self.unlanded.is_empty()
+    }
+
+    /// Every distinct staged sender. See [`Unlanded::senders`].
+    ///
+    /// [`Unlanded::senders`]: crate::unlanded::Unlanded::senders
+    pub fn unlanded_senders(&self) -> HashSet<Address> {
+        self.unlanded.senders()
+    }
+
+    /// Take what the chain has not passed. See [`Unlanded::take_unlanded`].
+    ///
+    /// [`Unlanded::take_unlanded`]: crate::unlanded::Unlanded::take_unlanded
+    pub fn take_unlanded(&self, heads: &HashMap<Address, u64>) -> Vec<crate::unlanded::UnlandedTx> {
+        self.unlanded.take_unlanded(heads)
     }
 
     /// Append many records under one lock, with a single write and a single
@@ -655,70 +731,43 @@ impl Drop for LockedTimer {
     }
 }
 
-// ─── Pool interaction trait ─────────────────────────────────────────────────
+// ─── Decoding the journal back into transactions ────────────────────────────
 
-/// Minimal pool-side surface [`restore_preconf_state`] needs.
+/// Turns journal bytes back into something the queue can hold.
 ///
-/// Production callers wrap a real [`reth_transaction_pool::TransactionPool`]
-/// via [`RestorePoolAdapter`](crate::RestorePoolAdapter); tests inject a stub
-/// that records `contains` / `add_envelope` calls without standing up the full
-/// reth pool.
+/// Production uses [`RestoreDirect`](crate::RestoreDirect); tests inject a
+/// stub so a decode failure can be scripted.
 ///
-/// Kept here, alongside the journal, so the restore helper has no
-/// dependency on `reth-transaction-pool` itself — that wiring lives at
-/// the call site, not in the journal module.
+/// A trait, and kept here beside the journal, so the restore helper needs no
+/// dependency on `reth-transaction-pool` — the pooled envelope type it
+/// decodes into is supplied at the call site.
 #[async_trait::async_trait]
-pub trait RestorePool: Send + Sync {
-    /// Whether the pool already knows about this tx (e.g. via its own
-    /// journal). Currently unused by [`restore_preconf_state`] — the
-    /// unified `add_envelope` path handles both "new admit" and
-    /// "already imported" branches — but kept on the trait for
-    /// metric / telemetry callers that want an explicit pre-check.
-    async fn contains(&self, hash: &TxHash) -> bool;
-
-    /// Decode + recover + attempt to admit `tx_rlp` into the pool.
+pub trait RestoreSource: Send + Sync {
+    /// Decode and recover `tx_rlp`, and convert it into the form the queue
+    /// holds.
     ///
-    /// Returns `Ok(recovered)` in both of the following cases:
-    /// - the tx was newly admitted;
-    /// - the pool rejected admission with `AlreadyImported` (e.g. reth's local-tx backup restored
-    ///   the same tx first).
-    ///
-    /// In either case the caller needs the recovered envelope + sender
-    /// to push into the fifo — whether the pool already had the tx is
-    /// orthogonal.
-    ///
-    /// Only genuine pool errors (bad signature, nonce mismatch on the
-    /// post-restart state, ...) surface as `Err(reason)` — the restore
+    /// Only what the bytes themselves can be wrong about surfaces as
+    /// `Err(reason)`: they do not decode, or they decode to a type the
+    /// preconf path does not carry. Whether the commitment is still owed is
+    /// not this call's question — that is the chain's, and
+    /// [`restore_preconf_state`] asks it. The restore
     /// helper logs and skips those entries.
-    async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip>;
+    async fn recover_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip>;
 
-    /// Recover just the `(sender, nonce)` of `tx_rlp` — no pool involvement.
+    /// Recover just the `(sender, nonce)` of `tx_rlp`.
     ///
     /// Exists so [`restore_preconf_state`]'s pre-pass can claim each
     /// commitment's slot before *any* entry is admitted; see
     /// [`PreconfClassifier::mark_promised`](crate::PreconfClassifier::mark_promised)
-    /// for why that has to happen before `add_envelope`.
+    /// for why that has to happen before `recover_envelope`.
     ///
     /// `None` for anything that does not decode or whose signature does not
-    /// recover — the entry will fail `add_envelope` for the same reason a moment
+    /// recover — the entry will fail `recover_envelope` for the same reason a moment
     /// later, which is where it gets logged.
     ///
-    /// Decodes the same bytes `add_envelope` decodes again: one extra ec-recover
+    /// Decodes the same bytes `recover_envelope` decodes again: one extra ec-recover
     /// per journal entry, once per process start.
     fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)>;
-
-    /// Synchronously remove transactions from the pool by hash. Used
-    /// by [`PreconfTxSet`]'s pool-eviction
-    /// callback path — every transition to a non-on-chain terminal
-    /// state (`Timeout` / `Canceled` / `Failed`) triggers a same-hash
-    /// eviction to close the "client saw failure but tx later lands"
-    /// SLA gap.
-    ///
-    /// Idempotent — absent hashes are silently ignored (reth's
-    /// `pool.remove_transactions` returns an empty `Vec` in that
-    /// case). Sync because reth's `TransactionPool::remove_transactions`
-    /// is sync and holds only the pool's internal mutex briefly.
-    fn remove_transactions(&self, hashes: Vec<TxHash>);
 }
 
 /// Whether a commitment is on the canonical chain, as far as this node can
@@ -753,32 +802,47 @@ pub enum OnChain {
 /// The chain-side lookup [`restore_preconf_state`] needs to tell "this
 /// commitment landed" apart from "some other transaction consumed its nonce".
 ///
-/// Separate from [`RestorePool`] because the pool has no way to answer it — see
-/// [`RestoreSkip::NonceConsumed`].
+/// Separate from [`RestoreSource`] because the pool has no way to answer it — see
+/// the chain's account nonce.
 pub trait CommitmentChainView: Send + Sync {
     /// Is `hash` on the canonical chain?
     fn commitment_on_chain(&self, hash: &TxHash) -> OnChain;
+
+    /// `sender`'s account nonce on the canonical chain, or `None` if it
+    /// cannot be read.
+    ///
+    /// Restore asks this first, and for most entries it is the only question:
+    /// a commitment whose nonce is still free is simply still owed, and goes
+    /// straight back in the queue. Only when the nonce is *gone* is there
+    /// anything to investigate, and only then is the more expensive
+    /// [`Self::commitment_on_chain`] worth paying for.
+    ///
+    /// This is the judgement the transaction pool's validator used to make on
+    /// restore's behalf, as a side effect of refusing the transaction. It is
+    /// asked directly now, because the pool no longer sees these transactions
+    /// at all.
+    fn account_nonce(&self, sender: &Address) -> Option<u64>;
 }
 
-/// Why a journal entry was not re-admitted to the pool.
+/// Why a journal entry could not be turned back into a transaction.
 ///
-/// Deliberately says only what the **pool** can distinguish. Which of the three
-/// things a consumed nonce means — commitment honoured, nonce stolen, or
-/// unknowable — is resolved by [`restore_preconf_state`] with a
-/// [`CommitmentChainView`].
+/// Deliberately says only what the **bytes** can be wrong about. Whether a
+/// commitment is still owed — and, when its nonce is gone, which of honoured,
+/// stolen or unknowable that means — is resolved by
+/// [`restore_preconf_state`] with a [`CommitmentChainView`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreSkip {
-    /// The sender's account nonce has moved past this transaction — by **some** transaction, not
-    /// necessarily this one, so it cannot mean the commitment was kept: `validate_sender_nonce`
-    /// compares the *account's* nonce, never the hash, so a different tx yields the same error.
-    NonceConsumed(String),
-    /// Anything else: corrupt bytes, a variant that cannot be preconfirmed, or
-    /// a pool refusal that is not "nonce already consumed". A real failure —
-    /// the commitment is lost.
+    /// Corrupt bytes, or a variant that cannot be preconfirmed. A real
+    /// failure — the commitment is lost.
+    ///
+    /// "The nonce is already gone" used to be a second variant here, because
+    /// the transaction pool reported it as a refusal. Restore asks the chain
+    /// for that now, so it is a fact about the world rather than an error
+    /// from a decoder.
     Rejected(String),
 }
 
-/// Output of a successful [`RestorePool::add_envelope`] — the decoded
+/// Output of a successful [`RestoreSource::recover_envelope`] — the decoded
 /// envelope plus the recovered sender. The journal needs both: the
 /// envelope to push into the fifo, the sender as the `from` field
 /// keyed by `(sender, nonce)` for the replacement guard.
@@ -791,19 +855,31 @@ pub struct RestoredEnvelope {
 }
 
 // ─── Startup restore ────────────────────────────────────────────────────────
+/// Is the commitment's nonce still the sender's next one?
+///
+/// `true` also when the chain cannot be read: an unreadable account is not
+/// evidence that the nonce was taken, and treating it as such would abandon a
+/// commitment on a transient storage error. Queueing it instead is recoverable
+/// — the build's own forward sweep drops it if it turns out to be stale.
+fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -> bool {
+    match chain.account_nonce(&rec.from) {
+        Some(on_chain) => alloy_consensus::Transaction::nonce(&rec.envelope) >= on_chain,
+        None => true,
+    }
+}
 
 /// Walk the journal at startup and re-establish the in-memory state
 /// the running system expects.
 ///
 /// Order matters:
 ///
-/// 1. Mark **every** loaded hash [`Verdict::Promised`] up front, before admitting any of them. This
-///    is what carries "a receipt for this tx already went out to a client" across the restart, and
-///    it has to happen first — step 2 runs the pool validator, which classifies. See below.
-/// 2. Decode + attempt to admit into the pool via [`RestorePool::add_envelope`]. The trait treats
-///    `AlreadyImported` as success — reth's own local-tx backup may have restored the same tx from
-///    disk before this call, and either outcome yields the recovered envelope needed for the fifo
-///    push.
+/// 1. Mark **every** loaded hash promised up front, before admitting any of them. This is what
+///    carries "a receipt for this tx already went out to a client" across the restart, and it has
+///    to happen first: it is what claims the `(sender, nonce)` each commitment was issued against,
+///    before anything else can take it.
+/// 2. Decode via [`RestoreSource::recover_envelope`], then ask the chain whether the commitment is
+///    still owed — the sender's nonce first, and only if that is gone, whether this transaction is
+///    the one that took it.
 /// 3. Push the recovered envelope into the fifo with
 ///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so the dispatch layer's
 ///    deadline / gas-budget gates bypass the tx (SLA: "receipt returned → tx must land").
@@ -814,24 +890,21 @@ pub struct RestoredEnvelope {
 /// acknowledged to a client must come back regardless of what current policy
 /// says. Cold start runs before restore, so without step 1 a restored tx would
 /// be classified `Eligible` and re-judged against the *current*
-/// `preconf_max_gas_per_tx`: lower that flag, restart, and `add_envelope` starts
+/// `preconf_max_gas_per_tx`: lower that flag, restart, and `recover_envelope` starts
 /// rejecting commitments a client was already told had succeeded — silently,
 /// since restore skips and logs.
 ///
-/// [`Verdict::Promised`] makes the exemption explicit: `admit_and_claim` is
-/// get-or-insert, so the verdict installed here survives step 2, and the
+/// The `promised` flag makes the exemption explicit: the claim is
+/// get-or-insert, so the record installed here survives step 2, and the
 /// validator returns a promised transaction straight to its inner validator —
 /// ahead of the ceiling and every other preconf gate. The pre-pass loop carries
 /// the rest of the argument.
 ///
-/// Non-recoverable failures (corrupt tx bytes, pool refusal for reasons
-/// other than `AlreadyImported`) are logged and skipped — best-effort
-/// restore, never block startup.
-///
-/// [`Verdict::Promised`]: crate::classifier::Verdict::Promised
-pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
+/// Non-recoverable failures (corrupt bytes, a type the preconf path does not
+/// carry) are logged and skipped — best-effort restore, never block startup.
+pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     journal: &PreconfJournal,
-    pool: &P,
+    source: &P,
     chain: &C,
     fifo: &Arc<PreconfTxSet>,
     classifier: &PreconfClassifier,
@@ -862,10 +935,9 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
     // Step 1 — a pre-pass: every hash becomes a live commitment owning its nonce before any is
     // admitted. Two reasons it is not folded into the loop below.
     //
-    // **The verdict.** `add_envelope` hands the tx to the pool, whose validator classifies
-    // whatever is not yet marked. Two journal entries sharing a `(sender, nonce)` are enough to
-    // matter: admitting the first would classify the *second* against the current allowlists and
-    // put it through the replacement guard instead of treating it as the commitment it is.
+    // **The record.** Two journal entries sharing a `(sender, nonce)` are enough to matter:
+    // admitting the first would put the *second* through the replacement guard instead of
+    // treating it as the commitment it is.
     //
     // **The slot.** `mark_promised` both records "a receipt for this went out in a previous
     // process" and claims the `(sender, nonce)`, from what `recover_slot` hands it. Back-filling
@@ -874,14 +946,14 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
     // ordering closes that window today (`cli::node` runs restore before the pool loader, the RPC
     // server and the network); claiming here makes it structural instead.
     for entry in &entries {
-        match pool.recover_slot(&entry.tx_rlp) {
+        match source.recover_slot(&entry.tx_rlp) {
             Some((from, nonce)) => {
                 if let Err(owner) =
                     classifier.mark_promised(entry.hash, &from, nonce, entry.block_height)
                 {
                     // Someone already owns the nonce, so this commitment is the
                     // one that will lose it. Deliberately not seized — see
-                    // `mark_promised`. `add_envelope` below decides the outcome
+                    // `mark_promised`. `recover_envelope` below decides the outcome
                     // (typically `ReplacementUnderpriced`) and logs it.
                     warn!(
                         target: "mantle::preconf::journal",
@@ -892,11 +964,12 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
                 }
             }
             // Undecodable envelope. **No record is written**, deliberately:
-            // `recover_slot` shares its first step with `add_envelope`
-            // (`recover_raw_transaction::<PoolPooledTx<P>>`), so this entry is
-            // about to be rejected there too — it will never enter the pool or
-            // get a fifo entry, and a `Promised` record would break the rule that
-            // a promise names the `(sender, nonce)` it was issued against.
+            // `recover_slot` shares its first step with `recover_envelope`, so this
+            // entry is about to be rejected there too and will never reach the
+            // queue — and a `Promised` record would break the rule that a
+            // promise names the `(sender, nonce)` it was issued against. A
+            // record that cannot say which nonce it defends would go on to
+            // occupy one anyway.
             //
             // Reaching this means the file was corrupted in a way that survived
             // JSON parsing, or this binary no longer supports that transaction
@@ -921,12 +994,28 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
     let mut rejected = 0usize;
 
     for entry in entries {
-        let recovered = match pool.add_envelope(&entry.tx_rlp).await {
-            Ok(rec) => rec,
-            Err(RestoreSkip::NonceConsumed(reason)) => {
-                // The nonce is gone, but the pool cannot say to whom. Ask the
-                // chain: the three answers mean entirely different things, and
-                // only the first is the commitment having been kept.
+        let recovered = match source.recover_envelope(&entry.tx_rlp).await {
+            // Decoded. Whether it is still owed is the chain's to say, and the
+            // cheap half of that question comes first: if the sender's nonce
+            // has not moved past this transaction, nothing has taken its place
+            // and the commitment simply has not been kept yet.
+            //
+            // Only when the nonce *is* gone is there anything to investigate,
+            // and only then is the transaction-lookup query below worth
+            // paying for. This is the judgement the pool's validator used to
+            // make as a side effect of refusing the transaction; the pool no
+            // longer sees these at all, so it is asked directly.
+            Ok(rec) if nonce_still_free(chain, &rec) => rec,
+            Ok(rec) => {
+                let reason = format!(
+                    "sender {:?} has moved past nonce {}",
+                    rec.from,
+                    alloy_consensus::Transaction::nonce(&rec.envelope),
+                );
+                // The nonce is gone, but knowing that does not say to whom.
+                // Ask the chain: the three answers mean entirely different
+                // things, and only the first is the commitment having been
+                // kept.
                 match chain.commitment_on_chain(&entry.hash) {
                     OnChain::Yes { height } => {
                         // The promise was kept before the restart. Start its
@@ -1001,7 +1090,7 @@ pub async fn restore_preconf_state<P: RestorePool, C: CommitmentChainView>(
                     target: "mantle::preconf::journal",
                     hash = ?entry.hash,
                     reason,
-                    "pool rejected restored tx; commitment cannot be honoured"
+                    "restored tx could not be decoded; commitment cannot be honoured"
                 );
                 rejected += 1;
                 continue;
@@ -1551,6 +1640,7 @@ mod tests {
             rotate_notify: Notify::new(),
             pending: SyncMutex::new(VecDeque::new()),
             pending_bytes: AtomicUsize::new(0),
+            unlanded: crate::unlanded::Unlanded::new(),
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());
@@ -1856,17 +1946,17 @@ mod tests {
 
     // ── restore_preconf_state ──────────────────────────────────────
 
-    /// Stub pool that records `contains` / `add_envelope` calls. We
+    /// Stub pool that records `contains` / `recover_envelope` calls. We
     /// don't go through real reth pool machinery — that's wired in by
     /// the cli crate at a later phase. The stub fabricates plausible
-    /// envelopes for every `add_envelope` call.
+    /// envelopes for every `recover_envelope` call.
     struct StubPool {
         // Hashes the stub will report as already-present.
         known: HashSet<TxHash>,
         // Counts for assertions.
         contains_calls: std::sync::Mutex<Vec<TxHash>>,
         add_calls: std::sync::Mutex<Vec<Bytes>>,
-        // Whether add_envelope should return Err.
+        // Whether recover_envelope should return Err.
         reject_add: bool,
         // Whether recover_slot should fail, i.e. the bytes do not decode.
         undecodable: bool,
@@ -1885,15 +1975,8 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RestorePool for StubPool {
-        async fn contains(&self, hash: &TxHash) -> bool {
-            self.contains_calls.lock().unwrap().push(*hash);
-            self.known.contains(hash)
-        }
-        fn remove_transactions(&self, _hashes: Vec<TxHash>) {
-            // No mark_* fires in journal-only tests; keep no-op.
-        }
-        /// Must agree with the `(from, nonce)` `add_envelope` fabricates below —
+    impl RestoreSource for StubPool {
+        /// Must agree with the `(from, nonce)` `recover_envelope` fabricates below —
         /// restore claims the slot from this and pushes the fifo entry from that,
         /// so a mismatch would silently test nothing.
         fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
@@ -1903,7 +1986,7 @@ mod tests {
             let seed = tx_rlp.first().copied().unwrap_or(0);
             Some((Address::from([seed; 20]), u64::from(seed)))
         }
-        async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+        async fn recover_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
             self.add_calls.lock().unwrap().push(tx_rlp.clone());
             if self.reject_add {
                 return Err(RestoreSkip::Rejected("rejected by stub".into()));
@@ -1937,9 +2020,15 @@ mod tests {
     /// [`OnChain::Yes`] is what tests that predate the three-way split want —
     /// back then a consumed nonce *was* "the commitment landed", so passing `Yes`
     /// keeps their subject unchanged.
-    struct StubChain(OnChain);
+    /// `nonce` is what the chain says the sender is at; `None` leaves every
+    /// commitment's nonce free, which is the "still owed" path.
+    struct StubChain(OnChain, Option<u64>);
 
     impl CommitmentChainView for StubChain {
+        fn account_nonce(&self, _sender: &Address) -> Option<u64> {
+            self.1
+        }
+
         fn commitment_on_chain(&self, _hash: &TxHash) -> OnChain {
             self.0
         }
@@ -1947,7 +2036,7 @@ mod tests {
 
     /// The chain view for tests that are not about this distinction.
     fn landed() -> StubChain {
-        StubChain(OnChain::Yes { height: LANDED_AT })
+        StubChain(OnChain::Yes { height: LANDED_AT }, None)
     }
 
     /// Height `landed()` reports. Arbitrary; the tests only care about it
@@ -2111,9 +2200,9 @@ mod tests {
     #[tokio::test]
     async fn restore_pushes_fifo_when_pool_already_contains() {
         // Regression guard for J5: pre-fix, when pool.contains returned
-        // true, restore's inner branch called `add_envelope` and treated
+        // true, restore's inner branch called `recover_envelope` and treated
         // the resulting `Err(AlreadyImported)` as `continue;` — the
-        // fifo push was skipped. Post-fix, `add_envelope`'s trait
+        // fifo push was skipped. Post-fix, `recover_envelope`'s trait
         // contract treats AlreadyImported as `Ok(recovered)` and
         // restore unconditionally pushes to the fifo.
         let (_dir, j) = fresh_journal().await;
@@ -2131,29 +2220,29 @@ mod tests {
     }
 
     /// **The ordering invariant of C4.** Every entry must already carry
-    /// `Verdict::Promised` **before the first one is offered to the pool**, not
-    /// merely before its own admission. Asserted from inside `add_envelope`, i.e.
+    /// promised **before the first one is offered to the pool**, not
+    /// merely before its own admission. Asserted from inside `recover_envelope`, i.e.
     /// at exactly the moment the real validator would run. See the pre-pass in
     /// `restore_preconf_state` for why the stronger form is the one that matters.
     #[tokio::test]
     async fn restore_marks_every_entry_promised_before_admitting_any() {
-        /// Pool that, on each tx it is handed, snapshots the verdicts of **all**
+        /// Pool that, on each tx it is handed, snapshots the promise flag of **all**
         /// journal hashes — including the ones not offered yet.
-        struct VerdictSpyPool {
+        struct RecordSpyPool {
             classifier: Arc<PreconfClassifier>,
             hashes: Vec<TxHash>,
-            seen: std::sync::Mutex<Vec<Vec<Option<crate::classifier::Verdict>>>>,
+            seen: std::sync::Mutex<Vec<Vec<bool>>>,
         }
         #[async_trait::async_trait]
-        impl RestorePool for VerdictSpyPool {
-            async fn contains(&self, _hash: &TxHash) -> bool {
-                false
-            }
+        impl RestoreSource for RecordSpyPool {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((Address::from([seed; 20]), u64::from(seed)))
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            async fn recover_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
                 use alloy_consensus::{Signed, TxLegacy};
                 use alloy_primitives::Signature;
 
@@ -2164,25 +2253,24 @@ mod tests {
                 self.seen
                     .lock()
                     .unwrap()
-                    .push(self.hashes.iter().map(|h| self.classifier.verdict(h)).collect());
+                    .push(self.hashes.iter().map(|h| self.classifier.is_tracked(h)).collect());
                 Ok(RestoredEnvelope {
                     envelope: TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)),
                     from: Address::from([seed; 20]),
                 })
             }
-            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
         }
 
         let (_dir, j) = fresh_journal().await;
         // `entry(byte, height)` keys both the journal hash and the stub's
-        // fabricated envelope off the same byte, so the spy can look the verdict
+        // fabricated envelope off the same byte, so the spy can look the record
         // up by hash.
         j.append_promised(&entry(1, 10)).await.unwrap();
         j.append_promised(&entry(2, 11)).await.unwrap();
         j.append_promised(&entry(3, 12)).await.unwrap();
 
         let classifier = Arc::new(empty_classifier());
-        let pool = VerdictSpyPool {
+        let pool = RecordSpyPool {
             classifier: classifier.clone(),
             hashes: (1u8..=3).map(|b| TxHash::from([b; 32])).collect(),
             seen: std::sync::Mutex::new(vec![]),
@@ -2197,7 +2285,7 @@ mod tests {
         // each entry just before its own admission satisfies "this one is
         // Promised" but leaves those two `None` — that arrangement fails here.
         assert!(
-            seen[0].iter().all(|v| *v == Some(crate::classifier::Verdict::Promised)),
+            seen[0].iter().all(|promised| *promised),
             "all entries must be Promised before the first admission, including \
              those not yet admitted; got {:?}",
             seen[0],
@@ -2208,7 +2296,7 @@ mod tests {
     /// its `(sender, nonce)` before the first entry is offered to the pool.
     ///
     /// Without the pre-pass claiming it, the nonce would read as *free* from
-    /// restore until `add_envelope` drives that entry through the validator. A
+    /// restore until `recover_envelope` drives that entry through the validator. A
     /// same-nonce transaction admitted in that interval takes the slot, and the
     /// commitment loses a nonce its client was already told it had. Nothing can
     /// admit in that interval as the node is wired today (`cli::node` runs
@@ -2230,15 +2318,15 @@ mod tests {
             seen: std::sync::Mutex<Vec<Vec<Option<TxHash>>>>,
         }
         #[async_trait::async_trait]
-        impl RestorePool for SlotSpyPool {
-            async fn contains(&self, _hash: &TxHash) -> bool {
-                false
-            }
+        impl RestoreSource for SlotSpyPool {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((Address::from([seed; 20]), u64::from(seed)))
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            async fn recover_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
                 use alloy_consensus::{Signed, TxLegacy};
                 use alloy_primitives::Signature;
 
@@ -2259,7 +2347,6 @@ mod tests {
                     from: Address::from([seed; 20]),
                 })
             }
-            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
         }
 
         let (_dir, j) = fresh_journal().await;
@@ -2269,8 +2356,7 @@ mod tests {
 
         let classifier = Arc::new(PreconfClassifier::new(
             false,
-            std::time::Duration::from_secs(3600),
-            crate::classifier::DEFAULT_VERDICT_CACHE_CAP,
+            crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP,
         ));
         let pool = SlotSpyPool {
             classifier: classifier.clone(),
@@ -2304,29 +2390,22 @@ mod tests {
     /// `a_consumed_nonce_never_reaches_the_fifo`.
     #[tokio::test]
     async fn restore_starts_the_retention_clock_for_an_already_landed_entry() {
-        struct OnChainPool;
-        #[async_trait::async_trait]
-        impl RestorePool for OnChainPool {
-            async fn contains(&self, _hash: &TxHash) -> bool {
-                false
-            }
-            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
-                let seed = tx_rlp.first().copied().unwrap_or(0);
-                Some((Address::from([seed; 20]), u64::from(seed)))
-            }
-            async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
-                Err(RestoreSkip::NonceConsumed("nonce too low".into()))
-            }
-            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
-        }
-
         let (_dir, j) = fresh_journal().await;
         let e = entry(1, 10);
         j.append_promised(&e).await.unwrap();
 
         let c = empty_classifier();
-        restore_preconf_state(&j, &OnChainPool, &landed(), &Arc::new(PreconfTxSet::new(16)), &c)
-            .await;
+        // Coherent rather than `landed()`: a transaction that is on chain has
+        // necessarily taken its nonce, and it is the *nonce* that sends
+        // restore looking for the hash in the first place.
+        restore_preconf_state(
+            &j,
+            &OnChainPool,
+            &StubChain(OnChain::Yes { height: LANDED_AT }, NONCE_IS_GONE),
+            &Arc::new(PreconfTxSet::new(16)),
+            &c,
+        )
+        .await;
 
         // Landing starts the retention clock — it does not end tracking. Until
         // the block is buried, a reorg could bring the commitment back and it
@@ -2349,9 +2428,9 @@ mod tests {
     /// **The invariant the guard's occupancy check rests on**: nothing ever gets
     /// a fifo entry for a `(sender, nonce)` it does not own.
     ///
-    /// Restore is the one place that pushes entries without going through the
-    /// pool listener, and the one place that mints `Verdict::Promised` — the
-    /// verdict the guard waves past its occupancy check. So it is the only
+    /// Restore is the one place that pushes entries without going through
+    /// admission, and the one place that mints a promise — the
+    /// record the guard waves past its occupancy check. So it is the only
     /// candidate for producing the violating state, and it needs two journal
     /// records on one `(sender, nonce)` to try.
     ///
@@ -2371,15 +2450,14 @@ mod tests {
         const SHARED_NONCE: u64 = 7;
 
         #[async_trait::async_trait]
-        impl RestorePool for SameSlotPool {
-            async fn contains(&self, _hash: &TxHash) -> bool {
-                false
-            }
-            fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
+        impl RestoreSource for SameSlotPool {
             fn recover_slot(&self, _tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 Some((SHARED_SENDER, SHARED_NONCE))
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            async fn recover_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
                 use alloy_consensus::{Signed, TxLegacy};
                 use alloy_primitives::Signature;
                 let byte = tx_rlp.first().copied().unwrap_or(0);
@@ -2415,24 +2493,35 @@ mod tests {
         );
     }
 
-    /// A pool that only ever answers "the nonce is gone" — the one error whose
-    /// meaning the pool cannot pin down. Reused by the three tests below, which
-    /// differ only in what the *chain* then says.
-    struct NonceConsumedPool;
+    /// The sender's nonce, as the tests below arrange for the chain to report
+    /// it: past every commitment they journal, so each takes the "nonce is
+    /// gone" path and differs only in what the chain then says about the hash.
+    const NONCE_IS_GONE: Option<u64> = Some(u64::MAX);
+
+    /// A decoder that always succeeds. What the entry's fate is depends on
+    /// the chain now, not on this.
+    struct OnChainPool;
 
     #[async_trait::async_trait]
-    impl RestorePool for NonceConsumedPool {
-        async fn contains(&self, _hash: &TxHash) -> bool {
-            false
-        }
+    impl RestoreSource for OnChainPool {
         fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
             let seed = tx_rlp.first().copied().unwrap_or(0);
             Some((Address::from([seed; 20]), u64::from(seed)))
         }
-        async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
-            Err(RestoreSkip::NonceConsumed("nonce too low".into()))
+        async fn recover_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            use alloy_consensus::{Signed, TxLegacy};
+            use alloy_primitives::Signature;
+            let seed = tx_rlp.first().copied().unwrap_or(0);
+            let inner = TxLegacy { nonce: u64::from(seed), ..Default::default() };
+            Ok(RestoredEnvelope {
+                envelope: TxEnvelope::Legacy(Signed::new_unchecked(
+                    inner,
+                    Signature::test_signature(),
+                    TxHash::from([seed; 32]),
+                )),
+                from: Address::from([seed; 20]),
+            })
         }
-        fn remove_transactions(&self, _hashes: Vec<TxHash>) {}
     }
 
     /// **The bug this three-way split exists for.** The sender's nonce is gone,
@@ -2455,8 +2544,8 @@ mod tests {
         let c = empty_classifier();
         restore_preconf_state(
             &j,
-            &NonceConsumedPool,
-            &StubChain(OnChain::No),
+            &OnChainPool,
+            &StubChain(OnChain::No, NONCE_IS_GONE),
             &Arc::new(PreconfTxSet::new(16)),
             &c,
         )
@@ -2491,8 +2580,8 @@ mod tests {
         let c = empty_classifier();
         restore_preconf_state(
             &j,
-            &NonceConsumedPool,
-            &StubChain(OnChain::Unknown),
+            &OnChainPool,
+            &StubChain(OnChain::Unknown, NONCE_IS_GONE),
             &Arc::new(PreconfTxSet::new(16)),
             &c,
         )
@@ -2516,8 +2605,8 @@ mod tests {
         let c = empty_classifier();
         restore_preconf_state(
             &j,
-            &NonceConsumedPool,
-            &StubChain(OnChain::Yes { height: LANDED_AT }),
+            &OnChainPool,
+            &StubChain(OnChain::Yes { height: LANDED_AT }, NONCE_IS_GONE),
             &Arc::new(PreconfTxSet::new(16)),
             &c,
         )
@@ -2541,8 +2630,8 @@ mod tests {
 
             restore_preconf_state(
                 &j,
-                &NonceConsumedPool,
-                &StubChain(answer),
+                &OnChainPool,
+                &StubChain(answer, NONCE_IS_GONE),
                 &fifo,
                 &empty_classifier(),
             )
@@ -2567,7 +2656,7 @@ mod tests {
         let c = empty_classifier();
         restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
 
-        // Both entries' add_envelope calls return Err — the function
+        // Both entries' recover_envelope calls return Err — the function
         // does not panic and walks all entries.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2);
         assert!(fifo.snapshot().await.is_empty());

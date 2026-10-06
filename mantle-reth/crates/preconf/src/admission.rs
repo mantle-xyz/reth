@@ -1,0 +1,725 @@
+//! The preconf path's front door.
+//!
+//! One call takes a raw transaction from "bytes off the wire" to "queued, and
+//! the builder has been told". Everything that can refuse it refuses here,
+//! synchronously, with a reason — which is the point. The route this replaces
+//! reached the queue through the transaction pool and a listener, so a
+//! transaction the pool parked rather than rejected produced no refusal at
+//! all: the client waited out the whole timeout to be told nothing happened.
+//!
+//! ## Order
+//!
+//! Cheapest judgement first, and two placements are deliberate rather than
+//! incidental:
+//!
+//! * **recording the commitment** comes before the validator, because the record has to exist
+//!   before any step that can fail expensively — otherwise every failure path owes a rollback;
+//! * the **queue's own rules** come last, because they are the only ones needing its lock, and
+//!   holding it for a request already doomed is time no other request can use.
+//!
+//! ## What it does not have
+//!
+//! No transaction pool. Not an omission — the preconf path answers nonce,
+//! balance and duplicate questions from its own queue and from chain state,
+//! and each of the three tempting reads of the pool was considered and
+//! refused. A pool handle here would make that invariant unenforceable, so
+//! there is nothing to hold one.
+//!
+//! No state provider either, for a narrower reason: the validator already
+//! read the sender's account to judge the transaction, and says what it read.
+//! A second read here would be two answers to one question, and which one the
+//! queue got would turn on whether a canonical head happened to land between
+//! them.
+//!
+//! The validator chain is shared with the pool rather than duplicated: both
+//! paths must give one answer to "is this transaction valid", and the chain's
+//! own head-tracking is driven once, by pool maintenance, for both.
+
+use std::sync::Arc;
+
+use alloy_consensus::{Transaction, TxEnvelope, TxType};
+use alloy_eips::eip2718::Decodable2718;
+use alloy_primitives::{Address, Bytes, TxKind};
+use op_alloy_consensus::OpTxEnvelope;
+use reth_rpc_eth_types::utils::recover_raw_transaction;
+use reth_transaction_pool::{
+    PoolTransaction, TransactionOrigin, TransactionValidationOutcome, TransactionValidator,
+    error::InvalidPoolTransactionError,
+};
+use tokio::sync::oneshot;
+use tracing::{debug, trace};
+
+use crate::{
+    PreconfClassifier, PreconfConfig, PreconfTxSet,
+    preconf_tx_set::{AdmitRequest, Capacity},
+    types::{PreconfError, PreconfReceipt, PreconfSource},
+};
+
+/// The transaction types the preconf path accepts.
+///
+/// A list rather than a set of exclusions, so a type added upstream is
+/// refused until someone decides otherwise. Set-code transactions are the
+/// reason it exists: one of them re-points an account's code, which changes
+/// what every transaction queued behind it would do — a coupling this queue
+/// has no way to account for. Blob transactions are refused for the plainer
+/// reason that an L2 has nowhere to put them.
+///
+/// It bars *establishing* a delegation, and nothing else. Calling an account
+/// that already has one, or sending from one, is an ordinary transaction and
+/// goes through untouched.
+const fn accepts(ty: TxType) -> bool {
+    matches!(ty, TxType::Legacy | TxType::Eip2930 | TxType::Eip1559)
+}
+
+/// The type byte of an EIP-2718 envelope, without decoding it.
+///
+/// Read ahead of the decode, and it has to be: the pooled type this node
+/// builds with has no blob variant, so a blob transaction fails to decode at
+/// all and the caller would hear "malformed" about something perfectly well
+/// formed that simply is not accepted here. A type is not a parse error.
+///
+/// Per EIP-2718 a leading byte of `0x00..=0x7f` is the type; anything above
+/// is the RLP list prefix of a legacy transaction.
+fn peek_tx_type(bytes: &[u8]) -> Option<u8> {
+    match bytes.first()? {
+        &ty @ 0x00..=0x7f => Some(ty),
+        _ => Some(TxType::Legacy as u8),
+    }
+}
+
+/// Best-effort conversion of an [`OpTxEnvelope`] into an alloy [`TxEnvelope`].
+///
+/// Drops `Deposit` (and any future OP-specific) variants by returning `None`.
+/// User-submitted variants (`Legacy` / `Eip1559` / `Eip2930` / `Eip7702`) are
+/// passed through unchanged.
+///
+/// Shared with [`crate::restore::RestoreDirect`] so admission
+/// and the restore-time adapter agree on which OP tx variants are
+/// preconf-eligible.
+pub(crate) fn op_envelope_to_alloy(op_tx: OpTxEnvelope) -> Option<TxEnvelope> {
+    match op_tx {
+        OpTxEnvelope::Legacy(tx) => Some(TxEnvelope::Legacy(tx)),
+        OpTxEnvelope::Eip2930(tx) => Some(TxEnvelope::Eip2930(tx)),
+        OpTxEnvelope::Eip1559(tx) => Some(TxEnvelope::Eip1559(tx)),
+        OpTxEnvelope::Eip7702(tx) => Some(TxEnvelope::Eip7702(tx)),
+        // Deposit (type 0x7E) is L1→L2 system-injected — never user-submitted
+        // preconf-eligible.
+        OpTxEnvelope::Deposit(_) => None,
+        // PostExec (type 0x7D, mantle-specific) is a system tx emitted after
+        // block execution — never user-submitted preconf-eligible.
+        OpTxEnvelope::PostExec(_) => None,
+    }
+}
+
+/// Turns a validator refusal into something the client can act on.
+///
+/// The route this replaces flattened every one of these into a single string
+/// with a `pool rejected:` prefix, which told a caller nothing about whether
+/// to retry, to top up, or to give up. The reason itself is preserved either
+/// way; what is added is a variant to match on.
+fn refusal(err: &InvalidPoolTransactionError) -> PreconfError {
+    PreconfError::PoolRejected(err.to_string())
+}
+
+/// An admitted transaction, and what the caller still needs to know about
+/// it.
+///
+/// The RPC handler waits on the client's channel after this returns, and that
+/// wait is keyed on the transaction's identity — which admission has already
+/// worked out and the caller would otherwise decode a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedTx {
+    /// Transaction hash.
+    pub hash: alloy_primitives::TxHash,
+    /// Recovered sender.
+    pub sender: Address,
+    /// Sender nonce.
+    pub nonce: u64,
+}
+
+/// Admission as the RPC handler sees it.
+///
+/// Object-safe on purpose. The concrete type carries the validator chain and
+/// the state provider as parameters, and the handler is built in a later
+/// node-builder phase than the one where those exist — so what crosses
+/// between them is this, not the type.
+#[async_trait::async_trait]
+pub trait DynAdmission: Send + Sync + std::fmt::Debug {
+    /// See [`PreconfAdmission::admit`].
+    async fn admit(
+        &self,
+        bytes: Bytes,
+        origin_instant: std::time::Instant,
+        responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
+    ) -> Result<AdmittedTx, PreconfError>;
+}
+
+#[async_trait::async_trait]
+impl<V> DynAdmission for PreconfAdmission<V>
+where
+    V: TransactionValidator + std::fmt::Debug + 'static,
+    V::Transaction: PoolTransaction<Pooled: Decodable2718>,
+    OpTxEnvelope: From<<V::Transaction as PoolTransaction>::Consensus>,
+{
+    async fn admit(
+        &self,
+        bytes: Bytes,
+        origin_instant: std::time::Instant,
+        responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
+    ) -> Result<AdmittedTx, PreconfError> {
+        Self::admit(self, &bytes, origin_instant, responder).await
+    }
+}
+
+/// Decides whether a transaction may join the preconf queue, and puts it
+/// there if so.
+///
+/// Holds no pool and no state provider; see the module docs.
+pub struct PreconfAdmission<V> {
+    validator: V,
+    fifo: Arc<PreconfTxSet>,
+    classifier: Arc<PreconfClassifier>,
+    cfg: Arc<PreconfConfig>,
+    /// What the queue may hold, taken from the node's own pool configuration
+    /// so that tuning one tunes both.
+    capacity: Capacity,
+}
+
+impl<V> std::fmt::Debug for PreconfAdmission<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreconfAdmission")
+            .field("cfg", &self.cfg)
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<V> PreconfAdmission<V> {
+    /// Bind admission to the validator chain and queue it works against.
+    pub const fn new(
+        validator: V,
+        fifo: Arc<PreconfTxSet>,
+        classifier: Arc<PreconfClassifier>,
+        cfg: Arc<PreconfConfig>,
+        capacity: Capacity,
+    ) -> Self {
+        Self { validator, fifo, classifier, cfg, capacity }
+    }
+}
+
+impl<V> PreconfAdmission<V>
+where
+    V: TransactionValidator + 'static,
+    V::Transaction: PoolTransaction<Pooled: Decodable2718>,
+    // A conversion rather than an equality, matching how the node states the
+    // same relation: for any OP-stack primitives the two coincide, but the
+    // bound the compiler can see is the `From` impl.
+    OpTxEnvelope: From<<V::Transaction as PoolTransaction>::Consensus>,
+{
+    /// Decide on `bytes`, and queue them if they pass.
+    ///
+    /// `responder` is the client's channel; it goes into the entry under the
+    /// queue's own lock, so the builder cannot reach an entry with nobody to
+    /// answer. The instant beside it is when the request arrived, which is the
+    /// clock the dispatch deadline measures — not when this call happened to
+    /// run.
+    pub async fn admit(
+        &self,
+        bytes: &Bytes,
+        origin_instant: std::time::Instant,
+        responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
+    ) -> Result<AdmittedTx, PreconfError> {
+        // Before the decode — see `peek_tx_type`.
+        let ty = peek_tx_type(bytes)
+            .ok_or_else(|| PreconfError::Internal("empty transaction payload".to_string()))?;
+        if !TxType::try_from(ty).is_ok_and(accepts) {
+            return Err(PreconfError::UnsupportedTxType { ty });
+        }
+
+        let recovered =
+            recover_raw_transaction::<<V::Transaction as PoolTransaction>::Pooled>(bytes)
+                .map_err(|e| PreconfError::Internal(e.to_string()))?;
+        let pool_tx = <V::Transaction as PoolTransaction>::from_pooled(recovered);
+
+        let sender = pool_tx.sender();
+        let hash = *pool_tx.hash();
+        let nonce = pool_tx.nonce();
+        let gas_limit = Transaction::gas_limit(&pool_tx);
+        let to = match pool_tx.kind() {
+            TxKind::Call(to) => Some(to),
+            TxKind::Create => None,
+        };
+
+        // The allowlist gate. Not the binding one — see `preview_eligibility`
+        // for where that is. This is here so a sender who was never allowlisted
+        // is turned away before a state read and a validator round trip.
+        if !self.classifier.preview_eligibility(&sender, to.as_ref()) {
+            trace!(target: "mantle::preconf::admission", ?sender, ?to, ?hash, "not allowlisted");
+            return Err(PreconfError::NotPreconfEligible);
+        }
+
+        if gas_limit > self.cfg.preconf_max_gas_per_tx {
+            return Err(PreconfError::PreconfGasLimitExceeded {
+                gas_limit,
+                max: self.cfg.preconf_max_gas_per_tx,
+            });
+        }
+
+        // Nothing is recorded on the way in, so nothing is owed back on the
+        // way out: the queue creates the entry, and the classifier's record is
+        // not written until a receipt goes out (`mark_promised`).
+        match self.decide(pool_tx, sender, hash, origin_instant, responder).await {
+            Ok(()) => Ok(AdmittedTx { hash, sender, nonce }),
+            Err(err) => {
+                // Kept under its original name so existing dashboards follow
+                // the judgement to where it moved. What it counts is narrower
+                // now: the queue answers from chain state plus its own
+                // contents, so a gap is the client's own doing rather than
+                // possibly ours.
+                if matches!(err, PreconfError::NonceGap { .. }) {
+                    metrics::counter!("preconf.rpc.nonce_gap_rejected_total").increment(1);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Everything after the record exists: the validator, then the queue.
+    ///
+    /// Split out so the caller has one place to release the record from,
+    /// rather than a release on every branch that can fail.
+    async fn decide(
+        &self,
+        pool_tx: V::Transaction,
+        sender: Address,
+        hash: alloy_primitives::TxHash,
+        origin_instant: std::time::Instant,
+        responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
+    ) -> Result<(), PreconfError> {
+        // The type gate ran first, so this is one of the three it lets
+        // through and the conversion cannot fail.
+        let op_envelope = OpTxEnvelope::from(pool_tx.clone_into_consensus().into_inner());
+        let Some(envelope) = op_envelope_to_alloy(op_envelope) else {
+            return Err(PreconfError::Internal("unsupported envelope past the type gate".into()));
+        };
+        // The same chain the pool puts its own transactions through, so the two
+        // paths cannot disagree about what is valid — and the account state the
+        // queue's baseline is measured against comes from here, and only from
+        // here. The validator has just read the sender's account to judge this
+        // transaction and reports what it read; reading it again through a
+        // provider would be two answers to one question, with a canonical head
+        // landing in between deciding which.
+        let (chain_nonce, bytecode_hash) =
+            match self.validator.validate_transaction(TransactionOrigin::External, pool_tx).await {
+                TransactionValidationOutcome::Valid { state_nonce, bytecode_hash, .. } => {
+                    (state_nonce, bytecode_hash)
+                }
+                TransactionValidationOutcome::Invalid(_, err) => {
+                    debug!(target: "mantle::preconf::admission", ?hash, %err, "validator refused");
+                    return Err(refusal(&err));
+                }
+                TransactionValidationOutcome::Error(_, err) => {
+                    return Err(PreconfError::Internal(err.to_string()));
+                }
+            };
+
+        self.fifo
+            .admit(
+                &self.classifier,
+                AdmitRequest {
+                    tx: Arc::new(envelope),
+                    from: sender,
+                    source: PreconfSource::Rpc,
+                    responder: Some((origin_instant, responder)),
+                    chain_nonce,
+                    bytecode_hash,
+                },
+                self.capacity,
+            )
+            .await
+    }
+}
+
+/// The queue's ceilings, as the node's pool is configured.
+///
+/// Read from the live `PoolConfig` rather than restated, so `--txpool.*`
+/// moves both paths together and neither can drift into being the looser one.
+pub fn capacity_from_pool_config(
+    cfg: &reth_transaction_pool::PoolConfig,
+    preconf: &PreconfConfig,
+) -> Capacity {
+    Capacity {
+        max_txs: cfg.pending_limit.max_txs,
+        max_size: cfg.pending_limit.max_size,
+        max_account_slots: cfg.max_account_slots,
+        max_inflight_delegated: cfg.max_inflight_delegated_slot_limit,
+        // Derived, not configured directly, so retuning the per-block budget
+        // carries the queue ceiling with it.
+        max_queued_gas: preconf
+            .preconf_max_gas_per_block
+            .saturating_mul(preconf.preconf_queue_gas_blocks),
+    }
+}
+
+#[cfg(test)]
+mod record_release_tests {
+    //! What a refused admission owes back.
+    //!
+    //! The record is written before the validator runs, so every path that
+    //! fails after it has to hand it back — otherwise the hash keeps a
+    //! commitment record for a transaction that is going nowhere, and the
+    //! sender could never get those bytes preconfirmed again.
+    //!
+    //! One exception, and it is the whole reason the release is not
+    //! unconditional: a commitment whose receipt has already gone out keeps
+    //! its record and its nonce.
+
+    use super::*;
+    use crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP;
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{B256, U256};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
+    use reth_optimism_primitives::OpBlock;
+    use reth_optimism_txpool::OpPooledTransaction;
+    use reth_transaction_pool::error::InvalidPoolTransactionError;
+    use std::collections::HashSet;
+
+    const RECIPIENT: Address = Address::new([0x42; 20]);
+
+    /// Refuses everything, which is the only branch these tests are about.
+    #[derive(Debug)]
+    struct AlwaysRefuses;
+
+    impl TransactionValidator for AlwaysRefuses {
+        type Transaction = OpPooledTransaction;
+        type Block = OpBlock;
+
+        async fn validate_transaction(
+            &self,
+            _origin: TransactionOrigin,
+            transaction: Self::Transaction,
+        ) -> TransactionValidationOutcome<Self::Transaction> {
+            TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Underpriced,
+            )
+        }
+    }
+
+    struct Fixture {
+        admission: PreconfAdmission<AlwaysRefuses>,
+        classifier: Arc<PreconfClassifier>,
+        fifo: Arc<PreconfTxSet>,
+        signer: PrivateKeySigner,
+    }
+
+    fn fixture() -> Fixture {
+        let signer =
+            PrivateKeySigner::from_bytes(&B256::from([0x11; 32])).expect("valid secp256k1 scalar");
+        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
+        classifier.update_whitelist(
+            [(signer.address(), RECIPIENT)].into_iter().collect(),
+            HashSet::default(),
+            HashSet::default(),
+        );
+
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        let cfg = PreconfConfig {
+            enabled: true,
+            preconf_max_gas_per_tx: 1_000_000,
+            ..Default::default()
+        };
+        let admission = PreconfAdmission::new(
+            AlwaysRefuses,
+            fifo.clone(),
+            classifier.clone(),
+            Arc::new(cfg),
+            Capacity {
+                max_txs: 16,
+                max_size: 1 << 20,
+                max_account_slots: 16,
+                max_inflight_delegated: 1,
+                max_queued_gas: u64::MAX,
+            },
+        );
+        Fixture { admission, classifier, fifo, signer }
+    }
+
+    /// Signed for real: the sender is recovered cryptographically, so a
+    /// fabricated signature would not survive the decode.
+    fn signed_raw(signer: &PrivateKeySigner, nonce: u64) -> (Bytes, B256) {
+        let tx = TxEip1559 {
+            chain_id: 10,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(RECIPIENT),
+            value: U256::from(1u64),
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).expect("in-memory signer");
+        let signed = tx.into_signed(signature);
+        let hash = *signed.hash();
+        (TxEnvelope::Eip1559(signed).encoded_2718().into(), hash)
+    }
+
+    #[tokio::test]
+    async fn a_refusal_hands_back_the_record_it_froze() {
+        let f = fixture();
+        let (raw, hash) = signed_raw(&f.signer, 0);
+        let (resp, _rx) = oneshot::channel();
+
+        f.admission
+            .admit(&raw, std::time::Instant::now(), resp)
+            .await
+            .expect_err("the validator refuses everything");
+
+        assert!(!f.classifier.is_tracked(&hash), "the record must be released");
+        assert!(!f.fifo.contains(&hash).await, "and nothing may be left queued");
+    }
+
+    /// The exception. Reachable shape: the transaction was applied and its
+    /// receipt returned, but its block is not canonical yet — so nothing has
+    /// set `committed_height` to protect the record. A same-hash resubmit in
+    /// that window is re-validated and can fail on account state alone, since
+    /// Mantle recomputes the L1 and operator fees every time.
+    ///
+    /// A record exists only for a commitment whose event has gone out, so its
+    /// presence is the thing that must survive a refused resubmit.
+    #[tokio::test]
+    async fn a_refusal_must_not_drop_a_commitment_already_promised() {
+        let f = fixture();
+        let (raw, hash) = signed_raw(&f.signer, 0);
+        let sender = f.signer.address();
+        let (resp, _rx) = oneshot::channel();
+
+        assert_eq!(f.classifier.mark_promised(hash, &sender, 0, 0), Ok(()));
+        assert!(f.classifier.is_tracked(&hash), "precondition: the commitment is acknowledged",);
+
+        f.admission
+            .admit(&raw, std::time::Instant::now(), resp)
+            .await
+            .expect_err("the validator refuses the resubmit");
+
+        assert!(f.classifier.is_tracked(&hash), "the commitment record must survive");
+        assert_eq!(
+            f.classifier.slot_owner(&sender, 0),
+            Some(hash),
+            "and so must the nonce it was promised against",
+        );
+    }
+
+    /// The type gate runs before anything is recorded, so there is nothing
+    /// to hand back — and nothing must be left behind either.
+    #[tokio::test]
+    async fn a_type_refused_transaction_never_froze_anything() {
+        let f = fixture();
+        let (raw, hash) = signed_raw(&f.signer, 0);
+        let (resp, _rx) = oneshot::channel();
+
+        // Same bytes, but presented as a type the path does not take.
+        assert!(!accepts(TxType::Eip7702));
+        f.admission.admit(&raw, std::time::Instant::now(), resp).await.expect_err("refused");
+
+        assert!(!f.classifier.is_tracked(&hash));
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    //! Where the queue's baseline comes from.
+    //!
+    //! The validator reads the sender's account to judge the transaction, and
+    //! says what it read. Reading it a second time here would be two answers
+    //! to one question, and a canonical head landing between them decides
+    //! which — so the one the validator used is the one the queue is measured
+    //! against.
+
+    use super::*;
+    use crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP;
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{B256, U256};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
+    use reth_optimism_primitives::OpBlock;
+    use reth_optimism_txpool::OpPooledTransaction;
+    use reth_transaction_pool::validate::ValidTransaction;
+    use std::collections::HashSet;
+
+    const RECIPIENT: Address = Address::new([0x43; 20]);
+
+    /// Accepts everything, reporting the account state it claims to have read.
+    #[derive(Debug)]
+    struct AcceptsAt {
+        state_nonce: u64,
+    }
+
+    impl TransactionValidator for AcceptsAt {
+        type Transaction = OpPooledTransaction;
+        type Block = OpBlock;
+
+        async fn validate_transaction(
+            &self,
+            _origin: TransactionOrigin,
+            transaction: Self::Transaction,
+        ) -> TransactionValidationOutcome<Self::Transaction> {
+            TransactionValidationOutcome::Valid {
+                balance: U256::MAX,
+                state_nonce: self.state_nonce,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(transaction),
+                propagate: false,
+                authorities: None,
+            }
+        }
+    }
+
+    fn signed(signer: &PrivateKeySigner, nonce: u64) -> Bytes {
+        let tx = TxEip1559 {
+            chain_id: 10,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(RECIPIENT),
+            value: U256::from(1u64),
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).expect("in-memory signer");
+        TxEnvelope::Eip1559(tx.into_signed(signature)).encoded_2718().into()
+    }
+
+    fn admission_at(state_nonce: u64) -> (PreconfAdmission<AcceptsAt>, PrivateKeySigner) {
+        let signer =
+            PrivateKeySigner::from_bytes(&B256::from([0x12; 32])).expect("valid secp256k1 scalar");
+        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
+        classifier.update_whitelist(
+            [(signer.address(), RECIPIENT)].into_iter().collect(),
+            HashSet::default(),
+            HashSet::default(),
+        );
+
+        let cfg = PreconfConfig {
+            enabled: true,
+            preconf_max_gas_per_tx: 1_000_000,
+            ..Default::default()
+        };
+        let admission = PreconfAdmission::new(
+            AcceptsAt { state_nonce },
+            Arc::new(PreconfTxSet::new(16)),
+            classifier,
+            Arc::new(cfg),
+            Capacity {
+                max_txs: 16,
+                max_size: 1 << 20,
+                max_account_slots: 16,
+                max_inflight_delegated: 1,
+                max_queued_gas: u64::MAX,
+            },
+        );
+        (admission, signer)
+    }
+
+    /// The validator says the sender sits at 7, so 7 is the nonce that may be
+    /// queued — nothing else is consulted for it.
+    #[tokio::test]
+    async fn the_validators_state_nonce_is_the_baseline() {
+        let (admission, signer) = admission_at(7);
+        let (resp, _rx) = oneshot::channel();
+
+        let out = admission.admit(&signed(&signer, 7), std::time::Instant::now(), resp).await;
+
+        assert_eq!(out.expect("nonce 7 is the sender's next").nonce, 7);
+    }
+
+    /// And the gap is measured from it too: one past the validator's answer is
+    /// a gap, not a queueable transaction.
+    #[tokio::test]
+    async fn a_nonce_past_the_validators_answer_is_a_gap() {
+        let (admission, signer) = admission_at(7);
+        let (resp, _rx) = oneshot::channel();
+
+        let out = admission.admit(&signed(&signer, 8), std::time::Instant::now(), resp).await;
+
+        assert!(
+            matches!(out, Err(PreconfError::NonceGap { tx_nonce: 8, pending_nonce: 7 })),
+            "{out:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The list is what bars establishing a delegation. Using an account that
+    /// already has one is an ordinary transaction of an ordinary type, so it
+    /// is not on this list's business at all.
+    #[test]
+    fn only_the_three_ordinary_types_are_accepted() {
+        assert!(accepts(TxType::Legacy));
+        assert!(accepts(TxType::Eip2930));
+        assert!(accepts(TxType::Eip1559));
+        assert!(!accepts(TxType::Eip4844));
+        assert!(!accepts(TxType::Eip7702));
+    }
+
+    /// The three ordinary types cross over; the two system types have no
+    /// counterpart and must not be smuggled through as one.
+    #[test]
+    fn the_conversion_passes_user_types_and_drops_system_ones() {
+        use alloy_consensus::{Signed, TxEip1559, TxLegacy};
+        use alloy_primitives::{B256, Sealed, Signature};
+
+        let sig = Signature::test_signature();
+        let eip1559 = OpTxEnvelope::Eip1559(Signed::new_unchecked(
+            TxEip1559::default(),
+            sig,
+            B256::repeat_byte(1),
+        ));
+        assert!(matches!(op_envelope_to_alloy(eip1559), Some(TxEnvelope::Eip1559(_))));
+
+        let legacy = OpTxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy::default(),
+            sig,
+            B256::repeat_byte(2),
+        ));
+        assert!(matches!(op_envelope_to_alloy(legacy), Some(TxEnvelope::Legacy(_))));
+
+        let deposit = OpTxEnvelope::Deposit(Sealed::new_unchecked(
+            op_alloy_consensus::TxDeposit {
+                from: Address::repeat_byte(1),
+                to: TxKind::Call(Address::repeat_byte(2)),
+                gas_limit: 21_000,
+                ..Default::default()
+            },
+            B256::repeat_byte(99),
+        ));
+        assert!(op_envelope_to_alloy(deposit).is_none());
+    }
+
+    /// The ceilings come from the pool's own configuration; restating them
+    /// would let the two drift apart the first time an operator tuned one.
+    #[test]
+    fn the_ceilings_are_the_pools_own() {
+        let pool = reth_transaction_pool::PoolConfig::default();
+        let preconf = PreconfConfig::default();
+        let cap = capacity_from_pool_config(&pool, &preconf);
+
+        assert_eq!(cap.max_txs, pool.pending_limit.max_txs);
+        assert_eq!(cap.max_size, pool.pending_limit.max_size);
+        assert_eq!(cap.max_account_slots, pool.max_account_slots);
+        assert_eq!(cap.max_inflight_delegated, pool.max_inflight_delegated_slot_limit);
+        // The one ceiling the pool has no opinion on: it is the preconf
+        // per-block budget times the backlog we will hold, so retuning the
+        // budget moves it without anyone remembering to.
+        assert_eq!(
+            cap.max_queued_gas,
+            preconf.preconf_max_gas_per_block * preconf.preconf_queue_gas_blocks,
+        );
+    }
+}

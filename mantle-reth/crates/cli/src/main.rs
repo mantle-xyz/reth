@@ -149,8 +149,8 @@ fn main() {
 /// The preconf whitelist cold start + watcher deliberately do **not** live in the
 /// `on_node_started` hooks below. Those run once the RPC server, payload builder and
 /// consensus engine are already accepting work, and a preconf tx admitted before the
-/// allowlists have loaded would have its verdict frozen as ineligible for good — a verdict
-/// is immutable for the life of the transaction. They run inside
+/// allowlists have loaded would be refused for good — the door is asked once
+/// per transaction and never again. They run inside
 /// `MantlePoolBuilder::build_pool` instead; see the comment there.
 async fn launch_node(
     builder: WithLaunchContext<NodeBuilder<DatabaseEnv, OpChainSpec>>,

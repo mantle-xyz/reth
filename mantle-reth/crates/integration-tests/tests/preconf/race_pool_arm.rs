@@ -1,24 +1,22 @@
 //! Pool-arm regression + co-existence coverage.
 //!
-//! `apply_one_best_tx` in the fork's payload builder skips a tx that carries a
-//! preconf verdict — `classifier.verdict(hash).is_some_and(Verdict::is_preconf)`
-//! (`builder::payload_builder`) — so a commitment can never leak out through the
-//! pool iterator ahead of its fifo entry and be applied twice.
+//! `apply_one_best_tx` in the fork's payload builder skips a tx the preconf arm
+//! has queued — `fifo.contains(hash)` (`builder::payload_builder`) — so a
+//! commitment can never leak out through the pool iterator and be applied twice.
 //!
-//! The predicate is the **frozen verdict**, not a live allowlist read, and the
-//! only writer of an eligible verdict is `claim_preconf`, called from
+//! The predicate is the **fifo entry**, not a live allowlist read, and the only
+//! thing that creates one for a client request is
 //! `eth_sendRawTransactionWithPreconf`. Being on the allowlist therefore does
 //! **not** make a transaction preconf: the RPC method decides. A whitelisted
-//! sender using plain `eth_sendRawTransaction` is latched `NotEligible` and
-//! lands through the ordinary pool arm.
+//! sender using plain `eth_sendRawTransaction` gets no entry and lands through
+//! the ordinary pool arm.
 //!
 //! Coverage:
 //!
 //! - `allowlisted_sender_via_plain_sendtx_lands_through_the_pool_arm` — on the allowlist, but
-//!   submitted the ordinary way, so no verdict is frozen and the pool arm applies it.
+//!   submitted the ordinary way, so it gets no fifo entry and the pool arm applies it.
 //!   Discriminating in both directions: were plain submissions eligible again, the pool arm would
-//!   skip it *and* no fifo entry would exist (nothing called the preconf RPC), so it would never
-//!   land at all.
+//!   skip it *and* the preconf arm would still have nothing queued for it, so it would never land.
 //! - `non_preconf_eligible_regular_sendtx_lands_via_pool_arm` — the same, for a sender that is not
 //!   on the allowlist either. Guards against a regression where the gate rejects every pool-path tx
 //!   on a preconf-enabled node.
@@ -30,7 +28,7 @@
 //!   lost either, and lands in the next one.
 
 use super::helpers::PreconfCfgBuilder;
-use crate::{canonize_built, launch_preconf_node};
+use crate::{canonize_built, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -51,6 +49,143 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
         ..Default::default()
     };
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
+}
+
+/// **One sender**, both channels, consecutive nonces: the ordinary transaction
+/// waits a block, and is not lost.
+///
+/// `preconf_and_pool_txs_coexist_in_one_block` covers two *independent*
+/// senders, which is the easy half — nothing couples them. A single sender
+/// interleaving the channels is the coupled case, and the answer is the same
+/// before and after the refactor for two entirely different reasons. Both are
+/// worth stating, because "unchanged outcome, changed mechanism" is exactly the
+/// shape a regression hides in:
+///
+/// - **Today** the preconf transaction is in the pool, so the pool arm meets it in its iterator,
+///   skips it on its fifo entry, and calls `mark_invalid(sender, nonce)` — which drains that
+///   sender's *descendants* from the iterator too. The ordinary transaction at `nonce+1` is
+///   collateral.
+/// - **After** the preconf transaction is not in the pool at all, so the pool never sees nonce 0,
+///   reads nonce 1 as a gap, and parks it in `Queued`.
+///
+/// Either way it lands in the next block, once the preconf transaction is
+/// canonical and the sender's on-chain nonce has moved. That — *deferred, never
+/// dropped* — is the contract worth pinning, and it is what this test asserts.
+///
+/// Green today; must stay green.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_sender_interleaving_both_channels_defers_the_ordinary_tx_by_a_block() {
+    use super::helpers::send_preconf;
+    use mantle_reth_rpc_ext::PreconfStatus;
+
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let sender = Wallet::default().with_chain_id(1).inner.address();
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(sender)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(3_000)
+        .build();
+
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
+
+    // nonce=0 over preconf, nonce=1 the ordinary way. Submitting the ordinary
+    // one first would make the preconf submission the one facing a gap — the
+    // mirror case, and the one `dual_channel_nonce.rs` covers.
+    let preconf_tx = signed_transfer(chain_id, &wallet, 0).await;
+    let ordinary_tx = signed_transfer(chain_id, &wallet, 1).await;
+
+    // Ordering matters three ways and all three are load-bearing:
+    //
+    // 1. The preconf submission goes first and is left in flight — with no build running it simply
+    //    waits, which is what puts nonce 0 where the pool can account for it.
+    // 2. The ordinary submission follows, so that nonce 1 is a *successor* rather than a gap and
+    //    reaches `Pending` instead of `Queued`.
+    // 3. Only then is the build started. The pool iterator is a snapshot taken at build start (see
+    //    `pool_tx_arriving_after_build_start_waits_for_the_next_block`), so anything submitted
+    //    afterwards cannot be in this block whatever its nonce.
+    let http_clone = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, preconf_tx).await });
+
+    // **The line that breaks first** once preconf transactions stop entering
+    // the pool: the pool's pending nonce is driven by what it holds, and it
+    // would then hold nothing for this sender.
+    super::helpers::wait_fifo_entry(&fifo, sender, 0).await;
+
+    let ordinary_hash: B256 =
+        node.rpc.inject_tx(ordinary_tx).await.expect("ordinary submission accepted");
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let event = rpc_task.await.expect("rpc join").expect("the preconf tx must be accepted");
+    assert!(
+        matches!(event.status, PreconfStatus::Success),
+        "expected Success, got {:?} (reason={:?})",
+        event.status,
+        event.reason
+    );
+
+    let sealed: Vec<B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(sealed.contains(&event.tx_hash), "the preconf tx must land; sealed = {sealed:?}");
+    assert!(
+        !sealed.contains(&ordinary_hash),
+        "the same sender's ordinary tx must NOT share the block with its preconf \
+         predecessor; sealed = {sealed:?}"
+    );
+
+    // ── Block 2: it was deferred, not dropped ───────────────────────────
+    crate::canonicalize_payload!(node, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let sealed: Vec<B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(
+        sealed.contains(&ordinary_hash),
+        "deferring must not mean dropping: once the preconf tx is canonical the ordinary \
+         one must land in the next block; sealed = {sealed:?}"
+    );
 }
 
 /// A sender on the allowlist that submits the **ordinary** way is not preconf, and lands
@@ -103,17 +238,17 @@ async fn allowlisted_sender_via_plain_sendtx_lands_through_the_pool_arm() {
     assert!(
         sealed.contains(&tx_hash),
         "an allowlisted sender's plain sendRawTransaction must land through the pool arm \
-         (no verdict is frozen, so the arm does not skip it, and no fifo entry exists \
+         (no record is frozen, so the arm does not skip it, and no fifo entry exists \
          to apply it the other way); hash {tx_hash:?} not in sealed block: {sealed:?}"
     );
 }
 
 /// A sender that is not on the allowlist either reaches chain through the
-/// vanilla pool best-tx iterator (`apply_one_best_tx`): no verdict is frozen, so
+/// vanilla pool best-tx iterator (`apply_one_best_tx`): no record is frozen, so
 /// the skip predicate is false and the arm executes normally.
 ///
 /// Regression guard: catches an accidental broadening of the gate (an inverted
-/// predicate, or one that treats a missing verdict as eligible) that would
+/// predicate, or one that treats a missing record as eligible) that would
 /// starve the pool path on any preconf-enabled node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn non_preconf_eligible_regular_sendtx_lands_via_pool_arm() {
@@ -176,7 +311,7 @@ async fn non_preconf_eligible_regular_sendtx_lands_via_pool_arm() {
 ///
 /// The pool-arm sender is deliberately off the allowlist. That is belt and
 /// braces rather than the load-bearing part — it submits the ordinary way, so
-/// no verdict is frozen for it either way — but it keeps the scenario legible:
+/// no record is frozen for it either way — but it keeps the scenario legible:
 /// exactly one of the two transactions goes through the preconf pipeline.
 ///
 /// **The pool tx is injected before the FCU, and has to be:** `build_payload`
@@ -208,8 +343,8 @@ async fn preconf_and_pool_txs_coexist_in_one_block() {
 
     // Pool-arm tx: submit via `inject_tx` (plain `eth_sendRawTransaction`),
     // **before** the FCU so it is in the pool when the build snapshots it.
-    // `pool_sender_signer.address()` misses the whitelist ⇒ preconf listener
-    // filter drops it ⇒ never enters fifo ⇒ pool arm is its only path.
+    // `pool_sender_signer.address()` misses the whitelist ⇒ admission would
+    // refuse it ⇒ never enters the fifo ⇒ the pool arm is its only path.
     let pool_tx: alloy_primitives::Bytes = {
         let request = TransactionRequest {
             chain_id: Some(chain_id),
@@ -291,7 +426,7 @@ async fn preconf_and_pool_txs_coexist_in_one_block() {
 async fn pool_tx_arriving_after_build_start_waits_for_the_next_block() {
     // Whitelist an unrelated placeholder so the config validates while the test
     // wallet misses the list. The allowlist is not what decides it — this tx is
-    // submitted the ordinary way, so no eligible verdict is ever frozen and the
+    // submitted the ordinary way, so no eligible record is ever frozen and the
     // pool arm is its only route.
     let placeholder = Address::from([0xFE; 20]);
     let cfg =

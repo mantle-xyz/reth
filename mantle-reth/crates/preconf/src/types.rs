@@ -6,28 +6,23 @@ use serde::{Deserialize, Serialize};
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
 /// by `mantle-reth-rpc-ext`.
 ///
-/// State machine (transitions via `PreconfTxSet::mark_*` /
-/// `reset_success_to_waiting`). Every forward transition is a CAS on
-/// `status == Waiting`; from anything else it returns
-/// `MarkError::IllegalTransition(current)`.
+/// A queued entry is in exactly one of two states, and the only transition is
+/// `Waiting → Success` (a CAS on `status == Waiting`; from anything else
+/// `PreconfTxSet::mark_succeeded` returns `MarkError::IllegalTransition`).
+/// `reset_success_to_waiting` is the one move back.
 ///
 /// ```text
-///                     ┌──→ Success   (applied to an in-flight builder; EVM
-///                     │              revert / halt lands here too, carrying
-///                     │              `status = false`, matching op-geth)
-///                     ├──→ Failed    (builder rejected pre-execute, e.g.
-///                     │              nonce-too-low / gas-over-block-limit)
-/// [push] → Waiting ──┤
-///                     ├──→ Timeout   (the client's deadline elapsed)
-///                     └──→ Canceled  (server pre-apply reject: block gas
-///                                     budget, admin kick, etc.)
+/// [push] → Waiting ──→ Success   (applied to an in-flight builder; EVM
+///                                 revert / halt lands here too, carrying
+///                                 `status = false`, matching op-geth)
 /// ```
 ///
-/// Prefer [`Self::is_active`] / [`Self::is_replaceable`] /
-/// [`Self::is_revivable_by_same_hash`] over open-coding `matches!` over the
-/// terminal set; each documents what its answer permits.
+/// **There is no failure state.** A commitment that cannot be honoured is
+/// removed and its client told why, in one operation
+/// (`PreconfTxSet::complete_failure`). An entry's presence means it is live;
+/// the reason it ended lives in the `PreconfError` the client received.
 ///
-/// **`Success` is not strictly terminal**: an entry still in the fifo means
+/// **`Success` is not terminal either**: an entry still in the fifo means
 /// "applied to an in-flight builder whose block was never canon'd" — the
 /// `PayloadJob` prologue's canon-forward (`sync_fifo_forward_to_head` →
 /// `PreconfTxSet::forward`) drops it once the sender's nonce moves past. Stale
@@ -36,23 +31,10 @@ use serde::{Deserialize, Serialize};
 /// presence of the entry is the "in-flight, not canon" flag; no separate
 /// variant is needed.
 ///
-/// **"Not on chain" is maintained by the callers, not enforced here.** The
-/// transitions never consult the chain. What holds the property up is that
-/// every caller runs before `apply_fn` or on its `Err` path, and that the
-/// pool-eviction hook the `mark_*` methods fire drops the hash so it cannot
-/// land later. That hook is **best-effort, not atomic** — `canon_handler` evicts
-/// from the fifo and the pool in two separate calls — so re-check the callers
-/// before relying on it. In particular a tx that already returned a `Success`
-/// receipt can still reach `Failed`: the receipt is sent as soon as the apply
-/// commits to the *in-flight* builder, long before any block is canonical. That
-/// case is a broken commitment — see [`PreconfError::CommitmentBroken`].
-///
-/// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — different
-/// things, and not connected by a direct mapping:
-/// - Fifo `Failed` = builder rejected pre-execute, tx not on chain (with the caveat above)
-/// - Wire `Failed` (`mantle-reth-rpc-ext::PreconfStatus`) = `receipt.status == false` (revert /
-///   halt), tx **is** on chain. Derived by the RPC handler from `PreconfReceipt.status`, not from
-///   this enum.
+/// **Not the wire-layer `Failed`** — `mantle-reth-rpc-ext::PreconfStatus` also
+/// has a `Failed`, meaning `receipt.status == false` (revert / halt), where the
+/// tx **is** on chain. The RPC handler derives it from `PreconfReceipt.status`,
+/// not from this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PreconfStatus {
     /// Awaiting builder apply.
@@ -61,48 +43,6 @@ pub enum PreconfStatus {
     /// Builder apply succeeded; receipt available.
     #[serde(rename = "success")]
     Success,
-    /// Reth builder rejected pre-execute (in-flight nonce/balance race, block
-    /// gas exhausted at builder level, or other
-    /// `BlockExecutionError::Validation`) — see the enum-level notes for how far
-    /// "not on chain" reaches, and for why this is not the wire-layer `Failed`.
-    #[serde(rename = "failed")]
-    Failed,
-    /// Server-side timeout — only Waiting can transition here (CAS).
-    #[serde(rename = "timeout")]
-    Timeout,
-    /// Server pre-apply rejection (block gas budget, admin action, ...) —
-    /// only Waiting can transition here (CAS). Recovered by a same-hash
-    /// resubmit, which `push_if_absent` revives back to `Waiting` (see
-    /// [`Self::is_revivable_by_same_hash`]).
-    #[serde(rename = "canceled")]
-    Canceled,
-}
-
-impl PreconfStatus {
-    /// Live: the entry is either awaiting apply or applied to an in-flight
-    /// builder. A **different** hash must not take its `(sender, nonce)`.
-    pub const fn is_active(self) -> bool {
-        matches!(self, Self::Waiting | Self::Success)
-    }
-
-    /// The entry may be displaced by a **different** hash on the same
-    /// `(sender, nonce)`, and may be swept by `clean_reclaimable`. All three
-    /// terminal "not on chain" states qualify, including a broken commitment
-    /// (which ends in `Failed` — see [`PreconfError::CommitmentBroken`]).
-    ///
-    /// Same body as [`Self::is_revivable_by_same_hash`], kept separate on
-    /// purpose: they answer different questions, and a future state that answers
-    /// them differently must not have to hunt down open-coded `matches!` sites.
-    pub const fn is_replaceable(self) -> bool {
-        matches!(self, Self::Timeout | Self::Canceled | Self::Failed)
-    }
-
-    /// A resubmit of the **same hash** may flip the entry back to `Waiting`.
-    /// Always safe — reviving the same hash cannot hand the nonce to anyone
-    /// else. See [`Self::is_replaceable`] on why the two are separate.
-    pub const fn is_revivable_by_same_hash(self) -> bool {
-        matches!(self, Self::Timeout | Self::Canceled | Self::Failed)
-    }
 }
 
 /// Origin of a preconf entry in the fifo. Determines which pre-apply
@@ -115,12 +55,11 @@ impl PreconfStatus {
 ///   Covers two triggers:
 ///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
 ///       crash.
-///     - **Reorg reinject** — the pool re-admits a previously-promised tx after a reorg; the pool
-///       listener detects the case with `PreconfClassifier::is_promised`, i.e. "a `Success` receipt
-///       for this hash already went out to a client". Deliberately asked of the classifier rather
-///       than the journal: the journal's notion of a finished commitment is "canonical once", which
-///       is exactly what a reorg undoes, and the classifier answers synchronously so the listener's
-///       event loop never waits on the journal's async lock.
+///     - **Reorg reinject** — the canonical-state handler pushes back every commitment the reverted
+///       chain carried. Whether a hash is one is asked of the classifier
+///       (`PreconfClassifier::is_tracked`, i.e. "a `Success` receipt for this hash already went
+///       out") rather than of the journal: the journal's notion of a finished commitment is
+///       "canonical once", which is exactly what a reorg undoes.
 ///
 ///   In both cases the Mantle preconf SLA (*"once a receipt has been returned to the client, the
 ///   tx must land on chain"*) requires these entries to **bypass** the deadline and per-block gas
@@ -175,45 +114,28 @@ pub struct PreconfReceipt {
 pub enum PushResult {
     /// New entry created and broadcast notified.
     Inserted,
-    /// Same hash already present and [`PreconfStatus::is_active`]
-    /// (`Waiting` / `Success`) — idempotent no-op.
+    /// Same hash already present — idempotent no-op. Every entry in the queue
+    /// is live, so there is never one to reopen.
     AlreadyExists,
-    /// Same hash was in a status that [`PreconfStatus::is_revivable_by_same_hash`]
-    /// (`Timeout` / `Canceled` / `Failed`) and has been revived back to
-    /// `Waiting`. Any fresh responder the RPC handler attached to
-    /// `pending_responders` is now installed on the entry, and the entry's
-    /// insertion clock is refreshed to the fresh submission time — so dispatch's
-    /// deadline gate measures against the second submission, not the
-    /// (already-expired) first. See `push_if_absent` for why this is the only
-    /// path that reopens a same-hash resubmit.
-    Revived,
-    /// Different hash but same (sender, nonce) in a status that is **not**
-    /// [`PreconfStatus::is_replaceable`] — blocks the replacement attempt
-    /// (carrying the existing hash so callers can inspect / log it).
+    /// Different hash but same (sender, nonce), and the incumbent is still
+    /// live — blocks the replacement attempt (carrying the existing hash so
+    /// callers can inspect / log it).
     ConflictActive(TxHash),
 }
 
-/// Errors returned by [`crate::preconf_tx_set::PreconfTxSet::attach_responder`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum AttachError {
-    /// Existing entry already holds a responder, OR
-    /// `pending_responders` already has this hash.
-    /// RPC handler should immediately return `AlreadyInProgress` to the client
-    /// instead of waiting on a hung oneshot.
-    #[error("responder already attached for this hash")]
-    AlreadyAttached,
-}
-
-/// Errors returned by `PreconfTxSet::mark_succeeded` / `mark_failed`
-/// / `mark_timeout` — all share the same `Waiting → target` CAS body.
+/// Errors returned by the `Waiting`-source transitions —
+/// `PreconfTxSet::mark_succeeded` / `complete_failure` — and by
+/// `reset_success_to_waiting`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarkError {
-    /// Entry no longer present — safe to ignore (terminal signal is best-effort).
+    /// Entry no longer present — safe to ignore: whatever ended the commitment
+    /// answered its client on the way out.
     #[error("entry not found")]
     NotFound,
-    /// Existing status cannot transition to the requested terminal.
-    /// Typical race: RPC handler timeout fires same instant builder commits.
-    /// Whichever loses gets this error; caller logs but does not panic.
+    /// The entry is not in the status this transition requires as its source.
+    /// Typical race: the RPC handler's deadline fires the same instant the
+    /// builder commits. Whichever loses gets this error; the caller logs but
+    /// does not panic.
     #[error("illegal transition from {0:?}")]
     IllegalTransition(PreconfStatus),
 }
@@ -248,27 +170,34 @@ pub enum PreconfError {
         /// Pool's reported pending nonce for the sender.
         pending_nonce: u64,
     },
-    /// Cumulative cost across the sender's pending txs exceeds its balance, so
-    /// the pool parks this tx (`!ENOUGH_BALANCE`) instead of promoting it —
-    /// rejected synchronously to avoid a full-timeout block, same as
-    /// [`Self::NonceGap`]. Best-effort: the builder's gates are the final
-    /// authority.
+    /// The sender cannot pay for the transaction.
+    ///
+    /// Raised by the builder, from the EVM's own refusal — see
+    /// [`crate::apply::BuilderRejected`]. The queue does not pre-empt it: what
+    /// a sender can afford depends on what the block being built has already
+    /// done to its balance, and summing queued costs against canonical state
+    /// reads low when that block has spent and high when it has credited.
+    ///
+    /// The message still names a cumulative cost. That is the wording clients
+    /// already parse, kept verbatim so the same fact reads the same way
+    /// whichever stage reports it.
     #[error(
         "insufficient funds: sender balance {balance} < required {required} \
          (cumulative cost across the sender's pending txs)"
     )]
     InsufficientFunds {
-        /// Sender's on-chain balance.
+        /// The sender's balance as the block being built had left it.
         balance: U256,
-        /// Cumulative cost required to promote this tx: the sum of
-        /// `cost + extra_balance_cost` over the sender's gapless pending
-        /// chain, including this tx.
+        /// What paying for this transaction would have required.
         required: U256,
     },
     /// Pool rejected the transaction (validator error / underpriced / etc.).
     #[error("pool rejected: {0}")]
     PoolRejected(String),
-    /// Builder apply returned a terminal `Failed` status.
+    /// The EVM refused the transaction for a reason with no name of its own
+    /// here — see [`crate::apply::BuilderRejected`]. The refusals that *do*
+    /// have one (funds, base fee) arrive as those variants instead, so a
+    /// client is told the same thing whichever stage caught it.
     #[error("builder rejected: {0}")]
     BuilderRejected(String),
     /// A commitment whose receipt was already returned could not be landed: the
@@ -306,9 +235,8 @@ pub enum PreconfError {
     ///
     /// Unlike [`Self::BlockGasBudgetExceeded`] (an operator-hardening
     /// budget bypassed by `Replay`-sourced entries), the DA limit is a
-    /// consensus constraint enforced for **all** sources. The tx stays
-    /// reclaimable — a same-hash resubmit in a later slot (with DA
-    /// headroom) is revived and applied.
+    /// consensus constraint enforced for **all** sources. The commitment ends
+    /// here; a resubmit in a later slot (with DA headroom) is a fresh one.
     #[error("preconf tx exceeds DA limit: tx DA {tx_da} bytes, {used} already used, limit {limit}")]
     DaLimitExceeded {
         /// DA bytes already committed to the in-flight block.
@@ -319,17 +247,36 @@ pub enum PreconfError {
         /// or the post-Jovian footprint-gas bound, whichever fired).
         limit: u64,
     },
-    /// Another in-flight responder already exists for this hash.
-    /// Maps to `AttachError::AlreadyAttached` at the fifo layer.
+    /// The sender's nonce has moved past this transaction, so it can never be
+    /// applied.
+    ///
+    /// The queue drops an entry once the chain shows its sender at a higher
+    /// nonce. Not the same as "this transaction landed" — a *different*
+    /// transaction taking the nonce drops it just the same, and the queue
+    /// cannot tell which. Either way nothing is left to wait for, and saying so
+    /// beats a closed channel, which is indistinguishable from a bug.
+    #[error("sender nonce has advanced past {tx_nonce}; this transaction can no longer be applied")]
+    NonceSuperseded {
+        /// The nonce this transaction was signed for.
+        tx_nonce: u64,
+    },
+    /// The same hash is already in the queue with someone waiting on it.
     #[error("a preconf request is already in progress for this hash")]
     AlreadyInProgress,
+    /// A *different* transaction holds this `(sender, nonce)`, and it is past
+    /// the point where it can be replaced.
+    ///
+    /// Distinct from [`Self::AlreadyInProgress`], which is the same hash
+    /// arriving twice. The `pool rejected:` prefix is carried on purpose: this
+    /// refusal used to reach the client through the pool validator, and the
+    /// wording is what clients already parse.
+    #[error("pool rejected: cannot replace active preconf commitment for the same (sender, nonce)")]
+    ReplaceActiveCommitment,
     /// The transaction's own `gas_limit` exceeds `preconf_max_gas_per_tx`, the
     /// operator's per-transaction ceiling for the preconf fast path.
     ///
-    /// This is the operative gate: the RPC handler applies the ceiling before it
-    /// writes a verdict, so no transaction reaches the pool `Eligible` and over
-    /// the cap. `PreconfAwareValidator` carries the same comparison as defence
-    /// in depth for any future writer of an eligible verdict.
+    /// Applied before anything is recorded, so no transaction is ever both
+    /// `Eligible` and over the cap.
     #[error(
         "preconf gas limit exceeded: tx gas limit {gas_limit} exceeds preconf_max_gas_per_tx {max}"
     )]
@@ -339,21 +286,103 @@ pub enum PreconfError {
         /// The transaction's own gas limit.
         gas_limit: u64,
     },
-    /// The same raw transaction is already in the pool as an ordinary one — it
-    /// was submitted through plain `eth_sendRawTransaction`, or arrived over
-    /// p2p, before this request.
+    /// The transaction's type is not accepted on the preconf path.
     ///
-    /// The sender may be perfectly well allowlisted; what blocks the request is
-    /// that the transaction's classification was already frozen as non-preconf,
-    /// and a verdict is immutable for the life of the transaction (see
-    /// `PreconfClassifier`). So this is neither a whitelist miss
-    /// ([`Self::NotPreconfEligible`]) nor a live request to await
-    /// ([`Self::AlreadyInProgress`]) — the tx will land by the ordinary route,
-    /// with no preconfirmation.
-    #[error(
-        "transaction is already pooled as an ordinary transaction; no preconfirmation is possible for it"
-    )]
-    AlreadyPooledWithoutPreconf,
+    /// Only `Legacy` (0x00), `EIP-2930` (0x01) and `EIP-1559` (0x02) are. The
+    /// three refusals differ in why:
+    ///
+    /// * **EIP-7702 (0x04)** — a *delegation-setting* transaction. Refusing it keeps every
+    ///   authorization list off this path, which is what lets the preconf queue skip the pool's
+    ///   `AuthorityReserved` accounting entirely (that rule needs to see an authority's in-flight
+    ///   transactions, which live in the pool this path deliberately never reads). **Using** an
+    ///   already-delegated account is untouched: calling one, and sending an ordinary transaction
+    ///   from one, are both plain 0x02 transactions.
+    /// * **EIP-4844 (0x03)** — blob transactions are not part of the OP stack's user surface; the
+    ///   pool validator refuses them too. Stating it here moves the refusal earlier and gives it a
+    ///   name.
+    /// * **Deposit (0x7E) / `PostExec` (0x7D)** — system transactions, never user-submitted. They
+    ///   cannot in fact be decoded from an RPC submission, so this arm is unreachable for them; it
+    ///   exists so the accepted set is stated positively rather than inferred from what happens not
+    ///   to decode.
+    ///
+    /// Pinned by `preconf_error_display_wording_is_stable`.
+    #[error("unsupported transaction type for preconf: 0x{ty:02x}")]
+    UnsupportedTxType {
+        /// EIP-2718 type byte of the refused transaction.
+        ty: u8,
+    },
+    /// The preconf queue is at its configured entry or byte ceiling.
+    ///
+    /// The ceiling mirrors the transaction pool's (`PoolConfig::pending_limit`),
+    /// read from the same instance so an operator tuning `--txpool.*` moves both.
+    ///
+    /// **Refused rather than evicted**, unlike the pool: every entry in this
+    /// queue is a commitment awaiting settlement, so there is no "worst" one to
+    /// discard. Callers should back off and retry.
+    ///
+    /// Worded as the pool words a full pool, so "no room" reads the same
+    /// whichever channel the client used. Which ceiling fired is in the fields,
+    /// for logs and tests.
+    #[error("txpool is full")]
+    QueueFull {
+        /// Current occupancy in `unit`.
+        in_use: u64,
+        /// Configured ceiling in `unit`.
+        capacity: u64,
+        /// Which ceiling fired — `"entries"` or `"bytes"`.
+        unit: &'static str,
+    },
+    /// The sender already holds its maximum number of in-flight preconf
+    /// entries (`PoolConfig::max_account_slots`).
+    ///
+    /// Per-sender rather than global, so one sender cannot crowd out the queue.
+    ///
+    /// The pool answers its own per-sender ceiling with `txpool is full` as
+    /// well; matching it keeps the two channels indistinguishable to a client.
+    #[error("txpool is full")]
+    AccountSlotsFull {
+        /// Entries this sender currently holds.
+        in_use: u64,
+        /// Configured per-sender ceiling.
+        max: u64,
+    },
+    /// The transaction's fee cap is below the base fee of the block being built,
+    /// so it cannot execute in it.
+    ///
+    /// Raised by the builder, from the EVM's own refusal — see
+    /// [`crate::apply::BuilderRejected`]. The queue does not pre-empt it,
+    /// because only the EVM knows which block the transaction is being measured
+    /// against: between payload jobs the newest base fee the queue has seen
+    /// belongs to the block already sealed, and the two differ by up to a full
+    /// EIP-1559 adjustment.
+    ///
+    /// The transaction pool would park such a transaction in its `BaseFee`
+    /// sub-pool and promote it if the base fee later fell. This path has no
+    /// parking: the client is told, so it can raise its cap rather than wait
+    /// out `preconf_timeout` for a transaction that was never a candidate.
+    #[error("max fee per gas {tx_max_fee} is below the block base fee {base_fee}")]
+    BaseFeeTooLow {
+        /// The transaction's `max_fee_per_gas`.
+        tx_max_fee: u128,
+        /// Base fee of the block being built.
+        base_fee: u64,
+    },
+    /// The sender's account carries an EIP-7702 delegation, and it already holds
+    /// its maximum number of in-flight preconf entries for a delegated account.
+    ///
+    /// Distinct from [`Self::AccountSlotsFull`] and much tighter (one, by
+    /// default): a delegated account can re-delegate, which changes what every
+    /// queued transaction of its own would execute. Bounding how many can be
+    /// in flight bounds the blast radius. Mirrors the transaction pool's
+    /// `check_delegation_limit`, using the same `max_inflight_delegated_slot_limit`
+    /// — down to the wording it refuses with.
+    #[error("in-flight transaction limit reached for delegated accounts")]
+    DelegatedInflightLimit {
+        /// Entries this sender currently holds.
+        in_use: u64,
+        /// Configured ceiling for delegated accounts.
+        max: u64,
+    },
     /// Server-side timeout — receipt did not arrive within `preconf_timeout`.
     #[error("preconf timeout after {timeout_ms}ms")]
     Timeout {
@@ -374,13 +403,9 @@ mod tests {
     /// silently breaks SDKs — pin the exact strings here.
     #[test]
     fn preconf_status_serde_wire_format() {
-        for (status, expected) in [
-            (PreconfStatus::Waiting, "\"waiting\""),
-            (PreconfStatus::Success, "\"success\""),
-            (PreconfStatus::Failed, "\"failed\""),
-            (PreconfStatus::Timeout, "\"timeout\""),
-            (PreconfStatus::Canceled, "\"canceled\""),
-        ] {
+        for (status, expected) in
+            [(PreconfStatus::Waiting, "\"waiting\""), (PreconfStatus::Success, "\"success\"")]
+        {
             let s = serde_json::to_string(&status).unwrap();
             assert_eq!(s, expected, "wire format for {status:?} changed");
             let round: PreconfStatus = serde_json::from_str(&s).unwrap();
@@ -390,14 +415,17 @@ mod tests {
 
     /// The Display strings for user-facing error variants are part of the
     /// public wire contract — SDKs may parse them (e.g. the exact
-    /// "nonce gap: tx nonce N > pending nonce M" wording). Pin the
-    /// substrings to catch accidental rewording.
+    /// "nonce gap: tx nonce N > pending nonce M" wording). Pin them to catch
+    /// accidental rewording.
+    ///
+    /// Where `eth_sendRawTransaction` refuses the same condition, the wording
+    /// here is **its** wording, so a client sees one answer whichever channel it
+    /// used. The exceptions are the conditions that path does not refuse at all
+    /// — it parks the transaction and the client waits — which have no wording
+    /// to borrow. Those are marked below.
     #[test]
     fn preconf_error_display_wording_is_stable() {
-        assert_eq!(
-            PreconfError::NonceGap { tx_nonce: 85, pending_nonce: 75 }.to_string(),
-            "nonce gap: tx nonce 85 > pending nonce 75",
-        );
+        // --- conditions only this path has ---------------------------------
         assert_eq!(
             PreconfError::Timeout { timeout_ms: 200 }.to_string(),
             "preconf timeout after 200ms",
@@ -419,6 +447,48 @@ mod tests {
         assert_eq!(
             PreconfError::DaLimitExceeded { used: 1_000, tx_da: 500, limit: 1_200 }.to_string(),
             "preconf tx exceeds DA limit: tx DA 500 bytes, 1000 already used, limit 1200",
+        );
+        assert_eq!(
+            PreconfError::UnsupportedTxType { ty: 0x04 }.to_string(),
+            "unsupported transaction type for preconf: 0x04",
+        );
+        assert_eq!(
+            PreconfError::ReplaceActiveCommitment.to_string(),
+            "pool rejected: cannot replace active preconf commitment for the same (sender, nonce)",
+        );
+
+        // --- borrowed from `eth_sendRawTransaction` ------------------------
+        //
+        // Three conditions, one string, exactly as on the ordinary path: it
+        // answers a full pool, a full per-sender quota and a full byte budget
+        // with the same sentence. The fields say which fired; the wire does
+        // not, and did not before either.
+        for full in [
+            PreconfError::QueueFull { in_use: 10_000, capacity: 10_000, unit: "entries" },
+            PreconfError::QueueFull { in_use: 1 << 20, capacity: 1 << 20, unit: "bytes" },
+            PreconfError::AccountSlotsFull { in_use: 16, max: 16 },
+        ] {
+            assert_eq!(full.to_string(), "txpool is full", "{full:?}");
+        }
+        assert_eq!(
+            PreconfError::DelegatedInflightLimit { in_use: 1, max: 1 }.to_string(),
+            "in-flight transaction limit reached for delegated accounts",
+        );
+
+        // --- no wording to borrow ------------------------------------------
+        //
+        // The ordinary path parks these rather than refusing them, so there is
+        // no ordinary answer to match. Preconf refuses because it cannot park:
+        // a commitment it cannot honour now is one the client would otherwise
+        // wait out the whole timeout for.
+        assert_eq!(
+            PreconfError::BaseFeeTooLow { tx_max_fee: 500_000_000, base_fee: 1_000_000_000 }
+                .to_string(),
+            "max fee per gas 500000000 is below the block base fee 1000000000",
+        );
+        assert_eq!(
+            PreconfError::NonceGap { tx_nonce: 85, pending_nonce: 75 }.to_string(),
+            "nonce gap: tx nonce 85 > pending nonce 75",
         );
         assert_eq!(
             PreconfError::InsufficientFunds { balance: U256::from(100), required: U256::from(150) }
