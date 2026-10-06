@@ -706,7 +706,7 @@ impl PreconfTxSet {
             PreconfTxSetInner::unindex_sender_nonce(&mut inner.by_sender, from, nonce);
             inner.drop_hash(&incumbent);
         }
-        if let Err(owner) = classifier.claim_admission_slot(hash, &from, nonce) {
+        if let Err(owner) = classifier.slot_conflict(hash, &from, nonce) {
             debug!(
                 target: "mantle::preconf",
                 ?hash, ?owner, sender = ?from, nonce,
@@ -1338,9 +1338,6 @@ mod admit_tests {
         req: Req,
         capacity: Capacity,
     ) -> Result<(), PreconfError> {
-        let hash = *req.0.tx.tx_hash();
-        let from = req.0.from;
-        let _ = c.claim_preconf(hash, &from, Some(&addr(0xee)));
         set.admit(c, req.0, capacity).await
     }
 

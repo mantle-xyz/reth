@@ -1,36 +1,24 @@
-//! Freezes each transaction's preconf eligibility at pool-admission time.
+//! The preconf allowlists, and the record of every commitment this node owes.
 //!
-//! ## Why this exists
+//! ## Why eligibility is decided only once
 //!
 //! Once the allowlists became on-chain governed and refreshable at runtime (see
-//! [`crate::whitelist`]), "is this transaction preconf-eligible?" stopped being a
-//! pure function of the transaction and became a function of *when you ask*. That
-//! is fatal, because the builder treats the answer as a **partition**: a
-//! preconf-eligible transaction may only be applied by the preconf arm, and the
-//! pool arm must skip it (`builder::payload_builder` Stage 3). The pool arm is
-//! only safe to skip because the preconf arm is expected to pick the transaction
-//! up — which requires a fifo entry, created by admission using the allowlists
-//! *as they were at the moment it ran*.
+//! [`crate::whitelist`]), "is this transaction preconf-eligible?" became a
+//! function of *when you ask*. Asking it twice, in two places, is how a
+//! transaction ends up applied by both build arms or by neither.
 //!
-//! If admission and the builder read different allowlists, the partition breaks
-//! in both directions:
+//! So it is asked once, by [`PreconfClassifier::preview_eligibility`] at
+//! admission, and what that answer produces — a fifo entry — is the only thing
+//! either arm consults afterwards. Both skip a hash iff the fifo holds it
+//! (`builder::payload_builder::apply_one_best_tx` for the pool arm), so a later
+//! allowlist update cannot move a transaction between them.
 //!
-//! * **eligible → not eligible**: a fifo entry exists and the client already holds a
-//!   preconfirmation receipt, but the pool arm no longer skips the transaction. It lands via the
-//!   normal path, nobody applies the fifo entry, the responder never fires — the client times out
-//!   on a transaction that is already on chain, and the commitment we handed out is broken.
-//! * **not eligible → eligible**: no fifo entry was ever created, yet the pool arm now skips the
-//!   transaction. Neither arm applies it, so it is silently excluded from block building until the
-//!   allowlist flips back or it is evicted. A silent liveness failure, hitting a transaction that
-//!   was never promised anything.
+//! ## What the records carry
 //!
-//! So the guarantee we need is stronger than "commitments are irrevocable":
-//!
-//! > **Every component must agree on a transaction's classification for that
-//! > transaction's whole lifetime.**
-//!
-//! This module provides it by deciding once, at admission, and caching the
-//! result. Every downstream consumer reads the cache instead of re-deriving.
+//! A record exists for a hash whose event has gone out to a client, and
+//! outlives that transaction's fifo entry: the `(sender, nonce)` claim that
+//! refuses a replacement, the retention state behind [`SEAL_DEPTH`], and the
+//! journal's eviction question ([`PreconfClassifier::is_tracked`]).
 //!
 //! ## Why the allowlists live here and not on `PreconfConfig`
 //!
@@ -60,11 +48,10 @@
 //!
 //! Two independent locks, deliberately: the allowlists are read-often /
 //! written-almost-never, while the commitment cache takes one write per admitted
-//! transaction. They are never held at the same time — [`PreconfClassifier::claim_preconf`],
-//! the only caller that needs both, finishes with the allowlist before taking the
-//! record lock — so no lock order exists to get wrong. As everywhere else in this crate, a guard
-//! is never held across an `.await`; every accessor here returns an owned value and drops its
-//! guard before returning, so callers cannot accidentally hold one.
+//! transaction. They are never held at the same time: no method reads the
+//! allowlists and the records together, so no lock order exists to get wrong. As everywhere else in
+//! this crate, a guard is never held across an `.await`; every accessor here returns an owned value
+//! and drops its guard before returning, so callers cannot accidentally hold one.
 
 use alloy_primitives::{
     Address, TxHash,
@@ -263,26 +250,17 @@ impl CommitmentStore {
     /// Claims `key` for `hash` when the slot is free, and records the reverse
     /// link so every removal path can release it again.
     ///
-    /// The two callers — [`PreconfClassifier::claim_admission_slot`] and
-    /// [`PreconfClassifier::mark_promised`] — share this body deliberately: they
-    /// reach it from different directions (a live admission versus a journal
-    /// restore that has just decoded the sender and nonce), and two copies of
-    /// the predicate below would be two places to narrow it by mistake.
-    ///
-    /// Checking and claiming are decoupled: the incumbent is reported to
-    /// **every** caller, because a replacement is just as fatal whoever sends
-    /// it, but only a hash that already has a record may take the slot. One
-    /// without a record has no arm to defend, so occupying it would reject
-    /// later replacements for nothing.
-    fn claim(&mut self, key: (Address, u64), hash: TxHash, has_record: bool) -> SlotClaim {
+    /// Only [`PreconfClassifier::mark_promised`] reaches here: a slot exists for
+    /// a commitment whose receipt has gone out, and nothing else creates one.
+    /// An occupant is reported rather than displaced — who owns the nonce is
+    /// settled a layer up, by the queue.
+    fn claim(&mut self, key: (Address, u64), hash: TxHash) -> SlotClaim {
         let claim = match self.by_slot.entry(key) {
             // Same hash re-entering (retry / re-validation): idempotent.
             Entry::Occupied(slot) if *slot.get() == hash => Ok(()),
             Entry::Occupied(slot) => Err(*slot.get()),
             Entry::Vacant(slot) => {
-                if has_record {
-                    slot.insert(hash);
-                }
+                slot.insert(hash);
                 Ok(())
             }
         };
@@ -292,7 +270,6 @@ impl CommitmentStore {
         // with `slot: None` and rely on this back-fill; neither ever writes the
         // field itself.
         if claim.is_ok() &&
-            has_record &&
             let Some(cached) = self.by_hash.get_mut(&hash)
         {
             cached.slot = Some(key);
@@ -309,17 +286,6 @@ impl CommitmentStore {
             self.by_slot.remove(&key);
         }
     }
-}
-
-/// Why [`PreconfClassifier::claim_preconf`] refused a request.
-///
-/// One variant, kept named rather than collapsed to a `bool` so a second reason
-/// can be told apart from the first if one ever arrives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreconfClaimError {
-    /// The allowlist does not cover this `(from, to)` — or preconf is off on
-    /// this node entirely.
-    NotAllowlisted,
 }
 
 /// Outcome of trying to claim a `(sender, nonce)` slot at admission.
@@ -439,129 +405,30 @@ impl PreconfClassifier {
         }
     }
 
-    /// **Where preconf eligibility is decided.** Claims `hash` for the preconf
-    /// fast path, on behalf of a client that asked for it through
-    /// `eth_sendRawTransactionWithPreconf`.
+    /// **The one same-nonce refusal the queue cannot make for itself.**
+    /// `Err(owner)` when a commitment that is still owed holds
+    /// `(sender, nonce)`.
     ///
-    /// Called from admission, because that is the only place the deciding fact
-    /// — which RPC method this is — exists at all. One layer down the two
-    /// methods are indistinguishable.
+    /// Read-only: admission records nothing. A conflict between two
+    /// transactions that both have a queue entry is settled by the queue's own
+    /// `by_sender` index — the incumbent is there to be judged, and it always
+    /// wins. What is left for this is the case with no incumbent to judge: the
+    /// entry is gone and the commitment is still owed, which is the retention
+    /// window.
     ///
-    /// # The claim is exclusive, and the commitment store is the lock
-    ///
-    /// Get-or-insert, so whoever writes first wins, under the same lock every
-    /// other record write takes.
-    ///
-    /// `Ok(())` on an existing `Eligible` record is deliberate: a record
-    /// outlives its queue entry, so a resubmit after the first attempt ended
-    /// finds one still here. Re-asking must be idempotent.
-    ///
-    /// There is no case for an existing *non*-commitment record. Only this method
-    /// and [`Self::mark_promised`] write records, and both write a preconf one,
-    /// so an ordinary transaction leaves nothing behind to collide with.
-    ///
-    /// # What it does *not* do
-    ///
-    /// It does not claim the `(sender, nonce)` slot — that is
-    /// [`Self::claim_admission_slot`], which runs under the queue's own lock so
-    /// the slot and the entry are taken together.
-    pub fn claim_preconf(
-        &self,
-        hash: TxHash,
-        from: &Address,
-        to: Option<&Address>,
-    ) -> Result<(), PreconfClaimError> {
-        // Evaluated before the lock, so the allowlist lock and the record lock
-        // are never held together. `enabled` is folded into the predicate: a
-        // node that never opted in matches nothing.
-        if !self.evaluate_whitelist(from, to) {
-            return Err(PreconfClaimError::NotAllowlisted);
-        }
-
-        let mut store = self.commitments.write();
-        store.by_hash.entry(hash).or_insert(Commitment::new(None));
-        let len = store.by_hash.len();
-        drop(store);
-
-        self.observe_len(len);
-        Ok(())
-    }
-
-    /// Claim `(sender, nonce)` for a hash [`Self::claim_preconf`] has already
-    /// classified. `Err(incumbent)` when a different transaction owns it.
-    ///
-    /// The slot used to be claimed a layer down, on the pool's behalf.
-    /// Admission decides the same question earlier, and has to: it hands the
-    /// client a promise, so it cannot leave a later layer to discover the nonce
-    /// was spoken for.
-    ///
-    /// Called while the fifo's own lock is held, so that checking the slot and
-    /// taking it cannot be split by a concurrent request. That direction —
-    /// fifo first, records second — is the one every fifo removal already
-    /// takes, through `drop_hash`'s eviction callback.
-    ///
-    /// The slot must be free or already ours — never taken from someone else,
-    /// since an incumbent holding a nonce is a commitment that still has to
-    /// land.
-    ///
-    /// # Why the fifo's own index is not enough
-    ///
-    /// A slot outlives the fifo entry that took it. A commitment whose receipt
-    /// has gone out keeps its nonce through the retention window even after the
-    /// entry is gone, which is the whole point of the window — the transaction
-    /// is on chain, or about to be, and a second one on that nonce would either
-    /// be refused by the EVM or displace it.
-    pub fn claim_admission_slot(&self, hash: TxHash, sender: &Address, nonce: u64) -> SlotClaim {
+    /// Called with the fifo's lock held, so the answer cannot go stale before
+    /// the enqueue that follows it.
+    pub fn slot_conflict(&self, hash: TxHash, sender: &Address, nonce: u64) -> SlotClaim {
         if !self.enabled {
             return Ok(());
         }
-        let key = (*sender, nonce);
-        let mut store = self.commitments.write();
-        let has_record = store.by_hash.contains_key(&hash);
-        store.claim(key, hash, has_record)
-    }
-
-    /// Undo the effect of an admission that did not take: drop `hash`'s record
-    /// unless something else has come to depend on it. Returns `true` if the
-    /// record was dropped.
-    ///
-    /// The counterpart to [`Self::claim_preconf`], and the single home for the
-    /// question "may this failed admission destroy the record?". Both callers
-    /// ask it — the RPC handler when `add_transaction` refuses, and the
-    /// validator when its own gates or the inner validator refuse — and they
-    /// must agree, because for one transaction the two are the same record.
-    ///
-    /// The guard is the `promised` flag, never the record's mere presence:
-    /// keying on the variant would release the `Eligible` + promised records the
-    /// ordinary RPC flow leaves behind, i.e. exactly the ones that must survive.
-    /// [`Self::release_unless_committed`] underneath does not catch those either
-    /// — it reads `committed_height`, which only [`Self::mark_committed`] sets,
-    /// and the canonical notification has not arrived yet. A commitment already
-    /// acknowledged to a client would lose its `(sender, nonce)` inside the
-    /// retention window, the one thing that window exists to prevent.
-    ///
-    /// # What makes the window reachable
-    ///
-    /// Not "the receipt went out, so the nonce has advanced and a resubmit is
-    /// refused": once the block is canonical, `committed_height` is set and
-    /// [`Self::release_unless_committed`] already refuses. The reachable window
-    /// is the earlier one — receipt returned, block **not yet canonical** —
-    /// where the transaction is still in the pool, so a same-hash resubmit is
-    /// re-validated rather than deduplicated. That re-validation can fail on
-    /// account state through no act of the sender: Mantle recomputes
-    /// `extra_balance_cost` from the current `l1_block_info` every time, so
-    /// `InsufficientFunds` can flip between two blocks (the reachability
-    /// `a_repooled_tx_that_fails_revalidation_keeps_its_slot` is built on).
-    ///
-    /// It is also reachable *with* concurrency, which is why the validator
-    /// cannot narrow it to "the record is not mine": `mark_promised` can run on
-    /// another task while this admission sits inside the inner validator, so a
-    /// `Fresh` admission can come back to find its own hash promised.
-    pub fn release_preconf_claim(&self, hash: &TxHash) -> bool {
-        if self.is_promised(hash) {
-            return false;
+        match self.commitments.read().by_slot.get(&(*sender, nonce)) {
+            // Free, or ours already (a resubmit) — neither is another
+            // commitment's claim.
+            None => Ok(()),
+            Some(owner) if *owner == hash => Ok(()),
+            Some(owner) => Err(*owner),
         }
-        self.release_unless_committed(hash)
     }
 
     /// **Where commitment tracking is established.** Records that a `Success`
@@ -589,10 +456,9 @@ impl PreconfClassifier {
     /// There used to be a case here for a transaction whose record said it
     /// was not preconf: the claim was skipped, because such a transaction had
     /// no arm to defend the nonce with. It is unreachable now. The only
-    /// writers of a record are this method and `claim_preconf`, and both write
-    /// a commitment — a transaction the door refused leaves no record at all,
-    /// and every caller of this method is answering for a commitment that
-    /// went through the door.
+    /// writer of a record is this method, so every record is a commitment whose
+    /// receipt has gone out — a transaction the door refused, or one still in
+    /// flight, leaves nothing here at all.
     ///
     /// The slot claim **never displaces an existing owner**. If the slot is taken,
     /// the honest answer is that the incumbent owns the nonce; who wins is
@@ -617,15 +483,15 @@ impl PreconfClassifier {
 
         // Get-or-insert, then set `promised`. The insert case is journal restore
         // (this process has never seen the hash); the update case is the RPC
-        // handler, where `claim_preconf` froze `Eligible` on the way in. Either
-        // way the record itself is left alone; only `promised` flips.
+        // handler, where an earlier receipt for the same hash may already have
+        // written it. Either way the record itself is left alone.
         let cached = store.by_hash.entry(hash).or_insert_with(|| Commitment::new(None));
         cached.promised = true;
         cached.promised_height = Some(promised_height);
 
         // The record is there either way — inserted just above, or already
         // present from admission — so the slot is claimable.
-        let claim = store.claim(key, hash, true);
+        let claim = store.claim(key, hash);
         let len = store.by_hash.len();
         drop(store);
 
@@ -681,20 +547,6 @@ impl PreconfClassifier {
         store.by_hash.get_mut(hash).and_then(|cached| cached.committed_height.take()).is_some()
     }
 
-    /// Whether a `Success` receipt for this hash has been returned to a client.
-    ///
-    /// **Synchronous** — which is the point: the validator decides slot
-    /// ownership on a sync path and so cannot reach for the journal's
-    /// `contains(&hash).await`.
-    pub(crate) fn is_promised(&self, hash: &TxHash) -> bool {
-        self.commitments.read().by_hash.get(hash).is_some_and(|cached| cached.promised)
-    }
-
-    /// Whether this hash's commitment record may be dropped: it has to have been
-    /// observed on chain and buried under [`SEAL_DEPTH`] persisted blocks.
-    ///
-    /// `false` for a hash with no record at all — a caller asking about an
-    /// unknown hash gets "not releasable", never "go ahead".
     /// Whether this hash still has a record here at all — the journal's only
     /// eviction question.
     ///
@@ -806,12 +658,11 @@ impl PreconfClassifier {
     /// inserted between the snapshot and the `retain` below loses that record
     /// while holding a fifo entry.
     ///
-    /// The gap it needs is the one between [`Self::claim_preconf`], which writes
-    /// the record, and `PreconfTxSet::admit`, which inserts the entry — a single
-    /// validator call. Since `grace` is at least `preconf_timeout`, reaching the
-    /// race takes a validator slower than the client's entire deadline. Even
-    /// then it self-heals: [`Self::mark_promised`] get-or-inserts, so a receipt
-    /// writes the record back. Closing it properly would mean taking the fifo's
+    /// The gap it needs is between [`Self::mark_promised`], which writes the
+    /// record, and the entry it belongs to — and since a record is only written
+    /// for a commitment whose event has gone out, that entry is already there.
+    /// It self-heals regardless: `mark_promised` get-or-inserts, so the next
+    /// receipt writes the record back. Closing it properly would mean taking the fifo's
     /// async lock from this sync path, which is the dependency the whole
     /// callback/sweep split exists to avoid.
     ///
@@ -1042,8 +893,10 @@ mod tests {
             to: Option<&Address>,
             nonce: u64,
         ) -> (bool, SlotClaim) {
-            let _ = self.claim_preconf(hash, from, to);
-            let claim = self.claim_admission_slot(hash, from, nonce);
+            if !self.preview_eligibility(from, to) {
+                return (false, Ok(()));
+            }
+            let claim = self.mark_promised(hash, from, nonce, 0);
             (self.is_tracked(&hash), claim)
         }
 
@@ -1183,18 +1036,16 @@ mod tests {
     /// block. The canonical handler feeds it every hash in the block, and the
     /// overwhelming majority are ordinary user transactions.
     #[test]
-    fn mark_committed_is_a_noop_without_a_promise_record() {
+    fn mark_committed_is_a_noop_for_a_hash_with_no_record() {
         let c = classifier(LONG_GRACE);
-        // Classified and holding a slot, but no receipt ever went out.
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        // And a hash the classifier has never seen at all.
-        assert!(!c.mark_committed(&hash(1), AT), "a mere record is not a promise");
-        assert!(!c.mark_committed(&hash(9), AT), "and an unknown hash is nothing");
 
-        // Neither earns a retention period.
+        assert!(!c.mark_committed(&hash(9), AT), "an unknown hash is nothing");
+        assert!(c.mark_committed(&hash(1), AT), "a commitment of ours is counted");
+
+        // Only the latter earns a retention period.
         c.observe_persisted(AT + 1);
-        assert!(c.release_unless_committed(&hash(1)));
-        assert_eq!(c.slot_count(), 0);
+        assert!(!c.release_unless_committed(&hash(1)), "held by its depth");
     }
 
     /// Both orders end in the same state. `forward → release_unless_committed`
@@ -1235,7 +1086,7 @@ mod tests {
         assert!(c.uncommit(&hash(1)), "we had observed it on chain — that is drift");
         assert!(!c.uncommit(&hash(1)), "idempotent: the second call reports nothing");
 
-        assert!(c.is_promised(&hash(1)), "still an owed commitment");
+        assert!(c.is_tracked(&hash(1)), "still an owed commitment");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps its nonce");
 
         // With the observation withdrawn, depth no longer holds the record: it is
@@ -1421,8 +1272,8 @@ mod tests {
 
         c.update_whitelist(HashSet::default(), HashSet::default(), HashSet::default());
 
-        assert!(c.is_tracked(&hash(1)));
-        assert!(c.registered_via_preconf_rpc(hash(1), &addr(1)));
+        assert!(c.is_tracked(&hash(1)), "the commitment is untouched");
+        assert!(!c.preview_eligibility(&addr(1), Some(&addr(2))), "while the door now refuses it");
     }
 
     /// Case B: refused at the door, then the sender is added to the allowlist.
@@ -1457,11 +1308,9 @@ mod tests {
 
         // Restore pushes the envelope through the validator with an allowlist
         // that no longer contains the sender.
-        assert!(
-            c.registered_via_preconf_rpc(hash(1), &addr(9)),
-            "the record survives a door that now refuses its sender",
-        );
-        assert!(c.is_promised(&hash(1)), "and it is still a promise");
+        assert!(!c.preview_eligibility(&addr(9), Some(&addr(2))), "the door refuses that sender");
+        assert!(c.is_tracked(&hash(1)), "the record survives it");
+        assert!(c.is_tracked(&hash(1)), "and it is still a promise");
     }
 
     /// The journal-restore path in one call: record the promise **and** claim the
@@ -1477,7 +1326,7 @@ mod tests {
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
-        assert!(c.is_promised(&hash(1)));
+        assert!(c.is_tracked(&hash(1)));
         assert!(c.is_tracked(&hash(1)), "an unseen hash restores with a record of its own");
 
         c.release_unless_committed(&hash(1));
@@ -1501,7 +1350,7 @@ mod tests {
             "reports the incumbent rather than evicting it"
         );
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(2)));
-        assert!(c.is_promised(&hash(1)), "the promise is still recorded — only the claim lost");
+        assert!(c.is_tracked(&hash(1)), "the promise is still recorded — only the claim lost");
     }
 
     /// **`mark_promised` must not overwrite an existing record with
@@ -1511,9 +1360,9 @@ mod tests {
     /// treats as frozen start changing mid-life.
     ///
     /// The state this test constructs is reachable only from the RPC path, where
-    /// `claim_preconf` froze `Eligible` on the way in: restore runs before
-    /// anything in the process can classify, so its record is always a fresh
-    /// insert (asserted in `mark_promised_claims_the_slot_*`).
+    /// an earlier receipt for the same hash wrote it: restore runs before
+    /// anything in the process can answer a client, so its record is always a
+    /// fresh insert.
     #[test]
     fn mark_promised_records_the_promise_without_rewriting_the_record() {
         let c = classifier(LONG_GRACE);
@@ -1522,7 +1371,7 @@ mod tests {
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         assert!(c.is_tracked(&hash(1)), "record untouched");
-        assert!(c.is_promised(&hash(1)), "but the promise is recorded");
+        assert!(c.is_tracked(&hash(1)), "but the promise is recorded");
     }
 
     #[test]
@@ -1544,6 +1393,8 @@ mod tests {
         // submission would leave none.
         c.registered_via_preconf_rpc(hash(1), &addr(1));
         c.registered_via_preconf_rpc(hash(2), &addr(1));
+        // Past the depth that holds an unlanded promise, so `grace` decides.
+        c.observe_persisted(SEAL_DEPTH + 1);
 
         assert_eq!(c.sweep(&HashSet::default()), 2);
         assert_eq!(c.commitment_count(), 0);
@@ -1577,6 +1428,7 @@ mod tests {
         c.registered_via_preconf_rpc(hash(1), &addr(1));
         c.registered_via_preconf_rpc(hash(2), &addr(1));
         c.registered_via_preconf_rpc(hash(3), &addr(1));
+        c.observe_persisted(SEAL_DEPTH + 1);
 
         assert_eq!(c.sweep(&hashes(&[hash(2)])), 2);
         assert!(c.is_tracked(&hash(2)));
@@ -1848,10 +1700,8 @@ mod tests {
         // Governance revokes the rule; the incumbent's record stays frozen.
         c.update_whitelist(HashSet::default(), HashSet::default(), HashSet::default());
 
-        let (v2, claim2) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
-        assert!(!v2, "newcomer is judged under the new allowlist");
         assert_eq!(
-            claim2,
+            c.slot_conflict(hash(2), &addr(1), 7),
             Err(hash(1)),
             "but it must still be told the slot is taken — otherwise both arms end up \
              holding a transaction for the same nonce",
@@ -1881,7 +1731,7 @@ mod tests {
         let (registered, claim) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
 
         assert!(registered, "the losing commitment keeps its record");
-        assert!(c.is_promised(&hash(2)), "and it is still a promise");
+        assert!(c.is_tracked(&hash(2)), "and it is still a promise");
         assert_eq!(claim, Err(hash(1)), "the incumbent is reported, not silently overwritten");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps the slot");
     }
@@ -1940,6 +1790,7 @@ mod tests {
 
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
         assert_eq!(c.slot_count(), 1);
+        c.observe_persisted(SEAL_DEPTH + 1);
 
         assert_eq!(c.sweep(&hashes(&[])), 1);
         assert_eq!(c.commitment_count(), 0);
@@ -1975,7 +1826,7 @@ mod tests {
             "same hash re-claiming is idempotent"
         );
 
-        assert!(c.is_promised(&hash(1)));
+        assert!(c.is_tracked(&hash(1)));
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "claim preserved");
         c.release_unless_committed(&hash(1));
         assert_eq!(c.slot_count(), 0, "and is still releasable");

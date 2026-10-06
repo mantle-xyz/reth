@@ -10,7 +10,7 @@
 //!
 //! | order | refused by | why it went away |
 //! |---|---|---|
-//! | ordinary first, then preconf | the ordinary path used to leave a frozen classification behind, and it was immutable, so `claim_preconf` refused | nothing records anything for ordinary transactions once the pool decoration is gone |
+//! | ordinary first, then preconf | the ordinary path used to leave a frozen classification behind, and it was immutable, so admission refused | nothing records anything for ordinary transactions once the pool decoration is gone |
 //! | preconf first, then ordinary | the pool's own hash dedup — the preconf transaction was *in* the pool, so resubmitting it was "already known" | preconf transactions no longer enter the pool, so the hash is new to it |
 //!
 //! Accepting both is a deliberate loosening, on the grounds that whatever lands

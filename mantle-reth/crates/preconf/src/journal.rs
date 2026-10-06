@@ -20,7 +20,7 @@
 //! because the only notion this layer could form — *canonical once* — is one a
 //! reorg can undo. Rotation receives that decision as the `retain` predicate
 //! [`PreconfJournal::rotate`] takes, and restore asks
-//! `PreconfClassifier::is_promised` directly. This is the sole statement of that
+//! `PreconfClassifier::is_tracked` directly. This is the sole statement of that
 //! division; the rest of the file assumes it.
 //!
 //! The journal exposes `append_promised` / `load` / `rotate` for the durability
@@ -2237,7 +2237,7 @@ mod tests {
                 self.seen
                     .lock()
                     .unwrap()
-                    .push(self.hashes.iter().map(|h| self.classifier.is_promised(h)).collect());
+                    .push(self.hashes.iter().map(|h| self.classifier.is_tracked(h)).collect());
                 Ok(RestoredEnvelope {
                     envelope: TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)),
                     from: Address::from([seed; 20]),

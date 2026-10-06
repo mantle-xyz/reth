@@ -51,7 +51,6 @@ use tracing::{debug, trace};
 
 use crate::{
     PreconfClassifier, PreconfConfig, PreconfTxSet,
-    classifier::PreconfClaimError,
     preconf_tx_set::{AdmitRequest, Capacity},
     types::{PreconfError, PreconfReceipt, PreconfSource},
 };
@@ -251,10 +250,9 @@ where
             TxKind::Create => None,
         };
 
-        // Not the binding decision — `claim_preconf` below consults the same
-        // allowlists and freezes what it finds. This is here so a sender who
-        // was never allowlisted is turned away before a state read and a
-        // validator round trip.
+        // The allowlist gate. Not the binding one — see `preview_eligibility`
+        // for where that is. This is here so a sender who was never allowlisted
+        // is turned away before a state read and a validator round trip.
         if !self.classifier.preview_eligibility(&sender, to.as_ref()) {
             trace!(target: "mantle::preconf::admission", ?sender, ?to, ?hash, "not allowlisted");
             return Err(PreconfError::NotPreconfEligible);
@@ -267,20 +265,9 @@ where
             });
         }
 
-        // **Where eligibility is decided.** The deciding fact — that the
-        // client asked for a preconfirmation rather than sending an ordinary
-        // transaction — exists nowhere else; one layer down the two are
-        // indistinguishable.
-        // Previewed as allowlisted a moment ago, so a refusal here means
-        // governance moved in between. Same answer either way.
-        if let Err(PreconfClaimError::NotAllowlisted) =
-            self.classifier.claim_preconf(hash, &sender, to.as_ref())
-        {
-            return Err(PreconfError::NotPreconfEligible);
-        }
-
-        // From here every failure owes the record back, or the sender's nonce
-        // stays claimed by a transaction that is not going anywhere.
+        // Nothing is recorded on the way in, so nothing is owed back on the
+        // way out: the queue creates the entry, and the classifier's record is
+        // not written until a receipt goes out (`mark_promised`).
         match self.decide(pool_tx, sender, hash, origin_instant, responder).await {
             Ok(()) => Ok(AdmittedTx { hash, sender, nonce }),
             Err(err) => {
@@ -292,9 +279,6 @@ where
                 if matches!(err, PreconfError::NonceGap { .. }) {
                     metrics::counter!("preconf.rpc.nonce_gap_rejected_total").increment(1);
                 }
-                // Whether the record may actually go is not this call site's
-                // to work out — a commitment already acknowledged keeps it.
-                self.classifier.release_preconf_claim(&hash);
                 Err(err)
             }
         }
@@ -507,10 +491,8 @@ mod record_release_tests {
     /// that window is re-validated and can fail on account state alone, since
     /// Mantle recomputes the L1 and operator fees every time.
     ///
-    /// The assertions key on `is_promised`, not on the record's presence:
-    /// `mark_promised` sets the flag on whatever record is there, so the
-    /// ordinary flow leaves `Eligible` + promised — exactly the records that
-    /// must survive.
+    /// A record exists only for a commitment whose event has gone out, so its
+    /// presence is the thing that must survive a refused resubmit.
     #[tokio::test]
     async fn a_refusal_must_not_drop_a_commitment_already_promised() {
         let f = fixture();
@@ -518,16 +500,15 @@ mod record_release_tests {
         let sender = f.signer.address();
         let (resp, _rx) = oneshot::channel();
 
-        assert_eq!(f.classifier.claim_preconf(hash, &sender, Some(&RECIPIENT)), Ok(()));
         assert_eq!(f.classifier.mark_promised(hash, &sender, 0, 0), Ok(()));
-        assert!(f.classifier.is_promised(&hash), "precondition: the commitment is acknowledged",);
+        assert!(f.classifier.is_tracked(&hash), "precondition: the commitment is acknowledged",);
 
         f.admission
             .admit(&raw, std::time::Instant::now(), resp)
             .await
             .expect_err("the validator refuses the resubmit");
 
-        assert!(f.classifier.is_promised(&hash), "the commitment record must survive");
+        assert!(f.classifier.is_tracked(&hash), "the commitment record must survive");
         assert_eq!(
             f.classifier.slot_owner(&sender, 0),
             Some(hash),

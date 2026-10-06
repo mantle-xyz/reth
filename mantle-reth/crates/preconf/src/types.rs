@@ -57,7 +57,7 @@ pub enum PreconfStatus {
 ///       crash.
 ///     - **Reorg reinject** — the canonical-state handler pushes back every commitment the reverted
 ///       chain carried. Whether a hash is one is asked of the classifier
-///       (`PreconfClassifier::is_promised`, i.e. "a `Success` receipt for this hash already went
+///       (`PreconfClassifier::is_tracked`, i.e. "a `Success` receipt for this hash already went
 ///       out") rather than of the journal: the journal's notion of a finished commitment is
 ///       "canonical once", which is exactly what a reorg undoes.
 ///

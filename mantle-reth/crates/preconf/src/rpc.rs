@@ -594,7 +594,7 @@ mod tests {
         h.handler.claim_commitment_slot(&event, hash, &sender, 0).await;
 
         assert!(
-            h.classifier.is_promised(&hash),
+            h.classifier.is_tracked(&hash),
             "the classifier must know the commitment, or a reorg reinject is \
              re-gated as a fresh submission and `mark_committed` cannot count it",
         );

@@ -1,23 +1,22 @@
 //! Pool-arm regression + co-existence coverage.
 //!
-//! `apply_one_best_tx` in the fork's payload builder skips a tx that carries a
-//! commitment record — `classifier.is_tracked(hash)`
-//! (`builder::payload_builder`) — so a commitment can never leak out through the
-//! pool iterator ahead of its fifo entry and be applied twice.
+//! `apply_one_best_tx` in the fork's payload builder skips a tx the preconf arm
+//! has queued — `fifo.contains(hash)` (`builder::payload_builder`) — so a
+//! commitment can never leak out through the pool iterator and be applied twice.
 //!
-//! The predicate is the **commitment record**, not a live allowlist read, and the
-//! only writer of an eligible record is `claim_preconf`, called from
+//! The predicate is the **fifo entry**, not a live allowlist read, and the only
+//! thing that creates one for a client request is
 //! `eth_sendRawTransactionWithPreconf`. Being on the allowlist therefore does
 //! **not** make a transaction preconf: the RPC method decides. A whitelisted
-//! sender using plain `eth_sendRawTransaction` leaves no record and lands
-//! through the ordinary pool arm.
+//! sender using plain `eth_sendRawTransaction` gets no entry and lands through
+//! the ordinary pool arm.
 //!
 //! Coverage:
 //!
 //! - `allowlisted_sender_via_plain_sendtx_lands_through_the_pool_arm` — on the allowlist, but
-//!   submitted the ordinary way, so no record is frozen and the pool arm applies it. Discriminating
-//!   in both directions: were plain submissions eligible again, the pool arm would skip it *and* no
-//!   fifo entry would exist (nothing called the preconf RPC), so it would never land at all.
+//!   submitted the ordinary way, so it gets no fifo entry and the pool arm applies it.
+//!   Discriminating in both directions: were plain submissions eligible again, the pool arm would
+//!   skip it *and* the preconf arm would still have nothing queued for it, so it would never land.
 //! - `non_preconf_eligible_regular_sendtx_lands_via_pool_arm` — the same, for a sender that is not
 //!   on the allowlist either. Guards against a regression where the gate rejects every pool-path tx
 //!   on a preconf-enabled node.
@@ -63,7 +62,7 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 /// shape a regression hides in:
 ///
 /// - **Today** the preconf transaction is in the pool, so the pool arm meets it in its iterator,
-///   skips it on the commitment record, and calls `mark_invalid(sender, nonce)` — which drains that
+///   skips it on its fifo entry, and calls `mark_invalid(sender, nonce)` — which drains that
 ///   sender's *descendants* from the iterator too. The ordinary transaction at `nonce+1` is
 ///   collateral.
 /// - **After** the preconf transaction is not in the pool at all, so the pool never sees nonce 0,

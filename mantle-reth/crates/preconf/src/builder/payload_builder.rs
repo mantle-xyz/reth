@@ -844,9 +844,7 @@ enum BestTxStep {
 /// but factored out so each call handles exactly one tx — lets the
 /// unified select! loop interleave best-tx application with preconf
 /// commitment application.
-#[allow(clippy::too_many_arguments)]
-fn apply_one_best_tx<N, Builder>(
-    classifier: &PreconfClassifier,
+async fn apply_one_best_tx<N, Builder>(
     best_txs: &mut impl PayloadTransactions<
         Transaction: PoolTransaction<Consensus = N::SignedTx> + OpPooledTx,
     >,
@@ -863,26 +861,17 @@ where
     let Some(tx) = best_txs.next(()) else {
         return Ok(BestTxStep::Done);
     };
-    // A transaction the preconf arm owns is left to it. Both containers can hold
-    // one hash now that either channel accepts it, and this arm's snapshot is
-    // taken before the record is necessarily frozen. If this arm applied it,
-    // the transaction would land while its client was told `Timeout`.
+    // This hash was sent through both channels: the pool has it here, and the
+    // fifo has it queued. The preconf arm must be the one to apply it, or the
+    // client that asked for a preconfirmation never gets its receipt. Skipping
+    // does not drop it — the preconf arm holds it.
     //
-    // Skipping does not drop it: admission holds the `(sender, nonce)`, so the
-    // preconf arm is the only one that can apply it.
+    // A preconf submission on its own never enters the pool, so an entry here
+    // means both channels were used.
     //
-    // The predicate is the **record written at admission**, never a live
-    // allowlist read: re-deriving eligibility here would let an allowlist update
-    // between the two decisions strand the transaction with neither arm
-    // applying it. A record exists exactly for a transaction the preconf arm
-    // owns, so its presence is the whole answer.
-    //
-    // Removing this is not detectable by the suite — the biased `select!` puts
-    // preconf dispatch ahead of this arm, and a commitment older than the build
-    // arrives through the carryover preamble, so the preconf arm has got there
-    // first every time. That is a reading of the loop, not a property anything
-    // checks, which is why the guard stays.
-    if classifier.is_tracked(tx.hash()) {
+    // The suite stays green without this guard: the biased `select!` usually
+    // lets the preconf arm get there first anyway.
+    if fifo.contains(tx.hash()).await {
         best_txs.mark_invalid(tx.sender(), tx.nonce());
         return Ok(BestTxStep::Continue);
     }
@@ -2023,14 +2012,15 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 {
                     let iter = best_txs_iter.as_mut().expect("guard verified Some");
                     match apply_one_best_tx::<N, _>(
-                        &self.classifier,
                         iter,
                         &mut builder,
                         &mut info,
                         &self.fifo,
                         &constraints,
                         &mut pool_pacer,
-                    )? {
+                    )
+                    .await?
+                    {
                         // The iterator has advanced either way; the next
                         // select! iteration re-fires this arm.
                         BestTxStep::Continue => {}
