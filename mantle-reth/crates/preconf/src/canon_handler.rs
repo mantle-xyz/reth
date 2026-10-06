@@ -4,12 +4,11 @@
 //! and drives best-effort cleanups on committed / reverted chain events:
 //!
 //! - **Committed chain**: publishes the persisted block height (the ruler the retention period is
-//!   measured against — see `classifier::SEAL_DEPTH`), records every hash that has a promise record
-//!   as committed at its block's height, and runs [`PreconfTxSet::clean_reclaimable`] to evict
-//!   `Timeout` / `Canceled` / `Failed` entries — three "not on chain" states that must not linger
-//!   on senders who never post another nonce. Evicted hashes are then `remove_transactions`-ed from
-//!   the pool so a preconf tx that already surfaced a not-on-chain wire signal to the client cannot
-//!   silently land on chain later (which would corrupt off-chain reconciliation).
+//!   measured against — see `classifier::SEAL_DEPTH`) and records every hash that has a promise
+//!   record as committed at its block's height.
+//!
+//!   There is no sweep of ended commitments to do here: one that cannot be honoured is removed
+//!   when it ends, not parked in a terminal state for a later pass to find.
 //!
 //!   The per-sender nonce-frontier `forward()` deliberately does **not** run here: it runs at
 //!   `PayloadJob` start (`builder::payload_builder::sync_fifo_forward_to_head`), because the async
@@ -37,7 +36,6 @@ use reth_chain_state::CanonStateSubscriptions;
 use reth_execution_types::Chain;
 use reth_primitives_traits::NodePrimitives;
 use reth_storage_api::BlockNumReader;
-use reth_transaction_pool::TransactionPool;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -52,14 +50,8 @@ use crate::{
 /// parameter is `Pr::Primitives` — kept as a separate type parameter so
 /// trait bounds on the transaction type (`Transaction`, recovery) can
 /// be expressed without re-projecting `<Pr::Primitives as ...>` everywhere.
-pub struct PreconfCanonHandler<Pr, P, N> {
+pub struct PreconfCanonHandler<Pr, N> {
     provider: Pr,
-    /// Transaction pool. Used to `remove_transactions` the hashes evicted
-    /// by [`PreconfTxSet::clean_reclaimable`] so a Timeout or Canceled
-    /// preconf tx does NOT quietly land on chain later (which would
-    /// violate the client's bookkeeping — see design note in the run
-    /// loop).
-    pool: P,
     fifo: Arc<PreconfTxSet>,
     /// Record cache. Swept once per canonical notification against the
     /// fifo's live set — see [`PreconfClassifier::sweep`]. This handler is the
@@ -68,18 +60,17 @@ pub struct PreconfCanonHandler<Pr, P, N> {
     _n: PhantomData<fn() -> N>,
 }
 
-// Manual `Debug` impl: skip the provider / pool (which would force
-// `Pr: Debug` / `P: Debug` on every call site) and the phantom marker.
-impl<Pr, P, N> std::fmt::Debug for PreconfCanonHandler<Pr, P, N> {
+// Manual `Debug` impl: skip the provider (which would force `Pr: Debug` on
+// every call site) and the phantom marker.
+impl<Pr, N> std::fmt::Debug for PreconfCanonHandler<Pr, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfCanonHandler").field("fifo", &self.fifo).finish_non_exhaustive()
     }
 }
 
-impl<Pr, P, N> PreconfCanonHandler<Pr, P, N>
+impl<Pr, N> PreconfCanonHandler<Pr, N>
 where
     Pr: CanonStateSubscriptions<Primitives = N> + BlockNumReader + 'static,
-    P: TransactionPool + 'static,
     N: NodePrimitives,
     N::SignedTx: Transaction + TxHashRef,
     // The queue holds alloy envelopes; a reverted commitment has to be
@@ -94,11 +85,10 @@ where
     /// value.
     pub const fn new(
         provider: Pr,
-        pool: P,
         fifo: Arc<PreconfTxSet>,
         classifier: Arc<PreconfClassifier>,
     ) -> Self {
-        Self { provider, pool, fifo, classifier, _n: PhantomData }
+        Self { provider, fifo, classifier, _n: PhantomData }
     }
 
     /// Run the listener loop. Returns when the canonical-state stream
@@ -163,42 +153,18 @@ where
                 );
             }
 
-            // Housekeeping, per notification (~ per sealed block, ~2s on OP L2,
-            // matching op-geth's cadence without a separate task): sweep the
-            // reclaimable entries and drop the same hashes from the pool — see
-            // the module docs for why both halves are needed.
-            // `sync_fifo_forward_to_head` does not cover this: it only drops
-            // entries whose nonce trails the sealed frontier, so a reclaimable
-            // entry whose sender never posts another nonce would stay forever.
-            //
-            // The two calls are not atomic: between fifo eviction and pool
-            // removal a concurrent `build_payload` could pick the evicted tx up
-            // from the pool iterator. Accepted — the window is µs-scale
-            // (sequential calls in one task, no await beyond mutex acquisition)
-            // and the tx it could apply is one the fifo had already given up on.
-            let evicted = self.fifo.clean_reclaimable().await;
-            if !evicted.is_empty() {
-                let pool_removed = self.pool.remove_transactions(evicted.clone());
-                debug!(
-                    target: "mantle::preconf::canon",
-                    fifo_count = evicted.len(),
-                    pool_count = pool_removed.len(),
-                    "clean_reclaimable evicted {} fifo entries; removed {} from pool",
-                    evicted.len(),
-                    pool_removed.len(),
-                );
-            }
-
             // Record-cache sweep. Runs unconditionally: its target is the leak
             // `drop_hash` cannot reach — a tx classified at admission that sits
             // in `Queued`, never emits a `Pending` event, and so never gets a
             // fifo entry at all. Criterion is fifo membership plus a grace
             // period; see `PreconfClassifier::sweep`.
             //
-            // **Must stay below the `mark_committed` loop above.** Nothing in
-            // `sweep` exempts a record for being `promised`, and a commitment
+            // **Must stay below the `mark_committed` loop above.** A commitment
             // whose block just became canonical has usually lost its fifo entry
-            // already — so `committed_height` is the only thing holding it, and
+            // already, so what holds its record is depth rather than age. For a
+            // promise made more than `SEAL_DEPTH` blocks ago, `sweep`'s
+            // promise-recoverable arm has already lapsed, which leaves
+            // `committed_height` as the only thing holding it — and
             // `mark_committed` sets that from *this* notification. Hoisted above
             // the loop, the sweep could drop a commitment in the very
             // notification meant to record it as on chain.

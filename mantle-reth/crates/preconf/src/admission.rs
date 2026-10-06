@@ -52,7 +52,7 @@ use tracing::{debug, trace};
 use crate::{
     PreconfClassifier, PreconfConfig, PreconfTxSet,
     classifier::PreconfClaimError,
-    preconf_tx_set::{AdmitRequest, Admitted, Capacity},
+    preconf_tx_set::{AdmitRequest, Capacity},
     types::{PreconfError, PreconfReceipt, PreconfSource},
 };
 
@@ -94,7 +94,7 @@ fn peek_tx_type(bytes: &[u8]) -> Option<u8> {
 /// User-submitted variants (`Legacy` / `Eip1559` / `Eip2930` / `Eip7702`) are
 /// passed through unchanged.
 ///
-/// Shared with [`crate::pool_ext::pool_adapter::RestoreDirect`] so admission
+/// Shared with [`crate::restore::RestoreDirect`] so admission
 /// and the restore-time adapter agree on which OP tx variants are
 /// preconf-eligible.
 pub(crate) fn op_envelope_to_alloy(op_tx: OpTxEnvelope) -> Option<TxEnvelope> {
@@ -130,8 +130,6 @@ fn refusal(err: &InvalidPoolTransactionError) -> PreconfError {
 /// worked out and the caller would otherwise decode a second time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmittedTx {
-    /// Whether this created an entry or revived one.
-    pub outcome: Admitted,
     /// Transaction hash.
     pub hash: alloy_primitives::TxHash,
     /// Recovered sender.
@@ -284,7 +282,7 @@ where
         // From here every failure owes the record back, or the sender's nonce
         // stays claimed by a transaction that is not going anywhere.
         match self.decide(pool_tx, sender, hash, origin_instant, responder).await {
-            Ok(outcome) => Ok(AdmittedTx { outcome, hash, sender, nonce }),
+            Ok(()) => Ok(AdmittedTx { hash, sender, nonce }),
             Err(err) => {
                 // Kept under its original name so existing dashboards follow
                 // the judgement to where it moved. What it counts is narrower
@@ -313,7 +311,7 @@ where
         hash: alloy_primitives::TxHash,
         origin_instant: std::time::Instant,
         responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
-    ) -> Result<Admitted, PreconfError> {
+    ) -> Result<(), PreconfError> {
         // The type gate ran first, so this is one of the three it lets
         // through and the conversion cannot fail.
         let op_envelope = OpTxEnvelope::from(pool_tx.clone_into_consensus().into_inner());

@@ -1,26 +1,29 @@
-//! Bridge from a live [`TransactionPool`] to the [`crate::RestoreSource`]
-//! trait so [`crate::restore_preconf_state`] can re-admit and decode
-//! journal-persisted commitments at node startup.
+//! Turning journal bytes back into queue entries at startup.
+//!
+//! Two pieces, both for [`crate::restore_preconf_state`]:
+//!
+//! - [`RestoreDirect`] decodes a persisted commitment's wire bytes into the envelope + sender the
+//!   fifo needs.
+//! - [`ProviderChainView`] lets a node provider answer what restore asks of the chain: where a
+//!   sender's nonce stands, and whether a commitment already landed.
+//!
+//! **Neither touches the transaction pool.** Restore used to re-admit every
+//! commitment there and read the outcome off the pool's validator; since direct
+//! admission a commitment never enters the pool at all, so what is left is
+//! decoding plus two chain reads. [`RestoreDirect`] holds nothing — it is
+//! generic over the pool's transaction type only because the journal stores wire
+//! bytes and decoding them needs a type to decode *into*.
 //!
 //! It shares admission's `op_envelope_to_alloy` helper so the "which OP tx
 //! variants are preconf-eligible" decision stays in one place.
 //!
-//! ## `add_envelope` semantics
+//! ## What `recover_envelope` refuses
 //!
-//! Returns `Ok(recovered)` in **both** cases:
-//!
-//! - The tx was newly admitted to the pool.
-//! - The pool rejected admission with `AlreadyImported` (typically because reth's own local-tx
-//!   backup restored the same tx from disk before this call).
-//!
-//! In either case the caller ([`crate::restore_preconf_state`]) needs
-//! the decoded envelope + sender to `push_if_absent` into the fifo —
-//! whether the pool already knows about the tx is orthogonal to the
-//! fifo push.
-//!
-//! Only genuine pool errors (invalid signature, nonce mismatch on the
-//! post-restart state, etc.) surface as `Err(reason)`. The restore
-//! helper logs and skips those entries.
+//! `RestoreSkip::Rejected` for bytes that will not decode, and for the
+//! `Deposit` / `PostExec` variants — which should never reach the journal, since only
+//! preconf-RPC submissions are persisted, but are filtered anyway to match
+//! admission's own gate. [`crate::restore_preconf_state`] logs and skips those
+//! entries; everything else is handed back for `push_if_absent`.
 
 use std::marker::PhantomData;
 
@@ -88,7 +91,7 @@ where
         Some((recovered.signer(), alloy_consensus::Transaction::nonce(recovered.inner())))
     }
 
-    async fn add_envelope(
+    async fn recover_envelope(
         &self,
         tx_rlp: &alloy_primitives::Bytes,
     ) -> Result<RestoredEnvelope, RestoreSkip> {

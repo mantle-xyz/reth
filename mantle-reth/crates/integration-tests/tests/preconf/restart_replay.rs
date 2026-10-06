@@ -132,9 +132,9 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
 /// `--preconf.max-gas-per-tx` below that tx's gas limit.
 ///
 /// The tx below asks for 21 000 gas while the restarted node caps preconf txs at
-/// 20 000. The cap is an admission-time check, so restore's `add_envelope` runs
+/// 20 000. The cap is an admission-time check, so restore's `recover_envelope` runs
 /// straight into it — unless the entry is already promised, which the
-/// validator waves past every preconf gate. Without that exemption `add_envelope`
+/// validator waves past every preconf gate. Without that exemption `recover_envelope`
 /// returns `Err`, restore logs and skips, and the commitment is **silently
 /// dropped**: the client was told it succeeded and nothing lands.
 ///
@@ -225,28 +225,24 @@ fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::Pa
     (journal_file, journal_dir)
 }
 
-/// **D4 regression guard, second door.** A client resubmitting a hash that is
-/// mid-replay must not be able to destroy the commitment by timing out.
+/// A client resubmitting a hash that is mid-replay cannot disturb the
+/// commitment — and is refused rather than made to wait.
 ///
 /// Shape: journal restore leaves the entry in the fifo as `Waiting` /
-/// `PreconfSource::Replay` with no responder. Admission therefore accepts a
-/// same-hash resubmit onto it, and that resubmit's `handle_inner` reaches the
-/// deadline branch with
-/// `final_status == Some(Waiting)`. That branch used to run `mark_timeout`
-/// unconditionally, which makes the commitment replaceable by any same-nonce tx
-/// and sweepable by `clean_reclaimable` — so a promise whose receipt went out in
-/// the previous process would silently never land.
+/// `PreconfSource::Replay` with no responder. Its receipt went out in the
+/// previous process and cannot be reconstructed, so there is nothing a second
+/// client could be handed; admission says so instead of attaching a channel
+/// nobody will answer.
 ///
-/// No payload build is driven until after the deadline, so the RPC call is
-/// guaranteed to hit the deadline path. Two observables, either of which the
-/// pre-D4 behaviour breaks:
+/// The protection is that the entry never acquires a client at all, so nothing
+/// in this test *can* touch it. Two observables:
 ///
-/// 1. the tx is still in the pool afterwards (`mark_timeout` would have evicted it);
-/// 2. it still lands in the next block (a `Timeout` entry is skipped by `replay_fifo_carryover`).
+/// 1. the commitment is still queued after the refusal;
+/// 2. it still lands in the next block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_rpc_deadline_does_not_time_out_a_replaying_commitment() {
+async fn a_resubmit_cannot_disturb_a_replaying_commitment() {
     use super::helpers::send_preconf;
-    use mantle_reth_rpc_ext::PreconfStatus;
+    use jsonrpsee::core::ClientError;
 
     let recipient: Address = RECIPIENT.parse().unwrap();
     let chain_id = mantle_test_chain_spec().chain().id();
@@ -274,13 +270,15 @@ async fn an_rpc_deadline_does_not_time_out_a_replaying_commitment() {
         launch_preconf_node_with_fifo!(cfg).await;
 
     // Restore has already re-injected the tx and pushed a `Replay` fifo entry.
-    // Resubmitting the same hash attaches a fresh responder to that live entry;
-    // with no build running, this call can only end at the deadline.
-    let event = send_preconf(&http, raw_tx.clone()).await.expect("resubmit must not error");
-    assert_eq!(
-        event.status,
-        PreconfStatus::Timeout,
-        "this client's request times out — that part is expected",
+    // The resubmit is refused outright: there is no second receipt to give it.
+    // Note this returns immediately — it does not wait out `preconf_timeout`.
+    let err = send_preconf(&http, raw_tx.clone())
+        .await
+        .expect_err("a replaying commitment takes on no second client");
+    assert!(
+        matches!(&err, ClientError::Call(e)
+            if e.message().contains("already in progress")),
+        "expected AlreadyInProgress, got {err:?}",
     );
 
     // Observable 1: the commitment is still queued. This used to read the

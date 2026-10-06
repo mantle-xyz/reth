@@ -736,20 +736,20 @@ pub trait RestoreSource: Send + Sync {
     /// not this call's question — that is the chain's, and
     /// [`restore_preconf_state`] asks it. The restore
     /// helper logs and skips those entries.
-    async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip>;
+    async fn recover_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip>;
 
     /// Recover just the `(sender, nonce)` of `tx_rlp`.
     ///
     /// Exists so [`restore_preconf_state`]'s pre-pass can claim each
     /// commitment's slot before *any* entry is admitted; see
     /// [`PreconfClassifier::mark_promised`](crate::PreconfClassifier::mark_promised)
-    /// for why that has to happen before `add_envelope`.
+    /// for why that has to happen before `recover_envelope`.
     ///
     /// `None` for anything that does not decode or whose signature does not
-    /// recover — the entry will fail `add_envelope` for the same reason a moment
+    /// recover — the entry will fail `recover_envelope` for the same reason a moment
     /// later, which is where it gets logged.
     ///
-    /// Decodes the same bytes `add_envelope` decodes again: one extra ec-recover
+    /// Decodes the same bytes `recover_envelope` decodes again: one extra ec-recover
     /// per journal entry, once per process start.
     fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)>;
 }
@@ -826,7 +826,7 @@ pub enum RestoreSkip {
     Rejected(String),
 }
 
-/// Output of a successful [`RestoreSource::add_envelope`] — the decoded
+/// Output of a successful [`RestoreSource::recover_envelope`] — the decoded
 /// envelope plus the recovered sender. The journal needs both: the
 /// envelope to push into the fifo, the sender as the `from` field
 /// keyed by `(sender, nonce)` for the replacement guard.
@@ -861,7 +861,7 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
 ///    carries "a receipt for this tx already went out to a client" across the restart, and it has
 ///    to happen first: it is what claims the `(sender, nonce)` each commitment was issued against,
 ///    before anything else can take it.
-/// 2. Decode via [`RestoreSource::add_envelope`], then ask the chain whether the commitment is
+/// 2. Decode via [`RestoreSource::recover_envelope`], then ask the chain whether the commitment is
 ///    still owed — the sender's nonce first, and only if that is gone, whether this transaction is
 ///    the one that took it.
 /// 3. Push the recovered envelope into the fifo with
@@ -874,7 +874,7 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
 /// acknowledged to a client must come back regardless of what current policy
 /// says. Cold start runs before restore, so without step 1 a restored tx would
 /// be classified `Eligible` and re-judged against the *current*
-/// `preconf_max_gas_per_tx`: lower that flag, restart, and `add_envelope` starts
+/// `preconf_max_gas_per_tx`: lower that flag, restart, and `recover_envelope` starts
 /// rejecting commitments a client was already told had succeeded — silently,
 /// since restore skips and logs.
 ///
@@ -888,7 +888,7 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
 /// carry) are logged and skipped — best-effort restore, never block startup.
 pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     journal: &PreconfJournal,
-    pool: &P,
+    source: &P,
     chain: &C,
     fifo: &Arc<PreconfTxSet>,
     classifier: &PreconfClassifier,
@@ -930,14 +930,14 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     // ordering closes that window today (`cli::node` runs restore before the pool loader, the RPC
     // server and the network); claiming here makes it structural instead.
     for entry in &entries {
-        match pool.recover_slot(&entry.tx_rlp) {
+        match source.recover_slot(&entry.tx_rlp) {
             Some((from, nonce)) => {
                 if let Err(owner) =
                     classifier.mark_promised(entry.hash, &from, nonce, entry.block_height)
                 {
                     // Someone already owns the nonce, so this commitment is the
                     // one that will lose it. Deliberately not seized — see
-                    // `mark_promised`. `add_envelope` below decides the outcome
+                    // `mark_promised`. `recover_envelope` below decides the outcome
                     // (typically `ReplacementUnderpriced`) and logs it.
                     warn!(
                         target: "mantle::preconf::journal",
@@ -948,7 +948,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                 }
             }
             // Undecodable envelope. **No record is written**, deliberately:
-            // `recover_slot` shares its first step with `add_envelope`, so this
+            // `recover_slot` shares its first step with `recover_envelope`, so this
             // entry is about to be rejected there too and will never reach the
             // queue — and a `Promised` record would break the rule that a
             // promise names the `(sender, nonce)` it was issued against. A
@@ -978,7 +978,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     let mut rejected = 0usize;
 
     for entry in entries {
-        let recovered = match pool.add_envelope(&entry.tx_rlp).await {
+        let recovered = match source.recover_envelope(&entry.tx_rlp).await {
             // Decoded. Whether it is still owed is the chain's to say, and the
             // cheap half of that question comes first: if the sender's nonce
             // has not moved past this transaction, nothing has taken its place
@@ -1074,7 +1074,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                     target: "mantle::preconf::journal",
                     hash = ?entry.hash,
                     reason,
-                    "pool rejected restored tx; commitment cannot be honoured"
+                    "restored tx could not be decoded; commitment cannot be honoured"
                 );
                 rejected += 1;
                 continue;
@@ -1930,17 +1930,17 @@ mod tests {
 
     // ── restore_preconf_state ──────────────────────────────────────
 
-    /// Stub pool that records `contains` / `add_envelope` calls. We
+    /// Stub pool that records `contains` / `recover_envelope` calls. We
     /// don't go through real reth pool machinery — that's wired in by
     /// the cli crate at a later phase. The stub fabricates plausible
-    /// envelopes for every `add_envelope` call.
+    /// envelopes for every `recover_envelope` call.
     struct StubPool {
         // Hashes the stub will report as already-present.
         known: HashSet<TxHash>,
         // Counts for assertions.
         contains_calls: std::sync::Mutex<Vec<TxHash>>,
         add_calls: std::sync::Mutex<Vec<Bytes>>,
-        // Whether add_envelope should return Err.
+        // Whether recover_envelope should return Err.
         reject_add: bool,
         // Whether recover_slot should fail, i.e. the bytes do not decode.
         undecodable: bool,
@@ -1960,7 +1960,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RestoreSource for StubPool {
-        /// Must agree with the `(from, nonce)` `add_envelope` fabricates below —
+        /// Must agree with the `(from, nonce)` `recover_envelope` fabricates below —
         /// restore claims the slot from this and pushes the fifo entry from that,
         /// so a mismatch would silently test nothing.
         fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
@@ -1970,7 +1970,7 @@ mod tests {
             let seed = tx_rlp.first().copied().unwrap_or(0);
             Some((Address::from([seed; 20]), u64::from(seed)))
         }
-        async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+        async fn recover_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
             self.add_calls.lock().unwrap().push(tx_rlp.clone());
             if self.reject_add {
                 return Err(RestoreSkip::Rejected("rejected by stub".into()));
@@ -2184,9 +2184,9 @@ mod tests {
     #[tokio::test]
     async fn restore_pushes_fifo_when_pool_already_contains() {
         // Regression guard for J5: pre-fix, when pool.contains returned
-        // true, restore's inner branch called `add_envelope` and treated
+        // true, restore's inner branch called `recover_envelope` and treated
         // the resulting `Err(AlreadyImported)` as `continue;` — the
-        // fifo push was skipped. Post-fix, `add_envelope`'s trait
+        // fifo push was skipped. Post-fix, `recover_envelope`'s trait
         // contract treats AlreadyImported as `Ok(recovered)` and
         // restore unconditionally pushes to the fifo.
         let (_dir, j) = fresh_journal().await;
@@ -2205,7 +2205,7 @@ mod tests {
 
     /// **The ordering invariant of C4.** Every entry must already carry
     /// promised **before the first one is offered to the pool**, not
-    /// merely before its own admission. Asserted from inside `add_envelope`, i.e.
+    /// merely before its own admission. Asserted from inside `recover_envelope`, i.e.
     /// at exactly the moment the real validator would run. See the pre-pass in
     /// `restore_preconf_state` for why the stronger form is the one that matters.
     #[tokio::test]
@@ -2223,7 +2223,10 @@ mod tests {
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((Address::from([seed; 20]), u64::from(seed)))
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            async fn recover_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
                 use alloy_consensus::{Signed, TxLegacy};
                 use alloy_primitives::Signature;
 
@@ -2277,7 +2280,7 @@ mod tests {
     /// its `(sender, nonce)` before the first entry is offered to the pool.
     ///
     /// Without the pre-pass claiming it, the nonce would read as *free* from
-    /// restore until `add_envelope` drives that entry through the validator. A
+    /// restore until `recover_envelope` drives that entry through the validator. A
     /// same-nonce transaction admitted in that interval takes the slot, and the
     /// commitment loses a nonce its client was already told it had. Nothing can
     /// admit in that interval as the node is wired today (`cli::node` runs
@@ -2304,7 +2307,10 @@ mod tests {
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((Address::from([seed; 20]), u64::from(seed)))
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            async fn recover_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
                 use alloy_consensus::{Signed, TxLegacy};
                 use alloy_primitives::Signature;
 
@@ -2433,7 +2439,10 @@ mod tests {
             fn recover_slot(&self, _tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 Some((SHARED_SENDER, SHARED_NONCE))
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            async fn recover_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
                 use alloy_consensus::{Signed, TxLegacy};
                 use alloy_primitives::Signature;
                 let byte = tx_rlp.first().copied().unwrap_or(0);
@@ -2484,7 +2493,7 @@ mod tests {
             let seed = tx_rlp.first().copied().unwrap_or(0);
             Some((Address::from([seed; 20]), u64::from(seed)))
         }
-        async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+        async fn recover_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
             use alloy_consensus::{Signed, TxLegacy};
             use alloy_primitives::Signature;
             let seed = tx_rlp.first().copied().unwrap_or(0);
@@ -2632,7 +2641,7 @@ mod tests {
         let c = empty_classifier();
         restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
 
-        // Both entries' add_envelope calls return Err — the function
+        // Both entries' recover_envelope calls return Err — the function
         // does not panic and walks all entries.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2);
         assert!(fifo.snapshot().await.is_empty());

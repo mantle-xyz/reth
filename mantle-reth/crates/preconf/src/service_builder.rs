@@ -33,7 +33,6 @@ use std::sync::{Arc, OnceLock};
 
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::NodePrimitives;
-use reth_transaction_pool::TransactionPool;
 
 use crate::{
     PreconfCanonHandler, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfRpcHandler,
@@ -214,32 +213,28 @@ impl PreconfServiceBuilder {
         Ok(())
     }
 
-    /// Construct a canonical-state handler bound to `provider` + `pool`.
-    /// The caller is responsible for spawning the returned handler's
+    /// Construct a canonical-state handler bound to `provider`. The caller is
+    /// responsible for spawning the returned handler's
     /// [`run`](PreconfCanonHandler::run) future on its task executor.
     ///
     /// The generic `N` matches `Pr::Primitives` — for OP-stack nodes
     /// this is `OpPrimitives`; the bound `N::SignedTx: Transaction +
-    /// TxHashRef` is satisfied automatically. `P` is the transaction
-    /// pool; the handler uses it to `remove_transactions` on hashes
-    /// evicted by `PreconfTxSet::clean_reclaimable`, so a Timeout / Canceled preconf
-    /// tx cannot land on chain after the client already saw `Timeout`.
+    /// TxHashRef` is satisfied automatically.
     ///
     /// `Pr` must also be a `BlockNumReader`: the handler publishes
     /// `last_block_number()` (the **persisted** tip) to the classifier each
     /// notification, which is the ruler the retention period is measured
     /// against — see `classifier::SEAL_DEPTH`.
-    pub fn canon_handler<Pr, P, N>(&self, provider: Pr, pool: P) -> PreconfCanonHandler<Pr, P, N>
+    pub fn canon_handler<Pr, N>(&self, provider: Pr) -> PreconfCanonHandler<Pr, N>
     where
         Pr: CanonStateSubscriptions<Primitives = N> + reth_storage_api::BlockNumReader + 'static,
-        P: TransactionPool + 'static,
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
         // The reverted branch puts commitments back in the queue, which holds
         // alloy envelopes — see `PreconfCanonHandler`.
         op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
     {
-        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.classifier.clone())
+        PreconfCanonHandler::new(provider, self.fifo.clone(), self.classifier.clone())
     }
 
     /// Hand admission over from the pool-building phase.
@@ -410,7 +405,7 @@ mod tests {
 
     /// Stub pool used to exercise `PreconfServiceBuilder::start` without
     /// standing up a real reth pool. `start`'s only interaction with the
-    /// pool is via [`RestoreSource::add_envelope`], which
+    /// pool is via [`RestoreSource::recover_envelope`], which
     /// [`restore_preconf_state`] calls once per journal entry. Since
     /// tests here use empty journals, the stub can panic if reached —
     /// the empty-journal branch never invokes it.
@@ -442,7 +437,7 @@ mod tests {
         ) -> Option<(alloy_primitives::Address, u64)> {
             unreachable!("empty journal → restore_preconf_state must not call the pool")
         }
-        async fn add_envelope(
+        async fn recover_envelope(
             &self,
             _tx_rlp: &alloy_primitives::Bytes,
         ) -> Result<crate::journal::RestoredEnvelope, crate::journal::RestoreSkip> {
@@ -476,7 +471,7 @@ mod tests {
         use alloy_consensus::{Signed, TxLegacy};
         use alloy_primitives::{B256, Bytes, Signature, TxHash};
 
-        // Recording pool — every add_envelope call fabricates a
+        // Recording pool — every recover_envelope call fabricates a
         // synthetic envelope so restore_preconf_state has something to
         // push into the fifo, and asserts what got called. `Clone`
         // required because `start()` clones the pool into the
@@ -489,11 +484,11 @@ mod tests {
         #[async_trait::async_trait]
         impl RestoreSource for RecordingPool {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(alloy_primitives::Address, u64)> {
-                // Same `(from, nonce)` `add_envelope` fabricates below.
+                // Same `(from, nonce)` `recover_envelope` fabricates below.
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((alloy_primitives::Address::from([seed; 20]), u64::from(seed)))
             }
-            async fn add_envelope(
+            async fn recover_envelope(
                 &self,
                 tx_rlp: &Bytes,
             ) -> Result<RestoredEnvelope, crate::journal::RestoreSkip> {
@@ -575,7 +570,10 @@ mod tests {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 Some((Address::from([0xB1; 20]), u64::from(tx_rlp[0])))
             }
-            async fn add_envelope(&self, _tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip> {
+            async fn recover_envelope(
+                &self,
+                _tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
                 Err(RestoreSkip::Rejected("stub refuses to admit".into()))
             }
         }

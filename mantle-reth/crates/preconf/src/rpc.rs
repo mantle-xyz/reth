@@ -16,18 +16,18 @@
 //!
 //! * **Race the deadline.** `select!` rather than `timeout`, so the receiver outlives the elapsed
 //!   branch. On elapse the per-entry apply lock is taken, which serialises with dispatch's point of
-//!   no return; once held, the entry's status is definitive and a receipt dispatch already sent can
-//!   still be picked up. Without that the client could be told `Timeout` for a transaction already
+//!   no return; once held, no completion is in flight, so a result dispatch already sent is in the
+//!   channel to pick up. Without that the client could be told `Timeout` for a transaction already
 //!   committed to the block being built.
 //! * **Record the commitment.** Every receipt is recorded, reverts included — a revert is an
 //!   outcome, not a failure to keep the promise.
 //!
-//! Two doors hold a replaying commitment open against this path. A resubmit of
-//! a hash that is mid-replay must not be able to destroy it by timing out: the
-//! entry's receipt went to an earlier process, and marking it `Timeout` here
-//! would make it replaceable and sweepable. Both are keyed on the entry's
-//! source rather than its status, because a replaying commitment sits in
-//! exactly the same `Waiting` state a fresh one does.
+//! Two doors hold a replaying commitment open against a resubmitting client,
+//! both keyed on the entry's source rather than its status — a replaying
+//! commitment sits in the same `Waiting` state a fresh one does.
+//! `PreconfTxSet::admit` refuses the resubmit outright; `time_out_unfinished`
+//! ends only that client's wait and leaves the entry queued. Its receipt went
+//! to an earlier process, so removing the entry would mean it never lands.
 
 use std::sync::Arc;
 
@@ -114,9 +114,8 @@ impl PreconfRpcHandler {
         }
     }
 
-    /// Process a single `eth_sendRawTransactionWithPreconf` submission.
-    ///
-    /// See module-level documentation for the step-by-step semantics.
+    /// Process a single `eth_sendRawTransactionWithPreconf` submission:
+    /// admit, then wait out the deadline.
     pub async fn handle_inner(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
         // Anchor the SLA clock to the moment the request landed, before any
         // decode or validator latency. `TxEntry` carries this instant as
@@ -139,21 +138,19 @@ impl PreconfRpcHandler {
             .admit(bytes, origin_instant, resp_tx)
             .await
             .map_err(|e| preconf_error_to_rpc(&e))?;
-        let AdmittedTx { hash, sender, nonce, .. } = admitted;
+        let AdmittedTx { hash, sender, nonce } = admitted;
 
-        // Step 5 — await receipt or deadline, with race-safe handling.
+        // Await receipt or deadline, with race-safe handling.
         //
         // We use `tokio::select!` (not `tokio::time::timeout`) so
         // `resp_rx` outlives the deadline. On the deadline branch, we
         // acquire the per-entry `apply_lock` which serializes with
-        // dispatch's "point of no return"; once we hold the lock, the
-        // entry's status is definitive (either `Success`/`Failed`
-        // because dispatch committed and sent the receipt into
-        // `resp_rx`, or `Waiting` because dispatch never ran the
-        // apply). The `try_recv()` on `resp_rx` then reliably picks
-        // up any receipt that dispatch sent — closing the SLA race
-        // where a client could previously see `Timeout` even though
-        // the tx had already been committed to the builder state.
+        // dispatch's "point of no return"; once we hold the lock, any
+        // completion has already answered the channel. The `try_recv()`
+        // on `resp_rx` then reliably picks up whatever dispatch sent —
+        // closing the SLA race where a client could previously see
+        // `Timeout` even though the tx had already been committed to
+        // the builder state.
         let preconf_timeout = self.cfg.preconf_timeout;
         let deadline = tokio::time::sleep(preconf_timeout);
         tokio::pin!(deadline);
@@ -188,9 +185,9 @@ impl PreconfRpcHandler {
                 }
             }
 
-            // Our responder is gone, so we no longer own the slot: `mark_canceled`
-            // / `cancel_responder` here could only ever hit the client holding it
-            // now. Log loudly — no healthy path drops one — and fail only ourselves.
+            // Our responder is gone, so we no longer own the slot: ending the
+            // commitment here could only ever hit the client holding it now.
+            // Log loudly — no healthy path drops one — and fail only ourselves.
             Some(Err(_recv_err)) => {
                 warn!(target: "mantle::preconf::rpc", ?hash, "responder dropped before send");
                 let err = PreconfError::Internal("responder dropped before send".to_string());
@@ -204,148 +201,105 @@ impl PreconfRpcHandler {
                 debug!(target: "mantle::preconf::rpc", ?hash, ?preconf_timeout, "preconf deadline elapsed; resolving race");
                 metrics::counter!("preconf.api.timeout_total").increment(1);
 
-                // Acquire the per-entry `apply_lock`. If dispatch is
-                // running `apply_fn`, this blocks until it finishes
-                // mark_* + send. If dispatch never started (no active
-                // build, or gates rejected), we get the lock
-                // immediately.
+                // Every completion holds this lock from its decision through
+                // the send, so holding it means none is in flight and **the
+                // channel is the answer**. The entry is read only in the one
+                // case where nothing was sent.
                 //
-                // A `None` from `lock_for_apply` means no fifo entry for
-                // this hash — it was swept between admission and here. Treat
-                // as a genuine timeout.
+                // `None` means no entry for this hash — still not a special
+                // case, since a removed entry has no completion in flight
+                // either.
                 let apply_guard = self.fifo.lock_for_apply(&hash).await;
 
-                // Under the (possibly-held) lock, read the definitive
-                // final state. The whole view is kept (not just `status`) because
-                // the `Waiting` arm below has to know the entry's `source` — see
-                // the retention note there.
-                let final_entry = self.fifo.find_by_hash(&hash).await;
-                let final_status = final_entry.as_ref().map(|e| e.status);
-
-                match final_status {
-                    // **Must precede the `Success | Failed` arm below.** A
-                    // `Replay`-source `Failed` is a commitment we could not
-                    // honour; an `Rpc`-source one is an ordinary apply
-                    // rejection. That arm assumes dispatch queued a message on
-                    // `resp_rx`, but the breach path deliberately sends
-                    // nothing, so falling into it would report a `Timeout` the
-                    // client retries forever.
-                    //
-                    // This is also the **only** channel through which a client
-                    // can learn its commitment was broken: a `Replay` entry's
-                    // responder was consumed when the receipt went out, and the
-                    // node exposes no status-query RPC.
-                    Some(PreconfStatus::Failed)
-                        if final_entry
-                            .as_ref()
-                            .is_some_and(|e| e.source == PreconfSource::Replay) =>
-                    {
-                        drop(apply_guard);
-                        let err = PreconfError::CommitmentBroken;
-                        self.fifo.cancel_responder(&hash, err.clone()).await;
-                        Err(preconf_error_to_rpc(&err))
+                let outcome = match resp_rx.try_recv() {
+                    // Every receipt is recorded, reverts included — see
+                    // `claim_commitment_slot`.
+                    Ok(Ok(receipt)) => {
+                        let event = PreconfTxEvent::from(receipt);
+                        self.claim_commitment_slot(&event, hash, &sender, nonce).await;
+                        Ok(event)
                     }
-                    Some(PreconfStatus::Success | PreconfStatus::Failed) => {
-                        // Apply committed to builder state between our
-                        // deadline firing and lock acquisition. The
-                        // receipt (or error) is already queued in
-                        // `resp_rx` (dispatch sent it before releasing
-                        // the apply_lock we now hold). Retrieve it
-                        // non-blockingly.
-                        drop(apply_guard);
-                        match resp_rx.try_recv() {
-                            Ok(Ok(receipt)) => {
-                                let event = PreconfTxEvent::from(receipt);
-                                self.claim_commitment_slot(&event, hash, &sender, nonce).await;
-                                Ok(event)
-                            }
-                            Ok(Err(err)) => Err(preconf_error_to_rpc(&err)),
-                            Err(oneshot::error::TryRecvError::Empty) => {
-                                // Status says terminal but resp_rx is
-                                // empty — indicates lock-discipline
-                                // regression in dispatch. Log and
-                                // fall through to Timeout.
-                                warn!(
-                                    target: "mantle::preconf::rpc",
-                                    ?hash, ?final_status,
-                                    "terminal status but resp_rx empty; falling back to Timeout"
-                                );
-                                Ok(build_timeout_event(hash, preconf_timeout))
-                            }
-                            Err(oneshot::error::TryRecvError::Closed) => {
-                                warn!(
-                                    target: "mantle::preconf::rpc",
-                                    ?hash,
-                                    "resp_rx closed by dispatch without send; falling back to Timeout"
-                                );
-                                Ok(build_timeout_event(hash, preconf_timeout))
-                            }
-                        }
-                    }
-                    Some(PreconfStatus::Waiting) | None => {
-                        // Apply never committed.
-                        //
-                        // Second retention door: do NOT time out an entry whose
-                        // receipt has already gone out. `Replay` means exactly
-                        // that (journal restore / reorg reinject / stale
-                        // in-flight replay — see `PreconfSource`), and
-                        // `mark_timeout` would make that commitment
-                        // replaceable by another hash, and sweepable.
-                        //
-                        // Reachable because admission accepts a same-hash
-                        // resubmit onto a live `Waiting` entry whose responder
-                        // was already taken, which is the normal shape of a
-                        // replaying commitment. This client's request does time
-                        // out — but the commitment keeps being retried.
-                        let is_replay =
-                            final_entry.as_ref().is_some_and(|e| e.source == PreconfSource::Replay);
-                        if is_replay {
-                            debug!(
-                                target: "mantle::preconf::rpc",
-                                ?hash,
-                                "deadline elapsed on a replaying commitment; leaving it Waiting to retry"
-                            );
+                    // A `Timeout` is the op-geth-aligned wire shape, never a
+                    // JSON-RPC error — same as the pre-deadline arm above.
+                    Ok(Err(err)) => {
+                        if matches!(err, PreconfError::Timeout { .. }) {
+                            Ok(build_timeout_event(hash, preconf_timeout))
                         } else {
-                            // Transition under the still-held lock (or without
-                            // any lock if the entry was absent — mark_timeout
-                            // returns `NotFound`, which is fine).
-                            //
-                            // Nothing to evict alongside it: the transaction
-                            // never entered the pool, so the queue is the only
-                            // place it can be. `NotFound` here means it was
-                            // already swept, which is the same end state.
-                            let _ = self.fifo.mark_timeout(&hash).await;
+                            Err(preconf_error_to_rpc(&err))
                         }
-                        drop(apply_guard);
-                        self.fifo
-                            .cancel_responder(
-                                &hash,
-                                PreconfError::Timeout {
-                                    timeout_ms: preconf_timeout.as_millis() as u64,
-                                },
-                            )
-                            .await;
-                        Ok(build_timeout_event(hash, preconf_timeout))
                     }
-                    Some(PreconfStatus::Timeout | PreconfStatus::Canceled) => {
-                        // Some other path beat us (e.g. dispatch's
-                        // deadline gate or block-gas-budget gate
-                        // ran mark_* concurrently). The tx is not on
-                        // chain; return Timeout to the client.
-                        drop(apply_guard);
-                        self.fifo
-                            .cancel_responder(
-                                &hash,
-                                PreconfError::Timeout {
-                                    timeout_ms: preconf_timeout.as_millis() as u64,
-                                },
-                            )
-                            .await;
-                        Ok(build_timeout_event(hash, preconf_timeout))
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        self.time_out_unfinished(&hash, preconf_timeout).await
                     }
-                }
+                    // The responder went without a result. That is the
+                    // completion protocol broken, and `Timeout` would be a
+                    // claim we cannot make — it means "this did not execute
+                    // through the preconf path", and we do not know that.
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        warn!(
+                            target: "mantle::preconf::rpc",
+                            ?hash,
+                            "responder closed without a result"
+                        );
+                        metrics::counter!("preconf.api.no_result_total").increment(1);
+                        Err(preconf_error_to_rpc(&PreconfError::Internal(
+                            "responder closed without a result".to_string(),
+                        )))
+                    }
+                };
+
+                // After the answer, never before: releasing the lock first is
+                // what lets another path observe a finished entry whose result
+                // has not gone out yet.
+                drop(apply_guard);
+                outcome
             }
         }
+    }
+
+    /// Nobody completed this commitment, so this client's wait ends here.
+    ///
+    /// Reached only with the entry's `apply_lock` held and an empty channel,
+    /// so no completion is in flight or has run. The two remaining shapes are
+    /// told apart by the entry — the one place in this path that reads it.
+    async fn time_out_unfinished(
+        &self,
+        hash: &alloy_primitives::TxHash,
+        preconf_timeout: std::time::Duration,
+    ) -> RpcResult<PreconfTxEvent> {
+        let entry = self.fifo.find_by_hash(hash).await;
+
+        // Applied, and no receipt reached us. `Timeout` would claim it never
+        // executed, which is the opposite of what the entry says.
+        if entry.as_ref().is_some_and(|e| e.status == PreconfStatus::Success) {
+            warn!(
+                target: "mantle::preconf::rpc",
+                ?hash,
+                "entry is applied but no receipt was sent"
+            );
+            metrics::counter!("preconf.api.no_result_total").increment(1);
+            return Err(preconf_error_to_rpc(&PreconfError::Internal(
+                "entry applied without a receipt".to_string(),
+            )));
+        }
+
+        let timed_out = PreconfError::Timeout { timeout_ms: preconf_timeout.as_millis() as u64 };
+
+        // A replaying commitment keeps its place: its receipt went out in an
+        // earlier process and it still has to land, so only this client's wait
+        // is over. Removing the entry would mean it never lands.
+        let replaying = entry.as_ref().is_some_and(|e| e.source == PreconfSource::Replay);
+
+        if replaying {
+            // The commitment outlives this client, so only the wait ends.
+            self.fifo.cancel_responder(hash, timed_out).await;
+        } else {
+            // `Err` means something ended it between the read above and now,
+            // and whatever did answered this client on the way out. Nothing
+            // left to do either way.
+            let _ = self.fifo.complete_failure(hash, timed_out).await;
+        }
+        Ok(build_timeout_event(*hash, preconf_timeout))
     }
 }
 
@@ -390,18 +344,16 @@ impl DynPreconfHandler for PreconfRpcHandler {
 /// success). Both cases mean the tx **is on chain** — the receipt would
 /// not exist otherwise.
 ///
-/// Note the semantic mismatch with fifo-layer `PreconfStatus::Failed`,
-/// which signals a builder pre-apply reject (nonce-too-low, block gas
-/// budget, ...) — tx **NOT on chain**. That state never reaches this
-/// conversion; it flows to the client through the `Ok(Ok(Err(err)))`
-/// arm's `PreconfError`, not the receipt path.
+/// Note the semantic mismatch with a commitment the builder refused
+/// pre-apply (nonce-too-low, block gas budget, ...) — tx **NOT on chain**.
+/// That never reaches this conversion: it ends the queue entry and flows to
+/// the client as a `PreconfError`, not through the receipt path.
 ///
 /// `Waiting` / `Timeout` are constructed directly by the RPC handler's
 /// other arms and never routed through this `From` impl. There is no
-/// wire `Canceled` variant — server pre-apply rejections (the block-gas-budget gate gas
-/// budget, admin action) are surfaced as wire `Failed` with the
-/// specific reason in `PreconfTxEvent::reason`; the underlying fifo
-/// `PreconfStatus::Canceled` is an internal-only distinction.
+/// wire `Canceled` variant — server pre-apply rejections (the block-gas-budget
+/// gate, admin action) are surfaced as wire `Failed` with the specific reason
+/// in `PreconfTxEvent::reason`.
 impl From<PreconfReceipt> for PreconfTxEvent {
     fn from(r: PreconfReceipt) -> Self {
         let status = if r.status { WireStatus::Success } else { WireStatus::Failed };

@@ -38,12 +38,18 @@ const COUNTERS: &[&str] = &[
     "flashblock.slow_subscriber_dropped_total",
     "flashblock.superseded_slices_total",
     "preconf.api.timeout_total",
+    // The completion protocol was broken: an entry finished without a result
+    // reaching its client. Should stay flat at zero.
+    "preconf.api.no_result_total",
     "preconf.tx.success_total",
     "preconf.tx.failure_total",
     "preconf.tx.fatal_total",
     "preconf.build.panic_total",
     "preconf.build.watchdog_cancel_total",
     "preconf.fifo.da_rejected_total",
+    // An entry left the queue with a client still waiting on it — the
+    // completion protocol was bypassed. Should stay flat at zero.
+    "preconf.fifo.responder_dropped_total",
     "preconf.fifo.replay_deferred_total",
     "preconf.dispatch.deadline_skipped_total",
     "preconf.dispatch.gas_budget_skipped_total",

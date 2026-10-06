@@ -37,8 +37,8 @@ use reth_revm::context::{
 pub enum ApplyError {
     /// The transaction itself is invalid — `Validation(InvalidTx)` from the
     /// executor (bad signature / nonce / balance / etc.). Builder state is
-    /// left unchanged. The caller rejects **just this commitment**
-    /// (`mark_failed` + pool eviction + client error) and keeps building.
+    /// left unchanged. The caller ends **just this commitment**
+    /// (`complete_failure`) and keeps building.
     Rejected(BuilderRejected),
     /// A fatal, non-tx-specific execution error — anything that is **not**
     /// `Validation(InvalidTx)` (DB / header / fatal precompile, or the

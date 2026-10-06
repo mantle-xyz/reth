@@ -6,14 +6,12 @@
 //!
 //! - **Dedup**: a hash already committed in this build is short-circuited before any fifo / EVM
 //!   work, so it cannot enter the same block twice.
-//! - **Status gate**: only `Waiting` entries proceed; terminal entries are skipped. A same-hash
-//!   resubmit revives a reclaimable entry and is judged afresh.
+//! - **Status gate**: only `Waiting` entries proceed; an entry already applied is skipped.
 //! - **Pre-apply deadline**: when `entry.inserted_at.elapsed() + safety_margin >= preconf_timeout`,
-//!   the tx is *not* applied; the fifo entry is flipped to `Timeout` and the responder is cancelled
-//!   directly here. This closes the race where the RPC client has already given up but the builder
-//!   is about to commit a receipt.
-//! - **Responder ownership**: every terminal path (success, deadline skip, status-already-terminal)
-//!   calls exactly one of `take_responder` / `cancel_responder`, never both.
+//!   the tx is *not* applied; the commitment ends here and the client is told. This closes the race
+//!   where the RPC client has already given up but the builder is about to commit a receipt.
+//! - **Responder ownership**: every path that ends a commitment answers its client exactly once —
+//!   `complete_failure` or the `SuccessTicket`, never both.
 //!
 //! ## Apply-fn injection
 //!
@@ -79,7 +77,7 @@ pub(super) enum BlockKind {
     /// `Waiting` and retried next slot.
     Defer,
     /// Predecessor was permanently rejected → successor can never land either
-    /// (permanent nonce gap) → `mark_canceled` (server pre-apply rejection).
+    /// (permanent nonce gap), so its commitment ends too.
     Reject,
 }
 
@@ -169,9 +167,13 @@ impl LoopState {
     }
 }
 
-/// Handle one preconf hash end-to-end: dedup → fetch → status gate → pre-apply
-/// deadline → gas budget → caller-supplied apply → fifo mark + responder send.
-/// Enforces the four invariants listed in the module docs.
+/// Handle one preconf hash end-to-end: dedup → fetch → status gate → take the
+/// entry's `apply_lock` → pre-apply deadline → gas budget → re-check under the
+/// lock → caller-supplied apply → completion. Enforces the four invariants
+/// listed in the module docs.
+///
+/// The lock comes before the two gates because a gate that fires is itself a
+/// completion.
 ///
 /// `apply_fn` receives `(tx, hash, predicted_height)` and is invoked at most
 /// once per call — never once an earlier guard has fired. The bound is `FnMut`
@@ -197,8 +199,8 @@ where
     F: FnMut(Arc<TxEnvelope>, TxHash, u64) -> Result<PreconfReceipt, ApplyError>,
 {
     // A hash already applied into this block must not enter it twice. Rejections
-    // are not remembered here: they belong to the fifo entry, and a resubmit
-    // that revives the entry is a new attempt.
+    // are not remembered here: a rejection ends its entry, so a resubmit of the
+    // same hash arrives as a new entry and is judged afresh.
     if loop_state.is_committed(&hash) {
         trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; already committed");
         return Ok(());
@@ -250,6 +252,19 @@ where
             .record(elapsed_at_gate.as_millis() as f64);
     }
 
+    // ── Point of no return begins here ────────────────────────────────
+    //
+    // Acquire the per-entry `apply_lock` before anything that can **end** this
+    // commitment — the two gates below, not just `apply_fn`. Held from here
+    // through the send, so `rpc`'s deadline branch can never observe a finished
+    // commitment whose answer is still in flight, which is what holds
+    // "wire Timeout ⇒ tx not committed to builder state".
+    let Some(_apply_guard) = fifo.lock_for_apply(&hash).await else {
+        // Entry vanished between the reads above and this acquisition.
+        trace!(target: "mantle::preconf::dispatch", ?hash, "entry vanished before apply_lock");
+        return Ok(());
+    };
+
     if is_rpc && elapsed_at_gate + margin >= cfg.preconf_timeout {
         debug!(
             target: "mantle::preconf::dispatch",
@@ -258,9 +273,8 @@ where
             "pre-apply deadline passed; aborting"
         );
         metrics::counter!("preconf.dispatch.deadline_skipped_total").increment(1);
-        let _ = fifo.mark_timeout(&hash).await;
         let reason = PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
-        fifo.cancel_responder(&hash, reason).await;
+        let _ = fifo.complete_failure(&hash, reason).await;
         return Ok(());
     }
 
@@ -270,10 +284,6 @@ where
     // (worst case) ensures the reservation stays sound even if the
     // closure ends up spending less than the tx claimed. Uses `>` so
     // exact-boundary hits (`used + limit == max`) are accepted.
-    //
-    // fifo state is `Canceled` (server pre-apply rejection, tx not on
-    // chain) — semantically distinct from `Failed` (EVM apply ran and
-    // reverted, tx on chain).
     let tx_gas_limit = alloy_consensus::Transaction::gas_limit(entry.tx.as_ref());
     if is_rpc &&
         loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
@@ -287,34 +297,19 @@ where
             "block gas budget exhausted; aborting apply"
         );
         metrics::counter!("preconf.dispatch.gas_budget_skipped_total").increment(1);
-        let _ = fifo.mark_canceled(&hash).await;
         let reason = PreconfError::BlockGasBudgetExceeded {
             max: cfg.preconf_max_gas_per_block,
             used: loop_state.preconf_gas_used,
             limit: tx_gas_limit,
         };
-        fifo.cancel_responder(&hash, reason).await;
+        let _ = fifo.complete_failure(&hash, reason).await;
         return Ok(());
     }
 
-    // ── Point of no return begins here ────────────────────────────────
-    //
-    // Acquire the per-entry `apply_lock` before running `apply_fn`.
-    // Held through the entire commit path (`apply_fn` + mark_* + send)
-    // so the RPC deadline branch in `rpc::handle_inner` cannot mark
-    // this entry `Timeout` while its receipt is on its way to the
-    // client. Guarantees "wire Timeout ⇒ tx not committed to builder
-    // state".
-    let Some(_apply_guard) = fifo.lock_for_apply(&hash).await else {
-        // Entry vanished between the gate reads above and this acquisition.
-        trace!(target: "mantle::preconf::dispatch", ?hash, "entry vanished before apply_lock");
-        return Ok(());
-    };
-
-    // Re-check under the lock. The RPC deadline branch may have already
-    // transitioned the entry to `Timeout` in the window between our earlier
-    // gate reads and this acquisition; running `apply_fn` now would violate the
-    // invariant "committed to builder state ⇒ wire not Timeout".
+    // Re-check under the lock. The RPC deadline branch may have already ended
+    // the commitment in the window between our earlier gate reads and this
+    // acquisition; running `apply_fn` now would violate the invariant
+    // "committed to builder state ⇒ wire not Timeout".
     //
     // **Absent counts as changed.** `lock_for_apply` clones the lock's handle
     // under `inner` and then awaits outside it — it has to, or waiters would
@@ -352,16 +347,23 @@ where
             loop_state.record_committed(hash);
             loop_state.preconf_gas_used =
                 loop_state.preconf_gas_used.saturating_add(receipt.gas_used);
-            if let Err(e) = fifo.mark_succeeded(&hash).await {
-                // Lost a race with `clean_reclaimable` / cancel — entry already
-                // gone or in a non-Waiting state. Log and continue; the
-                // responder still gets the receipt if it exists.
-                trace!(
-                    target: "mantle::preconf::dispatch",
-                    ?hash, ?e,
-                    "mark_succeeded lost race"
-                );
-            }
+            // Transition and responder together, before the journal write:
+            // that write is an `await`, and a responder left in the entry
+            // across it can be taken by a concurrent removal.
+            let ticket = match fifo.begin_success(&hash).await {
+                Ok(ticket) => ticket,
+                Err(e) => {
+                    // Lost a race — entry already gone or in a non-Waiting
+                    // state. Log and continue: the transaction is in the block
+                    // either way, and there is no responder left to answer.
+                    trace!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?e,
+                        "begin_success lost race"
+                    );
+                    None
+                }
+            };
             // Persist before the receipt goes anywhere. The commitment is made
             // by the transaction landing, not by a client hearing about it:
             // a replayed entry has no responder at all, and a client
@@ -386,13 +388,13 @@ where
                     );
                 }
             }
-            if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Ok(receipt));
+            // The journal has it; the client may now have it too.
+            if let Some(ticket) = ticket {
+                ticket.send(receipt);
             }
         }
-        // Per-tx rejection of an entry the client is still waiting on.
-        // Mark it `Failed` (revivable via same-hash resubmit), evict it from
-        // the pool, hand the client the concrete error, and keep building.
+        // Per-tx rejection of an entry the client is still waiting on. End the
+        // commitment, hand the client the concrete error, and keep building.
         //
         // Guarded on `is_rpc`: an already-acknowledged commitment must not take
         // this path — see the `Rejected` arm below.
@@ -400,27 +402,24 @@ where
             warn!(
                 target: "mantle::preconf::dispatch",
                 ?hash, ?rejected,
-                "preconf apply rejected tx; marking entry as Failed"
+                "preconf apply rejected tx; ending the commitment"
             );
             metrics::counter!("preconf.tx.failure_total").increment(1);
             count_rejection(&rejected);
             let err = PreconfError::from(rejected);
-            if let Err(e) = fifo.mark_failed(&hash).await {
+            if let Err(e) = fifo.complete_failure(&hash, err).await {
                 trace!(
                     target: "mantle::preconf::dispatch",
                     ?hash, ?e,
-                    "mark_failed lost race"
+                    "completion lost race"
                 );
-            }
-            if let Some(resp) = fifo.take_responder(&hash).await {
-                let _ = resp.send(Err(err));
             }
         }
         // Fatal, non-tx-specific execution error (DB / header / fatal
         // precompile). The execution environment is untrustworthy, so we
         // abort the whole build — same policy as the pool arm
-        // (`payload_builder::apply_one_best_tx`). Crucially we do NOT
-        // `mark_failed` / evict / respond: the entry stays `Waiting` and
+        // (`payload_builder::apply_one_best_tx`). Crucially we do NOT end the
+        // commitment: the entry stays `Waiting` and
         // its responder stays attached so the still-valid commitment is
         // retried on the next build cycle instead of being silently
         // dropped while a possibly-corrupt block gets sealed.
@@ -442,14 +441,13 @@ where
         // No retry: every transient cause is already filtered out before apply,
         // so a second attempt would only re-derive the same answer. Transient
         // capacity becomes `Defer` (unbounded, not a retry budget), and a
-        // successor of a blocked predecessor is deferred or canceled — both in
+        // a successor of a blocked predecessor is deferred or ended — both in
         // `payload_builder::admit_and_dispatch`, neither reaching apply; `Fatal`
         // returns above. What is left is permanent: a nonce or balance that
         // moved since the tx last applied cleanly, an envelope this pipeline
         // cannot convert, or a predecessor a crash lost for good (the pool is
-        // in-memory; only preconf txs are journaled). So this is terminal on the
-        // first failure, and an ordinary `Failed` releasing the
-        // `(sender, nonce)` — see [`crate::types::PreconfStatus`].
+        // in-memory; only preconf txs are journaled). So the commitment ends on
+        // the first failure, which is what releases the `(sender, nonce)`.
         Err(ApplyError::Rejected(rejected)) => {
             // This line and the counter below are the only trace a breach
             // leaves: the responder went with the receipt, and the node exposes
@@ -461,16 +459,16 @@ where
             );
             metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
             count_rejection(&rejected);
-            if let Err(e) = fifo.mark_failed(&hash).await {
+            // A `Replay` entry has no responder (admission refuses to attach
+            // one), so this removes it with nobody to answer — the log and
+            // counter above are the only trace.
+            if let Err(e) = fifo.complete_failure(&hash, PreconfError::CommitmentBroken).await {
                 trace!(
                     target: "mantle::preconf::dispatch",
                     ?hash, ?e,
-                    "mark_failed lost race"
+                    "completion lost race"
                 );
             }
-            // Deliberately no `take_responder` / `send(Err)`: a `Replay` entry
-            // normally has none, and a client that did resubmit this hash learns
-            // the outcome from `rpc.rs`'s deadline path.
         }
     }
     Ok(())
@@ -550,9 +548,12 @@ mod tests {
     /// told had timed out, committed into the block anyway, which is exactly
     /// the invariant the lock exists to hold.
     ///
-    /// Driven through `forward_all` rather than the reclaimable sweep because
-    /// the sweep declines while the lock is held; `forward_all` does not, which
-    /// is what keeps this window open.
+    /// Driven through `complete_failure`, which `payload_builder`'s
+    /// pre-dispatch refusals — allowlist revoked, DA / block-gas capacity, a
+    /// permanently rejected predecessor — call without taking the entry's
+    /// `apply_lock`. That is what keeps this window open. (`forward_all` used
+    /// to be the driver here; it now claims the lock before removing, because
+    /// it is the one remover with no status CAS to stand in for one.)
     #[tokio::test]
     async fn an_entry_removed_while_dispatch_waited_for_the_lock_is_not_applied() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -591,9 +592,12 @@ mod tests {
         // Long enough to clear the gates and block on the lock.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // The sender's nonce moved past this entry — a different transaction
-        // took it — so the queue drops it. Nothing here waits for dispatch.
-        fifo.forward_all(&HashMap::from([(Address::ZERO, 1u64)])).await;
+        // A pre-dispatch refusal from another in-flight build ends the
+        // commitment. It takes no `apply_lock`, so nothing here waits for
+        // dispatch.
+        fifo.complete_failure(&hash, PreconfError::NotPreconfEligible)
+            .await
+            .expect("a Waiting entry may be ended");
         assert!(!fifo.contains(&hash).await, "the premise: the entry is gone");
 
         drop(guard);
@@ -603,6 +607,63 @@ mod tests {
             !applied.load(Ordering::SeqCst),
             "the entry was gone by the time the lock was acquired; applying the pre-gate \
              snapshot puts a transaction in the block that nothing is tracking",
+        );
+    }
+
+    /// The pre-apply gates are completions, so they must hold the entry's
+    /// `apply_lock` from the decision through the send. Without it `rpc`'s
+    /// deadline branch can take the lock mid-gate, find nothing in the channel,
+    /// and conclude nothing happened.
+    ///
+    /// Driven through the deadline gate because it fires without a build:
+    /// `inserted_at` is already past `preconf_timeout` when the entry is
+    /// pushed.
+    #[tokio::test]
+    async fn the_deadline_gate_waits_for_the_apply_lock_before_ending_the_entry() {
+        let fifo = Arc::new(PreconfTxSet::new(8));
+        // Zero timeout: `elapsed_at_gate + margin >= preconf_timeout` holds the
+        // moment the entry exists, so the gate fires without a build running.
+        let cfg = PreconfConfig { preconf_timeout: Duration::ZERO, ..Default::default() };
+        let tx = make_tx(0x6a);
+        let hash = *tx.tx_hash();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+
+        // Stands in for `rpc`'s deadline branch, which holds this lock while it
+        // decides what to tell the client.
+        let guard = fifo.lock_for_apply(&hash).await.expect("entry present");
+
+        let dispatch_fifo = fifo.clone();
+        let task = tokio::spawn(async move {
+            let mut state = LoopState::new(1);
+            apply_one_preconf(&dispatch_fifo, &cfg, None, hash, &mut state, synthetic_ok).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.expect("still queued").status,
+            PreconfStatus::Waiting,
+            "the gate must not end the entry while someone else holds the apply lock",
+        );
+        assert!(
+            matches!(resp_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "and must not have answered the client either",
+        );
+
+        drop(guard);
+        task.await.expect("join").expect("a deadline skip is not a fatal error");
+
+        assert!(
+            !fifo.contains(&hash).await,
+            "once the lock is free the gate ends the commitment, and ending removes it",
+        );
+        assert!(
+            matches!(resp_rx.try_recv(), Ok(Err(PreconfError::Timeout { .. }))),
+            "and the client is told why",
         );
     }
 
@@ -623,7 +684,7 @@ mod tests {
     }
 
     /// Test apply closure that reports a per-tx REJECTION — exercises the
-    /// `ApplyError::Rejected` → `mark_failed` + `take_responder(Err)` branch.
+    /// `ApplyError::Rejected` → `complete_failure` branch.
     fn synthetic_err(_: Arc<TxEnvelope>, _: TxHash, _: u64) -> Result<PreconfReceipt, ApplyError> {
         Err(ApplyError::Rejected(BuilderRejected::Other("synthetic error for test".into())))
     }
@@ -650,10 +711,10 @@ mod tests {
     /// Persisting a commitment hangs off the transaction landing, not off a
     /// client being there to hear about it.
     ///
-    /// `take_responder` returns `None` for replayed entries, and `resp.send`
-    /// fails for a client that already gave up — in both cases
-    /// the transaction is still in the block, and with slicing it has been
-    /// broadcast. Journaling from the receipt path missed exactly those.
+    /// `begin_success` hands back no ticket for a replayed entry, and the send
+    /// fails for a client that already gave up — in both cases the transaction
+    /// is still in the block, and with slicing it has been broadcast.
+    /// Journaling from the receipt path missed exactly those.
     #[tokio::test]
     async fn an_applied_commitment_is_journaled_even_with_no_responder_attached() {
         let fifo = PreconfTxSet::new(8);
@@ -802,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deadline_skip_marks_timeout_and_cancels_responder() {
+    async fn the_deadline_gate_ends_an_rpc_commitment_and_answers_its_client() {
         // Configure a 50ms preconf_timeout so the deadline check fires
         // deterministically after a short sleep.
         let cfg = PreconfConfig {
@@ -841,18 +902,17 @@ mod tests {
         // The transaction was not committed.
         assert_eq!(state.committed_len(), 0);
 
-        // Fifo entry is now Timeout.
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Timeout);
+        // The commitment is over, so the entry is gone with it.
+        assert!(!fifo.contains(&hash).await);
     }
 
-    /// Same-slot client resubmit after a Timeout: the deadline gate fires, the
-    /// client resubmits (refreshing `inserted_at`), and the second dispatch
-    /// judges the revived entry afresh and applies successfully.
+    /// Same-slot client resubmit after a timeout: the deadline gate ends the
+    /// commitment, the resubmit arrives as a new entry with a fresh
+    /// `inserted_at`, and the second dispatch applies it.
     ///
-    /// Locks the "Timeout is not a stable exclusion" invariant — a regression
-    /// that forwarded the stored Timeout via `cancel_responder` would deny
-    /// service to a legitimately re-eligible tx.
+    /// Locks "a timeout is not a stable exclusion" — letting the first
+    /// attempt's verdict reach the second submission would deny service to a
+    /// re-eligible tx.
     #[tokio::test]
     async fn dedup_timeout_re_evaluates_gate_on_fresh_inserted_at() {
         use std::time::Instant;
@@ -876,9 +936,10 @@ mod tests {
         // First dispatch: Timeout via deadline gate.
         let err = resp_rx1.await.expect("responder closed").expect_err("must be Timeout");
         assert!(matches!(err, PreconfError::Timeout { .. }));
-        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Timeout,);
+        assert!(!fifo.contains(&hash).await, "the timed-out commitment is over and gone");
 
-        // Step 2: client resubmit — refresh `inserted_at`, revive to Waiting.
+        // Step 2: the client resubmits. There is no entry left to revive, so
+        // this is a fresh admission with a fresh clock.
         let (resp_tx2, resp_rx2) = oneshot::channel();
         fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
         assert!(fifo.set_responder(hash, Instant::now(), resp_tx2).await);
@@ -913,11 +974,13 @@ mod tests {
         let mut state = LoopState::new(1);
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err).await.unwrap();
         assert!(matches!(first_rx.await.unwrap(), Err(PreconfError::BuilderRejected(_))));
-        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Failed);
+        assert!(!fifo.contains(&hash).await, "the rejected commitment is over and gone");
 
+        // Nothing is left to revive, so the resubmit is a new entry, judged
+        // afresh.
         assert!(matches!(
             fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
-            PushResult::Revived
+            PushResult::Inserted
         ));
         let (second_resp, second_rx) = oneshot::channel();
         assert!(fifo.set_responder(hash, Instant::now(), second_resp).await);
@@ -930,7 +993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_failure_marks_failed_and_sends_err_to_responder() {
+    async fn apply_failure_ends_the_commitment_and_sends_err_to_responder() {
         let fifo = PreconfTxSet::new(8);
         let cfg = PreconfConfig::default();
         let tx = make_tx(0x44);
@@ -950,12 +1013,9 @@ mod tests {
         // The transaction was not committed.
         assert_eq!(state.committed_len(), 0);
 
-        // Fifo entry transitioned to Failed (not Success). Both sources land
-        // there; only the reporting differs — see
-        // `a_broken_commitment_is_marked_failed_and_releases_its_slot`.
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Failed);
-        assert_eq!(entry.source, PreconfSource::Rpc);
+        // The entry is gone. Both sources end here; only the reporting differs
+        // — see `a_broken_commitment_ends_and_releases_its_slot`.
+        assert!(!fifo.contains(&hash).await, "a rejected commitment is over and gone");
     }
 
     // ===== An already-acknowledged commitment that cannot be applied: broken,
@@ -974,12 +1034,11 @@ mod tests {
         hash
     }
 
-    /// A commitment whose receipt already went out is marked `Failed` on the
-    /// first apply rejection, releasing its `(sender, nonce)`. See the breach
-    /// arm in `apply_one_preconf` for why there is no retry, and
-    /// [`crate::types::PreconfStatus`] for why the nonce must be released.
+    /// A commitment whose receipt already went out ends on the first apply
+    /// rejection, and ending it releases its `(sender, nonce)`. See the breach
+    /// arm in `apply_one_preconf` for why there is no retry.
     #[tokio::test]
-    async fn a_broken_commitment_is_marked_failed_and_releases_its_slot() {
+    async fn a_broken_commitment_ends_and_releases_its_slot() {
         let fifo = PreconfTxSet::new(8);
         let cfg = PreconfConfig::default();
         let hash = push_replayed(&fifo, make_tx(0x91)).await;
@@ -989,10 +1048,10 @@ mod tests {
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
 
-        let entry = fifo.find_by_hash(&hash).await.expect("entry survives until the sweep");
-        assert_eq!(entry.status, PreconfStatus::Failed, "terminal on the first failure");
-        assert!(entry.status.is_replaceable(), "and the nonce is released");
-        assert_eq!(entry.source, PreconfSource::Replay, "the source is what marks it a breach");
+        assert!(
+            !fifo.contains(&hash).await,
+            "terminal on the first failure, and ending it is what releases the nonce",
+        );
         assert_eq!(state.committed_len(), 0);
     }
 
@@ -1026,14 +1085,10 @@ mod tests {
             PreconfStatus::Waiting,
             "left Waiting, responder still attached, for the next build cycle",
         );
-        assert!(
-            entry.status.is_active(),
-            "a fatal environment error must leave the commitment live, not broken",
-        );
     }
 
-    /// A broken commitment must not be applied by later jobs — dispatch's
-    /// status gate treats it as terminal and reports the breach reason.
+    /// A broken commitment must not be applied by later jobs: ending it
+    /// removed it, so a later job finds no entry at all.
     #[tokio::test]
     async fn a_broken_commitment_is_not_applied_again() {
         use std::cell::Cell;
@@ -1046,7 +1101,7 @@ mod tests {
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_err)
             .await
             .expect("a per-tx rejection keeps the build going; no Fatal here");
-        assert_eq!(fifo.find_by_hash(&hash).await.unwrap().status, PreconfStatus::Failed);
+        assert!(!fifo.contains(&hash).await, "the breach ended the commitment");
 
         // A later job: the apply closure must not run at all.
         let calls = Cell::new(0u32);
@@ -1066,9 +1121,9 @@ mod tests {
     /// A FATAL apply error (DB / header / fatal precompile) must abort the
     /// whole build — `apply_one_preconf` returns `Err` — and, unlike the
     /// per-tx `Rejected` path, must leave the commitment intact for retry:
-    /// the fifo entry stays `Waiting` (NOT `Failed`, so it is never evicted
-    /// from the pool), nothing is recorded in loop state, and the responder
-    /// stays attached so the client keeps waiting for the next build cycle.
+    /// the fifo entry stays `Waiting`, nothing is recorded in loop state, and
+    /// the responder stays attached so the client keeps waiting for the next
+    /// build cycle.
     /// This is the asymmetry the fix removes: the pool arm already aborts
     /// on this class; the preconf arm used to silently drop the commitment.
     #[tokio::test]
@@ -1088,12 +1143,12 @@ mod tests {
         // 1. Propagates as a build-aborting error.
         assert!(out.is_err(), "fatal apply must abort the build (return Err)");
 
-        // 2. Entry left Waiting — NOT terminal, so never evicted from pool.
+        // 2. Entry left Waiting, so the next build retries it.
         let entry = fifo.find_by_hash(&hash).await.expect("entry must survive a fatal abort");
         assert_eq!(
             entry.status,
             PreconfStatus::Waiting,
-            "fatal must not mark the entry terminal — it stays revivable for retry"
+            "fatal must not end the commitment — it stays queued for retry"
         );
 
         // 3. The commitment is untouched.
@@ -1146,8 +1201,8 @@ mod tests {
     }
 
     /// Over budget: `used + tx.gas_limit > preconf_max_gas_per_block`
-    /// rejects with `BlockGasBudgetExceeded { max, used, limit }`,
-    /// flips fifo to `Failed`, records exclusion.
+    /// rejects with `BlockGasBudgetExceeded { max, used, limit }` and ends the
+    /// commitment.
     #[tokio::test]
     async fn apply_one_preconf_over_budget_rejects_with_typed_error() {
         let cfg = PreconfConfig {
@@ -1185,10 +1240,9 @@ mod tests {
         assert_eq!(state.committed_len(), 0);
         assert_eq!(state.preconf_gas_used(), 21_000);
 
-        // Fifo entry flipped to Canceled — server pre-apply rejected,
-        // no EVM state change, tx will NOT land on chain.
-        let entry = fifo.find_by_hash(&hash).await.unwrap();
-        assert_eq!(entry.status, PreconfStatus::Canceled);
+        // Server pre-apply rejection — no EVM state change, the tx will NOT
+        // land on chain, and the commitment is over, so nothing is left queued.
+        assert!(!fifo.contains(&hash).await);
     }
 
     /// Cumulative tracking: successful applies increment
@@ -1223,9 +1277,8 @@ mod tests {
         assert_eq!(state.committed_len(), 3);
     }
 
-    /// Gate ② — `fifo.find_by_hash` returns None (entry evicted between
-    /// broadcast and pickup, or a stale broadcast event surviving a
-    /// `clean_reclaimable` race). `apply_one_preconf` must:
+    /// Gate ② — `fifo.find_by_hash` returns None (the entry was removed
+    /// between broadcast and pickup). `apply_one_preconf` must:
     ///
     /// - NOT invoke `apply_fn`
     /// - NOT touch responders
@@ -1253,64 +1306,42 @@ mod tests {
         assert_eq!(state.preconf_gas_used(), 0);
     }
 
-    /// Gate ③ — `entry.status != Waiting`. Terminal / reclaimable
-    /// entries reach `apply_one_preconf` when a stale broadcast event fires
-    /// post-transition. They must not invoke `apply_fn` or touch responders.
-    ///
-    /// Run once per non-Waiting variant so any future state added to
-    /// `PreconfStatus` gets caught if it's not handled by the gate.
+    /// Gate ③ — `entry.status != Waiting`. A `Success` entry reaches
+    /// `apply_one_preconf` when a stale broadcast event fires after it has
+    /// already been applied. It must not invoke `apply_fn` or touch the
+    /// responder.
     #[tokio::test]
     async fn non_waiting_status_skips_apply_and_leaves_the_responder_alone() {
         use std::cell::Cell;
-        for pre_status in [
-            PreconfStatus::Success,
-            PreconfStatus::Failed,
-            PreconfStatus::Timeout,
-            PreconfStatus::Canceled,
-        ] {
-            let fifo = PreconfTxSet::new(8);
-            let cfg = PreconfConfig::default();
-            let tx = make_tx(0xee);
-            let hash = *tx.tx_hash();
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0xee);
+        let hash = *tx.tx_hash();
 
-            let (resp_tx, mut resp_rx) = oneshot::channel();
-            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
-            assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await;
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+        fifo.mark_succeeded(&hash).await.unwrap();
 
-            // Drive the entry into the target non-Waiting state.
-            match pre_status {
-                PreconfStatus::Success => fifo.mark_succeeded(&hash).await.unwrap(),
-                PreconfStatus::Failed => fifo.mark_failed(&hash).await.unwrap(),
-                PreconfStatus::Timeout => fifo.mark_timeout(&hash).await.unwrap(),
-                PreconfStatus::Canceled => fifo.mark_canceled(&hash).await.unwrap(),
-                _ => unreachable!(),
-            }
+        let mut state = LoopState::new(1);
+        let call_count = Cell::new(0u32);
+        let mut apply_fn = |tx, h, height| {
+            call_count.set(call_count.get() + 1);
+            synthetic_ok(tx, h, height)
+        };
 
-            let mut state = LoopState::new(1);
-            let call_count = Cell::new(0u32);
-            let mut apply_fn = |tx, h, height| {
-                call_count.set(call_count.get() + 1);
-                synthetic_ok(tx, h, height)
-            };
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, &mut apply_fn).await.unwrap();
 
-            apply_one_preconf(&fifo, &cfg, None, hash, &mut state, &mut apply_fn).await.unwrap();
+        assert_eq!(call_count.get(), 0, "apply_fn must not run for an applied entry");
+        assert_eq!(state.committed_len(), 0);
+        // Responder untouched — the first application owns it, and the dispatch
+        // loop must NOT double-send.
+        assert!(resp_rx.try_recv().is_err(), "responder must NOT be touched by dispatch");
 
-            assert_eq!(call_count.get(), 0, "apply_fn must not run when status={pre_status:?}",);
-            assert_eq!(state.committed_len(), 0);
-            // Responder untouched — the entry's terminal transition path
-            // (mark_succeeded/failed/timeout/canceled) is responsible for
-            // resolving the responder; the dispatch loop must NOT double-send.
-            assert!(
-                resp_rx.try_recv().is_err(),
-                "responder must NOT be touched by dispatch for status={pre_status:?}"
-            );
-
-            // Fifo entry still there, still in the pre-transitioned status
-            // (except Failed/Success which the test doesn't remove; forward
-            // cleanup handles that later).
-            let entry = fifo.find_by_hash(&hash).await.unwrap();
-            assert_eq!(entry.status, pre_status);
-        }
+        // Fifo entry still there, still Success: a successful commitment stays
+        // queued until the sender's nonce moves past it.
+        let entry = fifo.find_by_hash(&hash).await.unwrap();
+        assert_eq!(entry.status, PreconfStatus::Success);
     }
 
     // ── Source-differentiated gate tests (mantle preconf SLA: journal
@@ -1319,8 +1350,8 @@ mod tests {
     /// Journal-replayed entries bypass the pre-apply deadline gate.
     /// Even after the timeout has elapsed since insertion, `apply_fn`
     /// still fires and the tx transitions to Success — the RPC-source
-    /// counterpart under the same conditions goes to Timeout (see
-    /// `deadline_skip_marks_timeout_and_cancels_responder`).
+    /// counterpart under the same conditions is timed out (see
+    /// `the_deadline_gate_ends_an_rpc_commitment_and_answers_its_client`).
     #[tokio::test]
     async fn replay_source_bypasses_deadline_gate() {
         let cfg = PreconfConfig {
@@ -1404,8 +1435,7 @@ mod tests {
         assert_eq!(state.committed_len(), 1, "only the journal tx committed");
         let j_entry = fifo.find_by_hash(&j_hash).await.unwrap();
         assert_eq!(j_entry.status, PreconfStatus::Success);
-        let r_entry = fifo.find_by_hash(&r_hash).await.unwrap();
-        assert_eq!(r_entry.status, PreconfStatus::Canceled);
+        assert!(!fifo.contains(&r_hash).await, "the budget-rejected one is over and gone");
     }
 
     /// Race regression: an RPC-side timeout deadline fires **while**

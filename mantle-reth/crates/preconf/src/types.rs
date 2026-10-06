@@ -6,28 +6,23 @@ use serde::{Deserialize, Serialize};
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
 /// by `mantle-reth-rpc-ext`.
 ///
-/// State machine (transitions via `PreconfTxSet::mark_*` /
-/// `reset_success_to_waiting`). Every forward transition is a CAS on
-/// `status == Waiting`; from anything else it returns
-/// `MarkError::IllegalTransition(current)`.
+/// A queued entry is in exactly one of two states, and the only transition is
+/// `Waiting → Success` (a CAS on `status == Waiting`; from anything else
+/// `PreconfTxSet::mark_succeeded` returns `MarkError::IllegalTransition`).
+/// `reset_success_to_waiting` is the one move back.
 ///
 /// ```text
-///                     ┌──→ Success   (applied to an in-flight builder; EVM
-///                     │              revert / halt lands here too, carrying
-///                     │              `status = false`, matching op-geth)
-///                     ├──→ Failed    (builder rejected pre-execute, e.g.
-///                     │              nonce-too-low / gas-over-block-limit)
-/// [push] → Waiting ──┤
-///                     ├──→ Timeout   (the client's deadline elapsed)
-///                     └──→ Canceled  (server pre-apply reject: block gas
-///                                     budget, admin kick, etc.)
+/// [push] → Waiting ──→ Success   (applied to an in-flight builder; EVM
+///                                 revert / halt lands here too, carrying
+///                                 `status = false`, matching op-geth)
 /// ```
 ///
-/// Prefer [`Self::is_active`] / [`Self::is_replaceable`] /
-/// [`Self::is_revivable_by_same_hash`] over open-coding `matches!` over the
-/// terminal set; each documents what its answer permits.
+/// **There is no failure state.** A commitment that cannot be honoured is
+/// removed and its client told why, in one operation
+/// (`PreconfTxSet::complete_failure`). An entry's presence means it is live;
+/// the reason it ended lives in the `PreconfError` the client received.
 ///
-/// **`Success` is not strictly terminal**: an entry still in the fifo means
+/// **`Success` is not terminal either**: an entry still in the fifo means
 /// "applied to an in-flight builder whose block was never canon'd" — the
 /// `PayloadJob` prologue's canon-forward (`sync_fifo_forward_to_head` →
 /// `PreconfTxSet::forward`) drops it once the sender's nonce moves past. Stale
@@ -36,21 +31,10 @@ use serde::{Deserialize, Serialize};
 /// presence of the entry is the "in-flight, not canon" flag; no separate
 /// variant is needed.
 ///
-/// **"Not on chain" is maintained by the callers, not enforced here.** The
-/// transitions never consult the chain. What holds the property up is that
-/// every caller runs before `apply_fn` or on its `Err` path, and that the
-/// transaction is in no other container to be picked up from. In particular a
-/// tx that already returned a `Success`
-/// receipt can still reach `Failed`: the receipt is sent as soon as the apply
-/// commits to the *in-flight* builder, long before any block is canonical. That
-/// case is a broken commitment — see [`PreconfError::CommitmentBroken`].
-///
-/// **Fifo-layer `Failed` vs wire-layer `PreconfStatus::Failed`** — different
-/// things, and not connected by a direct mapping:
-/// - Fifo `Failed` = builder rejected pre-execute, tx not on chain (with the caveat above)
-/// - Wire `Failed` (`mantle-reth-rpc-ext::PreconfStatus`) = `receipt.status == false` (revert /
-///   halt), tx **is** on chain. Derived by the RPC handler from `PreconfReceipt.status`, not from
-///   this enum.
+/// **Not the wire-layer `Failed`** — `mantle-reth-rpc-ext::PreconfStatus` also
+/// has a `Failed`, meaning `receipt.status == false` (revert / halt), where the
+/// tx **is** on chain. The RPC handler derives it from `PreconfReceipt.status`,
+/// not from this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PreconfStatus {
     /// Awaiting builder apply.
@@ -59,48 +43,6 @@ pub enum PreconfStatus {
     /// Builder apply succeeded; receipt available.
     #[serde(rename = "success")]
     Success,
-    /// Reth builder rejected pre-execute (in-flight nonce/balance race, block
-    /// gas exhausted at builder level, or other
-    /// `BlockExecutionError::Validation`) — see the enum-level notes for how far
-    /// "not on chain" reaches, and for why this is not the wire-layer `Failed`.
-    #[serde(rename = "failed")]
-    Failed,
-    /// Server-side timeout — only Waiting can transition here (CAS).
-    #[serde(rename = "timeout")]
-    Timeout,
-    /// Server pre-apply rejection (block gas budget, admin action, ...) —
-    /// only Waiting can transition here (CAS). Recovered by a same-hash
-    /// resubmit, which `push_if_absent` revives back to `Waiting` (see
-    /// [`Self::is_revivable_by_same_hash`]).
-    #[serde(rename = "canceled")]
-    Canceled,
-}
-
-impl PreconfStatus {
-    /// Live: the entry is either awaiting apply or applied to an in-flight
-    /// builder. A **different** hash must not take its `(sender, nonce)`.
-    pub const fn is_active(self) -> bool {
-        matches!(self, Self::Waiting | Self::Success)
-    }
-
-    /// The entry may be displaced by a **different** hash on the same
-    /// `(sender, nonce)`, and may be swept by `clean_reclaimable`. All three
-    /// terminal "not on chain" states qualify, including a broken commitment
-    /// (which ends in `Failed` — see [`PreconfError::CommitmentBroken`]).
-    ///
-    /// Same body as [`Self::is_revivable_by_same_hash`], kept separate on
-    /// purpose: they answer different questions, and a future state that answers
-    /// them differently must not have to hunt down open-coded `matches!` sites.
-    pub const fn is_replaceable(self) -> bool {
-        matches!(self, Self::Timeout | Self::Canceled | Self::Failed)
-    }
-
-    /// A resubmit of the **same hash** may flip the entry back to `Waiting`.
-    /// Always safe — reviving the same hash cannot hand the nonce to anyone
-    /// else. See [`Self::is_replaceable`] on why the two are separate.
-    pub const fn is_revivable_by_same_hash(self) -> bool {
-        matches!(self, Self::Timeout | Self::Canceled | Self::Failed)
-    }
 }
 
 /// Origin of a preconf entry in the fifo. Determines which pre-apply
@@ -172,33 +114,28 @@ pub struct PreconfReceipt {
 pub enum PushResult {
     /// New entry created and broadcast notified.
     Inserted,
-    /// Same hash already present and [`PreconfStatus::is_active`]
-    /// (`Waiting` / `Success`) — idempotent no-op.
+    /// Same hash already present — idempotent no-op. Every entry in the queue
+    /// is live, so there is never one to reopen.
     AlreadyExists,
-    /// Same hash was in a status that [`PreconfStatus::is_revivable_by_same_hash`]
-    /// (`Timeout` / `Canceled` / `Failed`) and has been revived back to
-    /// `Waiting`. The resubmission's responder is installed on the entry and
-    /// the entry's insertion clock is refreshed to the fresh submission time — so dispatch's
-    /// deadline gate measures against the second submission, not the
-    /// (already-expired) first. See `push_if_absent` for why this is the only
-    /// path that reopens a same-hash resubmit.
-    Revived,
-    /// Different hash but same (sender, nonce) in a status that is **not**
-    /// [`PreconfStatus::is_replaceable`] — blocks the replacement attempt
-    /// (carrying the existing hash so callers can inspect / log it).
+    /// Different hash but same (sender, nonce), and the incumbent is still
+    /// live — blocks the replacement attempt (carrying the existing hash so
+    /// callers can inspect / log it).
     ConflictActive(TxHash),
 }
 
-/// Errors returned by `PreconfTxSet::mark_succeeded` / `mark_failed`
-/// / `mark_timeout` — all share the same `Waiting → target` CAS body.
+/// Errors returned by the `Waiting`-source transitions —
+/// `PreconfTxSet::mark_succeeded` / `complete_failure` — and by
+/// `reset_success_to_waiting`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarkError {
-    /// Entry no longer present — safe to ignore (terminal signal is best-effort).
+    /// Entry no longer present — safe to ignore: whatever ended the commitment
+    /// answered its client on the way out.
     #[error("entry not found")]
     NotFound,
-    /// Existing status cannot transition to the requested terminal.
-    /// Typical race: RPC handler timeout fires same instant builder commits.
-    /// Whichever loses gets this error; caller logs but does not panic.
+    /// The entry is not in the status this transition requires as its source.
+    /// Typical race: the RPC handler's deadline fires the same instant the
+    /// builder commits. Whichever loses gets this error; the caller logs but
+    /// does not panic.
     #[error("illegal transition from {0:?}")]
     IllegalTransition(PreconfStatus),
 }
@@ -298,9 +235,8 @@ pub enum PreconfError {
     ///
     /// Unlike [`Self::BlockGasBudgetExceeded`] (an operator-hardening
     /// budget bypassed by `Replay`-sourced entries), the DA limit is a
-    /// consensus constraint enforced for **all** sources. The tx stays
-    /// reclaimable — a same-hash resubmit in a later slot (with DA
-    /// headroom) is revived and applied.
+    /// consensus constraint enforced for **all** sources. The commitment ends
+    /// here; a resubmit in a later slot (with DA headroom) is a fresh one.
     #[error("preconf tx exceeds DA limit: tx DA {tx_da} bytes, {used} already used, limit {limit}")]
     DaLimitExceeded {
         /// DA bytes already committed to the in-flight block.
@@ -310,6 +246,19 @@ pub enum PreconfError {
         /// The DA bound that would be exceeded (per-tx / per-block bytes,
         /// or the post-Jovian footprint-gas bound, whichever fired).
         limit: u64,
+    },
+    /// The sender's nonce has moved past this transaction, so it can never be
+    /// applied.
+    ///
+    /// The queue drops an entry once the chain shows its sender at a higher
+    /// nonce. Not the same as "this transaction landed" — a *different*
+    /// transaction taking the nonce drops it just the same, and the queue
+    /// cannot tell which. Either way nothing is left to wait for, and saying so
+    /// beats a closed channel, which is indistinguishable from a bug.
+    #[error("sender nonce has advanced past {tx_nonce}; this transaction can no longer be applied")]
+    NonceSuperseded {
+        /// The nonce this transaction was signed for.
+        tx_nonce: u64,
     },
     /// The same hash is already in the queue with someone waiting on it.
     #[error("a preconf request is already in progress for this hash")]
@@ -454,13 +403,9 @@ mod tests {
     /// silently breaks SDKs — pin the exact strings here.
     #[test]
     fn preconf_status_serde_wire_format() {
-        for (status, expected) in [
-            (PreconfStatus::Waiting, "\"waiting\""),
-            (PreconfStatus::Success, "\"success\""),
-            (PreconfStatus::Failed, "\"failed\""),
-            (PreconfStatus::Timeout, "\"timeout\""),
-            (PreconfStatus::Canceled, "\"canceled\""),
-        ] {
+        for (status, expected) in
+            [(PreconfStatus::Waiting, "\"waiting\""), (PreconfStatus::Success, "\"success\"")]
+        {
             let s = serde_json::to_string(&status).unwrap();
             assert_eq!(s, expected, "wire format for {status:?} changed");
             let round: PreconfStatus = serde_json::from_str(&s).unwrap();
