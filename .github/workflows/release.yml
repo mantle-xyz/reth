@@ -2,7 +2,7 @@ name: release
 
 on:
   push:
-    tags: ["v*", "op-reth-v*", "mantle-v*"]
+    tags: ["v*", "mantle-v*"]
 
 env:
   CARGO_TERM_COLOR: always
