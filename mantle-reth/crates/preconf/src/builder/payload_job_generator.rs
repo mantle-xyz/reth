@@ -496,7 +496,7 @@ mod tests {
         let cancel = JobCancel::new();
         let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
         assert!(fired, "window elapsed with no cancel ⇒ watchdog fires");
-        assert!(cancel.is_cancelled(), "watchdog must signal cancel on fire");
+        assert!(cancel.reason().is_some(), "watchdog must signal cancel on fire");
     }
 
     #[tokio::test(start_paused = true)]

@@ -7,12 +7,13 @@
 //! release the in-flight EVM state, and stop polling the fifo / sweep
 //! sources.
 //!
-//! Implementation: a `watch::Sender<bool>` shared between the outer job
-//! (writer) and the builder loop (reader). `signal()` flips the flag to
-//! `true`; `is_cancelled()` is a fast non-async check the builder loop
-//! can call between iterations; `wait()` is the async path used inside
-//! `tokio::select!` so the loop wakes immediately on cancel instead of
-//! waiting for the next sweep tick.
+//! Implementation: a `watch::Sender<Option<CancelReason>>` shared between the
+//! outer job (writer) and the builder loop (reader). `resolve()` / `abandon()`
+//! record the reason; `wait()` is the async path used inside `tokio::select!`
+//! so the loop wakes immediately on cancel instead of waiting for the next
+//! sweep tick; `reason()` is the non-async read, for the loop's tail — which
+//! has to tell a resolved build from an abandoned one, so there is no
+//! bool-shaped "is it cancelled" question anywhere.
 //!
 //! The signal is **one-shot** — once flipped, callers expect the loop to
 //! exit shortly after. There is no "uncancel".
@@ -73,8 +74,8 @@ impl JobCancel {
         self.signal_with(CancelReason::Abandoned);
     }
 
-    /// Flip the cancel flag. Subsequent `is_cancelled()` calls return
-    /// `true`, and any task awaiting `wait()` is woken.
+    /// Record the reason the build stopped. [`Self::reason`] returns it from
+    /// here on, and any task awaiting `wait()` is woken.
     ///
     /// **The first reason is the one that sticks**, and a second call changes
     /// nothing. Both can fire for one job — `resolve_kind` asks for a payload
@@ -118,13 +119,8 @@ impl JobCancel {
         (*self.rx.borrow() != Some(CancelReason::Abandoned)).then(work)
     }
 
-    /// Fast non-async read of the cancel flag.
-    pub fn is_cancelled(&self) -> bool {
-        self.rx.borrow().is_some()
-    }
-
-    /// Async wait until the cancel flag flips to `true`. Returns
-    /// immediately if already cancelled.
+    /// Async wait until a reason is recorded. Returns immediately if the build
+    /// has already been stopped.
     ///
     /// Designed to be awaited inside `tokio::select!` alongside the
     /// builder loop's fifo / sweep / resolve branches.
@@ -246,25 +242,14 @@ mod tests {
         assert_eq!(c.reason(), Some(CancelReason::Abandoned));
     }
 
-    #[tokio::test]
-    async fn new_is_not_cancelled() {
-        let c = JobCancel::new();
-        assert!(!c.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn signal_flips_flag() {
-        let c = JobCancel::new();
-        c.abandon();
-        assert!(c.is_cancelled());
-    }
-
+    /// Distinct from `the_first_reason_is_the_one_that_sticks`, which is about
+    /// two *different* reasons racing: this is the same one arriving twice.
     #[tokio::test]
     async fn signal_is_idempotent() {
         let c = JobCancel::new();
         c.abandon();
         c.abandon();
-        assert!(c.is_cancelled());
+        assert_eq!(c.reason(), Some(CancelReason::Abandoned));
     }
 
     #[tokio::test]
@@ -293,7 +278,7 @@ mod tests {
         let a = JobCancel::new();
         let b = a.clone();
         a.abandon();
-        assert!(b.is_cancelled(), "clone should observe parent's signal");
+        assert_eq!(b.reason(), Some(CancelReason::Abandoned), "clone observes the parent's signal");
     }
 
     #[tokio::test]
@@ -301,6 +286,6 @@ mod tests {
         let a = JobCancel::new();
         let b = a.clone();
         b.abandon();
-        assert!(a.is_cancelled(), "parent should observe clone's signal");
+        assert_eq!(a.reason(), Some(CancelReason::Abandoned), "parent observes the clone's signal");
     }
 }
