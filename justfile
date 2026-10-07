@@ -1,7 +1,7 @@
 # Mantle op-reth Build System
 
 GIT_SHA := `git rev-parse HEAD`
-GIT_TAG := `git describe --tags --abbrev=0 2>/dev/null || echo "unknown"`
+GIT_TAG := `git describe --tags --exact-match --match 'mantle-v*' 2>/dev/null || echo "dev-$(git rev-parse --short=7 HEAD)"`
 BIN_DIR := "dist/bin"
 CARGO_TARGET_DIR := env("CARGO_TARGET_DIR", "target")
 
@@ -136,6 +136,7 @@ lint: fmt clippy
 # any flaky-passed test. Doctests stay on `cargo test` (nextest can't run them).
 test-ci:
   cargo test --workspace --lib
+  cargo test -p mantle-reth-cli --test build_version
   cargo nextest run -p mantle-reth-integration-tests --tests --retries 2
   cargo test --doc --workspace
 
