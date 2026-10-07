@@ -64,7 +64,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     PreconfClassifier, PreconfConfig, PreconfTxSet,
-    apply::{ApplyError, BuilderRejected, apply_preconf_tx},
+    apply::{ApplyError, BuilderRejected, TxFacts, apply_preconf_tx},
     builder::{
         ExecutionInfo,
         cancel::{CancelReason, JobCancel},
@@ -371,8 +371,8 @@ where
     // Conversion / ec-recover failures are per-tx faults (a malformed
     // envelope can never land) → `Rejected`, not `Fatal`.
     // Read off the envelope before it is consumed: the EVM's base-fee refusal
-    // does not carry the fee cap that tripped it — see `apply::FeeFacts`.
-    let tx_max_fee = alloy_consensus::Transaction::max_fee_per_gas(tx.as_ref());
+    // does not carry the fee cap that tripped it, and nothing downstream can
+    // recover the sender, nonce or type once the executor has taken it.
     let envelope = (*tx).clone();
     let signed: N::SignedTx = envelope.try_into().map_err(|_| {
         ApplyError::Rejected(BuilderRejected::Other(
@@ -382,7 +382,17 @@ where
     let recovered: Recovered<N::SignedTx> = signed.try_into_recovered().map_err(|_| {
         ApplyError::Rejected(BuilderRejected::Other("ec-recover failed for preconf tx".into()))
     })?;
-    let receipt = apply_preconf_tx(builder, recovered.clone(), hash, height, tx_max_fee)?;
+    let facts = TxFacts {
+        tx_type: recovered.ty(),
+        from: recovered.signer(),
+        to: crate::rpc::tx_kind_to_address(alloy_consensus::Transaction::kind(recovered.inner())),
+        nonce: alloy_consensus::Transaction::nonce(recovered.inner()),
+        max_fee_per_gas: alloy_consensus::Transaction::max_fee_per_gas(recovered.inner()),
+        max_priority_fee_per_gas: alloy_consensus::Transaction::max_priority_fee_per_gas(
+            recovered.inner(),
+        ),
+    };
+    let receipt = apply_preconf_tx(builder, recovered.clone(), hash, height, facts)?;
 
     Ok((receipt, recovered))
 }
@@ -405,6 +415,39 @@ struct BuildConstraints {
     base_fee: u64,
     /// Payload attributes timestamp (interop-deadline validation).
     timestamp: u64,
+}
+
+/// What computing a preconf transaction's L1 fee fields needs beyond what the
+/// build loop already carries.
+///
+/// `l1_block_info` is fetched once per block, so each transaction costs a
+/// `clear_tx_l1_cost` rather than a fresh set of storage reads. The token ratio
+/// is the exception — see `refresh_token_ratio`.
+struct L1FeeCtx<'a, ChainSpec> {
+    chain_spec: &'a ChainSpec,
+    l1_block_info: op_revm::L1BlockInfo,
+}
+
+impl<ChainSpec> L1FeeCtx<'_, ChainSpec> {
+    /// Re-read the gas oracle's token ratio into the cached L1 block info.
+    ///
+    /// Must run before the apply it feeds — see the call site in
+    /// `apply_preconf_with_da` for why. Covered end to end by
+    /// `preconf::full_receipt::l1_fee_uses_the_token_ratio_in_force_before_the_tx`.
+    fn refresh_token_ratio<B: BlockBuilder>(&mut self, builder: &mut B) -> Result<(), ApplyError> {
+        use reth_revm::Database as _;
+        let ratio = builder
+            .evm_mut()
+            .db_mut()
+            .storage(op_revm::constants::GAS_ORACLE_CONTRACT, op_revm::constants::TOKEN_RATIO_SLOT)
+            .map_err(|e| {
+                ApplyError::Fatal(PayloadBuilderError::other(BlockExecutionError::msg(format!(
+                    "reading token ratio for preconf L1 fee: {e:?}"
+                ))))
+            })?;
+        self.l1_block_info.token_ratio = ratio;
+        Ok(())
+    }
 }
 
 /// Estimate a preconf tx's data-availability footprint in bytes.
@@ -533,11 +576,12 @@ fn preconf_admission(
 /// (unchanged in the single-task window between admission and apply), and only
 /// dispatches on `Admit`. A gate here would be dead code.
 #[allow(clippy::too_many_arguments)]
-fn apply_preconf_with_da<N, B>(
+fn apply_preconf_with_da<N, B, ChainSpec>(
     builder: &mut B,
     info: &mut ExecutionInfo<N::SignedTx>,
     fifo: &PreconfTxSet,
     limits: BuildConstraints,
+    l1_ctx: &mut L1FeeCtx<'_, ChainSpec>,
     tx: Arc<TxEnvelope>,
     hash: TxHash,
     height: u64,
@@ -546,12 +590,40 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    ChainSpec: reth_optimism_forks::OpHardforks + reth_chainspec::EthChainSpec,
 {
     let tx_da = estimated_tx_da_size(&tx);
     // Miner tip is independent of gas used — capture it before `tx` is consumed
     // by apply, then fold `tip × gas_used` into the block value below.
     let miner_tip = tx.effective_tip_per_gas(limits.base_fee).unwrap_or_default();
-    let (receipt, recovered) = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
+
+    // The token ratio is read per transaction, not per block: a transaction
+    // earlier in this block may have emitted `TokenRatioUpdated`, and the
+    // figure that decides this transaction's L1 fee is the one in force before
+    // it runs. This mirrors what `eth_getTransactionReceipt` reports, which is
+    // what a client will reconcile against.
+    //
+    // Must happen before the apply, or this transaction's own update would
+    // contaminate its own fee.
+    l1_ctx.refresh_token_ratio(builder)?;
+    // `L1BlockInfo` caches the last transaction's L1 cost; without this the
+    // previous transaction's figure would be reported for this one.
+    l1_ctx.l1_block_info.clear_tx_l1_cost();
+
+    let (mut receipt, recovered) = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
+
+    receipt.block_timestamp = limits.timestamp;
+    receipt.l1_fields =
+        reth_optimism_rpc::eth::OpReceiptFieldsBuilder::new(limits.timestamp, height)
+            .l1_block_info(l1_ctx.chain_spec, recovered.inner(), &mut l1_ctx.l1_block_info)
+            .map_err(|e| ApplyError::Fatal(PayloadBuilderError::other(e)))?
+            // `opGasRefund` is left unset here: by the time this path sees
+            // the execution result it has already been canonicalized
+            // (the post-exec refund folded in), and the pre-refund figure
+            // lives on a concrete executor type the payload builder does
+            // not expose to this module.
+            .build();
+
     info.cumulative_da_bytes_used = info.cumulative_da_bytes_used.saturating_add(tx_da);
     info.cumulative_gas_used += receipt.gas_used;
     record_executed(info, fifo, recovered, false);
@@ -614,7 +686,7 @@ fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: Prec
 /// The `info` cumulative reads happen *before* the `&mut info` apply closure
 /// is constructed (the values are `u64` copies), so there is no borrow clash.
 #[allow(clippy::too_many_arguments)]
-async fn admit_and_dispatch<N, B>(
+async fn admit_and_dispatch<N, B, ChainSpec>(
     fifo: &PreconfTxSet,
     cfg: &PreconfConfig,
     journal: Option<&PreconfJournal>,
@@ -624,11 +696,13 @@ async fn admit_and_dispatch<N, B>(
     info: &mut ExecutionInfo<N::SignedTx>,
     limits: BuildConstraints,
     whitelist: &Whitelist,
+    l1_ctx: &mut L1FeeCtx<'_, ChainSpec>,
 ) -> Result<(), PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    ChainSpec: reth_optimism_forks::OpHardforks + reth_chainspec::EthChainSpec,
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
     let (source, sender, nonce) = (entry.source, entry.from, entry.nonce);
@@ -696,7 +770,7 @@ where
     match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source) {
         Admission::Admit => {
             let mut apply_fn = |tx, h, height| {
-                apply_preconf_with_da::<N, _>(builder, info, fifo, limits, tx, h, height)
+                apply_preconf_with_da::<N, _, _>(builder, info, fifo, limits, l1_ctx, tx, h, height)
             };
             // Propagate a fatal apply error to abort the whole build; a
             // per-tx rejection resolves inside `apply_one_preconf` and
@@ -1631,6 +1705,23 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let mut best_txs_iter = best_txs_iter_opt;
         let mut fifo_rx = self.fifo.subscribe();
         let predicted_height = ctx.parent().number() + 1;
+
+        // L1 fee parameters for this block. `try_fetch` is the same call the
+        // block executor makes for its own operator-fee charge, so both read
+        // the same L1Block contract state.
+        let mut l1_ctx = L1FeeCtx {
+            chain_spec: ctx.chain_spec.as_ref(),
+            l1_block_info: L1BlockInfo::try_fetch(
+                builder.evm_mut().db_mut(),
+                U256::from(predicted_height),
+                reth_optimism_evm::revm_spec_by_timestamp_after_bedrock(
+                    ctx.chain_spec.as_ref(),
+                    attrs_timestamp,
+                ),
+            )
+            .map_err(PayloadBuilderError::other)?,
+        };
+
         let mut loop_state = dispatch::LoopState::new(predicted_height);
 
         // Adaptive-N pool quota schedule — see `derive_pool_quota_schedule`.
@@ -1905,7 +1996,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             // queued fresh RPC pushes. `admit_and_dispatch` builds the apply
             // closure (which folds gas/DA into `info`) internally per hash.
             for hash in replay_fifo_carryover(&self.fifo).await {
-                admit_and_dispatch::<N, _>(
+                admit_and_dispatch::<N, _, _>(
                     &self.fifo,
                     &self.cfg,
                     self.journal.as_deref(),
@@ -1915,6 +2006,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     &mut info,
                     constraints,
                     &whitelist,
+                    &mut l1_ctx,
                 )
                 .await?;
             }
@@ -1976,11 +2068,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 recv = fifo_rx.recv() => {
                     match recv {
                         Ok(hash) => {
-                            admit_and_dispatch::<N, _>(
+                            admit_and_dispatch::<N, _, _>(
                                 &self.fifo, &self.cfg, self.journal.as_deref(), hash,
                                 &mut loop_state,
                                 &mut builder, &mut info, constraints,
                                 &whitelist,
+                                &mut l1_ctx,
                             )
                             .await?;
                         }
@@ -1995,11 +2088,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                 "fifo broadcast lagged; reconciling via snapshot"
                             );
                             for hash in self.fifo.snapshot().await {
-                                admit_and_dispatch::<N, _>(
+                                admit_and_dispatch::<N, _, _>(
                                     &self.fifo, &self.cfg, self.journal.as_deref(), hash,
                                 &mut loop_state,
                                     &mut builder, &mut info, constraints,
                                     &whitelist,
+                                    &mut l1_ctx,
                                 )
                                 .await?;
                             }

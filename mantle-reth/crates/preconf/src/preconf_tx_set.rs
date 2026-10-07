@@ -1910,7 +1910,7 @@ mod account_view_tests {
 mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559};
-    use alloy_primitives::{B256, Signature};
+    use alloy_primitives::{B256, Bloom, Signature};
 
     fn addr(byte: u8) -> Address {
         Address::from([byte; 20])
@@ -2162,6 +2162,17 @@ mod tests {
             gas_used: 21_000,
             reason: String::new(),
             revert_data: alloy_primitives::Bytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 21_000,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+            effective_gas_price: 0,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         });
         assert!(matches!(resp_rx.try_recv(), Ok(Ok(r)) if r.block_height == 7));
     }
@@ -2714,8 +2725,8 @@ mod proptest_model {
 
     fn model_mark(model: &mut Model, hb: u8, target: PreconfStatus) {
         // Only a `Waiting` entry moves; anything else is a no-op.
-        if let Some((_, _, st)) = model.get_mut(&hb) &&
-            *st == PreconfStatus::Waiting
+        if let Some((_, _, st)) = model.get_mut(&hb)
+            && *st == PreconfStatus::Waiting
         {
             *st = target;
         }
@@ -2857,7 +2868,7 @@ mod proptest_model {
 mod proptest_responder_model {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559};
-    use alloy_primitives::{B256, Bytes, Log, Signature};
+    use alloy_primitives::{B256, Bloom, Bytes, Log, Signature};
     use proptest::prelude::*;
     use tokio::sync::oneshot::error::TryRecvError;
 
@@ -2884,6 +2895,17 @@ mod proptest_responder_model {
             gas_used: 0,
             reason: String::new(),
             revert_data: Bytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 0,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+            effective_gas_price: 0,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         }
     }
     fn some_err() -> PreconfError {

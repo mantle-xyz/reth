@@ -20,7 +20,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{B256, Bytes, TxKind, U256};
+use alloy_primitives::{Address, B256, Bloom, Bytes, TxKind, U256};
 use alloy_rpc_types_eth::{
     TransactionRequest,
     state::{StateOverride, StateOverridesBuilder},
@@ -66,6 +66,15 @@ use tracing::debug;
 ///   promise, but against different state. `block_height`, `status` and `receipt.logs` are all
 ///   recomputed then, and the client is **not** sent a corrected event: the response to this call
 ///   has already been delivered.
+/// - The fields added to `receipt` are all **positions and figures from one particular build**.
+///   `transactionIndex`, `cumulativeGasUsed` and each log's `logIndex` say where this transaction
+///   sat in the block that was being built; a replay puts it somewhere else, and no corrected event
+///   is sent. `gasUsed`, `logsBloom`, `status`, `effectiveGasPrice` and the L1 fee fields are all
+///   recomputed on replay too.
+/// - `blockHash` is absent and always will be: the block is not sealed when this event is produced,
+///   so its header does not exist yet.
+/// - Fields being absent altogether means the sequencer did not send them — an op-geth sequencer
+///   sends only `logs`.
 ///
 /// Consequently, **do not reconcile on the fields of this event**. Treat it as
 /// "accepted, will land", and read the authoritative outcome from
@@ -131,7 +140,13 @@ pub enum PreconfStatus {
 /// (Timeout / server pre-apply reject), `[]` when apply happened but
 /// emitted no logs. SDKs treat both as "no logs" but the wire shape
 /// preserves the distinction.
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Every field but `logs` is `Option` and omitted when absent. An absent field
+/// means the sequencer did not send one — an op-geth sequencer sends only
+/// `logs` — so a forwarding reth node reproduces its response byte for byte.
+/// A zero would be a number this node invented; absence is the honest answer.
+#[derive(Debug, Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreconfTxReceipt {
     /// Event logs, echoed verbatim from the sequencer.
     ///
@@ -149,18 +164,88 @@ pub struct PreconfTxReceipt {
     /// corrected event sent. Read `eth_getTransactionReceipt` to reconcile.
     #[serde(default)]
     pub logs: Option<Vec<PreconfLog>>,
+
+    /// EVM status — `0x1` on success, `0x0` on revert or halt.
+    ///
+    /// Not to be confused with [`PreconfTxEvent::status`], which is the
+    /// preconfirmation's own four-state outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub status: Option<u64>,
+    /// Gas this transaction alone used, after the post-exec refund — the same
+    /// figure `eth_getTransactionReceipt` reports.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub gas_used: Option<u64>,
+    /// Block gas used through this transaction, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub cumulative_gas_used: Option<u64>,
+    /// This transaction's index in the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub transaction_index: Option<u64>,
+    /// Bloom over this transaction's logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_bloom: Option<Bloom>,
+    /// EIP-2718 transaction type byte.
+    #[serde(
+        default,
+        rename = "type",
+        skip_serializing_if = "Option::is_none",
+        with = "alloy_serde::quantity::opt"
+    )]
+    pub tx_type: Option<u64>,
+    /// Sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Address>,
+    /// Recipient — absent for a creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Address>,
+    /// Address a creation deployed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<Address>,
+    /// What this transaction paid per unit of gas.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub effective_gas_price: Option<u128>,
+    /// The eleven L1 fee fields, flattened so their shape matches
+    /// `eth_getTransactionReceipt` exactly. Every field inside is `Option` and
+    /// omitted when the fork that introduced it is not active, so an op-geth
+    /// sequencer's response is unaffected.
+    ///
+    /// The type also carries `opGasRefund`, `depositNonce` and
+    /// `depositReceiptVersion`. None of the three is ever set here — a preconf
+    /// transaction can never be a deposit, and `opGasRefund` is left unset for
+    /// the reason given at its `OpReceiptFieldsBuilder` call site in
+    /// `apply_preconf_with_da` — so all three stay absent from the wire.
+    #[serde(flatten)]
+    pub l1_fields: op_alloy_rpc_types::OpTransactionReceiptFields,
 }
 
 /// Preconfirmation log entry
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreconfLog {
     /// Log address
-    pub address: alloy_primitives::Address,
+    pub address: Address,
     /// Log topics
     pub topics: Vec<B256>,
     /// Log data
     pub data: Bytes,
+    /// Number of the block being built when this log was emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub block_number: Option<u64>,
+    /// Timestamp of the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub block_timestamp: Option<u64>,
+    /// Hash of the transaction that emitted this log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_hash: Option<B256>,
+    /// Index of that transaction in the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub transaction_index: Option<u64>,
+    /// This log's index across the whole block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub log_index: Option<u64>,
+    /// Geth compatibility field — always `false` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<bool>,
 }
 
 // ─── Preconf handler indirection ─────────────────────────────────────────────
@@ -1613,14 +1698,14 @@ mod tests {
 
     #[test]
     fn preconf_tx_receipt_logs_none_serializes_as_null() {
-        let r = PreconfTxReceipt { logs: None };
+        let r = PreconfTxReceipt { logs: None, ..Default::default() };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(json, r#"{"logs":null}"#);
     }
 
     #[test]
     fn preconf_tx_receipt_logs_empty_vec_serializes_as_empty_array() {
-        let r = PreconfTxReceipt { logs: Some(vec![]) };
+        let r = PreconfTxReceipt { logs: Some(vec![]), ..Default::default() };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(json, r#"{"logs":[]}"#);
     }
@@ -1633,7 +1718,9 @@ mod tests {
                 address: addr,
                 topics: vec![B256::from([0xCD; 32])],
                 data: Bytes::from(vec![0xEF, 0xEF]),
+                ..Default::default()
             }]),
+            ..Default::default()
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: PreconfTxReceipt = serde_json::from_str(&json).unwrap();
@@ -1897,5 +1984,26 @@ mod tests {
         assert_eq!(parse_quantity_u64(&serde_json::json!("2a")), None);
         assert_eq!(parse_quantity_u64(&serde_json::json!("0xzz")), None);
         assert_eq!(parse_quantity_u64(&serde_json::Value::Null), None);
+    }
+
+    // ─── preconf event forwarding: byte-identity round-trip ─────────────
+
+    /// A reth follower forwarding an op-geth sequencer's response deserializes
+    /// it into `PreconfTxEvent` and re-serializes. op-geth does not send any of
+    /// the fields added here, so every one of them must vanish on the way out —
+    /// a zero would be a number this node invented.
+    #[test]
+    fn geth_shaped_event_round_trips_byte_for_byte() {
+        let geth = r#"{"txHash":"0x0101010101010101010101010101010101010101010101010101010101010101","status":"failed","reason":"execution reverted","blockHeight":"0x1","receipt":{"logs":null}}"#;
+        let decoded: PreconfTxEvent = serde_json::from_str(geth).expect("decode geth shape");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-encode"), geth);
+    }
+
+    /// Same, for op-geth's log shape: three fields and nothing else.
+    #[test]
+    fn geth_shaped_logs_round_trip_byte_for_byte() {
+        let geth = r#"{"txHash":"0x0202020202020202020202020202020202020202020202020202020202020202","status":"success","reason":"","blockHeight":"0x2","receipt":{"logs":[{"address":"0x0000000000000000000000000000000000000001","topics":["0x0303030303030303030303030303030303030303030303030303030303030303"],"data":"0x"}]}}"#;
+        let decoded: PreconfTxEvent = serde_json::from_str(geth).expect("decode geth shape");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-encode"), geth);
     }
 }
