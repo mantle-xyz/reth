@@ -252,8 +252,9 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     /// / SDM-enable settings.
     builder_config: OpBuilderConfig,
     cfg: Arc<PreconfConfig>,
-    /// Decides which arm owns a transaction. Read synchronously from the
-    /// pool best-tx step, which is why it cannot be the (async) fifo.
+    /// The allowlists, and which nonces owed commitments hold. Read
+    /// synchronously from the pool best-tx step (`apply_one_best_tx`), which is
+    /// why it cannot be the (async) fifo.
     classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
     /// Commitment journal. `None` only on the disabled path, which builds no
@@ -925,6 +926,7 @@ async fn apply_one_best_tx<N, Builder>(
     builder: &mut Builder,
     info: &mut ExecutionInfo<N::SignedTx>,
     fifo: &PreconfTxSet,
+    classifier: &PreconfClassifier,
     constraints: &BuildConstraints,
     pacer: &mut AdmissionPacer,
 ) -> Result<BestTxStep, PayloadBuilderError>
@@ -949,6 +951,42 @@ where
         best_txs.mark_invalid(tx.sender(), tx.nonce());
         return Ok(BestTxStep::Continue);
     }
+
+    // A *different* transaction on a nonce an owed commitment holds. The hash
+    // check above cannot see this one, and neither can the pool: a commitment
+    // never enters it, and nothing on the pool's admission path consults the
+    // slot index.
+    //
+    // Only a reorg makes this reachable. While the chain holds the commitment,
+    // its nonce is spent and any other transaction for it fails nonce-too-low
+    // here anyway. Take the block back and the chain nonce goes with it, so the
+    // same transaction becomes executable at exactly the moment the commitment
+    // is waiting to be replayed onto that nonce — and whichever runs first
+    // takes it for good.
+    //
+    // Last line rather than the only one: the carryover preamble dispatches
+    // replayed commitments before this arm fires, so in an ordinary build the
+    // commitment has already taken the nonce and the candidate fails on its
+    // own. This covers the builds where that does not happen — the commitment
+    // deferred for block capacity (`preconf_admission`), or a reorg
+    // notification that has not reached the fifo before this build started.
+    //
+    // Same rule as `PreconfClassifier::slot_conflict`: the slot's own
+    // transaction resubmitted is not a conflict, and is left to fail (or not)
+    // on its merits.
+    if let Some(owner) = classifier.slot_owner(&tx.sender(), tx.nonce()) &&
+        owner != *tx.hash()
+    {
+        metrics::counter!("preconf.build.pool_tx_on_committed_nonce_total").increment(1);
+        debug!(
+            target: "mantle::preconf::payload_builder",
+            candidate = ?tx.hash(), ?owner, sender = ?tx.sender(), nonce = tx.nonce(),
+            "pool transaction claims a nonce an owed commitment holds; skipping it"
+        );
+        best_txs.mark_invalid(tx.sender(), tx.nonce());
+        return Ok(BestTxStep::Continue);
+    }
+
     let interop = tx.interop_deadline();
     let tx_da_size = tx.estimated_da_size();
     let tx = tx.into_consensus();
@@ -2118,6 +2156,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         &mut builder,
                         &mut info,
                         &self.fifo,
+                        &self.classifier,
                         &constraints,
                         &mut pool_pacer,
                     )

@@ -18,6 +18,7 @@ const COUNTERS: &[&str] = &[
     "flashblock.slice_allowance_exhausted_total",
     "preconf.build.failed_total",
     "preconf.build.resolved_payload_superseded_total",
+    "preconf.build.pool_tx_on_committed_nonce_total",
     "preconf.build.tx_nonce_already_used_total",
     "preconf.build.tx_over_block_limits_total",
     "preconf.build.tx_rejected_by_evm_total",
