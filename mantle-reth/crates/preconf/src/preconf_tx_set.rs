@@ -871,6 +871,9 @@ impl PreconfTxSet {
     ///
     /// The queue's own rules read that index directly, under `inner`; this is
     /// the only way to read it from outside, and the only reason it is public.
+    /// No production caller needs it — the readers are the tests, including the
+    /// integration suite, which is a separate crate and so cannot reach a
+    /// `#[cfg(test)]` method.
     /// `entries` and `snapshot` are both built from `order`, so neither can
     /// observe `by_sender` drifting out of step with them — the divergence the
     /// admission and push paths log and self-heal rather than trust.

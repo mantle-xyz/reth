@@ -286,6 +286,10 @@ impl PreconfJournal {
 
     /// Path the journal is bound to. Stable for the lifetime of the
     /// instance.
+    ///
+    /// Test-only: rotation reads the field directly, and nothing in production
+    /// asks a journal where it lives.
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -463,6 +467,12 @@ impl PreconfJournal {
     }
 
     /// How many records are waiting for a write to succeed.
+    ///
+    /// Test-only — the production view of this is the
+    /// `preconf.journal.pending_entries` gauge. Kept because the
+    /// `PENDING_CAPACITY` / `PENDING_MAX_BYTES` fuses have no other observation
+    /// point.
+    #[cfg(test)]
     pub fn pending_len(&self) -> usize {
         self.pending.lock().len()
     }

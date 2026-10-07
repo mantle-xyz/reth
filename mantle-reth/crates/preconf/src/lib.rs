@@ -3,7 +3,8 @@
 //! This crate provides the core types and traits for the preconf subsystem:
 //!
 //! - [`config::PreconfConfig`] — runtime configuration & whitelist checks
-//! - [`classifier::PreconfClassifier`] — freezes each tx's preconf eligibility at admission
+//! - [`classifier::PreconfClassifier`] — the allowlists, and the record of every commitment this
+//!   node owes
 //! - [`types`] — common enums and error types
 //! - [`preconf_tx_set::PreconfTxSet`] — the commitment truth source
 //! - [`apply`] — builder apply path interface
