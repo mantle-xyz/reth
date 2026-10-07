@@ -152,13 +152,6 @@ where
                         "fifo already contains this hash; idempotent skip"
                     );
                 }
-                PushResult::Revived => {
-                    debug!(
-                        target: "mantle::preconf::listener",
-                        ?hash, ?sender,
-                        "revived reclaimable fifo entry (Timeout/Canceled → Waiting)"
-                    );
-                }
                 PushResult::ConflictActive(existing) => {
                     // `hash` shares its `(sender, nonce)` with an active commitment
                     // (`existing`) of a different hash: the replacement guard was

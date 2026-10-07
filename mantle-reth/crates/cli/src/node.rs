@@ -464,8 +464,7 @@ where
             // was called during `components()`.
             let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
                 preconf.as_ref().map(|svc| {
-                    let canon =
-                        svc.canon_handler(ctx.node().provider().clone(), ctx.node().pool().clone());
+                    let canon = svc.canon_handler(ctx.node().provider().clone());
                     ctx.node()
                         .task_executor()
                         .spawn_critical_task("mantle-preconf-canon-handler", canon.run());

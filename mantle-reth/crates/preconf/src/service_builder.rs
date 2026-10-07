@@ -154,24 +154,21 @@ impl PreconfServiceBuilder {
         Ok(())
     }
 
-    /// Construct a canonical-state handler bound to `provider` + `pool`.
+    /// Construct a canonical-state handler bound to `provider`.
     /// The caller is responsible for spawning the returned handler's
     /// [`run`](PreconfCanonHandler::run) future on its task executor.
     ///
     /// The generic `N` matches `Pr::Primitives` — for OP-stack nodes
     /// this is `OpPrimitives`; the bound `N::SignedTx: Transaction +
-    /// TxHashRef` is satisfied automatically. `P` is the transaction
-    /// pool; the handler uses it to `remove_transactions` on hashes
-    /// evicted by `PreconfTxSet::clean_reclaimable`, so a Timeout / Canceled preconf
-    /// tx cannot land on chain after the client already saw `Timeout`.
-    pub fn canon_handler<Pr, P, N>(&self, provider: Pr, pool: P) -> PreconfCanonHandler<Pr, P, N>
+    /// TxHashRef` is satisfied automatically. Pool eviction runs through the
+    /// fifo's own callback, not from here.
+    pub fn canon_handler<Pr, N>(&self, provider: Pr) -> PreconfCanonHandler<Pr, N>
     where
         Pr: CanonStateSubscriptions<Primitives = N> + 'static,
-        P: TransactionPool + 'static,
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
     {
-        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.journal().clone())
+        PreconfCanonHandler::new(provider, self.fifo.clone(), self.journal().clone())
     }
 
     /// Construct the local-sequencer RPC handler. Returned by value so

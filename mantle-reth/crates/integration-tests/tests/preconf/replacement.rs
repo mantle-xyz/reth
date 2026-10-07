@@ -106,11 +106,10 @@ async fn active_hash_resubmit_returns_already_in_progress() {
     first.abort();
 }
 
-/// A Timeout entry in the fifo must NOT hold the `(sender, nonce)` slot
-/// against replacement — after the first tx times out, a differently-
-/// signed tx for the same slot (different `value`, hence different
-/// hash) must be admitted and land on chain. Guards against a
-/// regression where the Timeout-state entry blocks replacement forever.
+/// A timed-out slot must not be held against replacement **forever**. While the
+/// entry exists the slot is taken and every differently-hashed tx is refused;
+/// what bounds the lockout is finalisation, by the client's deadline or the
+/// next build's. Hence the retry: the guarantee is "eventually admitted".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_slot_replaceable_by_different_hash() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -165,8 +164,22 @@ async fn timeout_slot_replaceable_by_different_hash() {
         .payload_id
         .expect("payload_id present");
 
+    // Retry until the incumbent is finalised and the slot frees. Bounded well
+    // above `preconf_timeout` (150ms) so a real regression still fails fast.
     let http_c = http.clone();
-    let rpc_task = tokio::spawn(async move { send_preconf(&http_c, tx_b).await });
+    let rpc_task = tokio::spawn(async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match send_preconf(&http_c, tx_b.clone()).await {
+                Ok(ev) => return Ok(ev),
+                Err(e) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    let _ = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let payload = node

@@ -18,6 +18,19 @@ CI (`.github/workflows/ci.yml`) runs `lint` and `test` (`just test-ci`) in
 parallel on every PR to `mantle-stage2` and `main`. Running `just pr` first
 avoids round-trips waiting on CI.
 
+## When *not* to run the suite
+
+Tests cost minutes; comment and doc edits cost none. Do not run the integration
+suite for a change that cannot alter behaviour:
+
+- **Comment / doc-comment only** — `cargo check` is enough to catch a broken intra-doc link or a doc test that stopped compiling.
+- **Rename of a private item, formatting, import ordering** — `just lint` covers it.
+
+For behavioural changes, run the unit tests freely, but treat the integration
+suite (`--test preconf` / `it`) as something to run **once, when the work is
+done and the user has reviewed it** — not after every intermediate edit. Wait
+for the user to ask before running it.
+
 ## Test tiers
 
 The suite is split by **runtime**, not by "is it a node test": anything that runs
