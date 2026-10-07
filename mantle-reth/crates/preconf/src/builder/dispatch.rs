@@ -345,6 +345,23 @@ where
         Ok(receipt) => {
             metrics::counter!("preconf.tx.success_total").increment(1);
             loop_state.record_committed(hash);
+            // The claim is made here, by the transaction executing — not below,
+            // when a client hears about it. Before this the nonce was unguarded
+            // for every entry that never reached a client: a replay, or one
+            // whose caller hung up. `mark_promised` upgrades the kind when the
+            // receipt lands.
+            if let Err(owner) = fifo.claims().record_announced(
+                hash,
+                &entry.from,
+                entry.nonce,
+                loop_state.predicted_height,
+            ) {
+                debug!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?owner, sender = ?entry.from, nonce = entry.nonce,
+                    "the nonce this executed on is recorded against another claim"
+                );
+            }
             loop_state.preconf_gas_used =
                 loop_state.preconf_gas_used.saturating_add(receipt.gas_used);
             // Transition and responder together, before the journal write:
@@ -449,15 +466,28 @@ where
         // in-memory; only preconf txs are journaled). So the commitment ends on
         // the first failure, which is what releases the `(sender, nonce)`.
         Err(ApplyError::Rejected(rejected)) => {
-            // This line and the counter below are the only trace a breach
-            // leaves: the responder went with the receipt, and the node exposes
-            // no status query. Keep both.
-            error!(
-                target: "mantle::preconf::dispatch",
-                ?hash, ?rejected,
-                "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
-            );
-            metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+            // Only a claim a client was handed counts as broken. One that never
+            // got past a slice is an `Announced` claim, and its readers correct
+            // themselves at the next canonical block — see `ClaimKind`. Logging
+            // both at `error!` would bury the one nobody downstream can repair.
+            if fifo.claims().was_promised(&hash) {
+                // This line and the counter are the only trace a breach leaves:
+                // the responder went with the receipt, and the node exposes no
+                // status query. Keep both.
+                error!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?rejected,
+                    "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
+                );
+                metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+            } else {
+                warn!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?rejected,
+                    "an announced transaction could not be re-applied; releasing its nonce"
+                );
+                metrics::counter!("preconf.tx.announced_dropped_total").increment(1);
+            }
             count_rejection(&rejected);
             // A `Replay` entry has no responder (admission refuses to attach
             // one), so this removes it with nobody to answer — the log and
@@ -822,6 +852,44 @@ mod tests {
 
         let (entries, _) = journal.load().await.unwrap();
         assert!(entries.is_empty(), "it is already in the file it was read from");
+    }
+
+    /// **The claim is made by executing, not by a client hearing about it.**
+    ///
+    /// No responder is attached here, which is the shape a replay has and the
+    /// shape a commitment gets when its caller hangs up. Before the claim moved
+    /// to the apply, nothing recorded such an entry, so `slot_owner` answered
+    /// `None` and a same-nonce pool transaction could take the nonce out from
+    /// under a transaction already announced in a slice.
+    #[tokio::test]
+    async fn a_successful_apply_claims_the_nonce_even_with_no_client_waiting() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x31);
+        let hash = *tx.tx_hash();
+
+        assert!(matches!(
+            fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Replay).await,
+            PushResult::Inserted
+        ));
+        assert_eq!(
+            fifo.claims().slot_owner(&Address::ZERO, tx.nonce()),
+            None,
+            "the premise: queued is not yet claimed",
+        );
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
+
+        assert_eq!(
+            fifo.claims().slot_owner(&Address::ZERO, tx.nonce()),
+            Some(hash),
+            "the apply must claim the nonce",
+        );
+        assert!(
+            !fifo.claims().was_promised(&hash),
+            "and must not call it promised — no receipt reached anyone",
+        );
     }
 
     #[tokio::test]

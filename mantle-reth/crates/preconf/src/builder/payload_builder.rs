@@ -750,14 +750,25 @@ where
             dispatch::BlockKind::Reject => {
                 // The predecessor is over a bound no block can clear, so this
                 // successor can never reach its nonce. Both are `Replay`, so
-                // both were already promised, and neither can be kept.
-                error!(
-                    target: "mantle::preconf::dispatch",
-                    ?hash, ?sender, nonce,
-                    "COMMITMENT BROKEN: a permanently rejected predecessor leaves this \
-                     replayed commitment unable to reach its nonce"
-                );
-                metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+                // both were claimed; only one a client was handed counts as
+                // broken (see `ClaimKind`).
+                if fifo.claims().was_promised(&hash) {
+                    error!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?sender, nonce,
+                        "COMMITMENT BROKEN: a permanently rejected predecessor leaves this \
+                         replayed commitment unable to reach its nonce"
+                    );
+                    metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+                } else {
+                    warn!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?sender, nonce,
+                        "a permanently rejected predecessor leaves this announced transaction \
+                         unable to reach its nonce"
+                    );
+                    metrics::counter!("preconf.tx.announced_dropped_total").increment(1);
+                }
                 let _ = fifo.complete_failure(&hash, PreconfError::CommitmentBroken).await;
                 return Ok(());
             }

@@ -112,6 +112,11 @@ pub const SEAL_DEPTH: u64 = 32;
 /// the `promised` flag for why a record and a promise are not the same thing.
 #[derive(Debug, Clone, Copy)]
 struct Commitment {
+    /// How strong the claim is — see [`ClaimKind`].
+    ///
+    /// Only ever moves `Announced` → `Promised`, by [`Commitments::mark_promised`].
+    /// There is no way back: a receipt that reached a client cannot be unsent.
+    kind: ClaimKind,
     /// The `(sender, nonce)` slot this record claimed, if it claimed one.
     slot: Option<(Address, u64)>,
     /// Height of the canonical block this commitment was observed in, if it has
@@ -127,11 +132,36 @@ struct Commitment {
 }
 
 impl Commitment {
-    /// A freshly recorded commitment, promised for `promised_height` and not yet
-    /// seen on chain.
-    const fn new(promised_height: u64) -> Self {
-        Self { slot: None, committed_height: None, promised_height }
+    /// A freshly recorded claim at `promised_height`, not yet seen on chain.
+    const fn new(kind: ClaimKind, promised_height: u64) -> Self {
+        Self { kind, slot: None, committed_height: None, promised_height }
     }
+}
+
+/// How strong a claim this node made about a transaction.
+///
+/// Both are public statements and both have to be kept, which is why they share
+/// a record, a slot and the must-land machinery. They differ in **who cleans up
+/// when the claim turns out false**, and that is what the per-kind behaviour
+/// below follows from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// Executed, and announced to whoever is subscribed to the slice stream —
+    /// but no client has been handed a receipt for it.
+    ///
+    /// A flashblock consumer serves this as `pending`, so the statement is
+    /// public and has real readers. It is the weaker of the two because those
+    /// readers reconcile on their own: the consumer has reorg detection and
+    /// corrects itself at the next canonical block.
+    Announced,
+    /// A receipt went back to a client over
+    /// `eth_sendRawTransactionWithPreconf`.
+    ///
+    /// Nobody downstream can repair this one. If the transaction does not land,
+    /// the node lied to a caller that was synchronously waiting — which is what
+    /// `preconf.tx.commitment_broken_total` counts, and why only this kind
+    /// increments it.
+    Promised,
 }
 
 /// The commitment records, plus the `(sender, nonce)` → hash index that makes
@@ -310,6 +340,45 @@ impl Commitments {
         }
     }
 
+    /// **Where tracking begins.** Records that `hash` executed in the block
+    /// being built, and claims the `(sender, nonce)` it ran on.
+    ///
+    /// Called from the apply, not from the receipt — the claim is made by the
+    /// transaction executing and going out in a slice, not by a client hearing
+    /// about it. Two consequences follow, and both are the point:
+    ///
+    /// * a commitment whose client disconnected before its receipt still holds its nonce, where
+    ///   before it held nothing and a same-nonce pool transaction could take it;
+    /// * every executed transaction has a record, so `slot_owner` is a complete answer rather than
+    ///   one that happens to cover the cases a client was waiting on.
+    ///
+    /// Idempotent, and **never downgrades**: a hash already `Promised` stays
+    /// `Promised`, which is what a replay of an acknowledged commitment hits.
+    pub fn record_announced(
+        &self,
+        hash: TxHash,
+        sender: &Address,
+        nonce: u64,
+        height: u64,
+    ) -> SlotClaim {
+        if !self.enabled {
+            return Ok(());
+        }
+        let key = (*sender, nonce);
+        let mut store = self.store.write();
+
+        let cached =
+            store.by_hash.entry(hash).or_insert(Commitment::new(ClaimKind::Announced, height));
+        cached.promised_height = height;
+
+        let claim = store.claim(key, hash);
+        let len = store.by_hash.len();
+        drop(store);
+
+        self.observe_len(len);
+        claim
+    }
+
     /// **Where commitment tracking is established.** Records that a `Success`
     /// receipt for `hash` has gone out to a client, and claims the
     /// `(sender, nonce)` it was issued against.
@@ -364,11 +433,15 @@ impl Commitments {
         let key = (*sender, nonce);
         let mut store = self.store.write();
 
-        // Get-or-insert, then set `promised`. The insert case is journal restore
-        // (this process has never seen the hash); the update case is the RPC
-        // handler, where an earlier receipt for the same hash may already have
-        // written it. Either way the record itself is left alone.
-        let cached = store.by_hash.entry(hash).or_insert(Commitment::new(promised_height));
+        // Get-or-insert, then upgrade the kind. The insert case is journal
+        // restore (this process has never seen the hash); the update case is the
+        // ordinary one — the apply recorded it as `Announced` a moment earlier,
+        // and this is the receipt reaching its client.
+        let cached = store
+            .by_hash
+            .entry(hash)
+            .or_insert(Commitment::new(ClaimKind::Promised, promised_height));
+        cached.kind = ClaimKind::Promised;
         cached.promised_height = promised_height;
 
         // The record is there either way — inserted just above, or already
@@ -445,6 +518,15 @@ impl Commitments {
     /// means the pool arm takes it. Synchronous, because that arm cannot wait.
     pub fn is_tracked(&self, hash: &TxHash) -> bool {
         self.store.read().by_hash.contains_key(hash)
+    }
+
+    /// Whether a receipt for `hash` reached a client.
+    ///
+    /// `false` for a hash with no record at all and for one that only ever got
+    /// as far as a slice — see [`ClaimKind`] for why the two are not the same
+    /// failure.
+    pub fn was_promised(&self, hash: &TxHash) -> bool {
+        self.store.read().by_hash.get(hash).is_some_and(|c| c.kind == ClaimKind::Promised)
     }
 
     /// Which transaction currently owns `(sender, nonce)`, if any.
@@ -614,6 +696,9 @@ impl Commitments {
                 "commitment cache above capacity — chain likely stalled (fifo eviction is canon-driven)"
             );
         }
+        // The `preconf.classifier.*` series keep their names after the move:
+        // they are a published interface, and renaming them would silently
+        // break every dashboard and alert built on them.
         metrics::gauge!("preconf.classifier.over_capacity").set(f64::from(u8::from(over)));
     }
 }
@@ -1274,6 +1359,61 @@ mod tests {
             Fx { claims: Commitments::from_config(&cfg), wl: PreconfClassifier::from_config(&cfg) };
 
         assert!(c.registered_via_preconf_rpc(hash(1), &addr(200)));
+    }
+
+    // ========================= claim kinds =========================
+
+    /// The apply records a claim; the receipt upgrades it. Both steps claim the
+    /// same slot, and the second must not lose what the first established.
+    #[test]
+    fn the_receipt_upgrades_the_claim_the_apply_recorded() {
+        let c = classifier();
+        assert_eq!(c.record_announced(hash(1), &addr(1), 7, 100), Ok(()));
+        assert!(c.is_tracked(&hash(1)));
+        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
+        assert!(!c.was_promised(&hash(1)), "nothing has reached a client yet");
+
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 100), Ok(()));
+        assert!(c.was_promised(&hash(1)), "the receipt makes it a promise");
+        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and the slot is unchanged");
+    }
+
+    /// A replay re-executes an already-acknowledged commitment, so the apply
+    /// runs again on a record that is already `Promised`. Downgrading it would
+    /// make a real breach stop counting as one.
+    #[test]
+    fn re_executing_a_promised_commitment_does_not_downgrade_it() {
+        let c = classifier();
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 100), Ok(()));
+        assert!(c.was_promised(&hash(1)));
+
+        assert_eq!(c.record_announced(hash(1), &addr(1), 7, 101), Ok(()));
+
+        assert!(c.was_promised(&hash(1)), "a re-apply must not unsend the receipt");
+    }
+
+    /// The slot rule is the registry's, not the caller's: an announced claim
+    /// cannot take a nonce another claim already holds.
+    #[test]
+    fn an_announced_claim_cannot_take_a_held_nonce() {
+        let c = classifier();
+        assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 100), Ok(()));
+
+        assert_eq!(
+            c.record_announced(hash(2), &addr(1), 7, 100),
+            Err(hash(1)),
+            "the incumbent is reported, not displaced",
+        );
+        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
+    }
+
+    /// A node with preconf off records nothing, by either door.
+    #[test]
+    fn a_disabled_registry_records_no_announcement() {
+        let c = Commitments::disabled();
+        assert_eq!(c.record_announced(hash(1), &addr(1), 7, 100), Ok(()));
+        assert!(!c.is_tracked(&hash(1)));
+        assert_eq!(c.slot_owner(&addr(1), 7), None);
     }
 
     // ===================== (sender, nonce) slot index =====================

@@ -61,6 +61,7 @@ const COUNTERS: &[&str] = &[
     "preconf.execute.rejected_other_total",
     // Commitment retention + on-chain allowlist governance.
     "preconf.canon.reorg_drift_total",
+    "preconf.tx.announced_dropped_total",
     "preconf.tx.commitment_broken_total",
     "preconf.tx.replay_round_total",
     "preconf.journal.dropped_entries_total",
