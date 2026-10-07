@@ -34,7 +34,7 @@
 //! returns an owned value and drops its guard before returning.
 
 use alloy_primitives::{
-    Address, TxHash,
+    Address, B256, TxHash,
     map::{
         Entry,
         foldhash::{HashMap, HashSet},
@@ -273,6 +273,13 @@ pub struct Commitments {
     /// [`Self::sweep`] is no longer being called.
     over_capacity: AtomicBool,
 
+    /// The block this node sealed last, so the next build can recognise it as
+    /// its parent and release what it executed without reading the chain.
+    ///
+    /// `parking_lot::Mutex` rather than the store's lock: it is written once per
+    /// build and read once per build, and it has nothing to do with the records.
+    sealed_payload: parking_lot::Mutex<Option<B256>>,
+
     /// Last known **persisted** block height — the reading of the ruler
     /// described on [`SEAL_DEPTH`]. Fed by the canonical-state handler once per
     /// notification via [`Self::observe_persisted`].
@@ -305,6 +312,7 @@ impl Commitments {
             store: RwLock::new(CommitmentStore::default()),
             capacity,
             over_capacity: AtomicBool::new(false),
+            sealed_payload: parking_lot::Mutex::new(None),
             persisted_height: AtomicU64::new(0),
         }
     }
@@ -535,6 +543,29 @@ impl Commitments {
     /// preconf claim on this nonce".
     pub fn slot_owner(&self, sender: &Address, nonce: u64) -> Option<TxHash> {
         self.store.read().by_slot.get(&(*sender, nonce)).copied()
+    }
+
+    /// Record the block this build sealed.
+    ///
+    /// Paired with [`Self::parent_is_ours`]: together they answer "did what I
+    /// executed last time land?" with one hash comparison and no chain reads,
+    /// which is the healthy path and the reason this is worth keeping at all.
+    pub fn note_sealed(&self, block: B256) {
+        *self.sealed_payload.lock() = Some(block);
+    }
+
+    /// Whether `parent_hash` is the block the last build sealed.
+    ///
+    /// True means the chain built on what this node produced, so everything
+    /// that build executed is on chain.
+    ///
+    /// False is the conservative direction and is what a superseded payload
+    /// gives: the last `note_sealed` wins, so if the consensus layer took an
+    /// earlier one this reads false and the caller falls back to asking the
+    /// chain. Sweeping twice costs a few state reads; not sweeping loses
+    /// transactions.
+    pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
+        *self.sealed_payload.lock() == Some(parent_hash)
     }
 
     /// Publishes the current **persisted** block height — the reading of the

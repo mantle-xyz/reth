@@ -1015,6 +1015,45 @@ impl PreconfTxSet {
         self.inner.lock().await.by_sender.keys().copied().collect()
     }
 
+    /// Every sender holding a `Success` entry — what the last build executed and
+    /// has not yet confirmed on chain.
+    ///
+    /// The slow sweep reads a chain nonce per sender in this set, so it is
+    /// deliberately the senders and not the entries.
+    pub async fn senders_with_landed_claims(&self) -> HashSet<Address> {
+        let inner = self.inner.lock().await;
+        inner
+            .entries
+            .values()
+            .filter(|e| e.status == PreconfStatus::Success)
+            .map(|e| e.from)
+            .collect()
+    }
+
+    /// Drop every `Success` entry, for the build that has just established its
+    /// parent is the block this node sealed.
+    ///
+    /// **The healthy path, and the reason the sealed-block hash is tracked at
+    /// all.** If the chain built on our block then everything that build
+    /// executed is on it, so there is nothing to ask the chain and nothing to
+    /// replay. The alternative is [`Self::forward_all`], which reads an account
+    /// per sender — a few hundred state reads per block once ordinary
+    /// transactions are in here too.
+    ///
+    /// `Waiting` entries are untouched: they were never executed, so our block
+    /// landing says nothing about them.
+    pub async fn drop_landed_claims(&self) -> usize {
+        let mut inner = self.inner.lock().await;
+        let landed: Vec<TxHash> = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| e.status == PreconfStatus::Success)
+            .map(|(hash, _)| *hash)
+            .collect();
+        inner.drop_hashes(&landed);
+        landed.len()
+    }
+
     /// Builder subscribes the broadcast notifier here.
     ///
     /// Each call returns an independent `Receiver` — multi-consumer.
