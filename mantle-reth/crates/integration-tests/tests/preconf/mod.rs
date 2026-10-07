@@ -24,6 +24,7 @@ mod da_footprint;
 mod delegated_sender;
 mod dual_channel_nonce;
 mod dual_channel_same_hash;
+mod full_receipt;
 mod gas_budgets;
 mod happy_path;
 mod insufficient_funds;

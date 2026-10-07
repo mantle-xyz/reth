@@ -1,6 +1,7 @@
 //! Common types shared across preconf modules.
 
-use alloy_primitives::{Bytes, Log, TxHash, U256};
+use alloy_primitives::{Address, Bloom, Bytes, Log, TxHash, U256};
+use op_alloy_rpc_types::OpTransactionReceiptFields;
 use serde::{Deserialize, Serialize};
 
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
@@ -95,15 +96,43 @@ pub struct PreconfReceipt {
     pub block_height: u64,
     /// Whether execution succeeded (status == 1).
     pub status: bool,
-    /// EVM logs emitted by the transaction.
+    /// Logs, read off the receipt the executor built for this transaction —
+    /// the same object that gets sealed into the block.
     pub logs: Vec<Log>,
-    /// Gas used by this transaction alone (`ResultGas::tx_gas_used`).
+    /// Gas this transaction alone used, after the post-exec refund. The same
+    /// figure the sealed receipt's cumulative total is built from, and the
+    /// same one `eth_getTransactionReceipt` reports.
     pub gas_used: u64,
     /// Optional revert / halt reason — empty on success.
     pub reason: String,
     /// Raw revert return data — used by RPC handler to abi-decode the revert
     /// reason matching op-geth's `abi.UnpackRevert` behavior.
     pub revert_data: Bytes,
+    /// This transaction's index in the block being built.
+    pub tx_index: u64,
+    /// Block gas used through this transaction, inclusive.
+    pub cumulative_gas_used: u64,
+    /// Bloom over this transaction's logs.
+    pub logs_bloom: Bloom,
+    /// How many logs the block emitted before this transaction — the
+    /// `logIndex` its first log carries.
+    pub log_index_base: u64,
+    /// EIP-2718 transaction type byte.
+    pub tx_type: u8,
+    /// Sender.
+    pub from: Address,
+    /// Recipient — `None` for a creation.
+    pub to: Option<Address>,
+    /// Address a creation deployed to, `None` otherwise.
+    pub contract_address: Option<Address>,
+    /// What this transaction paid per unit of gas.
+    pub effective_gas_price: u128,
+    /// Timestamp of the block being built — what this transaction's logs
+    /// report as their `blockTimestamp`.
+    pub block_timestamp: u64,
+    /// L1 fee fields, built by the same `OpReceiptFieldsBuilder` that backs
+    /// `eth_getTransactionReceipt`.
+    pub l1_fields: OpTransactionReceiptFields,
 }
 
 /// Result of [`crate::preconf_tx_set::PreconfTxSet::push_if_absent`].
@@ -506,7 +535,7 @@ mod tests {
     /// one field must make the two receipts distinct).
     #[test]
     fn preconf_receipt_field_level_diff_participates_in_partialeq() {
-        use alloy_primitives::{Address, B256, Bytes, Log, LogData};
+        use alloy_primitives::{Address, B256, Bloom, Bytes, Log, LogData};
 
         // Reference construction — every field explicitly named so a
         // struct-shape change (new / removed field) forces update.
@@ -521,6 +550,17 @@ mod tests {
             gas_used: 21_000,
             reason: String::new(),
             revert_data: Bytes::new(),
+            tx_index: 3,
+            cumulative_gas_used: 95_000,
+            logs_bloom: Bloom::with_last_byte(1),
+            log_index_base: 5,
+            tx_type: 2,
+            from: Address::from([7; 20]),
+            to: Some(Address::from([8; 20])),
+            contract_address: None,
+            effective_gas_price: 1_500,
+            block_timestamp: 1_700_000_000,
+            l1_fields: OpTransactionReceiptFields::default(),
         };
         assert_eq!(base, base.clone(), "identical clone equals base");
 
@@ -551,6 +591,22 @@ mod tests {
 
         let mut r = base.clone();
         r.revert_data = Bytes::from(vec![0xff]);
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.tx_index = 4;
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.cumulative_gas_used = 96_000;
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.logs_bloom = Bloom::ZERO;
+        assert_ne!(r, base);
+
+        let mut r = base.clone();
+        r.log_index_base = 6;
         assert_ne!(r, base);
     }
 }

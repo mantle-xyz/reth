@@ -5,20 +5,24 @@
 //! EVM execution result and converts it into a [`PreconfReceipt`] suitable
 //! for delivery to the RPC client.
 //!
-//! The receipt-building logic itself lives in [`build_receipt`], a pure
-//! function over [`ExecutionResult`]. End-to-end tests with a real
-//! `OpBlockBuilder` are deferred to later integration tests; this module
-//! unit-tests `build_receipt` directly against synthetic execution results.
+//! The receipt is assembled from three sources, each with its own pure
+//! function: [`exec_outcome`] for what only the EVM result knows (revert
+//! reason, status), [`block_position`] for everything the executor's own
+//! receipt carries, and the caller-supplied transaction facts ([`TxFacts`])
+//! for the rest.
 //!
 //! [`BlockBuilder::execute_transaction_with_result_closure`]: reth_evm::execute::BlockBuilder::execute_transaction_with_result_closure
 
 use crate::types::{PreconfError, PreconfReceipt};
+use alloy_consensus::TxReceipt;
 use alloy_evm::{Evm, block::TxResult};
-use alloy_primitives::{Bytes, TxHash, U256};
+use alloy_primitives::{Address, Bloom, Bytes, Log, TxHash, U256};
 use alloy_sol_types::{Revert, SolError};
 use core::any::Any;
 use op_revm::OpHaltReason;
-use reth_evm::execute::{BlockBuilder, BlockExecutionError, BlockValidationError, ExecutorTx};
+use reth_evm::execute::{
+    BlockBuilder, BlockExecutionError, BlockExecutor, BlockValidationError, ExecutorTx, GasOutput,
+};
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_revm::context::{
     Block as _,
@@ -110,6 +114,43 @@ pub struct FeeFacts {
     pub base_fee: u64,
 }
 
+/// What the transaction itself says, read before the apply consumes it.
+///
+/// `FeeFacts` is derived from this plus the block's own base fee, so the floor
+/// the EVM judges against and the price reported on the receipt are the same
+/// number.
+#[derive(Debug, Clone, Copy)]
+pub struct TxFacts {
+    /// EIP-2718 transaction type byte.
+    pub tx_type: u8,
+    /// Sender.
+    pub from: Address,
+    /// Recipient — `None` for a creation.
+    pub to: Option<Address>,
+    /// The nonce this transaction was signed for.
+    pub nonce: u64,
+    /// Fee cap.
+    pub max_fee_per_gas: u128,
+    /// Priority fee cap — `None` for pre-1559 transaction types.
+    pub max_priority_fee_per_gas: Option<u128>,
+}
+
+impl TxFacts {
+    /// What this transaction actually pays per unit of gas against the given
+    /// base fee.
+    pub fn effective_gas_price(&self, base_fee: u64) -> u128 {
+        match self.max_priority_fee_per_gas {
+            Some(tip) => self.max_fee_per_gas.min(u128::from(base_fee).saturating_add(tip)),
+            None => self.max_fee_per_gas,
+        }
+    }
+
+    /// The address a creation deploys to, or `None` for a call.
+    pub fn contract_address(&self) -> Option<Address> {
+        self.to.is_none().then(|| self.from.create(self.nonce))
+    }
+}
+
 /// Classify an EVM transaction refusal — see [`BuilderRejected`].
 fn classify(error: &dyn alloy_evm::InvalidTxError, fees: FeeFacts) -> BuilderRejected {
     match error.as_invalid_tx_err() {
@@ -139,41 +180,76 @@ fn classify(error: &dyn alloy_evm::InvalidTxError, fees: FeeFacts) -> BuilderRej
 ///   invocation, so we defensively surface the missing-closure case as `Fatal` rather than
 ///   `panic!`. Either way the execution environment is untrustworthy, so the caller aborts the
 ///   whole build (mirroring the pool arm) and leaves the commitment for retry.
+///
+/// `gas_used` is the **canonical** figure the executor hands back — the one the
+/// sealed receipt's cumulative total is built from, and the one
+/// `eth_getTransactionReceipt` reports.
 pub fn apply_preconf_tx<B>(
     builder: &mut B,
     tx: impl ExecutorTx<B::Executor>,
     tx_hash: TxHash,
     block_height: u64,
-    tx_max_fee: u128,
+    facts: TxFacts,
 ) -> Result<PreconfReceipt, ApplyError>
 where
     B: BlockBuilder,
+    <B::Executor as BlockExecutor>::Receipt: TxReceipt<Log = Log>,
 {
     // Read before the borrow the execution takes, and off the block being
     // built rather than from the caller: it is the floor the EVM is about to
     // judge against, so the two cannot disagree.
-    let fees = FeeFacts { tx_max_fee, base_fee: builder.evm_mut().block().basefee() };
+    let fees = FeeFacts {
+        tx_max_fee: facts.max_fee_per_gas,
+        base_fee: builder.evm_mut().block().basefee(),
+    };
 
-    let mut captured: Option<PreconfReceipt> = None;
+    let mut captured: Option<ExecOutcome> = None;
     let exec_result = builder.execute_transaction_with_result_closure(tx, |res| {
         let ras = res.result();
-        captured = Some(build_receipt(tx_hash, block_height, &ras.result));
+        captured = Some(exec_outcome(&ras.result));
     });
     // Route the raw `BlockExecutionError` (variant intact) into the
     // classifier — stringifying here would erase both the InvalidTx-vs-fatal
     // distinction and the refusal's own reason.
-    interpret_apply_result(exec_result.map(|_| ()), captured, fees)
+    let (gas, outcome) = interpret_apply_result(exec_result, captured, fees)?;
+
+    // The executor pushed this transaction's receipt before returning, so the
+    // last entry is ours. Nothing may await between the apply and this read.
+    let pos = block_position(builder.executor().receipts());
+
+    Ok(PreconfReceipt {
+        tx_hash,
+        block_height,
+        status: outcome.status,
+        logs: pos.logs,
+        gas_used: gas.tx_gas_used(),
+        reason: outcome.reason,
+        revert_data: outcome.revert_data,
+        tx_index: pos.tx_index,
+        cumulative_gas_used: pos.cumulative_gas_used,
+        logs_bloom: pos.logs_bloom,
+        log_index_base: pos.log_index_base,
+        tx_type: facts.tx_type,
+        from: facts.from,
+        to: facts.to,
+        contract_address: facts.contract_address(),
+        effective_gas_price: facts.effective_gas_price(fees.base_fee),
+        // Overwritten by `apply_preconf_with_da`, which holds `limits.timestamp`
+        // and the per-block `L1FeeCtx` this function does not have.
+        block_timestamp: 0,
+        l1_fields: Default::default(),
+    })
 }
 
-/// Pure interpretation of the `(execute_result, captured_receipt)` pair —
+/// Pure interpretation of the `(execute_result, captured_outcome)` pair —
 /// the untestable-directly `apply_preconf_tx` wrapper's decision matrix
 /// extracted so all outcomes get unit coverage without a full
 /// `BlockBuilder` mock.
 ///
 /// | execute result                       | captured  | outcome                                     |
 /// |--------------------------------------|-----------|---------------------------------------------|
-/// | `Ok(())`                             | `Some(r)` | `Ok(r)` — happy path                        |
-/// | `Ok(())`                             | `None`    | `Err(Fatal)` — upstream trait contract bug  |
+/// | `Ok(gas)`                            | `Some(o)` | `Ok((gas, o))` — happy path                 |
+/// | `Ok(gas)`                            | `None`    | `Err(Fatal)` — upstream trait contract bug  |
 /// | `Err(Validation(InvalidTx))`         | anything  | `Err(Rejected)` — tx invalid, reject it     |
 /// | `Err(_ /* DB/header/precompile */)`  | anything  | `Err(Fatal)` — abort the build              |
 ///
@@ -182,14 +258,14 @@ where
 /// is a per-tx rejection; any other executor error is a fatal, non-tx
 /// fault that must abort the build rather than silently drop a commitment.
 fn interpret_apply_result(
-    exec_result: Result<(), BlockExecutionError>,
-    captured: Option<PreconfReceipt>,
+    exec_result: Result<GasOutput, BlockExecutionError>,
+    captured: Option<ExecOutcome>,
     fees: FeeFacts,
-) -> Result<PreconfReceipt, ApplyError> {
+) -> Result<(GasOutput, ExecOutcome), ApplyError> {
     match exec_result {
-        Ok(()) => captured.ok_or_else(|| {
+        Ok(gas) => captured.map(|outcome| (gas, outcome)).ok_or_else(|| {
             // Executor returned Ok but never ran the closure → we have no
-            // receipt yet the tx may have been committed. State is now
+            // outcome yet the tx may have been committed. State is now
             // inconsistent; treat as fatal (abort) rather than reject.
             ApplyError::Fatal(BlockExecutionError::msg("BlockBuilder closure not invoked").into())
         }),
@@ -203,29 +279,34 @@ fn interpret_apply_result(
     }
 }
 
-/// Convert a revm [`ExecutionResult`] into a [`PreconfReceipt`].
+/// What only the EVM's own execution result can answer.
+///
+/// Everything the consensus receipt carries is read from the receipt instead
+/// (see [`block_position`]) — this covers the two things that never reach a
+/// block: whether/why a transaction reverted, and the revert data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutcome {
+    /// Whether execution succeeded.
+    pub status: bool,
+    /// Revert / halt reason — empty on success.
+    pub reason: String,
+    /// Raw revert return data.
+    pub revert_data: Bytes,
+}
+
+/// Read [`ExecOutcome`] off a revm [`ExecutionResult`].
 ///
 /// Pure function — no side effects. Generic over the halt-reason type so
 /// callers can pass either the stock revm `HaltReason` or the OP-stack
 /// `OpHaltReason`; the halt reason is mapped to op-geth-compatible text via
 /// [`GethHaltReason`] (e.g. out-of-gas → "out of gas") when the concrete type
 /// is recognized, else rendered via `Debug`.
-pub fn build_receipt<H: core::fmt::Debug + 'static>(
-    tx_hash: TxHash,
-    block_height: u64,
-    result: &ExecutionResult<H>,
-) -> PreconfReceipt {
+pub fn exec_outcome<H: core::fmt::Debug + 'static>(result: &ExecutionResult<H>) -> ExecOutcome {
     match result {
-        ExecutionResult::Success { gas, logs, .. } => PreconfReceipt {
-            tx_hash,
-            block_height,
-            status: true,
-            logs: logs.clone(),
-            gas_used: gas.tx_gas_used(),
-            reason: String::new(),
-            revert_data: Bytes::new(),
-        },
-        ExecutionResult::Revert { gas, output, .. } => {
+        ExecutionResult::Success { .. } => {
+            ExecOutcome { status: true, reason: String::new(), revert_data: Bytes::new() }
+        }
+        ExecutionResult::Revert { output, .. } => {
             // Decode `Error(string)` → "execution reverted: <msg>", matching
             // op-geth's `abi.UnpackRevert`. Panic/custom/raw reverts miss the
             // selector → `Err` → bare "execution reverted".
@@ -233,26 +314,11 @@ pub fn build_receipt<H: core::fmt::Debug + 'static>(
                 Ok(r) => format!("execution reverted: {}", r.reason),
                 Err(_) => "execution reverted".to_string(),
             };
-            PreconfReceipt {
-                tx_hash,
-                block_height,
-                status: false,
-                // revm surfaces "logs emitted before revert" as an
-                // observability field, but the EVM's state rollback erases
-                // them from statedb. Op-geth reads receipts from statedb
-                // (`state_processor.go:281`) so its Failed-status receipts
-                // observe empty logs naturally. To keep our preconf receipt
-                // byte-equal with the eventually-sealed receipt, we drop
-                // revm's pre-revert log snapshot here.
-                logs: Vec::new(),
-                gas_used: gas.tx_gas_used(),
-                reason,
-                revert_data: output.clone(),
-            }
+            ExecOutcome { status: false, reason, revert_data: output.clone() }
         }
-        ExecutionResult::Halt { reason, gas, .. } => {
+        ExecutionResult::Halt { reason, .. } => {
             // Map to op-geth's vm-error text when the concrete halt type is
-            // known (production: OpHaltReason). build_receipt is generic over
+            // known (production: OpHaltReason). `exec_outcome` is generic over
             // the EVM's abstract HaltReason, so we downcast rather than thread
             // a new trait bound through the (deliberately generic) builder
             // path; unknown halt types keep their opaque Debug form.
@@ -262,16 +328,49 @@ pub fn build_receipt<H: core::fmt::Debug + 'static>(
                 .map(|h| h.geth_halt_reason())
                 .or_else(|| any.downcast_ref::<HaltReason>().map(|h| h.geth_halt_reason()))
                 .unwrap_or_else(|| format!("{reason:?}"));
-            PreconfReceipt {
-                tx_hash,
-                block_height,
-                status: false,
-                logs: Vec::new(),
-                gas_used: gas.tx_gas_used(),
-                reason,
-                revert_data: Bytes::new(),
-            }
+            ExecOutcome { status: false, reason, revert_data: Bytes::new() }
         }
+    }
+}
+
+/// Where this transaction sits in the block, read off the receipts the
+/// executor has accumulated so far.
+///
+/// The last entry is this transaction's receipt — the same object that gets
+/// sealed — so every field here is what the block will say, not a parallel
+/// reconstruction of it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BlockPosition {
+    /// Index of this transaction in the block.
+    pub tx_index: u64,
+    /// Block gas used through this transaction, inclusive.
+    pub cumulative_gas_used: u64,
+    /// Bloom over this transaction's logs.
+    pub logs_bloom: Bloom,
+    /// Logs the block emitted before this transaction — the `logIndex` its
+    /// first log carries.
+    pub log_index_base: u64,
+    /// This transaction's own logs.
+    pub logs: Vec<Log>,
+}
+
+/// Read [`BlockPosition`] off the executor's receipts.
+///
+/// An empty slice yields zeros. That cannot happen after a successful apply —
+/// the executor pushes a receipt before returning — but returning zeros rather
+/// than panicking keeps a defensive caller safe, and lets the function be
+/// unit-tested from an empty start.
+pub fn block_position<R>(receipts: &[R]) -> BlockPosition
+where
+    R: TxReceipt<Log = Log>,
+{
+    let Some((last, earlier)) = receipts.split_last() else { return BlockPosition::default() };
+    BlockPosition {
+        tx_index: earlier.len() as u64,
+        cumulative_gas_used: last.cumulative_gas_used(),
+        logs_bloom: last.bloom(),
+        log_index_base: earlier.iter().map(|r| r.logs().len() as u64).sum(),
+        logs: last.logs().to_vec(),
     }
 }
 
@@ -323,7 +422,7 @@ impl GethHaltReason for OpHaltReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{B256, Bytes, Log, LogData, address, b256, hex, keccak256};
+    use alloy_primitives::{B256, Bytes, Log, LogData, address, b256, hex};
     use reth_revm::context::result::{
         EVMError, HaltReason, InvalidTransaction, OutOfGasError, Output, ResultGas, SuccessReason,
     };
@@ -334,10 +433,6 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("dummy db error")]
     struct DummyDbErr;
-
-    fn h(byte: u8) -> TxHash {
-        TxHash::from([byte; 32])
-    }
 
     fn gas(used: u64) -> ResultGas {
         // total_gas_spent = used, no refund, no floor —
@@ -355,77 +450,127 @@ mod tests {
         }
     }
 
+    fn receipt_with(cumulative_gas_used: u64, log_count: usize) -> op_alloy_consensus::OpReceipt {
+        let logs = (0..log_count)
+            .map(|i| Log {
+                address: address!("0000000000000000000000000000000000000001"),
+                data: LogData::new_unchecked(vec![B256::from([i as u8; 32])], Bytes::new()),
+            })
+            .collect();
+        op_alloy_consensus::OpReceipt::Eip1559(alloy_consensus::Receipt {
+            status: alloy_consensus::Eip658Value::Eip658(true),
+            cumulative_gas_used,
+            logs,
+        })
+    }
+
     #[test]
-    fn build_receipt_success_populates_logs_and_status_true() {
+    fn block_position_empty_receipts_is_all_zero() {
+        let pos = block_position::<op_alloy_consensus::OpReceipt>(&[]);
+        assert_eq!(pos, BlockPosition::default());
+    }
+
+    #[test]
+    fn block_position_first_tx_starts_at_zero() {
+        let receipts = [receipt_with(21_000, 2)];
+        let pos = block_position(&receipts);
+        assert_eq!(pos.tx_index, 0);
+        assert_eq!(pos.cumulative_gas_used, 21_000);
+        assert_eq!(pos.log_index_base, 0);
+        assert_eq!(pos.logs.len(), 2);
+    }
+
+    /// `log_index_base` counts **logs**, not receipts — a block whose earlier
+    /// transactions emitted 5 logs between them puts this one's first log at 5,
+    /// regardless of how many transactions that took.
+    #[test]
+    fn block_position_log_index_base_counts_logs_not_receipts() {
+        let receipts = [
+            receipt_with(21_000, 0), // deposit-shaped: no logs
+            receipt_with(50_000, 3),
+            receipt_with(80_000, 2),
+            receipt_with(95_000, 1),
+        ];
+        let pos = block_position(&receipts);
+        assert_eq!(pos.tx_index, 3);
+        assert_eq!(pos.cumulative_gas_used, 95_000);
+        assert_eq!(pos.log_index_base, 5);
+        assert_eq!(pos.logs.len(), 1);
+    }
+
+    /// The bloom is derived from the receipt's own logs, never stored, so it
+    /// cannot disagree with `logs`.
+    #[test]
+    fn block_position_bloom_matches_its_own_logs() {
+        let receipts = [receipt_with(21_000, 0), receipt_with(50_000, 2)];
+        let pos = block_position(&receipts);
+        assert_eq!(pos.logs_bloom, receipts[1].bloom());
+        assert_ne!(pos.logs_bloom, Bloom::ZERO);
+    }
+
+    // Logs and block position moved to `block_position`; the "revert carries no
+    // logs" and "tx_hash / block_height survive" cases are covered end to end
+    // by `integration-tests/tests/preconf/full_receipt.rs`.
+
+    #[test]
+    fn exec_outcome_success_has_status_true() {
         let log = sample_log();
         let result: ExecutionResult<HaltReason> = ExecutionResult::Success {
             reason: SuccessReason::Return,
             gas: gas(21_000),
-            logs: vec![log.clone()],
+            logs: vec![log],
             output: Output::Call(Bytes::new()),
         };
-        let r = build_receipt(h(1), 42, &result);
-        assert_eq!(r.tx_hash, h(1));
-        assert_eq!(r.block_height, 42);
-        assert!(r.status);
-        assert_eq!(r.gas_used, 21_000);
-        assert_eq!(r.logs, vec![log]);
-        assert!(r.reason.is_empty());
-        assert!(r.revert_data.is_empty());
+        let o = exec_outcome(&result);
+        assert!(o.status);
+        assert!(o.reason.is_empty());
+        assert!(o.revert_data.is_empty());
     }
 
     #[test]
-    fn build_receipt_revert_carries_revert_data_and_status_false() {
+    fn exec_outcome_revert_carries_revert_data_and_status_false() {
         let revert_payload = Bytes::from_static(&hex!("08c379a0"));
         let result: ExecutionResult<HaltReason> = ExecutionResult::Revert {
             gas: gas(30_000),
             logs: vec![],
             output: revert_payload.clone(),
         };
-        let r = build_receipt(h(2), 100, &result);
-        assert_eq!(r.tx_hash, h(2));
-        assert_eq!(r.block_height, 100);
-        assert!(!r.status);
-        assert_eq!(r.gas_used, 30_000);
-        assert!(r.logs.is_empty());
+        let o = exec_outcome(&result);
+        assert!(!o.status);
         // Bare `Error(string)` selector with no body is NOT decodable →
         // reason falls back to the plain string (matches op-geth's behavior
         // for reverts it can't unpack).
-        assert_eq!(r.reason, "execution reverted");
-        assert_eq!(r.revert_data, revert_payload);
+        assert_eq!(o.reason, "execution reverted");
+        assert_eq!(o.revert_data, revert_payload);
     }
 
     #[test]
-    fn build_receipt_revert_decodes_error_string_reason() {
+    fn exec_outcome_revert_decodes_error_string_reason() {
         // A well-formed `Error(string)` payload (as emitted by
         // `require(false, "…")`) must surface as `execution reverted: <msg>`,
         // byte-for-byte matching op-geth's `abi.UnpackRevert` output.
         let payload = Bytes::from(Revert { reason: "allowance insufficient".into() }.abi_encode());
         let result: ExecutionResult<HaltReason> =
             ExecutionResult::Revert { gas: gas(30_000), logs: vec![], output: payload.clone() };
-        let r = build_receipt(h(4), 101, &result);
-        assert!(!r.status);
-        assert_eq!(r.reason, "execution reverted: allowance insufficient");
+        let o = exec_outcome(&result);
+        assert!(!o.status);
+        assert_eq!(o.reason, "execution reverted: allowance insufficient");
         // Raw ABI bytes are still preserved verbatim for downstream consumers.
-        assert_eq!(r.revert_data, payload);
+        assert_eq!(o.revert_data, payload);
     }
 
     #[test]
-    fn build_receipt_halt_formats_reason_and_status_false() {
+    fn exec_outcome_halt_formats_reason_and_status_false() {
         let result: ExecutionResult<HaltReason> = ExecutionResult::Halt {
             reason: HaltReason::OutOfGas(OutOfGasError::Basic),
             gas: gas(50_000),
             logs: vec![],
         };
-        let r = build_receipt(h(3), 200, &result);
-        assert_eq!(r.tx_hash, h(3));
-        assert_eq!(r.block_height, 200);
-        assert!(!r.status);
-        assert_eq!(r.gas_used, 50_000);
-        assert!(r.logs.is_empty());
+        let o = exec_outcome(&result);
+        assert!(!o.status);
         // OOG halt reason is mapped to op-geth's text.
-        assert_eq!(r.reason, "out of gas");
-        assert!(r.revert_data.is_empty());
+        assert_eq!(o.reason, "out of gas");
+        assert!(o.revert_data.is_empty());
     }
 
     #[test]
@@ -448,109 +593,52 @@ mod tests {
         assert_eq!(OpHaltReason::FailedDeposit.geth_halt_reason(), "FailedDeposit");
     }
 
-    #[test]
-    fn build_receipt_success_with_no_logs_yields_empty_log_vec() {
-        let result: ExecutionResult<HaltReason> = ExecutionResult::Success {
-            reason: SuccessReason::Stop,
-            gas: gas(21_000),
-            logs: vec![],
-            output: Output::Call(Bytes::new()),
-        };
-        let r = build_receipt(h(4), 1, &result);
-        assert!(r.status);
-        assert!(r.logs.is_empty());
-    }
-
-    /// EIP-658 semantics: a failed receipt (`status = false`) carries **no
-    /// logs**, even if the EVM's `ExecutionResult::Revert` variant surfaces
-    /// logs. `build_receipt` must strip them. Op-geth does the same at the
-    /// `Status=Failed` path — dropping this would break receipt byte-equality
-    /// with a normally-sealed receipt for the same tx.
-    #[test]
-    fn build_receipt_revert_strips_logs_even_when_present() {
-        let log = sample_log();
-        let result: ExecutionResult<HaltReason> = ExecutionResult::Revert {
-            gas: gas(30_000),
-            logs: vec![log],
-            output: Bytes::from_static(&hex!("08c379a0")),
-        };
-        let r = build_receipt(h(2), 100, &result);
-        assert!(r.logs.is_empty(), "EIP-658 requires failed receipts drop logs; got {:?}", r.logs);
-        assert!(!r.status);
-    }
-
-    /// `build_receipt` is generic over the halt-reason type `H`. Stock revm
+    /// `exec_outcome` is generic over the halt-reason type `H`. Stock revm
     /// callers use `HaltReason`; op-stack callers use `OpHaltReason` (which
     /// adds the `FailedDeposit` variant on top of `Base(HaltReason)`). Lock
     /// the op-stack instantiation so a future breaking change to
     /// `OpHaltReason` (renaming `FailedDeposit`, removing `Debug`, etc.)
     /// gets caught at build time instead of at devnet.
     #[test]
-    fn build_receipt_generic_over_op_halt_reason() {
+    fn exec_outcome_generic_over_op_halt_reason() {
         use op_revm::OpHaltReason;
         let result: ExecutionResult<OpHaltReason> = ExecutionResult::Halt {
             reason: OpHaltReason::FailedDeposit,
             gas: gas(50_000),
             logs: vec![],
         };
-        let r = build_receipt(h(9), 1, &result);
-        assert!(!r.status);
+        let o = exec_outcome(&result);
+        assert!(!o.status);
         assert!(
-            r.reason.contains("FailedDeposit"),
+            o.reason.contains("FailedDeposit"),
             "expected 'FailedDeposit' in reason, got {}",
-            r.reason
+            o.reason
         );
     }
 
-    #[test]
-    fn build_receipt_preserves_tx_hash_and_block_height_bytewise() {
-        // Make sure no field swap shenanigans — TxHash and block_height
-        // must propagate verbatim.
-        let want_hash = TxHash::from(keccak256(b"some-tx-bytes"));
-        let want_height: u64 = 0xdead_beef_u64;
-        let result: ExecutionResult<HaltReason> = ExecutionResult::Success {
-            reason: SuccessReason::Return,
-            gas: gas(1),
-            logs: vec![],
-            output: Output::Call(Bytes::new()),
-        };
-        let r = build_receipt(want_hash, want_height, &result);
-        assert_eq!(r.tx_hash, want_hash);
-        assert_eq!(r.block_height, want_height);
-        let other_hash: B256 =
-            b256!("0000000000000000000000000000000000000000000000000000000000000001");
-        assert_ne!(r.tx_hash, other_hash);
-    }
-
-    fn sample_receipt() -> PreconfReceipt {
-        PreconfReceipt {
-            tx_hash: h(7),
-            block_height: 1,
-            status: true,
-            logs: vec![],
-            gas_used: 21_000,
-            reason: String::new(),
-            revert_data: Bytes::new(),
-        }
+    fn sample_outcome() -> ExecOutcome {
+        ExecOutcome { status: true, reason: String::new(), revert_data: Bytes::new() }
     }
 
     /// Happy path: `execute_transaction_with_result_closure` returned `Ok`
     /// AND the closure ran (captured is Some) → interpret returns the
-    /// captured receipt verbatim.
+    /// gas/outcome pair verbatim.
     #[test]
     fn interpret_apply_result_ok_with_captured_returns_receipt() {
-        let receipt = sample_receipt();
-        let out = interpret_apply_result(Ok(()), Some(receipt.clone()), fees());
-        assert_eq!(out.expect("ok path returns the captured receipt"), receipt);
+        let outcome = sample_outcome();
+        let out = interpret_apply_result(Ok(GasOutput::new(21_000)), Some(outcome.clone()), fees());
+        let (gas, got) = out.expect("ok path returns the captured outcome");
+        assert_eq!(gas.tx_gas_used(), 21_000);
+        assert_eq!(got, outcome);
     }
 
     /// Upstream trait bug: reth returned `Ok` but never invoked the closure.
-    /// We have no receipt yet the tx may have committed → state is
+    /// We have no outcome yet the tx may have committed → state is
     /// inconsistent, so interpret must surface this as `Fatal` (abort the
     /// build) rather than a per-tx rejection based on our own bug.
     #[test]
     fn interpret_apply_result_ok_without_captured_returns_fatal() {
-        match interpret_apply_result(Ok(()), None, fees()) {
+        match interpret_apply_result(Ok(GasOutput::new(21_000)), None, fees()) {
             Err(ApplyError::Fatal(_)) => {}
             other => panic!("expected Fatal, got {other:?}"),
         }
@@ -657,23 +745,23 @@ mod tests {
         );
     }
 
-    /// The `Err` branch shadows any captured receipt — even if the closure
+    /// The `Err` branch shadows any captured outcome — even if the closure
     /// happened to have written to `captured` before the executor errored
-    /// out, we must NOT return that partial receipt as a success. Locks
+    /// out, we must NOT return that partial outcome as a success. Locks
     /// the precedence of the branches in `interpret_apply_result`.
     #[test]
     fn interpret_apply_result_invalid_tx_takes_precedence_over_captured() {
-        let receipt = sample_receipt();
+        let outcome = sample_outcome();
         let err = BlockExecutionError::evm(
             EVMError::<DummyDbErr, InvalidTransaction>::Transaction(
                 InvalidTransaction::NonceTooLow { tx: 1, state: 2 },
             ),
             B256::ZERO,
         );
-        let out = interpret_apply_result(Err(err), Some(receipt), fees());
+        let out = interpret_apply_result(Err(err), Some(outcome), fees());
         assert!(
             matches!(out, Err(ApplyError::Rejected(_))),
-            "Err path must ignore captured receipt, got {out:?}"
+            "Err path must ignore captured outcome, got {out:?}"
         );
     }
 
@@ -711,10 +799,10 @@ mod tests {
     /// `revert_data`'s first 4 bytes are the ABI selector. The
     /// canonical `Error(string)` selector is `0x08c379a0` (see solc
     /// docs / EIP-838). SDKs downstream (op-geth compat) unpack via
-    /// this selector; ensuring `build_receipt` preserves the selector
+    /// this selector; ensuring `exec_outcome` preserves the selector
     /// prefix intact is a byte-level contract, not a doc.
     #[test]
-    fn build_receipt_revert_data_preserves_error_selector() {
+    fn exec_outcome_revert_data_preserves_error_selector() {
         // Full `Error("boom")` ABI-encoded payload:
         //   selector (4)   = 0x08c379a0
         //   offset  (32)   = 0x00..20
@@ -728,13 +816,13 @@ mod tests {
         ));
         let result: ExecutionResult<HaltReason> =
             ExecutionResult::Revert { gas: gas(30_000), logs: vec![], output: payload.clone() };
-        let r = build_receipt(h(2), 100, &result);
+        let o = exec_outcome(&result);
 
         // Full payload preserved (structural check, not just length).
-        assert_eq!(r.revert_data, payload);
+        assert_eq!(o.revert_data, payload);
 
         // 4-byte selector at the head is exactly Error(string).
-        let selector = &r.revert_data[..4];
+        let selector = &o.revert_data[..4];
         assert_eq!(
             selector,
             &[0x08, 0xc3, 0x79, 0xa0],
@@ -742,13 +830,13 @@ mod tests {
         );
     }
 
-    /// `build_receipt`'s `Halt` branch renders `HaltReason` via
+    /// `exec_outcome`'s `Halt` branch renders `HaltReason` via
     /// its `Debug` impl. Existing coverage only checks
     /// `OutOfGas::Basic`; a Debug-format shift on other variants would
     /// silently degrade log messages. Spot-check a few common variants
     /// so upstream Debug drift trips a test.
     #[test]
-    fn build_receipt_halt_reason_covers_common_variants() {
+    fn exec_outcome_halt_reason_covers_common_variants() {
         for reason in [
             HaltReason::OpcodeNotFound,
             HaltReason::InvalidJump,
@@ -758,11 +846,48 @@ mod tests {
         ] {
             let result: ExecutionResult<HaltReason> =
                 ExecutionResult::Halt { reason: reason.clone(), gas: gas(50_000), logs: vec![] };
-            let r = build_receipt(h(3), 200, &result);
-            assert!(!r.status, "halt ⇒ status false");
-            assert!(!r.reason.is_empty(), "halt reason string must be non-empty for {reason:?}");
-            assert!(r.revert_data.is_empty(), "halt has no revert data");
-            assert_eq!(r.gas_used, 50_000);
+            let o = exec_outcome(&result);
+            assert!(!o.status, "halt ⇒ status false");
+            assert!(!o.reason.is_empty(), "halt reason string must be non-empty for {reason:?}");
+            assert!(o.revert_data.is_empty(), "halt has no revert data");
         }
+    }
+
+    fn facts(to: Option<Address>, max_fee: u128, tip: Option<u128>) -> TxFacts {
+        TxFacts {
+            tx_type: 2,
+            from: address!("00000000000000000000000000000000000000aa"),
+            to,
+            nonce: 7,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: tip,
+        }
+    }
+
+    /// Legacy and 2930 transactions carry no priority fee; what they bid is
+    /// what they pay.
+    #[test]
+    fn effective_gas_price_without_tip_is_the_bid() {
+        assert_eq!(facts(None, 1_000, None).effective_gas_price(300), 1_000);
+    }
+
+    #[test]
+    fn effective_gas_price_is_base_fee_plus_tip_when_under_the_cap() {
+        assert_eq!(facts(None, 1_000, Some(200)).effective_gas_price(300), 500);
+    }
+
+    /// The fee cap wins when base fee plus tip would exceed it.
+    #[test]
+    fn effective_gas_price_is_capped_by_max_fee() {
+        assert_eq!(facts(None, 400, Some(200)).effective_gas_price(300), 400);
+    }
+
+    /// A creation has no recipient, so the address it deploys to is derived
+    /// from the sender and the nonce it used.
+    #[test]
+    fn contract_address_is_set_only_for_creations() {
+        let sender = address!("00000000000000000000000000000000000000aa");
+        assert_eq!(facts(None, 0, None).contract_address(), Some(sender.create(7)));
+        assert_eq!(facts(Some(Address::ZERO), 0, None).contract_address(), None);
     }
 }

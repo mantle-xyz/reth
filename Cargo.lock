@@ -5352,6 +5352,7 @@ dependencies = [
 name = "mantle-reth-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-genesis",
  "alloy-network",
  "alloy-op-hardforks",
@@ -5373,6 +5374,7 @@ dependencies = [
  "mantle-reth-rpc-ext",
  "mantle-reth-ws-proxy",
  "op-alloy-consensus",
+ "op-alloy-rpc-types",
  "op-alloy-rpc-types-engine",
  "op-revm",
  "reth-chainspec",
@@ -5426,6 +5428,7 @@ dependencies = [
  "metrics",
  "op-alloy-consensus",
  "op-alloy-flz",
+ "op-alloy-rpc-types",
  "op-alloy-rpc-types-engine",
  "op-revm",
  "parking_lot",
@@ -5443,6 +5446,7 @@ dependencies = [
  "reth-optimism-node",
  "reth-optimism-payload-builder",
  "reth-optimism-primitives",
+ "reth-optimism-rpc",
  "reth-optimism-txpool",
  "reth-payload-builder",
  "reth-payload-builder-primitives",
@@ -5479,6 +5483,7 @@ dependencies = [
  "jsonrpsee",
  "mantle-reth-flashblocks",
  "metrics",
+ "op-alloy-rpc-types",
  "op-revm",
  "reth-chainspec",
  "reth-optimism-evm",

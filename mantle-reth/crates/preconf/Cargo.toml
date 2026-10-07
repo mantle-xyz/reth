@@ -12,6 +12,11 @@ description = "Mantle preconfirmation core types for op-reth"
 workspace = true
 
 [dependencies]
+# L1 fee receipt fields — reuse op-reth's own builder so the figures preconf
+# reports and the ones `eth_getTransactionReceipt` reports come from one place.
+reth-optimism-rpc.workspace = true
+op-alloy-rpc-types.workspace = true
+
 # The flashblock wire format, shared with the RPC-side consumer.
 mantle-reth-flashblocks-types.workspace = true
 

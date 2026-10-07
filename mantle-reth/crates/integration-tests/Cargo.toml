@@ -75,6 +75,9 @@ reth-chainspec = { workspace = true }
 reth-tracing = { workspace = true }
 
 # alloy
+# `TxReceipt` — the full-receipt test reads `logs()` / `bloom()` / `status()`
+# off the sealed receipt's inner consensus type.
+alloy-consensus = { workspace = true }
 alloy-genesis = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
@@ -87,6 +90,11 @@ alloy-op-hardforks = { workspace = true }
 alloy-signer-local = { workspace = true }
 op-alloy-consensus = { workspace = true }
 op-alloy-rpc-types-engine = { workspace = true }
+# `OpTransactionReceipt` — the full-receipt test deserialises
+# `eth_getTransactionReceipt` into this rather than `serde_json::Value`, so a
+# field-name / encoding mismatch fails to parse instead of silently comparing
+# the wrong thing.
+op-alloy-rpc-types = { workspace = true }
 
 # revm / op-revm (for replay tests)
 revm = { workspace = true, features = ["std"] }

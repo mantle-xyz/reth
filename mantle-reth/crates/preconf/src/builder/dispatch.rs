@@ -285,8 +285,8 @@ where
     // closure ends up spending less than the tx claimed. Uses `>` so
     // exact-boundary hits (`used + limit == max`) are accepted.
     let tx_gas_limit = alloy_consensus::Transaction::gas_limit(entry.tx.as_ref());
-    if is_rpc &&
-        loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
+    if is_rpc
+        && loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
     {
         debug!(
             target: "mantle::preconf::dispatch",
@@ -372,8 +372,8 @@ where
             //
             // A `Replay` entry came out of this file; writing it back on every
             // block it is retried in would grow it without adding anything.
-            if let Some(journal) = journal &&
-                entry.source != PreconfSource::Replay
+            if let Some(journal) = journal
+                && entry.source != PreconfSource::Replay
             {
                 let record = JournalEntry::for_executed(
                     hash,
@@ -479,7 +479,7 @@ mod tests {
     use std::time::Duration;
 
     use alloy_consensus::{Signed, Transaction, TxLegacy};
-    use alloy_primitives::{Address, B256, Bytes, Signature};
+    use alloy_primitives::{Address, B256, Bloom, Bytes, Signature};
     use tokio::sync::oneshot;
 
     use crate::types::PushResult;
@@ -680,6 +680,17 @@ mod tests {
             gas_used: tx.gas_limit(),
             reason: String::new(),
             revert_data: Bytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: tx.gas_limit(),
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+            effective_gas_price: 0,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         })
     }
 
@@ -757,6 +768,17 @@ mod tests {
                 gas_used: tx.gas_limit(),
                 reason: "execution reverted".to_string(),
                 revert_data: Bytes::new(),
+                tx_index: 0,
+                cumulative_gas_used: tx.gas_limit(),
+                logs_bloom: Bloom::default(),
+                log_index_base: 0,
+                tx_type: 2,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+                effective_gas_price: 0,
+                block_timestamp: 0,
+                l1_fields: Default::default(),
             })
         }
 
@@ -1481,6 +1503,17 @@ mod tests {
                 gas_used: alloy_consensus::Transaction::gas_limit(tx.as_ref()),
                 reason: String::new(),
                 revert_data: Bytes::new(),
+                tx_index: 0,
+                cumulative_gas_used: alloy_consensus::Transaction::gas_limit(tx.as_ref()),
+                logs_bloom: Bloom::default(),
+                log_index_base: 0,
+                tx_type: 2,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+                effective_gas_price: 0,
+                block_timestamp: 0,
+                l1_fields: Default::default(),
             })
         };
 

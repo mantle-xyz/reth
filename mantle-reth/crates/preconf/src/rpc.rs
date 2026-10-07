@@ -314,8 +314,9 @@ fn build_timeout_event(
         status: WireStatus::Timeout,
         reason: format!("preconf timeout after {preconf_timeout:?}"),
         block_height: 0,
-        // No EVM apply happened → wire logs = null (tri-state).
-        receipt: PreconfTxReceipt { logs: None },
+        // No EVM apply happened → every receipt field stays absent, and wire
+        // logs are the tri-state `null`.
+        receipt: PreconfTxReceipt { logs: None, ..Default::default() },
     }
 }
 
@@ -357,13 +358,23 @@ impl DynPreconfHandler for PreconfRpcHandler {
 impl From<PreconfReceipt> for PreconfTxEvent {
     fn from(r: PreconfReceipt) -> Self {
         let status = if r.status { WireStatus::Success } else { WireStatus::Failed };
+        let base = r.log_index_base;
         let logs = r
             .logs
             .into_iter()
-            .map(|log| PreconfLog {
+            .enumerate()
+            .map(|(i, log)| PreconfLog {
                 address: log.address,
                 topics: log.data.topics().to_vec(),
                 data: log.data.data,
+                block_number: Some(r.block_height),
+                block_timestamp: Some(r.block_timestamp),
+                transaction_hash: Some(r.tx_hash),
+                transaction_index: Some(r.tx_index),
+                log_index: Some(base + i as u64),
+                // Nothing here came off a reorged block; the field exists to
+                // match the standard shape, not to carry information.
+                removed: Some(false),
             })
             .collect();
         Self {
@@ -371,10 +382,23 @@ impl From<PreconfReceipt> for PreconfTxEvent {
             status,
             reason: r.reason,
             block_height: r.block_height,
-            // Apply happened (via receipt path) — wrap logs in Some
-            // even when empty, to signal "apply succeeded, no logs
-            // emitted" (distinguished from Timeout's `None`).
-            receipt: PreconfTxReceipt { logs: Some(logs) },
+            receipt: PreconfTxReceipt {
+                // Apply happened (via receipt path) — wrap logs in Some
+                // even when empty, to signal "apply succeeded, no logs
+                // emitted" (distinguished from Timeout's `None`).
+                logs: Some(logs),
+                status: Some(u64::from(r.status)),
+                gas_used: Some(r.gas_used),
+                cumulative_gas_used: Some(r.cumulative_gas_used),
+                transaction_index: Some(r.tx_index),
+                logs_bloom: Some(r.logs_bloom),
+                tx_type: Some(u64::from(r.tx_type)),
+                from: Some(r.from),
+                to: r.to,
+                contract_address: r.contract_address,
+                effective_gas_price: Some(r.effective_gas_price),
+                l1_fields: r.l1_fields,
+            },
         }
     }
 }
@@ -405,7 +429,7 @@ pub(crate) fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Addre
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, Bytes as PrimBytes, Log, LogData};
+    use alloy_primitives::{Address, B256, Bloom, Bytes as PrimBytes, Log, LogData};
     use mantle_reth_rpc_ext::PreconfStatus as WireStatus;
     use std::collections::HashSet;
 
@@ -428,6 +452,17 @@ mod tests {
             gas_used: 21_000,
             reason: if success { String::new() } else { "execution reverted".to_string() },
             revert_data: PrimBytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 21_000,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 1_000_000_000,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         }
     }
 
@@ -459,6 +494,17 @@ mod tests {
             gas_used: 0,
             reason: String::new(),
             revert_data: PrimBytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 0,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 0,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         };
         let event: PreconfTxEvent = receipt.into();
         let logs = event.receipt.logs.expect("Some logs");
@@ -479,6 +525,17 @@ mod tests {
             gas_used: 0,
             reason: String::new(),
             revert_data: PrimBytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 0,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 0,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         };
         let event: PreconfTxEvent = receipt.into();
         assert_eq!(event.receipt.logs.as_ref().map(|l| l.len()), Some(0));
@@ -584,6 +641,17 @@ mod tests {
             gas_used: 21_000,
             reason: "execution reverted".to_string(),
             revert_data: PrimBytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 21_000,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: sender,
+            to: Some(RECIPIENT),
+            contract_address: None,
+            effective_gas_price: 1_000_000_000,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         });
         assert_eq!(event.status, WireStatus::Failed, "precondition: this is the reverted arm");
 
@@ -594,5 +662,69 @@ mod tests {
             "the classifier must know the commitment, or a reorg reinject is \
              re-gated as a fresh submission and `mark_committed` cannot count it",
         );
+    }
+
+    /// `logIndex` is block-global: the first log of a transaction whose block
+    /// already emitted 5 logs is 5, not 0.
+    #[test]
+    fn from_receipt_numbers_logs_from_the_block_wide_base() {
+        let log = |n: u8| alloy_primitives::Log {
+            address: alloy_primitives::Address::ZERO,
+            data: alloy_primitives::LogData::new_unchecked(
+                vec![alloy_primitives::B256::from([n; 32])],
+                PrimBytes::new(),
+            ),
+        };
+        let event = PreconfTxEvent::from(PreconfReceipt {
+            tx_hash: alloy_primitives::TxHash::from([7u8; 32]),
+            block_height: 500,
+            status: true,
+            logs: vec![log(1), log(2)],
+            gas_used: 48_000,
+            reason: String::new(),
+            revert_data: PrimBytes::new(),
+            tx_index: 3,
+            cumulative_gas_used: 95_000,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            log_index_base: 5,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 1_000_000_000,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
+        });
+
+        assert_eq!(event.receipt.status, Some(1));
+        assert_eq!(event.receipt.gas_used, Some(48_000));
+        assert_eq!(event.receipt.cumulative_gas_used, Some(95_000));
+        assert_eq!(event.receipt.transaction_index, Some(3));
+
+        let logs = event.receipt.logs.expect("apply happened");
+        assert_eq!(logs[0].log_index, Some(5));
+        assert_eq!(logs[1].log_index, Some(6));
+        for l in &logs {
+            assert_eq!(l.block_number, Some(500));
+            assert_eq!(l.transaction_index, Some(3));
+            assert_eq!(l.transaction_hash, Some(alloy_primitives::B256::from([7u8; 32])));
+            assert_eq!(l.removed, Some(false));
+        }
+    }
+
+    /// A timeout means no EVM apply happened, so nothing but the tri-state
+    /// `logs: null` may appear — the response stays byte-identical to op-geth's.
+    #[test]
+    fn timeout_event_carries_no_receipt_fields() {
+        let event = build_timeout_event(
+            alloy_primitives::TxHash::from([1u8; 32]),
+            std::time::Duration::from_millis(500),
+        );
+        assert!(event.receipt.logs.is_none());
+        assert!(event.receipt.status.is_none());
+        assert!(event.receipt.gas_used.is_none());
+        assert!(event.receipt.cumulative_gas_used.is_none());
+        assert!(event.receipt.transaction_index.is_none());
+        assert!(event.receipt.logs_bloom.is_none());
     }
 }
