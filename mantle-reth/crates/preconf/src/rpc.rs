@@ -41,7 +41,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::{
-    PreconfClassifier, PreconfConfig, PreconfTxSet,
+    PreconfConfig, PreconfTxSet,
     admission::{AdmittedTx, DynAdmission},
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
 };
@@ -53,9 +53,6 @@ pub struct PreconfRpcHandler {
     admission: Arc<dyn DynAdmission>,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
-    /// Owns the allowlists and every commitment record. The single decider of
-    /// preconf eligibility, shared with the validator and the builder.
-    classifier: Arc<PreconfClassifier>,
 }
 
 impl std::fmt::Debug for PreconfRpcHandler {
@@ -76,9 +73,8 @@ impl PreconfRpcHandler {
         admission: Arc<dyn DynAdmission>,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
-        classifier: Arc<PreconfClassifier>,
     ) -> Self {
-        Self { admission, fifo, cfg, classifier }
+        Self { admission, fifo, cfg }
     }
 
     /// Claim the `(sender, nonce)` slot for a commitment whose receipt is going
@@ -104,7 +100,9 @@ impl PreconfRpcHandler {
         // precedes the block — is what makes it available to both later events
         // (`forward → release_unless_committed` and the canonical notification)
         // no matter which of them runs first.
-        if let Err(owner) = self.classifier.mark_promised(hash, sender, nonce, event.block_height) {
+        if let Err(owner) =
+            self.fifo.claims().mark_promised(hash, sender, nonce, event.block_height)
+        {
             warn!(
                 target: "mantle::preconf::rpc",
                 ?hash, ?owner,
@@ -433,7 +431,7 @@ mod tests {
     use mantle_reth_rpc_ext::PreconfStatus as WireStatus;
     use std::collections::HashSet;
 
-    use crate::{admission::AdmittedTx, classifier::DEFAULT_COMMITMENT_CACHE_CAP};
+    use crate::{admission::AdmittedTx, classifier::PreconfClassifier};
 
     fn sample_log(addr_byte: u8, topic_byte: u8, data_byte: u8) -> Log {
         let data = LogData::new_unchecked(
@@ -594,13 +592,13 @@ mod tests {
 
     struct Harness {
         handler: PreconfRpcHandler,
-        classifier: Arc<PreconfClassifier>,
+        fifo: Arc<PreconfTxSet>,
         sender: Address,
     }
 
     fn harness() -> Harness {
         let sender = Address::from([0x11; 20]);
-        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
+        let classifier = Arc::new(PreconfClassifier::new(false));
         classifier.update_whitelist(
             [(sender, RECIPIENT)].into_iter().collect(),
             HashSet::default(),
@@ -612,13 +610,10 @@ mod tests {
             preconf_max_gas_per_tx: 1_000_000,
             ..Default::default()
         };
-        let handler = PreconfRpcHandler::new(
-            Arc::new(UnusedAdmission),
-            Arc::new(PreconfTxSet::new(16)),
-            Arc::new(cfg),
-            classifier.clone(),
-        );
-        Harness { handler, classifier, sender }
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        let handler =
+            PreconfRpcHandler::new(Arc::new(UnusedAdmission), fifo.clone(), Arc::new(cfg));
+        Harness { handler, fifo, sender }
     }
 
     /// An EVM revert that produced a receipt is a commitment like any other —
@@ -658,7 +653,7 @@ mod tests {
         h.handler.claim_commitment_slot(&event, hash, &sender, 0).await;
 
         assert!(
-            h.classifier.is_tracked(&hash),
+            h.fifo.claims().is_tracked(&hash),
             "the classifier must know the commitment, or a reorg reinject is \
              re-gated as a fresh submission and `mark_committed` cannot count it",
         );

@@ -194,7 +194,7 @@ impl PreconfServiceBuilder {
         P: RestoreSource + Clone + 'static,
         C: crate::journal::CommitmentChainView,
     {
-        restore_preconf_state(&self.journal, pool, chain, &self.fifo, &self.classifier).await;
+        restore_preconf_state(&self.journal, pool, chain, &self.fifo, self.fifo.claims()).await;
 
         // Every fifo removal path also drops the commitment record: on most
         // of them, once the entry is gone there is nothing left for the record
@@ -205,11 +205,6 @@ impl PreconfServiceBuilder {
         // Registered as a callback rather than a direct reference so the fifo
         // stays ignorant of the classifier (the sweep in the other
         // direction is driven by the canonical-state handler, which holds both).
-        let classifier_for_evict = self.classifier.clone();
-        self.fifo.set_record_eviction_callback(Arc::new(move |hash| {
-            classifier_for_evict.release_unless_committed(&hash);
-        }));
-
         Ok(())
     }
 
@@ -234,7 +229,7 @@ impl PreconfServiceBuilder {
         // alloy envelopes — see `PreconfCanonHandler`.
         op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
     {
-        PreconfCanonHandler::new(provider, self.fifo.clone(), self.classifier.clone())
+        PreconfCanonHandler::new(provider, self.fifo.clone())
     }
 
     /// Hand admission over from the pool-building phase.
@@ -255,12 +250,7 @@ impl PreconfServiceBuilder {
     /// the caller can decide whether to wrap in `Arc` (the path through
     /// `MantleRpcExt::new` expects `Arc<dyn DynPreconfHandler>`).
     pub fn rpc_handler(&self, admission: Arc<dyn DynAdmission>) -> PreconfRpcHandler {
-        PreconfRpcHandler::new(
-            admission,
-            self.fifo.clone(),
-            self.cfg.clone(),
-            self.classifier.clone(),
-        )
+        PreconfRpcHandler::new(admission, self.fifo.clone(), self.cfg.clone())
     }
 }
 

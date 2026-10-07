@@ -16,21 +16,21 @@
 //! short-lived journal that gets rotated periodically.
 //!
 //! **No in-memory view of which commitments are still owed lives here.**
-//! [`PreconfClassifier`] is the single owner of "this commitment is over",
+//! [`Commitments`] is the single owner of "this commitment is over",
 //! because the only notion this layer could form — *canonical once* — is one a
 //! reorg can undo. Rotation receives that decision as the `retain` predicate
 //! [`PreconfJournal::rotate`] takes, and restore asks
-//! `PreconfClassifier::is_tracked` directly. This is the sole statement of that
+//! `Commitments::is_tracked` directly. This is the sole statement of that
 //! division; the rest of the file assumes it.
 //!
 //! **Two writers, and only one of them creates the record that keeps a line.**
 //! [`PreconfJournal::append_promised`] takes one commitment from the apply;
 //! [`PreconfJournal::append_batch`] takes a whole slice, ordinary transactions
-//! included. The classifier record that `retain` reads is established
+//! included. The registry record that `retain` reads is established
 //! elsewhere, when a client is handed its event — so a line whose hash never
 //! gets one is slot-scoped: good for a restart inside the slot, gone at the
 //! next rotation. For the slice's ordinary transactions that is the intent;
-//! see `PreconfClassifier::mark_promised` for the case where it is not.
+//! see `Commitments::mark_promised` for the case where it is not.
 //!
 //! **The second writer only exists when slicing does.** With flashblocks off,
 //! what reaches this file is commitments and nothing else, so a restart replays
@@ -70,7 +70,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{PreconfClassifier, PreconfTxSet};
+use crate::{Commitments, PreconfTxSet};
 
 /// One persisted preconf commitment. Carries everything needed to
 /// put the transaction back in the queue on restart and to recognise
@@ -611,10 +611,10 @@ impl PreconfJournal {
         let (entries, bad_before) = self.load_upto(compacting_upto).await?;
 
         // Which records may go is the caller's decision, not this type's, and it
-        // is the *only* rule here: `retain` asks the classifier whether the
+        // is the *only* rule here: `retain` asks the registry whether the
         // commitment is still tracked. This type deliberately owns no eviction
         // policy of its own — a second, journal-local rule could drop a record
-        // the classifier still holds, which is precisely the divergence the two
+        // the registry still holds, which is precisely the divergence the two
         // halves of commitment tracking must not have. Evaluated once per record,
         // so a concurrent update lands in the *next* rotation rather than half of
         // this one.
@@ -768,7 +768,7 @@ pub trait RestoreSource: Send + Sync {
     ///
     /// Exists so [`restore_preconf_state`]'s pre-pass can claim each
     /// commitment's slot before *any* entry is admitted; see
-    /// [`PreconfClassifier::mark_promised`](crate::PreconfClassifier::mark_promised)
+    /// [`Commitments::mark_promised`](crate::Commitments::mark_promised)
     /// for why that has to happen before `recover_envelope`.
     ///
     /// `None` for anything that does not decode or whose signature does not
@@ -793,7 +793,7 @@ pub enum OnChain {
     /// Found on the canonical chain, in the block at `height`.
     ///
     /// The height is carried because "on chain" is revocable: restore has to
-    /// start the retention clock (`PreconfClassifier::mark_committed`) for this
+    /// start the retention clock (`Commitments::mark_committed`) for this
     /// commitment, and that clock is a block depth. Without it a restored
     /// commitment that had already landed would keep a promise record that no
     /// rotation could ever drop.
@@ -917,10 +917,10 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     source: &P,
     chain: &C,
     fifo: &Arc<PreconfTxSet>,
-    classifier: &PreconfClassifier,
+    claims: &Commitments,
 ) {
-    // No prune before the replay pass: the only eviction rule is "the classifier
-    // no longer tracks this", and the classifier is empty until the loop below
+    // No prune before the replay pass: the only eviction rule is "the registry
+    // no longer tracks this", and the registry is empty until the loop below
     // populates it — pruning here would discard every commitment we owe on the
     // very restart meant to honour them. The prune happens once at the end
     // instead, against the records this pass just established.
@@ -959,7 +959,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
         match source.recover_slot(&entry.tx_rlp) {
             Some((from, nonce)) => {
                 if let Err(owner) =
-                    classifier.mark_promised(entry.hash, &from, nonce, entry.block_height)
+                    claims.mark_promised(entry.hash, &from, nonce, entry.block_height)
                 {
                     // Someone already owns the nonce, so this commitment is the
                     // one that will lose it. Deliberately not seized — see
@@ -1030,7 +1030,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                     OnChain::Yes { height } => {
                         // The promise was kept before the restart. Start its
                         // retention clock at the block it actually landed in:
-                        // rotation keeps a record only while the classifier is
+                        // rotation keeps a record only while the registry is
                         // still tracking it, so without this the entry would be
                         // immortal — nothing else will ever report this block,
                         // it is already in the past, and every future restart
@@ -1040,7 +1040,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                         // tracking outright. Landing is revocable; if the block
                         // is shallow, a reorg right after startup must still
                         // find the commitment holding its nonce.
-                        classifier.mark_committed(&entry.hash, height);
+                        claims.mark_committed(&entry.hash, height);
                         debug!(
                             target: "mantle::preconf::journal",
                             hash = ?entry.hash,
@@ -1095,7 +1095,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                 // promise record would pin the nonce and hold the journal line
                 // for a commitment this process has already abandoned. The two
                 // halves go together or the journal outlives what tracks it.
-                classifier.release_unless_committed(&entry.hash);
+                claims.release_unless_committed(&entry.hash);
                 warn!(
                     target: "mantle::preconf::journal",
                     hash = ?entry.hash,
@@ -1135,7 +1135,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     // stands.
     //
     // Telling them apart needs the entry to say which it is, and nothing here
-    // can work it out: the classifier is empty at this point — this very pass
+    // can work it out: the registry is empty at this point — this very pass
     // is what fills it — and the record carries no marker. A field would do it,
     // and old files would need no guess, since every record written before pool
     // transactions were journaled is a commitment. Left for the pass that
@@ -1155,15 +1155,15 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
 
     // Prune now, against the records this pass just established: entries whose
     // commitment was kept and buried, and the ones given up above, are gone from
-    // the classifier and so leave the file here. Doing it after the replay rather
-    // than before is what lets the eviction rule be the classifier's alone —
+    // the registry and so leave the file here. Doing it after the replay rather
+    // than before is what lets the eviction rule be the registry's alone —
     // before it, every record would read as untracked. Best-effort; the next
     // rotation retries.
-    if let Err(e) = journal.rotate(|hash| classifier.is_tracked(hash)).await {
+    if let Err(e) = journal.rotate(|hash| claims.is_tracked(hash)).await {
         warn!(
             target: "mantle::preconf::journal",
             ?e,
-            "post-restore rotate failed; the file keeps entries the classifier has dropped"
+            "post-restore rotate failed; the file keeps entries the registry has dropped"
         );
     }
 }
@@ -1194,7 +1194,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
 /// nearly-empty journal in the first few seconds after boot.
 pub async fn run_rejournal_loop<F, T>(
     journal: Arc<PreconfJournal>,
-    classifier: Arc<PreconfClassifier>,
+    claims: Arc<Commitments>,
     interval: Duration,
     shutdown: F,
 ) -> T
@@ -1207,7 +1207,7 @@ where
     // reach the block it was made for, or when a build gave it up. Everything
     // else — never landed but still reachable, landed but shallow, landed and
     // then reorged out — is still owed and stays in the file.
-    let retain = |hash: &TxHash| classifier.is_tracked(hash);
+    let retain = |hash: &TxHash| claims.is_tracked(hash);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Consume the immediate-first tick so we don't rotate at t=0.
@@ -1306,7 +1306,7 @@ fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
 /// the reth `TaskManager` participates in the graceful shutdown handoff.
 pub fn spawn_rejournal_loop(
     journal: Arc<PreconfJournal>,
-    classifier: Arc<PreconfClassifier>,
+    claims: Arc<Commitments>,
     interval: Duration,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
@@ -1317,7 +1317,7 @@ pub fn spawn_rejournal_loop(
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
-        let () = run_rejournal_loop(journal, classifier, interval, shutdown).await;
+        let () = run_rejournal_loop(journal, claims, interval, shutdown).await;
     })
 }
 
@@ -2056,7 +2056,7 @@ mod tests {
     /// The production rotation predicate: a record stays while the classifier is
     /// still tracking its commitment. Tests use it so they exercise the same
     /// decision production does, rather than a hand-written stand-in.
-    fn retain_tracked(c: &PreconfClassifier) -> impl Fn(&TxHash) -> bool + '_ {
+    fn retain_tracked(c: &Commitments) -> impl Fn(&TxHash) -> bool + '_ {
         move |h| c.is_tracked(h)
     }
 
@@ -2070,8 +2070,8 @@ mod tests {
     /// `enabled: false`, which short-circuits every write on this type — restore
     /// would appear to run and record nothing. Any classifier a test hands to
     /// `restore_preconf_state` must be enabled for the same reason.
-    fn empty_classifier() -> PreconfClassifier {
-        PreconfClassifier::from_config(&crate::PreconfConfig {
+    fn empty_classifier() -> Commitments {
+        Commitments::from_config(&crate::PreconfConfig {
             enabled: true,
             ..crate::PreconfConfig::default()
         })
@@ -2081,14 +2081,14 @@ mod tests {
     /// observed on chain, and has since been buried `SEAL_DEPTH` persisted
     /// blocks deep. That is the only state in which rotation may drop a record,
     /// so it is what the rejournal-loop tests need to set up.
-    fn classifier_done_with(hashes: &[TxHash]) -> Arc<PreconfClassifier> {
+    fn classifier_done_with(hashes: &[TxHash]) -> Arc<Commitments> {
         let c = empty_classifier();
         for (i, h) in hashes.iter().enumerate() {
             // Distinct (sender, nonce) per hash so the claims do not collide.
             let _ = c.mark_promised(*h, &Address::from([0xEE; 20]), i as u64, 0);
             c.mark_committed(h, LANDED_AT);
         }
-        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         for h in hashes {
             // Rotation keys on the record, so take the step that removes it — the
             // same one `forward` takes when the fifo drops a landed entry. Its
@@ -2102,9 +2102,9 @@ mod tests {
     /// A classifier with the watermark already high enough that anything
     /// [`finish_tracking`] marks becomes immediately releasable. For tests that
     /// need to finish a commitment *after* the rotation loop has started.
-    fn classifier_with_high_watermark() -> Arc<PreconfClassifier> {
+    fn classifier_with_high_watermark() -> Arc<Commitments> {
         let c = empty_classifier();
-        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         Arc::new(c)
     }
 
@@ -2112,7 +2112,7 @@ mod tests {
     /// landed, and promised for a block the chain cannot have buried. Rotation
     /// must keep it — an entry with no record at all would be dropped as an
     /// orphan, so a fixture's survivor has to say so explicitly.
-    fn still_owed(c: &PreconfClassifier, hash: TxHash) {
+    fn still_owed(c: &Commitments, hash: TxHash) {
         let _ = c.mark_promised(hash, &Address::from([0xEE; 20]), u64::from(hash.0[0]), u64::MAX);
         assert!(c.is_tracked(&hash));
     }
@@ -2124,7 +2124,7 @@ mod tests {
     /// expiring is not the record disappearing. This takes the same step
     /// production takes when `forward` drops the fifo entry of a landed
     /// commitment, so the journal predicate sees what it would see there.
-    fn finish_tracking(c: &PreconfClassifier, hash: TxHash) {
+    fn finish_tracking(c: &Commitments, hash: TxHash) {
         // The nonce is derived from the hash so repeated calls do not collide.
         let _ = c.mark_promised(hash, &Address::from([0xEE; 20]), u64::from(hash.0[0]), 0);
         c.mark_committed(&hash, LANDED_AT);
@@ -2239,7 +2239,7 @@ mod tests {
         /// Pool that, on each tx it is handed, snapshots the promise flag of **all**
         /// journal hashes — including the ones not offered yet.
         struct RecordSpyPool {
-            classifier: Arc<PreconfClassifier>,
+            classifier: Arc<Commitments>,
             hashes: Vec<TxHash>,
             seen: std::sync::Mutex<Vec<Vec<bool>>>,
         }
@@ -2323,7 +2323,7 @@ mod tests {
         /// Pool that, on each tx it is handed, snapshots the owner of **all** the
         /// journal entries' slots — including those not offered yet.
         struct SlotSpyPool {
-            classifier: Arc<PreconfClassifier>,
+            classifier: Arc<Commitments>,
             slots: Vec<(Address, u64)>,
             seen: std::sync::Mutex<Vec<Vec<Option<TxHash>>>>,
         }
@@ -2364,10 +2364,8 @@ mod tests {
         j.append_promised(&entry(2, 11)).await.unwrap();
         j.append_promised(&entry(3, 12)).await.unwrap();
 
-        let classifier = Arc::new(PreconfClassifier::new(
-            false,
-            crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP,
-        ));
+        let classifier =
+            Arc::new(Commitments::enabled(crate::commitments::DEFAULT_COMMITMENT_CACHE_CAP));
         let pool = SlotSpyPool {
             classifier: classifier.clone(),
             slots: (1u8..=3).map(|b| (Address::from([b; 20]), u64::from(b))).collect(),
@@ -2392,7 +2390,7 @@ mod tests {
     /// having been kept, not a failure. Landing starts the retention clock
     /// rather than ending tracking: while the block is shallow a reorg could
     /// bring the commitment back, so rotation keeps the record. Once
-    /// [`crate::classifier::SEAL_DEPTH`] persisted blocks sit on top, retention
+    /// [`crate::commitments::SEAL_DEPTH`] persisted blocks sit on top, retention
     /// expires and the record may go — which is what stops every future restart
     /// replaying and complaining about the same entry forever.
     ///
@@ -2428,7 +2426,7 @@ mod tests {
 
         // Buried deep enough, the record may go — so the next restart will not
         // see it again.
-        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         assert!(c.release_unless_committed(&e.hash), "buried: the record is released");
         let stats = j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();
@@ -2622,7 +2620,7 @@ mod tests {
         )
         .await;
 
-        c.observe_persisted(LANDED_AT + crate::classifier::SEAL_DEPTH);
+        c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         assert!(c.release_unless_committed(&e.hash), "buried ⇒ the record may go");
         j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();

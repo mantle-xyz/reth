@@ -55,14 +55,14 @@ use alloy_primitives::{
 use parking_lot::RwLock;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Instant,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
 use tracing::{debug, error};
 
 use crate::{
-    classifier::PreconfClassifier,
+    commitments::{Commitments, DEFAULT_COMMITMENT_CACHE_CAP},
     types::{MarkError, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus, PushResult},
 };
 
@@ -209,11 +209,6 @@ impl SuccessTicket {
     }
 }
 
-/// A hash-keyed eviction callback: `PreconfTxSet` fires these outward at
-/// removal time so it never has to hold a reference to
-/// the pool or the classifier (which would close a dependency cycle).
-type EvictFn = Arc<dyn Fn(TxHash) + Send + Sync>;
-
 /// Inner state guarded by a single `Mutex` — see module docs.
 struct PreconfTxSetInner {
     /// FIFO insertion order — hashes only. Steady-state size is bounded by the
@@ -233,23 +228,13 @@ struct PreconfTxSetInner {
     /// answers each by scanning every entry in the fifo.
     by_sender: HashMap<Address, BTreeMap<u64, TxHash>>,
 
-    /// Record-eviction callback, fired from [`Self::drop_hash`].
-    ///
-    /// The **same** `OnceLock` as [`PreconfTxSet::record_evict`] — held here
-    /// too because `drop_hash` is a method on the inner type and cannot reach
-    /// the outer one. Sharing the cell (rather than copying the closure) keeps
-    /// registration a single lock-free `set` on the outer handle.
-    record_evict: Arc<OnceLock<EvictFn>>,
+    /// The registry, for releasing a record from [`Self::drop_hash`].
+    claims: Arc<Commitments>,
 }
 
 impl PreconfTxSetInner {
-    fn new(record_evict: Arc<OnceLock<EvictFn>>) -> Self {
-        Self {
-            order: VecDeque::new(),
-            entries: HashMap::new(),
-            by_sender: HashMap::new(),
-            record_evict,
-        }
+    fn new(claims: Arc<Commitments>) -> Self {
+        Self { order: VecDeque::new(), entries: HashMap::new(), by_sender: HashMap::new(), claims }
     }
 
     /// Removes a hash from all indices (`entries` / `by_sender` / `order`).
@@ -357,11 +342,10 @@ impl PreconfTxSetInner {
         // that the landing is irrevocable, so the commitment can still be live
         // here. Do not read this callback as proof that it is over.
         //
-        // Runs under the inner mutex, so the callback must be cheap,
-        // non-blocking, and must never re-enter the fifo.
-        if let Some(f) = self.record_evict.get() {
-            f(*hash);
-        }
+        // Runs under the inner mutex. The registry has its own `parking_lot`
+        // lock and this is the only place the two are nested, so there is one
+        // order and nothing to get wrong.
+        self.claims.release_unless_committed(hash);
         entry
     }
 }
@@ -468,11 +452,14 @@ pub struct PreconfTxSet {
 
     notifier: broadcast::Sender<TxHash>,
 
-    /// Record-eviction callback — see
-    /// [`Self::set_record_eviction_callback`]. The same cell is held by
-    /// `PreconfTxSetInner`, which is what actually fires it (from
-    /// `drop_hash`).
-    record_evict: Arc<OnceLock<EvictFn>>,
+    /// The claims this node has made, and the nonces they hold.
+    ///
+    /// Owned here because every removal path already runs under this type, and
+    /// the only question a removal has to ask the registry — "is this one still
+    /// owed?" — used to travel out through a registered callback. The same
+    /// `Arc` is held by `PreconfTxSetInner`, which releases records directly
+    /// from `drop_hash`.
+    claims: Arc<Commitments>,
 }
 
 impl PreconfTxSet {
@@ -481,16 +468,36 @@ impl PreconfTxSet {
     /// Panics if `broadcast_cap == 0` (tokio invariant). Configs are
     /// validated upstream via `PreconfConfig::validate`.
     pub fn new(broadcast_cap: usize) -> Self {
+        Self::with_claims(
+            broadcast_cap,
+            Arc::new(Commitments::enabled(DEFAULT_COMMITMENT_CACHE_CAP)),
+        )
+    }
+
+    /// The production constructor: the registry's `enabled` tracks the config's,
+    /// so a node that has not opted in records nothing.
+    pub fn from_config(cfg: &crate::config::PreconfConfig) -> Self {
+        Self::with_claims(cfg.broadcast_cap, Arc::new(Commitments::from_config(cfg)))
+    }
+
+    /// Shared body of both constructors.
+    fn with_claims(broadcast_cap: usize, claims: Arc<Commitments>) -> Self {
         let (notifier, _) = broadcast::channel(broadcast_cap);
         // Register the gauge at 0 so it has a baseline from startup.
         metrics::gauge!("preconf.fifo.pending").set(0.0);
-        let record_evict = Arc::new(OnceLock::new());
         Self {
-            inner: Mutex::new(PreconfTxSetInner::new(record_evict.clone())),
+            inner: Mutex::new(PreconfTxSetInner::new(claims.clone())),
             accounts: RwLock::new(AccountView::default()),
             notifier,
-            record_evict,
+            claims,
         }
+    }
+
+    /// The claims this node has made. Read synchronously — the registry uses
+    /// `parking_lot`, so the builder's sync apply hook and the pool best-tx step
+    /// can both reach it without this type's `async` lock.
+    pub fn claims(&self) -> &Arc<Commitments> {
+        &self.claims
     }
 
     // ============ Account view ============
@@ -543,21 +550,6 @@ impl PreconfTxSet {
         metrics::gauge!("preconf.fifo.gas_used").set(gas as f64);
     }
 
-    /// Register the record-eviction callback fired from `drop_hash`,
-    /// i.e. on **every** fifo removal path. Called once by
-    /// [`crate::PreconfServiceBuilder::start`] with a closure forwarding to
-    /// `PreconfClassifier::release_unless_committed`.
-    ///
-    /// Direction matters: the fifo pushes removals *out* and never holds the
-    /// classifier. Neither type references the other.
-    ///
-    /// Idempotent (`OnceLock::set`, first registration wins). Leaving it
-    /// unregistered is valid — removals then don't touch the commitment cache,
-    /// which is what test / pass-through paths want.
-    pub fn set_record_eviction_callback(&self, f: EvictFn) {
-        let _ = self.record_evict.set(f);
-    }
-
     // ============ Admission ============
 
     /// Decide and enqueue in one step: every remaining rule, then the entry,
@@ -591,12 +583,7 @@ impl PreconfTxSet {
     /// The slot claim reaches into the classifier while this lock is held. That
     /// is the direction every fifo removal already takes — `drop_hash` fires
     /// the record eviction from inside here — so it adds no new order.
-    pub async fn admit(
-        &self,
-        classifier: &PreconfClassifier,
-        req: AdmitRequest,
-        capacity: Capacity,
-    ) -> Result<(), PreconfError> {
+    pub async fn admit(&self, req: AdmitRequest, capacity: Capacity) -> Result<(), PreconfError> {
         let AdmitRequest { tx, from, source, responder, chain_nonce, bytecode_hash } = req;
         let hash = *tx.tx_hash();
         let nonce = tx.nonce();
@@ -685,7 +672,7 @@ impl PreconfTxSet {
 
         // ── The (sender, nonce) slot ───────────────────────────────────
         // Two indices answer this, and both have to. The queue knows who is
-        // waiting on the nonce; the classifier knows who *owns* it, which
+        // waiting on the nonce; the registry knows who *owns* it, which
         // outlasts the entry — a commitment whose receipt has gone out keeps
         // its nonce through the retention window with nothing left in here.
         //
@@ -706,7 +693,7 @@ impl PreconfTxSet {
             PreconfTxSetInner::unindex_sender_nonce(&mut inner.by_sender, from, nonce);
             inner.drop_hash(&incumbent);
         }
-        if let Err(owner) = classifier.slot_conflict(hash, &from, nonce) {
+        if let Err(owner) = self.claims.slot_conflict(hash, &from, nonce) {
             debug!(
                 target: "mantle::preconf",
                 ?hash, ?owner, sender = ?from, nonce,
@@ -1264,19 +1251,11 @@ mod admit_tests {
     //! reason.
 
     use super::*;
-    use crate::config::PreconfConfig;
     use alloy_consensus::{Signed, TxEip1559};
     use alloy_primitives::Signature;
 
     fn addr(byte: u8) -> Address {
         Address::from([byte; 20])
-    }
-
-    /// Any sender is eligible, so nothing here is refused for being off the
-    /// allowlist — that decision belongs a step earlier.
-    fn classifier() -> PreconfClassifier {
-        let cfg = PreconfConfig { enabled: true, all_preconfs: true, ..Default::default() };
-        PreconfClassifier::from_config(&cfg)
     }
 
     fn tx(nonce: u64, hash_byte: u8, max_fee: u128) -> Arc<TxEnvelope> {
@@ -1335,22 +1314,16 @@ mod admit_tests {
 
     /// Admission has to record the commitment before it can claim a nonce, which
     /// is the order the real path runs in.
-    async fn admit(
-        set: &PreconfTxSet,
-        c: &PreconfClassifier,
-        req: Req,
-        capacity: Capacity,
-    ) -> Result<(), PreconfError> {
-        set.admit(c, req.0, capacity).await
+    async fn admit(set: &PreconfTxSet, req: Req, capacity: Capacity) -> Result<(), PreconfError> {
+        set.admit(req.0, capacity).await
     }
 
     #[tokio::test]
     async fn a_transaction_that_breaks_no_rule_is_queued_and_announced() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let mut rx = set.subscribe();
 
-        let out = admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), cap()).await;
+        let out = admit(&set, Req::new(tx(0, 1, 0), addr(1)), cap()).await;
 
         assert_eq!(out.unwrap(), ());
         assert_eq!(rx.try_recv().unwrap(), B256::from([1u8; 32]), "the builder is told");
@@ -1364,11 +1337,10 @@ mod admit_tests {
     #[tokio::test]
     async fn a_full_queue_refuses_the_newcomer_rather_than_evicting() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let full = Capacity { max_txs: 1, ..cap() };
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), full).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(0, 2, 0), addr(2)), full).await;
+        admit(&set, Req::new(tx(0, 1, 0), addr(1)), full).await.unwrap();
+        let out = admit(&set, Req::new(tx(0, 2, 0), addr(2)), full).await;
 
         assert!(matches!(out, Err(PreconfError::QueueFull { unit: "entries", .. })), "{out:?}");
         assert_eq!(set.snapshot().await.len(), 1, "the incumbent stays");
@@ -1377,10 +1349,9 @@ mod admit_tests {
     #[tokio::test]
     async fn the_byte_ceiling_is_enforced_separately_from_the_entry_count() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let tight = Capacity { max_size: 1, ..cap() };
 
-        let out = admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), tight).await;
+        let out = admit(&set, Req::new(tx(0, 1, 0), addr(1)), tight).await;
 
         assert!(matches!(out, Err(PreconfError::QueueFull { unit: "bytes", .. })), "{out:?}");
     }
@@ -1394,11 +1365,10 @@ mod admit_tests {
     #[tokio::test]
     async fn the_gas_ceiling_bounds_the_queue_not_the_transaction() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let tight = Capacity { max_queued_gas: 6_000_000, ..cap() };
 
-        admit(&set, &c, Req::new(tx_gas(0, 1, 4_000_000), addr(1)), tight).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx_gas(0, 2, 4_000_000), addr(2)), tight).await;
+        admit(&set, Req::new(tx_gas(0, 1, 4_000_000), addr(1)), tight).await.unwrap();
+        let out = admit(&set, Req::new(tx_gas(0, 2, 4_000_000), addr(2)), tight).await;
 
         assert!(
             matches!(
@@ -1420,10 +1390,9 @@ mod admit_tests {
     #[tokio::test]
     async fn a_transaction_larger_than_the_whole_ceiling_is_refused() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let tight = Capacity { max_queued_gas: 6_000_000, ..cap() };
 
-        let out = admit(&set, &c, Req::new(tx_gas(0, 1, 7_000_000), addr(1)), tight).await;
+        let out = admit(&set, Req::new(tx_gas(0, 1, 7_000_000), addr(1)), tight).await;
 
         assert!(
             matches!(out, Err(PreconfError::QueueFull { unit: "gas", in_use: 0, .. })),
@@ -1439,11 +1408,10 @@ mod admit_tests {
     #[tokio::test]
     async fn a_replay_entry_s_gas_is_counted_against_a_later_admission() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let tight = Capacity { max_queued_gas: 6_000_000, ..cap() };
 
         set.push_if_absent(tx_gas(0, 1, 5_000_000), addr(1), PreconfSource::Replay).await;
-        let out = admit(&set, &c, Req::new(tx_gas(0, 2, 2_000_000), addr(2)), tight).await;
+        let out = admit(&set, Req::new(tx_gas(0, 2, 2_000_000), addr(2)), tight).await;
 
         assert!(
             matches!(out, Err(PreconfError::QueueFull { unit: "gas", in_use: 5_000_000, .. })),
@@ -1454,20 +1422,19 @@ mod admit_tests {
     #[tokio::test]
     async fn one_sender_may_not_take_more_than_its_share_of_the_queue() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let two = Capacity { max_account_slots: 2, ..cap() };
         let alice = addr(1);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice), two).await.unwrap();
-        admit(&set, &c, Req::new(tx(1, 2, 0), alice), two).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(2, 3, 0), alice), two).await;
+        admit(&set, Req::new(tx(0, 1, 0), alice), two).await.unwrap();
+        admit(&set, Req::new(tx(1, 2, 0), alice), two).await.unwrap();
+        let out = admit(&set, Req::new(tx(2, 3, 0), alice), two).await;
 
         assert!(
             matches!(out, Err(PreconfError::AccountSlotsFull { in_use: 2, max: 2 })),
             "{out:?}"
         );
         assert!(
-            admit(&set, &c, Req::new(tx(0, 4, 0), addr(2)), two).await.is_ok(),
+            admit(&set, Req::new(tx(0, 4, 0), addr(2)), two).await.is_ok(),
             "the ceiling is per sender, not for the queue",
         );
     }
@@ -1478,7 +1445,6 @@ mod admit_tests {
     #[tokio::test]
     async fn a_replayed_commitment_refuses_to_take_on_a_client() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let tx = tx(0, 1, 0);
         let hash = *tx.tx_hash();
         // The shape a journal restore or reorg reinject leaves behind.
@@ -1487,7 +1453,7 @@ mod admit_tests {
         let (resp_tx, _rx) = oneshot::channel();
         let mut req = Req::new(tx, addr(1));
         req.0.responder = Some((Instant::now(), resp_tx));
-        let out = admit(&set, &c, req, cap()).await;
+        let out = admit(&set, req, cap()).await;
 
         assert!(matches!(out, Err(PreconfError::AlreadyInProgress)), "{out:?}");
         assert!(
@@ -1509,9 +1475,8 @@ mod admit_tests {
     #[tokio::test]
     async fn a_fee_cap_under_any_base_fee_is_still_queued() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
 
-        let out = admit(&set, &c, Req::new(tx(0, 1, 1), addr(1)), cap()).await;
+        let out = admit(&set, Req::new(tx(0, 1, 1), addr(1)), cap()).await;
 
         assert_eq!(out.unwrap(), ());
     }
@@ -1522,10 +1487,9 @@ mod admit_tests {
     #[tokio::test]
     async fn an_open_build_does_not_give_the_queue_a_floor() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         set.reset_accounts();
 
-        let out = admit(&set, &c, Req::new(tx(0, 1, 1), addr(1)), cap()).await;
+        let out = admit(&set, Req::new(tx(0, 1, 1), addr(1)), cap()).await;
 
         assert_eq!(out.unwrap(), ());
     }
@@ -1535,9 +1499,8 @@ mod admit_tests {
     #[tokio::test]
     async fn a_nonce_past_the_end_of_the_senders_chain_is_a_gap() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
 
-        let out = admit(&set, &c, Req::new(tx(5, 1, 0), addr(1)).chain_nonce(0), cap()).await;
+        let out = admit(&set, Req::new(tx(5, 1, 0), addr(1)).chain_nonce(0), cap()).await;
 
         assert!(
             matches!(out, Err(PreconfError::NonceGap { tx_nonce: 5, pending_nonce: 0 })),
@@ -1548,18 +1511,17 @@ mod admit_tests {
     #[tokio::test]
     async fn each_admitted_nonce_extends_how_far_the_next_one_may_reach() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
-        admit(&set, &c, Req::new(tx(1, 2, 0), alice), cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(3, 3, 0), alice), cap()).await;
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        admit(&set, Req::new(tx(1, 2, 0), alice), cap()).await.unwrap();
+        let out = admit(&set, Req::new(tx(3, 3, 0), alice), cap()).await;
 
         assert!(
             matches!(out, Err(PreconfError::NonceGap { tx_nonce: 3, pending_nonce: 2 })),
             "two queued, so 2 is the next reachable nonce; got {out:?}",
         );
-        assert!(admit(&set, &c, Req::new(tx(2, 4, 0), alice), cap()).await.is_ok());
+        assert!(admit(&set, Req::new(tx(2, 4, 0), alice), cap()).await.is_ok());
     }
 
     /// The baseline is not the chain's alone — what the block being built has
@@ -1568,15 +1530,14 @@ mod admit_tests {
     #[tokio::test]
     async fn what_the_block_has_executed_moves_the_baseline() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
         set.reset_accounts();
 
-        let before = admit(&set, &c, Req::new(tx(1, 1, 0), alice).chain_nonce(0), cap()).await;
+        let before = admit(&set, Req::new(tx(1, 1, 0), alice).chain_nonce(0), cap()).await;
         assert!(matches!(before, Err(PreconfError::NonceGap { .. })), "{before:?}");
 
         set.observe_executed(alice, 0);
-        let after = admit(&set, &c, Req::new(tx(1, 2, 0), alice).chain_nonce(0), cap()).await;
+        let after = admit(&set, Req::new(tx(1, 2, 0), alice).chain_nonce(0), cap()).await;
 
         assert_eq!(after.unwrap(), (), "nonce 0 has run, so nonce 1 is next");
     }
@@ -1594,11 +1555,10 @@ mod admit_tests {
     #[tokio::test]
     async fn a_senders_chain_may_total_more_than_its_balance() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(1, 2, 0), alice), cap()).await;
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        let out = admit(&set, Req::new(tx(1, 2, 0), alice), cap()).await;
 
         assert_eq!(out.unwrap(), ());
         assert_eq!(set.snapshot().await.len(), 2, "both are the builder's to judge");
@@ -1613,19 +1573,21 @@ mod admit_tests {
     #[tokio::test]
     async fn a_nonce_owned_by_a_commitment_with_no_entry_left_is_still_taken() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
         let first = B256::from([1u8; 32]);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
         // The receipt goes out, and with it the claim on the nonce.
-        c.mark_promised(first, &alice, 0, 7).expect("the slot was free");
+        set.claims().mark_promised(first, &alice, 0, 7).expect("the slot was free");
         set.mark_succeeded(&first).await.unwrap();
-        // Swept from the queue; the classifier keeps the slot.
+        // Observed on chain, so the sweep that follows must not release it —
+        // this is what `release_unless_committed` is for.
+        assert!(set.claims().mark_committed(&first, 7));
+        // Swept from the queue; the registry keeps the slot.
         set.forward_all(&std::collections::HashMap::from([(alice, 1u64)])).await;
         assert!(set.find_by_sender_nonce(&alice, 0).await.is_none(), "the premise: no entry");
 
-        let out = admit(&set, &c, Req::new(tx(0, 2, 0), alice), cap()).await;
+        let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;
 
         assert!(matches!(out, Err(PreconfError::ReplaceActiveCommitment)), "{out:?}");
     }
@@ -1636,11 +1598,10 @@ mod admit_tests {
     #[tokio::test]
     async fn an_in_flight_incumbent_keeps_its_nonce() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(0, 2, 0), alice), cap()).await;
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;
 
         assert!(matches!(out, Err(PreconfError::ReplaceActiveCommitment)), "{out:?}");
     }
@@ -1650,13 +1611,12 @@ mod admit_tests {
     #[tokio::test]
     async fn the_same_hash_while_someone_is_waiting_on_it_is_refused() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let (resp, _rx) = oneshot::channel();
         let mut first = Req::new(tx(0, 1, 0), addr(1));
         first.0.responder = Some((Instant::now(), resp));
 
-        admit(&set, &c, first, cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), cap()).await;
+        admit(&set, first, cap()).await.unwrap();
+        let out = admit(&set, Req::new(tx(0, 1, 0), addr(1)), cap()).await;
 
         assert!(matches!(out, Err(PreconfError::AlreadyInProgress)), "{out:?}");
     }
@@ -1664,15 +1624,14 @@ mod admit_tests {
     #[tokio::test]
     async fn a_successful_entry_does_not_accept_a_new_responder() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let hash = B256::from([1u8; 32]);
-        admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), cap()).await.unwrap();
+        admit(&set, Req::new(tx(0, 1, 0), addr(1)), cap()).await.unwrap();
         set.mark_succeeded(&hash).await.unwrap();
 
         let (resp, rx) = oneshot::channel();
         let mut again = Req::new(tx(0, 1, 0), addr(1));
         again.0.responder = Some((Instant::now(), resp));
-        let out = admit(&set, &c, again, cap()).await;
+        let out = admit(&set, again, cap()).await;
 
         assert!(matches!(out, Err(PreconfError::AlreadyInProgress)), "{out:?}");
         assert!(rx.await.is_err(), "the completed entry must not retain a responder");
@@ -1685,16 +1644,15 @@ mod admit_tests {
     #[tokio::test]
     async fn the_same_hash_with_nobody_waiting_on_it_is_still_refused() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let hash = B256::from([1u8; 32]);
 
         // Queued with no responder, as journal restore leaves it.
-        admit(&set, &c, Req::new(tx(0, 1, 0), addr(1)), cap()).await.unwrap();
+        admit(&set, Req::new(tx(0, 1, 0), addr(1)), cap()).await.unwrap();
 
         let (resp, rx) = oneshot::channel();
         let mut again = Req::new(tx(0, 1, 0), addr(1));
         again.0.responder = Some((Instant::now(), resp));
-        let out = admit(&set, &c, again, cap()).await;
+        let out = admit(&set, again, cap()).await;
 
         assert!(matches!(out, Err(PreconfError::AlreadyInProgress)), "{out:?}");
         assert!(rx.await.is_err(), "the refused responder is not installed");
@@ -1713,11 +1671,10 @@ mod admit_tests {
     #[tokio::test]
     async fn a_delegated_sender_is_held_to_a_tighter_ceiling() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice).delegated(), cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(1, 2, 0), alice).delegated(), cap()).await;
+        admit(&set, Req::new(tx(0, 1, 0), alice).delegated(), cap()).await.unwrap();
+        let out = admit(&set, Req::new(tx(1, 2, 0), alice).delegated(), cap()).await;
 
         assert!(
             matches!(out, Err(PreconfError::DelegatedInflightLimit { in_use: 1, max: 1 })),
@@ -1731,11 +1688,10 @@ mod admit_tests {
     #[tokio::test]
     async fn an_ordinary_sender_is_not_held_to_the_delegated_ceiling() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
 
-        admit(&set, &c, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
-        let out = admit(&set, &c, Req::new(tx(1, 2, 0), alice), cap()).await;
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        let out = admit(&set, Req::new(tx(1, 2, 0), alice), cap()).await;
 
         assert_eq!(out.unwrap(), ());
     }
@@ -1745,15 +1701,14 @@ mod admit_tests {
     #[tokio::test]
     async fn an_empty_code_hash_does_not_read_as_a_delegation() {
         let set = PreconfTxSet::new(8);
-        let c = classifier();
         let alice = addr(1);
         let empty = |mut r: Req| {
             r.0.bytecode_hash = Some(KECCAK256_EMPTY);
             r
         };
 
-        admit(&set, &c, empty(Req::new(tx(0, 1, 0), alice)), cap()).await.unwrap();
-        let out = admit(&set, &c, empty(Req::new(tx(1, 2, 0), alice)), cap()).await;
+        admit(&set, empty(Req::new(tx(0, 1, 0), alice)), cap()).await.unwrap();
+        let out = admit(&set, empty(Req::new(tx(1, 2, 0), alice)), cap()).await;
 
         assert_eq!(out.unwrap(), ());
     }
@@ -1933,38 +1888,34 @@ mod tests {
         Arc::new(TxEnvelope::Eip1559(Signed::new_unchecked(inner, sig, hash)))
     }
 
-    /// Every fifo removal path must drop the commitment record, because
+    /// Every fifo removal path must release the commitment record, because
     /// `drop_hash` is the single point they all converge on. Asserted through
-    /// two different public entry points so the hook is proven to sit at that
+    /// two different public entry points so the release is proven to sit at that
     /// convergence point rather than on one route.
     #[tokio::test]
-    async fn removal_paths_fire_the_record_eviction_callback() {
+    async fn removal_paths_release_the_commitment_record() {
         let set = PreconfTxSet::new(16);
-        let seen: Arc<std::sync::Mutex<Vec<TxHash>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        set.set_record_eviction_callback(Arc::new(move |hash| sink.lock().unwrap().push(hash)));
 
         // Route 1 — `complete_failure`, the single-entry removal, via `drop_hash`.
         set.push_if_absent(make_tx(0, 1), addr(1), PreconfSource::Rpc).await;
+        set.claims().mark_promised(h(1), &addr(1), 0, 0).unwrap();
+        assert!(set.claims().is_tracked(&h(1)), "premise: the record exists");
         set.complete_failure(&h(1), PreconfError::BuilderRejected("rejected".into()))
             .await
             .unwrap();
+        assert!(!set.claims().is_tracked(&h(1)), "complete_failure must release it");
 
         // Route 2 — `forward_all`, the bulk removal, via `drop_hashes`.
         set.push_if_absent(make_tx(7, 2), addr(2), PreconfSource::Rpc).await;
+        set.claims().mark_promised(h(2), &addr(2), 7, 0).unwrap();
         forward_one(&set, &addr(2), 8).await;
-
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![h(1), h(2)],
-            "both removal routes must evict, and only the removed hashes",
-        );
+        assert!(!set.claims().is_tracked(&h(2)), "forward_all must release it too");
     }
 
-    /// Leaving the callback unregistered must stay valid — that is the test /
-    /// pass-through path, and `drop_hash` runs on every removal.
+    /// A removal with no record to release must stay valid — `drop_hash` runs
+    /// on every removal, including for transactions that never got a receipt.
     #[tokio::test]
-    async fn removal_without_record_callback_is_a_noop() {
+    async fn removal_without_a_record_is_a_noop() {
         let set = PreconfTxSet::new(16);
         set.push_if_absent(make_tx(0, 1), addr(1), PreconfSource::Rpc).await;
         set.complete_failure(&h(1), PreconfError::BuilderRejected("rejected".into()))

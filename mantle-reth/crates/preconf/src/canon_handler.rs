@@ -38,10 +38,7 @@ use reth_primitives_traits::NodePrimitives;
 use reth_storage_api::BlockNumReader;
 use tracing::{debug, error, warn};
 
-use crate::{
-    PreconfClassifier, admission::op_envelope_to_alloy, preconf_tx_set::PreconfTxSet,
-    types::PreconfSource,
-};
+use crate::{admission::op_envelope_to_alloy, preconf_tx_set::PreconfTxSet, types::PreconfSource};
 
 /// Long-running async task bridging `CanonStateNotification` events to
 /// [`PreconfTxSet`] cleanup.
@@ -53,10 +50,6 @@ use crate::{
 pub struct PreconfCanonHandler<Pr, N> {
     provider: Pr,
     fifo: Arc<PreconfTxSet>,
-    /// Record cache. Swept once per canonical notification against the
-    /// fifo's live set — see [`PreconfClassifier::sweep`]. This handler is the
-    /// only place that holds both, which is why the sweep lives here.
-    classifier: Arc<PreconfClassifier>,
     _n: PhantomData<fn() -> N>,
 }
 
@@ -83,12 +76,8 @@ where
     /// Takes no journal handle: `mark_committed` on the classifier owns the
     /// retention decision, and the reorg-drift signal is `uncommit`'s return
     /// value.
-    pub const fn new(
-        provider: Pr,
-        fifo: Arc<PreconfTxSet>,
-        classifier: Arc<PreconfClassifier>,
-    ) -> Self {
-        Self { provider, fifo, classifier, _n: PhantomData }
+    pub const fn new(provider: Pr, fifo: Arc<PreconfTxSet>) -> Self {
+        Self { provider, fifo, _n: PhantomData }
     }
 
     /// Run the listener loop. Returns when the canonical-state stream
@@ -119,7 +108,7 @@ where
             // while tearing down this task would stop the fifo cleanup and the
             // sweep too.
             match self.provider.last_block_number() {
-                Ok(height) => self.classifier.observe_persisted(height),
+                Ok(height) => self.fifo.claims().observe_persisted(height),
                 Err(e) => warn!(
                     target: "mantle::preconf::canon",
                     ?e,
@@ -138,7 +127,7 @@ where
             for block in committed.blocks_iter() {
                 let height = block.number();
                 for recovered in block.clone_transactions_recovered() {
-                    if self.classifier.mark_committed(recovered.inner().tx_hash(), height) {
+                    if self.fifo.claims().mark_committed(recovered.inner().tx_hash(), height) {
                         commitments += 1;
                     }
                 }
@@ -170,7 +159,7 @@ where
             // notification meant to record it as on chain.
             let live: alloy_primitives::map::foldhash::HashSet<_> =
                 self.fifo.snapshot().await.into_iter().collect();
-            let dropped = self.classifier.sweep(&live);
+            let dropped = self.fifo.claims().sweep(&live);
             if dropped > 0 {
                 debug!(
                     target: "mantle::preconf::canon",
@@ -200,7 +189,7 @@ where
             // same-nonce replacement a reorg invites. And its return value is
             // exactly the reorg-drift predicate: a reverted transaction we had
             // recorded as committed is drift, one we never observed is not.
-            if self.classifier.uncommit(&hash) {
+            if self.fifo.claims().uncommit(&hash) {
                 warn!(
                     target: "mantle::preconf::canon",
                     ?hash,

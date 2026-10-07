@@ -926,7 +926,6 @@ async fn apply_one_best_tx<N, Builder>(
     builder: &mut Builder,
     info: &mut ExecutionInfo<N::SignedTx>,
     fifo: &PreconfTxSet,
-    classifier: &PreconfClassifier,
     constraints: &BuildConstraints,
     pacer: &mut AdmissionPacer,
 ) -> Result<BestTxStep, PayloadBuilderError>
@@ -974,7 +973,7 @@ where
     // Same rule as `PreconfClassifier::slot_conflict`: the slot's own
     // transaction resubmitted is not a conflict, and is left to fail (or not)
     // on its merits.
-    if let Some(owner) = classifier.slot_owner(&tx.sender(), tx.nonce()) &&
+    if let Some(owner) = fifo.claims().slot_owner(&tx.sender(), tx.nonce()) &&
         owner != *tx.hash()
     {
         metrics::counter!("preconf.build.pool_tx_on_committed_nonce_total").increment(1);
@@ -2156,7 +2155,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         &mut builder,
                         &mut info,
                         &self.fifo,
-                        &self.classifier,
                         &constraints,
                         &mut pool_pacer,
                     )
@@ -2763,7 +2761,7 @@ mod tests {
     fn a_whitelist_snapshot_is_pinned_against_a_mid_build_refresh() {
         use alloy_primitives::map::foldhash::HashSet;
 
-        let c = PreconfClassifier::new(false, 128);
+        let c = PreconfClassifier::new(false);
         let sender = Address::from([1u8; 20]);
         let to = Address::from([2u8; 20]);
         c.update_whitelist(

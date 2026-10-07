@@ -542,7 +542,7 @@ where
                     let journal = svc.journal().clone();
                     // Rotation asks the classifier which commitments are still
                     // tracked — it owns that answer.
-                    let rotate_classifier = svc.classifier().clone();
+                    let rotate_claims = svc.fifo().claims().clone();
                     let interval = svc.cfg().rejournal_interval;
                     ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(
                         "mantle-preconf-rejournal-loop",
@@ -559,7 +559,7 @@ where
                             // journal file has been closed cleanly.
                             let guard = mantle_reth_preconf::run_rejournal_loop(
                                 journal,
-                                rotate_classifier,
+                                rotate_claims,
                                 interval,
                                 signal,
                             )
