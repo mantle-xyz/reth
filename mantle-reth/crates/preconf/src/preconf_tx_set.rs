@@ -67,9 +67,8 @@ pub struct TxEntry {
     pub from: Address,
     /// Sender nonce.
     pub nonce: u64,
-    /// Wall-clock insertion time. Load-bearing: the fifo deadline sweep
-    /// finalises the entry as `Timeout` once
-    /// `elapsed >= preconf_timeout`.
+    /// Wall-clock insertion time. Load-bearing: the builds' pre-apply gate
+    /// votes `Timeout` once `elapsed + safety_margin >= preconf_timeout`.
     pub inserted_at: Instant,
     /// Current status — see [`PreconfStatus`].
     pub status: PreconfStatus,
@@ -87,12 +86,15 @@ pub struct TxEntry {
     /// terminal and takes holds too: a promise can still be overturned by every
     /// build failing it. `Arc` so a hold releases the entry *instance* (ABA).
     applying: Arc<AtomicUsize>,
+    /// The reason sent once the last holder fails it. A concrete rejection
+    /// outranks `Timeout`, which only says the clock ran out.
+    verdict: Option<PreconfError>,
 }
 
 /// A single build's registered interest in one fifo entry. Consumed by exactly
 /// one of `finish_success` / `finish_failure` / `release`; dropping it
 /// unconsumed decrements as a safety net but cannot finalise, leaving the entry
-/// to the deadline.
+/// to the next build's vote.
 #[derive(Debug)]
 pub struct ApplyHold {
     hash: TxHash,
@@ -121,8 +123,8 @@ pub enum SuccessOutcome {
     /// Already promised. The receipt is redundant and dropped, but the source
     /// is re-armed to `Applied` so no failure quorum can bury it this round.
     Redundant,
-    /// The entry is gone — the deadline finalised it first. Nothing recorded;
-    /// the responder belongs to whoever finalised it.
+    /// The entry is gone — canon dropped it. A live hold keeps every verdict
+    /// from finalising, so nothing else can. Nothing recorded.
     Gone,
 }
 
@@ -138,6 +140,9 @@ pub enum TimeoutOutcome {
     Absent,
     /// The entry exists but is already promised, or is a replay that must land.
     Exempt,
+    /// A build still holds it and may yet apply it. Left to the builds' vote;
+    /// the parked responder stays, refusing a same-hash resubmit meanwhile.
+    Held,
 }
 
 impl ApplyHold {
@@ -408,6 +413,7 @@ impl PreconfTxSet {
             source,
             responder,
             applying: Arc::new(AtomicUsize::new(0)),
+            verdict: None,
         };
         inner.entries.insert(hash, entry);
         inner.by_sender.insert((from, nonce), hash);
@@ -477,6 +483,7 @@ impl PreconfTxSet {
         let mut inner = self.inner.lock().await;
         let _ = hold.take();
         let Some(entry) = inner.entries.get_mut(&hash) else { return SuccessOutcome::Gone };
+        entry.verdict = None;
         if entry.status == PreconfStatus::Success {
             // The receipt is redundant, but a build applied it *now*: re-arm
             // the protection. Without this the success would leave no trace and
@@ -508,7 +515,7 @@ impl PreconfTxSet {
         let hash = hold.hash();
         let responder = {
             let mut inner = self.inner.lock().await;
-            let Some(entry) = inner.entries.get(&hash) else {
+            let Some(entry) = inner.entries.get_mut(&hash) else {
                 let _ = hold.take();
                 return false;
             };
@@ -518,8 +525,13 @@ impl PreconfTxSet {
                 let _ = hold.take();
                 return false;
             }
+            let reason = match entry.verdict.take() {
+                Some(prev) if matches!(err, PreconfError::Timeout { .. }) => prev,
+                _ => err,
+            };
             let was_promised = entry.source != PreconfSource::Rpc;
             if hold.take() > 0 {
+                entry.verdict = Some(reason);
                 return false;
             }
             // Shares the critical section with the removal: otherwise a
@@ -540,25 +552,27 @@ impl PreconfTxSet {
                     "commitment broken: every build failed an already-promised tx"
                 );
             }
-            inner.drop_hash(&hash).and_then(|mut e| e.responder.take())
+            let responder = inner.drop_hash(&hash).and_then(|mut e| e.responder.take());
+            responder.map(|r| (r, reason))
         };
-        if let Some(r) = responder {
-            let _ = r.send(Err(err));
+        if let Some((r, reason)) = responder {
+            let _ = r.send(Err(reason));
         }
         true
     }
 
-    /// Finalise one entry as `Timeout`. The caller's deadline is the authority,
-    /// so there is no age test. Two callers: the build's pre-apply gate (which
-    /// walks every entry, making it the general sweep) and the RPC handler when
-    /// its client gives up with no build running. `Success` and `Replay` are
-    /// never finalised.
+    /// Finalise one entry as `Timeout` on the RPC handler's deadline — only
+    /// when no build holds it. Builds vote `Timeout` through `finish_failure`
+    /// instead. `Success` and `Replay` are never finalised.
     pub async fn finalize_timeout(&self, hash: &TxHash, timeout: Duration) -> TimeoutOutcome {
         let responder = {
             let mut inner = self.inner.lock().await;
             let Some(entry) = inner.entries.get(hash) else { return TimeoutOutcome::Absent };
             if entry.status != PreconfStatus::Waiting || entry.source != PreconfSource::Rpc {
                 return TimeoutOutcome::Exempt;
+            }
+            if entry.applying.load(Ordering::SeqCst) > 0 {
+                return TimeoutOutcome::Held;
             }
             // Pool eviction shares the critical section with the removal — see
             // `finalize_non_success` for why the two must not be observable
@@ -737,7 +751,9 @@ impl PreconfTxSet {
                 // only push, or the RPC handler that owns the slot has
                 // taken its responder). If a responder is present, a
                 // client is actively waiting and we must not overwrite
-                // its `oneshot::Sender`.
+                // its `oneshot::Sender`. A timed-out client's closed sender
+                // counts too: it refuses a same-hash resubmit until the
+                // builds' vote ends the entry.
                 PreconfStatus::Waiting => {
                     if entry.responder.is_some() {
                         return Err(AttachError::AlreadyAttached);
@@ -745,15 +761,6 @@ impl PreconfTxSet {
                     entry.responder = Some(responder);
                     return Ok(());
                 }
-                // Reclaimable — this is a same-hash retry after a
-                // `Timeout` (client deadline), `Canceled` (block-gas-budget pre-apply
-                // reject), or `Failed` (reth builder pre-execute reject;
-                // tx NOT on chain). Install the fresh responder and
-                // refresh `inserted_at` so `builder::dispatch`'s
-                // deadline gate measures against the second submission
-                // rather than the (already-expired) first. The
-                // subsequent `push_if_absent` from the pool listener
-                // flips the entry back to `Waiting` and broadcasts.
                 // A terminal outcome removes the entry in the same critical
                 // section that records it, so `entries` only ever holds
                 // `Waiting` / `Success`. Reaching here means that invariant
@@ -1109,24 +1116,107 @@ mod tests {
         assert!(!set.contains(&hash).await);
     }
 
-    /// The deadline sweep is the only thing that can preempt an in-flight
-    /// success: once it has finalised the entry, a late success is refused and
-    /// its receipt dropped.
+    fn timeout_err() -> PreconfError {
+        PreconfError::Timeout { timeout_ms: 1 }
+    }
+
+    /// The RPC deadline cannot end an entry a build still holds: that build may
+    /// be mid-apply, and its success must still be recorded.
     #[tokio::test]
-    async fn the_deadline_sweep_preempts_a_late_success() {
+    async fn the_rpc_deadline_leaves_a_held_entry_to_the_builds() {
         let set = PreconfTxSet::new(16);
         let tx = make_tx(0, 1);
         let hash = *tx.tx_hash();
         set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
 
         let hold = set.register(&hash).await.unwrap();
+        assert_eq!(set.finalize_timeout(&hash, Duration::ZERO).await, TimeoutOutcome::Held);
+        assert!(set.contains(&hash).await);
+        assert_eq!(set.finish_success(hold, receipt(1)).await, SuccessOutcome::Recorded);
+    }
+
+    /// With no holder left, the RPC deadline is the last word.
+    #[tokio::test]
+    async fn the_rpc_deadline_finalises_an_unheld_entry() {
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        let hash = *tx.tx_hash();
+        set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
+
+        drop(set.register(&hash).await.unwrap());
         assert_eq!(set.finalize_timeout(&hash, Duration::ZERO).await, TimeoutOutcome::Finalised);
-        assert_eq!(
-            set.finish_success(hold, receipt(1)).await,
-            SuccessOutcome::Gone,
-            "entry already finalised",
-        );
         assert!(!set.contains(&hash).await);
+    }
+
+    /// One build seeing the deadline is a vote, not a verdict: a build that
+    /// passed the gate just before it may still land the tx.
+    #[tokio::test]
+    async fn a_timeout_vote_does_not_preempt_a_build_still_applying() {
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        let hash = *tx.tx_hash();
+        set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
+
+        let applying = set.register(&hash).await.unwrap();
+        let late = set.register(&hash).await.unwrap();
+        assert!(!set.finish_failure(late, timeout_err()).await, "another build still holds it");
+        assert!(set.contains(&hash).await);
+        assert_eq!(set.finish_success(applying, receipt(1)).await, SuccessOutcome::Recorded);
+    }
+
+    /// A concrete rejection outranks `Timeout` whichever vote comes last.
+    #[tokio::test]
+    async fn a_concrete_rejection_outranks_timeout_in_the_vote() {
+        for timeout_last in [true, false] {
+            let set = PreconfTxSet::new(16);
+            let tx = make_tx(0, 1);
+            let hash = *tx.tx_hash();
+            let (s, mut r) = oneshot::channel();
+            set.attach_responder(hash, Instant::now(), s).await.unwrap();
+            set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
+
+            let first = set.register(&hash).await.unwrap();
+            let last = set.register(&hash).await.unwrap();
+            let (a, b) = if timeout_last {
+                (some_err(), timeout_err())
+            } else {
+                (timeout_err(), some_err())
+            };
+            assert!(!set.finish_failure(first, a).await);
+            assert!(set.finish_failure(last, b).await);
+            assert_eq!(r.try_recv().unwrap(), Err(some_err()), "timeout_last={timeout_last}");
+        }
+    }
+
+    /// While the builds' vote is open, a same-hash resubmit is refused by the
+    /// timed-out client's parked responder, and no second entry appears.
+    #[tokio::test]
+    async fn a_same_hash_resubmit_is_refused_while_the_vote_is_open() {
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        let hash = *tx.tx_hash();
+        let (s, r) = oneshot::channel();
+        set.attach_responder(hash, Instant::now(), s).await.unwrap();
+        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
+        let hold = set.register(&hash).await.unwrap();
+
+        drop(r); // the client's deadline elapsed
+        assert_eq!(set.finalize_timeout(&hash, Duration::ZERO).await, TimeoutOutcome::Held);
+        let (s2, _r2) = oneshot::channel();
+        assert_eq!(
+            set.attach_responder(hash, Instant::now(), s2).await,
+            Err(AttachError::AlreadyAttached),
+        );
+        assert_eq!(
+            set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await,
+            PushResult::AlreadyExists
+        );
+        assert_eq!(set.snapshot().await, vec![hash]);
+
+        // Once the vote ends the entry, the hash is free again.
+        assert!(set.finish_failure(hold, timeout_err()).await);
+        let (s3, _r3) = oneshot::channel();
+        assert!(set.attach_responder(hash, Instant::now(), s3).await.is_ok());
     }
 
     /// `Success` entries and `Replay` commitments are never finalised.
@@ -1403,6 +1493,7 @@ mod tests {
             source: PreconfSource::Rpc,
             responder: Some(resp_tx),
             applying: Arc::new(AtomicUsize::new(0)),
+            verdict: None,
         };
         let view = entry.snapshot_view();
         assert_eq!(view.hash, entry.hash);

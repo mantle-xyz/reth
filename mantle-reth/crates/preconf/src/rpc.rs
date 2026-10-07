@@ -15,15 +15,11 @@
 //! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
 //!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
 //!    builder could apply it before the responder is registered, dropping the receipt.
-//! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if the fifo
-//!    entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the builder.
+//! 5. Submit to the pool. `AlreadyImported` (the tx reached the pool first by another route) is not
+//!    an error; both outcomes fall through to step 6.
 //! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return `Ok(Timeout
-//!    event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
-//!    (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
-//!    fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
-//!    and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
-//!    (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
-//!    `pending_responders`).
+//!    event)` (op-geth-aligned, meaning "unknown") and hand the entry to
+//!    [`PreconfTxSet::finalize_timeout`], which ends it only if no build holds it.
 
 use std::sync::Arc;
 
@@ -180,18 +176,9 @@ where
             return Err(preconf_error_to_rpc(&PreconfError::AlreadyInProgress));
         }
 
-        // Step 4 — submit to pool.
-        //
-        // `Ok(_)` and `Err(AlreadyImported)` are both admission successes
-        // and fall through to Step 5. The pool listener will observe
-        // whichever admission path took effect and call
-        // `push_if_absent`, which handles the same-hash retry case
-        // internally: if the fifo entry for this hash is in a
-        // reclaimable terminal state (`Timeout` / `Canceled`), it is
-        // revived to `Waiting` and broadcast so dispatch can pick it up.
-        // Active-state resubmits are rejected earlier at Step 3
-        // (`attach_responder`) — by the time we reach Step 4 we know
-        // the fifo entry is either absent or in a reclaimable state.
+        // Step 4 — submit to pool. `Ok(_)` and `Err(AlreadyImported)` both
+        // fall through to Step 5; a resubmit of a still-live entry was already
+        // refused at Step 3.
         match self.pool.add_transaction(TransactionOrigin::External, pool_tx).await {
             Ok(_) => {}
             Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
@@ -202,19 +189,8 @@ where
             }
         }
 
-        // Step 5 — await receipt or deadline, with race-safe handling.
-        //
-        // We use `tokio::select!` (not `tokio::time::timeout`) so
-        // `resp_rx` outlives the deadline. On the deadline branch, we
-        // acquire the per-entry `apply_lock` which serializes with
-        // dispatch's "point of no return"; once we hold the lock, the
-        // entry's status is definitive (either `Success`/`Failed`
-        // because dispatch committed and sent the receipt into
-        // `resp_rx`, or `Waiting` because dispatch never ran the
-        // apply). The `try_recv()` on `resp_rx` then reliably picks
-        // up any receipt that dispatch sent — closing the SLA race
-        // where a client could previously see `Timeout` even though
-        // the tx had already been committed to the builder state.
+        // Step 5 — await receipt or deadline. `biased` so a receipt that
+        // arrives together with the deadline wins.
         let preconf_timeout = self.cfg.preconf_timeout;
         let deadline = tokio::time::sleep(preconf_timeout);
         tokio::pin!(deadline);
@@ -283,10 +259,9 @@ where
                 debug!(target: "mantle::preconf::rpc", ?hash, ?preconf_timeout, "preconf deadline elapsed");
                 metrics::counter!("preconf.api.timeout_total").increment(1);
 
-                // Finalise here rather than leaving it to the next build: the
-                // client's own deadline is authoritative, and acting now frees
-                // the `(sender, nonce)` slot exactly when the client is told to
-                // give up.
+                // Ends the entry only if no build holds it. `Held` leaves it to
+                // their vote, and the parked responder must stay: it is what
+                // refuses a same-hash resubmit (`AlreadyInProgress`) meanwhile.
                 if self.fifo.finalize_timeout(&hash, preconf_timeout).await ==
                     TimeoutOutcome::Absent
                 {
@@ -294,7 +269,8 @@ where
                     // so no build sees it and `drop_hash` never clears its
                     // parked responder. Free the slot for a resubmit and evict
                     // so it cannot be mined after the client was told
-                    // `Timeout`. `Exempt` skips this: that entry is promised.
+                    // `Timeout`. `Exempt` / `Held` skip this: promised, or
+                    // still in a build's hands.
                     self.fifo
                         .cancel_responder(
                             &hash,

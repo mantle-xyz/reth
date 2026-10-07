@@ -9,9 +9,8 @@
 //! - **Status gate**: only `Waiting` entries proceed; terminal entries are recorded as excluded and
 //!   skipped.
 //! - **Pre-apply deadline**: when `entry.inserted_at.elapsed() + safety_margin >= preconf_timeout`,
-//!   the tx is *not* applied; the fifo entry is flipped to `Timeout` and the responder is cancelled
-//!   directly here. This closes the race where the RPC client has already given up but the builder
-//!   is about to commit a receipt.
+//!   the tx is *not* applied and this build votes `Timeout`. Like any failure, the entry ends only
+//!   when the last holding build lets go — another may already be applying it.
 //! - **Responder ownership**: every terminal path (success, deadline skip, status-already-terminal)
 //!   calls exactly one of `take_responder` / `cancel_responder`, never both.
 //!
@@ -269,16 +268,9 @@ where
     // `preconf_timeout` for the RPC-layer deadline to elapse.
     //
     // Exception: a prior `Timeout` exclusion is **re-evaluated** rather
-    // than forwarded. The deadline gate below checks
-    // `entry.inserted_at.elapsed()` against `cfg.preconf_timeout`, and
-    // `attach_responder`'s reclaimable-state branch refreshes
-    // `inserted_at` when the client resubmits after a Timeout. So the
-    // deadline that fired for the first submission does NOT apply to
-    // the fresh submission — forwarding the stale Timeout would deny
-    // service to a legitimately re-eligible tx. We drop the stale
-    // exclusion here and let the gate below fire against the refreshed
-    // clock; if the deadline is still exceeded, the gate will re-record
-    // exclusion with the fresh timeout.
+    // than forwarded. Once that entry is finalised, a same-hash resubmit is a
+    // new entry with a fresh clock; forwarding the stale Timeout would deny it.
+    // The gate below re-records the exclusion if the deadline still holds.
     if loop_state.is_committed(&hash) {
         trace!(target: "mantle::preconf::dispatch", ?hash, "dedup hit; already committed");
         return Ok(());
@@ -348,14 +340,13 @@ where
             "pre-apply deadline passed; aborting"
         );
         metrics::counter!("preconf.dispatch.deadline_skipped_total").increment(1);
-        // The one place that already walks every entry — carryover, the
-        // broadcast arm and a `Lagged` re-scan all funnel through here — so a
-        // separate sweeper would just repeat the traversal. `finalize_timeout`
-        // answers the responder and removes the entry; the hold is therefore
-        // dropped rather than consumed, so nothing finalises twice.
-        fifo.finalize_timeout(&hash, cfg.preconf_timeout).await;
-        drop(loop_state.take_hold(&hash));
+        // A vote, not a verdict: another build may have passed this gate just
+        // before the deadline and still be applying. Every entry funnels through
+        // here, so no separate sweeper is needed.
         let reason = PreconfError::Timeout { timeout_ms: cfg.preconf_timeout.as_millis() as u64 };
+        if let Some(hold) = loop_state.take_hold(&hash) {
+            fifo.finish_failure(hold, reason.clone()).await;
+        }
         loop_state.record_excluded(hash, reason);
         return Ok(());
     }
@@ -419,10 +410,8 @@ where
             if let Some(hold) = loop_state.take_hold(&hash) &&
                 fifo.finish_success(hold, receipt).await == SuccessOutcome::Gone
             {
-                // The deadline finalised it while we were applying — the one
-                // way an in-flight success is preempted. The tx is in this
-                // block regardless; the client was already told `Timeout`,
-                // which means "unknown", so nothing is owed here.
+                // Canon dropped it while we were applying: its nonce is sealed,
+                // so this block cannot be adopted with it. Nothing to record.
                 trace!(
                     target: "mantle::preconf::dispatch",
                     ?hash,
