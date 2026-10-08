@@ -285,8 +285,8 @@ where
     // closure ends up spending less than the tx claimed. Uses `>` so
     // exact-boundary hits (`used + limit == max`) are accepted.
     let tx_gas_limit = alloy_consensus::Transaction::gas_limit(entry.tx.as_ref());
-    if is_rpc
-        && loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
+    if is_rpc &&
+        loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
     {
         debug!(
             target: "mantle::preconf::dispatch",
@@ -306,19 +306,14 @@ where
         return Ok(());
     }
 
-    // Re-check under the lock. The RPC deadline branch may have already ended
-    // the commitment in the window between our earlier gate reads and this
-    // acquisition; running `apply_fn` now would violate the invariant
+    // Re-check under the lock: the RPC deadline branch may have ended the
+    // commitment since the gates read it, and applying now would break
     // "committed to builder state ⇒ wire not Timeout".
     //
-    // **Absent counts as changed.** `lock_for_apply` clones the lock's handle
-    // under `inner` and then awaits outside it — it has to, or waiters would
-    // hold the queue's lock — so a removal that does not consult `apply_lock`
-    // (`forward_all`, whose predicate is the sender's nonce moving past this
-    // entry) can take the entry in that gap and leave us holding a mutex that
-    // belongs to nothing. Reading `None` as "nothing changed" applies the
-    // snapshot taken before the gates, which is the one case the lock is here
-    // to prevent.
+    // **Absent counts as changed.** `lock_for_apply` awaits outside `inner`, so
+    // `forward_all` can take the entry in that gap and leave us holding a mutex
+    // that belongs to nothing. Treating `None` as unchanged would apply the
+    // pre-gate snapshot — the one case this lock exists to prevent.
     match fifo.find_by_hash(&hash).await {
         Some(re_entry) if re_entry.status == PreconfStatus::Waiting => {}
         other => {
@@ -345,11 +340,9 @@ where
         Ok(receipt) => {
             metrics::counter!("preconf.tx.success_total").increment(1);
             loop_state.record_committed(hash);
-            // The claim is made here, by the transaction executing — not below,
-            // when a client hears about it. Before this the nonce was unguarded
-            // for every entry that never reached a client: a replay, or one
-            // whose caller hung up. `mark_promised` upgrades the kind when the
-            // receipt lands.
+            // The claim is made by executing, not below by a client hearing
+            // about it — which is what leaves a replay's nonce guarded.
+            // `mark_promised` upgrades the kind when the receipt lands.
             if let Err(owner) = fifo.claims().record_announced(
                 hash,
                 &entry.from,
@@ -389,8 +382,8 @@ where
             //
             // A `Replay` entry came out of this file; writing it back on every
             // block it is retried in would grow it without adding anything.
-            if let Some(journal) = journal
-                && entry.source != PreconfSource::Replay
+            if let Some(journal) = journal &&
+                entry.source != PreconfSource::Replay
             {
                 let record = JournalEntry::for_executed(
                     hash,
@@ -450,26 +443,17 @@ where
             metrics::counter!("preconf.tx.fatal_total").increment(1);
             return Err(e);
         }
-        // This entry's receipt has already gone out (`Replay` covers journal
-        // restore, reorg reinject, and stale-in-flight replay alike), so
-        // reaching here means the commitment is **broken** — and this is the
-        // only moment that fact is observable.
+        // The claim for this entry already went out, so reaching here means it
+        // cannot be kept — and this is the only moment that is observable.
         //
-        // No retry: every transient cause is already filtered out before apply,
-        // so a second attempt would only re-derive the same answer. Transient
-        // capacity becomes `Defer` (unbounded, not a retry budget), and a
-        // a successor of a blocked predecessor is deferred or ended — both in
-        // `payload_builder::admit_and_dispatch`, neither reaching apply; `Fatal`
-        // returns above. What is left is permanent: a nonce or balance that
-        // moved since the tx last applied cleanly, an envelope this pipeline
-        // cannot convert, or a predecessor a crash lost for good (the pool is
-        // in-memory; only preconf txs are journaled). So the commitment ends on
-        // the first failure, which is what releases the `(sender, nonce)`.
+        // No retry: every transient cause is filtered before apply (capacity
+        // becomes `Defer`, a blocked predecessor's successor never reaches
+        // here, `Fatal` returns above). What is left is permanent, so the
+        // claim ends on the first failure, releasing the `(sender, nonce)`.
         Err(ApplyError::Rejected(rejected)) => {
-            // Only a claim a client was handed counts as broken. One that never
-            // got past a slice is an `Announced` claim, and its readers correct
-            // themselves at the next canonical block — see `ClaimKind`. Logging
-            // both at `error!` would bury the one nobody downstream can repair.
+            // Only a claim a client was handed counts as broken; an announced
+            // one has readers that self-correct (see `ClaimKind`). Logging both
+            // at `error!` buries the one nobody downstream can repair.
             if fifo.claims().was_promised(&hash) {
                 // This line and the counter are the only trace a breach leaves:
                 // the responder went with the receipt, and the node exposes no

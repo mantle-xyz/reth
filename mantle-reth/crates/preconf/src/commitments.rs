@@ -1,37 +1,24 @@
 //! The record of every claim this node has made about a transaction, and the
 //! `(sender, nonce)` slots those claims hold.
 //!
-//! A record exists for a hash whose receipt has gone out to a client, and
-//! outlives that transaction's fifo entry: the `(sender, nonce)` claim that
-//! refuses a replacement, the retention state behind [`SEAL_DEPTH`], and the
-//! journal's eviction question ([`Commitments::is_tracked`]).
+//! A record is created at the apply and outlives that transaction's fifo
+//! entry: it carries the claim that refuses a replacement, the retention state
+//! behind [`SEAL_DEPTH`], and the journal's eviction question
+//! ([`Commitments::is_tracked`]).
 //!
 //! **The journal is written elsewhere**, from the apply and from each slice, so
 //! "has a journal line" is the wider set. A line with no record here is
-//! slot-scoped — it survives a restart inside the slot and goes at the next
-//! rotation — which is right for the ordinary transactions a slice carries.
-//! It also catches a commitment whose client disconnected before its event, and
-//! that one is not in the pool to be recovered from, so a crash after a rotation
-//! and before the block is canonical loses it. Narrow, and stated here rather
-//! than closed: closing it means establishing the record where the journal line
-//! is written, which is a different place from where a client is answered.
+//! slot-scoped: it survives a restart inside the slot and goes at the next
+//! rotation.
 //!
-//! ## Why this is owned by `PreconfTxSet` and not by the allowlists
-//!
-//! It used to live on `PreconfClassifier`, which also owns the allowlists. The
-//! two never shared a lock, never shared a consumer, and never appeared in the
-//! same method — the only thing they shared was a constructor. Every consumer of
-//! this half (the RPC handler, the canonical handler, journal restore, the
-//! payload builder) already holds the fifo, so moving it there costs no new
-//! handle and lets the fifo release a record directly from `drop_hash` instead
-//! of through a registered callback.
+//! Owned by `PreconfTxSet`, which is what lets a removal release a record
+//! straight from `drop_hash`.
 //!
 //! ## Locking
 //!
-//! Read from the builder's apply hook and from the pool best-tx step, both sync
+//! Read from the builder's apply hook and the pool best-tx step, both sync
 //! `fn`s that never receive the fifo's `tokio::sync::Mutex` — hence
-//! `parking_lot` here. A guard is never held across an `.await`; every accessor
-//! returns an owned value and drops its guard before returning.
+//! `parking_lot` here. A guard is never held across an `.await`.
 
 use alloy_primitives::{
     Address, B256, TxHash,
@@ -56,60 +43,42 @@ use crate::config::PreconfConfig;
 /// [`Commitments::sweep`] for why exceeding it only warns.
 pub const DEFAULT_COMMITMENT_CACHE_CAP: usize = 100_000;
 
-/// How many **persisted** blocks must be stacked on top of a commitment's block
-/// before its tracking (commitment record + `(sender, nonce)` slot) may be released
-/// — 32.
+/// How many **persisted** blocks must bury a claim's block before its record
+/// and `(sender, nonce)` slot may be released — 32.
 ///
-/// This is the one ruler shared by the retention period here and the journal's
-/// discard gate: a commitment is forgotten only once
+/// The one ruler shared with the journal's discard gate:
 /// `committed_height + SEAL_DEPTH <= last_block_number()`.
 ///
-/// Two properties of that predicate matter more than the number itself:
+/// Two properties of that predicate matter more than the number:
 ///
-/// * it is measured against `last_block_number()` (**on disk**), not `best_block_number()` (which
-///   includes in-memory canonical blocks) — an un-persisted block is lost on a non-graceful exit,
-///   so counting it would let a commitment be forgotten before it is durable;
-/// * it is a block *depth*, not a duration — a duration says nothing about how deep a reorg can
-///   reach, which is the only thing the retention period defends against.
+/// * `last_block_number()` (**on disk**), not `best_block_number()` — an un-persisted block is lost
+///   on a non-graceful exit;
+/// * a block *depth*, not a duration — a duration says nothing about how deep a reorg can reach,
+///   which is all the retention period defends against.
 ///
-/// **Why 32 and not less.** The cost of holding a slot longer is close to zero:
-/// the nonce has been consumed on chain, so any *other* transaction for it is
-/// rejected by the inner validator with nonce-too-low regardless; the only thing
-/// the slot still blocks is exactly what it must block — a same-nonce
-/// replacement of a commitment that a reorg could bring back. So the depth is
-/// chosen for reorg tolerance, and the residual risk (a reorg deeper than this
-/// forgets a commitment that then loses its nonce) shrinks with it.
-///
-/// **Why not finality.** Waiting for a finalized marker would stall on a chain
-/// whose derivation pipeline has not started, pinning every slot indefinitely.
+/// Holding a slot longer is nearly free (the nonce is spent on chain, so
+/// anything else for it is nonce-too-low anyway), so the depth is chosen for
+/// reorg tolerance. Finality would be the alternative and would stall on a
+/// chain whose derivation pipeline has not started.
 pub const SEAL_DEPTH: u64 = 32;
 
-/// One commitment this node has made. A record exists exactly for a hash whose
-/// receipt has gone out, so its **presence is the answer** to "do we still owe
-/// this one"; [`Commitments::mark_promised`] is the only thing that
-/// creates one.
+/// One claim this node has made about a transaction. Its **presence is the
+/// answer** to "is this one still owed" — there is no "not claimed" record.
 ///
-/// A record exists exactly for a transaction the preconf arm owns; there is no
-/// "not preconf" record, so the record's **presence is the answer**.
+/// Created by [`Commitments::record_announced`] at the apply and upgraded by
+/// [`Commitments::mark_promised`] when a receipt reaches a client.
 ///
 /// `slot` is the reverse link into [`CommitmentStore::by_slot`], so every
-/// removal path can release the claim without scanning the index.
+/// removal can release the claim without scanning the index. The invariant is
+/// exact: **`slot` is `Some(key)` iff this hash may own `by_slot[key]`.** It is
+/// back-filled by `CommitmentStore::claim` under the same lock that inserts the
+/// record; a claim that loses to an incumbent returns `Err(owner)` while the
+/// record stays.
 ///
-/// It is `Option` because the claim may not be *ours*, not because it happens
-/// later: both writers insert the record and then call `CommitmentStore::claim`
-/// under the same lock, which back-fills the field. A claim that loses to an
-/// incumbent returns `Err(owner)` while the record itself stays (see
-/// `mark_promised_does_not_displace_an_existing_owner`).
-///
-/// The invariant is exact: **`slot` is `Some(key)` iff this hash may own
-/// `by_slot[key]`.**
-///
-/// `promised` / `committed_height` carry commitment-tracking state as fields
-/// rather than one value, because the three have different lifetimes:
-/// `record` is written once and never rewritten, `promised` is set once when a
-/// receipt goes out, and `committed_height` is the only reversible one —
-/// `uncommit` clears it on a reorg while the promise stands. See
-/// the `promised` flag for why a record and a promise are not the same thing.
+/// The three state fields are separate because their lifetimes are:
+/// `kind` only ever moves `Announced` → `Promised`, `promised_height` is set
+/// when the claim is made, and `committed_height` is the only reversible one —
+/// `uncommit` clears it on a reorg while the claim stands.
 #[derive(Debug, Clone, Copy)]
 struct Commitment {
     /// How strong the claim is — see [`ClaimKind`].
@@ -140,27 +109,19 @@ impl Commitment {
 
 /// How strong a claim this node made about a transaction.
 ///
-/// Both are public statements and both have to be kept, which is why they share
-/// a record, a slot and the must-land machinery. They differ in **who cleans up
-/// when the claim turns out false**, and that is what the per-kind behaviour
-/// below follows from.
+/// Both are public statements and both have to be kept, which is why they
+/// share a record, a slot and the must-land machinery. They differ in **who
+/// cleans up if the claim turns out false**, and the per-kind behaviour below
+/// follows from that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimKind {
-    /// Executed, and announced to whoever is subscribed to the slice stream —
-    /// but no client has been handed a receipt for it.
-    ///
-    /// A flashblock consumer serves this as `pending`, so the statement is
-    /// public and has real readers. It is the weaker of the two because those
-    /// readers reconcile on their own: the consumer has reorg detection and
-    /// corrects itself at the next canonical block.
+    /// Executed and announced on the slice stream, but no client holds a
+    /// receipt. Consumers serve it as `pending` and reconcile on their own —
+    /// they have reorg detection — which makes it the weaker claim.
     Announced,
-    /// A receipt went back to a client over
-    /// `eth_sendRawTransactionWithPreconf`.
-    ///
-    /// Nobody downstream can repair this one. If the transaction does not land,
-    /// the node lied to a caller that was synchronously waiting — which is what
-    /// `preconf.tx.commitment_broken_total` counts, and why only this kind
-    /// increments it.
+    /// A receipt went back over `eth_sendRawTransactionWithPreconf`. Nobody
+    /// downstream can repair this one, which is why only it increments
+    /// `preconf.tx.commitment_broken_total`.
     Promised,
 }
 
@@ -351,17 +312,12 @@ impl Commitments {
     /// **Where tracking begins.** Records that `hash` executed in the block
     /// being built, and claims the `(sender, nonce)` it ran on.
     ///
-    /// Called from the apply, not from the receipt — the claim is made by the
-    /// transaction executing and going out in a slice, not by a client hearing
-    /// about it. Two consequences follow, and both are the point:
-    ///
-    /// * a commitment whose client disconnected before its receipt still holds its nonce, where
-    ///   before it held nothing and a same-nonce pool transaction could take it;
-    /// * every executed transaction has a record, so `slot_owner` is a complete answer rather than
-    ///   one that happens to cover the cases a client was waiting on.
+    /// Called from the apply, not from the receipt — so an entry no client is
+    /// waiting on still holds its nonce, and `slot_owner` is a complete answer
+    /// rather than one covering only the cases a client was waiting on.
     ///
     /// Idempotent, and **never downgrades**: a hash already `Promised` stays
-    /// `Promised`, which is what a replay of an acknowledged commitment hits.
+    /// so, which is what a replay of an acknowledged commitment hits.
     pub fn record_announced(
         &self,
         hash: TxHash,
@@ -387,47 +343,28 @@ impl Commitments {
         claim
     }
 
-    /// **Where commitment tracking is established.** Records that a `Success`
-    /// receipt for `hash` has gone out to a client, and claims the
-    /// `(sender, nonce)` it was issued against.
+    /// Upgrade `hash` to [`ClaimKind::Promised`]: a receipt has gone out to a
+    /// client. Claims the `(sender, nonce)` if the apply has not already.
     ///
-    /// Two callers: the RPC handler, the instant it hands a client an event,
-    /// and journal restore's pre-pass, where the event went out in a previous
+    /// Two callers: the RPC handler the instant it hands a client an event, and
+    /// journal restore's pre-pass, where the event went out in a previous
     /// process.
     ///
     /// **Not in lockstep with the journal.** A record is what keeps a journal
-    /// line alive — rotation's only rule is [`Self::is_tracked`] — but the two
-    /// are written in different places: the journal from the apply
-    /// (`builder::dispatch`) and from each slice. A line whose hash never
-    /// reaches here is therefore slot-scoped: it survives a restart inside the
-    /// slot and is dropped at the next rotation. That is what the slice's
-    /// ordinary transactions want, and it is also what a commitment whose
-    /// client disconnected before its event gets, which is the narrower case —
-    /// see the module docs on what that leaves exposed.
+    /// line alive (rotation's only rule is [`Self::is_tracked`]), but the
+    /// journal is written from the apply and from each slice. A line whose hash
+    /// never reaches here is slot-scoped: it survives a restart inside the slot
+    /// and goes at the next rotation.
     ///
-    /// **Why here and not at canonical time.** A canonical notification hands us
-    /// bare transaction hashes for the whole block. To pick out our commitments
-    /// it needs a record that already exists — and the commitment record cannot
-    /// serve, because `forward → release_unless_committed` races the notification
-    /// and may already have dropped it. A receipt, by contrast, necessarily
-    /// precedes the block, so a record written here is in place before either
-    /// event can happen. See [`Self::mark_committed`].
+    /// **Do not move this to canonical time.** A canonical notification carries
+    /// bare hashes; picking out our own needs a record that already exists, and
+    /// `forward → release_unless_committed` races the notification. A receipt
+    /// necessarily precedes the block. See [`Self::mark_committed`].
     ///
-    /// There used to be a case here for a transaction whose record said it
-    /// was not preconf: the claim was skipped, because such a transaction had
-    /// no arm to defend the nonce with. It is unreachable now. The only
-    /// writer of a record is this method, so every record is a commitment whose
-    /// receipt has gone out — a transaction the door refused, or one still in
-    /// flight, leaves nothing here at all.
-    ///
-    /// The slot claim **never displaces an existing owner**. If the slot is taken,
-    /// the honest answer is that the incumbent owns the nonce; who wins is
-    /// decided one layer down by `push_if_absent`. Seizing it here for a
-    /// commitment that is about to lose it would make the guard refuse later
-    /// replacements on behalf of a transaction that will never be applied.
-    ///
-    /// Returns the outcome of that claim so restore can log a commitment that
-    /// arrives to find its nonce already spoken for.
+    /// **Never displaces an existing owner.** A taken slot means the incumbent
+    /// owns the nonce; who wins is settled a layer down by `push_if_absent`.
+    /// The claim's outcome is returned so restore can log a commitment that
+    /// arrives to find its nonce spoken for.
     pub fn mark_promised(
         &self,
         hash: TxHash,
@@ -528,11 +465,9 @@ impl Commitments {
         self.store.read().by_hash.contains_key(hash)
     }
 
-    /// Whether a receipt for `hash` reached a client.
-    ///
-    /// `false` for a hash with no record at all and for one that only ever got
-    /// as far as a slice — see [`ClaimKind`] for why the two are not the same
-    /// failure.
+    /// Whether a receipt for `hash` reached a client. `false` both for an
+    /// unknown hash and for one that only got as far as a slice — see
+    /// [`ClaimKind`].
     pub fn was_promised(&self, hash: &TxHash) -> bool {
         self.store.read().by_hash.get(hash).is_some_and(|c| c.kind == ClaimKind::Promised)
     }
@@ -545,25 +480,18 @@ impl Commitments {
         self.store.read().by_slot.get(&(*sender, nonce)).copied()
     }
 
-    /// Record the block this build sealed.
-    ///
-    /// Paired with [`Self::parent_is_ours`]: together they answer "did what I
-    /// executed last time land?" with one hash comparison and no chain reads,
-    /// which is the healthy path and the reason this is worth keeping at all.
+    /// Record the block this build sealed. Paired with
+    /// [`Self::parent_is_ours`] to answer "did what I executed last time land?"
+    /// with one comparison and no chain reads.
     pub fn note_sealed(&self, block: B256) {
         *self.sealed_payload.lock() = Some(block);
     }
 
-    /// Whether `parent_hash` is the block the last build sealed.
+    /// Whether `parent_hash` is the block the last build sealed — if so,
+    /// everything that build executed is on chain.
     ///
-    /// True means the chain built on what this node produced, so everything
-    /// that build executed is on chain.
-    ///
-    /// False is the conservative direction and is what a superseded payload
-    /// gives: the last `note_sealed` wins, so if the consensus layer took an
-    /// earlier one this reads false and the caller falls back to asking the
-    /// chain. Sweeping twice costs a few state reads; not sweeping loses
-    /// transactions.
+    /// False is the safe direction, and what a superseded payload gives (the
+    /// last `note_sealed` wins): the caller falls back to asking the chain.
     pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
         *self.sealed_payload.lock() == Some(parent_hash)
     }

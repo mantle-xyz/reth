@@ -39,9 +39,8 @@
 //! `builder::payload_builder`'s pool arm for why that is left as it is.
 //!
 //! The journal exposes `append_promised` / `append_batch` / `load` / `rotate`
-//! for the durability path, plus [`PreconfJournal::note_announced`], the
-//! startup helper [`restore_preconf_state`] and the background rotation loop
-//! [`spawn_rejournal_loop`].
+//! for the durability path, plus the startup helper [`restore_preconf_state`]
+//! and the background rotation loop [`spawn_rejournal_loop`].
 
 use std::{
     future::Future,
@@ -199,10 +198,8 @@ pub enum JournalError {
 /// module docs); that decision reaches rotation through the `retain` predicate
 /// [`Self::rotate`] takes.
 ///
-/// It does hold an index of pool transactions announced in a flashblock and not
-/// yet seen on chain (see [`crate::unlanded::Unlanded`]) — but the judgement is
-/// still the caller's: the chain nonces the sweep runs on are read by the build
-/// and handed in. This type never reads the chain.
+/// It never reads the chain: rotation's eviction rule arrives as the `retain`
+/// predicate, and nothing else here needs state.
 #[derive(Debug)]
 pub struct PreconfJournal {
     /// Path to the journal file. Stored for rotation, which writes a

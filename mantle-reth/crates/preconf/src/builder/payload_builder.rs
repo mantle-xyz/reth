@@ -751,9 +751,8 @@ where
             }
             dispatch::BlockKind::Reject => {
                 // The predecessor is over a bound no block can clear, so this
-                // successor can never reach its nonce. Both are `Replay`, so
-                // both were claimed; only one a client was handed counts as
-                // broken (see `ClaimKind`).
+                // successor never reaches its nonce. Only a claim a client was
+                // handed counts as broken (see `ClaimKind`).
                 if fifo.claims().was_promised(&hash) {
                     error!(
                         target: "mantle::preconf::dispatch",
@@ -945,9 +944,8 @@ async fn apply_one_best_tx<N, Builder>(
 where
     N: OpPayloadPrimitives,
     Builder: BlockBuilder<Primitives = N>,
-    // For staging what executed into the fifo. Satisfied for any OP-stack
-    // `NodePrimitives` by `impl From<OpTransactionSigned> for OpTxEnvelope`;
-    // named so the compiler can find the path, same as the pool builder does.
+    // For staging what executed into the fifo. Named so the compiler can find
+    // the conversion, same as the pool builder does.
     OpTxEnvelope: From<N::SignedTx>,
 {
     let Some(tx) = best_txs.next(()) else {
@@ -1082,33 +1080,14 @@ where
         .effective_tip_per_gas(constraints.base_fee)
         .expect("fee is always valid; execution succeeded");
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
-    // The one class of transaction nothing else brings back after a restart:
-    // deposits arrive with the attributes, a preconf commitment is journaled by
-    // the apply that commits it, and the post-execution transaction is made by
-    // the executor rather than sent by anyone.
-    //
-    // Marking it is not the same as persisting it. Only the slice path drains
-    // these (`SliceState::journal_and_publish`), so **with slicing off they are
-    // marked and never written** — the restart then replays commitments without
-    // the ordinary transactions they ran after, which is the failure this
-    // marking exists to prevent. Known, and left that way: writing them at the
-    // end of the build instead would put a disk write on the `engine_getPayload`
-    // path to cover a much narrower crash window.
-    // Stage it the same way a preconf commitment is staged, and for the same
-    // reason: it has executed and is about to be announced in a slice, so the
-    // node has made a statement about it that only landing makes true.
-    //
-    // This replaces the separate unlanded index. Before, an ordinary
-    // transaction lived nowhere between executing and the chain confirming it
-    // — the slice boundary prunes it from the pool half a slot early — so a
-    // block that never landed left it in no block and no pool. The fifo is
-    // where must-land work already lives, and `Replay` is what it means here
-    // too: no client is waiting, the gates that protect one do not apply, and
-    // the carryover preamble re-dispatches it ahead of fresh pool traffic.
-    //
-    // `Announced` on the registry rather than `Promised`: a flashblock
-    // consumer can correct itself, a caller holding a receipt cannot. See
-    // `ClaimKind`.
+    // The one class of transaction nothing else brings back after a restart.
+    // Only the slice path drains these, so **with slicing off they are marked
+    // and never written** — known, and left that way rather than put a disk
+    // write on the `engine_getPayload` path.
+    // Staged like a commitment, because by the next slice it is one: executed,
+    // announced, and pruned from the pool half a slot before the block could be
+    // canonical. `Replay` because no client is waiting; `Announced` because
+    // none was told. See `ClaimKind`.
     let signer = recovered.signer();
     let nonce = recovered.nonce();
     let staged: Option<TxEnvelope> =
@@ -1212,28 +1191,14 @@ where
             ctx.parent(),
             transactions,
             &output,
-            // Empty, and post-Isthmus that is wrong rather than merely
-            // approximate: the assembler reads a bundle only to derive the
-            // `L2ToL1MessagePasser` storage root, which `storage_root` computes
-            // as the current state plus whatever updates it is handed — so an
-            // empty bundle reports the parent's root, while every withdrawal in
-            // the block moves the real one. Slices of a block containing
-            // withdrawals therefore carry a root the sealed block will not have.
+            // Empty, so post-Isthmus the slice header reports the *parent's*
+            // `L2ToL1MessagePasser` root — wrong on any block containing a
+            // withdrawal. Passing the live bundle does not fix it (slicing
+            // never merges transitions, so ours is as empty as this one);
+            // getting the figure means assembling it from pending transitions.
             //
-            // The reference implementation passes its live bundle here, which
-            // reads as the line to copy and is not: a bundle only holds what
-            // `merge_transitions` has folded into it, and slicing never merges
-            // — doing so a second time appends an empty revert block and
-            // truncates the real one, which is what `slice_state_invariants`
-            // pins. Ours would be as empty as this one. Getting the figure
-            // means assembling it from the pending transitions instead, for
-            // this one predeploy, without touching the bundle.
-            //
-            // Left until a consumer is known to read the field. Until then it
-            // buys one header field on blocks that contain withdrawals, at the
-            // price of code that walks state revm expects to own; the rest of
-            // the slice header — transactions, receipts, gas — is exact
-            // regardless.
+            // Left until a consumer is known to read the field. Everything else
+            // in the slice header is exact.
             &BundleState::default(),
             state_provider,
             B256::ZERO,
@@ -1921,24 +1886,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // canon-stale entries, it does not apply any tx into the
         // in-flight block, so it is safe (and desirable — keeps fifo
         // aligned with chain state) during derivation builds too.
-        // Did what the last build executed actually land? Nothing else answers
-        // it for a block that never entered the canonical chain: no reorg
-        // fires, and the pool's own reinjection never sees it. Asking at the
-        // start of the next build is the race-free way, and it replaces asking
-        // why the last build ended — `Resolved` is not proof the consensus
-        // layer used the payload.
+        // Did what the last build executed land? For a block that never entered
+        // the chain nothing else answers: no reorg fires, and the pool's own
+        // reinjection never sees it. Asking here also beats asking why the last
+        // build ended — `Resolved` is not proof the payload was used.
         //
-        // Both arms run **before** the forward sweep below, so that sweep walks
-        // only what is left rather than a whole block's worth of entries.
-        //
-        // Not gated on slicing: this reads state and moves bookkeeping without
-        // putting anything in the block, and skipping it on a derivation build
-        // would leave the sealed hash behind a parent no later build matches.
+        // Before the forward sweep, so that sweep walks only what is left. Not
+        // gated on slicing: skipping it on a derivation build would strand the
+        // sealed hash behind a parent no later build matches.
         if self.fifo.claims().parent_is_ours(parent_hash) {
-            // The chain built on what this node sealed, so everything that
-            // build executed is on it. One hash comparison and an in-memory
-            // drop — no state reads at all. This is the healthy path, and the
-            // reason the sealed hash is worth tracking.
+            // Our block is the parent, so everything in it is on chain. One
+            // comparison and an in-memory drop — the healthy path, and why the
+            // sealed hash is tracked at all.
             let released = self.fifo.drop_landed_claims().await;
             if released > 0 {
                 debug!(
@@ -1948,12 +1907,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 );
             }
         } else {
-            // The parent is not ours, so what the last build executed may be in
-            // no block at all. Two things are wrong in that case and only one
-            // of them is here: the pool was told these senders moved on half a
-            // slot early, and that has to be put back. The entries themselves
-            // need no rescue — they are already in the fifo as `Success`, and
-            // the forward sweep below drops exactly the ones the chain took.
+            // What the last build executed may be in no block at all. Only the
+            // pool needs repairing here — it was told these senders moved on
+            // half a slot early. The entries need no rescue: they are in the
+            // fifo already, and the sweep below drops the ones the chain took.
             let staged = self.fifo.senders_with_landed_claims().await;
             if !staged.is_empty() {
                 metrics::counter!("flashblock.unlanded_sweep_slow_total").increment(1);
@@ -1965,12 +1922,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         // it sits at nonce 0, which is what the pool should be
                         // told.
                         Ok(nonce) => nonce.unwrap_or(0),
-                        // A failed read is not a nonce, and must not be spent as
-                        // one. Telling the pool a sender at nonce 30 is back at
-                        // 0 parks everything they hold until a real canonical
-                        // update arrives. Skipping costs nothing here: the
-                        // forward sweep below keeps any entry it was given no
-                        // nonce for, so it is asked about again next build.
+                        // A failed read is not a nonce. Telling the pool a
+                        // sender at 30 is back at 0 parks everything they hold.
+                        // Skipping is free: the sweep below keeps any entry it
+                        // got no nonce for, and asks again next build.
                         Err(err) => {
                             metrics::counter!("flashblock.unlanded_nonce_unreadable_total")
                                 .increment(1);
@@ -1982,17 +1937,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             continue;
                         }
                     };
-                    // Put the pool's record back where the chain has it. The
-                    // slice boundary advanced it on the strength of a block that
-                    // did not land, and the pool discards rather than parks
-                    // anything below the nonce it holds — so leaving it raised
-                    // costs this sender everything they send until a real block
-                    // corrects it.
+                    // Back to where the chain has it: the pool discards rather
+                    // than parks anything below the nonce it holds.
                     //
-                    // An unreadable balance is the one thing still guessed here,
-                    // downwards, as pool maintenance guesses it: zero parks the
-                    // sender for a block, where guessing upwards would admit an
-                    // unfunded transaction. The nonce is the half worth having.
+                    // Balance is guessed downwards, as pool maintenance guesses
+                    // it — zero parks the sender for a block, guessing upwards
+                    // would admit an unfunded transaction.
                     changed.push(ChangedAccount {
                         address: sender,
                         nonce,
@@ -2265,8 +2215,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // everything this build announced is on chain and the whole group goes
         // without a single state read — which is the healthy path, and the
         // reason the sweep costs nothing on a chain that is working.
-        // No longer gated on the journal: the registry holds this, and it
-        // exists whether or not a journal file does.
+        // Not gated on the journal any more: the registry exists either way.
         self.fifo.claims().note_sealed(sealed_block.hash());
         debug!(
             target: "mantle::preconf::payload_builder",

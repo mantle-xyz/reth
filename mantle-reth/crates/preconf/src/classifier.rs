@@ -1,77 +1,35 @@
-//! The preconf allowlists, and the record of every commitment this node owes.
+//! The preconf allowlists, mirrored from the on-chain contract.
 //!
-//! ## Which arm owns a transaction, and whether policy still authorizes it
+//! ## Where eligibility is decided
 //!
 //! Once the allowlists became on-chain governed and refreshable at runtime (see
 //! [`crate::whitelist`]), "is this transaction preconf-eligible?" became a
-//! function of *when you ask*. Two questions hide in that one, and they are
-//! answered in different places.
+//! function of *when you ask*. Two questions hide in that one.
 //!
-//! **Which build arm owns the transaction** is settled once, at admission. What
+//! **Which build arm owns the transaction** is settled once, at admission: what
 //! [`PreconfClassifier::preview_eligibility`] lets through becomes a fifo entry,
-//! and the entry is the only thing either arm consults afterwards: both skip a
-//! hash iff the fifo holds it (`builder::payload_builder::apply_one_best_tx` for
-//! the pool arm). A later allowlist update therefore cannot move a transaction
-//! between the arms, which is what keeps it from being applied by both or by
-//! neither.
+//! and both arms skip a hash iff the fifo holds it
+//! (`builder::payload_builder::apply_one_best_tx` for the pool arm). A later
+//! allowlist update cannot move a transaction between the arms.
 //!
-//! **Whether policy still authorizes it** is re-decided per entry at build time,
-//! by `builder::payload_builder::barred_by_allowlist`, against the allowlist in
-//! force for that block. That check is the binding one; the admission check is a
-//! non-authoritative preview that only saves work on a sender the lists never
-//! covered. The commitment record cannot answer this question — it records
-//! eligibility as of admission, not what policy says now.
+//! **Whether policy still authorizes it** is re-decided per entry at build
+//! time, by `builder::payload_builder::barred_by_allowlist`, against the
+//! allowlist in force for that block. **That is the binding check**; the
+//! admission one is a non-authoritative preview.
 //!
-//! ## What the records carry
+//! ## Why the lists are private
 //!
-//! A record exists for a hash whose event has gone out to a client, and
-//! outlives that transaction's fifo entry: the `(sender, nonce)` claim that
-//! refuses a replacement, the retention state behind [`SEAL_DEPTH`], and the
-//! journal's eviction question ([`PreconfClassifier::is_tracked`]).
-//!
-//! **The journal is written elsewhere**, from the apply and from each slice, so
-//! "has a journal line" is the wider set. A line with no record here is
-//! slot-scoped — it survives a restart inside the slot and goes at the next
-//! rotation — which is right for the ordinary transactions a slice carries.
-//! It also catches a commitment whose client disconnected before its event,
-//! and that one is not in the pool to be recovered from, so a crash after a
-//! rotation and before the block is canonical loses it. Narrow, and stated
-//! here rather than closed: closing it means establishing the record where the
-//! journal line is written, which is a different place from where a client is
-//! answered.
-//!
-//! ## Why the allowlists live here and not on `PreconfConfig`
-//!
-//! The lists are private to [`PreconfClassifier`], and there is deliberately no
-//! public `is_preconf_tx` — no way to hand in a transaction and get back an
-//! answer derived from whatever the lists happen to say at that instant.
-//!
-//! That is **not** the same as "eligibility cannot be re-derived anywhere else".
-//! It can: [`PreconfClassifier::whitelist_snapshot`] hands out an
-//! `Arc<Whitelist>` and [`Whitelist::is_eligible`] evaluates the predicate
-//! against it, which is exactly what the payload builder does once per block to
-//! judge commitments against the allowlist in force at build time.
-//!
-//! What the shape buys is that re-deriving forces the caller to **name which
-//! allowlist it means**. A snapshot answers "who would be eligible under these
-//! lists"; it cannot answer the question this module owns — "what was this
-//! *already-admitted* transaction classified as" — because that answer is not a
-//! function of any list. It lives in the commitment cache, and every consumer that
-//! needs the partition to hold reads it from there.
+//! There is deliberately no public `is_preconf_tx`. Re-deriving eligibility is
+//! allowed — [`PreconfClassifier::whitelist_snapshot`] hands out an
+//! `Arc<Whitelist>` and [`Whitelist::is_eligible`] evaluates against it, which
+//! is what the payload builder does once per block — but the shape forces the
+//! caller to **name which allowlist it means**.
 //!
 //! ## Locking
 //!
-//! The commitment store is read from the builder's apply hook, a sync `fn` that
-//! never receives the fifo, so it has to be **synchronously readable** — hence
-//! `parking_lot` here, where every `PreconfTxSet` lookup is `async` behind a
-//! `tokio::sync::Mutex`.
-//!
-//! Two independent locks, deliberately: the allowlists are read-often /
-//! written-almost-never, while the commitment cache takes one write per admitted
-//! transaction. They are never held at the same time: no method reads the
-//! allowlists and the records together, so no lock order exists to get wrong. As everywhere else in
-//! this crate, a guard is never held across an `.await`; every accessor here returns an owned value
-//! and drops its guard before returning, so callers cannot accidentally hold one.
+//! `parking_lot`, because the builder reads the snapshot from a sync `fn`. The
+//! commitment records that used to share this type live in
+//! [`crate::commitments`] now; they never shared a lock with the lists.
 
 use alloy_primitives::{Address, map::foldhash::HashSet};
 use parking_lot::RwLock;
@@ -217,8 +175,8 @@ impl PreconfClassifier {
     }
 
     /// Number of commitment records — for logging, metrics and assertions.
-    /// nothing, so it cannot pre-empt the record
-    /// [`Self::mark_promised`] establishes once a receipt goes out.
+    /// nothing, so it cannot pre-empt the record the apply establishes (see
+    /// [`crate::commitments::Commitments::record_announced`]).
     pub fn preview_eligibility(&self, from: &Address, to: Option<&Address>) -> bool {
         self.evaluate_whitelist(from, to)
     }

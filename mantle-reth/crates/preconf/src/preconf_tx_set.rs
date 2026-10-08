@@ -73,14 +73,12 @@ use crate::{
 /// roughly three blocks' worth: long enough to cover a run of blocks that do
 /// not land, short enough that the staging half stays about a megabyte.
 ///
-/// **A backstop, not a working limit.** On a chain that is producing, every
-/// build clears these — `drop_landed_claims` when the parent is ours, the
-/// forward sweep when it is not. Reaching this means neither has happened for
-/// several blocks, which is worth alerting on rather than silently growing.
+/// **A backstop, not a working limit.** Every build clears these on a chain
+/// that is producing, so reaching the cap means several have not — worth
+/// alerting on rather than growing silently.
 ///
-/// Only `Announced` claims are evictable. A `Promised` one is never dropped for
-/// being old: a client is holding its receipt, and the whole subsystem exists
-/// so that transaction lands.
+/// Only `Announced` claims are evictable; a `Promised` one is never dropped
+/// for being old.
 pub const STAGED_CAP: usize = 4096;
 
 /// A single fifo entry.
@@ -471,11 +469,9 @@ pub struct PreconfTxSet {
 
     /// The claims this node has made, and the nonces they hold.
     ///
-    /// Owned here because every removal path already runs under this type, and
-    /// the only question a removal has to ask the registry — "is this one still
-    /// owed?" — used to travel out through a registered callback. The same
-    /// `Arc` is held by `PreconfTxSetInner`, which releases records directly
-    /// from `drop_hash`.
+    /// Owned here because every removal path already runs under this type.
+    /// `PreconfTxSetInner` holds the same `Arc` and releases records straight
+    /// from `drop_hash`, where a registered callback used to go.
     claims: Arc<Commitments>,
 }
 
@@ -572,34 +568,20 @@ impl PreconfTxSet {
     /// Decide and enqueue in one step: every remaining rule, then the entry,
     /// under a single hold of the lock.
     ///
-    /// Splitting the two is what the old path did, and every gap between them
-    /// was a window — a nonce checked and then taken by someone else, a
-    /// transaction accepted into the pool that the fifo then refused. Here
-    /// there is nothing between deciding and being in the queue.
+    /// Nothing sits between deciding and being in the queue, so there is no
+    /// window for a nonce to be checked and then taken.
     ///
-    /// The caller has already decoded the transaction, established that the
-    /// sender may use the preconf path, and put it through the validator; what
-    /// is left are exactly the rules that depend on what this queue already
-    /// holds.
+    /// The caller has decoded, allowlisted and validated; what is left are the
+    /// rules that depend on what this queue already holds.
     ///
-    /// **Not among them: what the transaction costs.** Neither the fee cap nor
-    /// the balance it draws on is a queue rule, and for one reason — both are
-    /// measured against the block the transaction executes in, and only the EVM
-    /// knows that block. The queue would be judging a fee cap against whichever
-    /// build last published a base fee (the previous block, whenever no build
-    /// is open) and a balance against canonical state (which the block being
-    /// built may already have spent or credited). Both refusals still reach the
-    /// client under their own names —
+    /// **Cost is not among them.** Both the fee cap and the balance are
+    /// measured against the block the transaction executes in, which only the
+    /// EVM knows. They still reach the client by their own names —
     /// [`BaseFeeTooLow`](crate::types::PreconfError::BaseFeeTooLow) and
     /// [`InsufficientFunds`](crate::types::PreconfError::InsufficientFunds) —
     /// from the builder; see [`crate::apply::BuilderRejected`].
     ///
-    /// Ordering within the lock is by cost, cheapest first, so a request that
-    /// is going to be refused holds the lock for as little as possible.
-    ///
-    /// The slot claim reaches into the classifier while this lock is held. That
-    /// is the direction every fifo removal already takes — `drop_hash` fires
-    /// the record eviction from inside here — so it adds no new order.
+    /// Rules run cheapest first, so a doomed request holds the lock briefly.
     pub async fn admit(&self, req: AdmitRequest, capacity: Capacity) -> Result<(), PreconfError> {
         let AdmitRequest { tx, from, source, responder, chain_nonce, bytecode_hash } = req;
         let hash = *tx.tx_hash();
@@ -789,15 +771,12 @@ impl PreconfTxSet {
     /// Stage a transaction this build has **already executed**, so the next one
     /// can ask the chain whether it landed.
     ///
-    /// Enters as `Success` rather than `Waiting`, which is what it is: it ran.
-    /// That is also what `senders_with_landed_claims` and `drop_landed_claims`
-    /// select on, so a `Waiting` entry here would silently skip both the pool
-    /// nonce repair and the healthy-path release.
+    /// `Success`, not `Waiting`: that is what it is, and what
+    /// `senders_with_landed_claims` and `drop_landed_claims` select on.
+    /// Getting it wrong skips both silently.
     ///
-    /// **Does not notify the build loop.** The broadcast exists to tell the
-    /// dispatcher there is work; this has none — the transaction has run. At a
-    /// block's worth of ordinary transactions, waking the loop for each would
-    /// be a send per transaction for nothing.
+    /// Sends no broadcast — the notifier means "there is work to dispatch",
+    /// and this has run already.
     pub async fn stage_executed(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
         let out =
             self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await;
@@ -882,16 +861,12 @@ impl PreconfTxSet {
         PushResult::Inserted
     }
 
-    /// Drop the oldest evictable staged entries until the queue is back under
+    /// Drop the oldest evictable staged entries until back under
     /// [`STAGED_CAP`].
     ///
-    /// Walks `order`, which is arrival order, so the oldest go first — they are
-    /// the ones most likely to have landed already. Skips anything a client was
-    /// handed a receipt for: that one is owed regardless of how long the chain
-    /// has been stalled, and dropping it is the one thing this must never do.
-    ///
-    /// Called after staging rather than on a timer, because that is the only
-    /// path that grows this half of the queue.
+    /// Oldest first (`order` is arrival order) — those most likely to have
+    /// landed. **Never a `Promised` claim**: that one is owed however long the
+    /// chain has been stalled.
     async fn trim_staged(&self) {
         let mut inner = self.inner.lock().await;
         if inner.entries.len() <= STAGED_CAP {
@@ -1108,11 +1083,8 @@ impl PreconfTxSet {
         self.inner.lock().await.by_sender.keys().copied().collect()
     }
 
-    /// Every sender holding a `Success` entry — what the last build executed and
-    /// has not yet confirmed on chain.
-    ///
-    /// The slow sweep reads a chain nonce per sender in this set, so it is
-    /// deliberately the senders and not the entries.
+    /// Every sender holding a `Success` entry. Senders rather than entries
+    /// because the slow sweep reads one chain nonce per sender.
     pub async fn senders_with_landed_claims(&self) -> HashSet<Address> {
         let inner = self.inner.lock().await;
         inner
@@ -1123,18 +1095,12 @@ impl PreconfTxSet {
             .collect()
     }
 
-    /// Drop every `Success` entry, for the build that has just established its
-    /// parent is the block this node sealed.
+    /// Drop every `Success` entry, for a build whose parent is the block this
+    /// node sealed: all of it is on chain.
     ///
-    /// **The healthy path, and the reason the sealed-block hash is tracked at
-    /// all.** If the chain built on our block then everything that build
-    /// executed is on it, so there is nothing to ask the chain and nothing to
-    /// replay. The alternative is [`Self::forward_all`], which reads an account
-    /// per sender — a few hundred state reads per block once ordinary
-    /// transactions are in here too.
-    ///
-    /// `Waiting` entries are untouched: they were never executed, so our block
-    /// landing says nothing about them.
+    /// The healthy path. [`Self::forward_all`] is the alternative and reads an
+    /// account per sender — hundreds per block once ordinary transactions are
+    /// in here too. `Waiting` entries are untouched; they never executed.
     pub async fn drop_landed_claims(&self) -> usize {
         let mut inner = self.inner.lock().await;
         let landed: Vec<TxHash> = inner
