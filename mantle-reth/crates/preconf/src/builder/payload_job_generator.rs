@@ -172,6 +172,7 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx:
         From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>> + TryFrom<TxEnvelope>,
+    op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
 {
     type Job = PreconfPayloadJob<OpPayloadAttrs, OpBuiltPayload<N>>;
 

@@ -162,6 +162,7 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx:
         From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>> + TryFrom<TxEnvelope>,
+    op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
 {
     async fn spawn_payload_builder_service(
         self,

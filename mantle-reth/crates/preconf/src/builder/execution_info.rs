@@ -7,13 +7,12 @@ use std::{
 };
 
 use alloy_consensus::transaction::Recovered;
-use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::Address;
 use reth_optimism_payload_builder::builder::ExecutionInfo as OpExecutionInfo;
 use reth_optimism_primitives::OpTransaction;
 use reth_primitives_traits::SignedTransaction;
 
-use crate::{journal::JournalEntry, preconf_tx_set::PreconfTxSet, unlanded::Announced};
+use crate::{journal::JournalEntry, preconf_tx_set::PreconfTxSet};
 
 /// Whether this transaction's nonce field is its sender's account nonce.
 ///
@@ -137,7 +136,7 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
         &self.executed
     }
 
-    /// Everything executed since the last call, projected twice — once as
+    /// Everything executed since the last call, as
     /// journal records and once as what the unlanded index needs — and moves
     /// past them in the same step.
     ///
@@ -163,10 +162,7 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
     /// Only the slice path calls this, so with slicing off nothing drains what
     /// `record_journalable` marked — see the pool arm in
     /// `builder::payload_builder` for what that costs and why it stands.
-    pub fn take_journal_records(
-        &mut self,
-        block_height: u64,
-    ) -> (Vec<JournalEntry>, Vec<Announced>) {
+    pub fn take_journal_records(&mut self, block_height: u64) -> Vec<JournalEntry> {
         let taken = &self.journalable[self.journaled_upto..];
         let records: Vec<JournalEntry> = taken
             .iter()
@@ -175,15 +171,8 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
                 JournalEntry::for_executed(*tx.tx_hash(), tx, block_height)
             })
             .collect();
-        let announced: Vec<Announced> = taken
-            .iter()
-            .map(|&at| {
-                let tx = &self.executed[at];
-                (*tx.tx_hash(), tx.encoded_2718().into(), tx.signer(), tx.nonce())
-            })
-            .collect();
         self.journaled_upto = self.journalable.len();
-        (records, announced)
+        records
     }
 
     /// The highest nonce executed this block per sender.
@@ -329,7 +318,7 @@ mod tests {
         info.record_journalable(tx(sender(0xbb), 1));
         info.record(tx(sender(0xcc), 2));
 
-        let (records, _) = info.take_journal_records(7);
+        let records = info.take_journal_records(7);
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].hash, *info.executed()[1].tx_hash());
@@ -348,15 +337,14 @@ mod tests {
         info.record_journalable(tx(sender(0xbb), 1));
         info.record_journalable(tx(sender(0xcc), 2));
 
-        let (records, announced) = info.take_journal_records(7);
+        let records = info.take_journal_records(7);
 
-        assert_eq!(announced.len(), records.len());
-        let hashes: Vec<_> = announced.iter().map(|(hash, ..)| *hash).collect();
-        assert_eq!(hashes, records.iter().map(|r| r.hash).collect::<Vec<_>>());
-        assert_eq!(announced[0].2, sender(0xbb), "the signer, not re-derived");
-        assert_eq!(announced[0].3, 1);
-        assert_eq!(announced[1].2, sender(0xcc));
-        assert_eq!(announced[1].3, 2);
+        // Only what `record_journalable` marked, in execution order, carrying
+        // the signer the executor recovered rather than one re-derived here.
+        assert_eq!(
+            records.iter().map(|r| r.hash).collect::<Vec<_>>(),
+            vec![*tx(sender(0xbb), 1).tx_hash(), *tx(sender(0xcc), 2).tx_hash()],
+        );
     }
 
     /// The journal cursor tracks what has been handed over, the publish cursor
@@ -369,9 +357,9 @@ mod tests {
         info.record_journalable(tx(sender(0xaa), 0));
 
         // The slice was journaled, then dropped before it went out.
-        assert_eq!(info.take_journal_records(7).0.len(), 1);
+        assert_eq!(info.take_journal_records(7).len(), 1);
 
-        assert!(info.take_journal_records(7).0.is_empty(), "already handed over");
+        assert!(info.take_journal_records(7).is_empty(), "already handed over");
         assert_eq!(info.pending_slice().len(), 1, "but never published");
     }
 
@@ -384,7 +372,7 @@ mod tests {
         info.record_journalable(tx(sender(0xaa), 1));
         info.record_journalable(tx(sender(0xaa), 2));
 
-        let taken: Vec<_> = info.take_journal_records(7).0.iter().map(|r| r.hash).collect();
+        let taken: Vec<_> = info.take_journal_records(7).iter().map(|r| r.hash).collect();
         let expected: Vec<_> = info.executed()[2..].iter().map(|tx| *tx.tx_hash()).collect();
 
         assert_eq!(taken, expected, "in execution order, and only the new ones");

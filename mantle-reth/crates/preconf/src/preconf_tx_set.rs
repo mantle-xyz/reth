@@ -766,6 +766,32 @@ impl PreconfTxSet {
         from: Address,
         source: PreconfSource,
     ) -> PushResult {
+        self.push_with_status(tx, from, source, PreconfStatus::Waiting).await
+    }
+
+    /// Stage a transaction this build has **already executed**, so the next one
+    /// can ask the chain whether it landed.
+    ///
+    /// Enters as `Success` rather than `Waiting`, which is what it is: it ran.
+    /// That is also what `senders_with_landed_claims` and `drop_landed_claims`
+    /// select on, so a `Waiting` entry here would silently skip both the pool
+    /// nonce repair and the healthy-path release.
+    ///
+    /// **Does not notify the build loop.** The broadcast exists to tell the
+    /// dispatcher there is work; this has none — the transaction has run. At a
+    /// block's worth of ordinary transactions, waking the loop for each would
+    /// be a send per transaction for nothing.
+    pub async fn stage_executed(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
+        self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await
+    }
+
+    async fn push_with_status(
+        &self,
+        tx: Arc<TxEnvelope>,
+        from: Address,
+        source: PreconfSource,
+        status: PreconfStatus,
+    ) -> PushResult {
         let hash = *tx.tx_hash();
         let nonce = tx.nonce();
 
@@ -817,7 +843,7 @@ impl PreconfTxSet {
             nonce,
             size,
             inserted_at,
-            status: PreconfStatus::Waiting,
+            status,
             source,
             responder,
             apply_lock: Arc::new(Mutex::new(())),
@@ -827,7 +853,9 @@ impl PreconfTxSet {
         inner.order.push_back(hash);
         drop(inner);
 
-        let _ = self.notifier.send(hash);
+        if status == PreconfStatus::Waiting {
+            let _ = self.notifier.send(hash);
+        }
 
         PushResult::Inserted
     }
@@ -2718,8 +2746,8 @@ mod proptest_model {
 
     fn model_mark(model: &mut Model, hb: u8, target: PreconfStatus) {
         // Only a `Waiting` entry moves; anything else is a no-op.
-        if let Some((_, _, st)) = model.get_mut(&hb)
-            && *st == PreconfStatus::Waiting
+        if let Some((_, _, st)) = model.get_mut(&hb) &&
+            *st == PreconfStatus::Waiting
         {
             *st = target;
         }
