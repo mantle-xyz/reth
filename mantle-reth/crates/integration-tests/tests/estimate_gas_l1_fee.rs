@@ -70,6 +70,7 @@ fn attrs_with_l1_deposit(timestamp: u64) -> OpPayloadAttrs {
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
+            target_gas_limit: None,
         },
         transactions: Some(vec![l1_attributes_deposit_bytes()]),
         no_tx_pool: None,
