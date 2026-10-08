@@ -163,10 +163,6 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
         .with_rpc(rpc);
     config.network.discovery.discv5_port = Some(0);
     config.network.discovery.discv5_port_ipv6 = Some(0);
-    // These single-node tests drive Engine locally and do not need public peers.
-    config.network.addr = std::net::Ipv4Addr::LOCALHOST.into();
-    config.network.bootnodes = Some(Vec::new());
-    config.network.discovery.disable_discovery = true;
 
     let db = create_test_rw_db_with_path(
         config
