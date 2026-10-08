@@ -59,12 +59,29 @@ use std::{
     time::Instant,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     commitments::{Commitments, DEFAULT_COMMITMENT_CACHE_CAP},
     types::{MarkError, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus, PushResult},
 };
+
+/// How many executed-but-unconfirmed entries the queue holds before the oldest
+/// start falling out — 4096.
+///
+/// A full block carries on the order of 1400 ordinary transactions, so this is
+/// roughly three blocks' worth: long enough to cover a run of blocks that do
+/// not land, short enough that the staging half stays about a megabyte.
+///
+/// **A backstop, not a working limit.** On a chain that is producing, every
+/// build clears these — `drop_landed_claims` when the parent is ours, the
+/// forward sweep when it is not. Reaching this means neither has happened for
+/// several blocks, which is worth alerting on rather than silently growing.
+///
+/// Only `Announced` claims are evictable. A `Promised` one is never dropped for
+/// being old: a client is holding its receipt, and the whole subsystem exists
+/// so that transaction lands.
+pub const STAGED_CAP: usize = 4096;
 
 /// A single fifo entry.
 ///
@@ -782,7 +799,12 @@ impl PreconfTxSet {
     /// block's worth of ordinary transactions, waking the loop for each would
     /// be a send per transaction for nothing.
     pub async fn stage_executed(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
-        self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await
+        let out =
+            self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await;
+        if matches!(out, PushResult::Inserted) {
+            self.trim_staged().await;
+        }
+        out
     }
 
     async fn push_with_status(
@@ -858,6 +880,49 @@ impl PreconfTxSet {
         }
 
         PushResult::Inserted
+    }
+
+    /// Drop the oldest evictable staged entries until the queue is back under
+    /// [`STAGED_CAP`].
+    ///
+    /// Walks `order`, which is arrival order, so the oldest go first — they are
+    /// the ones most likely to have landed already. Skips anything a client was
+    /// handed a receipt for: that one is owed regardless of how long the chain
+    /// has been stalled, and dropping it is the one thing this must never do.
+    ///
+    /// Called after staging rather than on a timer, because that is the only
+    /// path that grows this half of the queue.
+    async fn trim_staged(&self) {
+        let mut inner = self.inner.lock().await;
+        if inner.entries.len() <= STAGED_CAP {
+            return;
+        }
+        let over = inner.entries.len() - STAGED_CAP;
+        let mut doomed = Vec::with_capacity(over);
+        for hash in &inner.order {
+            if doomed.len() == over {
+                break;
+            }
+            let evictable =
+                inner.entries.get(hash).is_some_and(|e| e.status == PreconfStatus::Success) &&
+                    !self.claims.was_promised(hash);
+            if evictable {
+                doomed.push(*hash);
+            }
+        }
+        if doomed.is_empty() {
+            return;
+        }
+        metrics::counter!("preconf.fifo.staged_evicted_total").increment(doomed.len() as u64);
+        warn!(
+            target: "mantle::preconf",
+            evicted = doomed.len(),
+            entries = inner.entries.len(),
+            cap = STAGED_CAP,
+            "staged entries past the cap — the chain has not taken what this node built for \
+             several blocks",
+        );
+        inner.drop_hashes(&doomed);
     }
 
     /// Returns true if the hash is currently present in `entries`.
@@ -1953,6 +2018,73 @@ mod tests {
         let sig = Signature::test_signature();
         let hash = B256::from([hash_byte; 32]);
         Arc::new(TxEnvelope::Eip1559(Signed::new_unchecked(inner, sig, hash)))
+    }
+
+    /// **The staging cap never drops a claim a client is holding.**
+    ///
+    /// Eviction is a backstop for a chain that has stopped taking what this
+    /// node builds. Dropping an announced transaction there costs a resend;
+    /// dropping a promised one breaks the only guarantee the subsystem makes.
+    #[tokio::test]
+    async fn the_staging_cap_evicts_announced_claims_and_never_promised_ones() {
+        let set = PreconfTxSet::new(16);
+
+        // One promised claim, parked at the very front so arrival order would
+        // pick it first if the kind were not consulted.
+        let promised = make_tx(0, 0xff);
+        let promised_hash = *promised.tx_hash();
+        set.stage_executed(promised.clone(), addr(0xff)).await;
+        set.claims().mark_promised(promised_hash, &addr(0xff), 0, 1).unwrap();
+
+        // Then enough announced ones to push the queue well past the cap.
+        // Hashes have to be distinct across more than 256 values, so they are
+        // derived from the counter rather than from a single repeated byte —
+        // a colliding hash is `AlreadyExists`, and the cap would never be
+        // reached.
+        for i in 0..(STAGED_CAP + 64) {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let inner = TxEip1559 { nonce: i as u64, ..Default::default() };
+            let tx = Arc::new(TxEnvelope::Eip1559(Signed::new_unchecked(
+                inner,
+                Signature::test_signature(),
+                B256::from(raw),
+            )));
+            let sender = Address::from([(i % 200 + 1) as u8; 20]);
+            set.stage_executed(tx, sender).await;
+        }
+
+        assert!(
+            set.contains(&promised_hash).await,
+            "a promised claim must survive the cap however old it is",
+        );
+        assert!(
+            set.entries().await.len() <= STAGED_CAP + 1,
+            "the cap must hold, give or take the promised entry it refuses to drop",
+        );
+    }
+
+    /// **§2.3.** The slice boundary raises the pool's nonce for every sender it
+    /// executed, so the repair has to know about every one of them. It used to
+    /// walk an index that held pool-arm senders only, which left a sender who
+    /// sent nothing but preconf transactions with a pool nonce ahead of the
+    /// chain for as long as the block failed to land.
+    #[tokio::test]
+    async fn the_landed_claim_sweep_sees_preconf_senders_too() {
+        let set = PreconfTxSet::new(16);
+        let preconf_only = addr(0xaa);
+
+        // A commitment: executed, receipt out, no ordinary transaction from
+        // this sender anywhere.
+        let tx = make_tx(0, 0xa1);
+        let hash = *tx.tx_hash();
+        set.stage_executed(tx, preconf_only).await;
+        set.claims().mark_promised(hash, &preconf_only, 0, 1).unwrap();
+
+        assert!(
+            set.senders_with_landed_claims().await.contains(&preconf_only),
+            "the pool-nonce repair must cover a sender the old unlanded index never held",
+        );
     }
 
     /// Every fifo removal path must release the commitment record, because
