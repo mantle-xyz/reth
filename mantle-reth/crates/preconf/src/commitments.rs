@@ -928,7 +928,7 @@ mod tests {
 
     /// The sweep runs on the same cadence and would otherwise undo the scheme:
     /// a committed commitment has already lost its fifo entry, so depth is the
-    /// only thing left holding it — see [`PreconfClassifier::sweep`].
+    /// only thing left holding it — see [`Commitments::sweep`].
     #[test]
     fn sweep_holds_a_committed_commitment_until_it_is_buried() {
         let c = classifier();

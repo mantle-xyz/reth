@@ -57,10 +57,10 @@ pub enum PreconfStatus {
 ///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
 ///       crash.
 ///     - **Reorg reinject** — the canonical-state handler pushes back every commitment the reverted
-///       chain carried. Whether a hash is one is asked of the classifier
-///       (`PreconfClassifier::is_tracked`, i.e. "a `Success` receipt for this hash already went
-///       out") rather than of the journal: the journal's notion of a finished commitment is
-///       "canonical once", which is exactly what a reorg undoes.
+///       chain carried. Whether a hash is one is asked of the claim registry
+///       (`Commitments::is_tracked`, i.e. "a `Success` receipt for this hash already went out")
+///       rather than of the journal: the journal's notion of a finished commitment is "canonical
+///       once", which is exactly what a reorg undoes.
 ///
 ///   In both cases the Mantle preconf SLA (*"once a receipt has been returned to the client, the
 ///   tx must land on chain"*) requires these entries to **bypass** the deadline and per-block gas

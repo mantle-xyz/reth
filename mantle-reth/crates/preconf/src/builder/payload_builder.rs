@@ -966,28 +966,20 @@ where
         return Ok(BestTxStep::Continue);
     }
 
-    // A *different* transaction on a nonce an owed commitment holds. The hash
-    // check above cannot see this one, and neither can the pool: a commitment
-    // never enters it, and nothing on the pool's admission path consults the
-    // slot index.
+    // A *different* transaction on a nonce an owed claim holds. The hash check
+    // above cannot see it, and neither can the pool — nothing on its admission
+    // path consults the slot index.
     //
-    // Only a reorg makes this reachable. While the chain holds the commitment,
-    // its nonce is spent and any other transaction for it fails nonce-too-low
-    // here anyway. Take the block back and the chain nonce goes with it, so the
-    // same transaction becomes executable at exactly the moment the commitment
-    // is waiting to be replayed onto that nonce — and whichever runs first
-    // takes it for good.
+    // Only a reorg makes it reachable: while the chain holds the claim its
+    // nonce is spent, so anything else for it is nonce-too-low anyway.
     //
-    // Last line rather than the only one: the carryover preamble dispatches
-    // replayed commitments before this arm fires, so in an ordinary build the
-    // commitment has already taken the nonce and the candidate fails on its
-    // own. This covers the builds where that does not happen — the commitment
-    // deferred for block capacity (`preconf_admission`), or a reorg
-    // notification that has not reached the fifo before this build started.
+    // The last line, not the only one — the carryover preamble usually takes
+    // the nonce first. This covers the builds where it does not: a claim
+    // deferred for block capacity, or a reorg notification that has not
+    // reached the fifo yet.
     //
-    // Same rule as `PreconfClassifier::slot_conflict`: the slot's own
-    // transaction resubmitted is not a conflict, and is left to fail (or not)
-    // on its merits.
+    // Same rule as `Commitments::slot_conflict`: the slot's own transaction
+    // resubmitted is not a conflict.
     if let Some(owner) = fifo.claims().slot_owner(&tx.sender(), tx.nonce()) &&
         owner != *tx.hash()
     {
