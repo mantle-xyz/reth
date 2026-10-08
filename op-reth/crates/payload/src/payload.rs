@@ -906,6 +906,7 @@ mod tests {
                 withdrawals: Some(vec![]),
                 parent_beacon_block_root: Some(B256::ZERO),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some(vec![encoded.into()]),
             no_tx_pool: None,
@@ -924,10 +925,9 @@ mod tests {
         assert_eq!(decoded_eth_tx_value(&built.transactions[0].1), Some(eth_tx_value));
     }
 
-    /// Verifier side: `engine_newPayload` turns the payload into a block through
-    /// `try_into_block_with_sidecar`, which is the first thing
-    /// [`crate::validator::ensure_well_formed_payload`] calls. A decode error there surfaces as
-    /// `Invalid`, and since op-node re-derives the same L1 block forever, the node never recovers.
+    /// Verifier side: `engine_newPayload` converts the data into an envelope and decodes its
+    /// transactions before accepting the block. A decode error there surfaces as `Invalid`, and
+    /// since op-node re-derives the same L1 block forever, the node never recovers.
     #[test]
     fn engine_payload_decodes_deposit_with_eth_tx_value_above_u128() {
         let eth_tx_value = U256::from(1u8) << 128;
@@ -940,11 +940,12 @@ mod tests {
             },
         };
 
-        let OpExecutionData { payload, sidecar } =
+        let payload =
             OpExecutionData::v3(ExecutionPayloadV3::from_block_slow(&block), vec![], B256::ZERO);
 
-        let decoded: Block<OpTransactionSigned> = payload
-            .try_into_block_with_sidecar(&sidecar)
+        let decoded: Block<OpTransactionSigned> = OpExecutionPayloadEnvelope::try_from(payload)
+            .expect("newPayload should have a valid sidecar")
+            .try_into_block()
             .expect("newPayload must decode a deposit with ethTxValue > u128::MAX");
 
         assert_eq!(decoded_eth_tx_value(&decoded.body.transactions[0]), Some(eth_tx_value));
