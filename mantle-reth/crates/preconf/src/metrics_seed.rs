@@ -30,10 +30,7 @@ const COUNTERS: &[&str] = &[
     "preconf.admit.rejected_delegated_total",
     "flashblock.deadline_already_passed_total",
     "flashblock.dropped_after_abandon_total",
-    "flashblock.unlanded_replayed_total",
-    "flashblock.unlanded_evicted_total",
     "flashblock.unlanded_sweep_slow_total",
-    "flashblock.unlanded_undecodable_total",
     "flashblock.unlanded_nonce_unreadable_total",
     "flashblock.slices_missed_by_slow_subscribers_total",
     "flashblock.slow_subscriber_dropped_total",
@@ -48,6 +45,7 @@ const COUNTERS: &[&str] = &[
     "preconf.build.panic_total",
     "preconf.build.watchdog_cancel_total",
     "preconf.fifo.da_rejected_total",
+    "preconf.fifo.staged_evicted_total",
     // An entry left the queue with a client still waiting on it — the
     // completion protocol was bypassed. Should stay flat at zero.
     "preconf.fifo.responder_dropped_total",
@@ -61,6 +59,7 @@ const COUNTERS: &[&str] = &[
     "preconf.execute.rejected_other_total",
     // Commitment retention + on-chain allowlist governance.
     "preconf.canon.reorg_drift_total",
+    "preconf.tx.announced_dropped_total",
     "preconf.tx.commitment_broken_total",
     "preconf.tx.replay_round_total",
     "preconf.journal.dropped_entries_total",
@@ -85,7 +84,6 @@ const COUNTERS: &[&str] = &[
 const GAUGES: &[&str] = &[
     "flashblock.endpoint_serving",
     "flashblock.subscribers",
-    "flashblock.unlanded_pending",
     "preconf.fifo.pending",
     "preconf.fifo.entries",
     "preconf.fifo.bytes_used",

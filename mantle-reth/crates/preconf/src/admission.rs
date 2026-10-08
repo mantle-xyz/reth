@@ -178,6 +178,8 @@ where
 pub struct PreconfAdmission<V> {
     validator: V,
     fifo: Arc<PreconfTxSet>,
+    /// The allowlists, for the early-rejection preview only — the binding
+    /// check is the payload builder's, per block.
     classifier: Arc<PreconfClassifier>,
     cfg: Arc<PreconfConfig>,
     /// What the queue may hold, taken from the node's own pool configuration
@@ -325,7 +327,6 @@ where
 
         self.fifo
             .admit(
-                &self.classifier,
                 AdmitRequest {
                     tx: Arc::new(envelope),
                     from: sender,
@@ -375,7 +376,6 @@ mod record_release_tests {
     //! its record and its nonce.
 
     use super::*;
-    use crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP;
     use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{B256, U256};
@@ -410,7 +410,6 @@ mod record_release_tests {
 
     struct Fixture {
         admission: PreconfAdmission<AlwaysRefuses>,
-        classifier: Arc<PreconfClassifier>,
         fifo: Arc<PreconfTxSet>,
         signer: PrivateKeySigner,
     }
@@ -418,7 +417,7 @@ mod record_release_tests {
     fn fixture() -> Fixture {
         let signer =
             PrivateKeySigner::from_bytes(&B256::from([0x11; 32])).expect("valid secp256k1 scalar");
-        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
+        let classifier = Arc::new(PreconfClassifier::new(false));
         classifier.update_whitelist(
             [(signer.address(), RECIPIENT)].into_iter().collect(),
             HashSet::default(),
@@ -444,7 +443,7 @@ mod record_release_tests {
                 max_queued_gas: u64::MAX,
             },
         );
-        Fixture { admission, classifier, fifo, signer }
+        Fixture { admission, fifo, signer }
     }
 
     /// Signed for real: the sender is recovered cryptographically, so a
@@ -477,7 +476,7 @@ mod record_release_tests {
             .await
             .expect_err("the validator refuses everything");
 
-        assert!(!f.classifier.is_tracked(&hash), "the record must be released");
+        assert!(!f.fifo.claims().is_tracked(&hash), "the record must be released");
         assert!(!f.fifo.contains(&hash).await, "and nothing may be left queued");
     }
 
@@ -496,17 +495,17 @@ mod record_release_tests {
         let sender = f.signer.address();
         let (resp, _rx) = oneshot::channel();
 
-        assert_eq!(f.classifier.mark_promised(hash, &sender, 0, 0), Ok(()));
-        assert!(f.classifier.is_tracked(&hash), "precondition: the commitment is acknowledged",);
+        assert_eq!(f.fifo.claims().mark_promised(hash, &sender, 0, 0), Ok(()));
+        assert!(f.fifo.claims().is_tracked(&hash), "precondition: the commitment is acknowledged",);
 
         f.admission
             .admit(&raw, std::time::Instant::now(), resp)
             .await
             .expect_err("the validator refuses the resubmit");
 
-        assert!(f.classifier.is_tracked(&hash), "the commitment record must survive");
+        assert!(f.fifo.claims().is_tracked(&hash), "the commitment record must survive");
         assert_eq!(
-            f.classifier.slot_owner(&sender, 0),
+            f.fifo.claims().slot_owner(&sender, 0),
             Some(hash),
             "and so must the nonce it was promised against",
         );
@@ -524,7 +523,7 @@ mod record_release_tests {
         assert!(!accepts(TxType::Eip7702));
         f.admission.admit(&raw, std::time::Instant::now(), resp).await.expect_err("refused");
 
-        assert!(!f.classifier.is_tracked(&hash));
+        assert!(!f.fifo.claims().is_tracked(&hash));
     }
 }
 
@@ -539,7 +538,6 @@ mod baseline_tests {
     //! against.
 
     use super::*;
-    use crate::classifier::DEFAULT_COMMITMENT_CACHE_CAP;
     use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{B256, U256};
@@ -596,7 +594,7 @@ mod baseline_tests {
     fn admission_at(state_nonce: u64) -> (PreconfAdmission<AcceptsAt>, PrivateKeySigner) {
         let signer =
             PrivateKeySigner::from_bytes(&B256::from([0x12; 32])).expect("valid secp256k1 scalar");
-        let classifier = Arc::new(PreconfClassifier::new(false, DEFAULT_COMMITMENT_CACHE_CAP));
+        let classifier = Arc::new(PreconfClassifier::new(false));
         classifier.update_whitelist(
             [(signer.address(), RECIPIENT)].into_iter().collect(),
             HashSet::default(),

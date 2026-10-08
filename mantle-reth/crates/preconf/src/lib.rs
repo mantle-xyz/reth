@@ -3,8 +3,9 @@
 //! This crate provides the core types and traits for the preconf subsystem:
 //!
 //! - [`config::PreconfConfig`] — runtime configuration & whitelist checks
-//! - [`classifier::PreconfClassifier`] — the allowlists, and the record of every commitment this
-//!   node owes
+//! - [`classifier::PreconfClassifier`] — the allowlists
+//! - [`commitments::Commitments`] — the record of every claim this node has made, owned by the
+//!   fifo
 //! - [`types`] — common enums and error types
 //! - [`preconf_tx_set::PreconfTxSet`] — the commitment truth source
 //! - [`apply`] — builder apply path interface
@@ -17,6 +18,7 @@ pub mod apply;
 pub mod builder;
 pub mod canon_handler;
 pub mod classifier;
+pub mod commitments;
 pub mod config;
 pub mod flashblocks;
 pub mod journal;
@@ -27,7 +29,6 @@ pub mod restore;
 pub mod rpc;
 pub mod service_builder;
 pub mod types;
-pub mod unlanded;
 pub mod whitelist;
 
 pub use admission::{AdmittedTx, DynAdmission, PreconfAdmission};
@@ -36,7 +37,8 @@ pub use builder::{
     ResolvePayloadFuture,
 };
 pub use canon_handler::PreconfCanonHandler;
-pub use classifier::{DEFAULT_COMMITMENT_CACHE_CAP, PreconfClassifier, Whitelist};
+pub use classifier::{PreconfClassifier, Whitelist};
+pub use commitments::{Commitments, DEFAULT_COMMITMENT_CACHE_CAP, SEAL_DEPTH, SlotClaim};
 pub use config::{DEFAULT_PRECONF_QUEUE_GAS_BLOCKS, DEFAULT_SAFETY_MARGIN, PreconfConfig};
 pub use flashblocks::{
     FlashblockProducerConfig, FlashblockProducerConfigError, FlashblocksProducer,
@@ -54,7 +56,6 @@ pub use restore::{ProviderChainView, RestoreDirect};
 pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
 pub use types::{MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult};
-pub use unlanded::{Announced, UNLANDED_CAP, Unlanded, UnlandedTx};
 pub use whitelist::{
     EXPECTED_LAYOUT_VERSION, FROM_WILDCARDS_SLOT, LAYOUT_VERSION_SLOT, PAIRS_SLOT,
     TO_WILDCARDS_SLOT, WHITELIST_UPDATED_TOPIC0, WhitelistError, bootstrap_whitelist,

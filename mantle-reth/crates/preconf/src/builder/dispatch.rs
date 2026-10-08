@@ -285,8 +285,8 @@ where
     // closure ends up spending less than the tx claimed. Uses `>` so
     // exact-boundary hits (`used + limit == max`) are accepted.
     let tx_gas_limit = alloy_consensus::Transaction::gas_limit(entry.tx.as_ref());
-    if is_rpc
-        && loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
+    if is_rpc &&
+        loop_state.preconf_gas_used.saturating_add(tx_gas_limit) > cfg.preconf_max_gas_per_block
     {
         debug!(
             target: "mantle::preconf::dispatch",
@@ -306,19 +306,14 @@ where
         return Ok(());
     }
 
-    // Re-check under the lock. The RPC deadline branch may have already ended
-    // the commitment in the window between our earlier gate reads and this
-    // acquisition; running `apply_fn` now would violate the invariant
+    // Re-check under the lock: the RPC deadline branch may have ended the
+    // commitment since the gates read it, and applying now would break
     // "committed to builder state ⇒ wire not Timeout".
     //
-    // **Absent counts as changed.** `lock_for_apply` clones the lock's handle
-    // under `inner` and then awaits outside it — it has to, or waiters would
-    // hold the queue's lock — so a removal that does not consult `apply_lock`
-    // (`forward_all`, whose predicate is the sender's nonce moving past this
-    // entry) can take the entry in that gap and leave us holding a mutex that
-    // belongs to nothing. Reading `None` as "nothing changed" applies the
-    // snapshot taken before the gates, which is the one case the lock is here
-    // to prevent.
+    // **Absent counts as changed.** `lock_for_apply` awaits outside `inner`, so
+    // `forward_all` can take the entry in that gap and leave us holding a mutex
+    // that belongs to nothing. Treating `None` as unchanged would apply the
+    // pre-gate snapshot — the one case this lock exists to prevent.
     match fifo.find_by_hash(&hash).await {
         Some(re_entry) if re_entry.status == PreconfStatus::Waiting => {}
         other => {
@@ -345,6 +340,21 @@ where
         Ok(receipt) => {
             metrics::counter!("preconf.tx.success_total").increment(1);
             loop_state.record_committed(hash);
+            // The claim is made by executing, not below by a client hearing
+            // about it — which is what leaves a replay's nonce guarded.
+            // `mark_promised` upgrades the kind when the receipt lands.
+            if let Err(owner) = fifo.claims().record_announced(
+                hash,
+                &entry.from,
+                entry.nonce,
+                loop_state.predicted_height,
+            ) {
+                debug!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?owner, sender = ?entry.from, nonce = entry.nonce,
+                    "the nonce this executed on is recorded against another claim"
+                );
+            }
             loop_state.preconf_gas_used =
                 loop_state.preconf_gas_used.saturating_add(receipt.gas_used);
             // Transition and responder together, before the journal write:
@@ -372,8 +382,8 @@ where
             //
             // A `Replay` entry came out of this file; writing it back on every
             // block it is retried in would grow it without adding anything.
-            if let Some(journal) = journal
-                && entry.source != PreconfSource::Replay
+            if let Some(journal) = journal &&
+                entry.source != PreconfSource::Replay
             {
                 let record = JournalEntry::for_executed(
                     hash,
@@ -433,31 +443,35 @@ where
             metrics::counter!("preconf.tx.fatal_total").increment(1);
             return Err(e);
         }
-        // This entry's receipt has already gone out (`Replay` covers journal
-        // restore, reorg reinject, and stale-in-flight replay alike), so
-        // reaching here means the commitment is **broken** — and this is the
-        // only moment that fact is observable.
+        // The claim for this entry already went out, so reaching here means it
+        // cannot be kept — and this is the only moment that is observable.
         //
-        // No retry: every transient cause is already filtered out before apply,
-        // so a second attempt would only re-derive the same answer. Transient
-        // capacity becomes `Defer` (unbounded, not a retry budget), and a
-        // a successor of a blocked predecessor is deferred or ended — both in
-        // `payload_builder::admit_and_dispatch`, neither reaching apply; `Fatal`
-        // returns above. What is left is permanent: a nonce or balance that
-        // moved since the tx last applied cleanly, an envelope this pipeline
-        // cannot convert, or a predecessor a crash lost for good (the pool is
-        // in-memory; only preconf txs are journaled). So the commitment ends on
-        // the first failure, which is what releases the `(sender, nonce)`.
+        // No retry: every transient cause is filtered before apply (capacity
+        // becomes `Defer`, a blocked predecessor's successor never reaches
+        // here, `Fatal` returns above). What is left is permanent, so the
+        // claim ends on the first failure, releasing the `(sender, nonce)`.
         Err(ApplyError::Rejected(rejected)) => {
-            // This line and the counter below are the only trace a breach
-            // leaves: the responder went with the receipt, and the node exposes
-            // no status query. Keep both.
-            error!(
-                target: "mantle::preconf::dispatch",
-                ?hash, ?rejected,
-                "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
-            );
-            metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+            // Only a claim a client was handed counts as broken; an announced
+            // one has readers that self-correct (see `ClaimKind`). Logging both
+            // at `error!` buries the one nobody downstream can repair.
+            if fifo.claims().was_promised(&hash) {
+                // This line and the counter are the only trace a breach leaves:
+                // the responder went with the receipt, and the node exposes no
+                // status query. Keep both.
+                error!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?rejected,
+                    "COMMITMENT BROKEN: receipt was returned to the client but the tx could not be applied; releasing its nonce"
+                );
+                metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+            } else {
+                warn!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?rejected,
+                    "an announced transaction could not be re-applied; releasing its nonce"
+                );
+                metrics::counter!("preconf.tx.announced_dropped_total").increment(1);
+            }
             count_rejection(&rejected);
             // A `Replay` entry has no responder (admission refuses to attach
             // one), so this removes it with nobody to answer — the log and
@@ -822,6 +836,44 @@ mod tests {
 
         let (entries, _) = journal.load().await.unwrap();
         assert!(entries.is_empty(), "it is already in the file it was read from");
+    }
+
+    /// **The claim is made by executing, not by a client hearing about it.**
+    ///
+    /// No responder is attached here, which is the shape a replay has and the
+    /// shape a commitment gets when its caller hangs up. Before the claim moved
+    /// to the apply, nothing recorded such an entry, so `slot_owner` answered
+    /// `None` and a same-nonce pool transaction could take the nonce out from
+    /// under a transaction already announced in a slice.
+    #[tokio::test]
+    async fn a_successful_apply_claims_the_nonce_even_with_no_client_waiting() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x31);
+        let hash = *tx.tx_hash();
+
+        assert!(matches!(
+            fifo.push_if_absent(tx.clone(), Address::ZERO, PreconfSource::Replay).await,
+            PushResult::Inserted
+        ));
+        assert_eq!(
+            fifo.claims().slot_owner(&Address::ZERO, tx.nonce()),
+            None,
+            "the premise: queued is not yet claimed",
+        );
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
+
+        assert_eq!(
+            fifo.claims().slot_owner(&Address::ZERO, tx.nonce()),
+            Some(hash),
+            "the apply must claim the nonce",
+        );
+        assert!(
+            !fifo.claims().was_promised(&hash),
+            "and must not call it promised — no receipt reached anyone",
+        );
     }
 
     #[tokio::test]

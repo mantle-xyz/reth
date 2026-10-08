@@ -51,10 +51,7 @@
 //! untouched — both against the queue directly, where the rule now is.
 
 use super::helpers::{PreconfCfgBuilder, send_preconf, wait_fifo_entry};
-use crate::{
-    canonicalize_payload, launch_preconf_node, launch_preconf_node_with_classifier,
-    launch_preconf_node_with_fifo,
-};
+use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -748,8 +745,8 @@ async fn ending_a_commitment_releases_its_slot_and_a_rejected_successor_adds_not
         .max_gas_per_block(6_000_000)
         .build();
 
-    let (_node, http, wallet, chain_id, classifier) =
-        launch_preconf_node_with_classifier!(cfg, crate::helpers::mantle_test_chain_spec()).await;
+    let (_node, http, wallet, chain_id, fifo) =
+        launch_preconf_node_with_fifo!(cfg, crate::helpers::mantle_test_chain_spec()).await;
 
     // `a` parks and times out. The deadline ends the commitment, and ending it
     // is what removes the entry and hands the slot back.
@@ -762,11 +759,11 @@ async fn ending_a_commitment_releases_its_slot_and_a_rejected_successor_adds_not
         first.status,
     );
     assert_eq!(
-        classifier.slot_owner(&wallet_addr, 0),
+        fifo.claims().slot_owner(&wallet_addr, 0),
         None,
         "a commitment that ended without a receipt must not keep its slot",
     );
-    assert!(!classifier.is_tracked(&a_hash), "nor its record");
+    assert!(!fifo.claims().is_tracked(&a_hash), "nor its record");
 
     // `b`: same (sender, nonce), but its gas limit trips the per-tx ceiling, so
     // it is rejected. Nothing of it may survive the refusal.
@@ -792,9 +789,9 @@ async fn ending_a_commitment_releases_its_slot_and_a_rejected_successor_adds_not
         "expected the gas ceiling to be what rejects `b`, got: {msg}",
     );
 
-    assert!(!classifier.is_tracked(&b_hash), "a refused submission leaves no record");
+    assert!(!fifo.claims().is_tracked(&b_hash), "a refused submission leaves no record");
     assert_eq!(
-        classifier.slot_owner(&wallet_addr, 0),
+        fifo.claims().slot_owner(&wallet_addr, 0),
         None,
         "and claims no slot — the nonce stays free for whatever the sender sends next",
     );
