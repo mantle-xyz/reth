@@ -1,17 +1,26 @@
 //! The preconf allowlists, and the record of every commitment this node owes.
 //!
-//! ## Why eligibility is decided only once
+//! ## Which arm owns a transaction, and whether policy still authorizes it
 //!
 //! Once the allowlists became on-chain governed and refreshable at runtime (see
 //! [`crate::whitelist`]), "is this transaction preconf-eligible?" became a
-//! function of *when you ask*. Asking it twice, in two places, is how a
-//! transaction ends up applied by both build arms or by neither.
+//! function of *when you ask*. Two questions hide in that one, and they are
+//! answered in different places.
 //!
-//! So it is asked once, by [`PreconfClassifier::preview_eligibility`] at
-//! admission, and what that answer produces — a fifo entry — is the only thing
-//! either arm consults afterwards. Both skip a hash iff the fifo holds it
-//! (`builder::payload_builder::apply_one_best_tx` for the pool arm), so a later
-//! allowlist update cannot move a transaction between them.
+//! **Which build arm owns the transaction** is settled once, at admission. What
+//! [`PreconfClassifier::preview_eligibility`] lets through becomes a fifo entry,
+//! and the entry is the only thing either arm consults afterwards: both skip a
+//! hash iff the fifo holds it (`builder::payload_builder::apply_one_best_tx` for
+//! the pool arm). A later allowlist update therefore cannot move a transaction
+//! between the arms, which is what keeps it from being applied by both or by
+//! neither.
+//!
+//! **Whether policy still authorizes it** is re-decided per entry at build time,
+//! by `builder::payload_builder::barred_by_allowlist`, against the allowlist in
+//! force for that block. That check is the binding one; the admission check is a
+//! non-authoritative preview that only saves work on a sender the lists never
+//! covered. The commitment record cannot answer this question — it records
+//! eligibility as of admission, not what policy says now.
 //!
 //! ## What the records carry
 //!
@@ -83,8 +92,9 @@ use crate::config::PreconfConfig;
 /// The preconf allowlists, mirrored from the on-chain `PreconfWhitelist`
 /// contract (see [`crate::whitelist`]).
 ///
-/// Lives here rather than on [`PreconfConfig`] because eligibility is decided
-/// exactly once, by [`PreconfClassifier`] — see the module docs.
+/// Lives here rather than on [`PreconfConfig`] because [`PreconfClassifier`]
+/// owns the lists privately; a reader that wants to evaluate the predicate has
+/// to name which snapshot it means — see the module docs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Whitelist {
     /// Exact `(from, to)` rules.
@@ -287,10 +297,12 @@ impl CommitmentStore {
 /// nothing about fifo status.
 pub type SlotClaim = Result<(), TxHash>;
 
-/// Decides preconf eligibility once per transaction and remembers the answer.
+/// Owns the allowlists, and the record of every commitment this node owes.
 ///
-/// Held as `Arc<PreconfClassifier>` and shared by admission (the only writer of
-/// new records), the payload builder and the canon handler.
+/// Held as `Arc<PreconfClassifier>` and shared by the RPC handler and journal
+/// restore (the only writers of new records, both via
+/// [`PreconfClassifier::mark_promised`]), the payload builder and the canon
+/// handler.
 #[derive(Debug)]
 pub struct PreconfClassifier {
     /// Mirrors `PreconfConfig::enabled`. When false this node runs no preconf
@@ -663,8 +675,13 @@ impl PreconfClassifier {
     /// single policy and a reader must never see a mix of old and new. The
     /// watcher reads them from one state view for the same reason.
     ///
-    /// Affects **only transactions admitted after this point** — every record
-    /// already frozen stays as it is. That is the whole guarantee.
+    /// Leaves every existing commitment record as it is — a record states what
+    /// its transaction was classified as at admission, and nothing here rewrites
+    /// it. That is **not** the same as "only future transactions are affected":
+    /// the payload builder snapshots these lists per block
+    /// (`builder::payload_builder::barred_by_allowlist`), so a revocation
+    /// landing here still bars an already-admitted entry that has not been built
+    /// yet.
     pub fn update_whitelist(
         &self,
         pairs: HashSet<(Address, Address)>,
@@ -674,8 +691,11 @@ impl PreconfClassifier {
         *self.whitelist.write() = Arc::new(Whitelist { pairs, from_wildcards, to_wildcards });
     }
 
-    /// Current allowlist sizes as `(pairs, from_wildcards, to_wildcards)` — for
-    /// logging and assertions.
+    /// Current allowlist sizes as `(pairs, from_wildcards, to_wildcards)`.
+    ///
+    /// For assertions only — nothing in production reads it. Public rather than
+    /// `#[cfg(test)]` because the integration tests are a separate crate, and
+    /// `whitelist_onchain` polls it to wait for a governance update to land.
     pub fn whitelist_counts(&self) -> (usize, usize, usize) {
         let wl = self.whitelist.read();
         (wl.pairs.len(), wl.from_wildcards.len(), wl.to_wildcards.len())
@@ -705,9 +725,11 @@ impl PreconfClassifier {
         self.commitments.read().by_slot.len()
     }
 
-    /// **Non-authoritative** eligibility preview, for the RPC handler's early
-    /// rejection only. Does not write the cache, so it cannot pre-empt the
-    /// record the validator will freeze a moment later.
+    /// **Non-authoritative** eligibility preview, for admission's early
+    /// rejection only — the binding check is
+    /// `builder::payload_builder::barred_by_allowlist`, per block. Writes
+    /// nothing, so it cannot pre-empt the record
+    /// [`Self::mark_promised`] establishes once a receipt goes out.
     pub fn preview_eligibility(&self, from: &Address, to: Option<&Address>) -> bool {
         self.evaluate_whitelist(from, to)
     }

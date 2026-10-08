@@ -32,6 +32,7 @@ mod journal_rotation;
 mod journal_size_rotation;
 mod journal_write;
 mod no_tx_pool;
+mod pool_tx_on_committed_nonce;
 mod predeploy_genesis;
 mod queue_gas_ceiling;
 mod race_pool_arm;

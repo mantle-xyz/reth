@@ -98,7 +98,8 @@ pub const DEFAULT_BROADCAST_CAP: usize = 65536;
 /// afterwards. The mutable runtime state that used to live here — the
 /// allowlists — belongs to
 /// [`PreconfClassifier`](crate::classifier::PreconfClassifier), which owns them
-/// privately so eligibility can only be decided in one place.
+/// privately so there is one copy of the lists and every reader has to name
+/// which snapshot of them it is judging against.
 #[derive(Debug, Clone)]
 pub struct PreconfConfig {
     /// Master switch: false → entire preconf subsystem stays inactive

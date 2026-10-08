@@ -103,7 +103,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfPayloadJob")
             .field("attributes", &self.attributes)
-            .field("cancelled", &self.cancel.is_cancelled())
+            .field("cancel", &self.cancel.reason())
             .finish_non_exhaustive()
     }
 }
@@ -344,10 +344,10 @@ mod tests {
         let handle = tokio::spawn(async {});
         let job = PreconfPayloadJob::new((), rx, cancel, handle);
 
-        assert!(!cancel_observer.is_cancelled(), "cancel starts clear");
+        assert!(cancel_observer.reason().is_none(), "cancel starts clear");
         drop(job);
         assert!(
-            cancel_observer.is_cancelled(),
+            cancel_observer.reason().is_some(),
             "drop must signal cancel so the build task can exit its select! loop"
         );
     }
@@ -367,13 +367,13 @@ mod tests {
 
         // Simulate `resolve_kind`'s cancel firing before drop.
         cancel.abandon();
-        assert!(cancel_observer.is_cancelled(), "explicit signal marks cancel");
+        assert!(cancel_observer.reason().is_some(), "explicit signal marks cancel");
 
         // Dropping the (already-cancelled) job must not panic or
         // otherwise regress state — cancel stays observably cancelled.
         drop(job);
         assert!(
-            cancel_observer.is_cancelled(),
+            cancel_observer.reason().is_some(),
             "drop is idempotent — cancel remains set after redundant signal"
         );
     }

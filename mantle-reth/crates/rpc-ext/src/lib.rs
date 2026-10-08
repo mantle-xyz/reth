@@ -110,10 +110,14 @@ pub struct PreconfTxEvent {
 ///
 /// Matches op-geth's 4-variant `PreconfStatus` for cross-client SDK
 /// compatibility. Server pre-apply rejection (e.g. block gas budget) is
-/// collapsed into `Failed` at this wire boundary — the fine-grained
-/// reason travels in [`PreconfTxEvent::reason`]. The internal fifo state
-/// machine still distinguishes `Canceled` from `Failed` for replacement
-/// / clean-up semantics.
+/// collapsed into `Failed` at this wire boundary — the fine-grained reason
+/// travels in [`PreconfTxEvent::reason`].
+///
+/// **This enum is wider than what the node can be in.** The queue's own status
+/// is `Waiting` or `Success` and nothing else: a commitment that ends is
+/// removed rather than parked in a terminal state, so there is no `Canceled`
+/// or `Failed` to map from. The extra variants exist because the wire shape is
+/// op-geth's, not because this node has four states.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PreconfStatus {
     /// EVM apply succeeded; tx on chain.
@@ -127,8 +131,12 @@ pub enum PreconfStatus {
     /// Client-side deadline elapsed (`preconf_timeout`); tx NOT on chain.
     #[serde(rename = "timeout")]
     Timeout,
-    /// Preconfirmation is waiting (intermediate state; typically not
-    /// broadcast to subscribers).
+    /// Preconfirmation is still waiting on the builder.
+    ///
+    /// **Never sent by this node.** `eth_sendRawTransactionWithPreconf` only
+    /// answers once the commitment has ended, so the client sees one of the
+    /// three above. Carried for op-geth wire compatibility, and so a client
+    /// deserialising another implementation's event does not fail on it.
     #[serde(rename = "waiting")]
     Waiting,
 }
@@ -1690,11 +1698,10 @@ mod tests {
 
     // ─── PreconfTxReceipt.logs three-state serde ────────────────────
     //
-    // R6/T7 — `logs` distinguishes "no EVM apply happened" (`null`)
-    // from "apply happened but no logs" (`[]`) on the wire. This is a
-    // deliberate contract that R5/D1 wire refactor introduced (changed
-    // from `Vec<PreconfLog>` to `Option<Vec<PreconfLog>>`). SDKs rely
-    // on the distinction to build UX around Timeout vs revert.
+    // `logs` distinguishes "no EVM apply happened" (`null`) from "apply
+    // happened but no logs" (`[]`) on the wire — which is why the field is
+    // `Option<Vec<PreconfLog>>` rather than a plain `Vec`. SDKs rely on the
+    // distinction to tell a timeout from a revert.
 
     #[test]
     fn preconf_tx_receipt_logs_none_serializes_as_null() {
@@ -1738,8 +1745,9 @@ mod tests {
 
     #[test]
     fn preconf_status_wire_serde_has_four_variants() {
-        // R5/D1 decision 8B — wire enum matches op-geth's 4 variants.
-        // Regression guard against silently re-introducing `Canceled`.
+        // The wire enum matches op-geth's four variants. Regression guard
+        // against silently re-introducing `Canceled`, which this node's queue
+        // no longer has a state for.
         for (variant, expected) in [
             (PreconfStatus::Success, r#""success""#),
             (PreconfStatus::Failed, r#""failed""#),

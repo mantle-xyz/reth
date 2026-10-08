@@ -138,6 +138,11 @@ impl PublisherHandle {
     }
 
     /// Subscribers currently connected.
+    ///
+    /// Test-only, and used as a readiness barrier rather than an assertion:
+    /// publishing before the subscriber has attached drops the slice, so the
+    /// tests wait on this before they publish.
+    #[cfg(test)]
     pub fn subscriber_count(&self) -> usize {
         self.pipe.receiver_count()
     }

@@ -97,9 +97,9 @@ pub struct MantlePoolBuilder<T = OpPooledTransaction> {
 pub struct PreconfWiring {
     /// Runtime preconf configuration; cloned into the validator.
     pub cfg: Arc<PreconfConfig>,
-    /// Owns the allowlists; the single decider of preconf eligibility. Shared
-    /// with the RPC handler and the payload builder — see `PreconfServiceBuilder`
-    /// for why there is exactly one instance.
+    /// Owns the allowlists and the commitment records. Shared with the RPC
+    /// handler and the payload builder — see `PreconfServiceBuilder` for why
+    /// there is exactly one instance.
     pub classifier: Arc<PreconfClassifier>,
     /// Commitment fifo shared between validator, RPC handler, and builder.
     pub fifo: Arc<PreconfTxSet>,
