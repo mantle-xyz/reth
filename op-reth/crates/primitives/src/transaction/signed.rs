@@ -335,7 +335,7 @@ impl Decodable2718 for OpTransactionSigned {
                 TxDeposit::signature(),
             )),
             op_alloy_consensus::OpTxType::PostExec => Ok(Self::new_unhashed(
-                OpTypedTransaction::PostExec(TxPostExec::decode_2718(buf)?),
+                OpTypedTransaction::PostExec(TxPostExec::rlp_decode(buf)?),
                 TxPostExec::signature(),
             )),
         }
@@ -564,6 +564,25 @@ mod tests {
     use proptest::proptest;
     use proptest_arbitrary_interop::arb;
     use reth_codecs::Compact;
+
+    #[test]
+    fn post_exec_network_rlp_roundtrip() {
+        let transaction = OpTransactionSigned::new_unhashed(
+            OpTypedTransaction::PostExec(TxPostExec::new(op_alloy_consensus::PostExecPayload {
+                version: op_alloy_consensus::POST_EXEC_PAYLOAD_VERSION,
+                block_number: 0,
+                gas_refund_entries: Vec::new(),
+            })),
+            TxPostExec::signature(),
+        );
+        let mut encoded = Vec::new();
+        transaction.network_encode(&mut encoded);
+
+        let mut data = encoded.as_slice();
+        let decoded = OpTransactionSigned::network_decode(&mut data).unwrap();
+        assert_eq!(decoded, transaction);
+        assert!(data.is_empty());
+    }
 
     fn make_input_large_enough_for_zstd(tx: &mut OpTransactionSigned) {
         match &mut tx.transaction {
