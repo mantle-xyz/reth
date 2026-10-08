@@ -446,6 +446,9 @@ where
     fn add_ons(&self) -> Self::AddOns {
         let sequencer_url = self.op_node.args.sequencer.clone();
         let preconf = self.preconf.clone();
+        // Logs, feeHistory and unlisted extensions are handled locally at all heights.
+        // Before the snapshot cutoff, responses may contain incomplete logs, placeholder raw
+        // data or missing-state errors. Use history RPC directly for supported historical methods.
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |ctx| {
             // Build SequencerClient if a sequencer URL is configured.
