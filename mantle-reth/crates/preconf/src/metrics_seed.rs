@@ -113,6 +113,7 @@ const HISTOGRAMS: &[&str] = &[
     "flashblock.publish_interval_ms",
     "flashblock.slices_per_block",
     "preconf.api.handle_duration_ms",
+    "preconf.build.lock_wait_ms",
     "preconf.execute.duration_ms",
     "preconf.dispatch.elapsed_at_gate_ms",
     "preconf.journal.rotate_duration_ms",

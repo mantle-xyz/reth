@@ -51,7 +51,7 @@ pub use journal::{
 };
 pub use metrics_seed::seed_preconf_metrics;
 pub use payload_service_builder::MantlePreconfServiceBuilder;
-pub use preconf_tx_set::{PreconfTxSet, TxEntry};
+pub use preconf_tx_set::{BuildGuard, PreconfTxSet, TxEntry};
 pub use restore::{ProviderChainView, RestoreDirect};
 pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};

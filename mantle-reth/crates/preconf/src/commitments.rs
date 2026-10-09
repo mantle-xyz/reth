@@ -487,6 +487,18 @@ impl Commitments {
         *self.sealed_payload.lock() = Some(block);
     }
 
+    /// Forget which block the last build sealed.
+    ///
+    /// [`Self::note_sealed`] runs at the seal, after the build has stopped
+    /// executing; until then the answer here still names the build *before*
+    /// it, while the queue already holds what this one executed. Read in that
+    /// window, [`Self::parent_is_ours`] would say "on chain" about
+    /// transactions that are in no block. `None` makes it false, which is the
+    /// safe direction.
+    pub fn clear_sealed(&self) {
+        *self.sealed_payload.lock() = None;
+    }
+
     /// Whether `parent_hash` is the block the last build sealed — if so,
     /// everything that build executed is on chain.
     ///
@@ -1572,5 +1584,55 @@ mod tests {
         }
         assert_eq!(disabled.commitment_count(), 0);
         assert_eq!(disabled.slot_count(), 0);
+    }
+
+    // ===== The sealed-block shortcut.
+
+    /// Nothing sealed yet is not "the parent is mine".
+    #[test]
+    fn a_fresh_registry_claims_no_sealed_block() {
+        let c = classifier();
+        assert!(!c.parent_is_ours(B256::repeat_byte(1)));
+    }
+
+    /// The healthy case the shortcut exists for.
+    #[test]
+    fn the_block_this_node_sealed_is_recognised_as_its_own() {
+        let c = classifier();
+        let ours = B256::repeat_byte(7);
+        c.note_sealed(ours);
+
+        assert!(c.parent_is_ours(ours));
+        assert!(!c.parent_is_ours(B256::repeat_byte(8)), "another chain's block is not ours");
+    }
+
+    /// **A build clears as it stops executing**, because which block its
+    /// transactions went into is only settled at the seal — by which time the
+    /// next build may already have read this.
+    #[test]
+    fn clearing_sends_the_next_build_back_to_asking_the_chain() {
+        let c = classifier();
+        let previous = B256::repeat_byte(7);
+        c.note_sealed(previous);
+
+        c.clear_sealed();
+
+        assert!(
+            !c.parent_is_ours(previous),
+            "a cleared registry must not answer for the build before it",
+        );
+    }
+
+    /// Clearing is not permanent: the seal that follows re-establishes it.
+    #[test]
+    fn the_seal_after_a_clear_restores_the_shortcut() {
+        let c = classifier();
+        c.note_sealed(B256::repeat_byte(7));
+        c.clear_sealed();
+
+        let ours = B256::repeat_byte(9);
+        c.note_sealed(ours);
+
+        assert!(c.parent_is_ours(ours));
     }
 }

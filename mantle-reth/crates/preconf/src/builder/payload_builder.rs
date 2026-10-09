@@ -1662,6 +1662,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // `constraints` reuses it.
         let base_fee = builder.evm_mut().block().basefee();
 
+        // ── The queue's one writer, from here to the end of the loop ───
+        //
+        // Everything below reads and rewrites state shared with the build
+        // before it, which may still be running. Derivation builds
+        // (`no_tx_pool=true`) take it too: they execute no preconf transaction
+        // but still clear the account view and sweep the queue. The seal is
+        // deliberately outside — see `PreconfTxSet::lock_for_build`.
+        let wait_started = std::time::Instant::now();
+        let build_guard = self.fifo.lock_for_build().await;
+        metrics::histogram!("preconf.build.lock_wait_ms")
+            .record(wait_started.elapsed().as_secs_f64() * 1000.0);
+
         // The previous build's account view ends here. Cleared rather than
         // re-seeded: a build that is cancelled or never sealed must not leave
         // a sender pinned at a nonce the chain will never reach, and a sender
@@ -1992,12 +2004,19 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // derivation build from replaying anything: it has to execute exactly
         // what its attributes name, or the block it derives will not match the
         // sequencer's.
-        if allow_preconf {
+        //
+        // The cancel check is here because this runs before the loop's own
+        // arm, and `replay_fifo_carryover` resets every `Success` entry before
+        // it returns anything.
+        if allow_preconf && !cancel.is_abandoned() {
             // Dispatch carryover entries through the admission gate before the
             // select! loop's arms, so they land ahead of any concurrently
             // queued fresh RPC pushes. `admit_and_dispatch` builds the apply
             // closure (which folds gas/DA into `info`) internally per hash.
             for hash in replay_fifo_carryover(&self.fifo).await {
+                if cancel.is_abandoned() {
+                    break;
+                }
                 admit_and_dispatch::<N, _, _>(
                     &self.fifo,
                     &self.cfg,
@@ -2148,6 +2167,14 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // consensus layer took the payload, not that it used it. What the index
         // records is settled at the start of the next build, against the one
         // thing that can answer — the chain.
+
+        // ── Done executing: hand the queue on ─────────────────────────
+        //
+        // Explicit, because everything below is this build's own arithmetic
+        // and the next one should not wait on it. Dropping also clears the
+        // sealed-block hash, which the seal below re-establishes — see
+        // `BuildGuard`.
+        drop(build_guard);
 
         // ── Stage 4: SDM post-exec refund tx ───────────────────────────
         // `take_post_exec_entries` collects entries from ALL prior applies
