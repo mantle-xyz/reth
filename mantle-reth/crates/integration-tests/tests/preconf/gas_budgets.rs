@@ -467,36 +467,53 @@ async fn block_gas_budget_rejects_third_sender_in_same_slot() {
     );
 }
 
-/// Same-slot resubmit of an budget-rejected tx: `dispatch.rs::apply_one_preconf`
-/// dedups on `loop_state.excluded_reason(&hash)` before re-running any
-/// gate, but **forwards the stored rejection reason** to any responder
-/// attached by the second submission. The revived fifo entry (Canceled
-/// → Waiting via `push_if_absent`) never reaches the block-gas-budget gate a second
-/// time, yet the client sees a consistent error rather than a slow
-/// `Ok(Timeout)`.
+/// Same-slot resubmit of a budget-rejected tx. The first submit trips
+/// `dispatch.rs::apply_one_preconf`'s block-gas-budget gate and the entry goes
+/// `Canceled`. The resubmit revives it (`push_if_absent`'s reclaimable branch,
+/// `Canceled` → `Waiting`) and it is dispatched **again** — no rejection is
+/// cached per hash, so the entry is judged afresh against the same, still-full
+/// block and trips the same gate a second time. The client sees the same error,
+/// just as fast; it never falls back to the slow RPC-deadline path.
 ///
 /// Wire contract pinned by this test:
 ///
 ///   1st call → `Err(BlockGasBudgetExceeded)` (dispatch block-gas-budget gate, fast)
-///   2nd call same slot → **same** `Err(BlockGasBudgetExceeded)` (dedup
-///     forwards the stored reason, also fast — well under `preconf_timeout`)
+///   2nd call same slot → **same** `Err(BlockGasBudgetExceeded)` — same gate,
+///     identical `max`/`used`/`limit` (nothing committed in between), also fast
 ///
-/// Cross-slot recovery (canonicalise then resubmit, budget resets) is
-/// covered by `canceled_tx_recoverable_in_next_slot`.
+/// Then, with **no** third submit, tx2 must not land in the next slot either.
+/// That is the half a same-slot assertion cannot reach: the revive put the entry
+/// back to `Waiting`, so if the second dispatch failed to drive it terminal
+/// again it would survive as `Waiting` into the next job's
+/// `replay_fifo_carryover` and land on chain after the client had been told
+/// twice that it was rejected — the bug
+/// `dispatch.rs::a_resubmit_after_rejection_gets_a_fresh_verdict` pins at unit
+/// level. Three mechanisms keep it off chain, and the slot-2 assertion covers
+/// their combined effect: `mark_canceled`'s pool eviction, carryover skipping
+/// terminal entries, and `canon_handler`'s `clean_reclaimable` sweep. (The pool
+/// leg is additionally asserted on its own at the end of slot 1.)
+///
+/// Note the slot-2 job's `sync_fifo_forward_to_head` does not quietly do that
+/// work for them: tx2's nonce is 2 and the canonical nonce after tx0/tx1 is also
+/// 2, and the prune predicate is `nonce < new_nonce`.
+///
+/// Cross-slot *recovery* — resubmitting in slot 2, where the budget has reset
+/// and the tx must land — is the complement, covered by
+/// `canceled_tx_recoverable_in_next_slot`.
 ///
 /// Regression risks this guards:
-///  - `LoopState::excluded` reverting from `HashMap<TxHash, PreconfError>` back to a plain
-///    `HashSet<TxHash>` — the dedup branch would then have no reason to forward and the client
-///    would fall back to waiting the full `preconf_timeout`.
-///  - The dedup branch dropping its `cancel_responder(..., reason)` call and just `return`ing —
-///    same slow-Timeout regression.
+///  - A per-hash rejection cache returning to `LoopState` (the removed `excluded` map): the
+///    resubmit would be answered from the first attempt's verdict while the entry stayed `Waiting`,
+///    and the next slot's carryover would land it.
+///  - The status gate accepting a non-`Waiting` entry, or `mark_canceled` losing its pool eviction
+///    — either one puts the rejected tx back into a later block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
+async fn canceled_tx_same_slot_resubmit_is_rejected_again() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
     // Long-ish timeout so any regression that falls back to the RPC-layer
-    // deadline path is unambiguously slower than the fast-forward path.
+    // deadline path is unambiguously slower than a second gate rejection.
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(wallet_addr)
         .whitelist_to(recipient)
@@ -556,24 +573,24 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
         other => panic!("expected Call error on first submit, got {other:?}"),
     };
 
-    // Same-slot resubmit — dedup forwards the stored the block-gas-budget gate reason via
-    // `cancel_responder`, so the client sees the SAME error, fast.
+    // Same-slot resubmit — the entry is revived to `Waiting` and re-dispatched,
+    // so it meets the block-gas-budget gate a second time. Nothing committed in
+    // between, so the gate reports identical numbers.
     let start = std::time::Instant::now();
     let err_second = send_preconf(&http, tx2)
         .await
-        .expect_err("same-slot resubmit must surface the stored BlockGasBudgetExceeded");
+        .expect_err("same-slot resubmit must be budget-rejected again");
     let elapsed = start.elapsed();
 
     match err_second {
         ClientError::Call(ref e) => {
             assert!(
                 e.message().to_lowercase().contains("gas budget"),
-                "same-slot resubmit must forward BlockGasBudgetExceeded; got {}",
+                "same-slot resubmit must report BlockGasBudgetExceeded again; got {}",
                 e.message(),
             );
-            // The stored reason carries the same numeric fields as the
-            // first-submit error — clients relying on the `max`/`used`/
-            // `limit` values must see identical values across submits.
+            // `max` / `used` / `limit` are re-derived from the same block state,
+            // so clients see identical values across the two submits.
             assert_eq!(
                 e.message(),
                 first_message,
@@ -584,19 +601,19 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     }
     assert!(
         elapsed < std::time::Duration::from_millis(500),
-        "second submit must fast-forward the stored reason, not wait preconf_timeout; \
+        "second submit must be answered by the gate, not by waiting out preconf_timeout; \
          elapsed={elapsed:?}",
     );
 
     // Close the build and verify tx2 never lands in this slot.
-    let payload = node
+    let payload_1 = node
         .inner
         .payload_builder_handle
         .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
         .await
         .expect("resolve_kind")
         .expect("payload build");
-    let sealed: Vec<alloy_primitives::B256> = payload
+    let sealed: Vec<alloy_primitives::B256> = payload_1
         .block()
         .body()
         .transactions()
@@ -605,6 +622,55 @@ async fn canceled_tx_same_slot_resubmit_forwards_same_error() {
     assert!(
         !sealed.contains(&tx2_hash),
         "budget-rejected tx must never land in its own slot, even after resubmit; sealed={sealed:?}",
+    );
+    assert!(
+        reth_transaction_pool::TransactionPool::get(&node.inner.pool, &tx2_hash).is_none(),
+        "the second rejection must have evicted tx2 from the pool again",
+    );
+
+    // ── Slot 2: no third submit — the rejected tx must stay off chain ──
+    //
+    // Canonicalising is what makes a second job meaningful at all (otherwise the
+    // still-`Success` tx0/tx1 carry over and re-apply). It also runs
+    // `canon_handler`'s `clean_reclaimable`, so the assertion below pins the
+    // combined effect of the three mechanisms named in the doc rather than any
+    // one in isolation.
+    canonize_built!(node, payload_1);
+    wait_latest_nonce(&http, wallet_addr, 2).await;
+
+    let attrs_2 = node.payload.next_attributes();
+    let fcu_state_2 = node.current_forkchoice_state().expect("forkchoice state 2");
+    let payload_id_2 = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state_2, Some(attrs_2))
+        .await
+        .expect("FCU 2")
+        .payload_id
+        .expect("payload_id 2");
+
+    // Give the slot-2 job the window a carryover would need: had the entry
+    // survived as `Waiting`, this is when it would be applied.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload_2 = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id_2, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind 2")
+        .expect("payload 2");
+    let sealed_2: Vec<alloy_primitives::B256> = payload_2
+        .block()
+        .body()
+        .transactions()
+        .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
+        .collect();
+    assert!(
+        !sealed_2.contains(&tx2_hash),
+        "a tx the client was told twice was rejected must not land in the next slot \
+         without a resubmit; sealed_2={sealed_2:?}",
     );
 }
 

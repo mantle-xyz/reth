@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 /// Preconfirmation status — matches the wire-layer `PreconfStatus` exposed
 /// by `mantle-reth-rpc-ext`.
 ///
-/// State machine (transitions via `PreconfTxSet::mark_*` / `recover_*` /
-/// `reset_success_to_waiting`):
+/// State machine (transitions via `PreconfTxSet::mark_*` /
+/// `reset_success_to_waiting`, plus the reclaimable-revive branch of
+/// `push_if_absent`):
 ///
 /// ```text
 ///                     ┌──→ Success   (applied to an in-flight builder;
@@ -59,12 +60,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// **Success is not strictly terminal**: a `Success` entry that still exists
 /// in the fifo means "applied to an in-flight builder but that builder's
-/// block was never canon'd" — because `canon_handler::forward()` drops the
-/// entry entirely on canon commit. On a new payload job start, such stale
-/// `Success` entries are reset to `Waiting` and re-applied against the new
-/// builder to honor the mantle preconf SLA ("receipt returned → tx must
-/// land on chain"). The presence-of-entry acts as the "in-flight, not
-/// canon" flag; no separate `InFlight` variant is needed.
+/// block was never canon'd" — the payload-job prologue's canon-forward
+/// (`sync_fifo_forward_to_head` → `PreconfTxSet::forward`) drops the entry
+/// once the sender's on-chain nonce has moved past it. On a new payload job
+/// start, such stale `Success` entries are reset to `Waiting` and re-applied
+/// against the new builder to honor the mantle preconf SLA ("receipt
+/// returned → tx must land on chain"). The presence-of-entry acts as the
+/// "in-flight, not canon" flag; no separate `InFlight` variant is needed.
 ///
 /// **Timeout vs Canceled vs Failed** — all three are "not on chain,
 /// reclaimable" but signal different causes to the client:
@@ -77,9 +79,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// SDKs retry all three the same way: same-hash resubmit is safe;
 /// `push_if_absent` revives the fifo entry back to `Waiting` and the
-/// dispatch loop picks it up. Client-visible fast Err (same-slot dedup
-/// forwards the stored reason) or Ok(Timeout) (RPC deadline) both
-/// signal "try next slot".
+/// dispatch loop judges it **afresh** — no rejection is cached per hash. If
+/// the condition that rejected it still holds this slot, the same gate fires
+/// again and the client sees the same Err, still fast. That Err, or
+/// Ok(Timeout) (RPC deadline), signals "try next slot".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PreconfStatus {
     /// Awaiting builder apply.

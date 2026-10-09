@@ -265,15 +265,12 @@ where
                 }
             }
 
-            // Builder dropped the responder without sending — should not
-            // happen on healthy paths. Mark the entry `Canceled`
-            // (revivable + swept by `clean_reclaimable`) to signal a
-            // server-side failure with the tx never applied.
+            // Our responder is gone, so we no longer own the slot: `mark_canceled`
+            // / `cancel_responder` here could only ever hit the client holding it
+            // now. Log loudly — no healthy path drops one — and fail only ourselves.
             Some(Err(_recv_err)) => {
                 warn!(target: "mantle::preconf::rpc", ?hash, "responder dropped before send");
-                let _ = self.fifo.mark_canceled(&hash).await;
                 let err = PreconfError::Internal("responder dropped before send".to_string());
-                self.fifo.cancel_responder(&hash, err.clone()).await;
                 Err(preconf_error_to_rpc(&err))
             }
 
