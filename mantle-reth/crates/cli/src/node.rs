@@ -446,6 +446,10 @@ where
     fn add_ons(&self) -> Self::AddOns {
         let sequencer_url = self.op_node.args.sequencer.clone();
         let preconf = self.preconf.clone();
+        // Historical log and feeHistory ranges are forwarded whole. The history endpoint must
+        // cover the full range; latest/safe/finalized tags are interpreted by that endpoint.
+        // For a frozen backend, use explicit end blocks within its retained history. Unlisted
+        // extensions remain local and may lack pre-snapshot data.
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |ctx| {
             // Build SequencerClient if a sequencer URL is configured.

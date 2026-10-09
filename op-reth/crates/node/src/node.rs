@@ -73,6 +73,9 @@ use url::Url;
 
 use reth_optimism_payload_builder::OpPayloadAttrs;
 
+/// Mantle mainnet's first complete block after imported anchor 87,370,342.
+const MANTLE_MAINNET_HISTORY_START: u64 = 87_370_343;
+
 /// Builds [`OpPayloadAttrs`] for local/dev-mode payload generation.
 struct OpLocalPayloadAttributesBuilder {
     chain_spec: Arc<OpChainSpec>,
@@ -720,6 +723,14 @@ where
                     .chain_spec()
                     .op_fork_activation(OpHardfork::Bedrock)
                     .block_number()
+                    // Mantle mainnet uses the first complete block after its snapshot anchor.
+                    .map(|activation| {
+                        if ctx.node.provider().chain_spec().chain().id() == 5000 {
+                            MANTLE_MAINNET_HISTORY_START
+                        } else {
+                            activation
+                        }
+                    })
                     .filter(|activation| *activation > 0)
                     .map(|bedrock_block| (historical_rpc, bedrock_block))
             })
