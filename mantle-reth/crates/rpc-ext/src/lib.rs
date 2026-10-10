@@ -644,13 +644,14 @@ where
                 // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with RPCGasCap,
                 //   which defaults to DefaultMantleBlockGasLimit = 0x4000000000000)
                 // - ChainID = chain config chain ID
-                // - When baseFee > 0 and no gasPrice: EIP-7702 if authorizationList is present,
-                //   otherwise EIP-1559; explicit gasPrice or no baseFee uses legacy
+                // - With a baseFee field (including zero) and no gasPrice: EIP-7702 if
+                //   authorizationList is present, otherwise EIP-1559. An explicit gasPrice or
+                //   absent baseFee uses legacy, matching geth's CallDefaults baseFee != nil.
                 let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
                 let tx_envelope = build_unsigned_tx_envelope(
                     &request,
                     envelope_gas,
-                    header.base_fee_per_gas().unwrap_or(0),
+                    header.base_fee_per_gas(),
                     chain_id,
                 )?;
                 let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(
@@ -832,7 +833,7 @@ fn validate_estimate_total_fee_request(
 fn build_unsigned_tx_envelope(
     request: &TransactionRequest,
     gas_estimate: U256,
-    base_fee: u64,
+    base_fee: Option<u64>,
     chain_id: u64,
 ) -> RpcResult<Vec<u8>> {
     use alloy_consensus::{SignableTransaction, TxEip1559, TxEip7702, TxLegacy};
@@ -848,7 +849,7 @@ fn build_unsigned_tx_envelope(
     let nonce = request.nonce.unwrap_or(0);
     let zero_sig = Signature::new(U256::ZERO, U256::ZERO, false);
 
-    if base_fee > 0 && request.gas_price.is_none() {
+    if base_fee.is_some() && request.gas_price.is_none() {
         if let Some(authorization_list) = request.authorization_list.clone() {
             let to = to.into_to().ok_or_else(|| {
                 ErrorObject::owned(
@@ -952,7 +953,7 @@ mod tests {
     fn test_unsigned_tx_envelope(
         request: &TransactionRequest,
         gas_estimate: U256,
-        base_fee: u64,
+        base_fee: Option<u64>,
         chain_id: u64,
     ) -> Vec<u8> {
         build_unsigned_tx_envelope(request, gas_estimate, base_fee, chain_id)
@@ -992,7 +993,8 @@ mod tests {
     fn envelope_eip1559_when_basefee_nonzero_and_no_gas_price() {
         let request =
             TransactionRequest { to: Some(TxKind::Call(Default::default())), ..Default::default() };
-        let envelope = test_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
+        let envelope =
+            test_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337);
         // EIP-1559 envelope starts with type byte 0x02
         assert_eq!(envelope[0], 0x02, "should be EIP-1559 (type 0x02)");
     }
@@ -1004,17 +1006,160 @@ mod tests {
             gas_price: Some(10_000_000_000),
             ..Default::default()
         };
-        let envelope = test_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
+        let envelope =
+            test_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337);
         // Legacy envelope starts with RLP list prefix (>= 0xc0)
         assert!(envelope[0] >= 0xc0, "should be legacy RLP, got 0x{:02x}", envelope[0]);
     }
 
     #[test]
-    fn envelope_legacy_when_basefee_zero() {
+    fn envelope_legacy_when_basefee_absent() {
         let request =
             TransactionRequest { to: Some(TxKind::Call(Default::default())), ..Default::default() };
-        let envelope = test_unsigned_tx_envelope(&request, U256::from(21_000), 0, 1337);
-        assert!(envelope[0] >= 0xc0, "baseFee=0 should produce legacy RLP");
+        let envelope = test_unsigned_tx_envelope(&request, U256::from(100_000), None, 1337);
+        assert!(envelope[0] >= 0xc0, "an absent baseFee should produce legacy RLP");
+        assert_eq!(envelope.len(), 33);
+        assert_eq!(
+            test_l1_block_info().calculate_tx_l1_cost_for_estimate(
+                &envelope,
+                op_revm::OpSpecId::ARSIA,
+                80,
+            ),
+            U256::from(720_000_030_000_000u64)
+        );
+    }
+
+    #[test]
+    fn envelope_eip1559_when_basefee_zero() {
+        let request =
+            TransactionRequest { to: Some(TxKind::Call(Address::ZERO)), ..Default::default() };
+        let envelope = test_unsigned_tx_envelope(&request, U256::from(100_000), Some(0), 1337);
+        let nonzero =
+            test_unsigned_tx_envelope(&request, U256::from(100_000), Some(1_000_000), 1337);
+
+        assert_eq!(envelope[0], 0x02, "a present zero base fee must select EIP-1559");
+        assert_eq!(envelope, nonzero, "only the presence of the base fee selects the envelope");
+        // Golden values from op-geth's CallDefaults + ToTransaction + MarshalBinary.
+        assert_eq!(envelope.len(), 39);
+        assert_eq!(
+            test_l1_block_info().calculate_tx_l1_cost_for_estimate(
+                &envelope,
+                op_revm::OpSpecId::ARSIA,
+                80,
+            ),
+            U256::from(720_000_030_000_000u64)
+        );
+    }
+
+    #[test]
+    fn envelope_preserves_access_list_when_basefee_zero() {
+        let access_list = test_access_list();
+        let request = TransactionRequest {
+            to: Some(TxKind::Call(Address::ZERO)),
+            access_list: Some(access_list.clone()),
+            ..Default::default()
+        };
+        let envelope = test_unsigned_tx_envelope(&request, U256::from(100_000), Some(0), 1337);
+        let nonzero =
+            test_unsigned_tx_envelope(&request, U256::from(100_000), Some(1_000_000), 1337);
+
+        let mut encoded = envelope.as_slice();
+        let decoded = TxEnvelope::decode_2718(&mut encoded).expect("valid EIP-2718 envelope");
+        assert!(encoded.is_empty(), "decoder must consume the complete envelope");
+        let signed = decoded.as_eip1559().expect("zero base fee must keep an EIP-1559 envelope");
+        assert_eq!(signed.tx().access_list, access_list);
+        assert_eq!(envelope, nonzero);
+        // Independent op-geth golden; a legacy envelope silently drops the entire list.
+        assert_eq!(envelope.len(), 671);
+        assert_eq!(
+            test_l1_block_info().calculate_tx_l1_cost_for_estimate(
+                &envelope,
+                op_revm::OpSpecId::ARSIA,
+                80,
+            ),
+            U256::from(2_620_464_589_185_000u64)
+        );
+    }
+
+    #[test]
+    fn envelope_preserves_authorization_list_when_basefee_zero() {
+        let access_list = test_access_list();
+        let authorization_list = test_authorization_list();
+        let request = TransactionRequest {
+            to: Some(TxKind::Call(Address::ZERO)),
+            access_list: Some(access_list.clone()),
+            authorization_list: Some(authorization_list.clone()),
+            ..Default::default()
+        };
+        let envelope = test_unsigned_tx_envelope(&request, U256::from(100_000), Some(0), 1337);
+        let nonzero =
+            test_unsigned_tx_envelope(&request, U256::from(100_000), Some(1_000_000), 1337);
+
+        let mut encoded = envelope.as_slice();
+        let decoded = TxEnvelope::decode_2718(&mut encoded).expect("valid EIP-2718 envelope");
+        assert!(encoded.is_empty(), "decoder must consume the complete envelope");
+        let signed = decoded.as_eip7702().expect("zero base fee must keep an EIP-7702 envelope");
+        assert_eq!(signed.tx().access_list, access_list);
+        assert_eq!(signed.tx().authorization_list, authorization_list);
+        assert_eq!(envelope, nonzero);
+        // Independent op-geth golden for the complete type-4 envelope.
+        assert_eq!(envelope.len(), 767);
+        assert_eq!(
+            test_l1_block_info().calculate_tx_l1_cost_for_estimate(
+                &envelope,
+                op_revm::OpSpecId::ARSIA,
+                80,
+            ),
+            U256::from(2_843_308_198_470_000u64)
+        );
+    }
+
+    #[test]
+    fn envelope_calldata_fee_matches_geth_when_basefee_zero() {
+        let input = Bytes::from(patterned_bytes::<256>(0x11).to_vec());
+        let request = TransactionRequest {
+            to: Some(TxKind::Call(Address::ZERO)),
+            input: alloy_rpc_types_eth::TransactionInput::new(input.clone()),
+            ..Default::default()
+        };
+        let envelope = test_unsigned_tx_envelope(&request, U256::from(100_000), Some(0), 1337);
+        let nonzero =
+            test_unsigned_tx_envelope(&request, U256::from(100_000), Some(1_000_000), 1337);
+
+        let mut encoded = envelope.as_slice();
+        let decoded = TxEnvelope::decode_2718(&mut encoded).expect("valid EIP-2718 envelope");
+        assert!(encoded.is_empty(), "decoder must consume the complete envelope");
+        let signed = decoded.as_eip1559().expect("zero base fee must keep an EIP-1559 envelope");
+        assert_eq!(signed.tx().input, input);
+        assert_eq!(envelope, nonzero);
+        // Independent op-geth golden also catches the fee difference without any lists.
+        assert_eq!(envelope.len(), 299);
+        assert_eq!(
+            test_l1_block_info().calculate_tx_l1_cost_for_estimate(
+                &envelope,
+                op_revm::OpSpecId::ARSIA,
+                80,
+            ),
+            U256::from(1_939_888_160_826_000u64)
+        );
+    }
+
+    #[test]
+    fn envelope_gas_price_overrides_lists_when_basefee_zero() {
+        let request = TransactionRequest {
+            to: Some(TxKind::Call(Address::ZERO)),
+            gas_price: Some(0),
+            access_list: Some(test_access_list()),
+            authorization_list: Some(test_authorization_list()),
+            ..Default::default()
+        };
+        let envelope = test_unsigned_tx_envelope(&request, U256::from(100_000), Some(0), 1337);
+        let nonzero =
+            test_unsigned_tx_envelope(&request, U256::from(100_000), Some(1_000_000), 1337);
+
+        assert!(envelope[0] >= 0xc0, "explicit gasPrice, including zero, must select legacy");
+        assert_eq!(envelope, nonzero);
+        assert_eq!(envelope.len(), 33);
     }
 
     #[test]
@@ -1027,9 +1172,10 @@ mod tests {
             input: alloy_rpc_types_eth::TransactionInput::new(calldata.into()),
             ..Default::default()
         };
-        let empty = test_unsigned_tx_envelope(&request_empty, U256::from(21_000), 1_000_000, 1337);
+        let empty =
+            test_unsigned_tx_envelope(&request_empty, U256::from(21_000), Some(1_000_000), 1337);
         let with_data =
-            test_unsigned_tx_envelope(&request_data, U256::from(100_000), 1_000_000, 1337);
+            test_unsigned_tx_envelope(&request_data, U256::from(100_000), Some(1_000_000), 1337);
         assert!(
             with_data.len() > empty.len() + 200,
             "256-byte calldata should add >200 bytes to envelope (empty={}, with_data={})",
@@ -1048,10 +1194,18 @@ mod tests {
             ..request_without_list.clone()
         };
 
-        let without_list =
-            test_unsigned_tx_envelope(&request_without_list, U256::from(100_000), 1_000_000, 1337);
-        let with_list =
-            test_unsigned_tx_envelope(&request_with_list, U256::from(100_000), 1_000_000, 1337);
+        let without_list = test_unsigned_tx_envelope(
+            &request_without_list,
+            U256::from(100_000),
+            Some(1_000_000),
+            1337,
+        );
+        let with_list = test_unsigned_tx_envelope(
+            &request_with_list,
+            U256::from(100_000),
+            Some(1_000_000),
+            1337,
+        );
 
         let mut encoded = with_list.as_slice();
         let decoded = TxEnvelope::decode_2718(&mut encoded).expect("valid EIP-2718 envelope");
@@ -1091,13 +1245,13 @@ mod tests {
         let without_authorization = test_unsigned_tx_envelope(
             &request_without_authorization,
             U256::from(100_000),
-            1_000_000,
+            Some(1_000_000),
             1337,
         );
         let with_authorization = test_unsigned_tx_envelope(
             &request_with_authorization,
             U256::from(100_000),
-            1_000_000,
+            Some(1_000_000),
             1337,
         );
 
@@ -1130,8 +1284,8 @@ mod tests {
             authorization_list: Some(Vec::new()),
             ..Default::default()
         };
-        let error =
-            build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337).unwrap_err();
+        let error = build_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337)
+            .unwrap_err();
 
         assert_eq!(error.code(), -32000);
         assert_eq!(error.message(), "EIP-7702 transaction with empty auth list");
@@ -1143,8 +1297,8 @@ mod tests {
             authorization_list: Some(test_authorization_list()),
             ..Default::default()
         };
-        let error =
-            build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337).unwrap_err();
+        let error = build_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337)
+            .unwrap_err();
 
         assert_eq!(error.code(), -32000);
         assert_eq!(error.message(), "EIP-7702 transaction cannot be used to create contract");
@@ -1154,8 +1308,8 @@ mod tests {
     fn fee_request_prefers_contract_creation_error_to_empty_authorization_list() {
         let request =
             TransactionRequest { authorization_list: Some(Vec::new()), ..Default::default() };
-        let error =
-            build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337).unwrap_err();
+        let error = build_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337)
+            .unwrap_err();
 
         assert_eq!(error.code(), -32000);
         assert_eq!(error.message(), "EIP-7702 transaction cannot be used to create contract");
@@ -1170,8 +1324,8 @@ mod tests {
             authorization_list: Some(Vec::new()),
             ..Default::default()
         };
-        let error =
-            build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337).unwrap_err();
+        let error = build_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337)
+            .unwrap_err();
 
         assert_eq!(error.code(), -32000);
         assert_eq!(
@@ -1188,8 +1342,8 @@ mod tests {
             authorization_list: Some(Vec::new()),
             ..Default::default()
         };
-        let error =
-            build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337).unwrap_err();
+        let error = build_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337)
+            .unwrap_err();
 
         assert_eq!(error.code(), -32000);
         assert_eq!(error.message(), "chainId does not match node's (have=1, want=1337)");
@@ -1203,8 +1357,8 @@ mod tests {
             authorization_list: Some(test_authorization_list()),
             ..Default::default()
         };
-        let error =
-            build_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337).unwrap_err();
+        let error = build_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337)
+            .unwrap_err();
 
         assert_eq!(error.code(), -32000);
         assert_eq!(error.message(), "eth_estimateTotalFee does not support blob transactions");
@@ -1218,7 +1372,8 @@ mod tests {
             authorization_list: Some(test_authorization_list()),
             ..Default::default()
         };
-        let envelope = test_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
+        let envelope =
+            test_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337);
 
         assert!(envelope[0] >= 0xc0, "explicit gasPrice must keep a legacy envelope");
     }
@@ -1244,7 +1399,8 @@ mod tests {
             value: Some(U256::from(1)),
             ..Default::default()
         };
-        let envelope = test_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
+        let envelope =
+            test_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337);
         let cost = test_l1_block_info().calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
 
         // Arsia formula: cost = max(MinTxSizeScaled, fastlz*COEF - INTERCEPT) * l1FeeScaled / 1e12
@@ -1276,7 +1432,8 @@ mod tests {
             input: alloy_rpc_types_eth::TransactionInput::new(data.into()),
             ..Default::default()
         };
-        let envelope = test_unsigned_tx_envelope(&request, U256::from(100_000), 1_000_000, 1337);
+        let envelope =
+            test_unsigned_tx_envelope(&request, U256::from(100_000), Some(1_000_000), 1337);
         let cost = test_l1_block_info().calculate_tx_l1_cost_for_estimate(&envelope, spec_id, 80);
 
         assert_eq!(cost, U256::from(2_222_959_772_622_000u64));
@@ -1287,7 +1444,8 @@ mod tests {
         let spec_id = op_revm::OpSpecId::ARSIA;
         let request =
             TransactionRequest { to: Some(TxKind::Call(Default::default())), ..Default::default() };
-        let envelope = test_unsigned_tx_envelope(&request, U256::from(21_000), 1_000_000, 1337);
+        let envelope =
+            test_unsigned_tx_envelope(&request, U256::from(21_000), Some(1_000_000), 1337);
 
         // Correct: full envelope → MinTxSizeScaled floor
         let cost_correct =
@@ -1400,7 +1558,7 @@ mod tests {
             ..Default::default()
         };
         let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
-        let envelope = test_unsigned_tx_envelope(&request, envelope_gas, 0, 0x3569128);
+        let envelope = test_unsigned_tx_envelope(&request, envelope_gas, Some(0), 0x3569128);
 
         let spec_id = op_revm::OpSpecId::ARSIA;
         // 3231 = parent (pre-update, the bug); 3224 = target post-state (correct, matches geth).
