@@ -2,9 +2,9 @@ name: ci
 
 on:
   pull_request:
-    branches: [mantle-stage2, main]
+    branches: [mantle-stage2, main, dev/mantle-v1.6.2]
   push:
-    branches: [mantle-stage2, main]
+    branches: [mantle-stage2, main, dev/mantle-v1.6.2]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
