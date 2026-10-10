@@ -1882,7 +1882,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Yes: everything it executed is on chain — drop those entries in one
         // pass. No: it may be in no block at all — put back the sender nonces
         // the slice boundaries advanced on its behalf.
-        if self.fifo.claims().parent_is_ours(parent_hash) {
+        if build_guard.parent_is_ours(parent_hash) {
             let released = self.fifo.drop_landed_claims().await;
             if released > 0 {
                 debug!(

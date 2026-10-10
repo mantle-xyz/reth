@@ -495,7 +495,10 @@ impl Commitments {
     /// window, [`Self::parent_is_ours`] would say "on chain" about
     /// transactions that are in no block. `None` makes it false, which is the
     /// safe direction.
-    pub fn clear_sealed(&self) {
+    ///
+    /// Reached through `BuildGuard`'s `Drop` and nowhere else: what makes it
+    /// safe is being ordered before the queue is handed on.
+    pub(crate) fn clear_sealed(&self) {
         *self.sealed_payload.lock() = None;
     }
 
@@ -504,7 +507,10 @@ impl Commitments {
     ///
     /// False is the safe direction, and what a superseded payload gives (the
     /// last `note_sealed` wins): the caller falls back to asking the chain.
-    pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
+    ///
+    /// Asked through `BuildGuard`, which is what makes the answer good: the
+    /// hash is cleared the moment the queue is handed on.
+    pub(crate) fn parent_is_ours(&self, parent_hash: B256) -> bool {
         *self.sealed_payload.lock() == Some(parent_hash)
     }
 

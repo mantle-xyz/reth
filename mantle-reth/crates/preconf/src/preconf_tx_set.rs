@@ -483,6 +483,18 @@ pub struct BuildGuard {
     lock: Option<OwnedMutexGuard<()>>,
 }
 
+impl BuildGuard {
+    /// Whether the block the last build produced is this build's parent — if
+    /// so, everything that build executed is on chain.
+    ///
+    /// On the guard because the answer is only good while this build holds the
+    /// queue: handing it on erases the hash behind it, and the seal that comes
+    /// after writes a new one.
+    pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
+        self.claims.parent_is_ours(parent_hash)
+    }
+}
+
 impl Drop for BuildGuard {
     fn drop(&mut self) {
         // Before the mutex goes, or the next build takes the queue and reads
@@ -2083,10 +2095,7 @@ mod tests {
         set.claims().note_sealed(previous);
 
         let guard = set.lock_for_build().await;
-        assert!(
-            set.claims().parent_is_ours(previous),
-            "the holding build reads it in its own prologue",
-        );
+        assert!(guard.parent_is_ours(previous), "the holding build reads it in its own prologue",);
 
         drop(guard);
 
