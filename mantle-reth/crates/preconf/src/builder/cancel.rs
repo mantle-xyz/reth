@@ -100,6 +100,16 @@ impl JobCancel {
         *self.rx.borrow()
     }
 
+    /// Whether the build has been given up on. For loops outside `select!`,
+    /// which never reach [`Self::wait`].
+    ///
+    /// Abandoned, not cancelled: a resolved payload is on its way to the
+    /// consensus layer carrying the work the build is still doing, so stopping
+    /// on `Resolved` strands transactions the block was about to take.
+    pub fn is_abandoned(&self) -> bool {
+        self.reason() == Some(CancelReason::Abandoned)
+    }
+
     /// Run `work` unless the job has been abandoned, holding off both endings
     /// until it returns. `None` means it had been abandoned already.
     ///

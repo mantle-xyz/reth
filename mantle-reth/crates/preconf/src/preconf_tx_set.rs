@@ -30,15 +30,23 @@
 //! ## Lock order
 //!
 //! ```text
+//! build_lock → { inner, accounts, apply_lock }
+//!
 //! builder (sync):  writes AccountView only, never touches `inner`
 //! admit   (async): reads AccountView first, then takes `inner`
 //! forbidden:       taking `inner` while holding the AccountView write lock
 //! ```
 //!
-//! Acyclic, so there is no order to get wrong. The worst race between the two:
-//! `admit` reads a nonce the builder consumes a moment later, the transaction
-//! hits `nonce_too_low` at apply and the client is told `BuilderRejected`. Not a
-//! safety problem, and strictly better than waiting out the timeout.
+//! [`PreconfTxSet::lock_for_build`] is outermost: one build executes at a
+//! time, so everything below it has a single writer. The rpc and
+//! canonical-state paths do not take it — they interleave with a build by
+//! design.
+//!
+//! The rest is acyclic, so there is no order to get wrong. The worst race
+//! between the two: `admit` reads a nonce the builder consumes a moment later,
+//! the transaction hits `nonce_too_low` at apply and the client is told
+//! `BuilderRejected`. Not a safety problem, and strictly better than waiting
+//! out the timeout.
 //!
 //! Sibling of the older invariant on [`TxEntry::apply_lock`] — never acquired
 //! while holding `inner`.
@@ -396,10 +404,11 @@ enum NonceBasis {
 /// never reach — an absent sender falls back to chain state, always a valid
 /// answer.
 ///
-/// **Known window:** a superseded build is cancelled asynchronously, so it can
-/// still record a transaction after its replacement cleared the map. The
-/// residue reads high, never low, and high only costs a `nonce_too_low` at
-/// apply. A generation token on the reset would close it if it ever matters.
+/// The clear and every execution the loop records sit inside
+/// [`PreconfTxSet::lock_for_build`], so a superseded build cannot write here
+/// after its replacement cleared the map. The one write left outside is the
+/// seal stage's post-execution transaction, signed by `Address::ZERO`, which
+/// admission never asks about.
 #[derive(Debug, Default)]
 struct AccountView {
     /// Only senders this build has touched. Absent ⇒ ask the chain.
@@ -457,6 +466,44 @@ impl AccountView {
     }
 }
 
+/// The queue, held by the build that is executing — see
+/// [`PreconfTxSet::lock_for_build`].
+///
+/// Dropping it clears the sealed-block hash and then hands the queue on, in
+/// that order: the next build reads that hash the moment it takes the queue,
+/// and until this build seals it still names the build before it.
+///
+/// Coupled to the drop because the caller's own exits would skip it — every
+/// `?` between taking the queue and the seal, and an unwind — and those are
+/// exactly the builds whose transactions went nowhere.
+#[derive(Debug)]
+pub struct BuildGuard {
+    claims: Arc<Commitments>,
+    /// `Option` so the mutex can be released inside `drop`, after the clear.
+    lock: Option<OwnedMutexGuard<()>>,
+}
+
+impl BuildGuard {
+    /// Whether the block the last build produced is this build's parent — if
+    /// so, everything that build executed is on chain.
+    ///
+    /// On the guard because the answer is only good while this build holds the
+    /// queue: handing it on erases the hash behind it, and the seal that comes
+    /// after writes a new one.
+    pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
+        self.claims.parent_is_ours(parent_hash)
+    }
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        // Before the mutex goes, or the next build takes the queue and reads
+        // the hash this is about to erase.
+        self.claims.clear_sealed();
+        self.lock.take();
+    }
+}
+
 /// The commitment truth source. Constructed once at startup and shared via `Arc`.
 pub struct PreconfTxSet {
     inner: Mutex<PreconfTxSetInner>,
@@ -464,6 +511,10 @@ pub struct PreconfTxSet {
     /// What the in-flight build has executed — see [`AccountView`]. Beside
     /// `inner`, never within it; see the module's "Lock order".
     accounts: RwLock<AccountView>,
+
+    /// Held by the one build allowed to be executing — see
+    /// [`Self::lock_for_build`].
+    build_lock: Arc<Mutex<()>>,
 
     notifier: broadcast::Sender<TxHash>,
 
@@ -501,8 +552,29 @@ impl PreconfTxSet {
         Self {
             inner: Mutex::new(PreconfTxSetInner::new(claims.clone())),
             accounts: RwLock::new(AccountView::default()),
+            build_lock: Arc::new(Mutex::new(())),
             notifier,
             claims,
+        }
+    }
+
+    /// Claimed by a build before it touches the queue, released when it stops
+    /// executing. One build holds it at a time, so the queue has one writer.
+    ///
+    /// **Builds only.** The rpc and canonical-state paths interleave with a
+    /// build by design and do not take it.
+    ///
+    /// Two builds overlap routinely: a superseded job is signalled
+    /// asynchronously and keeps running on a thread of its own until its next
+    /// await point.
+    ///
+    /// Not held across the seal — the state root is the most expensive step in
+    /// a build and touches nothing shared. The wait costs one in-flight
+    /// dispatch instead: the loop takes its cancel arm first.
+    pub async fn lock_for_build(&self) -> BuildGuard {
+        BuildGuard {
+            claims: self.claims.clone(),
+            lock: Some(self.build_lock.clone().lock_owned().await),
         }
     }
 
@@ -1984,6 +2056,53 @@ mod tests {
         let sig = Signature::test_signature();
         let hash = B256::from([hash_byte; 32]);
         Arc::new(TxEnvelope::Eip1559(Signed::new_unchecked(inner, sig, hash)))
+    }
+
+    /// **One build at a time may be executing** — the incoming one waits
+    /// rather than reading a queue the outgoing one is still changing.
+    #[tokio::test]
+    async fn a_second_build_waits_for_the_one_holding_the_queue() {
+        let set = Arc::new(PreconfTxSet::new(16));
+
+        let outgoing = set.lock_for_build().await;
+
+        let incoming = Arc::clone(&set);
+        let waiting = tokio::spawn(async move {
+            let _guard = incoming.lock_for_build().await;
+        });
+
+        // Long enough that a lock which did not exclude would have been taken.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the incoming build must wait");
+
+        drop(outgoing);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("the incoming build must proceed once the queue is handed on")
+            .expect("join");
+    }
+
+    /// **Handing the queue on forgets which block the last build sealed.**
+    ///
+    /// It has to survive while the build holds the queue — the prologue reads
+    /// it — and must not survive the hand-off, since from there until this
+    /// build's own seal it describes the build before it.
+    #[tokio::test]
+    async fn handing_the_queue_on_forgets_the_last_sealed_block() {
+        let set = Arc::new(PreconfTxSet::new(16));
+        let previous = B256::repeat_byte(7);
+        set.claims().note_sealed(previous);
+
+        let guard = set.lock_for_build().await;
+        assert!(guard.parent_is_ours(previous), "the holding build reads it in its own prologue",);
+
+        drop(guard);
+
+        assert!(
+            !set.claims().parent_is_ours(previous),
+            "the next build must not be told the block before this one is its parent",
+        );
     }
 
     /// **The staging cap never drops a claim a client is holding.**
