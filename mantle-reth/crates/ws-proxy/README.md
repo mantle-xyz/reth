@@ -1,9 +1,14 @@
 # `mantle-reth-ws-proxy`
 
-Flashblock websocket fan-out proxy. Holds one upstream connection to the
+Subblock websocket fan-out proxy. Holds one upstream connection to the
 sequencer's slice stream and rebroadcasts each slice to many downstream
 subscribers, so the sequencer serves a single client no matter how many RPC
 nodes and third parties read the stream.
+
+"Subblock" is Optimism's current name for what this codebase calls a
+flashblock; the two mean the same thing. Optimism renamed the term in its
+documentation only, so every identifier here — flag names, metric series, type
+names — still reads `flashblock`, and so does the rest of this document.
 
 Ported from Base's `websocket-proxy`. It is a standalone binary — it is not
 linked into `op-reth` and does not run inside the node.
