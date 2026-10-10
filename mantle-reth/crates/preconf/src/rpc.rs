@@ -89,7 +89,7 @@ impl PreconfRpcHandler {
     /// owed a replay exactly as a successful one is — and `builder::dispatch`
     /// agrees, marking the fifo entry `Success` without reading `receipt.status`.
     /// Pinned by `a_reverted_receipt_is_still_recorded_as_a_commitment`.
-    async fn claim_commitment_slot(
+    fn claim_commitment_slot(
         &self,
         event: &PreconfTxEvent,
         hash: alloy_primitives::TxHash,
@@ -167,7 +167,7 @@ impl PreconfRpcHandler {
             // reverts included — see `claim_commitment_slot`.
             Some(Ok(Ok(receipt))) => {
                 let event = PreconfTxEvent::from(receipt);
-                self.claim_commitment_slot(&event, hash, &sender, nonce).await;
+                self.claim_commitment_slot(&event, hash, &sender, nonce);
                 Ok(event)
             }
 
@@ -214,7 +214,7 @@ impl PreconfRpcHandler {
                     // `claim_commitment_slot`.
                     Ok(Ok(receipt)) => {
                         let event = PreconfTxEvent::from(receipt);
-                        self.claim_commitment_slot(&event, hash, &sender, nonce).await;
+                        self.claim_commitment_slot(&event, hash, &sender, nonce);
                         Ok(event)
                     }
                     // A `Timeout` is the op-geth-aligned wire shape, never a
@@ -650,7 +650,7 @@ mod tests {
         });
         assert_eq!(event.status, WireStatus::Failed, "precondition: this is the reverted arm");
 
-        h.handler.claim_commitment_slot(&event, hash, &sender, 0).await;
+        h.handler.claim_commitment_slot(&event, hash, &sender, 0);
 
         assert!(
             h.fifo.claims().is_tracked(&hash),
