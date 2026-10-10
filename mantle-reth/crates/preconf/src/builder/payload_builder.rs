@@ -1878,30 +1878,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Sample the pending-backlog gauge once per build job (~per slot).
         self.fifo.publish_pending_gauge().await;
 
-        // Synchronous canon-forward — drop fifo entries whose nonce is
-        // already sealed as of parent block. Replaces the async
-        // `canon_handler::forward()` which raced with new PayloadJob
-        // start (see `sync_fifo_forward_to_head` docs for details).
-        // Reads via `state_provider_for_finish` (owned, not-yet-moved
-        // into `builder.finish`); `.account_nonce(...)` takes `&self`
-        // so the later move at Stage 5 is unaffected.
-        //
-        // Runs regardless of `allow_preconf`: `forward` only prunes
-        // canon-stale entries, it does not apply any tx into the
-        // in-flight block, so it is safe (and desirable — keeps fifo
-        // aligned with chain state) during derivation builds too.
-        // Did what the last build executed land? For a block that never entered
-        // the chain nothing else answers: no reorg fires, and the pool's own
-        // reinjection never sees it. Asking here also beats asking why the last
-        // build ended — `Resolved` is not proof the payload was used.
-        //
-        // Before the forward sweep, so that sweep walks only what is left. Not
-        // gated on slicing: skipping it on a derivation build would strand the
-        // sealed hash behind a parent no later build matches.
+        // Did the block the last build produced become this one's parent?
+        // Yes: everything it executed is on chain — drop those entries in one
+        // pass. No: it may be in no block at all — put back the sender nonces
+        // the slice boundaries advanced on its behalf.
         if self.fifo.claims().parent_is_ours(parent_hash) {
-            // Our block is the parent, so everything in it is on chain. One
-            // comparison and an in-memory drop — the healthy path, and why the
-            // sealed hash is tracked at all.
             let released = self.fifo.drop_landed_claims().await;
             if released > 0 {
                 debug!(
@@ -1911,10 +1892,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 );
             }
         } else {
-            // What the last build executed may be in no block at all. Only the
-            // pool needs repairing here — it was told these senders moved on
-            // half a slot early. The entries need no rescue: they are in the
-            // fifo already, and the sweep below drops the ones the chain took.
+            // Only the pool needs repairing: the entries are in the fifo
+            // already, and the sweep below drops the ones the chain took.
             let staged = self.fifo.senders_with_landed_claims().await;
             if !staged.is_empty() {
                 metrics::counter!("flashblock.unlanded_sweep_slow_total").increment(1);
@@ -1958,7 +1937,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         }
 
         // Drops whatever the chain has moved past — the landed entries in the
-        // slow arm above, and any stale `Waiting` entry in either.
+        // slow arm above, and any stale `Waiting` entry in either. Runs on
+        // derivation builds too: it prunes without applying anything, so it
+        // keeps the fifo aligned with chain state either way.
         sync_fifo_forward_to_head(&self.fifo, state_provider_for_finish.as_ref()).await;
 
         // ── Slice publishing state ────────────────────────────────────
