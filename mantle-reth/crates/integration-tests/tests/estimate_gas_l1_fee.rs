@@ -3,6 +3,8 @@
 //! The L1 fee helper expects an encoded transaction envelope. Passing raw request calldata makes
 //! empty calldata and ordinary calldata beginning with the deposit type byte (`0x7e`) look exempt,
 //! so reth can return an estimate for a balance that op-geth rejects.
+//! Difficult-to-compress calldata also verifies that the check does not add 80 to the FastLZ size:
+//! op-geth's `Ones += 80` has no effect on the Arsia/Fjord L1 data fee.
 
 use crate::helpers::with_mantle_node;
 use alloy_genesis::{Genesis, GenesisAccount};
@@ -30,6 +32,18 @@ const OPERATOR_FEE_SCALAR: u64 = 100_000_000;
 const TOKEN_RATIO: u64 = 4_369;
 const EXPECTED_L1_DATA_FEE: u128 = 1_586_067_345_511_818;
 const EMPTY_CALL_TOTAL: u128 = 2_846_069_445_511_818;
+
+// Concatenated SHA-256("pr129-review-<offset>") blocks at offsets 0, 32, ... 224.
+const HIGH_ENTROPY_CALLDATA: [u8; 256] = hex!(
+    "cabe4cea1cef821b7ee68317529990647ec4d437840c1bd95de394f72ec13c08
+     c6560b8062de963e294a1ef51c79c8243e0466697e16fd41fc6fed75c0f2e788
+     1720780fd15bc6af555760854e9d451fed98f80c14871a99809a63887a53f938
+     ccb8ad313cf88b5d8e3180d9b10afd8aae89d3f5b57c2fc83490c10d83515576
+     4c2c7ecdcc44b5bfd41aae7aa92ceba5bd803b9108ab6bd346a9100f434825da
+     0b40fdcbcf031d4bd8455eaeec2e2238e20eb892bc0e18512a515b367e37ad6c
+     f4298bc315405952d9f9dcc782c6c10ac366d9a2a0738f4611c72cd489c01680
+     e1b4d04f9d938ab6c2adec320771445e881572c85d265ca23f66bdef57abccf9"
+);
 
 /// Arsia L1-attributes calldata with the fee fields from the fixed QA3 reproduction block.
 fn arsia_l1_attributes_calldata() -> Bytes {
@@ -175,6 +189,57 @@ async fn estimate_gas_charges_l1_fee_for_calldata_edge_cases() {
                     U256::from(gas_limit),
                     "strict total > balance boundary must allow equality for {calldata}"
                 );
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn estimate_gas_matches_geth_for_high_entropy_calldata() {
+    with_mantle_node(
+        chain_spec_with_token_ratio(),
+        attrs_with_l1_deposit,
+        TreeConfig::default(),
+        |mut node, client| async move {
+            let head = node.advance_block().await.expect("mine L1-attributes block");
+            node.sync_to(head.block().hash()).await.expect("settle L1-attributes block");
+
+            // Independent op-geth v1.6.3 (`e33cd26cda583e42196b1be82a79b70258be49af`)
+            // NewL1CostFuncArsia goldens for the zero-signature dynamic-fee proxy envelopes.
+            // FastLZ sizes are 158 and 292; `Ones += 80` leaves these fees unchanged.
+            let mut cases = Vec::with_capacity(2);
+            for (calldata_len, geth_l1_fee) in
+                [(128, 1_586_067_345_511_818u128), (256, 3_198_660_081_310_128u128)]
+            {
+                let calldata = format!("0x{}", hex::encode(&HIGH_ENTROPY_CALLDATA[..calldata_len]));
+                let gas = estimate_gas(&client, &calldata, u128::MAX)
+                    .await
+                    .expect("fully funded difficult-to-compress call must estimate successfully");
+                let gas_limit: u64 = gas.try_into().expect("gas estimate fits u64");
+                assert!(
+                    gas_limit >= 21_000 + calldata_len as u64 * 40,
+                    "an EOA call with all non-zero calldata must cover the EIP-7623 floor"
+                );
+                eprintln!("calldata={calldata_len} bytes, estimated gas={gas_limit}");
+                cases.push((calldata_len, calldata, gas_limit, geth_l1_fee));
+            }
+
+            for (calldata_len, calldata, gas_limit, geth_l1_fee) in cases {
+                let l2_cost = u128::from(gas_limit) * GAS_PRICE;
+                let operator_cost = u128::from(gas_limit) * u128::from(OPERATOR_FEE_SCALAR) * 100;
+                let without_l1 = l2_cost + operator_cost;
+                let total = without_l1 + geth_l1_fee;
+
+                assert_eq!(
+                    estimate_gas(&client, &calldata, total)
+                        .await
+                        .expect("geth's exact L2 + L1 + operator balance must pass"),
+                    U256::from(gas_limit),
+                    "Arsia must not reject the +80 FastLZ difference window for {calldata_len} bytes"
+                );
+                assert_insufficient(&client, &calldata, total - 1, total).await;
+                assert_insufficient(&client, &calldata, without_l1, total).await;
             }
         },
     )

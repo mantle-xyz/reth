@@ -44,11 +44,11 @@ pub struct ArsiaFundsCheck<'a, C: ?Sized> {
 
 /// Checks that the caller can afford `gas_limit * fee_cap + L1_fee + operator_fee + value`.
 ///
-/// Port of op-geth v1.5.5 `mantleArsiaCheckFunds` (`eth/gasestimator/gasestimator.go`):
+/// Port of op-geth `mantleArsiaCheckFunds` (`eth/gasestimator/gasestimator.go`):
 /// - Skips if `fee_cap == 0` (`GasEstimationWithSkipCheckBalanceMode`)
 /// - Skips if Mantle Arsia not active
-/// - L1 fee: `l1_block_info.calculate_tx_l1_cost_for_estimate(envelope, spec, 80)` (+80 bytes
-///   overhead)
+/// - L1 fee: encoded proxy envelope without FastLZ padding (Arsia/Fjord ignores geth's `Ones +=
+///   80`)
 /// - Operator fee: `gas_limit * scalar * 100 + constant`
 /// - Total: `gas_limit * fee_cap + l1_cost + operator_cost + value`
 pub fn mantle_arsia_check_funds(
@@ -65,9 +65,10 @@ pub fn mantle_arsia_check_funds(
 
     let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(check.chain_spec, check.timestamp);
 
-    // L1 data fee with +80 bytes geth signature overhead
+    // Geth's `Ones += 80` does not affect Arsia/Fjord, which prices `FastLzSize`.
+    // Price the proxy envelope's compressed size unchanged for parity.
     let l1_cost =
-        check.l1_block_info.calculate_tx_l1_cost_for_estimate(check.tx_envelope, spec_id, 80);
+        check.l1_block_info.calculate_tx_l1_cost_for_estimate(check.tx_envelope, spec_id, 0);
 
     // Operator fee: gas_limit * scalar * 100 + constant
     let operator_cost = {
@@ -95,8 +96,23 @@ pub fn mantle_arsia_check_funds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_primitives::{Signature, TxKind, hex};
     use mantle_reth_chainspec::MANTLE_MAINNET;
     use reth_optimism_chainspec::OP_DEV;
+
+    // Concatenated SHA-256("pr129-review-<offset>") blocks at offsets 0, 32, ... 224.
+    // Fixed difficult-to-compress calldata makes the +80 FastLZ error observable.
+    const HIGH_ENTROPY_CALLDATA: [u8; 256] = hex!(
+        "cabe4cea1cef821b7ee68317529990647ec4d437840c1bd95de394f72ec13c08
+         c6560b8062de963e294a1ef51c79c8243e0466697e16fd41fc6fed75c0f2e788
+         1720780fd15bc6af555760854e9d451fed98f80c14871a99809a63887a53f938
+         ccb8ad313cf88b5d8e3180d9b10afd8aae89d3f5b57c2fc83490c10d83515576
+         4c2c7ecdcc44b5bfd41aae7aa92ceba5bd803b9108ab6bd346a9100f434825da
+         0b40fdcbcf031d4bd8455eaeec2e2238e20eb892bc0e18512a515b367e37ad6c
+         f4298bc315405952d9f9dcc782c6c10ac366d9a2a0738f4611c72cd489c01680
+         e1b4d04f9d938ab6c2adec320771445e881572c85d265ca23f66bdef57abccf9"
+    );
 
     /// Arsia timestamp on Mantle mainnet — tests use this to enter the Arsia code path.
     fn arsia_ts() -> u64 {
@@ -330,6 +346,74 @@ mod tests {
         // L1 data fee with non-zero L1 base fee and 256 bytes should be significant
         // This should now fail (insufficient funds)
         assert!(result.is_err(), "with non-zero L1 base fee, envelope should add L1 cost");
+    }
+
+    /// The fee goldens come from op-geth v1.6.3 (`e33cd26cda583e42196b1be82a79b70258be49af`)
+    /// `NewL1CostFuncArsia` on the same zero-signature dynamic-fee proxy transaction.
+    /// Geth adds 80 to `Ones`, which does not change the Arsia/Fjord fee's `FastLzSize`.
+    fn assert_geth_funds_boundary(calldata_len: usize, geth_l1_fee: u128) {
+        let gas_limit = 100_000;
+        let fee_cap = 1_000_000;
+        let signed = TxEip1559 {
+            chain_id: 0,
+            nonce: 0,
+            gas_limit,
+            max_fee_per_gas: fee_cap,
+            max_priority_fee_per_gas: fee_cap,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: HIGH_ENTROPY_CALLDATA[..calldata_len].to_vec().into(),
+        }
+        .into_signed(Signature::new(U256::ZERO, U256::ZERO, false));
+        let mut tx_envelope = Vec::new();
+        signed.eip2718_encode(&mut tx_envelope);
+
+        let info = L1BlockInfo {
+            l1_base_fee: U256::from(30_000_000_000u64),
+            l1_blob_base_fee: Some(U256::from(1_000_000u64)),
+            l1_base_fee_scalar: U256::from(5_000u64),
+            l1_blob_base_fee_scalar: Some(U256::from(100u64)),
+            token_ratio: U256::from(3_000u64),
+            operator_fee_scalar: Some(U256::from(2u64)),
+            operator_fee_constant: Some(U256::from(50_000u64)),
+            ..Default::default()
+        };
+        let l2_cost = U256::from(gas_limit) * U256::from(fee_cap);
+        let operator_cost = U256::from(gas_limit) * U256::from(2 * 100) + U256::from(50_000);
+        let total = l2_cost + U256::from(geth_l1_fee) + operator_cost;
+        let mut check = ArsiaFundsCheck {
+            gas_limit,
+            fee_cap: U256::from(fee_cap),
+            value: U256::ZERO,
+            from_balance: total,
+            l1_block_info: &info,
+            tx_envelope: &tx_envelope,
+            chain_spec: MANTLE_MAINNET.as_ref(),
+            timestamp: arsia_ts(),
+        };
+
+        let result = mantle_arsia_check_funds(&check);
+        assert!(result.is_ok(), "geth's exact {calldata_len}-byte balance must pass: {result:?}");
+
+        check.from_balance -= U256::from(1);
+        let err =
+            mantle_arsia_check_funds(&check).expect_err("one wei below geth's total must fail");
+        assert_eq!(err.total, total, "the required balance must match geth's independent golden");
+        assert_eq!(err.balance, total - U256::from(1));
+    }
+
+    #[test]
+    fn check_funds_matches_geth_with_128_byte_calldata() {
+        // FastLZ size 156; the unpadded fee stays at the minimum size. Adding 80 instead
+        // incorrectly raises the L1 fee to 1_114_764_526_446_000 wei.
+        assert_geth_funds_boundary(128, 720_000_030_000_000);
+    }
+
+    #[test]
+    fn check_funds_matches_geth_with_256_byte_calldata() {
+        // FastLZ size 290; adding 80 incorrectly raises the L1 fee to 1_921_819_760_073_000 wei.
+        assert_geth_funds_boundary(256, 1_439_995_739_997_000);
     }
 
     #[test]
