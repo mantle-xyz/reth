@@ -3,8 +3,8 @@
 //! The L1 fee helper expects an encoded transaction envelope. Passing raw request calldata makes
 //! empty calldata and ordinary calldata beginning with the deposit type byte (`0x7e`) look exempt,
 //! so reth can return an estimate for a balance that op-geth rejects.
-//! Difficult-to-compress calldata also verifies that the check does not add 80 to the FastLZ size:
-//! op-geth's `Ones += 80` has no effect on the Arsia/Fjord L1 data fee.
+//! Difficult-to-compress calldata also verifies that the check does not add 80 to the `FastLZ`
+//! size: op-geth's `Ones += 80` has no effect on the Arsia/Fjord L1 data fee.
 
 use crate::helpers::with_mantle_node;
 use alloy_genesis::{Genesis, GenesisAccount};

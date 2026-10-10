@@ -47,7 +47,7 @@ pub struct ArsiaFundsCheck<'a, C: ?Sized> {
 /// Port of op-geth `mantleArsiaCheckFunds` (`eth/gasestimator/gasestimator.go`):
 /// - Skips if `fee_cap == 0` (`GasEstimationWithSkipCheckBalanceMode`)
 /// - Skips if Mantle Arsia not active
-/// - L1 fee: encoded proxy envelope without FastLZ padding (Arsia/Fjord ignores geth's `Ones +=
+/// - L1 fee: encoded proxy envelope without `FastLZ` padding (Arsia/Fjord ignores geth's `Ones +=
 ///   80`)
 /// - Operator fee: `gas_limit * scalar * 100 + constant`
 /// - Total: `gas_limit * fee_cap + l1_cost + operator_cost + value`
