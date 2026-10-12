@@ -672,8 +672,9 @@ impl PreconfTxSet {
     /// `Instant::now()` at the call site is fine for RPC callers that
     /// want to include only downstream latency in the deadline budget.
     ///
-    /// Returns `AlreadyAttached` if any responder slot for this hash is
-    /// already occupied.
+    /// Returns `AlreadyAttached` when the hash's responder slot is held by a
+    /// client that can still be answered. A responder whose receiver already
+    /// went away does not count — see the reclaimable arm.
     pub async fn attach_responder(
         &self,
         hash: TxHash,
@@ -713,7 +714,14 @@ impl PreconfTxSet {
                 // rather than the (already-expired) first. The
                 // subsequent `push_if_absent` from the pool listener
                 // flips the entry back to `Waiting` and broadcasts.
+                //
+                // Occupancy is by liveness, not `is_some`: a live responder means
+                // another client is mid-flight on this hash (refuse, as `Waiting`
+                // does), while closed debris left by terminal paths is replaced.
                 PreconfStatus::Timeout | PreconfStatus::Canceled | PreconfStatus::Failed => {
+                    if entry.responder.as_ref().is_some_and(|r| !r.is_closed()) {
+                        return Err(AttachError::AlreadyAttached);
+                    }
                     entry.responder = Some(responder);
                     entry.inserted_at = origin_instant;
                     return Ok(());
@@ -1235,6 +1243,53 @@ mod tests {
         // Push must consume it and move it into the entry.
         set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
         assert!(set.take_responder(tx.tx_hash()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn attach_responder_refuses_to_clobber_a_live_responder_on_a_reclaimable_entry() {
+        // Two same-hash requests race while the entry is reclaimable. Refuse the
+        // second: a clobbered client wakes on `RecvError` and its error path then
+        // resolves the winner's responder, failing both on a tx that still lands.
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        let hash = *tx.tx_hash();
+        set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
+
+        let (s1, mut r1) = oneshot::channel();
+        set.attach_responder(hash, Instant::now(), s1).await.unwrap();
+        // Builder pre-execute reject → reclaimable, responder still attached.
+        set.mark_failed(&hash).await.unwrap();
+
+        let (s2, _r2) = oneshot::channel();
+        let err = set.attach_responder(hash, Instant::now(), s2).await.unwrap_err();
+        assert_eq!(err, AttachError::AlreadyAttached);
+
+        // First client's channel survives untouched.
+        assert!(matches!(r1.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        set.cancel_responder(&hash, PreconfError::NotPreconfEligible).await;
+        assert_eq!(r1.await.unwrap(), Err(PreconfError::NotPreconfEligible));
+    }
+
+    #[tokio::test]
+    async fn attach_responder_replaces_a_dead_responder_on_a_reclaimable_entry() {
+        // Counterpart: terminal paths exist that mark an entry without resolving
+        // its responder, so a retry must still get through once that client is
+        // gone — otherwise the hash stays wedged for the entry's whole life.
+        let set = PreconfTxSet::new(16);
+        let tx = make_tx(0, 1);
+        let hash = *tx.tx_hash();
+        set.push_if_absent(tx, addr(1), PreconfSource::Rpc).await;
+
+        let (s1, r1) = oneshot::channel();
+        set.attach_responder(hash, Instant::now(), s1).await.unwrap();
+        set.mark_timeout(&hash).await.unwrap();
+        drop(r1); // client gave up
+
+        let (s2, r2) = oneshot::channel();
+        set.attach_responder(hash, Instant::now(), s2).await.expect("dead slot is replaceable");
+
+        set.cancel_responder(&hash, PreconfError::NotPreconfEligible).await;
+        assert_eq!(r2.await.unwrap(), Err(PreconfError::NotPreconfEligible));
     }
 
     #[tokio::test]
@@ -2111,7 +2166,9 @@ mod proptest_responder_model {
                             assert!(r.is_err(), "step {i}: attach on Success must reject");
                             assert_closed(rx, &format!("step {i}: rejected attach"));
                         }
-                        Some(PreconfStatus::Waiting) => {
+                        // Waiting or reclaimable — the entry is there, so a live
+                        // responder is never clobbered and an empty slot takes ours.
+                        Some(_) => {
                             if st.held.is_some() {
                                 assert!(
                                     r.is_err(),
@@ -2119,18 +2176,9 @@ mod proptest_responder_model {
                                 );
                                 assert_closed(rx, &format!("step {i}: rejected attach"));
                             } else {
-                                assert!(r.is_ok(), "step {i}: attach on bare Waiting must succeed");
+                                assert!(r.is_ok(), "step {i}: attach on a bare entry must succeed");
                                 st.held = Some((Loc::Entry, rx));
                             }
-                        }
-                        Some(_) => {
-                            // Reclaimable: installs onto the entry, overwriting any prior
-                            // responder.
-                            assert!(r.is_ok(), "step {i}: attach on reclaimable must succeed");
-                            if let Some((_, old)) = st.held.take() {
-                                assert_closed(old, &format!("step {i}: overwritten responder"));
-                            }
-                            st.held = Some((Loc::Entry, rx));
                         }
                         None => {
                             if st.held.is_some() {

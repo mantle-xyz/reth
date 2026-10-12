@@ -21,6 +21,7 @@ alloy-sol-types.workspace = true
 # alloy-eips — `Encodable2718` to serialise a preconf `TxEnvelope` to its
 # canonical bytes for the DA-footprint (H3) size estimate.
 alloy-eips.workspace = true
+alloy-rlp.workspace = true
 
 # op-alloy-flz — `tx_estimated_size_fjord_bytes`, the fastlz-based DA size
 # estimator. Used by the preconf DA-footprint gate so its estimate is
