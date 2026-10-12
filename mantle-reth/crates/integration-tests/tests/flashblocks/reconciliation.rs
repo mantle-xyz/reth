@@ -145,3 +145,32 @@ async fn a_backlogged_canonical_notification_is_judged_against_the_tip() {
         "every overlay block is canonical at tip 5, so the overlay must retire",
     );
 }
+
+/// A snapshot stranded behind the tip is dropped when it is next read.
+///
+/// Every existing guard runs inside `process_canonical_block`, so a stream that
+/// delivers slices but no canonical notifications — a lagging or stalled notification
+/// path — leaves the overlay anchored wherever it was, indefinitely. `pending` keeps
+/// answering from that anchor, which by then is historical state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_stranded_behind_the_tip_is_dropped_without_a_notification() {
+    let (harness, mut node) = launch_flashblocks_node!(1, 3);
+
+    harness.send(base_slice(1)).await;
+    assert!(harness.pending().is_some(), "the base slice should open an overlay");
+
+    // The chain runs well past the overlay. No canonical notification is delivered,
+    // so reconciliation never gets a chance to retire it.
+    for _ in 0..5 {
+        mine!(node);
+    }
+
+    // Any further work makes the processor read the snapshot, which is where the
+    // staleness check lives.
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).build()).await;
+
+    assert!(
+        harness.pending().is_none(),
+        "a snapshot five blocks behind the tip must not survive being read"
+    );
+}

@@ -9,6 +9,7 @@ use mantle_reth_flashblocks::{
 
 use crate::consumer_helpers::{
     FlashblockBuilder, base_slice, base_slice_builder, l1_info_deposit, launch_flashblocks_node,
+    mine_canonical_block as mine,
 };
 
 /// Default depths: three blocks of trailing history, three of leading slack.
@@ -90,6 +91,29 @@ async fn a_slice_beyond_the_leading_depth_is_dropped() {
     harness.send(base_slice(100)).await;
 
     assert!(harness.pending().is_none(), "the leading-depth guard must drop the slice");
+}
+
+/// A slice for a block the chain has already canonicalised is skipped.
+///
+/// Executing it cannot produce a publishable overlay — whatever it computes sits at
+/// or below the tip — and doing the work anyway is what lets a backlog sustain
+/// itself: superseded payloads occupy the one consumer while fresh ones wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_for_an_already_canonical_block_is_skipped() {
+    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+
+    for _ in 0..3 {
+        mine!(node);
+    }
+
+    harness.send(base_slice(2)).await;
+
+    assert!(harness.pending().is_none(), "a superseded slice must not open an overlay");
+
+    // The guard is about the tip, not about the slice being malformed: one block
+    // past the tip still opens an overlay.
+    harness.send(base_slice(4)).await;
+    assert!(harness.pending().is_some(), "a slice ahead of the tip is still accepted");
 }
 
 /// A slice carrying an SDM post-exec transaction is rejected whole.

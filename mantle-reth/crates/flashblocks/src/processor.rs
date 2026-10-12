@@ -147,6 +147,22 @@ where
         pending_blocks_builder.with_state_overrides(state_overrides.clone());
 
         let pending_blocks = Arc::new(pending_blocks_builder.build()?);
+
+        // Deliberately read here rather than taking the loop's value: this guard
+        // exists for the window between that read and now, so a fresher tip is the
+        // whole point.
+        let tip_at_publish = self.canonical_tip();
+        if !self.extends_canonical_tip(&pending_blocks, tip_at_publish) {
+            debug!(
+                message = "built snapshot no longer leads the canonical tip, discarding",
+                canonical_tip = ?tip_at_publish,
+                latest_pending_block = pending_blocks.latest_block_number(),
+            );
+            Metrics::pending_drop_not_ahead().increment(1);
+            self.clear_live_state();
+            return Ok(None);
+        }
+
         self.set_live_state(db, state_overrides);
 
         Ok(Some(pending_blocks))
@@ -182,11 +198,15 @@ where
         while let Some((update, waiting)) = self.queue.recv().await {
             Metrics::queue_depth().set(waiting as f64);
 
-            let prev_pending_blocks = self.pending_blocks.load_full();
+            // Read once per update and threaded down: three guards consult it, and
+            // re-reading would let them disagree within one iteration, which shows up
+            // as self-contradicting logs rather than as a wrong decision.
+            let tip = self.canonical_tip();
+            let prev_pending_blocks = self.load_pending_or_drop_stranded(tip);
             match update {
                 StateUpdate::Canonical(block, ack) => {
                     debug!(message = "processing canonical block", block_number = block.number);
-                    match self.process_canonical_block(prev_pending_blocks, &block) {
+                    match self.process_canonical_block(prev_pending_blocks, &block, tip) {
                         Ok(new_pending_blocks) => {
                             self.pending_blocks.swap(new_pending_blocks);
 
@@ -202,8 +222,8 @@ where
                                     cached_count = cached.len(),
                                 );
                                 for flashblock in cached {
-                                    let fb_prev = self.pending_blocks.load_full();
-                                    self.apply_flashblock(fb_prev, flashblock).await;
+                                    let fb_prev = self.load_pending_or_drop_stranded(tip);
+                                    self.apply_flashblock(fb_prev, flashblock, tip).await;
                                 }
                             }
                         }
@@ -221,7 +241,7 @@ where
                         block_number = flashblock.metadata.block_number,
                         flashblock_index = flashblock.index
                     );
-                    self.apply_flashblock(prev_pending_blocks, flashblock).await;
+                    self.apply_flashblock(prev_pending_blocks, flashblock, tip).await;
                     if let Some(ack) = ack {
                         let _ = ack.send(());
                     }
@@ -234,10 +254,108 @@ where
     ///
     /// Placed on the flashblock path rather than in `reconcile`: a stalled canonical
     /// produces no `StateUpdate::Canonical`, so a check there would never run.
-    fn exceeds_leading_depth(&self, flashblock: &MantleFlashblockPayload) -> bool {
-        let Ok(canonical) = self.client.best_block_number() else { return false };
-        let leading = flashblock.metadata.block_number.saturating_sub(canonical);
+    fn exceeds_leading_depth(
+        &self,
+        flashblock: &MantleFlashblockPayload,
+        tip: Option<BlockNumber>,
+    ) -> bool {
+        // An unknown tip admits the slice: refusing work we cannot justify refusing
+        // would stall the overlay on a transient provider error.
+        let Some(tip) = tip else { return false };
+        let leading = flashblock.metadata.block_number.saturating_sub(tip);
         leading > self.max_leading_depth
+    }
+
+    /// The node's canonical tip, or `None` when the provider cannot answer.
+    ///
+    /// Callers decide what `None` means for them: admitting a slice is the safe
+    /// default on the flashblock path, keeping the snapshot is the safe default on
+    /// the guard paths. Nothing here chooses for them.
+    fn canonical_tip(&self) -> Option<BlockNumber> {
+        match self.client.best_block_number() {
+            Ok(tip) => Some(tip),
+            Err(e) => {
+                warn!(message = "could not read the canonical tip", error = %e);
+                None
+            }
+        }
+    }
+
+    /// Returns `true` when the chain has already canonicalised this slice's block.
+    ///
+    /// Executing it cannot produce a publishable snapshot, and doing the work anyway
+    /// is what lets a backlog sustain itself: superseded payloads occupy the single
+    /// consumer while fresh ones wait behind them.
+    fn is_superseded(
+        &self,
+        flashblock: &MantleFlashblockPayload,
+        tip: Option<BlockNumber>,
+    ) -> bool {
+        tip.is_some_and(|tip| flashblock.metadata.block_number <= tip)
+    }
+
+    /// Returns `true` when the snapshot still extends past the chain tip.
+    ///
+    /// A snapshot whose latest block is already canonical holds nothing pending, so
+    /// publishing it would serve `pending` from a base the chain has passed.
+    ///
+    /// Only a race reaches this: every reconciliation branch that rebuilds has
+    /// already established `latest > tip`, but the chain can move while the rebuild
+    /// runs. An unknown tip keeps the snapshot.
+    fn extends_canonical_tip(
+        &self,
+        pending_blocks: &PendingBlocks,
+        tip: Option<BlockNumber>,
+    ) -> bool {
+        tip.is_none_or(|tip| pending_blocks.latest_block_number() > tip)
+    }
+
+    /// Returns `true` when the snapshot has fallen too far behind to be worth keeping.
+    ///
+    /// Measured from `latest`, not `earliest`: `PendingBlocksBuilder::from_previous`
+    /// carries the earliest header forward unchanged, so `tip - earliest` is the
+    /// snapshot's width, which the trailing-depth limit already governs.
+    ///
+    /// Reuses `max_trailing_depth` deliberately. Since `earliest <= latest`, this
+    /// bound is strictly weaker than the one `DepthLimitExceeded` applies, so it can
+    /// only fire where reconciliation would already have rebuilt — it just does not
+    /// wait for a notification that may never come.
+    fn is_stranded_behind_tip(
+        &self,
+        pending_blocks: &PendingBlocks,
+        tip: Option<BlockNumber>,
+    ) -> bool {
+        tip.is_some_and(|tip| {
+            tip.saturating_sub(pending_blocks.latest_block_number()) > self.max_trailing_depth
+        })
+    }
+
+    /// Loads the published snapshot, dropping it first if it is stranded behind the tip.
+    ///
+    /// Every other staleness guard runs inside `process_canonical_block`, so a stream
+    /// that delivers slices but no canonical notifications would otherwise leave the
+    /// overlay anchored wherever it was, indefinitely.
+    fn load_pending_or_drop_stranded(
+        &self,
+        tip: Option<BlockNumber>,
+    ) -> Option<Arc<PendingBlocks>> {
+        let pending_blocks = self.pending_blocks.load_full()?;
+
+        if !self.is_stranded_behind_tip(&pending_blocks, tip) {
+            return Some(pending_blocks);
+        }
+
+        debug!(
+            message = "pending snapshot stranded behind the canonical tip, dropping",
+            canonical_tip = ?tip,
+            latest_pending_block = pending_blocks.latest_block_number(),
+            max_trailing_depth = self.max_trailing_depth,
+        );
+        Metrics::pending_drop_stranded().increment(1);
+        self.clear_live_state();
+        self.pending_blocks.store(None);
+
+        None
     }
 
     /// Canonical height to reconcile a notification against.
@@ -249,26 +367,28 @@ where
     /// larger of the two keeps the guards anchored to the chain. Falls back to the
     /// notification when the provider cannot answer, which is what the pre-tip
     /// behaviour was.
-    fn effective_canonical_number(&self, notified: BlockNumber) -> BlockNumber {
-        match self.client.best_block_number() {
-            Ok(tip) => notified.max(tip),
-            Err(e) => {
-                warn!(
-                    message = "could not read the canonical tip, reconciling against the notification",
-                    notified_block = notified,
-                    error = %e,
-                );
-                notified
-            }
-        }
+    fn effective_canonical_number(notified: BlockNumber, tip: Option<BlockNumber>) -> BlockNumber {
+        tip.map_or(notified, |tip| notified.max(tip))
     }
 
     async fn apply_flashblock(
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblock: MantleFlashblockPayload,
+        tip: Option<BlockNumber>,
     ) {
-        if self.exceeds_leading_depth(&flashblock) {
+        if self.is_superseded(&flashblock, tip) {
+            debug!(
+                message = "flashblock is for an already canonical block, skipping",
+                block_number = flashblock.metadata.block_number,
+                flashblock_index = flashblock.index,
+                canonical_tip = ?tip,
+            );
+            Metrics::flashblock_superseded().increment(1);
+            return;
+        }
+
+        if self.exceeds_leading_depth(&flashblock, tip) {
             Metrics::leading_depth_exceeded().increment(1);
             warn!(
                 message = "flashblock leads canonical beyond the configured depth, dropping",
@@ -342,6 +462,7 @@ where
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         block: &RecoveredBlock<OpBlock>,
+        tip: Option<BlockNumber>,
     ) -> Result<Option<Arc<PendingBlocks>>> {
         let pending_blocks = match &prev_pending_blocks {
             Some(pb) => pb,
@@ -369,7 +490,7 @@ where
         let strategy = CanonicalBlockReconciler::reconcile(
             Some(pending_blocks.earliest_block_number()),
             Some(pending_blocks.latest_block_number()),
-            self.effective_canonical_number(block.number),
+            Self::effective_canonical_number(block.number, tip),
             self.max_trailing_depth,
             reorg_detected,
         );
