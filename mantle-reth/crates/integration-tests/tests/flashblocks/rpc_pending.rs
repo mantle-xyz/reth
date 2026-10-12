@@ -4,12 +4,14 @@
 //! test's [`FlashblocksState`], the same pair `MantleNode::add_ons` wires up, and
 //! its methods are called directly rather than over JSON-RPC.
 
-use alloy_primitives::{Address, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
 use mantle_reth_flashblocks::EthApiOverrideServer;
 
 use crate::consumer_helpers::{
-    FlashblockBuilder, LOGGER, l1_info_deposit, launch_flashblocks_node, signed_call, test_sender,
+    DEPLOY_INIT_CODE, DEPLOYED_RUNTIME, FlashblockBuilder, LOGGER, SETTER, SETTER_SLOT,
+    SETTER_UNWRITTEN_SLOT, SETTER_UNWRITTEN_VALUE, SETTER_VALUE, l1_info_deposit,
+    launch_flashblocks_node, signed_call, signed_deploy, test_sender,
 };
 
 /// Value the overlay's user transaction moves into [`LOGGER`].
@@ -316,4 +318,105 @@ async fn send_raw_transaction_sync_returns_the_flashblock_receipt() {
     let receipt = receipt.expect("the slice carries the transaction");
     assert_eq!(receipt["transactionHash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
     assert_eq!(receipt["status"], "0x1");
+}
+
+/// Opens an overlay at block 1 whose user transaction calls [`SETTER`], so the
+/// overlay — and only the overlay — holds [`SETTER_SLOT`].
+macro_rules! overlay_with_storage_write {
+    ($harness:expr) => {{
+        let raw = signed_call(0, SETTER, U256::ZERO).await;
+        $harness
+            .send(FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw]).build())
+            .await;
+        assert!($harness.pending().is_some(), "the slice should open an overlay");
+    }};
+}
+
+/// `eth_getStorageAt` sees the overlay's write under `pending` only.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_storage_at_sees_the_overlay_only_under_pending() {
+    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let api = eth_api!(node, harness);
+
+    overlay_with_storage_write!(harness);
+
+    let pending = api
+        .storage_at(SETTER, SETTER_SLOT.into(), Some(BlockNumberOrTag::Pending.into()))
+        .await
+        .expect("query");
+    assert_eq!(pending, B256::with_last_byte(SETTER_VALUE));
+
+    let latest = api
+        .storage_at(SETTER, SETTER_SLOT.into(), Some(BlockNumberOrTag::Latest.into()))
+        .await
+        .expect("query");
+    assert_eq!(latest, B256::ZERO, "canonical state is untouched");
+}
+
+/// A slot the overlay never wrote falls back to canonical rather than reading
+/// `0` off an absent entry — the account is in the overlay, the slot is not.
+///
+/// Guards the wrong-answer case, not the wiring: canonical holds the same
+/// value, so this stays green with the override removed entirely. The wiring
+/// proof is `get_storage_at_sees_the_overlay_only_under_pending`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unwritten_slot_of_a_touched_account_falls_back_to_canonical() {
+    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let api = eth_api!(node, harness);
+
+    overlay_with_storage_write!(harness);
+
+    let pending = api
+        .storage_at(SETTER, SETTER_UNWRITTEN_SLOT.into(), Some(BlockNumberOrTag::Pending.into()))
+        .await
+        .expect("query");
+
+    assert_eq!(
+        pending,
+        B256::with_last_byte(SETTER_UNWRITTEN_VALUE),
+        "the overlay never wrote this slot, so canonical's value stands",
+    );
+}
+
+/// `eth_getCode` at `pending` serves a contract that exists only in the overlay.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_code_serves_a_contract_the_overlay_deployed() {
+    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw = signed_deploy(0, DEPLOY_INIT_CODE).await;
+    harness
+        .send(FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw]).build())
+        .await;
+    assert!(harness.pending().is_some(), "the slice should open an overlay");
+
+    let deployed = test_sender().create(0);
+
+    let pending =
+        api.get_code(deployed, Some(BlockNumberOrTag::Pending.into())).await.expect("query");
+    assert_eq!(pending, DEPLOYED_RUNTIME);
+
+    let latest =
+        api.get_code(deployed, Some(BlockNumberOrTag::Latest.into())).await.expect("query");
+    assert_eq!(latest, Bytes::new(), "canonical state has no such contract");
+}
+
+/// A wallet the overlay touched must still report no code.
+///
+/// Guards the REVM-padding trap rather than the overlay wiring: REVM pads
+/// bytecode for jump-destination analysis, so the execution-time form of empty
+/// code is a trailing `STOP`. Serving that from `eth_getCode` makes
+/// `EXTCODESIZE` report 1 for a plain wallet, flipping every `isContract()`
+/// guard. Canonical agrees with the overlay here, so this cannot fail on a
+/// missing override — only on a wrong one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_touched_by_the_overlay_still_has_no_code_at_pending() {
+    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let api = eth_api!(node, harness);
+
+    overlay_with_user_call!(harness);
+
+    let pending =
+        api.get_code(test_sender(), Some(BlockNumberOrTag::Pending.into())).await.expect("query");
+    assert_eq!(pending, Bytes::new());
 }

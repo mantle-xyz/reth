@@ -2,18 +2,36 @@
 //!
 //! `eth_simulateV1` is deliberately absent: it is owned by `MantleEthApiExt`,
 //! which injects pending overrides via [`PendingStateOverrides`].
+//!
+//! # Two overlay representations, and what is not covered
+//!
+//! The state reads here (`eth_getCode`, `eth_getStorageAt`) answer from the
+//! overlay's [`BundleState`], while `eth_call`, `eth_estimateGas` and
+//! `eth_simulateV1` answer from its `state_overrides`. Those are maintained
+//! separately and the bundle is the larger of the two — it also carries the
+//! EIP-4788 and EIP-2935 pre-execution writes and the writes of a cached
+//! replay. Do not assume the two agree on a given slot.
+//!
+//! Methods that read state but are **not** overridden still resolve `pending`
+//! through reth's own pending block, which this consumer never feeds, so they
+//! answer from canonical: `eth_getStorageValues`, `eth_getProof`,
+//! `eth_getAccount`, `eth_getAccountInfo`. `eth_getStorageValues` in
+//! particular can therefore disagree with `eth_getStorageAt` on the same slot.
+//!
+//! [`BundleState`]: reth_revm::db::BundleState
 
 use std::{sync::Arc, time::Duration};
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{
-    Address, Bytes, TxHash, U256,
+    Address, B256, Bytes, TxHash, U256,
     map::foldhash::{HashSet, HashSetExt},
 };
 use alloy_rpc_types_eth::{
     BlockOverrides, Filter, Log,
     state::{EvmOverrides, StateOverride, StateOverridesBuilder},
 };
+use alloy_serde::JsonStorageKey;
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
@@ -135,6 +153,19 @@ pub trait EthApiOverride {
         address: Address,
         block_number: Option<BlockId>,
     ) -> RpcResult<U256>;
+
+    /// Returns an account's code, with flashblock support for pending state.
+    #[method(name = "getCode")]
+    async fn get_code(&self, address: Address, block_number: Option<BlockId>) -> RpcResult<Bytes>;
+
+    /// Returns a storage slot's value, with flashblock support for pending state.
+    #[method(name = "getStorageAt")]
+    async fn storage_at(
+        &self,
+        address: Address,
+        index: JsonStorageKey,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<B256>;
 
     /// Returns transaction by hash, checking the canonical chain first.
     #[method(name = "getTransactionByHash")]
@@ -280,6 +311,41 @@ where
         }
 
         EthState::balance(&self.eth_api, address, block_number).await.map_err(Into::into)
+    }
+
+    async fn get_code(&self, address: Address, block_number: Option<BlockId>) -> RpcResult<Bytes> {
+        debug!(message = "rpc::get_code", address = %address);
+        let block_id = block_number.unwrap_or_default();
+        if block_id.is_pending() {
+            Metrics::rpc_get_code().increment(1);
+            let pending_blocks = self.flashblocks_state.get_pending_blocks();
+            // Empty bytes are an answer, not a miss: the overlay knows this
+            // account holds no code. Only `None` falls through.
+            if let Some(code) = pending_blocks.get_code(address) {
+                return Ok(code);
+            }
+        }
+
+        EthState::get_code(&self.eth_api, address, block_number).await.map_err(Into::into)
+    }
+
+    async fn storage_at(
+        &self,
+        address: Address,
+        index: JsonStorageKey,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<B256> {
+        debug!(message = "rpc::storage_at", address = %address, index = %index.as_b256());
+        let block_id = block_number.unwrap_or_default();
+        if block_id.is_pending() {
+            Metrics::rpc_get_storage_at().increment(1);
+            let pending_blocks = self.flashblocks_state.get_pending_blocks();
+            if let Some(value) = pending_blocks.get_storage_at(address, index.as_b256()) {
+                return Ok(value);
+            }
+        }
+
+        EthState::storage_at(&self.eth_api, address, index, block_number).await.map_err(Into::into)
     }
 
     async fn get_transaction_count(

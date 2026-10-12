@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Address, TxHash, U256};
+use alloy_primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::{Filter, Log, state::StateOverride};
 use arc_swap::Guard;
 use mantle_reth_flashblocks_types::MantleFlashblockPayload;
@@ -51,6 +51,15 @@ pub trait PendingBlocksAPI {
 
     /// Gets balance for an address. Returns `None` if the address was not touched.
     fn get_balance(&self, address: Address) -> Option<U256>;
+
+    /// Gets code for an address. Returns `None` if the overlay holds no answer
+    /// and the caller must fall back to canonical state; empty bytes mean the
+    /// overlay knows the account holds no code.
+    fn get_code(&self, address: Address) -> Option<Bytes>;
+
+    /// Gets a storage slot's value. Returns `None` if the overlay holds no
+    /// answer and the caller must fall back to canonical state.
+    fn get_storage_at(&self, address: Address, slot: B256) -> Option<B256>;
 
     /// Gets the state overrides for the pending blocks.
     fn get_state_overrides(&self) -> Option<StateOverride>;

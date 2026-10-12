@@ -5,7 +5,7 @@ use std::{collections::HashMap as StdHashMap, sync::Arc};
 use alloy_consensus::{Header, Sealed, TxReceipt};
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::TransactionResponse;
-use alloy_primitives::{Address, B256, BlockNumber, TxHash, U256};
+use alloy_primitives::{Address, B256, BlockNumber, Bytes, TxHash, U256};
 use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::{
     BlockTransactions, Filter, Header as RpcHeader, Log, Withdrawal, state::StateOverride,
@@ -583,6 +583,59 @@ impl PendingBlocks {
         self.account_balances.get(&address).copied()
     }
 
+    /// Returns the storage value at `slot` for `address` in pending state.
+    ///
+    /// `None` means the overlay holds no answer, so the caller must fall back
+    /// to canonical state — the block being built never wrote this slot, and
+    /// answering `0` would invent a value the chain never held.
+    ///
+    /// `Some(ZERO)` for a slot the overlay never wrote means the account's
+    /// whole storage is known, so there is nothing to fall back to: the
+    /// account was created in this block, destroyed in it, or touched while
+    /// not existing. Canonical may still hold a pre-destruction value, and
+    /// returning it would be wrong.
+    pub fn get_storage_at(&self, address: Address, slot: B256) -> Option<B256> {
+        self.bundle_state
+            .account(&address)?
+            .storage_slot(U256::from_be_bytes(slot.0))
+            .map(B256::from)
+    }
+
+    /// Returns the code for `address` in pending state.
+    ///
+    /// `None` means the overlay holds no answer, so the caller must fall back
+    /// to canonical state. Empty bytes are a positive answer, not a miss: the
+    /// overlay knows the account holds no code.
+    pub fn get_code(&self, address: Address) -> Option<Bytes> {
+        let account = self.bundle_state.account(&address)?;
+
+        // No post-state account: either it does not exist (the common case —
+        // a call to, or transfer at, an empty address) or the block being
+        // built destroyed it. Both hold no code, and falling back to canonical
+        // in the second case would resurrect a dead contract.
+        let Some(info) = account.info.as_ref() else {
+            return Some(Bytes::new());
+        };
+
+        if let Some(code) = info.code.as_ref() {
+            // `original_bytes`, not `bytes`: REVM pads bytecode with a trailing
+            // `STOP` for jump-destination analysis, which would make
+            // `EXTCODESIZE` report 1 for an account that holds no code.
+            return Some(code.original_bytes());
+        }
+        // Accounts loaded from the database arrive with `code: None`, so this
+        // is the path every wallet takes.
+        if info.is_empty_code_hash() {
+            return Some(Bytes::new());
+        }
+
+        // `AccountInfo::code` is populated lazily, so an account may carry only
+        // a hash. The bundle's contract map is the overlay's record of the code
+        // it deployed; a hash it cannot resolve belongs to code that predates
+        // this block, which canonical state holds.
+        self.bundle_state.bytecode(&info.code_hash).map(|code| code.original_bytes())
+    }
+
     /// Returns the state overrides for the pending state.
     pub fn get_state_overrides(&self) -> Option<StateOverride> {
         self.state_overrides.clone()
@@ -732,6 +785,14 @@ impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
         self.as_ref().and_then(|pb| pb.get_balance(address))
     }
 
+    fn get_code(&self, address: Address) -> Option<Bytes> {
+        self.as_ref().and_then(|pb| pb.get_code(address))
+    }
+
+    fn get_storage_at(&self, address: Address, slot: B256) -> Option<B256> {
+        self.as_ref().and_then(|pb| pb.get_storage_at(address, slot))
+    }
+
     fn get_state_overrides(&self) -> Option<StateOverride> {
         self.as_ref().and_then(|pb| pb.get_state_overrides())
     }
@@ -750,8 +811,11 @@ mod tests {
     use op_alloy_consensus::{OpReceipt, OpTxEnvelope};
     use op_alloy_rpc_types::L1BlockInfo;
     use op_alloy_rpc_types_engine::{OpFlashblockPayloadBase, OpFlashblockPayloadDelta};
-    use revm::state::AccountInfo;
-    use revm_database::states::BundleBuilder;
+    use revm::state::{AccountInfo, Bytecode};
+    use revm_database::states::{AccountStatus, BundleAccount, BundleBuilder};
+
+    // `HashMap` in this module is `imbl`'s; revm's bundle types want alloy's.
+    use alloy_primitives::map::HashMap as RevmMap;
 
     use super::*;
 
@@ -1250,5 +1314,219 @@ mod tests {
 
         assert_eq!(txs.len(), 1);
         assert_eq!(txs[0].transaction.tx_hash(), hash_a);
+    }
+
+    // ─── pending storage reads ──────────────────────────────────────────
+
+    /// Minimal overlay carrying nothing but the given state diff.
+    fn pending_blocks_with_bundle(bundle_state: BundleState) -> PendingBlocks {
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_flashblocks([test_flashblock()]);
+        builder.with_header(header_at(0));
+        builder.with_bundle_state(bundle_state);
+        builder.build().expect("build should succeed")
+    }
+
+    /// An overlay holding `address` with `status`, no storage slots and the
+    /// given post-state account info.
+    fn bundle_with_account(
+        address: Address,
+        present: Option<AccountInfo>,
+        status: AccountStatus,
+    ) -> BundleState {
+        let mut bundle = BundleState::default();
+        bundle.state.insert(address, BundleAccount::new(None, present, RevmMap::default(), status));
+        bundle
+    }
+
+    /// An overlay in which `address` has written `slot` to `value`.
+    fn bundle_with_slot(address: Address, slot: B256, value: u64) -> BundleState {
+        BundleBuilder::new(0..=0)
+            .state_address(address)
+            .state_present_account_info(address, AccountInfo::default())
+            .state_storage(
+                address,
+                RevmMap::from_iter([(
+                    U256::from_be_bytes(slot.0),
+                    (U256::ZERO, U256::from(value)),
+                )]),
+            )
+            .build()
+    }
+
+    /// A slot the block being built has written reads back from the overlay.
+    #[test]
+    fn written_storage_slot_is_served_from_the_overlay() {
+        let address = Address::with_last_byte(0x11);
+        let slot = B256::with_last_byte(0x07);
+        let bundle = bundle_with_slot(address, slot, 42);
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle).get_storage_at(address, slot),
+            Some(B256::from(U256::from(42))),
+        );
+    }
+
+    /// A slot the block being built never touched must fall back to canonical.
+    /// Answering `0` here would invent a value the chain never held.
+    #[test]
+    fn untouched_storage_slot_falls_back_to_canonical() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_slot(address, B256::with_last_byte(0x07), 1);
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle).get_storage_at(address, B256::with_last_byte(0x08)),
+            None,
+        );
+    }
+
+    /// A destroyed account's whole storage is known to be empty, so an
+    /// unwritten slot reads `0` rather than falling back — canonical still
+    /// holds the pre-destruction value.
+    #[test]
+    fn destroyed_account_reads_zero_instead_of_the_canonical_slot() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_account(address, None, AccountStatus::Destroyed);
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle).get_storage_at(address, B256::with_last_byte(0x07)),
+            Some(B256::ZERO),
+        );
+    }
+
+    /// An address the overlay says nothing about falls back to canonical.
+    #[test]
+    fn storage_of_an_untouched_account_falls_back_to_canonical() {
+        let bundle = bundle_with_account(
+            Address::with_last_byte(0x11),
+            Some(AccountInfo::default()),
+            AccountStatus::Changed,
+        );
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle)
+                .get_storage_at(Address::with_last_byte(0x22), B256::with_last_byte(0x07)),
+            None,
+        );
+    }
+
+    // ─── pending code reads ─────────────────────────────────────────────
+
+    fn test_bytecode() -> Bytecode {
+        Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xf3]))
+    }
+
+    /// Code deployed by the block being built reads back from the overlay.
+    #[test]
+    fn code_written_by_the_overlay_is_served() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_account(
+            address,
+            Some(AccountInfo::from_bytecode(test_bytecode())),
+            AccountStatus::InMemoryChange,
+        );
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle).get_code(address),
+            Some(test_bytecode().original_bytes()),
+        );
+    }
+
+    /// An account the block being built destroyed has no code — answering
+    /// `None` would fall back to canonical and resurrect the dead contract.
+    #[test]
+    fn destroyed_account_has_no_code() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_account(address, None, AccountStatus::Destroyed);
+
+        assert_eq!(pending_blocks_with_bundle(bundle).get_code(address), Some(Bytes::new()));
+    }
+
+    /// An account the overlay touched but which holds no code is an EOA, and
+    /// answers empty rather than falling back.
+    #[test]
+    fn account_without_code_is_served_as_empty() {
+        let address = Address::with_last_byte(0x11);
+        let bundle =
+            bundle_with_account(address, Some(AccountInfo::default()), AccountStatus::Changed);
+
+        assert_eq!(pending_blocks_with_bundle(bundle).get_code(address), Some(Bytes::new()));
+    }
+
+    /// The path every wallet takes: accounts loaded from the database arrive
+    /// with `code: None` and the empty code hash, and must be answered from the
+    /// overlay rather than sent back to the state provider.
+    ///
+    /// Distinct from the test above, which carries `AccountInfo::default()` —
+    /// that is `code: Some(Bytecode::default())`, so it exits one branch
+    /// earlier and pins the padding behaviour instead.
+    #[test]
+    fn account_carrying_only_the_empty_code_hash_is_served_as_empty() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_account(
+            address,
+            Some(AccountInfo { code: None, ..AccountInfo::default() }),
+            AccountStatus::Changed,
+        );
+
+        assert!(
+            AccountInfo { code: None, ..AccountInfo::default() }.is_empty_code_hash(),
+            "the fixture must carry the empty code hash for this to be the branch under test",
+        );
+        assert_eq!(pending_blocks_with_bundle(bundle).get_code(address), Some(Bytes::new()));
+    }
+
+    /// `AccountInfo::code` is lazily populated, so an account may carry only a
+    /// hash. The bundle's contract map resolves it.
+    #[test]
+    fn code_held_only_by_hash_is_resolved_from_the_contract_map() {
+        let address = Address::with_last_byte(0x11);
+        let bytecode = test_bytecode();
+        let code_hash = bytecode.hash_slow();
+
+        let mut bundle = bundle_with_account(
+            address,
+            Some(AccountInfo { code_hash, code: None, ..AccountInfo::default() }),
+            AccountStatus::Changed,
+        );
+        bundle.contracts.insert(code_hash, bytecode.clone());
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle).get_code(address),
+            Some(bytecode.original_bytes()),
+        );
+    }
+
+    /// A hash the overlay cannot resolve means the code predates the block
+    /// being built, so canonical state is the one that holds it.
+    #[test]
+    fn unresolvable_code_hash_falls_back_to_canonical() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_account(
+            address,
+            Some(AccountInfo {
+                code_hash: test_bytecode().hash_slow(),
+                code: None,
+                ..AccountInfo::default()
+            }),
+            AccountStatus::Changed,
+        );
+
+        assert_eq!(pending_blocks_with_bundle(bundle).get_code(address), None);
+    }
+
+    /// An address the overlay says nothing about falls back to canonical.
+    #[test]
+    fn code_of_an_untouched_account_falls_back_to_canonical() {
+        let bundle = bundle_with_account(
+            Address::with_last_byte(0x11),
+            Some(AccountInfo::default()),
+            AccountStatus::Changed,
+        );
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle).get_code(Address::with_last_byte(0x22)),
+            None,
+        );
     }
 }
