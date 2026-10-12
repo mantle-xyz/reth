@@ -32,7 +32,8 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks,
-    PendingBlocksBuilder, PendingStateBuilder, ProviderError, Result, StateProcessorError,
+    PendingBlocksBuilder, PendingStateBuilder, ProtocolError, ProviderError, Result,
+    StateProcessorError,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
@@ -469,8 +470,10 @@ where
         let latest_block_l1_block_info = prev_pending_blocks.latest_block_l1_block_info().clone();
         let latest_flashblock_tx_start = prev_pending_blocks.pending_transaction_count();
 
-        let mut live_state = self.lock_live_state();
-        let Some(LivePendingState { mut db, state_overrides }) = live_state.take() else {
+        // Taken through a temporary guard: the rebuild in the fallback below writes the
+        // live state back, so holding the guard across it deadlocks this thread.
+        let live_state = self.lock_live_state().take();
+        let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
                 message = "live pending state unavailable, falling back to full rebuild",
                 block_number = flashblock.metadata.block_number,
@@ -481,7 +484,6 @@ where
             flashblocks.push(flashblock.clone());
             return self.build_pending_state(Some(Arc::clone(prev_pending_blocks)), &flashblocks);
         };
-        drop(live_state);
 
         let latest_header = prev_pending_blocks.latest_header();
         let mut latest_block_flashblocks = prev_pending_blocks.latest_block_flashblocks();
@@ -594,8 +596,10 @@ where
             return Err(StateProcessorError::MissingFirstFlashblock);
         };
 
-        let mut live_state = self.lock_live_state();
-        let Some(LivePendingState { mut db, state_overrides }) = live_state.take() else {
+        // Taken through a temporary guard: the rebuild in the fallback below writes the
+        // live state back, so holding the guard across it deadlocks this thread.
+        let live_state = self.lock_live_state().take();
+        let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
                 message = "live pending state unavailable, falling back to full rebuild",
                 block_number = flashblock.metadata.block_number,
@@ -606,7 +610,6 @@ where
             flashblocks.push(flashblock.clone());
             return self.build_pending_state(Some(Arc::clone(prev_pending_blocks)), &flashblocks);
         };
-        drop(live_state);
 
         let previous_header = prev_pending_blocks.latest_header();
         let current_block = BlockAssembler::assemble(std::slice::from_ref(flashblock))?;
@@ -706,7 +709,8 @@ where
         let Some(&earliest_block_number) = flashblocks_per_block.keys().min() else {
             return Ok(None);
         };
-        let canonical_block = earliest_block_number - 1;
+        let canonical_block =
+            earliest_block_number.checked_sub(1).ok_or(ProtocolError::GenesisFlashblock)?;
         let mut last_block_header = self
             .client
             .header_by_number(canonical_block)

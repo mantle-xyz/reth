@@ -179,6 +179,58 @@ async fn get_logs_appends_the_overlay_when_the_range_ends_at_pending() {
     );
 }
 
+/// A code-less account touched by the overlay must not gain code in the overrides.
+///
+/// REVM pads bytecode for jump-destination analysis, so the execution-time form of
+/// empty code is a trailing `STOP`. Serialising that into the pending override makes
+/// `EXTCODESIZE` report 1 for a plain wallet, which flips every `isContract()` guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_touched_account_without_code_stays_without_code_in_the_overrides() {
+    let (harness, _node) = launch_flashblocks_node!(3, 3);
+
+    overlay_with_user_call!(harness);
+
+    let overrides = harness
+        .pending()
+        .expect("overlay")
+        .get_state_overrides()
+        .expect("the overlay publishes state overrides");
+    let sender = overrides.get(&test_sender()).expect("the sender was touched by the call");
+
+    assert!(
+        sender.code.as_ref().is_none_or(|code| code.is_empty()),
+        "a wallet must not gain code, got {:?}",
+        sender.code,
+    );
+}
+
+/// `eth_getLogs` at `pending` falls through to the standard implementation with no overlay.
+///
+/// Without an overlay the override must not answer from an empty snapshot: op-reth
+/// resolves `pending` to latest, so the canonical block's logs are the right answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_at_pending_without_an_overlay_passes_through() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw = signed_call(0, LOGGER, VALUE).await;
+    node.rpc.inject_tx(raw).await.expect("the pool takes the call");
+    mine_canonical_block!(node);
+
+    assert!(harness.pending().is_none(), "no slice was sent, so there is no overlay");
+
+    let filter = Filter::new()
+        .address(LOGGER)
+        .from_block(BlockNumberOrTag::Pending)
+        .to_block(BlockNumberOrTag::Pending);
+    let logs = api.get_logs(filter).await.expect("query");
+
+    assert_eq!(logs.len(), 1, "the standard implementation resolves `pending` to latest");
+    assert_eq!(logs[0].address(), LOGGER);
+}
+
 /// `eth_call` at `pending` executes against the overlay's state overrides.
 #[tokio::test(flavor = "multi_thread")]
 async fn call_at_pending_executes_against_the_overlay_state() {

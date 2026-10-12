@@ -456,6 +456,11 @@ where
         let mut all_logs = Vec::new();
 
         let pending_blocks = self.flashblocks_state.get_pending_blocks();
+        if pending_blocks.is_none() {
+            // Nothing to append, and the range handling below would skip the canonical
+            // query that the standard implementation resolves `pending` to on its own.
+            return self.eth_filter.logs(filter).await;
+        }
 
         let mut fetched_logs = HashSet::new();
         if !matches!(from_block, Some(BlockNumberOrTag::Pending)) {

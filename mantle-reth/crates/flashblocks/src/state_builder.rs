@@ -301,7 +301,11 @@ where
                     let existing_override = self.state_overrides.entry(*addr).or_default();
                     existing_override.balance = Some(acc.info.balance);
                     existing_override.nonce = Some(acc.info.nonce);
-                    existing_override.code = acc.info.code.clone().map(|code| code.bytes());
+                    // `bytes()` is REVM's execution-padded form, where empty code becomes a
+                    // trailing `STOP`. Overrides must carry the unpadded original so
+                    // `EXTCODESIZE` stays 0 for accounts that hold no code.
+                    existing_override.code =
+                        acc.info.code.clone().map(|code| code.original_bytes());
 
                     let existing =
                         existing_override.state_diff.get_or_insert_with(Default::default);
