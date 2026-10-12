@@ -1,4 +1,4 @@
-use crate::{InvalidCrossTx, OpPooledTx, supervisor::SupervisorClient};
+use crate::{InvalidCrossTx, OpPooledTx, interop_filter::InteropFilterClient};
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_primitives::U256;
 use op_revm::{L1BlockInfo, OpSpecId};
@@ -21,7 +21,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-/// The timeout for cross-chain transaction validation against the supervisor/interop-filter.
+/// The timeout for cross-chain transaction validation against the interop filter.
 pub(crate) const CHECK_ACCESS_LIST_TIMEOUT_SECS: u64 = 7200;
 
 /// Gas reserved on every L2 block for the always-present L1-info deposit transaction.
@@ -101,8 +101,8 @@ pub struct OpTransactionValidator<Client, Tx, Evm> {
     /// derived from the tracked L1 block info that is extracted from the first transaction in the
     /// L2 block.
     require_l1_data_gas_fee: bool,
-    /// Client used to check transaction validity with op-supervisor
-    supervisor_client: Option<SupervisorClient>,
+    /// Client used to check transaction validity with the interop filter.
+    interop_client: Option<InteropFilterClient>,
     /// tracks activated forks relevant for transaction validation
     fork_tracker: Arc<OpForkTracker>,
 }
@@ -146,6 +146,11 @@ where
     Tx: EthPoolTransaction + OpPooledTx,
     Evm: ConfigureEvm,
 {
+    /// Returns the most recent block gas limit seen by the validator.
+    pub fn block_gas_limit(&self) -> u64 {
+        self.inner.block_gas_limit()
+    }
+
     /// Create a new [`OpTransactionValidator`].
     pub fn new(inner: EthTransactionValidator<Client, Tx, Evm>) -> Self {
         let this = Self::with_block_info(inner, OpL1BlockInfo::default());
@@ -173,14 +178,14 @@ where
             inner: Arc::new(inner),
             block_info: Arc::new(block_info),
             require_l1_data_gas_fee: true,
-            supervisor_client: None,
+            interop_client: None,
             fork_tracker: Arc::new(OpForkTracker { interop: AtomicBool::from(false) }),
         }
     }
 
-    /// Set the supervisor client and safety level
-    pub fn with_supervisor(mut self, supervisor_client: SupervisorClient) -> Self {
-        self.supervisor_client = Some(supervisor_client);
+    /// Sets the interop filter client and safety level.
+    pub fn with_interop(mut self, interop_client: InteropFilterClient) -> Self {
+        self.interop_client = Some(interop_client);
         self
     }
 
@@ -252,6 +257,27 @@ where
             );
         }
 
+        // Reserve gas for the L1-info deposit that is present in every OP block, mirroring
+        // op-geth's `EffectiveGasLimit` (`core/txpool/validation.go`). The L1-info deposit is
+        // injected as the first transaction of every block and always consumes some gas, so a
+        // non-deposit transaction can never use the full block gas limit. The inner validator
+        // caps at the full block gas limit, which would admit a transaction in
+        // `(block_gas_limit - L1_INFO_GAS_OVERHEAD, block_gas_limit]` that can never be included
+        // (it would sit in the pool until it expires). Reject it up front, as op-geth does.
+        //
+        // This is done before the interop `is_valid_cross_tx` check below: the gas check is cheap,
+        // stateless and deterministic, whereas cross-tx validation is `async` and potentially
+        // network-bound (access-list filtering, up to `CHECK_ACCESS_LIST_TIMEOUT_SECS`). Rejecting
+        // an over-gas-limit transaction here avoids that work and is better admission-DoS hygiene.
+        let gas_limit = transaction.gas_limit();
+        let effective_limit = effective_gas_limit(self.inner.block_gas_limit());
+        if gas_limit > effective_limit {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, effective_limit),
+            );
+        }
+
         // Interop cross tx validation
         match self.is_valid_cross_tx(&transaction).await {
             Some(Err(err)) => {
@@ -269,22 +295,6 @@ where
                     .set_interop_deadline(self.block_timestamp() + CHECK_ACCESS_LIST_TIMEOUT_SECS);
             }
             _ => {}
-        }
-
-        // [MANTLE] Reserve gas for the L1-info deposit present in every L2 block, matching
-        // op-geth `EffectiveGasLimit` (`core/txpool/validation.go`). Upstream reth caps at the
-        // full block gas limit, so without this a tx with gas_limit in
-        // `(block_gas_limit - overhead, block_gas_limit]` would be admitted but could never be
-        // included (the L1-info deposit always consumes part of the block), leaving it stuck.
-        if self.chain_spec().is_mantle() {
-            let gas_limit = transaction.gas_limit();
-            let effective_limit = effective_gas_limit(self.inner.block_gas_limit());
-            if gas_limit > effective_limit {
-                return TransactionValidationOutcome::Invalid(
-                    transaction,
-                    InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, effective_limit),
-                );
-            }
         }
 
         let outcome = self.inner.validate_one_with_state(origin, transaction, state);
@@ -375,7 +385,7 @@ where
     pub async fn is_valid_cross_tx(&self, tx: &Tx) -> Option<Result<(), InvalidCrossTx>> {
         // We don't need to check for deposit transaction in here, because they won't come from
         // txpool
-        self.supervisor_client
+        self.interop_client
             .as_ref()?
             .is_valid_cross_tx(
                 tx.access_list(),
@@ -423,7 +433,7 @@ pub(crate) struct OpForkTracker {
 }
 
 impl OpForkTracker {
-    /// Returns `true` if Interop fork is activated.
+    /// Returns `true` if Lagoon fork is activated.
     pub(crate) fn is_interop_activated(&self) -> bool {
         self.interop.load(Ordering::Relaxed)
     }
@@ -488,7 +498,7 @@ mod tests {
 
     #[test]
     fn operator_fee_zero_and_no_panic_when_params_unset() {
-        // Pre-Isthmus L1 info has no operator fee params; operator_fee_charge would panic on the
+        // Pre-Isthmus L1 info has no operator fee params; `operator_fee_charge` would panic on the
         // missing scalar/constant, so the guard must return zero without calling it.
         let l1 = L1BlockInfo::default();
         assert!(l1.operator_fee_scalar.is_none() && l1.operator_fee_constant.is_none());

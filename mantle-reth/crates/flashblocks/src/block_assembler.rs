@@ -1,16 +1,12 @@
 //! Block assembly from flashblocks.
 
 use alloy_consensus::{Header, Sealed, proofs};
-use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::{B256, Bytes, bytes::BufMut};
-use alloy_rpc_types_engine::{
-    CancunPayloadFields, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
-    PraguePayloadFields,
-};
+use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
 use alloy_rpc_types_eth::Withdrawal;
 use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 use op_alloy_rpc_types_engine::{
-    OpExecutionPayload, OpExecutionPayloadSidecar, OpExecutionPayloadV4, OpFlashblockPayloadBase,
+    OpExecutionPayloadEnvelope, OpExecutionPayloadV4, OpFlashblockPayloadBase,
 };
 use op_revm::L1BlockInfo;
 use reth_optimism_primitives::OpBlock;
@@ -98,17 +94,12 @@ impl BlockAssembler {
             withdrawals_root: latest_flashblock.diff.withdrawals_root,
         };
 
-        let sidecar = OpExecutionPayloadSidecar::v4(
-            CancunPayloadFields {
-                parent_beacon_block_root: base.parent_beacon_block_root,
-                versioned_hashes: vec![],
-            },
-            PraguePayloadFields::new(EMPTY_REQUESTS_HASH),
-        );
-
-        let block: OpBlock = OpExecutionPayload::V4(execution_payload)
-            .try_into_block_with_sidecar(&sidecar)
-            .map_err(|e| ExecutionError::BlockConversion(e.to_string()))?;
+        let block: OpBlock = OpExecutionPayloadEnvelope::V4 {
+            payload: execution_payload,
+            parent_beacon_block_root: base.parent_beacon_block_root,
+        }
+        .try_into_block()
+        .map_err(|e| ExecutionError::BlockConversion(e.to_string()))?;
 
         // The final hash is not known until the block is sealed by the sequencer.
         let sealed_header = block.header.clone().seal(B256::ZERO);
@@ -189,6 +180,7 @@ mod tests {
                 withdrawals: vec![],
                 withdrawals_root: B256::ZERO,
                 blob_gas_used: None,
+                post_exec_tx: None,
             },
             metadata: MantleFlashblockMetadata {
                 block_number: 100,

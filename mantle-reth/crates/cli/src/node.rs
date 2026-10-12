@@ -421,11 +421,14 @@ impl MantleNode {
         // `(cfg, fifo)` — no whitelist, no broadcast events. The fork's
         // select! loop then sits idle waiting for cancel, and the
         // block seals at CL `getPayload` time.
-        let builder_config = OpBuilderConfig::new_with_sdm(
+        let mut builder_config = OpBuilderConfig::new(
             self.op_node.da_config.clone(),
             self.op_node.gas_limit_config.clone(),
-            args.sdm_enabled,
         );
+        // [MANTLE] Clone the node's handle rather than seeding a new one, so the builder and
+        // the executor observe the same `admin_setOperatorSdmOptIn` toggle.
+        builder_config.operator_sdm_opt_in = self.op_node.operator_sdm_opt_in.clone();
+
         // Slice publishing rides on the preconf handle: `--flashblocks.enable`
         // requires `--preconf.enable`, so there is no path where flashblocks
         // are configured without a preconf service to carry them.
@@ -460,7 +463,7 @@ impl MantleNode {
 
         ComponentsBuilder::default()
             .node_types::<N>()
-            .executor(OpExecutorBuilder::default().with_sdm_enabled(args.sdm_enabled))
+            .executor(OpExecutorBuilder::default())
             .pool(pool_builder)
             .payload(payload_service)
             .network(OpNetworkBuilder::new(args.disable_txpool_gossip, !args.discovery_v4))
@@ -609,8 +612,9 @@ where
                         use tokio_stream::StreamExt as _;
                         while let Some(Ok(notification)) = canonical_stream.next().await {
                             for block in notification.committed().blocks_iter() {
+                                // v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
                                 state_for_canonical
-                                    .on_canonical_block_received(block.clone());
+                                    .on_canonical_block_received(block.as_ref().clone());
                             }
                         }
                     });

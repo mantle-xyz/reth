@@ -434,6 +434,9 @@ mod tests {
     #[error("dummy db error")]
     struct DummyDbErr;
 
+    // revm 41 requires the DB error type of `EVMError` to carry this marker.
+    impl reth_revm::context::DBErrorMarker for DummyDbErr {}
+
     fn gas(used: u64) -> ResultGas {
         // total_gas_spent = used, no refund, no floor —
         // `tx_gas_used()` returns `used`.

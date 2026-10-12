@@ -14,7 +14,8 @@ use alloy_rpc_types_engine::{
 };
 use op_alloy_consensus::{EIP1559ParamError, encode_holocene_extra_data, encode_jovian_extra_data};
 use op_alloy_rpc_types_engine::{
-    OpExecutionPayloadEnvelopeV3, OpExecutionPayloadEnvelopeV4, OpExecutionPayloadV4,
+    OpExecutionPayloadEnvelope, OpExecutionPayloadEnvelopeV3, OpExecutionPayloadEnvelopeV4,
+    OpExecutionPayloadV4,
 };
 use reth_chainspec::EthChainSpec;
 use reth_optimism_evm::OpNextBlockEnvAttributes;
@@ -22,7 +23,7 @@ use reth_optimism_forks::OpHardforks;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuildNextEnv, BuiltPayload, BuiltPayloadExecutedBlock};
 use reth_primitives_traits::{
-    NodePrimitives, SealedBlock, SealedHeader, SignedTransaction, WithEncoded,
+    Block as _, NodePrimitives, SealedBlock, SealedHeader, SignedTransaction, WithEncoded,
 };
 
 /// Re-export for use in downstream arguments.
@@ -63,7 +64,7 @@ impl reth_payload_primitives::ExecutionPayload for OpExecData {
     }
 
     fn withdrawals(&self) -> Option<&Vec<alloy_eips::eip4895::Withdrawal>> {
-        self.0.withdrawals()
+        self.0.payload.as_v2().map(|payload| &payload.withdrawals)
     }
 
     fn block_access_list(&self) -> Option<&Bytes> {
@@ -464,6 +465,28 @@ impl<N: NodePrimitives> BuiltPayload for OpBuiltPayload<N> {
     }
 }
 
+// Counterpart to `OpPayloadTypes::block_to_payload`. The two are intentionally
+// parallel: this path receives the BAL via the payload's own field once OP
+// gains BAL support, while `block_to_payload` receives it as a separate arg.
+// See the comment on `OpPayloadTypes::block_to_payload` in `lib.rs`.
+impl<T, N> From<OpBuiltPayload<N>> for OpExecData
+where
+    T: SignedTransaction,
+    N: NodePrimitives<Block = Block<T>>,
+{
+    fn from(value: OpBuiltPayload<N>) -> Self {
+        let block = Arc::unwrap_or_clone(value.block);
+        let hash = block.hash();
+        Self(OpExecutionData::from(
+            OpExecutionPayloadEnvelope::from_block_unchecked(
+                hash,
+                &block.into_block().into_ethereum_block(),
+            )
+            .expect("built OP blocks must normalize"),
+        ))
+    }
+}
+
 // V1 engine_getPayloadV1 response
 impl<T, N> From<OpBuiltPayload<N>> for ExecutionPayloadV1
 where
@@ -697,6 +720,7 @@ mod tests {
                 withdrawals: Some([].into()),
                 parent_beacon_block_root: b256!("0x8fe0193b9bf83cb7e5a08538e494fecc23046aab9a497af3704f4afdae3250ff").into(),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some([bytes!("7ef8f8a0dc19cfa777d90980e4875d0a548a881baaa3f83f14d1bc0d3038bc329350e54194deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000f424000000000000000000000000300000000670d6d890000000000000125000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000014bf9181db6e381d4384bbf69c48b0ee0eed23c6ca26143c6d2544f9d39997a590000000000000000000000007f83d659683caf2767fd3c720981d51f5bc365bc")].into()),
             no_tx_pool: None,
@@ -729,6 +753,7 @@ mod tests {
                 withdrawals: Some([].into()),
                 parent_beacon_block_root: b256!("0x8fe0193b9bf83cb7e5a08538e494fecc23046aab9a497af3704f4afdae3250ff").into(),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some([bytes!("7ef8f8a0dc19cfa777d90980e4875d0a548a881baaa3f83f14d1bc0d3038bc329350e54194deaddeaddeaddeaddeaddeaddeaddeaddead00019442000000000000000000000000000000000000158080830f424080b8a4440a5e20000f424000000000000000000000000300000000670d6d890000000000000125000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000014bf9181db6e381d4384bbf69c48b0ee0eed23c6ca26143c6d2544f9d39997a590000000000000000000000007f83d659683caf2767fd3c720981d51f5bc365bc")].into()),
             no_tx_pool: None,
@@ -881,6 +906,7 @@ mod tests {
                 withdrawals: Some(vec![]),
                 parent_beacon_block_root: Some(B256::ZERO),
                 slot_number: None,
+                target_gas_limit: None,
             },
             transactions: Some(vec![encoded.into()]),
             no_tx_pool: None,
@@ -899,10 +925,9 @@ mod tests {
         assert_eq!(decoded_eth_tx_value(&built.transactions[0].1), Some(eth_tx_value));
     }
 
-    /// Verifier side: `engine_newPayload` turns the payload into a block through
-    /// `try_into_block_with_sidecar`, which is the first thing
-    /// [`crate::validator::ensure_well_formed_payload`] calls. A decode error there surfaces as
-    /// `Invalid`, and since op-node re-derives the same L1 block forever, the node never recovers.
+    /// Verifier side: `engine_newPayload` converts the data into an envelope and decodes its
+    /// transactions before accepting the block. A decode error there surfaces as `Invalid`, and
+    /// since op-node re-derives the same L1 block forever, the node never recovers.
     #[test]
     fn engine_payload_decodes_deposit_with_eth_tx_value_above_u128() {
         let eth_tx_value = U256::from(1u8) << 128;
@@ -915,11 +940,12 @@ mod tests {
             },
         };
 
-        let OpExecutionData { payload, sidecar } =
+        let payload =
             OpExecutionData::v3(ExecutionPayloadV3::from_block_slow(&block), vec![], B256::ZERO);
 
-        let decoded: Block<OpTransactionSigned> = payload
-            .try_into_block_with_sidecar(&sidecar)
+        let decoded: Block<OpTransactionSigned> = OpExecutionPayloadEnvelope::try_from(payload)
+            .expect("newPayload should have a valid sidecar")
+            .try_into_block()
             .expect("newPayload must decode a deposit with ethTxValue > u128::MAX");
 
         assert_eq!(decoded_eth_tx_value(&decoded.body.transactions[0]), Some(eth_tx_value));

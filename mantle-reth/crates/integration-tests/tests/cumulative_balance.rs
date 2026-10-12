@@ -79,6 +79,7 @@ fn attrs_with_operator_fee(timestamp: u64) -> OpPayloadAttrs {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
+            target_gas_limit: None,
             slot_number: None,
         },
         transactions: Some(vec![l1_attributes_deposit_bytes()]),

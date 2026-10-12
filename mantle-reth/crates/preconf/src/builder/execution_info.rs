@@ -476,10 +476,10 @@ mod slice_state_invariants {
             State::builder().with_database(EmptyDB::default()).with_bundle_update().build();
         state.load_cache_account(address).expect("an empty database yields an empty account");
 
-        let mut account = Account {
-            info: AccountInfo { balance: U256::from(100), nonce: 1, ..Default::default() },
-            ..Default::default()
-        };
+        // revm 41 made `Account::original_info` private, so the struct can no
+        // longer be built field-by-field here.
+        let mut account = Account::default();
+        account.info = AccountInfo { balance: U256::from(100), nonce: 1, ..Default::default() };
         account.status = AccountStatus::Touched;
         state.commit([(address, account)].into_iter().collect());
 

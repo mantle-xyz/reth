@@ -24,6 +24,7 @@ use alloy_evm::{
     block::{BlockExecutor as _, TxResult},
 };
 use alloy_primitives::{Address, B256, Sealed, TxHash, U256};
+use alloy_rlp::Encodable;
 use mantle_reth_flashblocks_types::FlashblockId;
 use op_alloy_consensus::{OpTxEnvelope, SDMGasEntry, TxPostExec, build_post_exec_tx};
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
@@ -38,7 +39,10 @@ use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpBuiltPayload;
 use reth_optimism_payload_builder::{
-    OpAttributes, OpPayloadPrimitives, builder::OpPayloadBuilderCtx, config::OpBuilderConfig,
+    OpAttributes, OpPayloadPrimitives,
+    block_size::{BLOCK_SIZE_PACKING_TARGET, RawSizeAdmission},
+    builder::OpPayloadBuilderCtx,
+    config::OpBuilderConfig,
     error::OpPayloadBuilderError,
 };
 use reth_optimism_primitives::OpTransaction;
@@ -186,7 +190,14 @@ where
             }
         }
 
-        info.cumulative_gas_used += gas_used.tx_gas_used();
+        // Sequencer txs (deposits/system txs) are never SDM-refunded, so the
+        // pre-refund (EVM) total equals the canonical total. Both counters have
+        // to move: the pool arm's pre-refund check starts from this total.
+        let tx_gas_used = gas_used.tx_gas_used();
+        info.accumulate_gas(tx_gas_used, tx_gas_used);
+        // Count the sequencer tx towards the block's uncompressed size, or the
+        // pool arm's EIP-7934 size check starts from zero and under-counts.
+        info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
         // Deposits dominate here, and the account view only counts those. On a
         // derivation build (`no_tx_pool=true`) the batched user transactions
         // arrive this way too, and those it reads outright — which is why this
@@ -418,6 +429,9 @@ struct BuildConstraints {
     predicted_height: u64,
     /// Payload attributes timestamp (interop-deadline validation).
     timestamp: u64,
+    /// Max cumulative uncompressed (EIP-2718) block size; `None` disables the cap.
+    /// Keeps a built payload inside the size CL clients assume.
+    max_uncompressed_block_size: Option<u64>,
 }
 
 /// What computing a preconf transaction's L1 fee fields needs beyond what the
@@ -470,7 +484,7 @@ fn estimated_tx_da_size(tx: &TxEnvelope) -> u64 {
 /// the execution result (did it succeed once admitted?).
 #[derive(Debug)]
 enum Admission {
-    /// The tx fits the current in-flight block's remaining DA + gas → dispatch.
+    /// The tx fits the current in-flight block's remaining RLP, DA and gas → dispatch.
     Admit,
     /// The tx fits an *empty* block but not the current one (transient
     /// capacity). Only returned for [`PreconfSource::Replay`]: the entry is
@@ -565,6 +579,29 @@ fn preconf_admission(
     }
 
     Admission::Admit
+}
+
+/// Compose the existing DA/gas verdict with the shared RLP budget before dispatch.
+fn combined_preconf_admission(
+    da_gas_admission: Admission,
+    raw_size_admission: RawSizeAdmission,
+    tx_rlp_length: usize,
+    source: PreconfSource,
+) -> Admission {
+    // An existing DA/gas rejection must survive a transient RLP capacity shortage.
+    if matches!(&da_gas_admission, Admission::Reject(_)) {
+        return da_gas_admission;
+    }
+    match raw_size_admission {
+        RawSizeAdmission::Fits => da_gas_admission,
+        RawSizeAdmission::BlockFull if source == PreconfSource::Replay => Admission::Defer,
+        RawSizeAdmission::BlockFull => Admission::Reject(PreconfError::BuilderRejected(format!(
+            "block RLP size headroom exhausted: need {tx_rlp_length} bytes, packing limit {BLOCK_SIZE_PACKING_TARGET}"
+        ))),
+        RawSizeAdmission::TooLarge => Admission::Reject(PreconfError::BuilderRejected(format!(
+            "transaction RLP size {tx_rlp_length} exceeds block packing limit {BLOCK_SIZE_PACKING_TARGET}"
+        ))),
+    }
 }
 
 /// Apply a preconf tx and fold its gas, DA footprint, **and priority fee** into
@@ -713,6 +750,7 @@ where
     let to = crate::rpc::tx_kind_to_address(entry.tx.kind());
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
+    let tx_rlp_length = entry.tx.as_ref().length();
     drop(entry);
 
     if !needs_admission(loop_state, &hash, status) {
@@ -780,7 +818,13 @@ where
     // borrow of `*info` ends before the `&mut info` closure below.
     let da_used = info.cumulative_da_bytes_used;
     let gas_used = info.cumulative_gas_used;
-    match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source) {
+    let admission = combined_preconf_admission(
+        preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source),
+        info.block_size.admission(tx_rlp_length, true),
+        tx_rlp_length,
+        source,
+    );
+    match admission {
         Admission::Admit => {
             let mut apply_fn = |tx, h, height| {
                 apply_preconf_with_da::<N, _, _>(builder, info, fifo, limits, l1_ctx, tx, h, height)
@@ -1004,6 +1048,8 @@ where
         constraints.block_da_limit,
         tx.gas_limit(),
         constraints.da_footprint_gas_scalar,
+        tx.encode_2718_len() as u64,
+        constraints.max_uncompressed_block_size,
     ) {
         // The block's own ceilings, not a slice's — this one says the block is
         // full, where the allowance rejection below says only that this slice is.
@@ -1194,6 +1240,8 @@ where
             &BundleState::default(),
             state_provider,
             B256::ZERO,
+            // EIP-7928 block access list hash; the slice header does not carry one.
+            None,
         ))
         .map_err(PayloadBuilderError::other)?;
 
@@ -1758,6 +1806,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             base_fee,
             predicted_height,
             timestamp: attrs_timestamp,
+            max_uncompressed_block_size: self.builder_config.max_uncompressed_block_size,
         };
 
         let mut best_txs_iter = best_txs_iter_opt;
@@ -2207,8 +2256,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         }
 
         // ── Stage 5: finalize ─────────────────────────────────────────
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(state_provider_for_finish, None)?;
+        let BlockBuilderOutcome {
+            execution_result,
+            hashed_state,
+            trie_updates,
+            block,
+            // EIP-7928 block access list; the preconf builder does not produce one.
+            block_access_list: _,
+        } = builder.finish(state_provider_for_finish, None)?;
+
+        info.block_size
+            .validate_final_rlp_length(block.rlp_length())
+            .map_err(PayloadBuilderError::other)?;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         // The hash the next build compares its parent against. If it matches,
@@ -2230,10 +2289,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let executed: BuiltPayloadExecutedBlock<N> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
-            // Match upstream: keep unsorted; conversion to sorted happens
-            // when needed downstream.
-            hashed_state: either::Either::Left(Arc::new(hashed_state)),
-            trie_updates: either::Either::Left(Arc::new(trie_updates)),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
+            changed_paths: None,
         };
 
         Ok(OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed)))
@@ -2555,6 +2613,8 @@ mod tests {
             predicted_height: 1,
             base_fee: 0,
             timestamp: 0,
+            // These tests exercise the DA limits, not the block-size cap.
+            max_uncompressed_block_size: None,
         }
     }
 
@@ -2641,6 +2701,124 @@ mod tests {
         assert!(matches!(
             preconf_admission(100, 21_000, 900, 0, limits, PreconfSource::Replay),
             Admission::Admit
+        ));
+    }
+
+    #[test]
+    fn combined_permanent_da_reject_precedes_raw_full() {
+        for limits in [
+            da_limits(Some(10_000), Some(1_000), None),
+            da_limits(Some(1_000), None, None),
+            da_limits(None, None, Some(u16::MAX)),
+        ] {
+            let admission = preconf_admission(1_001, 21_000, 0, 0, limits, PreconfSource::Replay);
+            assert!(matches!(admission, Admission::Reject(PreconfError::DaLimitExceeded { .. })));
+            assert!(
+                matches!(
+                    combined_preconf_admission(
+                        admission,
+                        RawSizeAdmission::BlockFull,
+                        100,
+                        PreconfSource::Replay
+                    ),
+                    Admission::Reject(PreconfError::DaLimitExceeded { .. })
+                ),
+                "permanent DA rejection must not become a transient raw-size defer"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_permanent_gas_reject_precedes_raw_full() {
+        let admission = preconf_admission(
+            100,
+            BLOCK_GAS + 1,
+            0,
+            0,
+            da_limits(None, None, None),
+            PreconfSource::Replay,
+        );
+        assert!(matches!(admission, Admission::Reject(_)));
+        assert!(
+            matches!(
+                combined_preconf_admission(
+                    admission,
+                    RawSizeAdmission::BlockFull,
+                    100,
+                    PreconfSource::Replay
+                ),
+                Admission::Reject(_)
+            ),
+            "permanent gas rejection must not become a transient raw-size defer"
+        );
+    }
+
+    #[test]
+    fn combined_raw_too_large_rejects_transient_da_deferral() {
+        let admission = preconf_admission(
+            200,
+            21_000,
+            900,
+            0,
+            da_limits(Some(1_000), Some(1_000), None),
+            PreconfSource::Replay,
+        );
+        assert!(matches!(admission, Admission::Defer));
+        assert!(
+            matches!(
+                combined_preconf_admission(
+                    admission,
+                    RawSizeAdmission::TooLarge,
+                    BLOCK_SIZE_PACKING_TARGET,
+                    PreconfSource::Replay
+                ),
+                Admission::Reject(_)
+            ),
+            "permanent raw-size rejection must not become a transient DA defer"
+        );
+    }
+
+    #[test]
+    fn combined_raw_too_large_rejects_transient_gas_deferral() {
+        let admission = preconf_admission(
+            100,
+            2_000_000,
+            0,
+            BLOCK_GAS - 1_000_000,
+            da_limits(None, None, None),
+            PreconfSource::Replay,
+        );
+        assert!(matches!(admission, Admission::Defer));
+        assert!(matches!(
+            combined_preconf_admission(
+                admission,
+                RawSizeAdmission::TooLarge,
+                BLOCK_SIZE_PACKING_TARGET,
+                PreconfSource::Replay
+            ),
+            Admission::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn combined_raw_full_preserves_source_policy() {
+        assert!(matches!(
+            combined_preconf_admission(
+                Admission::Admit,
+                RawSizeAdmission::BlockFull,
+                100,
+                PreconfSource::Replay
+            ),
+            Admission::Defer
+        ));
+        assert!(matches!(
+            combined_preconf_admission(
+                Admission::Admit,
+                RawSizeAdmission::BlockFull,
+                100,
+                PreconfSource::Rpc
+            ),
+            Admission::Reject(_)
         ));
     }
 

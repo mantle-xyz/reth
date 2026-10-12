@@ -15,7 +15,7 @@ use reth_node_api::{EngineApiValidator, EngineTypes};
 use reth_optimism_payload_builder::OpExecData;
 use reth_rpc_api::IntoEngineApiRpcModule;
 use reth_rpc_engine_api::EngineApi;
-use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory};
+use reth_storage_api::{BalProvider, BlockReader, HeaderProvider, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
 use tracing::{debug, trace};
 
@@ -183,9 +183,14 @@ pub trait OpEngineApi<Engine: EngineTypes> {
     /// Returns the most recent version of the payload that is available in the corresponding
     /// payload build process at the time of receiving this call.
     ///
-    /// See also <https://github.com/ethereum/execution-apis/blob/15399c2e2f16a5f800bf3f285640357e2c245ad9/src/engine/osaka.md#engine_getpayloadv5>
+    /// See also <https://github.com/ethereum/execution-apis/blob/main/src/engine/osaka.md#engine_getpayloadv5>
     ///
-    /// Required for Mantle Limb fork (maps to upstream Osaka/Prague payload envelope).
+    /// Note:
+    /// > Provider software MAY stop the corresponding build process after serving this call.
+    ///
+    /// OP modifications:
+    /// - the response type is extended to [`EngineTypes::ExecutionPayloadEnvelopeV5`].
+    /// - required for the Mantle Limb fork (maps to the Osaka/Prague payload envelope).
     #[method(name = "getPayloadV5")]
     async fn get_payload_v5(
         &self,
@@ -260,7 +265,7 @@ where
 impl<Provider, EngineT, Pool, Validator, ChainSpec> OpEngineApiServer<EngineT>
     for OpEngineApi<Provider, EngineT, Pool, Validator, ChainSpec>
 where
-    Provider: HeaderProvider + BlockReader + StateProviderFactory + 'static,
+    Provider: HeaderProvider + BlockReader + StateProviderFactory + BalProvider + 'static,
     EngineT: EngineTypes<ExecutionData = OpExecData>,
     Pool: TransactionPool + 'static,
     Validator: EngineApiValidator<EngineT>,
@@ -402,5 +407,19 @@ where
 {
     fn into_rpc_module(self) -> RpcModule<()> {
         self.into_rpc().remove_context()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OP_ENGINE_CAPABILITIES;
+
+    /// Osaka `engine_getPayloadV5` must be advertised: once Osaka/Karst is active the CL fetches
+    /// payloads via V5, and an unadvertised method is rejected with -38005 "Unsupported fork".
+    /// V4 stays advertised — V5 is additive (`newPayload` remains V4).
+    #[test]
+    fn advertises_get_payload_v5() {
+        assert!(OP_ENGINE_CAPABILITIES.contains(&"engine_getPayloadV5"));
+        assert!(OP_ENGINE_CAPABILITIES.contains(&"engine_getPayloadV4"));
     }
 }

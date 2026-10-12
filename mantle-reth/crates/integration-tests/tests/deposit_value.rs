@@ -96,7 +96,10 @@ async fn build_and_import(
         .inner
         .add_ons_handle
         .beacon_engine_handle
-        .new_payload(<OpEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone()))
+        .new_payload(<OpEngineTypes as PayloadTypes>::block_to_payload(
+            payload.block().clone(),
+            None,
+        ))
         .await
         .expect("verifier newPayload");
     assert!(status.is_valid(), "verifier must accept the payload: {status:?}");

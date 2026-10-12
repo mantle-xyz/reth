@@ -117,6 +117,7 @@ impl FlashblockBuilder {
                 withdrawals: vec![],
                 withdrawals_root: B256::ZERO,
                 blob_gas_used: None,
+                post_exec_tx: None,
             },
             metadata: MantleFlashblockMetadata {
                 block_number: self.block_number,
@@ -410,6 +411,7 @@ pub fn flashblocks_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
+            target_gas_limit: None,
         },
         transactions: Some(vec![l1_info_deposit(block_number_at(timestamp))]),
         no_tx_pool: None,

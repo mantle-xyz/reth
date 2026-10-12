@@ -75,6 +75,11 @@ pub fn build_flashblock<T: SignedTransaction>(
             logs_bloom: header.logs_bloom,
             block_hash: header.block_hash,
             blob_gas_used: header.blob_gas_used,
+            // TODO(sdm): the 1.6.3 line carries the SDM post-exec (0x7D) transaction
+            // out of band with replace-not-append semantics. This producer still
+            // appends it to `transactions` in a closing slice; see the startup gate
+            // in `cli/src/args.rs` that refuses SDM until that is reconciled.
+            post_exec_tx: None,
             // Accumulating totals, so a consumer reads the header field it is
             // reconstructing rather than having to sum slices itself.
             gas_used: header.gas_used,
