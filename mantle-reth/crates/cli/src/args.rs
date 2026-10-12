@@ -225,7 +225,9 @@ pub struct FlashblocksArgs {
     pub block_time_ms: Option<u64>,
 
     /// How far ahead of the slot deadline the budgeted slice grid finishes,
-    /// in milliseconds. Default 50ms.
+    /// in milliseconds. Default 0 — the loop runs until `getPayload`, so
+    /// unlike the reference implementation there is no self-imposed seal to
+    /// reserve time for. A non-zero value only shifts the tick grid earlier.
     #[arg(id = "flashblocks.leeway-time", long = "flashblocks.leeway-time")]
     pub leeway_time_ms: Option<u64>,
 }
