@@ -134,6 +134,36 @@ async fn a_slice_carrying_a_post_exec_transaction_is_rejected_whole() {
     assert_eq!(pending.pending_transaction_count(), 1, "only the deposit");
 }
 
+/// A transaction whose encoding is not canonical is rejected, taking its slice with it.
+///
+/// The overlay roots the wire bytes it was handed but hashes the transaction it
+/// decoded out of them, and nothing here compares the two. They agree only while the
+/// decoder refuses every non-canonical encoding. The sharp case is a deposit body
+/// stripped of its `0x7E` type byte: were it to decode, the overlay would execute a
+/// transaction, mint, and publish a receipt for something derivation will never
+/// accept, so the preconfirmation would simply evaporate.
+///
+/// This pins behaviour we inherit from `op-alloy` rather than implement, which is
+/// exactly why it is worth a test here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_with_a_non_canonical_encoding_is_rejected() {
+    let (harness, _node) = launch!();
+
+    let deposit = l1_info_deposit(1);
+    assert_eq!(deposit[0], 0x7e, "the fixture must be a typed deposit for this to mean anything");
+    let bare_body = alloy_primitives::Bytes::from(deposit[1..].to_vec());
+
+    harness.send(FlashblockBuilder::new(1, 0).transactions(vec![bare_body]).build()).await;
+
+    assert!(harness.pending().is_none(), "an untyped deposit body must not open an overlay");
+
+    // The same slice with the type byte intact is accepted, so the encoding was the
+    // only thing wrong with it.
+    harness.send(base_slice(1)).await;
+    let pending = harness.pending().expect("the canonical encoding is accepted");
+    assert_eq!(pending.pending_transaction_count(), 1);
+}
+
 /// The overlay reports the canonical block it was built on; with no overlay the base
 /// stays `pending` so the standard implementation keeps serving that tag.
 #[tokio::test(flavor = "multi_thread")]
