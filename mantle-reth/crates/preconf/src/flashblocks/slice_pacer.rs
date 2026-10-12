@@ -356,13 +356,28 @@ mod tests {
         assert_eq!(s.first_offset, Duration::from_millis(75));
     }
 
+    /// No longer the default (that is now zero), but the knob still has to
+    /// behave: a leeway below one interval shifts the grid and nothing else.
     #[test]
-    fn the_default_leeway_shifts_the_grid_without_changing_the_tick_count() {
+    fn a_sub_interval_leeway_shifts_the_grid_without_changing_the_tick_count() {
         let s = schedule(SLOT, Duration::from_millis(50));
 
         assert_eq!(s.tick_count, 10);
         assert_eq!(s.gas_per_batch, 3_000_000);
         assert_eq!(s.first_offset, Duration::from_millis(150));
+    }
+
+    /// The default: no leeway at all. Same tick count as the shifted grid
+    /// above — the whole drift divides evenly, so the first tick waits a
+    /// full interval instead of absorbing a remainder.
+    #[test]
+    fn the_default_zero_leeway_puts_every_tick_on_the_interval_grid() {
+        let s = schedule(SLOT, crate::flashblocks::DEFAULT_FLASHBLOCK_LEEWAY);
+
+        assert_eq!(s.drift, SLOT);
+        assert_eq!(s.tick_count, 10);
+        assert_eq!(s.gas_per_batch, 3_000_000);
+        assert_eq!(s.first_offset, INTERVAL);
     }
 
     #[test]

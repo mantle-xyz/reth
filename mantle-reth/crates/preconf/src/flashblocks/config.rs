@@ -18,14 +18,23 @@ use crate::PreconfConfig;
 pub const DEFAULT_FLASHBLOCK_BLOCK_TIME: Duration = Duration::from_millis(200);
 
 /// Default margin by which the budgeted slice grid finishes ahead of the
-/// slot deadline — 50ms.
+/// slot deadline — none.
 ///
-/// It shifts the whole tick grid rather than changing how many slices a
-/// block gets: at the default interval the slice count is the same for any
-/// leeway below one interval. Lower values push the last budgeted slice
-/// closer to the deadline, which leaves the tail more gas headroom but
-/// narrows the window between publishing that slice and sealing.
-pub const DEFAULT_FLASHBLOCK_LEEWAY: Duration = Duration::from_millis(50);
+/// The reference implementation deducts a leeway because it seals the block
+/// itself once the budgeted slices are out, and the margin is the time that
+/// seal needs. This builder does not: the loop runs until `getPayload`
+/// cancels it, so there is no self-imposed seal to reserve time for, and the
+/// closing slice already covers whatever executed after the last tick.
+///
+/// What remains is the effect on the grid, which is why the knob is kept:
+/// the leeway is subtracted from the drift, so it shifts every tick earlier
+/// without changing how many fire (any value below one interval leaves the
+/// count untouched). A non-zero value buys one thing — the last budgeted
+/// slice publishes that much before the payload is asked for, instead of
+/// racing it — and costs one extra slice assembly, which roots every
+/// transaction in the block, at the point in the slot where the critical
+/// path already is.
+pub const DEFAULT_FLASHBLOCK_LEEWAY: Duration = Duration::ZERO;
 
 /// Default address the publisher binds — loopback.
 pub const DEFAULT_FLASHBLOCK_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -195,7 +204,7 @@ mod tests {
         let cfg = FlashblockProducerConfig::default();
 
         assert_eq!(cfg.block_time, Duration::from_millis(200));
-        assert_eq!(cfg.leeway_time, Duration::from_millis(50));
+        assert_eq!(cfg.leeway_time, Duration::ZERO);
         assert_eq!(cfg.addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(cfg.port, 1111);
         assert_eq!(cfg.ring_capacity, 32);
