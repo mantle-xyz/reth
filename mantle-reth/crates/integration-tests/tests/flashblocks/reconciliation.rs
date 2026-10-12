@@ -114,3 +114,34 @@ async fn a_canonical_block_without_an_overlay_is_a_no_op() {
 
     assert!(harness.pending().is_none(), "nothing to reconcile, nothing to publish");
 }
+
+/// Staleness is measured against the node's tip, not the notification being handled.
+///
+/// The processor consumes canonical notifications and slices from one queue, so a
+/// backlog makes the notification height lag the chain. Judging the overlay by that
+/// height lets one whose blocks are all canonical survive, and `pending` then answers
+/// from a historical base — which is slow enough to deepen the backlog that caused it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backlogged_canonical_notification_is_judged_against_the_tip() {
+    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+
+    harness.send(base_slice(1)).await;
+    harness.send(base_slice_builder(2).prev(1, 0).build()).await;
+    harness.send(base_slice_builder(3).prev(2, 0).build()).await;
+
+    let pending = harness.pending().expect("overlay should span blocks 1 to 3");
+    assert_eq!((pending.earliest_block_number(), pending.latest_block_number()), (1, 3));
+
+    // The chain runs to 5 while only the block-1 notification has been dequeued.
+    let block = mine!(node);
+    assert_eq!(block.number, 1);
+    for _ in 0..4 {
+        mine!(node);
+    }
+    harness.send_canonical(block).await;
+
+    assert!(
+        harness.pending().is_none(),
+        "every overlay block is canonical at tip 5, so the overlay must retire",
+    );
+}

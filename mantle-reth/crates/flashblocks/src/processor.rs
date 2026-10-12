@@ -200,6 +200,29 @@ where
         leading > self.max_leading_depth
     }
 
+    /// Canonical height to reconcile a notification against.
+    ///
+    /// Canonical notifications and slices share one queue, so under backlog the
+    /// notification being handled can sit far below the chain. Reconciling against it
+    /// alone evaluates every guard in a stale frame: the overlay keeps trailing the
+    /// real tip while `CatchUp` and the depth limit both read as satisfied. Taking the
+    /// larger of the two keeps the guards anchored to the chain. Falls back to the
+    /// notification when the provider cannot answer, which is what the pre-tip
+    /// behaviour was.
+    fn effective_canonical_number(&self, notified: BlockNumber) -> BlockNumber {
+        match self.client.best_block_number() {
+            Ok(tip) => notified.max(tip),
+            Err(e) => {
+                warn!(
+                    message = "could not read the canonical tip, reconciling against the notification",
+                    notified_block = notified,
+                    error = %e,
+                );
+                notified
+            }
+        }
+    }
+
     async fn apply_flashblock(
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
@@ -306,7 +329,7 @@ where
         let strategy = CanonicalBlockReconciler::reconcile(
             Some(pending_blocks.earliest_block_number()),
             Some(pending_blocks.latest_block_number()),
-            block.number,
+            self.effective_canonical_number(block.number),
             self.max_trailing_depth,
             reorg_detected,
         );
