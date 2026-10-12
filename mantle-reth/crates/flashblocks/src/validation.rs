@@ -126,10 +126,19 @@ impl ReorgDetector {
     /// Compares tracked vs canonical transaction hashes to detect reorgs.
     ///
     /// Returns `ReorgDetected` if counts differ, hashes differ, or order differs.
+    ///
+    /// An empty tracked set means the overlay held no flashblocks for that canonical
+    /// block, so there is nothing to compare and no reorg to report. Every L2 block
+    /// carries an L1-attributes deposit, so a block the overlay does track is never
+    /// legitimately empty — only an untracked one reaches here empty.
     pub fn detect(
         tracked_tx_hashes: &[B256],
         canonical_tx_hashes: &[B256],
     ) -> ReorgDetectionResult {
+        if tracked_tx_hashes.is_empty() {
+            return ReorgDetectionResult::NoReorg;
+        }
+
         if tracked_tx_hashes == canonical_tx_hashes {
             ReorgDetectionResult::NoReorg
         } else {
@@ -286,7 +295,11 @@ mod tests {
     #[case(&[0x01, 0x02], &[0x02, 0x01], ReorgDetectionResult::ReorgDetected { tracked_count: 2, canonical_count: 2 })]
     #[case(&[0x01, 0x02, 0x03], &[0x01, 0x02], ReorgDetectionResult::ReorgDetected { tracked_count: 3, canonical_count: 2 })]
     #[case(&[0x01], &[0x01, 0x02, 0x03], ReorgDetectionResult::ReorgDetected { tracked_count: 1, canonical_count: 3 })]
-    #[case(&[], &[0x01], ReorgDetectionResult::ReorgDetected { tracked_count: 0, canonical_count: 1 })]
+    // An untracked canonical block is not a reorg: the overlay simply held nothing
+    // for it. Every L2 block carries an L1-attributes deposit, so a block the overlay
+    // does track is never legitimately empty.
+    #[case(&[], &[0x01], ReorgDetectionResult::NoReorg)]
+    #[case(&[], &[0x01, 0x02, 0x03], ReorgDetectionResult::NoReorg)]
     #[case(&[0x01], &[], ReorgDetectionResult::ReorgDetected { tracked_count: 1, canonical_count: 0 })]
     #[case(&[0x01, 0x01, 0x02], &[0x01, 0x02], ReorgDetectionResult::ReorgDetected { tracked_count: 3, canonical_count: 2 })]
     #[case(&[0x01, 0x02], &[0x03, 0x04], ReorgDetectionResult::ReorgDetected { tracked_count: 2, canonical_count: 2 })]
