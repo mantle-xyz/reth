@@ -42,6 +42,8 @@ flashblock_metrics! {
     counter   rpc_get_transaction_receipt               => "flashblocks.rpc.get_transaction_receipt";
     counter   rpc_get_transaction_by_hash               => "flashblocks.rpc.get_transaction_by_hash";
     counter   rpc_get_balance                           => "flashblocks.rpc.get_balance";
+    counter   rpc_get_code                              => "flashblocks.rpc.get_code";
+    counter   rpc_get_storage_at                        => "flashblocks.rpc.get_storage_at";
     counter   rpc_get_block_by_number                   => "flashblocks.rpc.get_block_by_number";
     counter   rpc_call                                  => "flashblocks.rpc.call";
     counter   rpc_estimate_gas                          => "flashblocks.rpc.estimate_gas";

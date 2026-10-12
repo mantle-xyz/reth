@@ -256,9 +256,63 @@ pub const TEST_CHAIN_ID: u64 = 5003;
 /// the returned balance lets `eth_call` distinguish overlay state from canonical.
 pub const LOGGER: Address = address!("0000000000000000000000000000000000000c0d");
 
+/// Predeploy that writes [`SETTER_VALUE`] to [`SETTER_SLOT`] and stops:
+/// `PUSH1 7 PUSH1 1 SSTORE STOP`.
+///
+/// `LOGGER` never touches storage, so a separate predeploy is what gives
+/// `eth_getStorageAt` an overlay-only slot to read.
+pub const SETTER: Address = address!("0000000000000000000000000000000000000c0e");
+
+/// The slot [`SETTER`] writes. Zero in canonical state until a block lands.
+pub const SETTER_SLOT: B256 = B256::with_last_byte(1);
+
+/// The value [`SETTER`] writes to [`SETTER_SLOT`].
+pub const SETTER_VALUE: u8 = 7;
+
+/// A slot [`SETTER`] holds in genesis and never writes.
+///
+/// Non-zero so that a read of it under `pending` distinguishes "fell back to
+/// canonical" from "answered zero off an absent overlay entry".
+pub const SETTER_UNWRITTEN_SLOT: B256 = B256::with_last_byte(0x42);
+
+/// The genesis value at [`SETTER_UNWRITTEN_SLOT`].
+pub const SETTER_UNWRITTEN_VALUE: u8 = 0x99;
+
+/// Init code returning the runtime `deadbeef`:
+/// `PUSH1 4 PUSH1 12 PUSH1 0 CODECOPY PUSH1 4 PUSH1 0 RETURN` then the runtime.
+///
+/// Deploying from a slice gives `eth_getCode` an address whose code exists in
+/// the overlay and nowhere else.
+pub const DEPLOY_INIT_CODE: Bytes = bytes!("6004600c60003960046000f3deadbeef");
+
+/// The runtime [`DEPLOY_INIT_CODE`] installs.
+pub const DEPLOYED_RUNTIME: Bytes = bytes!("deadbeef");
+
 /// Sender funded in genesis, used for the overlay's user transactions.
 pub fn test_sender() -> Address {
     Wallet::default().inner.address()
+}
+
+/// Signs a contract creation from [`test_sender`] for inclusion in a slice.
+pub async fn signed_deploy(nonce: u64, init_code: Bytes) -> Bytes {
+    let request = TransactionRequest {
+        chain_id: Some(TEST_CHAIN_ID),
+        nonce: Some(nonce),
+        to: Some(TxKind::Create),
+        gas: Some(200_000),
+        max_fee_per_gas: Some(20_000_000_000),
+        max_priority_fee_per_gas: Some(20_000_000_000),
+        value: Some(U256::ZERO),
+        input: TransactionInput::new(init_code),
+        ..Default::default()
+    };
+    TransactionTestContext::sign_tx(
+        Wallet::default().with_chain_id(TEST_CHAIN_ID).inner.clone(),
+        request,
+    )
+    .await
+    .encoded_2718()
+    .into()
 }
 
 /// Signs a call from [`test_sender`] for inclusion in a slice.
@@ -328,6 +382,16 @@ pub fn flashblocks_test_chain_spec() -> Arc<OpChainSpec> {
     genesis.alloc.insert(
         LOGGER,
         GenesisAccount { code: Some(bytes!("60006000a04760005260206000f3")), ..Default::default() },
+    );
+    genesis.alloc.insert(
+        SETTER,
+        GenesisAccount {
+            code: Some(bytes!("600760015500")),
+            storage: Some(
+                [(SETTER_UNWRITTEN_SLOT, B256::with_last_byte(SETTER_UNWRITTEN_VALUE))].into(),
+            ),
+            ..Default::default()
+        },
     );
     Arc::new(from_mantle_genesis(genesis))
 }
