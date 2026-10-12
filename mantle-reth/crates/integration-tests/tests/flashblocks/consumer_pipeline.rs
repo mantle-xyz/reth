@@ -151,3 +151,47 @@ async fn the_overlay_reports_its_canonical_base() {
     let base = harness.state().get_pending_blocks().get_canonical_block_number();
     assert_eq!(base, alloy_rpc_types_eth::BlockNumberOrTag::Number(0), "block 1 sits on genesis");
 }
+
+/// A rebuild forced by missing live state must not re-enter the live-state lock.
+///
+/// A slice that fails mid-execution has already taken the live state, and the error
+/// path leaves the overlay in place. The next slice for that block therefore finds an
+/// overlay but no live state and takes the full-rebuild fallback, which writes the
+/// live state back. Holding the lock across that fallback deadlocks the single
+/// consumer thread and stops the whole pipeline.
+///
+/// On regression this wedges the test binary rather than failing tidily: the timeout
+/// below fires and panics, but runtime shutdown then waits forever on the blocked
+/// worker. A CI timeout naming this test is the signal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_without_live_state_does_not_deadlock() {
+    use alloy_network::eip2718::Encodable2718;
+    use alloy_primitives::Sealable;
+    use op_alloy_consensus::{OpTxEnvelope, SDMGasEntry, build_post_exec_tx};
+
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+
+    let post_exec = OpTxEnvelope::PostExec(
+        build_post_exec_tx(1, vec![SDMGasEntry { index: 1, gas_refund: 2_500 }]).seal_slow(),
+    );
+    harness
+        .send(
+            FlashblockBuilder::new(1, 1)
+                .prev(1, 0)
+                .transactions(vec![post_exec.encoded_2718().into()])
+                .build(),
+        )
+        .await;
+    assert!(harness.pending().is_some(), "a failed slice must leave the overlay in place");
+
+    // Same (block, index) as the failed slice, so the sequence check still passes.
+    let retry = FlashblockBuilder::new(1, 1).prev(1, 0).build();
+    tokio::time::timeout(std::time::Duration::from_secs(10), harness.send(retry))
+        .await
+        .expect("the rebuild fallback must not hold the live-state lock");
+
+    let pending = harness.pending().expect("the retry should rebuild the overlay");
+    assert_eq!(pending.latest_flashblock_index(), 1);
+}
