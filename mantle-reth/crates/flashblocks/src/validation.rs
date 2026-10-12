@@ -168,6 +168,12 @@ pub struct CanonicalBlockReconciler;
 impl CanonicalBlockReconciler {
     /// Returns the appropriate [`ReconciliationStrategy`] based on pending vs canonical state.
     ///
+    /// `canonical_block_number` must be the node's effective canonical height, not the
+    /// height of the notification being handled. A caller that passes the notification
+    /// evaluates every guard below in whatever frame its queue has fallen behind to, so
+    /// neither `CatchUp` nor `DepthLimitExceeded` fires while the overlay drifts away
+    /// from the chain.
+    ///
     /// Priority: `NoPendingState` → `CatchUp` → `HandleReorg` → `DepthLimitExceeded` → `Continue`
     pub const fn reconcile(
         pending_earliest_block: Option<u64>,
