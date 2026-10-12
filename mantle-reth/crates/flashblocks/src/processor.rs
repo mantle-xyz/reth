@@ -2,7 +2,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
+    sync::{
+        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
@@ -65,10 +68,37 @@ pub enum StateUpdate {
     Flashblock(MantleFlashblockPayload, Option<oneshot::Sender<()>>),
 }
 
+/// The consuming end of the update queue, paired with the depth its producers keep.
+///
+/// The two travel together: taking an update is what makes the depth drop, so an
+/// owner that held only the receiver could not keep the count honest.
+#[derive(Debug)]
+pub struct QueueConsumer {
+    rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl QueueConsumer {
+    /// Pairs a receiver with the depth counter its senders increment.
+    pub const fn new(
+        rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+        depth: Arc<AtomicUsize>,
+    ) -> Self {
+        Self { rx, depth }
+    }
+
+    /// Takes the next update, reporting how many remain queued behind it.
+    async fn recv(&self) -> Option<(StateUpdate, usize)> {
+        let update = self.rx.lock().await.recv().await?;
+        let waiting = self.depth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        Some((update, waiting))
+    }
+}
+
 /// Processes flashblocks and canonical blocks to keep pending state updated.
 #[derive(Debug)]
 pub struct StateProcessor<Client> {
-    rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+    queue: QueueConsumer,
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
     max_trailing_depth: u64,
     max_leading_depth: u64,
@@ -105,7 +135,15 @@ where
         state_overrides: StateOverride,
     ) -> Result<Option<Arc<PendingBlocks>>> {
         db.merge_transitions(BundleRetention::Reverts);
-        pending_blocks_builder.with_bundle_state(db.bundle_state.clone());
+
+        // Every slice freezes a copy so the live database can keep mutating. The cost
+        // grows with the overlay, so it is worth watching rather than assuming.
+        let clone_started = Instant::now();
+        let bundle_state = db.bundle_state.clone();
+        Metrics::bundle_state_clone_duration().record(clone_started.elapsed());
+        Metrics::bundle_state_clone_size().record(bundle_state.size_hint() as f64);
+
+        pending_blocks_builder.with_bundle_state(bundle_state);
         pending_blocks_builder.with_state_overrides(state_overrides.clone());
 
         let pending_blocks = Arc::new(pending_blocks_builder.build()?);
@@ -121,7 +159,7 @@ where
         max_trailing_depth: u64,
         max_leading_depth: u64,
         max_cache_ahead_blocks: u64,
-        rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+        queue: QueueConsumer,
         sender: Sender<Arc<PendingBlocks>>,
     ) -> Self {
         let best = client.best_block_number().unwrap_or(0);
@@ -132,7 +170,7 @@ where
             client,
             max_trailing_depth,
             max_leading_depth,
-            rx,
+            queue,
             sender,
             cache: Arc::new(Mutex::new(cache)),
             live_state: StdMutex::new(None),
@@ -141,7 +179,9 @@ where
 
     /// Processes updates from the queue until the channel closes.
     pub async fn start(&self) {
-        while let Some(update) = self.rx.lock().await.recv().await {
+        while let Some((update, waiting)) = self.queue.recv().await {
+            Metrics::queue_depth().set(waiting as f64);
+
             let prev_pending_blocks = self.pending_blocks.load_full();
             match update {
                 StateUpdate::Canonical(block, ack) => {
@@ -198,6 +238,29 @@ where
         let Ok(canonical) = self.client.best_block_number() else { return false };
         let leading = flashblock.metadata.block_number.saturating_sub(canonical);
         leading > self.max_leading_depth
+    }
+
+    /// Canonical height to reconcile a notification against.
+    ///
+    /// Canonical notifications and slices share one queue, so under backlog the
+    /// notification being handled can sit far below the chain. Reconciling against it
+    /// alone evaluates every guard in a stale frame: the overlay keeps trailing the
+    /// real tip while `CatchUp` and the depth limit both read as satisfied. Taking the
+    /// larger of the two keeps the guards anchored to the chain. Falls back to the
+    /// notification when the provider cannot answer, which is what the pre-tip
+    /// behaviour was.
+    fn effective_canonical_number(&self, notified: BlockNumber) -> BlockNumber {
+        match self.client.best_block_number() {
+            Ok(tip) => notified.max(tip),
+            Err(e) => {
+                warn!(
+                    message = "could not read the canonical tip, reconciling against the notification",
+                    notified_block = notified,
+                    error = %e,
+                );
+                notified
+            }
+        }
     }
 
     async fn apply_flashblock(
@@ -306,7 +369,7 @@ where
         let strategy = CanonicalBlockReconciler::reconcile(
             Some(pending_blocks.earliest_block_number()),
             Some(pending_blocks.latest_block_number()),
-            block.number,
+            self.effective_canonical_number(block.number),
             self.max_trailing_depth,
             reorg_detected,
         );
