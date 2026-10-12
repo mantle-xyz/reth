@@ -3,10 +3,12 @@
 //! Slices are injected straight into the state processor and awaited; the
 //! websocket subscriber is not started.
 
-use mantle_reth_flashblocks::{FlashblocksAPI, PendingBlocksAPI};
+use mantle_reth_flashblocks::{
+    FlashblocksAPI, FlashblocksReceiver, FlashblocksState, PendingBlocksAPI,
+};
 
 use crate::consumer_helpers::{
-    FlashblockBuilder, base_slice, l1_info_deposit, launch_flashblocks_node,
+    FlashblockBuilder, base_slice, base_slice_builder, l1_info_deposit, launch_flashblocks_node,
     mine_canonical_block as mine,
 };
 
@@ -158,6 +160,36 @@ async fn a_slice_carrying_a_post_exec_transaction_is_rejected_whole() {
     assert_eq!(pending.pending_transaction_count(), 1, "only the deposit");
 }
 
+/// A transaction whose encoding is not canonical is rejected, taking its slice with it.
+///
+/// The overlay roots the wire bytes it was handed but hashes the transaction it
+/// decoded out of them, and nothing here compares the two. They agree only while the
+/// decoder refuses every non-canonical encoding. The sharp case is a deposit body
+/// stripped of its `0x7E` type byte: were it to decode, the overlay would execute a
+/// transaction, mint, and publish a receipt for something derivation will never
+/// accept, so the preconfirmation would simply evaporate.
+///
+/// This pins behaviour we inherit from `op-alloy` rather than implement, which is
+/// exactly why it is worth a test here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_with_a_non_canonical_encoding_is_rejected() {
+    let (harness, _node) = launch!();
+
+    let deposit = l1_info_deposit(1);
+    assert_eq!(deposit[0], 0x7e, "the fixture must be a typed deposit for this to mean anything");
+    let bare_body = alloy_primitives::Bytes::from(deposit[1..].to_vec());
+
+    harness.send(FlashblockBuilder::new(1, 0).transactions(vec![bare_body]).build()).await;
+
+    assert!(harness.pending().is_none(), "an untyped deposit body must not open an overlay");
+
+    // The same slice with the type byte intact is accepted, so the encoding was the
+    // only thing wrong with it.
+    harness.send(base_slice(1)).await;
+    let pending = harness.pending().expect("the canonical encoding is accepted");
+    assert_eq!(pending.pending_transaction_count(), 1);
+}
+
 /// The overlay reports the canonical block it was built on; with no overlay the base
 /// stays `pending` so the standard implementation keeps serving that tag.
 #[tokio::test(flavor = "multi_thread")]
@@ -174,6 +206,37 @@ async fn the_overlay_reports_its_canonical_base() {
 
     let base = harness.state().get_pending_blocks().get_canonical_block_number();
     assert_eq!(base, alloy_rpc_types_eth::BlockNumberOrTag::Number(0), "block 1 sits on genesis");
+}
+
+/// Updates waiting for the processor are counted.
+///
+/// The queue is unbounded and shared by both sources, so a backlog is invisible
+/// unless it is counted: it shows up only as guards reasoning about a stale height
+/// and `pending` answering from an older base.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_queue_depth_counts_updates_the_processor_has_not_taken() {
+    // Never started, so nothing drains what is queued here.
+    let state = FlashblocksState::new(3, 3, 5);
+    assert_eq!(state.queued_updates(), 0, "a fresh queue is empty");
+
+    state.on_flashblock_received(base_slice(1));
+    state.on_flashblock_received(base_slice_builder(2).prev(1, 0).build());
+
+    assert_eq!(state.queued_updates(), 2, "nothing is consuming the queue");
+}
+
+/// The count drops back as the processor consumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumed_update_leaves_the_queue_empty() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+
+    assert_eq!(
+        harness.state().queued_updates(),
+        0,
+        "the acknowledgement means the processor is done with it"
+    );
 }
 
 /// A rebuild forced by missing live state must not re-enter the live-state lock.

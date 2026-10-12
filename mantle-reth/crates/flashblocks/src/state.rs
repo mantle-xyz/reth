@@ -1,6 +1,9 @@
 //! Shared flashblock state and update queue.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use alloy_consensus::Header;
 use arc_swap::{ArcSwapOption, Guard};
@@ -19,7 +22,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     FlashblocksAPI, FlashblocksReceiver, PendingBlocks,
-    processor::{StateProcessor, StateUpdate},
+    processor::{QueueConsumer, StateProcessor, StateUpdate},
 };
 
 /// Roughly four seconds of flashblocks.
@@ -31,6 +34,7 @@ pub struct FlashblocksState {
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
     queue: mpsc::UnboundedSender<StateUpdate>,
     rx: Arc<Mutex<mpsc::UnboundedReceiver<StateUpdate>>>,
+    queue_depth: Arc<AtomicUsize>,
     flashblock_sender: Sender<Arc<PendingBlocks>>,
     max_trailing_depth: u64,
     max_leading_depth: u64,
@@ -55,6 +59,7 @@ impl FlashblocksState {
             pending_blocks,
             queue: tx,
             rx: Arc::new(Mutex::new(rx)),
+            queue_depth: Arc::new(AtomicUsize::new(0)),
             flashblock_sender,
             max_trailing_depth,
             max_leading_depth,
@@ -77,7 +82,7 @@ impl FlashblocksState {
             self.max_trailing_depth,
             self.max_leading_depth,
             self.max_cache_ahead_blocks,
-            Arc::clone(&self.rx),
+            QueueConsumer::new(Arc::clone(&self.rx), Arc::clone(&self.queue_depth)),
             self.flashblock_sender.clone(),
         );
 
@@ -86,10 +91,29 @@ impl FlashblocksState {
         });
     }
 
+    /// Updates queued but not yet taken by the processor.
+    ///
+    /// The queue is unbounded and carries both canonical notifications and slices, so
+    /// a processor falling behind shows up here before it shows up anywhere else.
+    pub fn queued_updates(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Queues an update, keeping [`queued_updates`](Self::queued_updates) in step.
+    ///
+    /// Counted before the send so the depth never reads low while a value is in
+    /// flight, and rolled back if the processor is already gone.
+    fn enqueue(&self, update: StateUpdate) -> Result<(), mpsc::error::SendError<StateUpdate>> {
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        self.queue.send(update).inspect_err(|_| {
+            self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        })
+    }
+
     /// Handles a canonical block being received.
     pub fn on_canonical_block_received(&self, block: RecoveredBlock<OpBlock>) {
         let block_number = block.number;
-        match self.queue.send(StateUpdate::Canonical(block, None)) {
+        match self.enqueue(StateUpdate::Canonical(block, None)) {
             Ok(_) => {
                 info!(message = "added canonical block to processing queue", block_number)
             }
@@ -113,8 +137,7 @@ impl FlashblocksState {
         block: RecoveredBlock<OpBlock>,
     ) -> Result<(), &'static str> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.queue
-            .send(StateUpdate::Canonical(block, Some(ack_tx)))
+        self.enqueue(StateUpdate::Canonical(block, Some(ack_tx)))
             .map_err(|_| "flashblocks processing queue closed")?;
         ack_rx.await.map_err(|_| "flashblocks processor dropped the acknowledgement")
     }
@@ -128,8 +151,7 @@ impl FlashblocksState {
         flashblock: MantleFlashblockPayload,
     ) -> Result<(), &'static str> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.queue
-            .send(StateUpdate::Flashblock(flashblock, Some(ack_tx)))
+        self.enqueue(StateUpdate::Flashblock(flashblock, Some(ack_tx)))
             .map_err(|_| "flashblocks processing queue closed")?;
         ack_rx.await.map_err(|_| "flashblocks processor dropped the acknowledgement")
     }
@@ -139,7 +161,7 @@ impl FlashblocksReceiver for FlashblocksState {
     fn on_flashblock_received(&self, flashblock: MantleFlashblockPayload) {
         let flashblock_index = flashblock.index;
         let block_number = flashblock.metadata.block_number;
-        match self.queue.send(StateUpdate::Flashblock(flashblock, None)) {
+        match self.enqueue(StateUpdate::Flashblock(flashblock, None)) {
             Ok(_) => {
                 debug!(
                     message = "added flashblock to processing queue",

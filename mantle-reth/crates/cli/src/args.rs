@@ -128,23 +128,26 @@ pub struct FlashblocksConsumerArgs {
     /// Named to match the `flashblocks-rpc` deployments already in operation.
     /// Absent (default) leaves the consumer off and the `pending` tag on its
     /// standard local-mempool semantics.
-    #[arg(long = "flashblocks.websocket-url")]
+    ///
+    /// Every flag in this group also answers to a `--subblocks.` prefix, the
+    /// name Optimism's documentation now uses for the same thing.
+    #[arg(long = "flashblocks.websocket-url", alias = "subblocks.websocket-url")]
     pub websocket_url: Option<Url>,
 
     /// Interval between upstream websocket ping frames, in seconds.
-    #[arg(long = "flashblocks.ping-interval-secs")]
+    #[arg(long = "flashblocks.ping-interval-secs", alias = "subblocks.ping-interval-secs")]
     pub ping_interval_secs: Option<u64>,
 
     /// Canonical blocks the pending overlay may trail behind before a rebuild.
-    #[arg(long = "flashblocks.max-trailing-depth")]
+    #[arg(long = "flashblocks.max-trailing-depth", alias = "subblocks.max-trailing-depth")]
     pub max_trailing_depth: Option<u64>,
 
     /// Blocks the pending overlay may lead canonical by before slices are dropped.
-    #[arg(long = "flashblocks.max-leading-depth")]
+    #[arg(long = "flashblocks.max-leading-depth", alias = "subblocks.max-leading-depth")]
     pub max_leading_depth: Option<u64>,
 
     /// Blocks ahead of canonical for which early-arriving slices are cached.
-    #[arg(long = "flashblocks.max-cache-ahead-blocks")]
+    #[arg(long = "flashblocks.max-cache-ahead-blocks", alias = "subblocks.max-cache-ahead-blocks")]
     pub max_cache_ahead_blocks: Option<u64>,
 }
 
@@ -206,27 +209,38 @@ pub struct FlashblocksArgs {
     ///
     /// Off by default: leaving it off keeps the payload builder's
     /// pre-flashblock behaviour byte for byte, which is the rollback path.
-    #[arg(id = "flashblocks.enable", long = "flashblocks.enable")]
+    ///
+    /// Every flag in this group also answers to a `--subblocks.` prefix, the
+    /// name Optimism's documentation now uses for the same thing.
+    #[arg(id = "flashblocks.enable", long = "flashblocks.enable", alias = "subblocks.enable")]
     pub enable: bool,
 
     /// Address the flashblocks publisher binds. Default `127.0.0.1`.
-    #[arg(id = "flashblocks.addr", long = "flashblocks.addr")]
+    #[arg(id = "flashblocks.addr", long = "flashblocks.addr", alias = "subblocks.addr")]
     pub addr: Option<IpAddr>,
 
     /// Port the flashblocks publisher binds. Default `1111`.
-    #[arg(id = "flashblocks.port", long = "flashblocks.port")]
+    #[arg(id = "flashblocks.port", long = "flashblocks.port", alias = "subblocks.port")]
     pub port: Option<u16>,
 
     /// Interval between slices, in milliseconds. Default 200ms.
     ///
     /// When flashblocks are enabled this also becomes the payload builder's
     /// ticker cadence, superseding `--preconf.sweep-interval-ms`.
-    #[arg(id = "flashblocks.block-time", long = "flashblocks.block-time")]
+    #[arg(
+        id = "flashblocks.block-time",
+        long = "flashblocks.block-time",
+        alias = "subblocks.block-time"
+    )]
     pub block_time_ms: Option<u64>,
 
     /// How far ahead of the slot deadline the budgeted slice grid finishes,
     /// in milliseconds. Default 50ms.
-    #[arg(id = "flashblocks.leeway-time", long = "flashblocks.leeway-time")]
+    #[arg(
+        id = "flashblocks.leeway-time",
+        long = "flashblocks.leeway-time",
+        alias = "subblocks.leeway-time"
+    )]
     pub leeway_time_ms: Option<u64>,
 }
 
@@ -559,6 +573,31 @@ mod tests {
         assert_eq!(cfg.leeway_time, DEFAULT_FLASHBLOCK_LEEWAY);
     }
 
+    /// Optimism renamed flashblocks to subblocks in its public documentation
+    /// while keeping `flashblocks` as the canonical flag name. We mirror that:
+    /// every publisher flag also answers to `--subblocks.`.
+    #[test]
+    fn subblocks_aliases_reach_the_publisher_flags() {
+        let cfg = parse_flashblocks(&[
+            "--subblocks.enable",
+            "--subblocks.addr",
+            "0.0.0.0",
+            "--subblocks.port",
+            "2222",
+            "--subblocks.block-time",
+            "250",
+            "--subblocks.leeway-time",
+            "0",
+        ])
+        .into_config()
+        .expect("enabled");
+
+        assert_eq!(cfg.addr, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.port, 2222);
+        assert_eq!(cfg.block_time, Duration::from_millis(250));
+        assert_eq!(cfg.leeway_time, Duration::ZERO);
+    }
+
     /// The two groups are validated against each other, and enabling
     /// flashblocks without preconf is rejected before the node starts.
     #[test]
@@ -699,6 +738,34 @@ mod tests {
             .into_config(args.rollup.flashblocks_url.as_ref())
             .expect("no conflict")
             .expect("enabled");
+        assert_eq!(cfg.subscriber_ping_interval, Duration::from_secs(5));
+        assert_eq!(cfg.max_trailing_depth, 7);
+        assert_eq!(cfg.max_leading_depth, 9);
+        assert_eq!(cfg.max_cache_ahead_blocks, 11);
+    }
+
+    /// Same mirror of Optimism's naming on the consumer side. The alias must
+    /// not disturb upstream's own `--flashblocks-url`, which stays distinct.
+    #[test]
+    fn subblocks_aliases_reach_the_consumer_flags() {
+        let args = parse_consumer(&[
+            "--subblocks.websocket-url",
+            "ws://sequencer:1111",
+            "--subblocks.ping-interval-secs",
+            "5",
+            "--subblocks.max-trailing-depth",
+            "7",
+            "--subblocks.max-leading-depth",
+            "9",
+            "--subblocks.max-cache-ahead-blocks",
+            "11",
+        ]);
+        let cfg = args
+            .flashblocks_consumer
+            .into_config(args.rollup.flashblocks_url.as_ref())
+            .expect("no conflict")
+            .expect("enabled");
+        assert_eq!(cfg.websocket_url.as_str(), "ws://sequencer:1111/");
         assert_eq!(cfg.subscriber_ping_interval, Duration::from_secs(5));
         assert_eq!(cfg.max_trailing_depth, 7);
         assert_eq!(cfg.max_leading_depth, 9);

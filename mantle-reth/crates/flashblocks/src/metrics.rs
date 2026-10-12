@@ -40,6 +40,7 @@ flashblock_metrics! {
     gauge     pending_snapshot_fb_index                 => "flashblocks.pending_snapshot_fb_index";
     gauge     pending_snapshot_height                   => "flashblocks.pending_snapshot_height";
     counter   leading_depth_exceeded                    => "flashblocks.leading_depth_exceeded";
+    gauge     queue_depth                               => "flashblocks.queue_depth";
     counter   reconnect_attempts                        => "flashblocks.reconnect_attempts";
     counter   rpc_get_transaction_count                 => "flashblocks.rpc.get_transaction_count";
     counter   rpc_get_transaction_receipt               => "flashblocks.rpc.get_transaction_receipt";
