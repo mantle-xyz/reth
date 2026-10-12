@@ -114,3 +114,24 @@ async fn a_canonical_block_without_an_overlay_is_a_no_op() {
 
     assert!(harness.pending().is_none(), "nothing to reconcile, nothing to publish");
 }
+
+/// The processor has no ingest-side filter, so a slice for an already canonical block arrives
+/// with no previous state, carries index 0, and reopens an overlay. This drives the processor
+/// directly, bypassing the filter in `on_flashblock_received` that prevents it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_processor_alone_reopens_an_overlay_for_an_already_canonical_block() {
+    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+
+    harness.send(base_slice(1)).await;
+    let block = mine!(node);
+    assert_eq!(block.number, 1);
+    harness.send_canonical(block).await;
+    assert!(harness.pending().is_none(), "canonical reaching the tip clears the overlay");
+
+    harness.send(base_slice(1)).await;
+
+    assert!(
+        harness.pending().is_some(),
+        "without an ingest-side filter the late slice reopens the overlay"
+    );
+}
