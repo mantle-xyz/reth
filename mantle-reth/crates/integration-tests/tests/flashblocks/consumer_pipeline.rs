@@ -3,10 +3,12 @@
 //! Slices are injected straight into the state processor and awaited; the
 //! websocket subscriber is not started.
 
-use mantle_reth_flashblocks::{FlashblocksAPI, PendingBlocksAPI};
+use mantle_reth_flashblocks::{
+    FlashblocksAPI, FlashblocksReceiver, FlashblocksState, PendingBlocksAPI,
+};
 
 use crate::consumer_helpers::{
-    FlashblockBuilder, base_slice, l1_info_deposit, launch_flashblocks_node,
+    FlashblockBuilder, base_slice, base_slice_builder, l1_info_deposit, launch_flashblocks_node,
 };
 
 /// Default depths: three blocks of trailing history, three of leading slack.
@@ -150,6 +152,37 @@ async fn the_overlay_reports_its_canonical_base() {
 
     let base = harness.state().get_pending_blocks().get_canonical_block_number();
     assert_eq!(base, alloy_rpc_types_eth::BlockNumberOrTag::Number(0), "block 1 sits on genesis");
+}
+
+/// Updates waiting for the processor are counted.
+///
+/// The queue is unbounded and shared by both sources, so a backlog is invisible
+/// unless it is counted: it shows up only as guards reasoning about a stale height
+/// and `pending` answering from an older base.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_queue_depth_counts_updates_the_processor_has_not_taken() {
+    // Never started, so nothing drains what is queued here.
+    let state = FlashblocksState::new(3, 3, 5);
+    assert_eq!(state.queued_updates(), 0, "a fresh queue is empty");
+
+    state.on_flashblock_received(base_slice(1));
+    state.on_flashblock_received(base_slice_builder(2).prev(1, 0).build());
+
+    assert_eq!(state.queued_updates(), 2, "nothing is consuming the queue");
+}
+
+/// The count drops back as the processor consumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumed_update_leaves_the_queue_empty() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+
+    assert_eq!(
+        harness.state().queued_updates(),
+        0,
+        "the acknowledgement means the processor is done with it"
+    );
 }
 
 /// A rebuild forced by missing live state must not re-enter the live-state lock.
