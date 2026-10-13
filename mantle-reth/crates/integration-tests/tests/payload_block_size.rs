@@ -78,9 +78,10 @@ const SLOT_DURATION: Duration = Duration::from_secs(2);
 /// would seal whatever the builder had reached — for the paced pool arm, an
 /// empty block. Past one [`SLOT_DURATION`] (the pool quota is fully open) and
 /// well short of three (the stall watchdog abandons the job and `getPayload`
-/// comes back empty). The margin is not load-bearing: every case below asserts
-/// an exact inclusion count and fails loudly rather than silently shrinking.
-const BUILD_SETTLE: Duration = Duration::from_millis(2_500);
+/// comes back empty), with comparable slack either side rather than crowding
+/// the lower bound. The margin is not load-bearing: every case below asserts an
+/// exact inclusion count and fails loudly rather than silently shrinking.
+const BUILD_SETTLE: Duration = Duration::from_millis(3_500);
 
 /// Queue ceilings for a directly-admitted probe. Deliberately far above
 /// anything these tests queue: the subject is the block's RLP budget, and a
@@ -109,9 +110,11 @@ fn chain_spec(reverting: bool) -> Arc<OpChainSpec> {
 /// production gate.
 ///
 /// Inserted into the fork schedule rather than written into the fixture JSON:
-/// `from_mantle_genesis` maps Mantle's own fork timeline and the OP forks those
-/// imply, and Lagoon is in neither list, so a `lagoonTime` field would be read
-/// and dropped.
+/// Lagoon is not on Mantle's schedule at all, so `from_mantle_genesis` has no
+/// `lagoonTime` to read.
+///
+/// The insert appends rather than slotting the fork into canonical order, so do
+/// not reuse this helper for a test that reads fork IDs.
 fn sdm_chain_spec() -> Arc<OpChainSpec> {
     let mut spec = (*chain_spec(false)).clone();
     spec.inner.hardforks.insert(OpHardfork::Lagoon, ForkCondition::Timestamp(0));
@@ -783,6 +786,23 @@ async fn pool_admission_counts_the_block_body_item_not_the_2718_payload() {
                 body_sum, mandatory_sum,
                 "sealed block-body item lengths must equal what the budget recorded"
             );
+
+            // Why it was left out, not just that it was. Same probe, same node,
+            // same pool, against a block whose budget has room for it: anything
+            // else that could have refused it — its gas, its DA footprint, its
+            // nonce, the pool never having held it — refuses it here too, and
+            // this suite's only guard against a crossed byte measure would
+            // otherwise keep passing while guarding nothing.
+            let head = node.submit_payload(payload.clone()).await.unwrap();
+            node.update_forkchoice(head, head).await.unwrap();
+            let attrs = node.payload.next_attributes();
+            let control = build(&mut node, attrs).await.expect("control block");
+            assert!(
+                sealed_hashes(&control).contains(&probe_hash),
+                "the probe never became includable, so its absence above says nothing \
+                 about the byte measure"
+            );
+            assert_valid_size(&node, &control);
         },
     )
     .await;
