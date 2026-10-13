@@ -174,7 +174,11 @@ reth-provider = { workspace = true, features = ["test-utils"] }
 # `testing_pool()` + `MockTransaction` — the slice-boundary pool maintenance
 # tests assert on real sub-pool transitions, which a stub cannot reproduce.
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-reth-optimism-chainspec.workspace = true
+# `superchain-configs` — the test fixtures build their chainspec from
+# `OpChainSpecBuilder::optimism_mainnet()`, which only exists behind that
+# feature. Workspace-wide checks get it for free via feature unification; spell
+# it out so `cargo check -p mantle-reth-preconf --all-targets` also compiles.
+reth-optimism-chainspec = { workspace = true, features = ["superchain-configs"] }
 reth-optimism-primitives.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true

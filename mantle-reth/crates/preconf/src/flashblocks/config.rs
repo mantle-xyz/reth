@@ -138,14 +138,16 @@ pub enum FlashblockProducerConfigError {
     /// rather than running it, the same way the canonical block executor
     /// does — the gas refunds the entries describe are applied by the
     /// surrounding post-exec machinery, not by executing this transaction.
-    /// What the consumer skips is the payload verification
-    /// (`verify_post_exec_tx`) the canonical executor additionally runs
-    /// against it. The consumer's replayed pending/preconf overlay does not
-    /// reproduce that surrounding machinery, so it omits the refunds until
-    /// the next canonical block resynchronises state — a transient
-    /// pending-state inaccuracy, not a chain split. The 1.6.3 wire protocol
-    /// has an out-of-band field for the post-exec transaction that no
-    /// producer fills yet.
+    /// What the consumer skips are the two payload checks the canonical
+    /// executor additionally runs against it: `verify_post_exec_tx`, which
+    /// matches the transaction's payload against the entries the executor
+    /// accumulated, and `verifier_post_exec_refund_for_tx`, which rejects a
+    /// Verify entry that targets the post-exec transaction's own index. The
+    /// consumer's replayed pending/preconf overlay does not reproduce that
+    /// surrounding machinery, so it omits the refunds until the next canonical
+    /// block resynchronises state — a transient pending-state inaccuracy, not
+    /// a chain split. The 1.6.3 wire protocol has an out-of-band field for the
+    /// post-exec transaction that no producer fills yet.
     ///
     /// This only gates the boot-time flag (`--rollup.operator-sdm-opt-in`):
     /// `admin_setOperatorSdmOptIn` can still flip SDM on at runtime after a
@@ -357,11 +359,25 @@ mod tests {
         ));
     }
 
+    /// The other side of `validate_rejects_sdm_together_with_flashblocks`:
+    /// with SDM off, an explicitly tuned publishing config — not just the
+    /// defaults, which the test above already covers — is accepted and handed
+    /// back unchanged, so chaining `validate` cannot silently normalise an
+    /// operator's values.
     #[test]
     fn validate_accepts_flashblocks_without_sdm() {
         let preconf = preconf_with_slot(Duration::from_secs(2));
+        let configured = FlashblockProducerConfig {
+            block_time: Duration::from_millis(250),
+            leeway_time: Duration::from_millis(50),
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 9_999,
+            ring_capacity: 64,
+            broadcast_capacity: 16,
+            best_tx_lead_slices: 2,
+        };
 
-        assert!(cfg().validate(Some(&preconf), false).is_ok());
+        assert_eq!(configured.clone().validate(Some(&preconf), false), Ok(configured));
     }
 
     /// Every slice after the first would then be served by the build-start

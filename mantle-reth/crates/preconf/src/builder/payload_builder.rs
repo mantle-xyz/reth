@@ -1106,11 +1106,20 @@ where
     // `carries_its_senders_nonce` doubles as the SDM refund gate.
     let sdm_refund_possible = carries_its_senders_nonce(tx.inner());
     let tx_rlp_length = tx.length();
-    if info.block_size.admission(tx_rlp_length, sdm_refund_possible) != RawSizeAdmission::Fits {
-        // Both verdicts take the transaction out of this block. `TooLarge` is
-        // permanent, but the pool decides what to do with it next; here the
-        // only choice is to stop offering it.
-        metrics::counter!("preconf.build.tx_over_block_rlp_total").increment(1);
+    let rlp_admission = info.block_size.admission(tx_rlp_length, sdm_refund_possible);
+    if rlp_admission != RawSizeAdmission::Fits {
+        // Both verdicts take the transaction out of this block, and the pool
+        // decides what to do with it next; here the only choice is to stop
+        // offering it. They are counted apart because an operator responds to
+        // them differently: `TooLarge` is permanent — the transaction is
+        // bigger than a whole block's RLP budget, so no block will ever hold
+        // it — while `BlockFull` only says this block ran out of room, which
+        // is a sign of how full blocks are running.
+        if rlp_admission == RawSizeAdmission::TooLarge {
+            metrics::counter!("preconf.build.tx_exceeds_block_rlp_total").increment(1);
+        } else {
+            metrics::counter!("preconf.build.block_rlp_full_skipped_total").increment(1);
+        }
         best_txs.mark_invalid(tx.signer(), tx.nonce());
         return Ok(BestTxStep::Continue);
     }
