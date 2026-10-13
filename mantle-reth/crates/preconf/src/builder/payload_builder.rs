@@ -952,19 +952,27 @@ where
     let Some(tx) = best_txs.next(()) else {
         return Ok(BestTxStep::Done);
     };
-    // This hash was sent through both channels: the pool has it here, and the
-    // fifo has it queued. The preconf arm must be the one to apply it, or the
-    // client that asked for a preconfirmation never gets its receipt. Skipping
-    // does not drop it — the preconf arm holds it.
-    //
-    // A preconf submission on its own never enters the pool, so an entry here
-    // means both channels were used.
-    //
-    // The suite stays green without this guard: the biased `select!` usually
-    // lets the preconf arm get there first anyway.
-    if fifo.contains(tx.hash()).await {
-        best_txs.mark_invalid(tx.sender(), tx.nonce());
-        return Ok(BestTxStep::Continue);
+    // The fifo already holds this hash, for one of two reasons that call for
+    // opposite treatment of the sender's later transactions.
+    match fifo.status_of(tx.hash()).await {
+        // Applied already, so the nonce is spent and the descendants this
+        // snapshot carries are the ones that can run now. Skip this one alone —
+        // the same rule the nonce-too-low branch applies after execution.
+        Some(PreconfStatus::Success) => {
+            metrics::counter!("preconf.build.pool_tx_already_applied_total").increment(1);
+            return Ok(BestTxStep::Continue);
+        }
+        // Still owed: the preconf arm must be the one to apply it, or the
+        // client never gets its receipt. Skipping does not drop it, and the
+        // unspent nonce blocks the descendants.
+        //
+        // The suite stays green without this guard — the biased `select!`
+        // usually lets the preconf arm get there first anyway.
+        Some(PreconfStatus::Waiting) => {
+            best_txs.mark_invalid(tx.sender(), tx.nonce());
+            return Ok(BestTxStep::Continue);
+        }
+        None => {}
     }
 
     // A *different* transaction on a nonce an owed claim holds. The hash check
