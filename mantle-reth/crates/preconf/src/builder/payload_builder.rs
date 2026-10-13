@@ -2289,6 +2289,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             let entries = builder.executor_mut().take_post_exec_entries();
             try_include_post_exec_tx::<N::SignedTx, _>(block_number, entries, |tx| {
                 let recorded = tx.clone();
+                // Taken before `execute_transaction` consumes the transaction.
+                let tx_rlp_length = tx.length();
                 builder.execute_transaction(tx).map(|gas| {
                     let tx_gas_used = gas.tx_gas_used();
                     // Both counters, for the same reason as every other arm —
@@ -2299,10 +2301,15 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     // not because it moves the totals.
                     //
                     // `cumulative_uncompressed_bytes` is deliberately left alone:
-                    // nothing is admitted after this stage, so no size check can
-                    // read it again, and the sealed block's real length is
-                    // validated directly at finalize.
+                    // nothing is admitted after this stage, so no running total
+                    // is read again. For the same reason the RLP budget below is
+                    // recorded for shape-consistency with the other arms rather
+                    // than for any later check to consume — the sealed block's
+                    // real length is validated directly at finalize.
                     info.accumulate_gas(tx_gas_used, tx_gas_used);
+                    // Swaps the virtual per-transaction reserve for the real
+                    // item. The post-exec transaction is never itself refundable.
+                    info.block_size.record_post_exec(tx_rlp_length);
                     // The closing slice is published after this stage, so leaving
                     // the transaction out would make the published slices stop
                     // one short of the sealed block.
