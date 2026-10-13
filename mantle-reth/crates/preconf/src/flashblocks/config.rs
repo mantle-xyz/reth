@@ -124,21 +124,27 @@ pub enum FlashblockProducerConfigError {
     RequiresPreconfEnabled,
     /// SDM production and flashblocks publishing are both on. The producer
     /// appends the SDM post-exec transaction to the closing slice's
-    /// `transactions`; the consumer replays it as a state-free no-op instead
-    /// of applying the real gas refund, because it does not run the payload
-    /// verification the canonical block executor applies. That leaves the
-    /// consumer's pending/preconf overlay missing a refund the sealed block
-    /// actually includes until the next canonical block resynchronises it —
-    /// a transient pending-state inaccuracy, not a chain split. The 1.6.3
-    /// wire protocol has an out-of-band field for the post-exec transaction
-    /// that no producer fills yet.
+    /// `transactions`; the consumer short-circuits it to a state-free no-op
+    /// rather than running it, the same way the canonical block executor
+    /// does — the gas refunds the entries describe are applied by the
+    /// surrounding post-exec machinery, not by executing this transaction.
+    /// What the consumer skips is the payload verification
+    /// (`verify_post_exec_tx`) the canonical executor additionally runs
+    /// against it. The consumer's replayed pending/preconf overlay does not
+    /// reproduce that surrounding machinery, so it omits the refunds until
+    /// the next canonical block resynchronises state — a transient
+    /// pending-state inaccuracy, not a chain split. The 1.6.3 wire protocol
+    /// has an out-of-band field for the post-exec transaction that no
+    /// producer fills yet.
     ///
     /// This only gates the boot-time flag (`--rollup.operator-sdm-opt-in`):
     /// `admin_setOperatorSdmOptIn` can still flip SDM on at runtime after a
     /// node has started with flashblocks already publishing.
     #[error(
-        "--flashblocks.enable cannot be combined with SDM production until the \
-         post-exec transaction is carried out of band"
+        "--flashblocks.enable refuses this startup configuration while \
+         --rollup.operator-sdm-opt-in is also set, because the post-exec \
+         transaction is not yet carried out of band; this does not prevent \
+         enabling SDM at runtime via admin_setOperatorSdmOptIn"
     )]
     SdmNotSupportedWithFlashblocks,
 }
