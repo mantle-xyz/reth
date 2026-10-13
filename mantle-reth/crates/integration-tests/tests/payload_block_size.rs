@@ -23,9 +23,12 @@ use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::{AccessList, AccessListItem, TransactionInput, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
+use futures_util::StreamExt;
 use mantle_reth_cli::node::MantleNode;
+use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 use mantle_reth_preconf::{
     PreconfConfig, PreconfError, PreconfReceipt, PreconfServiceBuilder, PreconfStatus,
+    flashblocks::FlashblockProducerConfig,
     preconf_tx_set::{AdmitRequest, Capacity},
     types::PreconfSource,
 };
@@ -48,6 +51,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 const BLOCK_GAS_LIMIT: u64 = 80_000_000;
 const LARGE_TX_GAS: u64 = 1_021_000;
@@ -858,6 +862,206 @@ async fn sdm_production_appends_no_post_exec_transaction_under_the_shipped_refun
                  `record_post_exec` needs behavioural coverage"
             );
             assert_valid_size(&node, &payload);
+        },
+    )
+    .await;
+}
+
+// ──────────────────── the budget across slice boundaries ────────────────────
+//
+// Every case above builds the block in one piece. The budget lives in a single
+// `ExecutionInfo`, created once before the build loop and carried to the seal,
+// so publishing the block in slices must not restart it. Nothing above would
+// notice if it did: none of them publishes a slice, and a budget rebuilt at
+// each boundary never comes near the packing target, because no one slice
+// carries anything like a block's worth of bytes.
+
+/// Slice cadence for the sliced case.
+///
+/// Wide enough that the whole block is not published in a handful of
+/// megabyte-scale messages the subscriber has to keep up with, narrow enough
+/// that both legs below cross several boundaries.
+const SLICE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the block is held open before the second batch is injected.
+///
+/// Spans several [`SLICE_INTERVAL`]s so the first batch has executed and gone
+/// out in a published slice before anything else arrives.
+const FIRST_LEG: Duration = Duration::from_millis(800);
+
+/// How long the block is held open after the second batch is injected.
+///
+/// Mid-build arrivals are only seen when the pool iterator is rebuilt, which
+/// happens on a tick, so this has to cover that tick plus the execution of
+/// everything the budget still has room for. Well short of the three slots at
+/// which the stall watchdog abandons the job.
+const SECOND_LEG: Duration = Duration::from_millis(2_000);
+
+/// Publisher config for the sliced case. The port is left to the OS so
+/// concurrent tests never collide; everything but the cadence is the shipped
+/// default.
+fn flashblocks_cfg() -> FlashblockProducerConfig {
+    FlashblockProducerConfig {
+        addr: std::net::Ipv4Addr::LOCALHOST.into(),
+        port: 0,
+        block_time: SLICE_INTERVAL,
+        ..Default::default()
+    }
+}
+
+/// Drain the publisher into a shared buffer for as long as it keeps sending.
+///
+/// Reading only once the block is sealed does not work here: a slice of this
+/// block carries megabytes, and a subscriber still writing one out while the
+/// next ticks arrive falls behind the broadcast and has its subscription
+/// ended — so the tail of the block would be missing for a reason that has
+/// nothing to do with what is being measured.
+fn collect_slices(
+    mut subscriber: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+) -> Arc<std::sync::Mutex<Vec<MantleFlashblockPayload>>> {
+    let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&collected);
+    tokio::spawn(async move {
+        while let Some(Ok(message)) = subscriber.next().await {
+            if let Message::Text(text) = message {
+                let slice = serde_json::from_str::<MantleFlashblockPayload>(&text)
+                    .expect("the publisher emits decodable slices");
+                sink.lock().expect("collector mutex").push(slice);
+            }
+        }
+    });
+    collected
+}
+
+/// The bytes a slice announced, measured as EIP-2718 payloads.
+///
+/// A block-body item is that plus an RLP string wrapper — four bytes on a
+/// transaction of this size. The margins asserted against are megabytes, so the
+/// difference cannot decide anything here.
+fn slice_bytes(slice: &MantleFlashblockPayload) -> usize {
+    slice.diff.transactions.iter().map(|tx| tx.len()).sum()
+}
+
+/// A block published in slices is bounded as one block, not as a run of them.
+///
+/// The fixture is the one [`preconf_pool_stops_before_the_rlp_cap`] uses, split
+/// so that half of it arrives after the block has already published slices
+/// carrying the other half. The block stops at the same capacity either way,
+/// and it can only do that by counting the bytes of slices already sent. Give
+/// each slice its own budget and nothing is ever refused — the fixture fits the
+/// block's gas limit, so the pool arm runs through all 78 and seals a block
+/// over the protocol cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_rlp_budget_accumulates_across_slice_boundaries() {
+    let spec = chain_spec(false);
+    let chain_id = spec.chain().id();
+    let txs = large_transactions(chain_id, 78).await;
+    // `large_transactions` gives each sender four consecutive nonces, so a split
+    // on a multiple of four leaves the two legs with disjoint senders and no
+    // nonce gap between them.
+    let (early, late) = txs.split_at(40);
+    let (early, late) = (early.to_vec(), late.to_vec());
+    let (mut service, _dir) = preconf_service().await;
+    service.bind_flashblocks(flashblocks_cfg()).expect("flashblocks endpoint binds");
+    let fb_addr = service.flashblocks().expect("just bound").publisher().local_addr();
+
+    with_configured_mantle_node(
+        MantleNode::default().with_preconf(service),
+        spec,
+        attributes,
+        TreeConfig::default(),
+        move |mut node, _| async move {
+            let (subscriber, _) = connect_async(format!("ws://{fb_addr}"))
+                .await
+                .expect("subscriber connects to the publisher");
+            let collected = collect_slices(subscriber);
+
+            for tx in &early {
+                node.rpc
+                    .inject_tx(tx.encoded_2718().into())
+                    .await
+                    .expect("funded pool tx accepted");
+            }
+
+            let attrs = node.payload.next_attributes();
+            let payload_id = node
+                .inner
+                .add_ons_handle
+                .beacon_engine_handle
+                .fork_choice_updated(node.current_forkchoice_state().unwrap(), Some(attrs))
+                .await
+                .expect("FCU starts payload job")
+                .payload_id
+                .expect("payload id");
+
+            tokio::time::sleep(FIRST_LEG).await;
+            for tx in &late {
+                node.rpc.inject_tx(tx.encoded_2718().into()).await.expect("late pool tx accepted");
+            }
+            tokio::time::sleep(SECOND_LEG).await;
+
+            let payload = tokio::time::timeout(
+                Duration::from_secs(60),
+                node.inner.payload_builder_handle.resolve_kind(payload_id, PayloadKind::Earliest),
+            )
+            .await
+            .expect("builder finishes")
+            .expect("payload job exists")
+            // The budget's last line of defence, and the first thing a
+            // per-slice budget trips: the pool arm packs past the consensus cap
+            // and `validate_final_rlp_length` refuses the finished block, so the
+            // node produces none at all.
+            .expect("the sliced block must seal");
+
+            let slices = collected.lock().expect("collector mutex").clone();
+            let carrying: Vec<usize> = slices
+                .iter()
+                .map(|slice| slice.diff.transactions.len())
+                .filter(|count| *count > 0)
+                .collect();
+
+            // Premise one: the block really did record transactions on both
+            // sides of a boundary. One slice carrying everything would leave
+            // nothing for the budget to carry over.
+            assert!(
+                carrying.len() >= 2,
+                "the block has to record transactions in more than one slice; slices carried \
+                 {carrying:?}"
+            );
+
+            // Premise two: a budget that started fresh at each boundary would
+            // have had room for every slice this block published, so it would
+            // have refused nothing and the block would have run on to its gas
+            // limit. SDM production is off here, as it is in the build, which
+            // is what makes a slice's whole payload equivalent to its
+            // transactions recorded one at a time.
+            let fresh = BlockSizeBudget::new(true, true, payload.block().number, false);
+            for (index, slice) in slices.iter().enumerate() {
+                let bytes = slice_bytes(slice);
+                assert_eq!(
+                    fresh.admission(bytes, true),
+                    RawSizeAdmission::Fits,
+                    "slice {index} carries {bytes} bytes, enough to reach the packing target on \
+                     its own — this case cannot then tell a block budget from a per-slice one"
+                );
+            }
+
+            // The claim: slicing moved the capacity not at all.
+            let included = payload.block().body().transactions.len();
+            assert_eq!(
+                included, 67,
+                "the sliced block must stop at the capacity the unsliced one stops at"
+            );
+            assert!(
+                payload.block().rlp_length() < PACKING_TARGET,
+                "the whole block, not each slice, has to stay under the packing target"
+            );
+            assert_valid_size(&node, &payload);
+            eprintln!(
+                "sliced pool block: {included} txs, {} RLP bytes, {} slices carrying {carrying:?}",
+                payload.block().rlp_length(),
+                slices.len(),
+            );
         },
     )
     .await;
