@@ -359,9 +359,11 @@ pub struct PreconfArgs {
     pub max_gas_per_block: Option<u64>,
 
     /// How much backlog the preconf queue will hold, in blocks' worth of
-    /// `preconf.max-gas-per-block`. Default `1` — a request queued behind more
-    /// than that cannot land before its own deadline, so it is refused on
-    /// arrival rather than left to time out.
+    /// `preconf.max-gas-per-block`. Default `8` — a backstop against a flood,
+    /// not a restatement of the per-block budget: overflowing a single block is
+    /// ordinary and recoverable, and refusing that at admission would remove a
+    /// recovery path that exists on purpose. See
+    /// `DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`.
     #[arg(long = "preconf.queue-gas-blocks")]
     pub queue_gas_blocks: Option<u64>,
 
