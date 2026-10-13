@@ -884,7 +884,7 @@ impl PreconfTxSet {
             if inner.entries.contains_key(&existing_hash) {
                 return PushResult::ConflictActive(existing_hash);
             }
-            // Invariant violation: `by_sender[(from, nonce)]` points at a hash
+            // Invariant violation: `by_sender[from][nonce]` points at a hash
             // with no entry. Both halves are needed — `drop_hash` alone skips
             // `by_sender` because the entry is already gone, and the new insert
             // cannot claim the slot until it is cleared.
@@ -897,7 +897,7 @@ impl PreconfTxSet {
             );
             debug_assert!(
                 false,
-                "by_sender[({from:?}, {nonce})] -> {existing_hash:?} but entry missing"
+                "by_sender[{from:?}][{nonce}] -> {existing_hash:?} but entry missing"
             );
             PreconfTxSetInner::unindex_sender_nonce(&mut inner.by_sender, from, nonce);
             inner.drop_hash(&existing_hash);
@@ -2793,15 +2793,15 @@ mod tests {
         assert!(std::mem::size_of::<TxEntryView>() < std::mem::size_of::<TxEntry>());
     }
 
-    /// `push_if_absent` self-heal path: `by_sender[(from, nonce)] = ghost`
-    /// with no matching `entries[ghost]`. In debug builds this trips a
-    /// `debug_assert!` (intentional dev-time signal), so this test runs
-    /// only in release mode. `cargo test --release` executes it.
+    /// `push_if_absent` self-heal path: `by_sender[from][nonce] = ghost`
+    /// with no matching `entries[ghost]`. Reaching that state trips a
+    /// `debug_assert!` (intentional dev-time signal), so the test is compiled
+    /// everywhere but only runs under `cargo test --release`.
     ///
     /// TODO: replace with `tracing-test` capture to also verify the
     /// `error!()` line fires. For now assert observable side effects only.
     #[tokio::test]
-    #[cfg(not(debug_assertions))]
+    #[cfg_attr(debug_assertions, ignore = "the self-heal path trips a debug_assert; release only")]
     async fn push_if_absent_self_heals_dangling_by_sender() {
         let set = PreconfTxSet::new(4);
         let ghost = h(9);
@@ -2811,7 +2811,7 @@ mod tests {
         // Prime by_sender + order with ghost — no entries[ghost].
         {
             let mut inner = set.inner.lock().await;
-            inner.by_sender.insert((from, nonce), ghost);
+            inner.by_sender.entry(from).or_default().insert(nonce, ghost);
             inner.order.push_back(ghost);
         }
 
@@ -2823,7 +2823,7 @@ mod tests {
 
         let inner = set.inner.lock().await;
         // by_sender now points at the real hash, not ghost.
-        assert_eq!(inner.by_sender.get(&(from, nonce)), Some(&h(1)));
+        assert_eq!(inner.by_sender.get(&from).and_then(|nonces| nonces.get(&nonce)), Some(&h(1)));
         // Ghost cleaned from order; only real hash remains.
         assert!(!inner.order.contains(&ghost));
         assert!(inner.order.contains(&h(1)));
