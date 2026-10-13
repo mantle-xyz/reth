@@ -693,6 +693,11 @@ where
     // the 2718 payload the line above counts. `tx_rlp_length` is the same value
     // the admission check used, so the reservation and the record agree. A false
     // receipt status still means the transaction was included by the executor.
+    //
+    // The refund flag is a constant `true` here where the other arms call
+    // `carries_its_senders_nonce`: a queued commitment is an
+    // `alloy_consensus::TxEnvelope`, which has no deposit and no post-exec
+    // variant, so that predicate could only ever return `true` for one.
     info.block_size.record_transaction(tx_rlp_length, true);
     record_executed(info, fifo, recovered, false);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
@@ -849,6 +854,10 @@ where
     let gas_used = info.cumulative_gas_used;
     let admission = combined_preconf_admission(
         preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source),
+        // Constant `true` for the SDM refund flag, for the same reason the
+        // matching `record_transaction` in `apply_preconf_with_da` uses one:
+        // `entry.tx` is an `alloy_consensus::TxEnvelope`, which has no deposit
+        // and no post-exec variant.
         info.block_size.admission(tx_rlp_length, true),
         tx_rlp_length,
         source,

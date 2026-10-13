@@ -498,10 +498,27 @@ async fn mandatory_case(preconf: bool, count: usize) {
             let result =
                 if preconf { build(&mut node, attrs).await } else { build_normal(&node, attrs) };
             if count == 78 {
-                assert!(
-                    result.is_err(),
-                    "oversized mandatory attributes must fail before publishing an executed payload"
+                let err = result.expect_err(
+                    "oversized mandatory attributes must fail before publishing an executed \
+                     payload",
                 );
+                if preconf {
+                    // The preconf job reports a build task that exited without
+                    // a payload as `MissingPayload` and keeps the cause in the
+                    // log, so the cause can only be pinned on the ordinary
+                    // builder's leg below. What is pinned here is the safety
+                    // property both legs share: nothing was published.
+                    assert!(
+                        matches!(err, PayloadBuilderError::MissingPayload),
+                        "the build must end with no payload; got: {err}"
+                    );
+                } else {
+                    assert!(
+                        err.to_string().contains("exceeds maximum"),
+                        "the refusal must be the final block-size check rather than any other \
+                         build failure; got: {err}"
+                    );
+                }
             } else {
                 let payload = result.expect("legal mandatory attributes");
                 assert_eq!(payload.block().body().transactions.len(), count);
@@ -648,9 +665,15 @@ async fn raw_size_defer_preserves_same_sender_successors() {
 // sized so that they do.
 
 /// Replay `txs` into a budget shaped exactly as the builder shapes one for a
-/// Mantle Osaka block with SDM production off, measuring each item with `measure`.
-fn replay_budget(txs: &[TxEnvelope], measure: fn(&TxEnvelope) -> usize) -> BlockSizeBudget {
-    let mut budget = BlockSizeBudget::new(true, true, 1, false);
+/// Mantle Osaka block, measuring each item with `measure`. `sdm_enabled` is the
+/// builder's SDM production gate, which decides whether each recorded
+/// transaction also reserves a refund entry.
+fn replay_budget(
+    txs: &[TxEnvelope],
+    measure: fn(&TxEnvelope) -> usize,
+    sdm_enabled: bool,
+) -> BlockSizeBudget {
+    let mut budget = BlockSizeBudget::new(true, true, 1, sdm_enabled);
     for tx in txs {
         budget.record_transaction(measure(tx), true);
     }
@@ -724,8 +747,8 @@ async fn pool_admission_counts_the_block_body_item_not_the_2718_payload() {
     let chain_id = spec.chain().id();
     let mandatory = large_transactions(chain_id, 67).await;
 
-    let exact = replay_budget(&mandatory, |tx| tx.length());
-    let undercount = replay_budget(&mandatory, |tx| tx.encode_2718_len());
+    let exact = replay_budget(&mandatory, |tx| tx.length(), false);
+    let undercount = replay_budget(&mandatory, |tx| tx.encode_2718_len(), false);
     let headroom = largest_admissible(&exact);
     let undercount_headroom = largest_admissible(&undercount);
     assert!(
@@ -816,17 +839,28 @@ async fn pool_admission_counts_the_block_body_item_not_the_2718_payload() {
 
 /// Stage 4 appends an SDM post-exec refund transaction and swaps the budget's
 /// per-transaction reserve for that transaction's real RLP item
-/// (`BlockSizeBudget::record_post_exec`). It never runs on a node built from
-/// this repository: entries are only accumulated for a transaction whose refund
-/// is non-zero, and the refund policy the open-source builder installs —
-/// `alloy_op_evm::post_exec::NullRefundPolicy` — refunds nothing, so the
-/// entry list is always empty and no transaction is appended.
+/// (`BlockSizeBudget::record_post_exec`). It never runs on the shipped Mantle
+/// node: entries are only accumulated for a transaction whose refund is
+/// non-zero, and the refund policy this builder installs —
+/// `alloy_op_evm::post_exec::NullRefundPolicy` — refunds nothing, so the entry
+/// list is always empty and no transaction is appended.
 ///
 /// Asserted rather than left as a note, because the coverage of that line rests
-/// on it. Both halves of the production gate are switched on here, so a refund
-/// policy that actually refunds turns this test red — which is exactly the
-/// change that makes the post-exec budget swap reachable and owing a
-/// behavioural test of its own.
+/// on it. A refund policy that actually refunds turns this test red — which is
+/// exactly the change that makes the post-exec budget swap reachable and owing
+/// a behavioural test of its own.
+///
+/// Both halves of the production gate have to be observably on for that to mean
+/// anything, and neither is taken on trust. The protocol half is asserted off
+/// the chain spec. The operator half travels `RollupArgs` → `OpNode` →
+/// `MantleNode` → `OpBuilderConfig` → `OpPayloadBuilderCtx::sdm_production_enabled`,
+/// and a break anywhere along it would leave Stage 4 skipped and this test green
+/// while guarding nothing — so the end of that journey is observed rather than
+/// assumed, through the one effect the gate has that is visible from outside the
+/// builder: with SDM on, every recorded transaction also reserves a maximum-width
+/// refund entry, so the block's optional-packing headroom shrinks. The probe is
+/// sized into exactly that difference, and the builder refusing it is the
+/// builder saying the flag arrived.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sdm_production_appends_no_post_exec_transaction_under_the_shipped_refund_policy() {
     let spec = sdm_chain_spec();
@@ -835,7 +869,44 @@ async fn sdm_production_appends_no_post_exec_transaction_under_the_shipped_refun
         spec.is_lagoon_active_at_timestamp(u64::MAX),
         "the protocol half of the SDM gate must really be on, or this proves nothing"
     );
-    let mandatory = large_transactions(chain_id, 4).await;
+    let mandatory = large_transactions(chain_id, 67).await;
+
+    // The same fixture against the two budgets the builder could end up with.
+    // The SDM-on budget carries 67 refund reserves the other does not, so it has
+    // strictly less room left for an optional transaction.
+    let sdm_off = replay_budget(&mandatory, |tx| tx.length(), false);
+    let sdm_on = replay_budget(&mandatory, |tx| tx.length(), true);
+    let off_headroom = largest_admissible(&sdm_off);
+    let on_headroom = largest_admissible(&sdm_on);
+    assert!(
+        off_headroom > on_headroom,
+        "the refund reserves must cost headroom, or there is no gap to probe"
+    );
+
+    let signer = Wallet::new(20).with_chain_id(chain_id).wallet_gen()[19].clone();
+    // One byte above what the SDM-on budget allows, up to what the SDM-off
+    // budget would allow. The lower half of that span keeps the probe clear of
+    // the far edge, where its own reserve decides the verdict.
+    let span = off_headroom - on_headroom;
+    let probe =
+        probe_sized_into(signer.clone(), chain_id, 0, on_headroom + 1..=on_headroom + span / 2)
+            .await;
+    assert_eq!(
+        sdm_on.admission(probe.length(), true),
+        RawSizeAdmission::BlockFull,
+        "a builder that got the operator flag must refuse this probe"
+    );
+    assert_eq!(
+        sdm_off.admission(probe.length(), true),
+        RawSizeAdmission::Fits,
+        "a builder that lost it must admit it — that disagreement is what the build decides"
+    );
+    let probe_hash = *probe.tx_hash();
+    eprintln!(
+        "SDM headroom: {off_headroom} bytes off, {on_headroom} bytes on; probe {} bytes",
+        probe.length()
+    );
+
     let (service, _dir) = preconf_service().await;
     // The operator half of the gate — the same flag `admin_setOperatorSdmOptIn`
     // toggles at runtime.
@@ -847,6 +918,10 @@ async fn sdm_production_appends_no_post_exec_transaction_under_the_shipped_refun
         attributes,
         TreeConfig::default(),
         move |mut node, _| async move {
+            node.rpc
+                .inject_tx(probe.encoded_2718().into())
+                .await
+                .expect("funded probe accepted by the pool");
             let mut attrs = mandatory_attributes(&mut node, &mandatory);
             // Entries are only produced while the node sequences its own block:
             // `no_tx_pool` means "reproduce what the consensus layer derived",
@@ -855,13 +930,33 @@ async fn sdm_production_appends_no_post_exec_transaction_under_the_shipped_refun
             attrs.0.no_tx_pool = Some(false);
             let payload = build(&mut node, attrs).await.expect("SDM-enabled block");
             let body = &payload.block().body().transactions;
-            assert_eq!(body.len(), mandatory.len(), "the block holds the mandatory txs alone");
             assert!(
                 !body.iter().any(|tx| tx.ty() == op_alloy_consensus::POST_EXEC_TX_TYPE_ID),
                 "a post-exec transaction here means the refund policy now refunds, and \
                  `record_post_exec` needs behavioural coverage"
             );
+            assert!(
+                !sealed_hashes(&payload).contains(&probe_hash),
+                "the pool arm admitted a probe only an SDM-off budget has room for, so the \
+                 operator opt-in never reached the builder's config and Stage 4 was skipped"
+            );
+            assert_eq!(body.len(), mandatory.len(), "the block holds the mandatory txs alone");
             assert_valid_size(&node, &payload);
+
+            // Why the probe was left out, not just that it was: anything else
+            // that could have refused it — its gas, its DA footprint, its nonce,
+            // the pool never having held it — refuses it here too, against the
+            // same node and the same pool but a block with room to spare.
+            let head = node.submit_payload(payload.clone()).await.unwrap();
+            node.update_forkchoice(head, head).await.unwrap();
+            let attrs = node.payload.next_attributes();
+            let control = build(&mut node, attrs).await.expect("control block");
+            assert!(
+                sealed_hashes(&control).contains(&probe_hash),
+                "the probe never became includable, so its absence above says nothing about \
+                 the operator gate"
+            );
+            assert_valid_size(&node, &control);
         },
     )
     .await;
@@ -956,6 +1051,11 @@ async fn the_rlp_budget_accumulates_across_slice_boundaries() {
     let spec = chain_spec(false);
     let chain_id = spec.chain().id();
     let txs = large_transactions(chain_id, 78).await;
+    // The same premise `pool_case` states, and this case needs it too: a
+    // per-slice budget refuses nothing and packs the whole fixture, which only
+    // fails the build if the fixture is genuinely over the protocol cap.
+    let candidate_bytes: usize = txs.iter().map(Encodable::length).sum();
+    assert!(candidate_bytes > HARD_CAP, "fixture must exceed the protocol cap");
     // `large_transactions` gives each sender four consecutive nonces, so a split
     // on a multiple of four leaves the two legs with disjoint senders and no
     // nonce gap between them.

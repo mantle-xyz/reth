@@ -285,10 +285,15 @@ mod tests {
     /// arms set aside is dropped and the real item takes its place, leaving the
     /// budget holding exactly the block's transactions.
     ///
-    /// Covered here rather than against a real build because the open-source
+    /// Covered here rather than against a real build because the Mantle
     /// builder installs `alloy_op_evm::post_exec::NullRefundPolicy`, which
     /// refunds nothing: Stage 4 accumulates no entries and appends no
-    /// transaction, so no node built from this repository reaches the swap.
+    /// transaction, so the shipped node never reaches the swap. A policy that
+    /// does refund exists in the tree — `FixedRefundPolicy` in
+    /// `op-reth/crates/sdm-fixture-node` — but that crate is test-only, kept
+    /// out of production images, and swaps the stock payload service rather
+    /// than this builder.
+    ///
     /// The integration suite pins that premise
     /// (`sdm_production_appends_no_post_exec_transaction_under_the_shipped_refund_policy`);
     /// this pins what the swap must do once a refund policy makes it reachable.
