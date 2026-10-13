@@ -1,7 +1,7 @@
 //! Persistent upstream websocket connection with backoff and resume.
 
 use std::{
-    io::Write,
+    io::Read,
     time::{Duration, Instant},
 };
 
@@ -370,6 +370,9 @@ fn parse_flashblock_position(data: &str) -> Option<(u64, u64)> {
 /// `MAX_DECOMPRESSED_FLASHBLOCK_BYTES`. Bounds the allocation a hostile or
 /// misconfigured upstream can force by sending a small, highly compressible
 /// payload.
+///
+/// The two ceilings are hardcoded independently — `mantle-reth-flashblocks-types`
+/// is only a dev-dependency here — so changing one means changing the other.
 const MAX_BINARY_SLICE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Recovers the slice JSON from a binary frame.
@@ -391,12 +394,15 @@ fn decode_binary_slice(data: &[u8]) -> Option<String> {
     }
 
     let mut decompressed = Vec::new();
+    // Read one byte past the ceiling: enough to tell "exactly at the limit"
+    // from "over it" without ever buffering more than that. Mirrors the
+    // consumer's `decompress`.
+    if let Err(error) = brotli::Decompressor::new(data, 4096)
+        .take(MAX_BINARY_SLICE_BYTES as u64 + 1)
+        .read_to_end(&mut decompressed)
     {
-        let mut decoder = brotli::DecompressorWriter::new(&mut decompressed, 4096);
-        if let Err(error) = decoder.write_all(data) {
-            warn!(%error, "failed to brotli-decompress a binary frame");
-            return None;
-        }
+        warn!(%error, "failed to brotli-decompress a binary frame");
+        return None;
     }
 
     if decompressed.len() > MAX_BINARY_SLICE_BYTES {
@@ -414,6 +420,7 @@ fn decode_binary_slice(data: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Write,
         net::SocketAddr,
         sync::{Arc, Mutex},
     };
@@ -703,6 +710,29 @@ mod tests {
             None,
             "over the size limit"
         );
+    }
+
+    /// A compression bomb clears the pre-decompression check — the frame is
+    /// kilobytes — so only the check after decompression can refuse it.
+    ///
+    /// That the decoder is bounded, and so never materializes the expansion,
+    /// is not observable here: an unbounded decoder returns `None` too, just
+    /// after allocating the whole thing. Boundedness rests on the `take` in
+    /// `decode_binary_slice`, not on this test.
+    #[test]
+    fn a_frame_that_expands_past_the_ceiling_is_rejected() {
+        let mut bomb = Vec::new();
+        {
+            let mut compressor = brotli::CompressorWriter::new(&mut bomb, 4096, 5, 22);
+            compressor.write_all(&vec![b'a'; MAX_BINARY_SLICE_BYTES * 2]).expect("compresses");
+        }
+
+        assert!(
+            bomb.len() < MAX_BINARY_SLICE_BYTES,
+            "the frame itself must clear the pre-decompression check, got {} bytes",
+            bomb.len()
+        );
+        assert_eq!(decode_binary_slice(&bomb), None, "expands past the ceiling");
     }
 
     #[test]
