@@ -1007,13 +1007,31 @@ async fn the_rlp_budget_accumulates_across_slice_boundaries() {
             .await
             .expect("builder finishes")
             .expect("payload job exists")
-            // The budget's last line of defence, and the first thing a
-            // per-slice budget trips: the pool arm packs past the consensus cap
-            // and `validate_final_rlp_length` refuses the finished block, so the
-            // node produces none at all.
-            .expect("the sliced block must seal");
+            .expect(
+                "the sliced block must seal. A MissingPayload here means the build produced \
+                 nothing, and the likeliest cause is the block RLP budget no longer accumulating \
+                 across slice boundaries: reset it per slice and no slice ever approaches the \
+                 packing target, so the pool arm refuses nothing, packs the whole fixture, and \
+                 `validate_final_rlp_length` rejects the finished block for exceeding the \
+                 consensus cap — the builder logs both byte counts at WARN. A stall-watchdog \
+                 timeout would surface here too, so check that log line before suspecting the \
+                 timings above",
+            );
 
-            let slices = collected.lock().expect("collector mutex").clone();
+            // Only this build's slices. The published stream is keyed by
+            // payload id, and premise one counts slices rather than blocks: two
+            // single-slice builds would otherwise satisfy it without a boundary
+            // ever being crossed. Nothing else can reach this subscriber today —
+            // one build, and a bare `ws://` connect replays no archive — so this
+            // excludes nothing now and keeps premise one honest if the harness
+            // ever advances a second block or rebuilds this height.
+            let slices: Vec<_> = collected
+                .lock()
+                .expect("collector mutex")
+                .iter()
+                .filter(|slice| slice.payload_id == payload_id)
+                .cloned()
+                .collect();
             let carrying: Vec<usize> = slices
                 .iter()
                 .map(|slice| slice.diff.transactions.len())
@@ -1029,12 +1047,20 @@ async fn the_rlp_budget_accumulates_across_slice_boundaries() {
                  {carrying:?}"
             );
 
-            // Premise two: a budget that started fresh at each boundary would
-            // have had room for every slice this block published, so it would
-            // have refused nothing and the block would have run on to its gas
-            // limit. SDM production is off here, as it is in the build, which
-            // is what makes a slice's whole payload equivalent to its
-            // transactions recorded one at a time.
+            // Premise two: no slice this block published is anywhere near the
+            // packing target on its own. SDM production is off here, as it is
+            // in the build, so a budget records a slice's whole payload exactly
+            // as it records its transactions one at a time, and this is the
+            // budget's own verdict rather than a restatement of its arithmetic.
+            //
+            // What this establishes on its own is only that each slice *fits* a
+            // fresh budget. The step to "a per-slice budget would have refused
+            // nothing" — which needs room for the next transaction too, not
+            // just the ones already in — is carried by the whole-block
+            // assertion below: every slice is a subset of a block that itself
+            // comes in under the target, so no prefix of it plus anything the
+            // block went on to contain can reach the target either. Remove that
+            // assertion and this premise stops covering the gap.
             let fresh = BlockSizeBudget::new(true, true, payload.block().number, false);
             for (index, slice) in slices.iter().enumerate() {
                 let bytes = slice_bytes(slice);
@@ -1054,7 +1080,8 @@ async fn the_rlp_budget_accumulates_across_slice_boundaries() {
             );
             assert!(
                 payload.block().rlp_length() < PACKING_TARGET,
-                "the whole block, not each slice, has to stay under the packing target"
+                "the whole block, not each slice, has to stay under the packing target — this \
+                 also carries the last step of premise two"
             );
             assert_valid_size(&node, &payload);
             eprintln!(
