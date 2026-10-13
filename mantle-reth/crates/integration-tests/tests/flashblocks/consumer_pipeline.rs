@@ -128,8 +128,12 @@ async fn a_slice_for_an_already_canonical_block_is_skipped() {
 /// This still only covers a post-exec transaction appended to `transactions`.
 /// The 1.6.3 consumer protocol carries it out of band in the slice's
 /// `post_exec_tx` field with replace-not-append semantics, and our producer does
-/// not yet do that — so producing flashblocks with SDM enabled is an untested
-/// combination that nothing currently refuses.
+/// not yet do that — so producing flashblocks with SDM enabled remains an
+/// untested combination. `FlashblockProducerConfig::validate` refuses it at
+/// boot (`--rollup.operator-sdm-opt-in` together with `--flashblocks.enable`),
+/// but that gate only sees the CLI flag: `admin_setOperatorSdmOptIn` can still
+/// turn SDM on at runtime after a node has started with flashblocks already
+/// publishing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_carrying_a_post_exec_transaction_replays_it_as_a_noop() {
     use alloy_network::eip2718::Encodable2718;

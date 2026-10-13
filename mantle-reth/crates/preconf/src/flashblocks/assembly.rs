@@ -79,9 +79,12 @@ pub fn build_flashblock<T: SignedTransaction>(
             // out of band with replace-not-append semantics. This producer still
             // appends it to `transactions` in a closing slice, so a node producing
             // flashblocks with SDM enabled publishes slices the 1.6.3 consumer
-            // protocol does not describe. Nothing currently refuses the
-            // combination, and nothing could refuse it at startup alone:
-            // `admin_setOperatorSdmOptIn` can turn SDM on while the node runs.
+            // protocol does not describe. `FlashblockProducerConfig::validate`
+            // refuses this combination at boot
+            // (`--rollup.operator-sdm-opt-in` together with
+            // `--flashblocks.enable`), but that only covers the CLI flag:
+            // `admin_setOperatorSdmOptIn` can still turn SDM on at runtime,
+            // after the gate has already passed.
             post_exec_tx: None,
             // Accumulating totals, so a consumer reads the header field it is
             // reconstructing rather than having to sum slices itself.
