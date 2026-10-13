@@ -253,7 +253,14 @@ async fn published_slices_are_a_prefix_of_the_sealed_block() {
 /// is needed is one tick to pick them up and a long gap before the next, which
 /// a second makes hundreds of milliseconds wide rather than a coin flip.
 fn wide_enough_to_have_a_tail() -> FlashblockProducerConfig {
-    FlashblockProducerConfig { block_time: Duration::from_secs(1), ..flashblocks_cfg() }
+    FlashblockProducerConfig {
+        block_time: Duration::from_secs(1),
+        // Tail tests are about the gap between the last tick and the seal, not
+        // about snapshot timing. This window holds one boundary, so any lead
+        // would spend it waiting and nothing would reach the block.
+        best_tx_lead_slices: 0,
+        ..flashblocks_cfg()
+    }
 }
 
 /// Open a block, inject five transactions into it, and wait until they have
@@ -638,5 +645,73 @@ async fn gas_used_accumulates_across_slices_and_lands_on_the_block() {
     assert!(
         reported.last().is_some_and(|last| *last <= sealed_gas),
         "the final slice reported more gas than the sealed block used ({sealed_gas}): {reported:?}",
+    );
+}
+
+/// Opens a block, injects one transaction *after* the build has started, and
+/// reports whether it reached the sealed block.
+///
+/// Injecting mid-build is the point: the build-start snapshot is already taken,
+/// so the only way in is a boundary refresh — what the lead holds back.
+async fn a_mid_build_transaction_lands(lead: u64) -> bool {
+    let sender = Wallet::default().inner.address();
+    let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
+    let fb = FlashblockProducerConfig { best_tx_lead_slices: lead, ..flashblocks_cfg() };
+    let (mut node, _http, wallet, chain_id, _fb_addr) =
+        crate::launch_flashblocks_node!(cfg, fb).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let tx_hash = keccak256(&raw);
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    // The build is already running. Let it tick once, then inject.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    node.rpc.inject_tx(raw).await.expect("inject transfer");
+
+    // Six more tick intervals for a refreshed snapshot to pick it up.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    payload
+        .block()
+        .body()
+        .transactions()
+        .any(|tx| keccak256(Bytes::from(tx.encoded_2718())) == tx_hash)
+}
+
+/// Control for the test below. If this ever fails, the next one proves nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mid_build_transaction_lands_when_there_is_no_lead() {
+    assert!(
+        a_mid_build_transaction_lands(0).await,
+        "a refreshed snapshot should pick up a transaction injected mid-build"
+    );
+}
+
+/// A lead set past the block's boundaries means no refresh ever matures — only
+/// true if the build loop routes its snapshots through the lead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lead_keeps_a_mid_build_transaction_out_of_the_block() {
+    assert!(
+        !a_mid_build_transaction_lands(10).await,
+        "the snapshot that would carry it is still waiting out its lead"
     );
 }

@@ -25,6 +25,7 @@
 //! - `pacing` — how fast the loop may admit pool transactions: the adaptive-N schedule and the
 //!   sweep / per-slice budgets behind one enum. Pure arithmetic, no reth types.
 
+mod best_tx_lead;
 pub mod cancel;
 pub(crate) mod dispatch;
 pub mod execution_info;
