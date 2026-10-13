@@ -35,7 +35,7 @@ use reth_evm::execute::{
     BlockValidationError,
 };
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult, ChangedAccount};
-use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt};
+use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt, PreRefundGasUsed};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpBuiltPayload;
 use reth_optimism_payload_builder::{
@@ -195,8 +195,8 @@ where
         // to move: the pool arm's pre-refund check starts from this total.
         let tx_gas_used = gas_used.tx_gas_used();
         info.accumulate_gas(tx_gas_used, tx_gas_used);
-        // Count the sequencer tx towards the block's uncompressed size, or the
-        // pool arm's EIP-7934 size check starts from zero and under-counts.
+        // Count the sequencer tx towards the block's uncompressed size, so the
+        // EIP-7934 size check starts from the right total rather than zero.
         info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
         // Deposits dominate here, and the account view only counts those. On a
         // derivation build (`no_tx_pool=true`) the batched user transactions
@@ -374,11 +374,12 @@ fn convert_and_apply_preconf<N, B>(
     tx: Arc<TxEnvelope>,
     hash: TxHash,
     height: u64,
-) -> Result<(PreconfReceipt, Recovered<N::SignedTx>), ApplyError>
+) -> Result<(PreconfReceipt, Recovered<N::SignedTx>, u64), ApplyError>
 where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    <B::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
 {
     // Conversion / ec-recover failures are per-tx faults (a malformed
     // envelope can never land) → `Rejected`, not `Fatal`.
@@ -404,9 +405,10 @@ where
             recovered.inner(),
         ),
     };
-    let receipt = apply_preconf_tx(builder, recovered.clone(), hash, height, facts)?;
+    let (receipt, evm_gas_used) =
+        apply_preconf_tx(builder, recovered.clone(), hash, height, facts)?;
 
-    Ok((receipt, recovered))
+    Ok((receipt, recovered, evm_gas_used))
 }
 
 /// Immutable per-block gas / DA / fee constraints, snapshotted once at
@@ -604,10 +606,11 @@ fn combined_preconf_admission(
     }
 }
 
-/// Apply a preconf tx and fold its gas, DA footprint, **and priority fee** into
-/// `info` so the pool best-tx arm (which reads `info.cumulative_gas_used` /
-/// `info.cumulative_da_bytes_used` via [`ExecutionInfo::is_tx_over_limits`]) sees
-/// the true running block totals — preconf and pool share one block DA + gas
+/// Apply a preconf tx and fold its gas, DA footprint, uncompressed size **and
+/// priority fee** into `info` so the pool best-tx arm (which reads
+/// `info.cumulative_evm_gas_used` / `info.cumulative_da_bytes_used` /
+/// `info.cumulative_uncompressed_bytes` via [`ExecutionInfo::is_tx_over_limits`])
+/// sees the true running block totals — preconf and pool share one block DA + gas
 /// budget — and the sealed payload's block value (`total_fees`) includes preconf
 /// revenue, same as pool txs.
 ///
@@ -630,6 +633,7 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    <B::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
     ChainSpec: reth_optimism_forks::OpHardforks + reth_chainspec::EthChainSpec,
 {
     let tx_da = estimated_tx_da_size(&tx);
@@ -650,22 +654,29 @@ where
     // previous transaction's figure would be reported for this one.
     l1_ctx.l1_block_info.clear_tx_l1_cost();
 
-    let (mut receipt, recovered) = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
+    let (mut receipt, recovered, evm_gas_used) =
+        convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
 
     receipt.block_timestamp = limits.timestamp;
     receipt.l1_fields =
         reth_optimism_rpc::eth::OpReceiptFieldsBuilder::new(limits.timestamp, height)
             .l1_block_info(l1_ctx.chain_spec, recovered.inner(), &mut l1_ctx.l1_block_info)
             .map_err(|e| ApplyError::Fatal(PayloadBuilderError::other(e)))?
-            // `opGasRefund` is left unset here: by the time this path sees
-            // the execution result it has already been canonicalized
-            // (the post-exec refund folded in), and the pre-refund figure
-            // lives on a concrete executor type the payload builder does
-            // not expose to this module.
+            // `opGasRefund` is left unset here. The pre-refund figure is now in
+            // hand (`evm_gas_used` above), so this is a deliberate omission and
+            // not a missing input — populating the field belongs with the rest
+            // of the SDM receipt work.
             .build();
 
     info.cumulative_da_bytes_used = info.cumulative_da_bytes_used.saturating_add(tx_da);
-    info.cumulative_gas_used += receipt.gas_used;
+    // Both gas counters have to move. `is_tx_over_limits` enforces the block gas
+    // limit against `cumulative_evm_gas_used` alone, so a preconf tx that only
+    // advanced the canonical total would be invisible to every later admission
+    // check on this block.
+    info.accumulate_gas(receipt.gas_used, evm_gas_used);
+    // Likewise for the EIP-7934 uncompressed-size check, which reads
+    // `cumulative_uncompressed_bytes` and would otherwise miss every preconf tx.
+    info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
     record_executed(info, fifo, recovered, false);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
@@ -742,6 +753,7 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    <B::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
     ChainSpec: reth_optimism_forks::OpHardforks + reth_chainspec::EthChainSpec,
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
@@ -988,6 +1000,7 @@ async fn apply_one_best_tx<N, Builder>(
 where
     N: OpPayloadPrimitives,
     Builder: BlockBuilder<Primitives = N>,
+    <Builder::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
     // For staging what executed into the fifo. Named so the compiler can find
     // the conversion, same as the pool builder does.
     OpTxEnvelope: From<N::SignedTx>,
@@ -1040,6 +1053,7 @@ where
     let interop = tx.interop_deadline();
     let tx_da_size = tx.estimated_da_size();
     let tx = tx.into_consensus();
+    let tx_uncompressed_size = tx.encode_2718_len() as u64;
 
     if info.is_tx_over_limits(
         tx_da_size,
@@ -1048,7 +1062,7 @@ where
         constraints.block_da_limit,
         tx.gas_limit(),
         constraints.da_footprint_gas_scalar,
-        tx.encode_2718_len() as u64,
+        tx_uncompressed_size,
         constraints.max_uncompressed_block_size,
     ) {
         // The block's own ceilings, not a slice's — this one says the block is
@@ -1091,7 +1105,10 @@ where
     };
 
     let recovered = tx.clone();
-    let gas_used = match builder.execute_transaction(tx.clone()) {
+    let mut evm_gas_used = 0u64;
+    let gas_used = match builder.execute_transaction_with_result_closure(tx.clone(), |res| {
+        evm_gas_used = res.evm_gas_used()
+    }) {
         Ok(g) => g,
         Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { error, .. })) => {
             pacer.cancel(ticket);
@@ -1112,8 +1129,14 @@ where
     };
     let tx_gas_used = gas_used.tx_gas_used();
     pacer.settle(ticket, tx_gas_used);
-    info.cumulative_gas_used += tx_gas_used;
+    // The pre-refund (EVM) total is the one the block gas limit is enforced
+    // against: `is_tx_over_limits` reads `cumulative_evm_gas_used` and never
+    // the canonical total, so advancing only the latter would leave the gas
+    // gate reading a counter that never moves.
+    info.accumulate_gas(tx_gas_used, evm_gas_used);
     info.cumulative_da_bytes_used += tx_da_size;
+    // Feeds the EIP-7934 uncompressed-size branch of the same check.
+    info.cumulative_uncompressed_bytes += tx_uncompressed_size;
     let miner_fee = tx
         .effective_tip_per_gas(constraints.base_fee)
         .expect("fee is always valid; execution succeeded");
@@ -2217,12 +2240,21 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 let recorded = tx.clone();
                 builder.execute_transaction(tx).map(|gas| {
                     let tx_gas_used = gas.tx_gas_used();
-                    // Accounted for like every other execution. The closing
-                    // slice is published after this stage, so leaving the
-                    // transaction out would make the published slices stop one
-                    // short of the sealed block; leaving its gas out would make
-                    // `info` stop being the block's running total.
-                    info.cumulative_gas_used += tx_gas_used;
+                    // Both counters, for the same reason as every other arm —
+                    // though for this transaction the executor reports zero on
+                    // both: its post-exec branch returns `canonical_gas_used: 0`
+                    // and `evm_gas_used: 0` without ever reaching the EVM. The
+                    // add is kept so the shape matches the arms where it counts,
+                    // not because it moves the totals.
+                    //
+                    // `cumulative_uncompressed_bytes` is deliberately left alone:
+                    // nothing is admitted after this stage, so no size check can
+                    // read it again, and the sealed block's real length is
+                    // validated directly at finalize.
+                    info.accumulate_gas(tx_gas_used, tx_gas_used);
+                    // The closing slice is published after this stage, so leaving
+                    // the transaction out would make the published slices stop
+                    // one short of the sealed block.
                     record_executed(&mut info, &self.fifo, recorded, false);
                     tx_gas_used
                 })

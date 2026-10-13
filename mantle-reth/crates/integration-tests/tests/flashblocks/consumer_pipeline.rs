@@ -126,9 +126,10 @@ async fn a_slice_for_an_already_canonical_block_is_skipped() {
 /// included — with it.
 ///
 /// This still only covers a post-exec transaction appended to `transactions`.
-/// Carrying it out of band in the slice's `post_exec_tx` field, with
-/// replace-not-append semantics, is what the startup gate in `cli/src/args.rs`
-/// waits on.
+/// The 1.6.3 consumer protocol carries it out of band in the slice's
+/// `post_exec_tx` field with replace-not-append semantics, and our producer does
+/// not yet do that — so producing flashblocks with SDM enabled is an untested
+/// combination that nothing currently refuses.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_carrying_a_post_exec_transaction_replays_it_as_a_noop() {
     use alloy_network::eip2718::Encodable2718;

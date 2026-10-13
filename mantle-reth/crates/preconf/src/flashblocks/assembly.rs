@@ -77,8 +77,11 @@ pub fn build_flashblock<T: SignedTransaction>(
             blob_gas_used: header.blob_gas_used,
             // TODO(sdm): the 1.6.3 line carries the SDM post-exec (0x7D) transaction
             // out of band with replace-not-append semantics. This producer still
-            // appends it to `transactions` in a closing slice; see the startup gate
-            // in `cli/src/args.rs` that refuses SDM until that is reconciled.
+            // appends it to `transactions` in a closing slice, so a node producing
+            // flashblocks with SDM enabled publishes slices the 1.6.3 consumer
+            // protocol does not describe. Nothing currently refuses the
+            // combination, and nothing could refuse it at startup alone:
+            // `admin_setOperatorSdmOptIn` can turn SDM on while the node runs.
             post_exec_tx: None,
             // Accumulating totals, so a consumer reads the header field it is
             // reconstructing rather than having to sum slices itself.

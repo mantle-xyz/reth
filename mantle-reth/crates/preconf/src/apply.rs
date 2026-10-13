@@ -23,6 +23,7 @@ use op_revm::OpHaltReason;
 use reth_evm::execute::{
     BlockBuilder, BlockExecutionError, BlockExecutor, BlockValidationError, ExecutorTx, GasOutput,
 };
+use reth_optimism_evm::PreRefundGasUsed;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_revm::context::{
     Block as _,
@@ -184,16 +185,23 @@ fn classify(error: &dyn alloy_evm::InvalidTxError, fees: FeeFacts) -> BuilderRej
 /// `gas_used` is the **canonical** figure the executor hands back — the one the
 /// sealed receipt's cumulative total is built from, and the one
 /// `eth_getTransactionReceipt` reports.
+///
+/// The second return value is the **pre-refund (EVM) gas** — real compute, before
+/// any SDM refund is subtracted. It is what the block gas limit is enforced
+/// against (`ExecutionInfo::is_tx_over_limits` reads `cumulative_evm_gas_used`
+/// and nothing else), so the caller has to fold it in separately; it equals
+/// `gas_used` whenever SDM refunds are off.
 pub fn apply_preconf_tx<B>(
     builder: &mut B,
     tx: impl ExecutorTx<B::Executor>,
     tx_hash: TxHash,
     block_height: u64,
     facts: TxFacts,
-) -> Result<PreconfReceipt, ApplyError>
+) -> Result<(PreconfReceipt, u64), ApplyError>
 where
     B: BlockBuilder,
     <B::Executor as BlockExecutor>::Receipt: TxReceipt<Log = Log>,
+    <B::Executor as BlockExecutor>::Result: PreRefundGasUsed,
 {
     // Read before the borrow the execution takes, and off the block being
     // built rather than from the caller: it is the floor the EVM is about to
@@ -204,9 +212,14 @@ where
     };
 
     let mut captured: Option<ExecOutcome> = None;
+    // Pre-refund gas has to come off the result here: the `GasOutput` the
+    // executor returns carries only the canonical figure, and by the time the
+    // receipt exists the refund has already been folded in.
+    let mut evm_gas_used = 0u64;
     let exec_result = builder.execute_transaction_with_result_closure(tx, |res| {
         let ras = res.result();
         captured = Some(exec_outcome(&ras.result));
+        evm_gas_used = res.evm_gas_used();
     });
     // Route the raw `BlockExecutionError` (variant intact) into the
     // classifier — stringifying here would erase both the InvalidTx-vs-fatal
@@ -217,28 +230,31 @@ where
     // last entry is ours. Nothing may await between the apply and this read.
     let pos = block_position(builder.executor().receipts());
 
-    Ok(PreconfReceipt {
-        tx_hash,
-        block_height,
-        status: outcome.status,
-        logs: pos.logs,
-        gas_used: gas.tx_gas_used(),
-        reason: outcome.reason,
-        revert_data: outcome.revert_data,
-        tx_index: pos.tx_index,
-        cumulative_gas_used: pos.cumulative_gas_used,
-        logs_bloom: pos.logs_bloom,
-        log_index_base: pos.log_index_base,
-        tx_type: facts.tx_type,
-        from: facts.from,
-        to: facts.to,
-        contract_address: facts.contract_address(),
-        effective_gas_price: facts.effective_gas_price(fees.base_fee),
-        // Overwritten by `apply_preconf_with_da`, which holds `limits.timestamp`
-        // and the per-block `L1FeeCtx` this function does not have.
-        block_timestamp: 0,
-        l1_fields: Default::default(),
-    })
+    Ok((
+        PreconfReceipt {
+            tx_hash,
+            block_height,
+            status: outcome.status,
+            logs: pos.logs,
+            gas_used: gas.tx_gas_used(),
+            reason: outcome.reason,
+            revert_data: outcome.revert_data,
+            tx_index: pos.tx_index,
+            cumulative_gas_used: pos.cumulative_gas_used,
+            logs_bloom: pos.logs_bloom,
+            log_index_base: pos.log_index_base,
+            tx_type: facts.tx_type,
+            from: facts.from,
+            to: facts.to,
+            contract_address: facts.contract_address(),
+            effective_gas_price: facts.effective_gas_price(fees.base_fee),
+            // Overwritten by `apply_preconf_with_da`, which holds `limits.timestamp`
+            // and the per-block `L1FeeCtx` this function does not have.
+            block_timestamp: 0,
+            l1_fields: Default::default(),
+        },
+        evm_gas_used,
+    ))
 }
 
 /// Pure interpretation of the `(execute_result, captured_outcome)` pair —
