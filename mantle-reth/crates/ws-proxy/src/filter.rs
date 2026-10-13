@@ -454,10 +454,13 @@ mod tests {
 /// serialises flat, so `logs` sits directly on the receipt rather than one
 /// level down under a variant name.
 ///
-/// **For the producer side**: these pass only while `metadata.receipts` is
-/// populated. It is `BTreeMap::default()` today, which makes every
-/// address/topic filter match nothing — see the plan discussion issue on
-/// `metadata.receipts`.
+/// **Producer-side caveat**: these pass because the fixtures below populate
+/// `metadata.receipts` by hand. The Mantle producer does not — `build_flashblock`
+/// in `mantle-reth-preconf` leaves that field at `BTreeMap::default()` — so
+/// against a live producer today every address and topic filter matches
+/// nothing, and a subscriber using one receives no slices at all. These tests
+/// lock the matching logic; they do not show that filtering is usable end to
+/// end, which needs the producer to start filling `metadata.receipts`.
 #[cfg(test)]
 mod mantle_shape {
     use alloy_consensus::Receipt;
