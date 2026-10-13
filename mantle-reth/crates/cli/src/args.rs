@@ -33,8 +33,8 @@ use mantle_reth_preconf::{
         DEFAULT_REJOURNAL_INTERVAL, DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
     },
     flashblocks::{
-        DEFAULT_FLASHBLOCK_ADDR, DEFAULT_FLASHBLOCK_BLOCK_TIME, DEFAULT_FLASHBLOCK_LEEWAY,
-        DEFAULT_FLASHBLOCK_PORT,
+        DEFAULT_BEST_TX_LEAD_SLICES, DEFAULT_FLASHBLOCK_ADDR, DEFAULT_FLASHBLOCK_BLOCK_TIME,
+        DEFAULT_FLASHBLOCK_LEEWAY, DEFAULT_FLASHBLOCK_PORT,
     },
 };
 use reth_optimism_node::args::RollupArgs;
@@ -250,6 +250,19 @@ pub struct FlashblocksArgs {
         alias = "subblocks.leeway-time"
     )]
     pub leeway_time_ms: Option<u64>,
+
+    /// Slice boundaries a refreshed pool snapshot waits before the builder
+    /// reads from it. Default 1.
+    ///
+    /// Each slice of lead delays mid-block pool transactions by that much,
+    /// widening the head start preconf submissions have; preconf latency is
+    /// unchanged. 0 disables it. Must stay below the slices a slot holds.
+    #[arg(
+        id = "flashblocks.best-tx-lead-slices",
+        long = "flashblocks.best-tx-lead-slices",
+        alias = "subblocks.best-tx-lead-slices"
+    )]
+    pub best_tx_lead_slices: Option<u64>,
 }
 
 impl FlashblocksArgs {
@@ -273,6 +286,7 @@ impl FlashblocksArgs {
                 .leeway_time_ms
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_FLASHBLOCK_LEEWAY),
+            best_tx_lead_slices: self.best_tx_lead_slices.unwrap_or(DEFAULT_BEST_TX_LEAD_SLICES),
             ..Default::default()
         })
     }
@@ -561,6 +575,8 @@ mod tests {
             "250",
             "--flashblocks.leeway-time",
             "0",
+            "--flashblocks.best-tx-lead-slices",
+            "1",
         ])
         .into_config()
         .expect("enabled");
@@ -569,6 +585,7 @@ mod tests {
         assert_eq!(cfg.port, 2222);
         assert_eq!(cfg.block_time, Duration::from_millis(250));
         assert_eq!(cfg.leeway_time, Duration::ZERO);
+        assert_eq!(cfg.best_tx_lead_slices, 1);
     }
 
     #[test]
@@ -579,6 +596,10 @@ mod tests {
         assert_eq!(cfg.port, DEFAULT_FLASHBLOCK_PORT);
         assert_eq!(cfg.block_time, DEFAULT_FLASHBLOCK_BLOCK_TIME);
         assert_eq!(cfg.leeway_time, DEFAULT_FLASHBLOCK_LEEWAY);
+        assert_eq!(
+            cfg.best_tx_lead_slices, 1,
+            "the default holds a refreshed snapshot back by one slice"
+        );
     }
 
     /// Optimism renamed flashblocks to subblocks in its public documentation
@@ -596,6 +617,8 @@ mod tests {
             "250",
             "--subblocks.leeway-time",
             "0",
+            "--subblocks.best-tx-lead-slices",
+            "2",
         ])
         .into_config()
         .expect("enabled");
@@ -604,6 +627,7 @@ mod tests {
         assert_eq!(cfg.port, 2222);
         assert_eq!(cfg.block_time, Duration::from_millis(250));
         assert_eq!(cfg.leeway_time, Duration::ZERO);
+        assert_eq!(cfg.best_tx_lead_slices, 2);
     }
 
     /// The two groups are validated against each other, and enabling

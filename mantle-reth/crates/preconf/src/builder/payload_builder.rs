@@ -72,6 +72,7 @@ use crate::{
     apply::{ApplyError, BuilderRejected, TxFacts, apply_preconf_tx},
     builder::{
         ExecutionInfo,
+        best_tx_lead::BestTxLead,
         cancel::{CancelReason, JobCancel},
         dispatch,
         execution_info::{carries_its_senders_nonce, record_executed},
@@ -1044,19 +1045,27 @@ where
     let Some(tx) = best_txs.next(()) else {
         return Ok(BestTxStep::Done);
     };
-    // This hash was sent through both channels: the pool has it here, and the
-    // fifo has it queued. The preconf arm must be the one to apply it, or the
-    // client that asked for a preconfirmation never gets its receipt. Skipping
-    // does not drop it — the preconf arm holds it.
-    //
-    // A preconf submission on its own never enters the pool, so an entry here
-    // means both channels were used.
-    //
-    // The suite stays green without this guard: the biased `select!` usually
-    // lets the preconf arm get there first anyway.
-    if fifo.contains(tx.hash()).await {
-        best_txs.mark_invalid(tx.sender(), tx.nonce());
-        return Ok(BestTxStep::Continue);
+    // The fifo already holds this hash, for one of two reasons that call for
+    // opposite treatment of the sender's later transactions.
+    match fifo.status_of(tx.hash()).await {
+        // Applied already, so the nonce is spent and the descendants this
+        // snapshot carries are the ones that can run now. Skip this one alone —
+        // the same rule the nonce-too-low branch applies after execution.
+        Some(PreconfStatus::Success) => {
+            metrics::counter!("preconf.build.pool_tx_already_applied_total").increment(1);
+            return Ok(BestTxStep::Continue);
+        }
+        // Still owed: the preconf arm must be the one to apply it, or the
+        // client never gets its receipt. Skipping does not drop it, and the
+        // unspent nonce blocks the descendants.
+        //
+        // The suite stays green without this guard — the biased `select!`
+        // usually lets the preconf arm get there first anyway.
+        Some(PreconfStatus::Waiting) => {
+            best_txs.mark_invalid(tx.sender(), tx.nonce());
+            return Ok(BestTxStep::Continue);
+        }
+        None => {}
     }
 
     // A *different* transaction on a nonce an owed claim holds. The hash check
@@ -1892,7 +1901,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             max_uncompressed_block_size: self.builder_config.max_uncompressed_block_size,
         };
 
-        let mut best_txs_iter = best_txs_iter_opt;
+        // Pool snapshots route through the lead so a refresh can be held back
+        // by whole boundaries. A lead of zero reduces to a single snapshot.
+        let mut best_txs = BestTxLead::new(
+            self.flashblocks.as_ref().map_or(0, |producer| producer.cfg.best_tx_lead_slices),
+            best_txs_iter_opt,
+        );
         let mut fifo_rx = self.fifo.subscribe();
 
         // L1 fee parameters for this block. `try_fetch` is the same call the
@@ -2182,7 +2196,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             &mut info,
                         );
                         let attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
-                        best_txs_iter = Some(BestPayloadTransactions::new(
+                        best_txs.refresh(BestPayloadTransactions::new(
                             self.pool.best_transactions_with_attributes(attrs).without_updates(),
                         ));
                     }
@@ -2243,10 +2257,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 }
                 // Admits ONE pool tx per fire, then returns to select! so
                 // biased cancel / preconf can preempt between every tx.
-                _ = std::future::ready(()), if best_txs_iter.is_some()
+                _ = std::future::ready(()), if best_txs.is_serving()
                     && pool_pacer.has_headroom() =>
                 {
-                    let iter = best_txs_iter.as_mut().expect("guard verified Some");
+                    let iter = best_txs.active_mut().expect("guard verified Some");
                     match apply_one_best_tx::<N, _>(
                         iter,
                         &mut builder,
@@ -2260,7 +2274,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         // The iterator has advanced either way; the next
                         // select! iteration re-fires this arm.
                         BestTxStep::Continue => {}
-                        BestTxStep::Done => best_txs_iter = None,
+                        BestTxStep::Done => best_txs.drain_active(),
                     }
                 }
             }

@@ -249,8 +249,13 @@ async fn a_block_built_without_slicing_journals_nothing() {
 async fn the_closing_slice_is_journaled_before_it_goes_out() {
     let (journal_file, journal_dir) = fresh_journal_path();
     let cfg = PreconfCfgBuilder::new().journal_path(journal_file.clone()).build();
-    // Wide enough to have a tail — see `producer_e2e` for why a second.
-    let fb = FlashblockProducerConfig { block_time: Duration::from_secs(1), ..flashblocks_cfg() };
+    // Wide enough to have a tail — see `producer_e2e` for why a second, and
+    // why the lead is pinned off for a tail test.
+    let fb = FlashblockProducerConfig {
+        block_time: Duration::from_secs(1),
+        best_tx_lead_slices: 0,
+        ..flashblocks_cfg()
+    };
     let (mut node, _http, wallet, chain_id, _fb_addr) =
         crate::launch_flashblocks_node!(cfg, fb).await;
 

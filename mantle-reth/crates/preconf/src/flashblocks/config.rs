@@ -52,6 +52,13 @@ pub const DEFAULT_RING_CAPACITY: usize = 32;
 /// Default capacity of the live broadcast channel — 32.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 32;
 
+/// Default boundaries a pool snapshot waits before it is used — 1.
+///
+/// A mid-block pool transaction is therefore offered to the builder a slice
+/// later than it otherwise would be, which buys preconf submissions a further
+/// slice of head start. 0 restores the behaviour from before the lead existed.
+pub const DEFAULT_BEST_TX_LEAD_SLICES: u64 = 1;
+
 /// Runtime configuration for publishing flashblocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashblockProducerConfig {
@@ -67,6 +74,8 @@ pub struct FlashblockProducerConfig {
     pub ring_capacity: usize,
     /// Capacity of the live broadcast channel.
     pub broadcast_capacity: usize,
+    /// Slice boundaries a refreshed pool snapshot waits before it is used.
+    pub best_tx_lead_slices: u64,
 }
 
 impl Default for FlashblockProducerConfig {
@@ -78,6 +87,7 @@ impl Default for FlashblockProducerConfig {
             port: DEFAULT_FLASHBLOCK_PORT,
             ring_capacity: DEFAULT_RING_CAPACITY,
             broadcast_capacity: DEFAULT_BROADCAST_CAPACITY,
+            best_tx_lead_slices: DEFAULT_BEST_TX_LEAD_SLICES,
         }
     }
 }
@@ -147,6 +157,14 @@ pub enum FlashblockProducerConfigError {
          enabling SDM at runtime via admin_setOperatorSdmOptIn"
     )]
     SdmNotSupportedWithFlashblocks,
+    /// The lead spans the slot, so no refresh ever matures before the seal.
+    #[error("flashblocks best_tx_lead_slices ({lead}) must be < the slices in a slot ({slices})")]
+    BestTxLeadSpansSlot {
+        /// Configured lead, in slice boundaries.
+        lead: u64,
+        /// Slices a slot holds at the configured interval.
+        slices: u64,
+    },
 }
 
 impl FlashblockProducerConfig {
@@ -192,6 +210,15 @@ impl FlashblockProducerConfig {
             return Err(FlashblockProducerConfigError::LeewayReachesSlot {
                 leeway: self.leeway_time,
                 slot: preconf.slot_duration,
+            });
+        }
+        // The checks above leave `block_time` non-zero and within the slot, so
+        // this divides safely and yields at least 1.
+        let slices = (preconf.slot_duration.as_nanos() / self.block_time.as_nanos()) as u64;
+        if self.best_tx_lead_slices >= slices {
+            return Err(FlashblockProducerConfigError::BestTxLeadSpansSlot {
+                lead: self.best_tx_lead_slices,
+                slices,
             });
         }
 
@@ -241,6 +268,7 @@ mod tests {
         assert_eq!(cfg.port, 1111);
         assert_eq!(cfg.ring_capacity, 32);
         assert_eq!(cfg.broadcast_capacity, 32);
+        assert_eq!(cfg.best_tx_lead_slices, 1);
     }
 
     #[test]
@@ -334,6 +362,26 @@ mod tests {
         let preconf = preconf_with_slot(Duration::from_secs(2));
 
         assert!(cfg().validate(Some(&preconf), false).is_ok());
+    }
+
+    /// Every slice after the first would then be served by the build-start
+    /// snapshot — a misconfiguration, not a stronger head start.
+    #[test]
+    fn validate_rejects_a_lead_that_spans_the_whole_slot() {
+        // 2s slot at 200ms slices is ten boundaries.
+        let cfg = FlashblockProducerConfig { best_tx_lead_slices: 10, ..cfg() };
+
+        assert!(matches!(
+            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
+            Err(FlashblockProducerConfigError::BestTxLeadSpansSlot { lead: 10, slices: 10 })
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_a_lead_inside_the_slot() {
+        let cfg = FlashblockProducerConfig { best_tx_lead_slices: 9, ..cfg() };
+
+        assert!(cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false).is_ok());
     }
 
     #[test]

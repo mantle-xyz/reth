@@ -977,6 +977,13 @@ impl PreconfTxSet {
         self.inner.lock().await.entries.contains_key(hash)
     }
 
+    /// Status of the entry with `hash`, or `None` when the fifo does not hold
+    /// it. A caller skipping a pool transaction reads this to tell a spent
+    /// nonce from one still owed.
+    pub async fn status_of(&self, hash: &TxHash) -> Option<PreconfStatus> {
+        self.inner.lock().await.entries.get(hash).map(|entry| entry.status)
+    }
+
     /// Snapshot of hashes in FIFO order. Used by the payload builder when
     /// it starts a new job to replay any pending commitments accumulated
     /// since the previous block.
@@ -2170,6 +2177,35 @@ mod tests {
             set.senders_with_landed_claims().await.contains(&preconf_only),
             "the pool-nonce repair must cover a sender the old unlanded index never held",
         );
+    }
+
+    /// The pool arm decides the fate of a sender's descendants from this
+    /// status. Collapsing the two back into a bare `contains` would hold
+    /// runnable transactions back for a slice.
+    #[tokio::test]
+    async fn status_of_separates_a_spent_nonce_from_an_owed_one() {
+        let set = PreconfTxSet::new(16);
+        let sender = addr(0xaa);
+
+        let executed = make_tx(0, 0xe1);
+        let executed_hash = *executed.tx_hash();
+        set.stage_executed(executed, sender).await;
+
+        let owed = make_tx(1, 0xe2);
+        let owed_hash = *owed.tx_hash();
+        set.push_if_absent(owed, sender, PreconfSource::Rpc).await;
+
+        assert_eq!(
+            set.status_of(&executed_hash).await,
+            Some(PreconfStatus::Success),
+            "a staged transaction has already run; its nonce is spent",
+        );
+        assert_eq!(
+            set.status_of(&owed_hash).await,
+            Some(PreconfStatus::Waiting),
+            "a queued preconf still owes its nonce",
+        );
+        assert_eq!(set.status_of(&h(0xcc)).await, None, "a hash the fifo never held");
     }
 
     /// Every fifo removal path must release the commitment record, because
