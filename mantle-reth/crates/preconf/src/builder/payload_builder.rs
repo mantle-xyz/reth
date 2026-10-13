@@ -24,21 +24,26 @@ use alloy_evm::{
     block::{BlockExecutor as _, TxResult},
 };
 use alloy_primitives::{Address, B256, Sealed, TxHash, U256};
+use alloy_rlp::Encodable;
 use mantle_reth_flashblocks_types::FlashblockId;
 use op_alloy_consensus::{OpTxEnvelope, SDMGasEntry, TxPostExec, build_post_exec_tx};
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
 use op_revm::{L1BlockInfo, constants::L1_BLOCK_CONTRACT};
 use reth_basic_payload_builder::BuildArguments;
+use reth_chainspec::EthereumHardforks;
 use reth_evm::execute::{
     BlockAssembler as _, BlockBuilder, BlockBuilderOutcome, BlockExecutionError,
     BlockValidationError,
 };
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult, ChangedAccount};
-use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt};
+use reth_optimism_evm::{ConfigurePostExecEvm, PostExecExecutorExt, PreRefundGasUsed};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpBuiltPayload;
 use reth_optimism_payload_builder::{
-    OpAttributes, OpPayloadPrimitives, builder::OpPayloadBuilderCtx, config::OpBuilderConfig,
+    OpAttributes, OpPayloadPrimitives,
+    block_size::{BLOCK_SIZE_PACKING_TARGET, BlockSizeBudget, RawSizeAdmission},
+    builder::OpPayloadBuilderCtx,
+    config::OpBuilderConfig,
     error::OpPayloadBuilderError,
 };
 use reth_optimism_primitives::OpTransaction;
@@ -70,7 +75,7 @@ use crate::{
         best_tx_lead::BestTxLead,
         cancel::{CancelReason, JobCancel},
         dispatch,
-        execution_info::record_executed,
+        execution_info::{carries_its_senders_nonce, record_executed},
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
     },
     classifier::Whitelist,
@@ -111,12 +116,15 @@ fn execute_sequencer_transactions_watching_whitelist<N, B>(
     builder: &mut B,
     fifo: &PreconfTxSet,
     whitelist_contract: Option<Address>,
+    block_size: BlockSizeBudget,
 ) -> Result<(ExecutionInfo<N::SignedTx>, Vec<WhitelistDelta>), PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
     B: BlockBuilder<Primitives = N>,
 {
-    let mut info = ExecutionInfo::default();
+    // Not `ExecutionInfo::default()`: that leaves the block-size budget
+    // disabled, so every admission check downstream would silently pass.
+    let mut info = ExecutionInfo::with_block_size(block_size);
     let mut deltas = Vec::new();
 
     for sequencer_tx in sequencer_txs {
@@ -187,7 +195,21 @@ where
             }
         }
 
-        info.cumulative_gas_used += gas_used.tx_gas_used();
+        // Sequencer txs (deposits/system txs) are never SDM-refunded, so the
+        // pre-refund (EVM) total equals the canonical total. Both counters have
+        // to move: the pool arm's pre-refund check starts from this total.
+        let tx_gas_used = gas_used.tx_gas_used();
+        info.accumulate_gas(tx_gas_used, tx_gas_used);
+        // Count the sequencer tx towards the block's uncompressed size, so the
+        // EIP-7934 size check starts from the right total rather than zero.
+        info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
+        // Mandatory: recorded but never admitted, and allowed to exceed the
+        // optional packing target. `carries_its_senders_nonce` doubles as the
+        // SDM refund gate — deposits and the post-exec transaction are neither
+        // nonce-carrying nor refundable. Must precede `record_executed`, which
+        // moves `recovered`.
+        info.block_size
+            .record_transaction(recovered.length(), carries_its_senders_nonce(recovered.inner()));
         // Deposits dominate here, and the account view only counts those. On a
         // derivation build (`no_tx_pool=true`) the batched user transactions
         // arrive this way too, and those it reads outright — which is why this
@@ -364,11 +386,12 @@ fn convert_and_apply_preconf<N, B>(
     tx: Arc<TxEnvelope>,
     hash: TxHash,
     height: u64,
-) -> Result<(PreconfReceipt, Recovered<N::SignedTx>), ApplyError>
+) -> Result<(PreconfReceipt, Recovered<N::SignedTx>, u64), ApplyError>
 where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    <B::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
 {
     // Conversion / ec-recover failures are per-tx faults (a malformed
     // envelope can never land) → `Rejected`, not `Fatal`.
@@ -394,9 +417,10 @@ where
             recovered.inner(),
         ),
     };
-    let receipt = apply_preconf_tx(builder, recovered.clone(), hash, height, facts)?;
+    let (receipt, evm_gas_used) =
+        apply_preconf_tx(builder, recovered.clone(), hash, height, facts)?;
 
-    Ok((receipt, recovered))
+    Ok((receipt, recovered, evm_gas_used))
 }
 
 /// Immutable per-block gas / DA / fee constraints, snapshotted once at
@@ -419,6 +443,9 @@ struct BuildConstraints {
     predicted_height: u64,
     /// Payload attributes timestamp (interop-deadline validation).
     timestamp: u64,
+    /// Max cumulative uncompressed (EIP-2718) block size; `None` disables the cap.
+    /// Keeps a built payload inside the size CL clients assume.
+    max_uncompressed_block_size: Option<u64>,
 }
 
 /// What computing a preconf transaction's L1 fee fields needs beyond what the
@@ -471,7 +498,7 @@ fn estimated_tx_da_size(tx: &TxEnvelope) -> u64 {
 /// the execution result (did it succeed once admitted?).
 #[derive(Debug)]
 enum Admission {
-    /// The tx fits the current in-flight block's remaining DA + gas → dispatch.
+    /// The tx fits the current in-flight block's remaining RLP, DA and gas → dispatch.
     Admit,
     /// The tx fits an *empty* block but not the current one (transient
     /// capacity). Only returned for [`PreconfSource::Replay`]: the entry is
@@ -568,10 +595,34 @@ fn preconf_admission(
     Admission::Admit
 }
 
-/// Apply a preconf tx and fold its gas, DA footprint, **and priority fee** into
-/// `info` so the pool best-tx arm (which reads `info.cumulative_gas_used` /
-/// `info.cumulative_da_bytes_used` via [`ExecutionInfo::is_tx_over_limits`]) sees
-/// the true running block totals — preconf and pool share one block DA + gas
+/// Compose the existing DA/gas verdict with the shared RLP budget before dispatch.
+fn combined_preconf_admission(
+    da_gas_admission: Admission,
+    raw_size_admission: RawSizeAdmission,
+    tx_rlp_length: usize,
+    source: PreconfSource,
+) -> Admission {
+    // An existing DA/gas rejection must survive a transient RLP capacity shortage.
+    if matches!(&da_gas_admission, Admission::Reject(_)) {
+        return da_gas_admission;
+    }
+    match raw_size_admission {
+        RawSizeAdmission::Fits => da_gas_admission,
+        RawSizeAdmission::BlockFull if source == PreconfSource::Replay => Admission::Defer,
+        RawSizeAdmission::BlockFull => Admission::Reject(PreconfError::BuilderRejected(format!(
+            "block RLP size headroom exhausted: need {tx_rlp_length} bytes, packing limit {BLOCK_SIZE_PACKING_TARGET}"
+        ))),
+        RawSizeAdmission::TooLarge => Admission::Reject(PreconfError::BuilderRejected(format!(
+            "transaction RLP size {tx_rlp_length} exceeds block packing limit {BLOCK_SIZE_PACKING_TARGET}"
+        ))),
+    }
+}
+
+/// Apply a preconf tx and fold its gas, DA footprint, uncompressed size **and
+/// priority fee** into `info` so the pool best-tx arm (which reads
+/// `info.cumulative_evm_gas_used` / `info.cumulative_da_bytes_used` /
+/// `info.cumulative_uncompressed_bytes` via [`ExecutionInfo::is_tx_over_limits`])
+/// sees the true running block totals — preconf and pool share one block DA + gas
 /// budget — and the sealed payload's block value (`total_fees`) includes preconf
 /// revenue, same as pool txs.
 ///
@@ -587,6 +638,7 @@ fn apply_preconf_with_da<N, B, ChainSpec>(
     limits: BuildConstraints,
     l1_ctx: &mut L1FeeCtx<'_, ChainSpec>,
     tx: Arc<TxEnvelope>,
+    tx_rlp_length: usize,
     hash: TxHash,
     height: u64,
 ) -> Result<PreconfReceipt, ApplyError>
@@ -594,6 +646,7 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    <B::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
     ChainSpec: reth_optimism_forks::OpHardforks + reth_chainspec::EthChainSpec,
 {
     let tx_da = estimated_tx_da_size(&tx);
@@ -614,22 +667,39 @@ where
     // previous transaction's figure would be reported for this one.
     l1_ctx.l1_block_info.clear_tx_l1_cost();
 
-    let (mut receipt, recovered) = convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
+    let (mut receipt, recovered, evm_gas_used) =
+        convert_and_apply_preconf::<N, _>(builder, tx, hash, height)?;
 
     receipt.block_timestamp = limits.timestamp;
     receipt.l1_fields =
         reth_optimism_rpc::eth::OpReceiptFieldsBuilder::new(limits.timestamp, height)
             .l1_block_info(l1_ctx.chain_spec, recovered.inner(), &mut l1_ctx.l1_block_info)
             .map_err(|e| ApplyError::Fatal(PayloadBuilderError::other(e)))?
-            // `opGasRefund` is left unset here: by the time this path sees
-            // the execution result it has already been canonicalized
-            // (the post-exec refund folded in), and the pre-refund figure
-            // lives on a concrete executor type the payload builder does
-            // not expose to this module.
+            // `opGasRefund` is left unset here. The pre-refund figure is now in
+            // hand (`evm_gas_used` above), so this is a deliberate omission and
+            // not a missing input — populating the field belongs with the rest
+            // of the SDM receipt work.
             .build();
 
     info.cumulative_da_bytes_used = info.cumulative_da_bytes_used.saturating_add(tx_da);
-    info.cumulative_gas_used += receipt.gas_used;
+    // Both gas counters have to move. `is_tx_over_limits` enforces the block gas
+    // limit against `cumulative_evm_gas_used` alone, so a preconf tx that only
+    // advanced the canonical total would be invisible to every later admission
+    // check on this block.
+    info.accumulate_gas(receipt.gas_used, evm_gas_used);
+    // Likewise for the EIP-7934 uncompressed-size check, which reads
+    // `cumulative_uncompressed_bytes` and would otherwise miss every preconf tx.
+    info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
+    // The block's RLP budget, measured in block-body item lengths rather than
+    // the 2718 payload the line above counts. `tx_rlp_length` is the same value
+    // the admission check used, so the reservation and the record agree. A false
+    // receipt status still means the transaction was included by the executor.
+    //
+    // The refund flag is a constant `true` here where the other arms call
+    // `carries_its_senders_nonce`: a queued commitment is an
+    // `alloy_consensus::TxEnvelope`, which has no deposit and no post-exec
+    // variant, so that predicate could only ever return `true` for one.
+    info.block_size.record_transaction(tx_rlp_length, true);
     record_executed(info, fifo, recovered, false);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
@@ -706,6 +776,7 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx: TryFrom<TxEnvelope>,
     B: BlockBuilder<Primitives = N>,
+    <B::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
     ChainSpec: reth_optimism_forks::OpHardforks + reth_chainspec::EthChainSpec,
 {
     let Some(entry) = fifo.find_by_hash(&hash).await else { return Ok(()) };
@@ -714,6 +785,7 @@ where
     let to = crate::rpc::tx_kind_to_address(entry.tx.kind());
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
+    let tx_rlp_length = entry.tx.as_ref().length();
     drop(entry);
 
     if !needs_admission(loop_state, &hash, status) {
@@ -781,10 +853,30 @@ where
     // borrow of `*info` ends before the `&mut info` closure below.
     let da_used = info.cumulative_da_bytes_used;
     let gas_used = info.cumulative_gas_used;
-    match preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source) {
+    let admission = combined_preconf_admission(
+        preconf_admission(tx_da, tx_gas, da_used, gas_used, limits, source),
+        // Constant `true` for the SDM refund flag, for the same reason the
+        // matching `record_transaction` in `apply_preconf_with_da` uses one:
+        // `entry.tx` is an `alloy_consensus::TxEnvelope`, which has no deposit
+        // and no post-exec variant.
+        info.block_size.admission(tx_rlp_length, true),
+        tx_rlp_length,
+        source,
+    );
+    match admission {
         Admission::Admit => {
             let mut apply_fn = |tx, h, height| {
-                apply_preconf_with_da::<N, _, _>(builder, info, fifo, limits, l1_ctx, tx, h, height)
+                apply_preconf_with_da::<N, _, _>(
+                    builder,
+                    info,
+                    fifo,
+                    limits,
+                    l1_ctx,
+                    tx,
+                    tx_rlp_length,
+                    h,
+                    height,
+                )
             };
             // Propagate a fatal apply error to abort the whole build; a
             // per-tx rejection resolves inside `apply_one_preconf` and
@@ -945,6 +1037,7 @@ async fn apply_one_best_tx<N, Builder>(
 where
     N: OpPayloadPrimitives,
     Builder: BlockBuilder<Primitives = N>,
+    <Builder::Executor as reth_evm::execute::BlockExecutor>::Result: PreRefundGasUsed,
     // For staging what executed into the fifo. Named so the compiler can find
     // the conversion, same as the pool builder does.
     OpTxEnvelope: From<N::SignedTx>,
@@ -1005,6 +1098,22 @@ where
     let interop = tx.interop_deadline();
     let tx_da_size = tx.estimated_da_size();
     let tx = tx.into_consensus();
+    let tx_uncompressed_size = tx.encode_2718_len() as u64;
+
+    // The block's RLP budget, which is not `tx_uncompressed_size`: that one is
+    // the 2718 payload feeding `max_uncompressed_block_size` below, while this
+    // is the block-body item length the sealed block's RLP is measured in.
+    // `carries_its_senders_nonce` doubles as the SDM refund gate.
+    let sdm_refund_possible = carries_its_senders_nonce(tx.inner());
+    let tx_rlp_length = tx.length();
+    if info.block_size.admission(tx_rlp_length, sdm_refund_possible) != RawSizeAdmission::Fits {
+        // Both verdicts take the transaction out of this block. `TooLarge` is
+        // permanent, but the pool decides what to do with it next; here the
+        // only choice is to stop offering it.
+        metrics::counter!("preconf.build.tx_over_block_rlp_total").increment(1);
+        best_txs.mark_invalid(tx.signer(), tx.nonce());
+        return Ok(BestTxStep::Continue);
+    }
 
     if info.is_tx_over_limits(
         tx_da_size,
@@ -1013,6 +1122,8 @@ where
         constraints.block_da_limit,
         tx.gas_limit(),
         constraints.da_footprint_gas_scalar,
+        tx_uncompressed_size,
+        constraints.max_uncompressed_block_size,
     ) {
         // The block's own ceilings, not a slice's — this one says the block is
         // full, where the allowance rejection below says only that this slice is.
@@ -1054,7 +1165,10 @@ where
     };
 
     let recovered = tx.clone();
-    let gas_used = match builder.execute_transaction(tx.clone()) {
+    let mut evm_gas_used = 0u64;
+    let gas_used = match builder.execute_transaction_with_result_closure(tx.clone(), |res| {
+        evm_gas_used = res.evm_gas_used()
+    }) {
         Ok(g) => g,
         Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { error, .. })) => {
             pacer.cancel(ticket);
@@ -1075,8 +1189,17 @@ where
     };
     let tx_gas_used = gas_used.tx_gas_used();
     pacer.settle(ticket, tx_gas_used);
-    info.cumulative_gas_used += tx_gas_used;
+    // The pre-refund (EVM) total is the one the block gas limit is enforced
+    // against: `is_tx_over_limits` reads `cumulative_evm_gas_used` and never
+    // the canonical total, so advancing only the latter would leave the gas
+    // gate reading a counter that never moves.
+    info.accumulate_gas(tx_gas_used, evm_gas_used);
     info.cumulative_da_bytes_used += tx_da_size;
+    // Feeds the EIP-7934 uncompressed-size branch of the same check.
+    info.cumulative_uncompressed_bytes += tx_uncompressed_size;
+    // Recorded only now: a transaction the executor refused contributes no
+    // bytes, while a revert or halt still occupies its RLP item in the block.
+    info.block_size.record_transaction(tx_rlp_length, sdm_refund_possible);
     let miner_fee = tx
         .effective_tip_per_gas(constraints.base_fee)
         .expect("fee is always valid; execution succeeded");
@@ -1203,6 +1326,8 @@ where
             &BundleState::default(),
             state_provider,
             B256::ZERO,
+            // EIP-7928 block access list hash; the slice header does not carry one.
+            None,
         ))
         .map_err(PayloadBuilderError::other)?;
 
@@ -1706,6 +1831,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             &mut builder,
             &self.fifo,
             crate::whitelist::wants_whitelist(&self.cfg),
+            BlockSizeBudget::new(
+                ctx.chain_spec.is_mantle(),
+                ctx.chain_spec.is_osaka_active_at_timestamp(ctx.attributes().timestamp()),
+                ctx.parent().number().saturating_add(1),
+                ctx.sdm_production_enabled(),
+            ),
         )?;
 
         // The allowlist this block is judged against — see `barred_by_allowlist`
@@ -1767,6 +1898,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             base_fee,
             predicted_height,
             timestamp: attrs_timestamp,
+            max_uncompressed_block_size: self.builder_config.max_uncompressed_block_size,
         };
 
         // Pool snapshots route through the lead so a refresh can be held back
@@ -2180,14 +2312,30 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             let entries = builder.executor_mut().take_post_exec_entries();
             try_include_post_exec_tx::<N::SignedTx, _>(block_number, entries, |tx| {
                 let recorded = tx.clone();
+                // Taken before `execute_transaction` consumes the transaction.
+                let tx_rlp_length = tx.length();
                 builder.execute_transaction(tx).map(|gas| {
                     let tx_gas_used = gas.tx_gas_used();
-                    // Accounted for like every other execution. The closing
-                    // slice is published after this stage, so leaving the
-                    // transaction out would make the published slices stop one
-                    // short of the sealed block; leaving its gas out would make
-                    // `info` stop being the block's running total.
-                    info.cumulative_gas_used += tx_gas_used;
+                    // Both counters, for the same reason as every other arm —
+                    // though for this transaction the executor reports zero on
+                    // both: its post-exec branch returns `canonical_gas_used: 0`
+                    // and `evm_gas_used: 0` without ever reaching the EVM. The
+                    // add is kept so the shape matches the arms where it counts,
+                    // not because it moves the totals.
+                    //
+                    // `cumulative_uncompressed_bytes` is deliberately left alone:
+                    // nothing is admitted after this stage, so no running total
+                    // is read again. For the same reason the RLP budget below is
+                    // recorded for shape-consistency with the other arms rather
+                    // than for any later check to consume — the sealed block's
+                    // real length is validated directly at finalize.
+                    info.accumulate_gas(tx_gas_used, tx_gas_used);
+                    // Swaps the virtual per-transaction reserve for the real
+                    // item. The post-exec transaction is never itself refundable.
+                    info.block_size.record_post_exec(tx_rlp_length);
+                    // The closing slice is published after this stage, so leaving
+                    // the transaction out would make the published slices stop
+                    // one short of the sealed block.
                     record_executed(&mut info, &self.fifo, recorded, false);
                     tx_gas_used
                 })
@@ -2221,8 +2369,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         }
 
         // ── Stage 5: finalize ─────────────────────────────────────────
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(state_provider_for_finish, None)?;
+        let BlockBuilderOutcome {
+            execution_result,
+            hashed_state,
+            trie_updates,
+            block,
+            // EIP-7928 block access list; the preconf builder does not produce one.
+            block_access_list: _,
+        } = builder.finish(state_provider_for_finish, None)?;
+
+        info.block_size
+            .validate_final_rlp_length(block.rlp_length())
+            .map_err(PayloadBuilderError::other)?;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         // The hash the next build compares its parent against. If it matches,
@@ -2244,10 +2402,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let executed: BuiltPayloadExecutedBlock<N> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
-            // Match upstream: keep unsorted; conversion to sorted happens
-            // when needed downstream.
-            hashed_state: either::Either::Left(Arc::new(hashed_state)),
-            trie_updates: either::Either::Left(Arc::new(trie_updates)),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
+            changed_paths: None,
         };
 
         Ok(OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed)))
@@ -2292,6 +2449,52 @@ mod tests {
         // Smoke: PreconfStatus is reachable from this module via crate root
         // re-exports, no need to also test accessor traversals here.
         let _ = PreconfStatus::Waiting;
+    }
+
+    /// An empty Mantle block shell: an empty transaction list, empty ommers
+    /// and empty withdrawals, with no header accounted for. This is what a
+    /// *disabled* budget estimates, so it is also what the whole build path
+    /// would be measuring against if the budget ever went back to
+    /// `ExecutionInfo::default()`.
+    const EMPTY_BLOCK_SHELL_RLP_LENGTH: usize = 4;
+
+    /// `ExecutionInfo::default()` leaves the budget disabled, which would make
+    /// every size check on this builder a no-op while still compiling and
+    /// passing. The replica must take a constructed budget instead.
+    ///
+    /// An enabled budget seeds `header_rlp_length` with a maximal header; a
+    /// disabled one seeds zero. Before any transaction is recorded that header
+    /// is the only input that differs between them — and an empty shell is
+    /// still a few bytes, so a `> 0` assertion would hold for a disabled
+    /// budget too and prove nothing.
+    #[test]
+    fn an_enabled_budget_accounts_for_the_header() {
+        let enabled = BlockSizeBudget::new(true, true, 42, false);
+        let disabled = BlockSizeBudget::new(false, true, 42, false);
+
+        let block_length_difference = enabled
+            .estimated_block_rlp_length()
+            .saturating_sub(disabled.estimated_block_rlp_length());
+
+        // 762 bytes of block-length difference today, of which 760 is the
+        // header itself; the other 2 are the outer block list's prefix
+        // widening as its payload crosses 55 bytes. The floor leaves room for
+        // a field being added or dropped upstream without pinning the exact
+        // encoding here.
+        assert!(
+            block_length_difference >= 512,
+            "a maximal header is several hundred bytes; got {block_length_difference}"
+        );
+    }
+
+    /// The other side of the same pin: a disabled budget accounts for no
+    /// header at all. Were `BlockSizeBudget::new` to start returning an
+    /// enabled budget off a non-Mantle chain, this is what would catch it.
+    #[test]
+    fn a_disabled_budget_accounts_for_no_header() {
+        let disabled = BlockSizeBudget::new(false, true, 42, false);
+
+        assert_eq!(disabled.estimated_block_rlp_length(), EMPTY_BLOCK_SHELL_RLP_LENGTH);
     }
 
     fn tx(byte: u8, nonce: u64) -> Arc<TxEnvelope> {
@@ -2569,6 +2772,8 @@ mod tests {
             predicted_height: 1,
             base_fee: 0,
             timestamp: 0,
+            // These tests exercise the DA limits, not the block-size cap.
+            max_uncompressed_block_size: None,
         }
     }
 
@@ -2655,6 +2860,124 @@ mod tests {
         assert!(matches!(
             preconf_admission(100, 21_000, 900, 0, limits, PreconfSource::Replay),
             Admission::Admit
+        ));
+    }
+
+    #[test]
+    fn combined_permanent_da_reject_precedes_raw_full() {
+        for limits in [
+            da_limits(Some(10_000), Some(1_000), None),
+            da_limits(Some(1_000), None, None),
+            da_limits(None, None, Some(u16::MAX)),
+        ] {
+            let admission = preconf_admission(1_001, 21_000, 0, 0, limits, PreconfSource::Replay);
+            assert!(matches!(admission, Admission::Reject(PreconfError::DaLimitExceeded { .. })));
+            assert!(
+                matches!(
+                    combined_preconf_admission(
+                        admission,
+                        RawSizeAdmission::BlockFull,
+                        100,
+                        PreconfSource::Replay
+                    ),
+                    Admission::Reject(PreconfError::DaLimitExceeded { .. })
+                ),
+                "permanent DA rejection must not become a transient raw-size defer"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_permanent_gas_reject_precedes_raw_full() {
+        let admission = preconf_admission(
+            100,
+            BLOCK_GAS + 1,
+            0,
+            0,
+            da_limits(None, None, None),
+            PreconfSource::Replay,
+        );
+        assert!(matches!(admission, Admission::Reject(_)));
+        assert!(
+            matches!(
+                combined_preconf_admission(
+                    admission,
+                    RawSizeAdmission::BlockFull,
+                    100,
+                    PreconfSource::Replay
+                ),
+                Admission::Reject(_)
+            ),
+            "permanent gas rejection must not become a transient raw-size defer"
+        );
+    }
+
+    #[test]
+    fn combined_raw_too_large_rejects_transient_da_deferral() {
+        let admission = preconf_admission(
+            200,
+            21_000,
+            900,
+            0,
+            da_limits(Some(1_000), Some(1_000), None),
+            PreconfSource::Replay,
+        );
+        assert!(matches!(admission, Admission::Defer));
+        assert!(
+            matches!(
+                combined_preconf_admission(
+                    admission,
+                    RawSizeAdmission::TooLarge,
+                    BLOCK_SIZE_PACKING_TARGET,
+                    PreconfSource::Replay
+                ),
+                Admission::Reject(_)
+            ),
+            "permanent raw-size rejection must not become a transient DA defer"
+        );
+    }
+
+    #[test]
+    fn combined_raw_too_large_rejects_transient_gas_deferral() {
+        let admission = preconf_admission(
+            100,
+            2_000_000,
+            0,
+            BLOCK_GAS - 1_000_000,
+            da_limits(None, None, None),
+            PreconfSource::Replay,
+        );
+        assert!(matches!(admission, Admission::Defer));
+        assert!(matches!(
+            combined_preconf_admission(
+                admission,
+                RawSizeAdmission::TooLarge,
+                BLOCK_SIZE_PACKING_TARGET,
+                PreconfSource::Replay
+            ),
+            Admission::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn combined_raw_full_preserves_source_policy() {
+        assert!(matches!(
+            combined_preconf_admission(
+                Admission::Admit,
+                RawSizeAdmission::BlockFull,
+                100,
+                PreconfSource::Replay
+            ),
+            Admission::Defer
+        ));
+        assert!(matches!(
+            combined_preconf_admission(
+                Admission::Admit,
+                RawSizeAdmission::BlockFull,
+                100,
+                PreconfSource::Rpc
+            ),
+            Admission::Reject(_)
         ));
     }
 

@@ -116,17 +116,26 @@ async fn a_slice_for_an_already_canonical_block_is_skipped() {
     assert!(harness.pending().is_some(), "a slice ahead of the tip is still accepted");
 }
 
-/// A slice carrying an SDM post-exec transaction is rejected whole.
+/// A slice carrying an SDM post-exec transaction replays it as a no-op.
 ///
 /// The canonical block executor recognises `POST_EXEC_TX_TYPE_ID` and returns
-/// before handing the transaction to the EVM. This replay path has no such
-/// branch, so it reaches `evm.transact` with the all-default `TxEnv` that
-/// `FromRecoveredTx<TxPostExec>` produces and fails pre-validation with
-/// `InvalidChainId`, taking the whole slice — L1-attributes deposit included —
-/// with it. A producer that publishes the final slice needs a matching skip
-/// branch here first; see T3 in the plan discussion.
+/// before handing the transaction to the EVM. The v2.4.2 line gives replay paths
+/// the same treatment: `transact_raw` short-circuits the type and synthesizes the
+/// consensus-defined no-op result, so the transaction joins the overlay instead of
+/// failing pre-validation and taking the whole slice — L1-attributes deposit
+/// included — with it.
+///
+/// This still only covers a post-exec transaction appended to `transactions`.
+/// The 1.6.3 consumer protocol carries it out of band in the slice's
+/// `post_exec_tx` field with replace-not-append semantics, and our producer does
+/// not yet do that — so producing flashblocks with SDM enabled remains an
+/// untested combination. `FlashblockProducerConfig::validate` refuses it at
+/// boot (`--rollup.operator-sdm-opt-in` together with `--flashblocks.enable`),
+/// but that gate only sees the CLI flag: `admin_setOperatorSdmOptIn` can still
+/// turn SDM on at runtime after a node has started with flashblocks already
+/// publishing.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_slice_carrying_a_post_exec_transaction_is_rejected_whole() {
+async fn a_slice_carrying_a_post_exec_transaction_replays_it_as_a_noop() {
     use alloy_network::eip2718::Encodable2718;
     use alloy_primitives::Sealable;
     use op_alloy_consensus::{OpTxEnvelope, SDMGasEntry, build_post_exec_tx};
@@ -144,20 +153,24 @@ async fn a_slice_carrying_a_post_exec_transaction_is_rejected_whole() {
         )
         .await;
 
-    let pending = harness.pending();
-    assert!(
-        pending.is_none(),
-        "the whole slice must be rejected, got an overlay at block {:?} with {:?} transactions",
-        pending.as_ref().map(|p| p.latest_block_number()),
-        pending.as_ref().map(|p| p.pending_transaction_count()),
+    let pending = harness.pending().expect("the slice must open an overlay");
+    assert_eq!(pending.latest_block_number(), 1);
+    assert_eq!(
+        pending.pending_transaction_count(),
+        2,
+        "the deposit and the post-exec transaction both land in the overlay"
     );
 
-    // Not fatal: nothing is cached and the processor keeps running, so a clean
-    // slice for the same height still opens an overlay.
-    harness.send(base_slice(1)).await;
+    // The processor keeps running, so a clean slice for the next height is
+    // still accepted and extends the same overlay.
+    harness.send(base_slice(2)).await;
     let pending = harness.pending().expect("a clean slice should still be accepted");
-    assert_eq!(pending.latest_block_number(), 1);
-    assert_eq!(pending.pending_transaction_count(), 1, "only the deposit");
+    assert_eq!(pending.latest_block_number(), 2);
+    assert_eq!(
+        pending.pending_transaction_count(),
+        3,
+        "the overlay counts across blocks: block 1's two plus block 2's deposit"
+    );
 }
 
 /// A transaction whose encoding is not canonical is rejected, taking its slice with it.

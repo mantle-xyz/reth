@@ -75,6 +75,17 @@ pub fn build_flashblock<T: SignedTransaction>(
             logs_bloom: header.logs_bloom,
             block_hash: header.block_hash,
             blob_gas_used: header.blob_gas_used,
+            // TODO(sdm): the 1.6.3 line carries the SDM post-exec (0x7D) transaction
+            // out of band with replace-not-append semantics. This producer still
+            // appends it to `transactions` in a closing slice, so a node producing
+            // flashblocks with SDM enabled publishes slices the 1.6.3 consumer
+            // protocol does not describe. `FlashblockProducerConfig::validate`
+            // refuses this combination at boot
+            // (`--rollup.operator-sdm-opt-in` together with
+            // `--flashblocks.enable`), but that only covers the CLI flag:
+            // `admin_setOperatorSdmOptIn` can still turn SDM on at runtime,
+            // after the gate has already passed.
+            post_exec_tx: None,
             // Accumulating totals, so a consumer reads the header field it is
             // reconstructing rather than having to sum slices itself.
             gas_used: header.gas_used,

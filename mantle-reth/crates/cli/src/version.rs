@@ -1,11 +1,6 @@
 //! Mantle version metadata injection.
 //!
-//! Overrides the default reth version strings with Mantle-specific values
-//! derived from git tags at build time.  The version is fully automatic:
-//!
-//! - On a tag `op-reth-v2.2.1-mantle-arsia.1` → version is that tag
-//! - Off tag → appends `-dev`
-//! - No tag at all → falls back to short commit SHA + `-dev`
+//! Overrides the default reth version strings with Mantle-specific build metadata.
 //!
 //! Call [`init_mantle_version`] **before** `Cli::parse()` so the clap
 //! `--version` flag and startup log use the Mantle values.
@@ -25,6 +20,7 @@ pub const MANTLE_CLIENT_NAME: &str = "Mantle-Reth";
 pub fn init_mantle_version() {
     let version = env!("MANTLE_VERSION");
     let sha = env!("MANTLE_GIT_SHA_SHORT");
+    let full_sha = env!("MANTLE_GIT_SHA");
     let profile = env!("MANTLE_BUILD_PROFILE");
 
     let defaults = default_reth_version_metadata();
@@ -42,11 +38,13 @@ pub fn init_mantle_version() {
             defaults.vergen_build_timestamp, defaults.vergen_cargo_features,
         )),
         p2p_client_version: Cow::Owned(format!(
-            "mantle-reth/{version}/{}",
-            defaults.vergen_cargo_target_triple,
+            "mantle-reth/{version}-{sha}/{}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS,
         )),
         extra_data: Cow::Owned(format!("mantle-reth/{version}/{}", std::env::consts::OS,)),
         vergen_git_sha: Cow::Borrowed(sha),
+        vergen_git_sha_long: Cow::Borrowed(full_sha),
         ..defaults
     });
 }

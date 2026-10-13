@@ -351,7 +351,7 @@ where
 
                 // No SDM accounting here: the refund is produced by an EVM inspector
                 // this path never arms, so gas and balances follow legacy accounting.
-                // Only correct while SDM stays disabled — see T3 in the plan discussion.
+                // Only correct while SDM stays disabled.
                 let mut op_receipt = OpReceiptBuilder::new(
                     self.receipt_builder.chain_spec(),
                     input,
@@ -582,6 +582,7 @@ mod tests {
                 withdrawals: vec![],
                 withdrawals_root: B256::ZERO,
                 blob_gas_used: None,
+                post_exec_tx: None,
             },
             metadata: MantleFlashblockMetadata {
                 block_number: header.number,

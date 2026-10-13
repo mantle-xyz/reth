@@ -31,6 +31,7 @@ alloy-sol-types.workspace = true
 # alloy-eips — `Encodable2718` to serialise a preconf `TxEnvelope` to its
 # canonical bytes for the DA-footprint (H3) size estimate.
 alloy-eips.workspace = true
+alloy-rlp.workspace = true
 
 # op-alloy-flz — `tx_estimated_size_fjord_bytes`, the fastlz-based DA size
 # estimator. Used by the preconf DA-footprint gate so its estimate is
@@ -110,7 +111,6 @@ reth-basic-payload-builder.workspace = true
 reth-chainspec.workspace = true
 reth-payload-util.workspace = true
 op-revm.workspace = true
-either.workspace = true
 
 # Step 7b: payload-service builder integration — implements reth's
 # `PayloadServiceBuilder` trait so the mantle cli can swap our

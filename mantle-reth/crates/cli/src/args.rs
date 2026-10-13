@@ -75,12 +75,18 @@ impl MantleArgs {
     /// permitted but unusual, and `main` warns about it.
     ///
     /// # Errors
-    /// Returns an error when the publisher is enabled without preconf, or when
-    /// both this consumer and upstream's are requested.
+    /// Returns an error when the publisher is enabled without preconf, when
+    /// the publisher is enabled together with the boot-time SDM opt-in
+    /// (`--rollup.operator-sdm-opt-in`), or when both this consumer and
+    /// upstream's are requested.
     pub fn into_configs(self) -> Result<MantleConfigs, MantleArgsError> {
+        let sdm_enabled = self.rollup.operator_sdm_opt_in;
         let preconf = self.preconf.into_config();
-        let publisher =
-            self.flashblocks.into_config().map(|cfg| cfg.validate(preconf.as_ref())).transpose()?;
+        let publisher = self
+            .flashblocks
+            .into_config()
+            .map(|cfg| cfg.validate(preconf.as_ref(), sdm_enabled))
+            .transpose()?;
         let consumer =
             self.flashblocks_consumer.into_config(self.rollup.flashblocks_url.as_ref())?;
 
@@ -632,8 +638,8 @@ mod tests {
             parse_flashblocks(&["--flashblocks.enable"]).into_config().expect("enabled");
         let preconf = parse(&["--preconf.enable", "--preconf.all"]).into_config();
 
-        assert!(flashblocks.clone().validate(preconf.as_ref()).is_ok());
-        assert!(flashblocks.validate(None).is_err());
+        assert!(flashblocks.clone().validate(preconf.as_ref(), false).is_ok());
+        assert!(flashblocks.validate(None, false).is_err());
     }
 
     /// Test helper covering the whole arg surface, so the startup gate is
@@ -667,6 +673,29 @@ mod tests {
         assert!(cfgs.preconf.is_some());
         assert!(cfgs.publisher.is_some());
         assert!(cfgs.consumer.is_none());
+    }
+
+    /// Boot-time gate only: this proves `--rollup.operator-sdm-opt-in` is
+    /// wired into the publisher's startup check, not that the combination is
+    /// refused everywhere — `admin_setOperatorSdmOptIn` still toggles SDM on
+    /// at runtime, after this check has already passed.
+    #[test]
+    fn enabling_flashblocks_with_sdm_fails_the_startup_gate() {
+        let err = parse_mantle(&[
+            "--preconf.enable",
+            "--preconf.all",
+            "--flashblocks.enable",
+            "--rollup.operator-sdm-opt-in=true",
+        ])
+        .into_configs()
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            MantleArgsError::Publisher(
+                FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks
+            )
+        );
     }
 
     /// Today's production shape: preconf on, flashblocks not yet rolled out.

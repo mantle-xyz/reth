@@ -132,6 +132,31 @@ pub enum FlashblockProducerConfigError {
     /// with the upstream builder, so the flag would have no effect.
     #[error("--flashblocks.enable requires --preconf.enable")]
     RequiresPreconfEnabled,
+    /// SDM production and flashblocks publishing are both on. The producer
+    /// appends the SDM post-exec transaction to the closing slice's
+    /// `transactions`; the consumer short-circuits it to a state-free no-op
+    /// rather than running it, the same way the canonical block executor
+    /// does — the gas refunds the entries describe are applied by the
+    /// surrounding post-exec machinery, not by executing this transaction.
+    /// What the consumer skips is the payload verification
+    /// (`verify_post_exec_tx`) the canonical executor additionally runs
+    /// against it. The consumer's replayed pending/preconf overlay does not
+    /// reproduce that surrounding machinery, so it omits the refunds until
+    /// the next canonical block resynchronises state — a transient
+    /// pending-state inaccuracy, not a chain split. The 1.6.3 wire protocol
+    /// has an out-of-band field for the post-exec transaction that no
+    /// producer fills yet.
+    ///
+    /// This only gates the boot-time flag (`--rollup.operator-sdm-opt-in`):
+    /// `admin_setOperatorSdmOptIn` can still flip SDM on at runtime after a
+    /// node has started with flashblocks already publishing.
+    #[error(
+        "--flashblocks.enable refuses this startup configuration while \
+         --rollup.operator-sdm-opt-in is also set, because the post-exec \
+         transaction is not yet carried out of band; this does not prevent \
+         enabling SDM at runtime via admin_setOperatorSdmOptIn"
+    )]
+    SdmNotSupportedWithFlashblocks,
     /// The lead spans the slot, so no refresh ever matures before the seal.
     #[error("flashblocks best_tx_lead_slices ({lead}) must be < the slices in a slot ({slices})")]
     BestTxLeadSpansSlot {
@@ -144,13 +169,20 @@ pub enum FlashblockProducerConfigError {
 
 impl FlashblockProducerConfig {
     /// Validates config invariants against the preconf config it runs
-    /// alongside. `preconf` is `None` when preconf is disabled.
+    /// alongside. `preconf` is `None` when preconf is disabled. `sdm_enabled`
+    /// is the boot-time SDM opt-in (`--rollup.operator-sdm-opt-in`); it is
+    /// checked unconditionally because no other field in this config can make
+    /// that combination safe.
     ///
     /// Returns the original config on success for ergonomic chaining.
     pub fn validate(
         self,
         preconf: Option<&PreconfConfig>,
+        sdm_enabled: bool,
     ) -> Result<Self, FlashblockProducerConfigError> {
+        if sdm_enabled {
+            return Err(FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks);
+        }
         if self.block_time.is_zero() {
             return Err(FlashblockProducerConfigError::InvalidBlockTime);
         }
@@ -243,7 +275,7 @@ mod tests {
     fn defaults_validate_clean() {
         let preconf = preconf_with_slot(Duration::from_secs(2));
 
-        assert!(cfg().validate(Some(&preconf)).is_ok());
+        assert!(cfg().validate(Some(&preconf), false).is_ok());
     }
 
     #[test]
@@ -251,7 +283,7 @@ mod tests {
         let cfg = FlashblockProducerConfig { block_time: Duration::ZERO, ..cfg() };
 
         assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2)))),
+            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
             Err(FlashblockProducerConfigError::InvalidBlockTime)
         ));
     }
@@ -261,7 +293,7 @@ mod tests {
         let cfg = FlashblockProducerConfig { block_time: Duration::from_secs(3), ..cfg() };
 
         assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2)))),
+            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
             Err(FlashblockProducerConfigError::BlockTimeExceedsSlot { .. })
         ));
     }
@@ -273,7 +305,7 @@ mod tests {
         let cfg = FlashblockProducerConfig { leeway_time: Duration::from_secs(2), ..cfg() };
 
         assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2)))),
+            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
             Err(FlashblockProducerConfigError::LeewayReachesSlot { .. })
         ));
     }
@@ -285,7 +317,7 @@ mod tests {
         let cfg = FlashblockProducerConfig { ring_capacity: 8, broadcast_capacity: 16, ..cfg() };
 
         assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2)))),
+            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
             Err(FlashblockProducerConfigError::RingSmallerThanBroadcast { ring: 8, broadcast: 16 })
         ));
     }
@@ -295,7 +327,7 @@ mod tests {
         let cfg = FlashblockProducerConfig { broadcast_capacity: 0, ..cfg() };
 
         assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2)))),
+            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
             Err(FlashblockProducerConfigError::InvalidBroadcastCapacity)
         ));
     }
@@ -306,9 +338,30 @@ mod tests {
     #[test]
     fn validate_rejects_flashblocks_without_preconf() {
         assert!(matches!(
-            cfg().validate(None),
+            cfg().validate(None, false),
             Err(FlashblockProducerConfigError::RequiresPreconfEnabled)
         ));
+    }
+
+    /// The producer appends the SDM post-exec transaction to the closing
+    /// slice's `transactions`. Until that carriage moves out of band (the
+    /// 1.6.3 consumer protocol's `post_exec_tx` field), it is not an
+    /// accurately-replayable combination: enabling both at boot is refused.
+    #[test]
+    fn validate_rejects_sdm_together_with_flashblocks() {
+        let preconf = preconf_with_slot(Duration::from_secs(2));
+
+        assert!(matches!(
+            cfg().validate(Some(&preconf), true),
+            Err(FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks)
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_flashblocks_without_sdm() {
+        let preconf = preconf_with_slot(Duration::from_secs(2));
+
+        assert!(cfg().validate(Some(&preconf), false).is_ok());
     }
 
     /// Every slice after the first would then be served by the build-start
@@ -319,7 +372,7 @@ mod tests {
         let cfg = FlashblockProducerConfig { best_tx_lead_slices: 10, ..cfg() };
 
         assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2)))),
+            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
             Err(FlashblockProducerConfigError::BestTxLeadSpansSlot { lead: 10, slices: 10 })
         ));
     }
@@ -328,7 +381,7 @@ mod tests {
     fn validate_accepts_a_lead_inside_the_slot() {
         let cfg = FlashblockProducerConfig { best_tx_lead_slices: 9, ..cfg() };
 
-        assert!(cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2)))).is_ok());
+        assert!(cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false).is_ok());
     }
 
     #[test]

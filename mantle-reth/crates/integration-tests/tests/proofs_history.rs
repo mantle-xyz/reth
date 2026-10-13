@@ -15,7 +15,7 @@ use alloy_primitives::Address;
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use mantle_reth_cli::node::MantleNode;
 use reth_node_api::TreeConfig;
-use reth_optimism_node::args::{ProofsStorageVersion, RollupArgs};
+use reth_optimism_node::args::{ProofsHistoryStorageArgs, ProofsStorageVersion, RollupArgs};
 use serde_json::Value;
 
 /// `debug_proofsSyncStatus` only exists when the debug override is installed, and the sidecar only
@@ -28,8 +28,10 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
 
     let args = RollupArgs {
         proofs_history: true,
-        proofs_history_storage_path: Some(sidecar_path.clone()),
-        proofs_history_storage_version: ProofsStorageVersion::V2,
+        history: ProofsHistoryStorageArgs {
+            storage_path: Some(sidecar_path.clone()),
+            storage_version: ProofsStorageVersion::V2,
+        },
         ..Default::default()
     };
 

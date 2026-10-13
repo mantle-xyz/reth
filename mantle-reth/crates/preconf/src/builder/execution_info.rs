@@ -8,7 +8,9 @@ use std::{
 
 use alloy_consensus::transaction::Recovered;
 use alloy_primitives::Address;
-use reth_optimism_payload_builder::builder::ExecutionInfo as OpExecutionInfo;
+use reth_optimism_payload_builder::{
+    block_size::BlockSizeBudget as OpBlockSizeBudget, builder::ExecutionInfo as OpExecutionInfo,
+};
 use reth_optimism_primitives::OpTransaction;
 use reth_primitives_traits::SignedTransaction;
 
@@ -22,7 +24,7 @@ use crate::{journal::JournalEntry, preconf_tx_set::PreconfTxSet};
 /// post-execution transaction is synthesised with `Address::ZERO` as its
 /// signer. They are counted rather than read — recording the `0` they report
 /// would put a sender sitting at nonce 50 down as next-at-1.
-fn carries_its_senders_nonce<T: OpTransaction>(tx: &T) -> bool {
+pub(crate) fn carries_its_senders_nonce<T: OpTransaction>(tx: &T) -> bool {
     !tx.is_deposit() && tx.as_post_exec().is_none()
 }
 
@@ -91,6 +93,17 @@ impl<T> Default for ExecutionInfo<T> {
             journalable: Vec::new(),
             journaled_upto: 0,
         }
+    }
+}
+
+impl<T> ExecutionInfo<T> {
+    /// Build with a constructed block-size budget.
+    ///
+    /// `Default` leaves the budget disabled, which is correct for a pre-Osaka
+    /// or non-Mantle chain but silently removes the size bound everywhere
+    /// else. Callers on the build path must go through here.
+    pub fn with_block_size(block_size: OpBlockSizeBudget) -> Self {
+        Self { inner: OpExecutionInfo { block_size, ..OpExecutionInfo::new() }, ..Self::default() }
     }
 }
 
@@ -216,7 +229,7 @@ mod tests {
     use alloy_primitives::{Address, B256, Sealable, Signature, TxKind, U256};
     use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
 
-    use super::{ExecutionInfo, OpExecutionInfo};
+    use super::{ExecutionInfo, OpBlockSizeBudget, OpExecutionInfo};
 
     type Info = ExecutionInfo<OpTxEnvelope>;
 
@@ -239,6 +252,86 @@ mod tests {
         let signature = Signature::new(U256::from(1), U256::from(1), false);
         let envelope = OpTxEnvelope::Legacy(Signed::new_unhashed(inner, signature));
         Recovered::new_unchecked(envelope, sender)
+    }
+
+    /// `Default` yields a disabled budget, so a build path that constructs its
+    /// `ExecutionInfo` that way has no size bound at all while still compiling
+    /// and passing its tests. `with_block_size` is the way past that, and it
+    /// has to carry the budget it was handed rather than deciding on one
+    /// itself — so both directions are pinned. Dropping the argument fails the
+    /// enabled case; substituting a budget of its own making fails whichever
+    /// of the two it did not pick.
+    #[test]
+    fn with_block_size_carries_the_budget_it_was_handed() {
+        let enabled = OpBlockSizeBudget::new(true, true, 42, false);
+        let disabled = OpBlockSizeBudget::new(false, true, 42, false);
+        let (enabled_length, disabled_length) =
+            (enabled.estimated_block_rlp_length(), disabled.estimated_block_rlp_length());
+
+        let info = Info::with_block_size(enabled);
+
+        assert_eq!(info.block_size.estimated_block_rlp_length(), enabled_length);
+        assert_eq!(
+            Info::with_block_size(disabled).block_size.estimated_block_rlp_length(),
+            disabled_length,
+            "a disabled budget is carried through just as faithfully",
+        );
+        assert_eq!(info.cumulative_gas_used, 0, "and nothing else comes along with it");
+        assert!(info.executed().is_empty());
+    }
+
+    /// What the build's Stage 4 does to the budget when it appends an SDM
+    /// post-exec refund transaction: the per-transaction reserve the earlier
+    /// arms set aside is dropped and the real item takes its place, leaving the
+    /// budget holding exactly the block's transactions.
+    ///
+    /// Covered here rather than against a real build because the Mantle
+    /// builder installs `alloy_op_evm::post_exec::NullRefundPolicy`, which
+    /// refunds nothing: Stage 4 accumulates no entries and appends no
+    /// transaction, so the shipped node never reaches the swap. A policy that
+    /// does refund exists in the tree — `FixedRefundPolicy` in
+    /// `op-reth/crates/sdm-fixture-node` — but that crate is test-only, kept
+    /// out of production images, and swaps the stock payload service rather
+    /// than this builder.
+    ///
+    /// The integration suite pins that premise
+    /// (`sdm_production_appends_no_post_exec_transaction_under_the_shipped_refund_policy`);
+    /// this pins what the swap must do once a refund policy makes it reachable.
+    #[test]
+    fn the_post_exec_swap_leaves_the_budget_holding_the_real_block() {
+        use alloy_rlp::Encodable as _;
+        use op_alloy_consensus::{SDMGasEntry, build_post_exec_tx};
+
+        // The real item, so the comparison against the reserve is the one the
+        // build makes rather than a stand-in for it.
+        let post_exec: OpTxEnvelope =
+            build_post_exec_tx(42, vec![SDMGasEntry { index: 1, gas_refund: 1 }])
+                .seal_slow()
+                .into();
+        let post_exec_item = post_exec.length();
+
+        let mut info = Info::with_block_size(OpBlockSizeBudget::new(true, true, 42, true));
+        info.block_size.record_transaction(200, true);
+        info.block_size.record_transaction(100, true);
+        let reserved = info.block_size.estimated_block_rlp_length();
+
+        info.block_size.record_post_exec(post_exec_item);
+
+        // The same three items with no reserve anywhere — which is what the
+        // sealed block is. Skipping the swap leaves the reserve in place and
+        // the post-exec bytes out, and lands on neither side of this.
+        let mut sealed = OpBlockSizeBudget::new(true, true, 42, false);
+        for item in [200, 100, post_exec_item] {
+            sealed.record_transaction(item, false);
+        }
+        assert_eq!(
+            info.block_size.estimated_block_rlp_length(),
+            sealed.estimated_block_rlp_length()
+        );
+        assert!(
+            info.block_size.estimated_block_rlp_length() < reserved,
+            "a maximum-width reserve is wider than the refund that replaces it"
+        );
     }
 
     #[test]
@@ -476,10 +569,10 @@ mod slice_state_invariants {
             State::builder().with_database(EmptyDB::default()).with_bundle_update().build();
         state.load_cache_account(address).expect("an empty database yields an empty account");
 
-        let mut account = Account {
-            info: AccountInfo { balance: U256::from(100), nonce: 1, ..Default::default() },
-            ..Default::default()
-        };
+        // revm 41 made `Account::original_info` private, so the struct can no
+        // longer be built field-by-field here.
+        let mut account = Account::default();
+        account.info = AccountInfo { balance: U256::from(100), nonce: 1, ..Default::default() };
         account.status = AccountStatus::Touched;
         state.commit([(address, account)].into_iter().collect());
 

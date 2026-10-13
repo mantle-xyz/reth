@@ -333,6 +333,7 @@ pub fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
+            target_gas_limit: None,
             slot_number: None,
         },
         transactions: None,
@@ -652,7 +653,7 @@ macro_rules! canonicalize_payload {
                 .beacon_engine_handle
                 .new_payload(
                     <reth_optimism_node::engine::OpEngineTypes as reth_node_api::PayloadTypes>
-                        ::block_to_payload($payload.block().clone()),
+                        ::block_to_payload($payload.block().clone(), None),
                 )
                 .await
                 .expect("newPayload call must not error");
@@ -971,6 +972,7 @@ pub fn l1_attrs_with(n: u64, origin: u64, extra: Vec<Bytes>) -> OpPayloadAttrs {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
+            target_gas_limit: None,
             slot_number: None,
         },
         transactions: Some(transactions),
