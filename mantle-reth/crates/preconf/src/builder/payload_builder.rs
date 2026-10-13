@@ -637,6 +637,7 @@ fn apply_preconf_with_da<N, B, ChainSpec>(
     limits: BuildConstraints,
     l1_ctx: &mut L1FeeCtx<'_, ChainSpec>,
     tx: Arc<TxEnvelope>,
+    tx_rlp_length: usize,
     hash: TxHash,
     height: u64,
 ) -> Result<PreconfReceipt, ApplyError>
@@ -688,6 +689,11 @@ where
     // Likewise for the EIP-7934 uncompressed-size check, which reads
     // `cumulative_uncompressed_bytes` and would otherwise miss every preconf tx.
     info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
+    // The block's RLP budget, measured in block-body item lengths rather than
+    // the 2718 payload the line above counts. `tx_rlp_length` is the same value
+    // the admission check used, so the reservation and the record agree. A false
+    // receipt status still means the transaction was included by the executor.
+    info.block_size.record_transaction(tx_rlp_length, true);
     record_executed(info, fifo, recovered, false);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
@@ -850,7 +856,17 @@ where
     match admission {
         Admission::Admit => {
             let mut apply_fn = |tx, h, height| {
-                apply_preconf_with_da::<N, _, _>(builder, info, fifo, limits, l1_ctx, tx, h, height)
+                apply_preconf_with_da::<N, _, _>(
+                    builder,
+                    info,
+                    fifo,
+                    limits,
+                    l1_ctx,
+                    tx,
+                    tx_rlp_length,
+                    h,
+                    height,
+                )
             };
             // Propagate a fatal apply error to abort the whole build; a
             // per-tx rejection resolves inside `apply_one_preconf` and
