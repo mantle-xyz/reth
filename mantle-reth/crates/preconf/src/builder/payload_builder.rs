@@ -67,6 +67,7 @@ use crate::{
     apply::{ApplyError, BuilderRejected, TxFacts, apply_preconf_tx},
     builder::{
         ExecutionInfo,
+        best_tx_lead::BestTxLead,
         cancel::{CancelReason, JobCancel},
         dispatch,
         execution_info::record_executed,
@@ -1760,7 +1761,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             timestamp: attrs_timestamp,
         };
 
-        let mut best_txs_iter = best_txs_iter_opt;
+        // Pool snapshots route through the lead so a refresh can be held back
+        // by whole boundaries. A lead of zero reduces to a single snapshot.
+        let mut best_txs = BestTxLead::new(
+            self.flashblocks.as_ref().map_or(0, |producer| producer.cfg.best_tx_lead_slices),
+            best_txs_iter_opt,
+        );
         let mut fifo_rx = self.fifo.subscribe();
 
         // L1 fee parameters for this block. `try_fetch` is the same call the
@@ -2050,7 +2056,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             &mut info,
                         );
                         let attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
-                        best_txs_iter = Some(BestPayloadTransactions::new(
+                        best_txs.refresh(BestPayloadTransactions::new(
                             self.pool.best_transactions_with_attributes(attrs).without_updates(),
                         ));
                     }
@@ -2111,10 +2117,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 }
                 // Admits ONE pool tx per fire, then returns to select! so
                 // biased cancel / preconf can preempt between every tx.
-                _ = std::future::ready(()), if best_txs_iter.is_some()
+                _ = std::future::ready(()), if best_txs.is_serving()
                     && pool_pacer.has_headroom() =>
                 {
-                    let iter = best_txs_iter.as_mut().expect("guard verified Some");
+                    let iter = best_txs.active_mut().expect("guard verified Some");
                     match apply_one_best_tx::<N, _>(
                         iter,
                         &mut builder,
@@ -2128,7 +2134,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         // The iterator has advanced either way; the next
                         // select! iteration re-fires this arm.
                         BestTxStep::Continue => {}
-                        BestTxStep::Done => best_txs_iter = None,
+                        BestTxStep::Done => best_txs.drain_active(),
                     }
                 }
             }
