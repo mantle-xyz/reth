@@ -30,6 +30,7 @@ use op_alloy_consensus::{OpTxEnvelope, SDMGasEntry, TxPostExec, build_post_exec_
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
 use op_revm::{L1BlockInfo, constants::L1_BLOCK_CONTRACT};
 use reth_basic_payload_builder::BuildArguments;
+use reth_chainspec::EthereumHardforks;
 use reth_evm::execute::{
     BlockAssembler as _, BlockBuilder, BlockBuilderOutcome, BlockExecutionError,
     BlockValidationError,
@@ -40,7 +41,7 @@ use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpBuiltPayload;
 use reth_optimism_payload_builder::{
     OpAttributes, OpPayloadPrimitives,
-    block_size::{BLOCK_SIZE_PACKING_TARGET, RawSizeAdmission},
+    block_size::{BLOCK_SIZE_PACKING_TARGET, BlockSizeBudget, RawSizeAdmission},
     builder::OpPayloadBuilderCtx,
     config::OpBuilderConfig,
     error::OpPayloadBuilderError,
@@ -73,7 +74,7 @@ use crate::{
         ExecutionInfo,
         cancel::{CancelReason, JobCancel},
         dispatch,
-        execution_info::record_executed,
+        execution_info::{carries_its_senders_nonce, record_executed},
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
     },
     classifier::Whitelist,
@@ -114,12 +115,15 @@ fn execute_sequencer_transactions_watching_whitelist<N, B>(
     builder: &mut B,
     fifo: &PreconfTxSet,
     whitelist_contract: Option<Address>,
+    block_size: BlockSizeBudget,
 ) -> Result<(ExecutionInfo<N::SignedTx>, Vec<WhitelistDelta>), PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
     B: BlockBuilder<Primitives = N>,
 {
-    let mut info = ExecutionInfo::default();
+    // Not `ExecutionInfo::default()`: that leaves the block-size budget
+    // disabled, so every admission check downstream would silently pass.
+    let mut info = ExecutionInfo::with_block_size(block_size);
     let mut deltas = Vec::new();
 
     for sequencer_tx in sequencer_txs {
@@ -198,6 +202,13 @@ where
         // Count the sequencer tx towards the block's uncompressed size, so the
         // EIP-7934 size check starts from the right total rather than zero.
         info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
+        // Mandatory: recorded but never admitted, and allowed to exceed the
+        // optional packing target. `carries_its_senders_nonce` doubles as the
+        // SDM refund gate — deposits and the post-exec transaction are neither
+        // nonce-carrying nor refundable. Must precede `record_executed`, which
+        // moves `recovered`.
+        info.block_size
+            .record_transaction(recovered.length(), carries_its_senders_nonce(recovered.inner()));
         // Deposits dominate here, and the account view only counts those. On a
         // derivation build (`no_tx_pool=true`) the batched user transactions
         // arrive this way too, and those it reads outright — which is why this
@@ -1768,6 +1779,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             &mut builder,
             &self.fifo,
             crate::whitelist::wants_whitelist(&self.cfg),
+            BlockSizeBudget::new(
+                ctx.chain_spec.is_mantle(),
+                ctx.chain_spec.is_osaka_active_at_timestamp(ctx.attributes().timestamp()),
+                ctx.parent().number().saturating_add(1),
+                ctx.sdm_production_enabled(),
+            ),
         )?;
 
         // The allowlist this block is judged against — see `barred_by_allowlist`
@@ -2368,6 +2385,47 @@ mod tests {
         // Smoke: PreconfStatus is reachable from this module via crate root
         // re-exports, no need to also test accessor traversals here.
         let _ = PreconfStatus::Waiting;
+    }
+
+    /// An empty Mantle block shell: an empty transaction list, empty ommers
+    /// and empty withdrawals, with no header accounted for. This is what a
+    /// *disabled* budget estimates, so it is also what the whole build path
+    /// would be measuring against if the budget ever went back to
+    /// `ExecutionInfo::default()`.
+    const EMPTY_BLOCK_SHELL_RLP_LENGTH: usize = 4;
+
+    /// `ExecutionInfo::default()` leaves the budget disabled, which would make
+    /// every size check on this builder a no-op while still compiling and
+    /// passing. The replica must take a constructed budget instead.
+    ///
+    /// An enabled budget seeds `header_rlp_length` with a maximal header; a
+    /// disabled one seeds zero. Before any transaction is recorded that header
+    /// is the only observable difference between them — and an empty shell is
+    /// still a few bytes, so a `> 0` assertion would hold for a disabled
+    /// budget too and prove nothing.
+    #[test]
+    fn an_enabled_budget_accounts_for_the_header() {
+        let enabled = BlockSizeBudget::new(true, true, 42, false);
+        let disabled = BlockSizeBudget::new(false, true, 42, false);
+
+        let header = enabled
+            .estimated_block_rlp_length()
+            .saturating_sub(disabled.estimated_block_rlp_length());
+
+        // 762 bytes as the header stands today; the floor leaves room for a
+        // field being added or dropped upstream without pinning the exact
+        // encoding here.
+        assert!(header >= 512, "a maximal header is several hundred bytes; got {header}");
+    }
+
+    /// The other side of the same pin: a disabled budget accounts for no
+    /// header at all. Were `BlockSizeBudget::new` to start returning an
+    /// enabled budget off a non-Mantle chain, this is what would catch it.
+    #[test]
+    fn a_disabled_budget_accounts_for_no_header() {
+        let disabled = BlockSizeBudget::new(false, true, 42, false);
+
+        assert_eq!(disabled.estimated_block_rlp_length(), EMPTY_BLOCK_SHELL_RLP_LENGTH);
     }
 
     fn tx(byte: u8, nonce: u64) -> Arc<TxEnvelope> {

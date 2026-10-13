@@ -8,7 +8,9 @@ use std::{
 
 use alloy_consensus::transaction::Recovered;
 use alloy_primitives::Address;
-use reth_optimism_payload_builder::builder::ExecutionInfo as OpExecutionInfo;
+use reth_optimism_payload_builder::{
+    block_size::BlockSizeBudget as OpBlockSizeBudget, builder::ExecutionInfo as OpExecutionInfo,
+};
 use reth_optimism_primitives::OpTransaction;
 use reth_primitives_traits::SignedTransaction;
 
@@ -22,7 +24,7 @@ use crate::{journal::JournalEntry, preconf_tx_set::PreconfTxSet};
 /// post-execution transaction is synthesised with `Address::ZERO` as its
 /// signer. They are counted rather than read — recording the `0` they report
 /// would put a sender sitting at nonce 50 down as next-at-1.
-fn carries_its_senders_nonce<T: OpTransaction>(tx: &T) -> bool {
+pub(crate) fn carries_its_senders_nonce<T: OpTransaction>(tx: &T) -> bool {
     !tx.is_deposit() && tx.as_post_exec().is_none()
 }
 
@@ -91,6 +93,17 @@ impl<T> Default for ExecutionInfo<T> {
             journalable: Vec::new(),
             journaled_upto: 0,
         }
+    }
+}
+
+impl<T> ExecutionInfo<T> {
+    /// Build with a constructed block-size budget.
+    ///
+    /// `Default` leaves the budget disabled, which is correct for a pre-Osaka
+    /// or non-Mantle chain but silently removes the size bound everywhere
+    /// else. Callers on the build path must go through here.
+    pub fn with_block_size(block_size: OpBlockSizeBudget) -> Self {
+        Self { inner: OpExecutionInfo { block_size, ..OpExecutionInfo::new() }, ..Self::default() }
     }
 }
 
@@ -216,7 +229,7 @@ mod tests {
     use alloy_primitives::{Address, B256, Sealable, Signature, TxKind, U256};
     use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
 
-    use super::{ExecutionInfo, OpExecutionInfo};
+    use super::{ExecutionInfo, OpBlockSizeBudget, OpExecutionInfo};
 
     type Info = ExecutionInfo<OpTxEnvelope>;
 
@@ -239,6 +252,27 @@ mod tests {
         let signature = Signature::new(U256::from(1), U256::from(1), false);
         let envelope = OpTxEnvelope::Legacy(Signed::new_unhashed(inner, signature));
         Recovered::new_unchecked(envelope, sender)
+    }
+
+    /// `Default` yields a disabled budget, so a build path that constructs its
+    /// `ExecutionInfo` that way has no size bound at all while still compiling
+    /// and passing its tests. `with_block_size` is the way past that, and a
+    /// version of it that dropped its argument would be just as silent — hence
+    /// comparing the two constructors rather than only asserting on one.
+    #[test]
+    fn with_block_size_carries_a_budget_default_would_leave_disabled() {
+        let enabled = OpBlockSizeBudget::new(true, true, 42, false);
+        let expected = enabled.estimated_block_rlp_length();
+
+        let info = Info::with_block_size(enabled);
+
+        assert_eq!(info.block_size.estimated_block_rlp_length(), expected);
+        assert!(
+            Info::default().block_size.estimated_block_rlp_length() < expected,
+            "the disabled budget this constructor exists to avoid",
+        );
+        assert_eq!(info.cumulative_gas_used, 0, "and nothing else comes along with it");
+        assert!(info.executed().is_empty());
     }
 
     #[test]
