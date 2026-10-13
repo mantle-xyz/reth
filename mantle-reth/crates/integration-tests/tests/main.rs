@@ -10,12 +10,7 @@ mod estimate_total_fee_zero_base_fee;
 mod fill_transaction;
 mod gas_estimation;
 mod gas_limit;
-// Arrives with the v2.4.2 merge, which brings the block-size budget type but
-// does not yet wire it into the builder's admission and per-transaction
-// recording. The suite also still speaks the pre-merge `PreconfConfig` /
-// `PreconfTxSet` API. Re-enable it with that wiring, porting the four call
-// sites it uses.
-// mod payload_block_size;
+mod payload_block_size;
 mod preconf_forwarding;
 mod proofs_history;
 mod txpool;

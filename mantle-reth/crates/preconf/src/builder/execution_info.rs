@@ -280,6 +280,55 @@ mod tests {
         assert!(info.executed().is_empty());
     }
 
+    /// What the build's Stage 4 does to the budget when it appends an SDM
+    /// post-exec refund transaction: the per-transaction reserve the earlier
+    /// arms set aside is dropped and the real item takes its place, leaving the
+    /// budget holding exactly the block's transactions.
+    ///
+    /// Covered here rather than against a real build because the open-source
+    /// builder installs `alloy_op_evm::post_exec::NullRefundPolicy`, which
+    /// refunds nothing: Stage 4 accumulates no entries and appends no
+    /// transaction, so no node built from this repository reaches the swap.
+    /// The integration suite pins that premise
+    /// (`sdm_production_appends_no_post_exec_transaction_under_the_shipped_refund_policy`);
+    /// this pins what the swap must do once a refund policy makes it reachable.
+    #[test]
+    fn the_post_exec_swap_leaves_the_budget_holding_the_real_block() {
+        use alloy_rlp::Encodable as _;
+        use op_alloy_consensus::{SDMGasEntry, build_post_exec_tx};
+
+        // The real item, so the comparison against the reserve is the one the
+        // build makes rather than a stand-in for it.
+        let post_exec: OpTxEnvelope =
+            build_post_exec_tx(42, vec![SDMGasEntry { index: 1, gas_refund: 1 }])
+                .seal_slow()
+                .into();
+        let post_exec_item = post_exec.length();
+
+        let mut info = Info::with_block_size(OpBlockSizeBudget::new(true, true, 42, true));
+        info.block_size.record_transaction(200, true);
+        info.block_size.record_transaction(100, true);
+        let reserved = info.block_size.estimated_block_rlp_length();
+
+        info.block_size.record_post_exec(post_exec_item);
+
+        // The same three items with no reserve anywhere — which is what the
+        // sealed block is. Skipping the swap leaves the reserve in place and
+        // the post-exec bytes out, and lands on neither side of this.
+        let mut sealed = OpBlockSizeBudget::new(true, true, 42, false);
+        for item in [200, 100, post_exec_item] {
+            sealed.record_transaction(item, false);
+        }
+        assert_eq!(
+            info.block_size.estimated_block_rlp_length(),
+            sealed.estimated_block_rlp_length()
+        );
+        assert!(
+            info.block_size.estimated_block_rlp_length() < reserved,
+            "a maximum-width reserve is wider than the refund that replaces it"
+        );
+    }
+
     #[test]
     fn transactions_are_recorded_in_execution_order() {
         let mut info = Info::default();
