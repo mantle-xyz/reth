@@ -1066,6 +1066,21 @@ where
     let tx = tx.into_consensus();
     let tx_uncompressed_size = tx.encode_2718_len() as u64;
 
+    // The block's RLP budget, which is not `tx_uncompressed_size`: that one is
+    // the 2718 payload feeding `max_uncompressed_block_size` below, while this
+    // is the block-body item length the sealed block's RLP is measured in.
+    // `carries_its_senders_nonce` doubles as the SDM refund gate.
+    let sdm_refund_possible = carries_its_senders_nonce(tx.inner());
+    let tx_rlp_length = tx.length();
+    if info.block_size.admission(tx_rlp_length, sdm_refund_possible) != RawSizeAdmission::Fits {
+        // Both verdicts take the transaction out of this block. `TooLarge` is
+        // permanent, but the pool decides what to do with it next; here the
+        // only choice is to stop offering it.
+        metrics::counter!("preconf.build.tx_over_block_rlp_total").increment(1);
+        best_txs.mark_invalid(tx.signer(), tx.nonce());
+        return Ok(BestTxStep::Continue);
+    }
+
     if info.is_tx_over_limits(
         tx_da_size,
         constraints.block_gas_limit,
@@ -1148,6 +1163,9 @@ where
     info.cumulative_da_bytes_used += tx_da_size;
     // Feeds the EIP-7934 uncompressed-size branch of the same check.
     info.cumulative_uncompressed_bytes += tx_uncompressed_size;
+    // Recorded only now: a transaction the executor refused contributes no
+    // bytes, while a revert or halt still occupies its RLP item in the block.
+    info.block_size.record_transaction(tx_rlp_length, sdm_refund_possible);
     let miner_fee = tx
         .effective_tip_per_gas(constraints.base_fee)
         .expect("fee is always valid; execution succeeded");

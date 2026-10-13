@@ -21,6 +21,7 @@ const COUNTERS: &[&str] = &[
     "preconf.build.pool_tx_on_committed_nonce_total",
     "preconf.build.tx_nonce_already_used_total",
     "preconf.build.tx_over_block_limits_total",
+    "preconf.build.tx_over_block_rlp_total",
     "preconf.build.tx_rejected_by_evm_total",
     "preconf.rpc.nonce_gap_rejected_total",
     "preconf.admit.rejected_entries_total",
