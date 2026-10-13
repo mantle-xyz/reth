@@ -256,20 +256,25 @@ mod tests {
 
     /// `Default` yields a disabled budget, so a build path that constructs its
     /// `ExecutionInfo` that way has no size bound at all while still compiling
-    /// and passing its tests. `with_block_size` is the way past that, and a
-    /// version of it that dropped its argument would be just as silent — hence
-    /// comparing the two constructors rather than only asserting on one.
+    /// and passing its tests. `with_block_size` is the way past that, and it
+    /// has to carry the budget it was handed rather than deciding on one
+    /// itself — so both directions are pinned. Dropping the argument fails the
+    /// enabled case; substituting a budget of its own making fails whichever
+    /// of the two it did not pick.
     #[test]
-    fn with_block_size_carries_a_budget_default_would_leave_disabled() {
+    fn with_block_size_carries_the_budget_it_was_handed() {
         let enabled = OpBlockSizeBudget::new(true, true, 42, false);
-        let expected = enabled.estimated_block_rlp_length();
+        let disabled = OpBlockSizeBudget::new(false, true, 42, false);
+        let (enabled_length, disabled_length) =
+            (enabled.estimated_block_rlp_length(), disabled.estimated_block_rlp_length());
 
         let info = Info::with_block_size(enabled);
 
-        assert_eq!(info.block_size.estimated_block_rlp_length(), expected);
-        assert!(
-            Info::default().block_size.estimated_block_rlp_length() < expected,
-            "the disabled budget this constructor exists to avoid",
+        assert_eq!(info.block_size.estimated_block_rlp_length(), enabled_length);
+        assert_eq!(
+            Info::with_block_size(disabled).block_size.estimated_block_rlp_length(),
+            disabled_length,
+            "a disabled budget is carried through just as faithfully",
         );
         assert_eq!(info.cumulative_gas_used, 0, "and nothing else comes along with it");
         assert!(info.executed().is_empty());

@@ -2400,7 +2400,7 @@ mod tests {
     ///
     /// An enabled budget seeds `header_rlp_length` with a maximal header; a
     /// disabled one seeds zero. Before any transaction is recorded that header
-    /// is the only observable difference between them — and an empty shell is
+    /// is the only input that differs between them — and an empty shell is
     /// still a few bytes, so a `> 0` assertion would hold for a disabled
     /// budget too and prove nothing.
     #[test]
@@ -2408,14 +2408,19 @@ mod tests {
         let enabled = BlockSizeBudget::new(true, true, 42, false);
         let disabled = BlockSizeBudget::new(false, true, 42, false);
 
-        let header = enabled
+        let block_length_difference = enabled
             .estimated_block_rlp_length()
             .saturating_sub(disabled.estimated_block_rlp_length());
 
-        // 762 bytes as the header stands today; the floor leaves room for a
-        // field being added or dropped upstream without pinning the exact
+        // 762 bytes of block-length difference today, of which 760 is the
+        // header itself; the other 2 are the outer block list's prefix
+        // widening as its payload crosses 55 bytes. The floor leaves room for
+        // a field being added or dropped upstream without pinning the exact
         // encoding here.
-        assert!(header >= 512, "a maximal header is several hundred bytes; got {header}");
+        assert!(
+            block_length_difference >= 512,
+            "a maximal header is several hundred bytes; got {block_length_difference}"
+        );
     }
 
     /// The other side of the same pin: a disabled budget accounts for no
