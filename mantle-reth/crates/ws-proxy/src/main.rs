@@ -66,6 +66,17 @@ struct Args {
     #[arg(long, env, default_value = "false")]
     public_access_enabled: bool,
 
+    /// Honour the address and topic filters on `/ws/{api_key}/filter`.
+    ///
+    /// Off by default, because both read `metadata.receipts` and
+    /// `metadata.new_account_balances`, which the Mantle producer leaves empty
+    /// — a filter would silently match nothing rather than filter. With this
+    /// off the route still serves unfiltered subscriptions; one carrying
+    /// filter parameters is refused with `501` and an explanation. Turn it on
+    /// only for an upstream that populates those maps.
+    #[arg(long, env, default_value = "false")]
+    enable_filters: bool,
+
     /// Serve a Prometheus endpoint.
     #[arg(long, env, default_value = "true")]
     metrics: bool,
@@ -227,6 +238,7 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
         authentication,
         TrustedProxyConfig::new(args.ip_addr_http_header, args.trusted_proxy_cidrs),
         args.public_access_enabled,
+        args.enable_filters,
     );
     let server_task = server.listen(token.clone());
 

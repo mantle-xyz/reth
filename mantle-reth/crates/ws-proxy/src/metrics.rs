@@ -107,6 +107,8 @@ proxy_metrics! {
         "Connection attempts rejected by the instance limit";
     counter   unauthorized_requests         => "flashblocks.proxy.unauthorized_requests",
         "Connection attempts rejected for an unknown API key";
+    counter   filter_subscriptions_refused  => "flashblocks.proxy.filter_subscriptions_refused",
+        "Filter subscriptions rejected because --enable-filters is off";
     counter   upstream_errors               => "flashblocks.proxy.upstream_errors",
         "Upstream connections that closed or errored";
     gauge     upstream_connections          => "flashblocks.proxy.upstream_connections",

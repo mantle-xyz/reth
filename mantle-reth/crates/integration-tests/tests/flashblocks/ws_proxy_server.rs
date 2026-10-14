@@ -39,6 +39,57 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::consumer_helpers::base_slice;
 
+/// A filter this upstream cannot honour is refused at the handshake, not
+/// accepted and then matched against metadata the producer leaves empty.
+///
+/// Silence is the failure mode worth preventing: a subscriber whose filter
+/// matches nothing sees an open connection carrying no slices, which reads as
+/// "the chain is quiet" rather than "this filter cannot work here".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_subscription_is_refused_when_filters_are_disabled() {
+    const KEY: &str = "third-party";
+
+    let harness = Harness::start(Config::default().with_keys(&[KEY])).await;
+
+    let err = connect_async(format!("ws://{}/ws/{KEY}/filter?addresses={UNMATCHED}", harness.addr))
+        .await
+        .expect_err("a filter subscription must not be upgraded");
+
+    let WsError::Http(response) = err else {
+        panic!("expected an HTTP refusal, got {err:?}");
+    };
+    assert_eq!(response.status(), 501, "the capability is missing, not the request malformed",);
+
+    let body = response.body().as_ref().expect("the refusal carries a body");
+    let body = String::from_utf8_lossy(body);
+    assert!(
+        body.contains("--enable-filters"),
+        "the refusal must name the flag that turns it on; got {body}",
+    );
+}
+
+/// No query parameters makes this route the unfiltered one, so refusing it
+/// would break a subscription that asks for nothing a disabled upstream
+/// cannot give.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_filter_route_still_serves_an_unfiltered_subscription() {
+    const KEY: &str = "third-party";
+
+    let harness = Harness::start(Config::default().with_keys(&[KEY])).await;
+
+    let mut client = harness
+        .connect_client(&format!("ws/{KEY}/filter"))
+        .await
+        .expect("a subscription without filter parameters connects");
+    harness.await_clients(1).await;
+
+    harness.broadcast_slice(1);
+    assert!(
+        !next_frame(&mut client).await.is_empty(),
+        "an unfiltered subscription receives slices"
+    );
+}
+
 /// An address that appears nowhere in the broadcast slices, so a filter on it
 /// matches no data frame.
 const UNMATCHED: &str = "0x00000000000000000000000000000000000000ff";
@@ -57,6 +108,10 @@ struct Config {
     /// Whether the registry enforces pong deadlines on clients.
     client_ping_enabled: bool,
     client_pong_timeout_ms: u64,
+    /// Whether `/ws/{api_key}/filter` honours filter parameters. Defaults to
+    /// `false`, as the binary does, so a test that needs filtering has to say
+    /// so and a test that does not exercises the shipped configuration.
+    enable_filters: bool,
 }
 
 impl Default for Config {
@@ -67,6 +122,7 @@ impl Default for Config {
             per_ip_limit: 100,
             client_ping_enabled: false,
             client_pong_timeout_ms: 30_000,
+            enable_filters: false,
         }
     }
 }
@@ -137,6 +193,7 @@ impl Harness {
             config.authentication,
             TrustedProxyConfig::new("X-Forwarded-For".to_owned(), Vec::new()),
             false,
+            config.enable_filters,
         );
 
         let bound = server.bind().await.expect("bind the proxy");
@@ -430,6 +487,7 @@ async fn a_filtered_client_is_still_pinged_and_survives() {
     let harness = Harness::start(Config {
         client_ping_enabled: true,
         client_pong_timeout_ms: 600,
+        enable_filters: true,
         ..Config::default().with_keys(&[KEY])
     })
     .await;

@@ -485,7 +485,10 @@ mod tests {
 ///   emitted a log, so a subscriber filtering on a single contract also receives slices that merely
 ///   mention it as an argument.
 ///
-/// Neither case produces an error on either side.
+/// Neither case produces an error on either side, which is why the server
+/// refuses a filter subscription outright unless `--enable-filters` says the
+/// upstream populates those maps: an empty stream is indistinguishable from a
+/// quiet chain.
 ///
 /// The tests below pass because their fixtures populate `metadata.receipts` by
 /// hand. They lock the matching logic; they do not show that filtering is

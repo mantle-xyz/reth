@@ -248,6 +248,7 @@ async fn spawn_proxy_with_auth(
         authentication,
         TrustedProxyConfig::new("X-Forwarded-For".to_owned(), Vec::new()),
         false,
+        false,
     );
 
     let bound = server.bind().await.expect("bind the proxy");

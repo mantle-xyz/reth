@@ -36,7 +36,7 @@ the upstream.
 | API-key authentication | `--api-keys app:key,...`, `--public-access-enabled` |
 | Client IP through forwarding proxies | `--ip-addr-http-header`, `--trusted-proxy-cidrs` |
 | Brotli compression downstream | `--enable-compression` |
-| Per-subscriber address/topic filtering ⚠️ **unusable on Mantle today — see below** | query parameters on the subscribe URL |
+| Per-subscriber address/topic filtering ⚠️ **off by default — see below** | `--enable-filters`, query parameters on the subscribe URL |
 | Upstream keepalive and backoff | `--subscriber-ping-interval-ms`, `--subscriber-pong-timeout-ms`, `--subscriber-max-interval-ms` |
 | Downstream keepalive | `--client-ping-enabled`, `--client-ping-interval-ms`, `--client-pong-timeout-ms` |
 
@@ -118,15 +118,27 @@ still replay transactions locally rather than believe what arrives here.
 The exception is `FilterType`, which parses the slice as JSON to evaluate a
 subscriber's address and topic filters.
 
-### ⚠️ Address and topic filters are unusable on Mantle today
+### ⚠️ Filters are off by default, because this upstream cannot feed them
 
-The two `metadata` maps the filter reads are empty on every slice the Mantle
-producer emits. Topic filters therefore match nothing, and address filters fall
-back to substring-matching the raw transaction hex: a `0x`-prefixed address —
-the form every tool emits — matches **nothing**, while a bare 40-digit address
-over-matches, hitting anything that mentions it in calldata. Neither case
-produces an error on either side, so a subscriber configuring a filter today
-silently gets either no slices or too many.
+Both filter kinds read `metadata.receipts` and `metadata.new_account_balances`,
+which the Mantle producer leaves empty on every slice. Topic filters would
+therefore match nothing at all — topics come only from receipt logs. Address
+filters would fall back to substring-matching the raw transaction hex, which
+answers differently depending on how the address was written: a `0x`-prefixed
+address, the form every tool emits, matches **nothing**, because a transaction
+hex carries one `0x` at the front and embedded addresses are bare. A bare
+40-digit address over-matches instead, hitting anything that mentions it in
+calldata.
+
+Rather than accept a filter and silently return an empty stream,
+`/ws/{api_key}/filter` refuses a subscription carrying filter parameters with
+`501` and an explanation. The same route still serves an **unfiltered**
+subscription, which is what it is without query parameters.
+
+`--enable-filters` turns the filtering on for an upstream that does populate
+those maps — a Base-derived one does. The matching logic itself is correct and
+covered; what is missing here is the data. `flashblocks.proxy.filter_subscriptions_refused`
+counts subscribers who tried.
 
 Which input feeds which filter, and why each spelling of an address behaves the
 way it does, is the module doc on `filter::mantle_shape`.

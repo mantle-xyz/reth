@@ -32,6 +32,7 @@ struct ServerState {
     rate_limiter: Arc<dyn RateLimit>,
     auth: Authentication,
     trusted_proxy_config: TrustedProxyConfig,
+    filters_enabled: bool,
 }
 
 /// `WebSocket` proxy server that accepts client connections and forwards messages
@@ -44,6 +45,7 @@ pub struct Server {
     trusted_proxy_config: TrustedProxyConfig,
     authentication: Option<Authentication>,
     public_access_enabled: bool,
+    filters_enabled: bool,
 }
 
 impl fmt::Debug for Server {
@@ -54,6 +56,7 @@ impl fmt::Debug for Server {
             .field("trusted_proxy_config", &self.trusted_proxy_config)
             .field("authentication", &self.authentication)
             .field("public_access_enabled", &self.public_access_enabled)
+            .field("filters_enabled", &self.filters_enabled)
             .finish_non_exhaustive()
     }
 }
@@ -74,6 +77,7 @@ impl Server {
         authentication: Option<Authentication>,
         trusted_proxy_config: TrustedProxyConfig,
         public_access_enabled: bool,
+        filters_enabled: bool,
     ) -> Self {
         Self {
             listen_addr,
@@ -82,6 +86,7 @@ impl Server {
             authentication,
             trusted_proxy_config,
             public_access_enabled,
+            filters_enabled,
         }
     }
 
@@ -128,6 +133,7 @@ impl Server {
             rate_limiter: Arc::clone(&self.rate_limiter),
             auth: self.authentication.clone().unwrap_or_else(Authentication::none),
             trusted_proxy_config: self.trusted_proxy_config.clone(),
+            filters_enabled: self.filters_enabled,
         });
 
         info!(message = "starting server", address = ?listener.local_addr());
@@ -221,8 +227,34 @@ async fn authenticated_filter_websocket_handler(
                 .unwrap()
         },
         |app| {
-            Metrics::connections_by_app(app).increment(1);
             let filter = create_filter_from_query(query.0);
+
+            // A filter this upstream cannot honour is refused here rather than
+            // accepted and quietly matched against absent metadata. `None`
+            // still connects: no query parameters makes this route equivalent
+            // to `/ws/{api_key}`, and refusing that would break nothing useful.
+            if !state.filters_enabled && !matches!(filter, FilterType::None) {
+                Metrics::filter_subscriptions_refused().increment(1);
+                warn!(
+                    %api_key,
+                    "refused a filter subscription; --enable-filters is off"
+                );
+                return Response::builder()
+                    .status(StatusCode::NOT_IMPLEMENTED)
+                    .body(Body::from(
+                        json!({
+                            "message": "address and topic filters are disabled on this proxy: \
+                                        the configured upstream does not populate the slice \
+                                        metadata they read. Subscribe to /ws/<api_key> and \
+                                        filter locally, or start the proxy with --enable-filters \
+                                        if its upstream does populate it.",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
+
+            Metrics::connections_by_app(app).increment(1);
             websocket_handler(state, ws, addr, headers, filter)
         },
     )
