@@ -20,24 +20,29 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{B256, Bytes, TxKind, U256};
-use alloy_rpc_types_eth::{TransactionRequest, state::EvmOverrides};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_rpc_types_eth::{EIP1186AccountProofResponse, TransactionRequest, state::EvmOverrides};
+use alloy_serde::JsonStorageKey;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
+use reth_errors::RethError;
 use reth_optimism_evm::extract_l1_info;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_rpc::SequencerClient;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_rpc_eth_api::{
-    FullEthApiTypes,
-    helpers::{EthBlocks, EthCall, EthFees},
+    EthApiTypes, FromEthApiError, FullEthApiTypes,
+    helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState},
 };
+use reth_rpc_eth_types::EthApiError;
 use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{
-    BlockIdReader, BlockReaderIdExt, StateProviderBox, StateProviderFactory, errors::ProviderResult,
+    BlockIdReader, BlockReaderIdExt, StateProofProvider, StateProviderBox, StateProviderFactory,
+    errors::ProviderResult,
 };
+use reth_trie_common::AccountProof;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -197,6 +202,27 @@ pub trait MantleEthApiExt {
         payload: serde_json::Value,
         block_number: Option<BlockId>,
     ) -> RpcResult<serde_json::Value>;
+
+    /// Overrides `eth_getProof` to keep geth parity for accounts that do not exist.
+    ///
+    /// geth — including op-geth, Mantle's reference client — reports zero
+    /// `codeHash`/`storageHash` for nonexistent accounts
+    /// ([go-ethereum#28357](https://github.com/ethereum/go-ethereum/pull/28357)); reth's
+    /// standard conversion reports `KECCAK_EMPTY`/`EMPTY_ROOT_HASH`. The exclusion-proof
+    /// shape op-geth clients already parse must stay geth's, so this override routes the
+    /// proof through [`AccountProof::into_eip1186_response_with`] with
+    /// `zero_empty_account = true` (the knob upstream added for exactly this case), same as
+    /// the proofs-history node's `EthApiExt` override. Everything else — proof-window
+    /// enforcement, block-id resolution (pending included), off-thread trie walking —
+    /// delegates to the same helpers the standard implementation uses, so responses for
+    /// existing accounts are identical.
+    #[method(name = "getProof")]
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse>;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -409,7 +435,15 @@ where
         + Send
         + Sync
         + 'static,
-    EthApi: EthBlocks + EthCall + EthFees + FullEthApiTypes + Send + Sync + 'static,
+    EthApi: EthBlocks
+        + EthCall
+        + EthFees
+        + EthApiSpec
+        + EthState
+        + FullEthApiTypes
+        + Send
+        + Sync
+        + 'static,
     // Lets `eth_simulateV1` surface the standard implementation's error verbatim, preserving the
     // spec-defined codes (-38010..-38026) instead of collapsing them into a generic -32000.
     ErrorObject<'static>: From<EthApi::Error>,
@@ -518,6 +552,50 @@ where
         blocks.push(end_value);
 
         Ok(blocks)
+    }
+
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse> {
+        // [MANTLE] mirror of upstream `EthState::get_proof`
+        // (rpc-eth-api/src/helpers/state.rs) — re-sync on upstream bump. Sole divergence:
+        // the geth-parity conversion below.
+        //
+        // `let _permit` (not `let _`): the tracing permit (`--rpc.max-tracing-requests`) is
+        // the only concurrency bound on proof generation, held for the whole operation.
+        let _permit = self
+            .eth_api()
+            .acquire_owned_tracing()
+            .await
+            .map_err(RethError::other)
+            .map_err(EthApiError::Internal)
+            .map_err(<EthApi as EthApiTypes>::Error::from_eth_err)
+            .map_err(ErrorObject::from)?;
+
+        // Omitted block param means latest, per the EIP-1898 geth convention
+        // (`BlockId::default()` is `Latest`, not a zero-ish hash/number).
+        let block_id = block_number.unwrap_or_default();
+        EthState::ensure_within_proof_window(self.eth_api(), block_id)
+            .map_err(ErrorObject::from)?;
+
+        self.eth_api()
+            .spawn_blocking_io_fut(async move |eth_api| {
+                let state = eth_api.state_at_block_id(block_id).await?;
+                let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
+                let proof: AccountProof = state
+                    .proof(Default::default(), address, &storage_keys)
+                    .map_err(<EthApi as EthApiTypes>::Error::from_eth_err)?;
+                // [MANTLE] geth parity (go-ethereum#28357): an account that does not exist
+                // reports zero `codeHash`/`storageHash` instead of `KECCAK_EMPTY`/
+                // `EMPTY_ROOT_HASH`, and a lone empty-trie sentinel node collapses to an empty
+                // proof array. Existing accounts are identical to the standard conversion.
+                Ok(proof.into_eip1186_response_with(keys, true))
+            })
+            .await
+            .map_err(ErrorObject::from)
     }
 
     async fn send_raw_transaction_with_preconf(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
