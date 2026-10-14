@@ -56,23 +56,13 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 ///
 /// `preconf_and_pool_txs_coexist_in_one_block` covers two *independent*
 /// senders, which is the easy half — nothing couples them. A single sender
-/// interleaving the channels is the coupled case, and the answer is the same
-/// before and after the refactor for two entirely different reasons. Both are
-/// worth stating, because "unchanged outcome, changed mechanism" is exactly the
-/// shape a regression hides in:
+/// interleaving the channels is the coupled case: the preconf transaction is
+/// not in the pool at all, so the pool never sees nonce 0, reads nonce 1 as a
+/// gap, and parks it in `Queued`.
 ///
-/// - **Today** the preconf transaction is in the pool, so the pool arm meets it in its iterator,
-///   skips it on its fifo entry, and calls `mark_invalid(sender, nonce)` — which drains that
-///   sender's *descendants* from the iterator too. The ordinary transaction at `nonce+1` is
-///   collateral.
-/// - **After** the preconf transaction is not in the pool at all, so the pool never sees nonce 0,
-///   reads nonce 1 as a gap, and parks it in `Queued`.
-///
-/// Either way it lands in the next block, once the preconf transaction is
+/// It lands in the next block all the same, once the preconf transaction is
 /// canonical and the sender's on-chain nonce has moved. That — *deferred, never
 /// dropped* — is the contract worth pinning, and it is what this test asserts.
-///
-/// Green today; must stay green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_sender_interleaving_both_channels_defers_the_ordinary_tx_by_a_block() {
     use super::helpers::send_preconf;
@@ -107,9 +97,9 @@ async fn one_sender_interleaving_both_channels_defers_the_ordinary_tx_by_a_block
     let http_clone = http.clone();
     let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, preconf_tx).await });
 
-    // **The line that breaks first** once preconf transactions stop entering
-    // the pool: the pool's pending nonce is driven by what it holds, and it
-    // would then hold nothing for this sender.
+    // Waiting on the fifo rather than on a pool nonce: a preconf submission
+    // never enters the pool, so the pool holds nothing for this sender to
+    // observe.
     super::helpers::wait_fifo_entry(&fifo, sender, 0).await;
 
     let ordinary_hash: B256 =

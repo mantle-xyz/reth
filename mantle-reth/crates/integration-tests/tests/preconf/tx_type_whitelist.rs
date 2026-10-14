@@ -13,9 +13,10 @@
 //!   would need to see an authority's in-flight transactions — and those live in the pool, which
 //!   this path deliberately never reads. The scope of the refusal is exactly "setting a
 //!   delegation"; *using* a delegated account is untouched and is covered by `delegated_sender.rs`.
-//! - **0x03 (EIP-4844 blob)** — already refused today, but by the pool validator, which reports it
-//!   through the catch-all `pool rejected: …` wrapper. Deciding it by type moves the refusal
-//!   earlier and gives it a name, which changes the error an SDK sees.
+//! - **0x03 (EIP-4844 blob)** — refused by type, before the validator is consulted, so the client
+//!   gets a named `UnsupportedTxType` rather than the validator's catch-all `pool rejected: …`
+//!   wrapper. A regression that let it fall through to the validator would still refuse it, just
+//!   with a different error — invisible unless pinned.
 //!
 //! Both tests whitelist the sender with a from-wildcard on purpose: if the
 //! refusal came from the allowlist instead of the type gate the assertions
@@ -81,12 +82,13 @@ async fn a_set_code_tx_is_refused_by_type() {
 
 /// A type-0x03 blob transaction is refused **by type, not by the pool**.
 ///
-/// The outcome is unchanged — blob transactions have never been admitted — but
-/// the error an SDK receives is: today the pool validator's refusal arrives
-/// wrapped as `pool rejected: …`, afterwards it is a named
-/// `UnsupportedTxType`. Pinned here because that wrapper is a documented part
-/// of the wire contract (`types.rs::preconf_error_display_wording_is_stable`)
-/// and the change is easy to ship unnoticed.
+/// Refusing it is not in question — blob transactions are never admitted — so
+/// what this test pins is *which* error an SDK receives: a named
+/// `UnsupportedTxType`, not the validator's catch-all `pool rejected: …`.
+/// Worth pinning because that wrapper is a documented part of the wire contract
+/// (`types.rs::preconf_error_display_wording_is_stable`), so a regression that
+/// let blob transactions fall through to the validator would be easy to ship
+/// unnoticed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_blob_tx_is_refused_by_type_not_by_the_pool() {
     let sender = Wallet::default().with_chain_id(1).inner.address();

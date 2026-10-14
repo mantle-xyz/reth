@@ -2809,8 +2809,8 @@ mod tests {
     /// `debug_assert!` (intentional dev-time signal), so the test is compiled
     /// everywhere but only runs under `cargo test --release`.
     ///
-    /// TODO: replace with `tracing-test` capture to also verify the
-    /// `error!()` line fires. For now assert observable side effects only.
+    /// Asserts the observable repair only, not the `error!` that accompanies
+    /// it — capturing that needs a subscriber this test does not install.
     #[tokio::test]
     #[cfg_attr(debug_assertions, ignore = "the self-heal path trips a debug_assert; release only")]
     async fn push_if_absent_self_heals_dangling_by_sender() {

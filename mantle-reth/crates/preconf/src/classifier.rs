@@ -80,9 +80,9 @@ impl Whitelist {
 
 /// Owns the preconf allowlists.
 ///
-/// Held as `Arc<PreconfClassifier>` and shared by the on-chain whitelist watcher
-/// (the only writer), admission's early-rejection preview, and the payload
-/// builder's per-block snapshot.
+/// Held as `Arc<PreconfClassifier>`: the on-chain whitelist watcher writes
+/// through [`Self::update_whitelist`], admission reads it for the
+/// early-rejection preview, and the payload builder takes a per-block snapshot.
 ///
 /// Commitment records are not here: they live in
 /// [`Commitments`](crate::commitments::Commitments), owned by the fifo — the two

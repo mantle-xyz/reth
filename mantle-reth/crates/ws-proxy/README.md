@@ -24,8 +24,9 @@ Mantle builds slices inside the sequencer rather than in a sidecar: the
 publisher is `MantleFlashblocksPublisher` in `mantle-reth-preconf`, enabled with
 `--flashblocks.enable` and listening on `--flashblocks.port` (1111 by default).
 Base's lineage — this crate is a port of Base's `websocket-proxy` — puts a
-separate builder and a rollup-boost hop ahead of the proxy; Mantle deploys
-neither, so the upstream here is the sequencer itself.
+separate builder and a rollup-boost hop ahead of the proxy. This document
+describes the topology this crate is configured for: the sequencer itself as
+the upstream.
 
 ## What it adds over plain rebroadcasting
 
@@ -51,8 +52,9 @@ mantle-ws-proxy \
 
 ## Routing depends on whether keys are configured
 
-The two routing tables are disjoint — no configuration serves both, so a
-subscriber's URL has to match the mode the proxy was started in.
+Authentication decides the base routes; `--public-access-enabled` adds the
+public `/ws` on top of them. A subscriber's URL has to match what the proxy
+was started with.
 
 | Started with | Routes served |
 |---|---|
@@ -120,14 +122,14 @@ subscriber's address and topic filters.
 
 The two `metadata` maps the filter reads are empty on every slice the Mantle
 producer emits. Topic filters therefore match nothing, and address filters fall
-back to substring-matching the raw transaction hex, which over-matches: a
-subscriber filtering on one contract also receives slices whose transactions
-merely mention it as an argument. Neither case produces an error on either
-side.
+back to substring-matching the raw transaction hex: a `0x`-prefixed address —
+the form every tool emits — matches **nothing**, while a bare 40-digit address
+over-matches, hitting anything that mentions it in calldata. Neither case
+produces an error on either side, so a subscriber configuring a filter today
+silently gets either no slices or too many.
 
-The full statement — which input feeds which filter, and the checklist for
-whoever populates the maps on the producer side — is the module doc on
-`filter::mantle_shape`.
+Which input feeds which filter, and why each spelling of an address behaves the
+way it does, is the module doc on `filter::mantle_shape`.
 
 ## Metrics
 

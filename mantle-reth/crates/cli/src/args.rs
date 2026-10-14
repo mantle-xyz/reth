@@ -710,7 +710,8 @@ mod tests {
         );
     }
 
-    /// Today's production shape: preconf on, flashblocks not yet rolled out.
+    /// Preconf on, no flashblocks flag: the publisher config stays absent, so
+    /// nothing downstream has to tolerate a half-configured producer.
     #[test]
     fn enabling_preconf_alone_leaves_flashblocks_absent() {
         let cfgs = parse_mantle(&["--preconf.enable", "--preconf.all"])

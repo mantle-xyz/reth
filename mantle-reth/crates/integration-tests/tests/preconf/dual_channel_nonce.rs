@@ -59,11 +59,9 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 /// An ordinary transaction that has **landed** leaves the sender free to
 /// continue on the preconf channel at the next nonce.
 ///
-/// Green today and after — by different routes. Today the pool still holds the
-/// executed transaction and reports the advanced pending nonce; afterwards the
-/// preconf view reads the chain nonce, which the canonical block advanced. The
-/// point of pinning it is that the *answer* must not change when the source
-/// does.
+/// The preconf nonce view starts from the **chain** nonce, which the canonical
+/// block has advanced. The point of pinning this is that the *answer* is the
+/// contract: it must hold whichever component supplies the nonce view.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_preconf_tx_after_a_canonical_normal_tx_is_admitted() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -160,32 +158,25 @@ async fn a_preconf_tx_after_a_canonical_normal_tx_is_admitted() {
     assert!(sealed.contains(&event.tx_hash), "the preconf tx must land in block 2; {sealed:?}");
 }
 
-/// The transaction refused at admission after the change would have failed at
-/// execution before it — so the narrowing costs nothing.
+/// A commitment refused at admission for a nonce gap would have failed at
+/// execution anyway — so the narrowing costs nothing.
 ///
 /// This is the load-bearing evidence for refusing rather than admitting. The
 /// argument for the narrowing is "it was doomed anyway, and finding out sooner
 /// is better"; without this test that is an assertion about the builder rather
-/// than a fact about it. If it turned out the transaction *could* succeed
-/// today, refusing it at admission would be a genuine loss of function, not a
-/// tightening.
+/// than a fact about it. If the transaction *could* in fact succeed, refusing
+/// it at admission would be a genuine loss of function, not a tightening.
 ///
 /// Why it is doomed: the preconf arm dispatches carryover **before** the pool
 /// arm drains (`payload_builder.rs`), so the commitment at `nonce+1` is applied
 /// while the ordinary transaction at `nonce` has not run. The EVM sees a nonce
 /// above the account's and rejects it.
 ///
-/// **Green today and after**, by different routes, which is exactly why the
-/// assertions are deliberately loose — they name the outcome, not the error:
-///
-/// | | admission | outcome |
-/// |---|---|---|
-/// | today | passes (the pool's pending nonce covers the queued tx) | `BuilderRejected` at apply |
-/// | after | `NonceGap` | refused outright |
-///
-/// Either way the commitment does not land and the client gets an error. The
-/// ordinary transaction lands regardless, which is what makes this a narrowing
-/// of *feedback latency* rather than of function.
+/// The assertions are deliberately loose — they name the outcome, not the
+/// error: what has to hold is that the commitment does not land and the client
+/// is told, not which gate said so. The ordinary transaction lands regardless,
+/// which is what makes this a narrowing of *feedback latency* rather than of
+/// function.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_preconf_tx_behind_an_unexecuted_normal_tx_never_lands_either_way() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -196,8 +187,7 @@ async fn a_preconf_tx_behind_an_unexecuted_normal_tx_never_lands_either_way() {
         .whitelist_to(recipient)
         // Raised for the reason `preconf_timeout_ms` gives, plus one of this
         // test's own: a timeout would satisfy "did not land" for the wrong
-        // reason, so today's path must have room to come back with its apply
-        // rejection instead.
+        // reason, so the refusal must have room to come back on its own.
         .preconf_timeout_ms(3_000)
         .build();
 
@@ -215,10 +205,10 @@ async fn a_preconf_tx_behind_an_unexecuted_normal_tx_never_lands_either_way() {
     let http_clone = http.clone();
     let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, preconf).await });
 
-    // A fixed wait rather than polling pool state: after the change the
-    // submission is refused outright and never reaches the pool, so anything
-    // that polls for it would hang. This is ample for the pool to admit it
-    // before the build starts.
+    // A fixed wait rather than polling pool state: the preconf submission is
+    // refused outright and never reaches the pool, so anything that polls for
+    // it would hang. This is ample for the refusal to come back before the
+    // build starts.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let attrs = node.payload.next_attributes();
@@ -263,11 +253,9 @@ async fn a_preconf_tx_behind_an_unexecuted_normal_tx_never_lands_either_way() {
 /// An ordinary transaction still **queued** in the pool does not extend the
 /// sender's preconf nonce view.
 ///
-/// The narrowing described in the module docs. Today the pool's pending nonce
-/// covers the queued transaction, so the follow-up preconf submission is
-/// admitted and then simply waits — the client learns nothing until
-/// `preconf_timeout`. Afterwards it is refused immediately with `NonceGap`,
-/// which the client is already expected to handle by resending in order.
+/// The narrowing described in the module docs: the submission is refused
+/// immediately with `NonceGap`, which the client is already expected to handle
+/// by resending in nonce order.
 ///
 /// No block is built here on purpose: the ordinary transaction must stay
 /// unexecuted for the window under test to exist.

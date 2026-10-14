@@ -27,9 +27,12 @@ pub const DEFAULT_FLASHBLOCK_BLOCK_TIME: Duration = Duration::from_millis(200);
 /// closing slice already covers whatever executed after the last tick.
 ///
 /// What remains is the effect on the grid, which is why the knob is kept:
-/// the leeway is subtracted from the drift, so it shifts every tick earlier
-/// without changing how many fire (any value below one interval leaves the
-/// count untouched). A non-zero value buys one thing — the last budgeted
+/// the leeway is subtracted from the drift, so it shifts every tick earlier.
+/// Whether it also changes how many fire depends on where the subtraction
+/// lands — `tick_count` is `ceil((drift - leeway) / interval)`, so a leeway
+/// that carries the window past a multiple of the interval drops a tick, even
+/// one far below an interval. From a full, interval-aligned slot it does not.
+/// A non-zero value buys one thing — the last budgeted
 /// slice publishes that much before the payload is asked for, instead of
 /// racing it — and costs one extra slice assembly, which roots every
 /// transaction in the block, at the point in the slot where the critical
@@ -56,7 +59,7 @@ pub const DEFAULT_BROADCAST_CAPACITY: usize = 32;
 ///
 /// A mid-block pool transaction is therefore offered to the builder a slice
 /// later than it otherwise would be, which buys preconf submissions a further
-/// slice of head start. 0 restores the behaviour from before the lead existed.
+/// slice of head start. `0` disables the lead.
 pub const DEFAULT_BEST_TX_LEAD_SLICES: u64 = 1;
 
 /// Runtime configuration for publishing flashblocks.
@@ -64,7 +67,9 @@ pub const DEFAULT_BEST_TX_LEAD_SLICES: u64 = 1;
 pub struct FlashblockProducerConfig {
     /// Interval between slices.
     pub block_time: Duration,
-    /// How far ahead of the slot deadline building stops.
+    /// How far ahead of the slot deadline the budgeted slice grid finishes.
+    /// Shifts the tick grid; does not end the build, which runs until
+    /// `getPayload` cancels it.
     pub leeway_time: Duration,
     /// Address the publisher binds.
     pub addr: IpAddr,

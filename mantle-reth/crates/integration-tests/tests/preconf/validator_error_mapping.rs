@@ -2,10 +2,9 @@
 //! itself.
 //!
 //! The preconf handler shares reth's (Mantle → OP → Eth) validator chain with
-//! the transaction pool, and today wraps whatever it returns in a single
-//! catch-all: `PreconfError::PoolRejected(format!("{}", e.kind))`. The direct-
-//! admission design translates those refusals itself, so **the wrapper goes
-//! away**.
+//! the transaction pool, and wraps whatever it returns in a single catch-all:
+//! `PreconfError::PoolRejected(err.to_string())` (`admission.rs`). The wrapper
+//! is an implementation detail; the reason it carries is not.
 //!
 //! That makes two things worth separating:
 //!
@@ -13,8 +12,7 @@
 //!   that pinned it would fail by design and teach nothing.
 //! - **The reason must survive.** A client that could tell "your gas limit is below the intrinsic
 //!   cost" from "you cannot afford this" must still be able to. That is what every assertion below
-//!   checks, and why they are **green today and must stay green** rather than being staged behind
-//!   `#[ignore]`.
+//!   checks.
 //!
 //! Two reasons from the full set are deliberately absent:
 //!

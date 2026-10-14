@@ -8,9 +8,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// Mantle's flashblock metadata.
 ///
-/// A superset of the metadata `op-alloy` defines: same three fields, plus
-/// the predecessor pointer. Every field is optional on decode, so metadata
-/// produced elsewhere still parses.
+/// A superset of the metadata `op-alloy` defines: same three fields, plus the
+/// predecessor pointer. `block_number` is required; the other three carry
+/// `#[serde(default)]`, so metadata produced elsewhere parses as long as it
+/// names the block. A payload omitting the `metadata` object entirely is also
+/// accepted — see [`MantleFlashblockPayload`](crate::MantleFlashblockPayload).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MantleFlashblockMetadata {
     /// L2 block this slice belongs to.
@@ -23,8 +25,14 @@ pub struct MantleFlashblockMetadata {
     #[serde(default)]
     pub prev_flashblock_id: FlashblockId,
 
-    /// Always empty. Present so the payload stays shaped like the upstream
-    /// one; consumers must not read it.
+    /// Always empty: `build_flashblock` in `mantle-reth-preconf` leaves it at
+    /// `BTreeMap::default()`. Present so the payload stays shaped like the
+    /// upstream one; consumers must not read it.
+    ///
+    /// That holds even if a producer starts filling it. The contents would be
+    /// state the sequencer claims, unverified until the consumer replays the
+    /// block itself. Routing is the one safe use — a wrong routing decision
+    /// only costs a subscriber some slices.
     #[serde(default)]
     pub new_account_balances: BTreeMap<Address, U256>,
 

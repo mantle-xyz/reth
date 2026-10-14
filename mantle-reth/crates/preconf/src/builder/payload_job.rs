@@ -197,8 +197,8 @@ where
 
 /// Future returned by [`PreconfPayloadJob::resolve_kind`].
 ///
-/// Waits for the spawned build task to **finish** (sender drops on
-/// task exit), then returns whatever the watch channel last held
+/// Waits for the spawned build task to **finish** (sender drops on task exit,
+/// success or failure), then returns whatever the watch channel last held
 /// — `Some(payload)` → `Ok`, `None` → `MissingPayload`.
 ///
 /// ## Why "wait for sender drop" rather than "return first `Some`"
@@ -233,16 +233,14 @@ where
     // Send`.
     Payload: Clone + Send + Sync + 'static,
 {
-    /// Build a future that resolves when the build task drops its
-    /// `watch::Sender` (task exit, success or failure). Returns the
-    /// last value written to the channel, or `MissingPayload` if
-    /// nothing was ever written.
+    /// Build a future over `payload_rx` that yields the channel's last value,
+    /// or `MissingPayload` if nothing was ever written. See
+    /// [`ResolvePayloadFuture`] for when it resolves and why.
     pub fn new(mut payload_rx: watch::Receiver<Option<Payload>>) -> Self {
         let fut = async move {
-            // `changed()` returns `Ok(())` for the one send the build
-            // task makes, and `Err` once it drops the sender. Waiting
-            // for the drop is what makes "the build task exited" the
-            // condition, rather than "a value showed up".
+            // `changed()` yields `Ok` per send and `Err` once the sender
+            // is gone, so looping until it errors parks here until the
+            // build task exits.
             while payload_rx.changed().await.is_ok() {
                 // No-op: the value is read once the sender is gone.
             }

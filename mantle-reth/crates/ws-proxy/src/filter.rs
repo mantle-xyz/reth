@@ -193,7 +193,8 @@ impl FilterType {
     /// `metadata.new_account_balances` keys, then log emitters under
     /// `metadata.receipts`, then a substring scan of the raw `diff.transactions`
     /// hex. Against a Mantle producer the first two are empty, so the substring
-    /// scan is the one that answers — see `mantle_shape` for what that costs.
+    /// scan is the only one that runs — and `mantle_shape` has what it answers,
+    /// which is not what a caller passing a `0x`-prefixed address expects.
     fn contains_any_address(&self, json: &Value, addresses: &HashSet<String>) -> bool {
         if let Some(found) = json
             .get("metadata")
@@ -462,9 +463,8 @@ mod tests {
 /// # What a Mantle slice actually carries
 ///
 /// Filtering reads three inputs, and two of them are empty on every slice the
-/// producer emits: `build_flashblock` in `mantle-reth-preconf` leaves both
-/// `MantleFlashblockMetadata` maps at `BTreeMap::default()`, and the fields
-/// themselves are documented as always empty.
+/// producer emits — see `MantleFlashblockMetadata::new_account_balances` for
+/// why those maps exist and why nothing may read them.
 ///
 /// | Input | Used for | State on a Mantle slice |
 /// |---|---|---|
@@ -475,29 +475,27 @@ mod tests {
 /// So against a live producer today a topic filter matches nothing at all —
 /// topics only ever come from receipt logs — and an address filter falls
 /// through to the last resort in `FilterType::contains_any_address`, a
-/// substring scan over the raw transaction hex. That still returns slices, but
-/// it matches an address appearing anywhere in calldata rather than one that
-/// emitted a log, so it over-matches rather than under-matches: a subscriber
-/// filtering on a single contract also receives slices whose transactions
-/// merely mention it as an argument. Neither case produces an error on either
-/// side.
+/// substring scan over the raw transaction hex. What that scan returns depends
+/// on how the subscriber wrote the address, because neither side strips `0x`:
+///
+/// * `0x`-prefixed, the form every tool emits and every other input here uses: **matches nothing.**
+///   A transaction hex carries one `0x`, at the front; an embedded address is 40 bare hex digits.
+///   The query can only be found if the literal `0x<address>` appears, which it does not.
+/// * bare 40 hex digits: **over-matches.** It hits an address anywhere in calldata, not one that
+///   emitted a log, so a subscriber filtering on a single contract also receives slices that merely
+///   mention it as an argument.
+///
+/// Neither case produces an error on either side.
 ///
 /// The tests below pass because their fixtures populate `metadata.receipts` by
 /// hand. They lock the matching logic; they do not show that filtering is
 /// usable end to end, which needs the producer to start filling that map.
 ///
-/// # For whoever implements the producer side
-///
-/// 1. Populate `metadata.receipts` when building each slice.
-/// 2. This module is the contract. Its fixtures build a real `MantleFlashblockPayload`, serialise
-///    it, and assert the filter matches — if they pass, this proxy will filter correctly.
-/// 3. `an_empty_receipts_map_matches_nothing` will start failing once the map is populated. That
-///    failure is the intended signal, not a regression: replace it with the populated-map
-///    assertion.
-/// 4. Keep the "consumers must not read it" guidance on the field. Once populated it carries
-///    *sequencer-claimed* receipts. This proxy may read them to route, because a wrong routing
-///    decision only costs a subscriber some slices; a consumer that believed them would be trusting
-///    unverified state.
+/// When a producer does start filling it, `an_empty_receipts_map_matches_nothing`
+/// will fail — that is the intended signal, not a regression; replace it with the
+/// populated-map assertion. The rest of this module is the contract to check
+/// against: its fixtures build a real `MantleFlashblockPayload`, serialise it, and
+/// assert the filter matches.
 #[cfg(test)]
 mod mantle_shape {
     use alloy_consensus::Receipt;
