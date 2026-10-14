@@ -35,7 +35,7 @@ neither, so the upstream here is the sequencer itself.
 | API-key authentication | `--api-keys app:key,...`, `--public-access-enabled` |
 | Client IP through forwarding proxies | `--ip-addr-http-header`, `--trusted-proxy-cidrs` |
 | Brotli compression downstream | `--enable-compression` |
-| Per-subscriber address/topic filtering | query parameters on the subscribe URL |
+| Per-subscriber address/topic filtering ⚠️ **unusable on Mantle today — see below** | query parameters on the subscribe URL |
 | Upstream keepalive and backoff | `--subscriber-ping-interval-ms`, `--subscriber-pong-timeout-ms`, `--subscriber-max-interval-ms` |
 | Downstream keepalive | `--client-ping-enabled`, `--client-ping-interval-ms`, `--client-pong-timeout-ms` |
 

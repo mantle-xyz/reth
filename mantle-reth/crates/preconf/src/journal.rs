@@ -25,7 +25,7 @@
 //! record the registry still holds, which is exactly the divergence the two
 //! halves of commitment tracking must not have.
 //!
-//! **Two writers, and only one of them creates the record that keeps a line.**
+//! **A line survives rotation only if the registry holds a record for its hash.**
 //! [`PreconfJournal::append_promised`] takes one commitment from the apply;
 //! [`PreconfJournal::append_batch`] takes a whole slice, ordinary transactions
 //! included. The registry record that `retain` reads is established
@@ -2439,8 +2439,8 @@ mod tests {
         .await;
 
         // `retain_tracked`, not `|_| true`: the entry survives because
-        // `Commitments` still has its record, which is what the old behaviour got
-        // wrong — treating the consumed nonce as "kept" dropped the line here.
+        // `Commitments` still has its record. A predicate that read the
+        // consumed nonce as "kept" would drop the line here instead.
         j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();
         assert_eq!(

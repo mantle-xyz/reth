@@ -9,10 +9,11 @@ use thiserror::Error;
 pub enum ProtocolError {
     /// Invalid flashblock sequence or ordering.
     ///
-    /// Reserved for sequence faults; it has no construction site today. Ordering
-    /// is reported through [`SequenceValidationResult`] and
-    /// [`StateProcessorError::NonConsecutiveBlock`] instead, so this message
-    /// never reaches a log.
+    /// Ordering faults are reported through [`SequenceValidationResult`] and
+    /// [`StateProcessorError::NonConsecutiveBlock`], so a reader chasing one
+    /// should start there. This variant is kept because `ProtocolError` is
+    /// public and not `#[non_exhaustive]`: dropping a variant breaks every
+    /// downstream `match`.
     ///
     /// [`SequenceValidationResult`]: crate::SequenceValidationResult
     #[error("invalid flashblock sequence: flashblocks must be processed in order")]
@@ -88,9 +89,11 @@ pub enum ExecutionError {
 
     /// Failed to load cache account for depositor.
     ///
-    /// Reserved; it has no construction site today. The receipt builder raises
-    /// [`ReceiptBuildError::DepositAccountLoad`], which converts into
-    /// [`Self::RpcReceiptBuild`], so this message never reaches a log.
+    /// The receipt builder raises [`ReceiptBuildError::DepositAccountLoad`],
+    /// which converts into [`Self::RpcReceiptBuild`] — that is the path a
+    /// deposit-account failure actually takes. Kept for the same reason
+    /// [`ProtocolError::InvalidSequence`] is: `ExecutionError` is public and
+    /// not `#[non_exhaustive]`.
     ///
     /// [`ReceiptBuildError::DepositAccountLoad`]: crate::ReceiptBuildError::DepositAccountLoad
     #[error("failed to load cache account for deposit transaction sender")]

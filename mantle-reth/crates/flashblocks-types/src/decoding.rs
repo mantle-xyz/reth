@@ -35,8 +35,9 @@ fn looks_like_json(bytes: &[u8]) -> bool {
 }
 
 fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FlashblockDecodeError> {
-    // Read one byte past the ceiling: enough to tell "exactly at the limit"
-    // from "over it" without ever buffering more than that.
+    // Read at most one byte past the ceiling into `out`: enough to tell
+    // "exactly at the limit" from "over it" without materialising the whole
+    // expansion. The decoder's own window is separate and not bounded by this.
     let mut out = Vec::new();
     brotli::Decompressor::new(bytes, 4096)
         .take(MAX_DECOMPRESSED_FLASHBLOCK_BYTES as u64 + 1)

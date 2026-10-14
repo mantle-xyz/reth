@@ -371,8 +371,9 @@ fn parse_flashblock_position(data: &str) -> Option<(u64, u64)> {
 /// decompression, so a small but highly compressible payload from a hostile or
 /// misconfigured upstream cannot force a large allocation.
 ///
-/// The two ceilings are hardcoded independently — `mantle-reth-flashblocks-types`
-/// is only a dev-dependency here — so changing one means changing the other.
+/// The two ceilings are declared independently — `mantle-reth-flashblocks-types`
+/// is only a dev-dependency here — and held equal by
+/// `the_ceiling_matches_the_consumer_s` rather than by convention.
 const MAX_BINARY_SLICE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Recovers the slice JSON from a binary frame.
@@ -394,9 +395,10 @@ fn decode_binary_slice(data: &[u8]) -> Option<String> {
     }
 
     let mut decompressed = Vec::new();
-    // Read one byte past the ceiling: enough to tell "exactly at the limit"
-    // from "over it" without ever buffering more than that. Mirrors the
-    // consumer's `decompress`.
+    // Read at most one byte past the ceiling into `decompressed`: enough to
+    // tell "exactly at the limit" from "over it" without materialising the
+    // whole expansion. Mirrors the consumer's `decompress`. The decoder's own
+    // window is separate and not bounded by this.
     if let Err(error) = brotli::Decompressor::new(data, 4096)
         .take(MAX_BINARY_SLICE_BYTES as u64 + 1)
         .read_to_end(&mut decompressed)
@@ -731,6 +733,20 @@ mod tests {
             bomb.len()
         );
         assert_eq!(decode_binary_slice(&bomb), None, "expands past the ceiling");
+    }
+
+    /// The proxy and the consumer have to refuse the same frames, or one of
+    /// them forwards a slice the other will not decode. The two constants are
+    /// declared independently — `mantle-reth-flashblocks-types` is a
+    /// dev-dependency here, so the ceiling cannot simply be imported — which
+    /// makes this the only thing holding them together.
+    #[test]
+    fn the_ceiling_matches_the_consumer_s() {
+        assert_eq!(
+            MAX_BINARY_SLICE_BYTES,
+            mantle_reth_flashblocks_types::MAX_DECOMPRESSED_FLASHBLOCK_BYTES,
+            "a proxy that accepts a different size than the consumer forwards slices it cannot read",
+        );
     }
 
     #[test]

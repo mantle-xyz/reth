@@ -21,7 +21,7 @@ pub const DEFAULT_MAX_CACHE_AHEAD_BLOCKS: u64 = 5;
 /// Once the gap closes, the caller drains the corresponding entries and feeds
 /// them through normal execution.
 ///
-/// The second path is the only caller of [`FlashblockCache::has_flashblock`]:
+/// That second path is what [`FlashblockCache::has_flashblock`] exists for:
 /// a slice with `index > 0` is worth keeping only when its predecessor is
 /// already buffered, otherwise a replay would start mid-block.
 ///
