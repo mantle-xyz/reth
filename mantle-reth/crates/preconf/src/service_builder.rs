@@ -196,15 +196,6 @@ impl PreconfServiceBuilder {
     {
         restore_preconf_state(&self.journal, pool, chain, &self.fifo, self.fifo.claims()).await;
 
-        // Every fifo removal path also drops the commitment record: on most
-        // of them, once the entry is gone there is nothing left for the record
-        // to protect. `forward` is the exception — it removes on
-        // "the sender's nonce moved past this entry", which neither identifies
-        // the tx that advanced the nonce nor is irrevocable, so the commitment
-        // may still be live.
-        // Registered as a callback rather than a direct reference so the fifo
-        // stays ignorant of the classifier (the sweep in the other
-        // direction is driven by the canonical-state handler, which holds both).
         Ok(())
     }
 

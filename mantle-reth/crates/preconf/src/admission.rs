@@ -12,8 +12,8 @@
 //! Cheapest judgement first, and two placements are deliberate rather than
 //! incidental:
 //!
-//! * **recording the commitment** comes before the validator, because the record has to exist
-//!   before any step that can fail expensively — otherwise every failure path owes a rollback;
+//! * the **allowlist preview** (`preview_eligibility`) comes before the validator, so a sender who
+//!   was never allowlisted costs neither a state read nor a validator round trip;
 //! * the **queue's own rules** come last, because they are the only ones needing its lock, and
 //!   holding it for a request already doomed is time no other request can use.
 //!
@@ -286,10 +286,10 @@ where
         }
     }
 
-    /// Everything after the record exists: the validator, then the queue.
+    /// The two expensive steps: the validator, then the queue.
     ///
-    /// Split out so the caller has one place to release the record from,
-    /// rather than a release on every branch that can fail.
+    /// Split out so `admit` has one place to see either one's refusal, rather
+    /// than a match on every branch that can fail.
     async fn decide(
         &self,
         pool_tx: V::Transaction,
@@ -363,17 +363,14 @@ pub fn capacity_from_pool_config(
 }
 
 #[cfg(test)]
-mod record_release_tests {
-    //! What a refused admission owes back.
+mod refused_admission_tests {
+    //! What a refused admission leaves behind.
     //!
-    //! The record is written before the validator runs, so every path that
-    //! fails after it has to hand it back — otherwise the hash keeps a
-    //! commitment record for a transaction that is going nowhere, and the
-    //! sender could never get those bytes preconfirmed again.
-    //!
-    //! One exception, and it is the whole reason the release is not
-    //! unconditional: a commitment whose receipt has already gone out keeps
-    //! its record and its nonce.
+    //! Admission writes no commitment record — `record_announced` does, at the
+    //! apply, and `mark_promised` at the receipt. So a refusal must leave
+    //! `Commitments` exactly as it found it: no record for a transaction that
+    //! is going nowhere, and none taken from a resubmit whose receipt has
+    //! already gone out.
 
     use super::*;
     use alloy_consensus::{SignableTransaction, TxEip1559};
@@ -466,7 +463,7 @@ mod record_release_tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_hands_back_the_record_it_froze() {
+    async fn a_refusal_leaves_no_record() {
         let f = fixture();
         let (raw, hash) = signed_raw(&f.signer, 0);
         let (resp, _rx) = oneshot::channel();
@@ -476,7 +473,7 @@ mod record_release_tests {
             .await
             .expect_err("the validator refuses everything");
 
-        assert!(!f.fifo.claims().is_tracked(&hash), "the record must be released");
+        assert!(!f.fifo.claims().is_tracked(&hash), "a refused admission records nothing");
         assert!(!f.fifo.contains(&hash).await, "and nothing may be left queued");
     }
 
@@ -511,10 +508,10 @@ mod record_release_tests {
         );
     }
 
-    /// The type gate runs before anything is recorded, so there is nothing
-    /// to hand back — and nothing must be left behind either.
+    /// The type gate runs before the queue is touched at all, so a refusal
+    /// there records nothing.
     #[tokio::test]
-    async fn a_type_refused_transaction_never_froze_anything() {
+    async fn a_type_refused_transaction_records_nothing() {
         let f = fixture();
         let (raw, hash) = signed_raw(&f.signer, 0);
         let (resp, _rx) = oneshot::channel();

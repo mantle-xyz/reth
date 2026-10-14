@@ -149,9 +149,8 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
         &self.executed
     }
 
-    /// Everything executed since the last call, as
-    /// journal records and once as what the unlanded index needs — and moves
-    /// past them in the same step.
+    /// Everything `record_journalable` marked since the last call, as
+    /// [`JournalEntry`] records — and moves past them in the same step.
     ///
     /// One operation rather than a read and an advance, because there is no
     /// correct way to do one without the other: records left behind are written
@@ -159,15 +158,6 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
     /// the journal's own business — it keeps what a write could not place and
     /// carries it forward — so a record leaves here exactly once, whether or not
     /// the disk took it.
-    ///
-    /// Both projections come out of one call for that same reason: the cursor
-    /// may only advance once, so taking them separately would either announce a
-    /// transaction the journal skipped or journal one the index never saw.
-    ///
-    /// The index projection carries the signer and nonce alongside the encoding
-    /// because the sweep that reads them runs at the start of every build,
-    /// healthy ones included — decoding there, let alone ec-recovering, would
-    /// put a block's worth of work on a path that usually has nothing to do.
     ///
     /// Separate from the publish cursor because the two diverge: a slice dropped
     /// by the cancel guard was handed over all the same.
@@ -419,12 +409,10 @@ mod tests {
         assert_eq!(info.executed().len(), 3, "all three still executed, in order");
     }
 
-    /// The two projections describe the same transactions. They are taken
-    /// together so that they cannot diverge, and this is what "the same set"
-    /// means: one announcement per record, carrying the signer and nonce the
-    /// sweep compares against the chain without decoding anything.
+    /// A record comes out for each transaction `record_journalable` marked,
+    /// in execution order, and for no other.
     #[test]
-    fn the_index_projection_describes_the_same_transactions_as_the_records() {
+    fn the_records_are_the_journalable_transactions_in_execution_order() {
         let mut info = Info::default();
         info.record(tx(sender(0xaa), 0));
         info.record_journalable(tx(sender(0xbb), 1));
@@ -432,8 +420,7 @@ mod tests {
 
         let records = info.take_journal_records(7);
 
-        // Only what `record_journalable` marked, in execution order, carrying
-        // the signer the executor recovered rather than one re-derived here.
+        // Only what `record_journalable` marked, in execution order.
         assert_eq!(
             records.iter().map(|r| r.hash).collect::<Vec<_>>(),
             vec![*tx(sender(0xbb), 1).tx_hash(), *tx(sender(0xcc), 2).tx_hash()],

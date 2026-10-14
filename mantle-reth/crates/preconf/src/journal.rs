@@ -836,21 +836,10 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
 ///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so the dispatch layer's
 ///    deadline / gas-budget gates bypass the tx (SLA: "receipt returned → tx must land").
 ///
-/// ## Why step 1 has to come first
-///
-/// Restore deliberately does not re-derive eligibility — a commitment already
-/// acknowledged to a client must come back regardless of what current policy
-/// says. Cold start runs before restore, so without step 1 a restored tx would
-/// be classified `Eligible` and re-judged against the *current*
-/// `preconf_max_gas_per_tx`: lower that flag, restart, and `recover_envelope` starts
-/// rejecting commitments a client was already told had succeeded — silently,
-/// since restore skips and logs.
-///
-/// The `promised` flag makes the exemption explicit: the claim is
-/// get-or-insert, so the record installed here survives step 2, and the
-/// validator returns a promised transaction straight to its inner validator —
-/// ahead of the ceiling and every other preconf gate. The pre-pass loop carries
-/// the rest of the argument.
+/// Restore does not re-derive eligibility: nothing on this path reads
+/// `PreconfConfig`, so a commitment already acknowledged to a client comes back
+/// regardless of what current policy says. Why step 1 cannot be folded into
+/// step 2 is argued at the pre-pass loop below.
 ///
 /// Non-recoverable failures (corrupt bytes, a type the preconf path does not
 /// carry) are logged and skipped — best-effort restore, never block startup.
@@ -1897,15 +1886,12 @@ mod tests {
 
     // ── restore_preconf_state ──────────────────────────────────────
 
-    /// Stub pool that records `contains` / `recover_envelope` calls. We
+    /// Stub [`RestoreSource`] that records every `recover_envelope` call. We
     /// don't go through real reth pool machinery — that's wired in by
     /// the cli crate at a later phase. The stub fabricates plausible
     /// envelopes for every `recover_envelope` call.
     struct StubPool {
-        // Hashes the stub will report as already-present.
-        known: HashSet<TxHash>,
         // Counts for assertions.
-        contains_calls: std::sync::Mutex<Vec<TxHash>>,
         add_calls: std::sync::Mutex<Vec<Bytes>>,
         // Whether recover_envelope should return Err.
         reject_add: bool,
@@ -1916,8 +1902,6 @@ mod tests {
     impl StubPool {
         fn new() -> Self {
             Self {
-                known: HashSet::new(),
-                contains_calls: std::sync::Mutex::new(Vec::new()),
                 add_calls: std::sync::Mutex::new(Vec::new()),
                 reject_add: false,
                 undecodable: false,
@@ -2128,7 +2112,6 @@ mod tests {
         let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
         restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
-        assert!(pool.contains_calls.lock().unwrap().is_empty());
         assert!(pool.add_calls.lock().unwrap().is_empty());
         assert!(fifo.snapshot().await.is_empty());
     }
@@ -2149,32 +2132,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_pushes_fifo_when_pool_already_contains() {
-        // Regression guard for J5: pre-fix, when pool.contains returned
-        // true, restore's inner branch called `recover_envelope` and treated
-        // the resulting `Err(AlreadyImported)` as `continue;` — the
-        // fifo push was skipped. Post-fix, `recover_envelope`'s trait
-        // contract treats AlreadyImported as `Ok(recovered)` and
-        // restore unconditionally pushes to the fifo.
+    async fn restore_pushes_single_entry_to_fifo() {
         let (_dir, j) = fresh_journal().await;
         let e1 = entry(3, 30);
         j.append_promised(&e1).await.unwrap();
 
-        let mut pool = StubPool::new();
-        pool.known.insert(e1.hash);
+        let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
         restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
 
         assert_eq!(pool.add_calls.lock().unwrap().len(), 1);
-        // Core J5 assertion: fifo received the entry.
         assert_eq!(fifo.snapshot().await.len(), 1);
     }
 
-    /// **The ordering invariant of C4.** Every entry must already carry
-    /// promised **before the first one is offered to the pool**, not
-    /// merely before its own admission. Asserted from inside `recover_envelope`, i.e.
-    /// at exactly the moment the real validator would run. See the pre-pass in
-    /// `restore_preconf_state` for why the stronger form is the one that matters.
+    /// Every entry must already carry promised **before the first one reaches
+    /// `recover_envelope`**, not merely before its own. Asserted from inside
+    /// `recover_envelope`. See the pre-pass in `restore_preconf_state` for why
+    /// the stronger form is the one that matters.
     #[tokio::test]
     async fn restore_marks_every_entry_promised_before_admitting_any() {
         /// Pool that, on each tx it is handed, snapshots the promise flag of **all**

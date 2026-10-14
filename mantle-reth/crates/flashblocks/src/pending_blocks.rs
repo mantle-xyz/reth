@@ -469,9 +469,8 @@ impl PendingBlocks {
 
     /// Returns the parent hash of the earliest pending block.
     ///
-    /// Consumers reusing cached execution results must verify their incoming
-    /// `parent_block_hash` matches this value: during a reorg or failover two
-    /// different parent hashes can share the same block number.
+    /// This pins the ancestor the snapshot was built on; a reorg or failover can
+    /// produce a different parent hash at the same block number.
     #[inline]
     pub fn parent_hash(&self) -> B256 {
         self.earliest_header.parent_hash

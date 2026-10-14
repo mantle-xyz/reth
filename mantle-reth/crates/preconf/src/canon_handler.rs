@@ -143,10 +143,10 @@ where
             }
 
             // Record-cache sweep. Runs unconditionally: its target is the leak
-            // `drop_hash` cannot reach — a tx classified at admission that sits
-            // in `Queued`, never emits a `Pending` event, and so never gets a
-            // fifo entry at all. Criterion is fifo membership plus reorg
-            // reach; see `Commitments::sweep`.
+            // `drop_hash` cannot reach — a record with no fifo entry to be
+            // removed from, left behind by `restore_preconf_state`'s
+            // `OnChain::No` and `OnChain::Unknown` arms. Criterion is fifo
+            // membership plus reorg reach; see `Commitments::sweep`.
             //
             // **Must stay below the `mark_committed` loop above.** A commitment
             // whose block just became canonical has usually lost its fifo entry

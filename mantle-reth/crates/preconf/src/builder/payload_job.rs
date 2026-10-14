@@ -203,24 +203,17 @@ where
 ///
 /// ## Why "wait for sender drop" rather than "return first `Some`"
 ///
-/// The pre-flashblock model only sent **once** (final payload), so
-/// "return first `Some`" was almost-always equivalent. But it has
-/// two latent issues:
+/// The channel carries a single value: `payload_job_generator` sends the
+/// finished `OpBuiltPayload` once and drops the sender without sending on
+/// every other exit. Flashblock slices do not pass through it —
+/// `SliceState::publish` hands those to `producer.publisher`.
 ///
-/// 1. **Race window** in the single-set case: if the receiver polls before the spawned task sends,
-///    then sees `None`, then polls again right after the send but before the task exits, the "first
-///    `Some`" returns immediately. That's fine for single-set but **wrong for flashblocks**, where
-///    the sender will set intermediate flashblock payloads — "first `Some`" would return a
-///    mid-build snapshot instead of the final block.
-/// 2. **Semantic mismatch**: `resolve_kind` is called when the CL asks for the *finished* payload.
-///    We should wait for the build to actually complete (sender drop), not opportunistically grab
-///    whatever's in the cell.
+/// Even so, the condition to wait on is the build task exiting, not a value
+/// appearing in the cell: `resolve_kind` is called when the consensus layer
+/// asks for the *finished* payload, and "first `Some`" would race the task
+/// between its send and its exit.
 ///
-/// New semantic (forward-compatible with flashblocks): loop on
-/// `changed().await` until it returns `Err` (sender dropped → build
-/// task exited), then read the final value from `borrow()`.
-///
-/// `resolve_kind` calls `self.cancel.signal()` before constructing
+/// `resolve_kind` calls `self.cancel.resolve()` before constructing
 /// this future, so the build task is already wrapping up — the
 /// `changed()` loop typically resolves within a few hundred μs.
 ///
@@ -246,16 +239,12 @@ where
     /// nothing was ever written.
     pub fn new(mut payload_rx: watch::Receiver<Option<Payload>>) -> Self {
         let fut = async move {
-            // Drain `changed()` notifications until the sender drops.
-            // Intermediate `Ok(())` results signal that the watch
-            // value was updated — for the single-set model that's the
-            // final payload; for future flashblocks each `Ok(())`
-            // signals an intermediate flashblock. Either way we keep
-            // waiting for the sender to actually drop (i.e. the build
-            // task to exit) before reading the latest value.
+            // `changed()` returns `Ok(())` for the one send the build
+            // task makes, and `Err` once it drops the sender. Waiting
+            // for the drop is what makes "the build task exited" the
+            // condition, rather than "a value showed up".
             while payload_rx.changed().await.is_ok() {
-                // No-op: value was updated, but build task may still
-                // emit more (flashblocks) or be finishing finalize.
+                // No-op: the value is read once the sender is gone.
             }
             // Sender dropped — read whatever's in the cell.
             payload_rx.borrow().clone().ok_or(PayloadBuilderError::MissingPayload)
