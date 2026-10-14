@@ -20,17 +20,13 @@
 //!
 //! ### Generic validator rejections live in `validator_error_mapping.rs`
 //!
-//! This file used to also carry `intrinsic_gas_too_low_pool_rejects`,
-//! `insufficient_funds_pool_rejects` and `block_gas_limit_exceeded_pool_rejects`,
-//! which pinned the `pool rejected: <inner>` wrapper that
-//! `rpc.rs::handle_inner`'s catch-all puts around every validator refusal.
-//!
-//! **That wrapper is going away** — the direct-admission design translates
-//! validator refusals itself — so a test asserting it would fail by design and
-//! teach nothing. The three moved to `validator_error_mapping.rs`, restated to
-//! assert what actually has to survive: that the refusal still *names its
-//! reason*. That file also covers two reasons these never did (oversized init
-//! code, Mantle's `MetaTx`).
+//! Refusals the shared validator chain makes — intrinsic gas too low,
+//! insufficient funds, block gas limit exceeded, oversized init code, Mantle's
+//! `MetaTx` — are asserted there, and only to the extent that the refusal
+//! *names its reason*. The `pool rejected: <inner>` wrapper that
+//! `rpc.rs::handle_inner`'s catch-all puts around them is not part of the
+//! contract: the direct-admission design translates validator refusals itself,
+//! so a test pinning the wrapper would fail by design and teach nothing.
 //!
 //! What stays here is the narrower family above: refusals the **preconf layer
 //! itself** makes, before the validator is consulted at all.

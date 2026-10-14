@@ -841,10 +841,10 @@ mod tests {
     /// **The claim is made by executing, not by a client hearing about it.**
     ///
     /// No responder is attached here, which is the shape a replay has and the
-    /// shape a commitment gets when its caller hangs up. Before the claim moved
-    /// to the apply, nothing recorded such an entry, so `slot_owner` answered
-    /// `None` and a same-nonce pool transaction could take the nonce out from
-    /// under a transaction already announced in a slice.
+    /// shape a commitment gets when its caller hangs up. Tie the claim to the
+    /// responder instead and no such entry is ever recorded: `slot_owner`
+    /// answers `None`, and a same-nonce pool transaction takes the nonce out
+    /// from under a transaction already announced in a slice.
     #[tokio::test]
     async fn a_successful_apply_claims_the_nonce_even_with_no_client_waiting() {
         let fifo = PreconfTxSet::new(8);
@@ -1197,9 +1197,8 @@ mod tests {
     /// per-tx `Rejected` path, must leave the commitment intact for retry:
     /// the fifo entry stays `Waiting`, nothing is recorded in loop state, and
     /// the responder stays attached so the client keeps waiting for the next
-    /// build cycle.
-    /// This is the asymmetry the fix removes: the pool arm already aborts
-    /// on this class; the preconf arm used to silently drop the commitment.
+    /// build cycle. The pool arm aborts on this class too: the two arms must
+    /// not disagree about what a fatal executor error means.
     #[tokio::test]
     async fn apply_fatal_aborts_build_and_leaves_entry_waiting() {
         let fifo = PreconfTxSet::new(8);
@@ -1522,11 +1521,10 @@ mod tests {
     /// sees `Success`, not `Timeout`.
     ///
     /// Regression guard for the SLA invariant "wire `Timeout` ⇒ tx not
-    /// committed to builder state". Without the `apply_lock` scheme,
-    /// the RPC deadline branch would previously flip the entry to
-    /// `Timeout` while dispatch had already committed the tx to the
-    /// in-flight builder, producing an on-chain landing under a
-    /// Timeout wire response.
+    /// committed to builder state". Without the `apply_lock` scheme, the
+    /// RPC deadline branch flips the entry to `Timeout` while dispatch has
+    /// already committed the tx to the in-flight builder, producing an
+    /// on-chain landing under a Timeout wire response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn apply_lock_blocks_rpc_timeout_race_and_yields_success() {
         let fifo = Arc::new(PreconfTxSet::new(8));

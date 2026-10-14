@@ -148,12 +148,13 @@ async fn a_sub_basefee_tx_is_refused_by_the_builder() {
 /// applied, because the next block is the one that decides.
 ///
 /// This is the case a queue-held threshold gets wrong, and the reason the
-/// threshold moved. The queue can only know a base fee a build published, so
-/// between jobs its newest value belongs to the block already sealed. The
+/// threshold is taken from the block being built. The queue can only know a
+/// base fee a build published, so between jobs its newest value belongs to the
+/// block already sealed. The
 /// block being built has its own, and on a chain below its gas target that one
 /// is lower — by up to 12.5% at Mantle's EIP-1559 denominator of 8. Anything
-/// the client bids into that gap executes perfectly well and used to be
-/// refused.
+/// the client bids into that gap executes perfectly well, and a queue-held
+/// threshold refuses it.
 ///
 /// Set up with no arithmetic about the decay: the head is genesis, which is
 /// empty, so the block built below is guaranteed to carry a lower base fee

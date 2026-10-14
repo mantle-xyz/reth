@@ -221,10 +221,10 @@ pub struct Commitments {
     /// Mirrors `PreconfConfig::enabled`. When false this node runs no preconf
     /// machinery at all, so nothing is recorded.
     ///
-    /// The leak this originally guarded against is gone — a node that has not
-    /// opted in no longer builds the RPC handler, so nothing reaches here to
-    /// record anything. Refusing anyway keeps the invariant this type's own,
-    /// rather than a consequence of how it is wired.
+    /// Nothing should reach here on a node that has not opted in: it never
+    /// builds the RPC handler, so there is no way to record anything. Refusing
+    /// anyway keeps the invariant this type's own, rather than a consequence of
+    /// how it is wired.
     enabled: bool,
     /// The commitment records and the `(sender, nonce)` slot index.
     /// `parking_lot` ⇒ synchronous reads, usable from the builder's sync apply
@@ -261,8 +261,7 @@ pub struct Commitments {
 impl Commitments {
     /// A recording registry, warning past `capacity`.
     ///
-    /// Deliberately not a `new(bool, usize)`: the type this replaced took
-    /// `all_preconfs` in that position, so a positional bool here is one
+    /// Deliberately not a `new(bool, usize)`: a positional bool there is one
     /// mechanical edit away from silently turning recording off.
     pub fn enabled(capacity: usize) -> Self {
         Self::build(true, capacity)
@@ -976,8 +975,7 @@ mod tests {
     /// promised, no fifo entry, never observed on chain. Were age allowed to
     /// decide it, the record would vanish while the
     /// commitment was still owed, stranding its journal line with nothing
-    /// tracking it. That divergence is what the journal used to need its own
-    /// wall-clock rule to paper over.
+    /// tracking it.
     #[test]
     fn sweep_holds_an_unlanded_promise_until_its_block_is_out_of_reach() {
         let c = classifier();
@@ -1087,10 +1085,8 @@ mod tests {
     /// transaction that reaches the node any other way — plain
     /// `eth_sendRawTransaction`, p2p, the pool's own reorg reinject — leaves
     /// no record here at all, and consumers read "no record" as not preconf.
-    ///
-    /// There used to be a second door: the pool's validator recorded every
-    /// transaction it saw. With it gone there is nothing to record, which is
-    /// why this asserts absence.
+    /// There is no second door that could record one, which is why this asserts
+    /// absence.
     #[test]
     fn a_transaction_that_never_asked_for_preconf_has_no_record() {
         let c = classifier();
@@ -1495,9 +1491,8 @@ mod tests {
     /// A transaction the door refused must not occupy a slot: it would reject
     /// replacements the preconf arm has no stake in.
     ///
-    /// It leaves no record either, which is a stronger position than the one
-    /// this used to assert — back when the pool's validator recorded every
-    /// transaction, there was one to keep out of the slot index.
+    /// It leaves no record either, which is stronger than merely keeping it out
+    /// of the slot index.
     #[test]
     fn a_refused_tx_claims_no_slot_and_leaves_no_record() {
         let c = classifier();

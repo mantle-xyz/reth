@@ -16,9 +16,7 @@
 //! over-broad implementation — refuse whenever sender or recipient has code —
 //! would pass a test that only checked (1) and break every delegated user.
 //! `a_preconf_call_to_a_delegated_eoa_lands` and
-//! `a_preconf_tx_from_a_delegated_eoa_lands` exist to fail in that case, and so
-//! are deliberately **not** `#[ignore]`d: they pass today and must still pass
-//! after.
+//! `a_preconf_tx_from_a_delegated_eoa_lands` exist to fail in that case.
 //!
 //! The third test covers the in-flight bound a delegated *sender* is held to,
 //! which the preconf queue does not have yet.

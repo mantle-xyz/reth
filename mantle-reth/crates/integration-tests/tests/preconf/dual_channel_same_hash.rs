@@ -5,13 +5,11 @@
 //! Both orders are covered, because they reach the same end state — one hash
 //! held by two independent queues — and must therefore give the same answer.
 //!
-//! What used to refuse the second submission depended on the order, and neither
-//! reason survived the direct-admission change:
-//!
-//! | order | refused by | why it went away |
-//! |---|---|---|
-//! | ordinary first, then preconf | the ordinary path used to leave a frozen classification behind, and it was immutable, so admission refused | nothing records anything for ordinary transactions once the pool decoration is gone |
-//! | preconf first, then ordinary | the pool's own hash dedup — the preconf transaction was *in* the pool, so resubmitting it was "already known" | preconf transactions no longer enter the pool, so the hash is new to it |
+//! Neither order has anything left to refuse the second submission with:
+//! nothing is recorded for an ordinary transaction, so ordinary admission
+//! cannot bar a later preconf call on that hash; and a preconf transaction
+//! never enters the pool, so an ordinary resubmission of the same hash is new
+//! to the pool's hash dedup rather than "already known".
 //!
 //! Accepting both is a deliberate loosening, on the grounds that whatever lands
 //! was put there by the client itself: "your preconfirmation failed" and "the
@@ -86,10 +84,10 @@ async fn assert_landed_exactly_once(
 
 /// Ordinary submission first, preconf second.
 ///
-/// The preconf call used to be refused outright, because the ordinary admission
-/// had already frozen a classification for this hash. It is accepted now,
-/// and races the pool arm for the same transaction — one of them lands it, and
-/// the other is dropped at execution as nonce-too-low.
+/// Ordinary admission freezes no classification for the hash — it records
+/// nothing at all — so the preconf call is accepted, and races the pool arm for
+/// the same transaction: one of them lands it, and the other is dropped at
+/// execution as nonce-too-low.
 ///
 /// **Accepted** is asserted against the queue, not against the RPC result:
 /// which arm wins is a race, so the call may legitimately come back with a
@@ -126,8 +124,7 @@ async fn ordinary_then_preconf_is_no_longer_refused() {
     let http_clone = http.clone();
     let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw).await });
 
-    // The assertion this test exists for: the preconf submission reached the
-    // queue. Under the old frozen-classification rule it never would have.
+    // The assertion this test exists for: the preconf submission reached the queue.
     wait_fifo_entry(&fifo, sender, 0).await;
 
     let payload = node
@@ -152,10 +149,9 @@ async fn ordinary_then_preconf_is_no_longer_refused() {
 
 /// Preconf submission first, ordinary second.
 ///
-/// The ordinary submission used to be "already known" — the preconf transaction
-/// was itself in the pool, so the hash was a duplicate. Preconf transactions
-/// never enter the pool now, so the hash is new to it and it is accepted; the
-/// `expect` below is the assertion.
+/// The preconf transaction is not itself in the pool, so its hash is new to the
+/// pool and the ordinary submission is accepted rather than refused as "already
+/// known"; the `expect` below is the assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preconf_then_ordinary_is_no_longer_refused() {
     let recipient: Address = RECIPIENT.parse().unwrap();

@@ -86,9 +86,9 @@ async fn signed_creation(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 /// until now `to == None` was refused at classification and never got in.
 ///
 /// The wildcard-loading assertions ride along on the same launch rather than
-/// taking a second one, because `classifier_freeze`'s notes are explicit that two
-/// node-spawning tests measurably raise this suite's unrelated flakiness and one
-/// does not. Cold start reads both wildcard arrays out of the sentinel
+/// taking a second one: a second node launch costs reliability under this
+/// suite's parallel load (see `classifier_freeze.rs`). Cold start reads both
+/// wildcard arrays out of the sentinel
 /// contract's genesis storage, which is the part a mock-backed unit test cannot
 /// reach: those build their storage with the same code that computes the slots.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -57,12 +57,10 @@ use reth_optimism_node::{OpEngineApiBuilder, OpEngineValidatorBuilder};
 /// MantleTransactionValidator<OpTransactionValidator<...>>
 /// ```
 ///
-/// The pool knows nothing about preconf. It used to carry a decorating layer
-/// that enforced the preconf replacement guard and per-tx gas ceiling on
-/// every transaction the node saw, sequencer or not; those judgements belong
-/// to `PreconfAdmission` now, on a path the pool is not part of. The same
-/// chain is shared with admission rather than duplicated, so both give one
-/// answer to "is this transaction valid".
+/// The pool knows nothing about preconf: the preconf replacement guard and
+/// per-tx gas ceiling are `PreconfAdmission`'s judgements, on a path the pool
+/// is not part of. The same chain is shared with admission rather than
+/// duplicated, so both give one answer to "is this transaction valid".
 pub type MantleTransactionPool<Client, S, Evm, T = OpPooledTransaction> = OpPool<
     Pool<
         TransactionValidationTaskExecutor<
@@ -287,8 +285,7 @@ where
             // The provider answers both of restore's chain questions: whether
             // a commitment's nonce is still its sender's next one, and — only
             // when it is not — whether the transaction that took it was this
-            // one. The pool used to answer the first as a side effect of
-            // refusing the transaction; it no longer sees these at all.
+            // one.
             let chain_view = ProviderChainView::new(ctx.provider().clone());
             svc.start(&adapter, &chain_view)
                 .await
@@ -548,7 +545,7 @@ where
                     // sealed hashes reported by the canon handler on the
                     // way down are dropped from the journal file before
                     // the node exits.
-                    // Journal is mandatory (stage2), so no `Option` dance here.
+                    // Journal is mandatory, so no `Option` dance here.
                     let journal = svc.journal().clone();
                     // Rotation asks the classifier which commitments are still
                     // tracked — it owns that answer.

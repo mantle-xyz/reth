@@ -125,11 +125,8 @@ impl PreconfRpcHandler {
         // gas ceiling, the validator chain and the queue's own rules, in that
         // order, with the client's channel installed under the queue's lock
         // so the builder cannot reach an entry that has nobody to answer.
-        //
-        // What used to be five steps here reached the queue through the pool
-        // and a listener, which is why a transaction the pool merely parked
-        // produced no refusal at all — the client waited out the timeout to
-        // learn nothing had happened.
+        // Every refusal therefore comes back from this one call as an error,
+        // rather than leaving a parked submission to wait out the deadline.
         let (resp_tx, resp_rx) = oneshot::channel();
         let admitted = self
             .admission
@@ -146,7 +143,7 @@ impl PreconfRpcHandler {
         // dispatch's "point of no return"; once we hold the lock, any
         // completion has already answered the channel. The `try_recv()`
         // on `resp_rx` then reliably picks up whatever dispatch sent —
-        // closing the SLA race where a client could previously see
+        // closing the SLA race where a client would otherwise see
         // `Timeout` even though the tx had already been committed to
         // the builder state.
         let preconf_timeout = self.cfg.preconf_timeout;
@@ -339,8 +336,11 @@ impl DynPreconfHandler for PreconfRpcHandler {
 ///
 /// Wire-layer `Success`/`Failed` is derived from `receipt.status: bool`,
 /// which reflects EVM execution outcome (`false` = revert/halt, `true` =
-/// success). Both cases mean the tx **is on chain** — the receipt would
-/// not exist otherwise.
+/// success). Both mean the transaction executed and produced a receipt —
+/// against the payload this build is assembling, which the consensus layer may
+/// still not adopt. The commitment is owed either way: a build whose payload
+/// goes unused hands its entries back for the next one to replay, at a height
+/// this event does not predict.
 ///
 /// A commitment the builder refused instead (nonce-too-low, block gas budget,
 /// DA budget) never reaches this conversion: there is no receipt, so it leaves

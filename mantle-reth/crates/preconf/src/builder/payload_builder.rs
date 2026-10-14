@@ -907,11 +907,11 @@ where
 /// Synchronous canon-forward — drops fifo entries whose nonce has
 /// already been sealed as of the parent block. Called at
 /// `build_payload` start, **before** [`replay_fifo_carryover`]; the
-/// pair together replace the async `canon_handler::forward()` sweep
-/// that used to race with new payload jobs (FCU for slot N+1 fires
-/// before / during / after `canon_handler`'s notification handler for
-/// slot N, so a new build could observe stale `Success` entries and
-/// incorrectly replay them via `reset_success_to_waiting`).
+/// pair runs inside the job rather than off a canonical-state
+/// notification, because FCU for slot N+1 fires before / during / after
+/// `PreconfCanonHandler`'s notification handler for slot N — a sweep
+/// driven from there lets a new build observe stale `Success` entries
+/// and replay them via `reset_success_to_waiting`.
 ///
 /// Reads the senders holding entries, asks the parent-block state for each of
 /// their nonces, and drops everything those nonces have passed in one sweep.
@@ -1506,10 +1506,10 @@ impl SliceState {
         // Before the publish below, always. See this function's docs.
         if let Some(journal) = journal {
             let height = ctx.parent().number() + 1;
-            // Staging no longer happens here: the apply puts every executed
-            // transaction into the fifo as it runs, so by the time a slice is
-            // assembled the index is already complete. What is left is the
-            // disk write, which is allowed to fail and retry.
+            // The apply puts every executed transaction into the fifo as it
+            // runs, so by the time a slice is assembled the index is already
+            // complete. What is left here is the disk write, which is allowed
+            // to fail and retry.
             let entries = info.take_journal_records(height);
             // The one part of a slice that touches the disk, and the one that
             // could put a tick over its interval.

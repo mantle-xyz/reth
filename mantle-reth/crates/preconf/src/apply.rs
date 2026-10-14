@@ -56,12 +56,11 @@ pub enum ApplyError {
 
 /// Why the EVM refused a transaction, as fields rather than a message.
 ///
-/// Two of the EVM's refusals have a name the client already knows, because
-/// the same judgement used to be made at admission against chain state:
+/// Two of the EVM's refusals have a name of their own in [`PreconfError`]:
 /// insufficient funds and a fee cap under the base fee. Rendering them to a
-/// string here would hand the client a different error for the same fact,
-/// depending only on which stage happened to catch it. Everything else the
-/// EVM can refuse has no admission-time counterpart and stays a message.
+/// string here would hand the client prose for a fact the API already names.
+/// Everything else the EVM can refuse has no named counterpart and stays a
+/// message.
 ///
 /// The classification is on the error's own variant, never on its text —
 /// `Display` output is not an interface.
@@ -527,9 +526,9 @@ mod tests {
         assert_ne!(pos.logs_bloom, Bloom::ZERO);
     }
 
-    // Logs and block position moved to `block_position`; the "revert carries no
-    // logs" and "tx_hash / block_height survive" cases are covered end to end
-    // by `integration-tests/tests/preconf/full_receipt.rs`.
+    // The "revert carries no logs" and "tx_hash / block_height survive" cases
+    // are covered end to end by
+    // `integration-tests/tests/preconf/full_receipt.rs`.
 
     #[test]
     fn exec_outcome_success_has_status_true() {
@@ -730,9 +729,9 @@ mod tests {
         }
     }
 
-    /// The wording is what clients already parse, so a refusal that moved from
-    /// admission to the builder has to arrive under its original name and
-    /// message — the classification exists for exactly this.
+    /// The wording is what clients already parse, so a builder refusal has to
+    /// reach them as the matching [`PreconfError`] variant, message and all —
+    /// the classification exists for exactly this.
     #[test]
     fn the_classified_refusals_reach_the_client_as_their_admission_errors() {
         assert_eq!(
@@ -788,9 +787,9 @@ mod tests {
     /// (which alloy-evm routes into `Internal(EVM)`, the bucket for
     /// database / header / fatal-precompile failures) — must classify as
     /// `Fatal` so the caller aborts the whole build instead of silently
-    /// dropping the commitment. This is the core of the bug fix: the pool
-    /// arm already aborts on this class; the preconf arm previously
-    /// collapsed it into `BuilderRejected`.
+    /// dropping the commitment — the same thing the pool arm does with this
+    /// class. Collapsing it into `BuilderRejected` would end the commitment
+    /// on an error that says nothing about the transaction.
     #[test]
     fn interpret_apply_result_internal_evm_error_is_fatal() {
         let err = BlockExecutionError::evm(

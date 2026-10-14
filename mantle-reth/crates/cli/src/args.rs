@@ -350,9 +350,10 @@ pub struct PreconfArgs {
     /// Slot duration in milliseconds — the ceiling on the remaining-time input
     /// to the pool best-tx gas schedule. `derive_pool_quota_schedule` clamps
     /// the time left to the slot deadline at this value, then divides
-    /// `block_gas_limit` evenly across the `--preconf.sweep-interval-ms` ticks
-    /// that fit in it. Default 2000ms (OP-stack block time). Change only on
-    /// chains with non-standard cadence.
+    /// `block_gas_limit` evenly across the ticks that fit in it. The tick is
+    /// `--flashblocks.block-time` when the publisher is enabled and
+    /// `--preconf.sweep-interval-ms` otherwise. Default 2000ms (OP-stack block
+    /// time). Change only on chains with non-standard cadence.
     #[arg(long = "preconf.slot-duration-ms")]
     pub slot_duration_ms: Option<u64>,
 
@@ -859,7 +860,7 @@ mod tests {
     /// The publisher and the consumer groups share the `--flashblocks.` prefix
     /// but no flag name, so clap accepts both on one command line and each
     /// resolves independently. Running both is unusual, not an error; `main`
-    /// warns. See issue Q19.
+    /// warns.
     #[test]
     fn the_publisher_and_the_consumer_can_be_enabled_together() {
         let cfgs = parse_mantle(&[

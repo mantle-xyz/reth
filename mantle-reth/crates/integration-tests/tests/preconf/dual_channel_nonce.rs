@@ -68,8 +68,6 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 /// preconf view reads the chain nonce, which the canonical block advanced. The
 /// point of pinning it is that the *answer* must not change when the source
 /// does.
-///
-/// Deliberately **not** `#[ignore]`d.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_preconf_tx_after_a_canonical_normal_tx_is_admitted() {
     let recipient: Address = RECIPIENT.parse().unwrap();

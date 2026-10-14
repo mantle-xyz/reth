@@ -25,8 +25,8 @@ pub fn mantle_test_chain_spec() -> Arc<OpChainSpec> {
 ///
 /// The shipped fixture has `extraData: 0x00`, which encodes no parameters at all. Since
 /// `newPayload` derives a block's expected base fee by decoding the parameters off its
-/// **parent**, anything built on genesis was rejected `Invalid { "base fee missing" }` and
-/// the head silently stayed at 0 — the root cause of this suite's long-running flakiness.
+/// **parent**, anything built on such a genesis is rejected `Invalid { "base fee missing" }`
+/// and the head silently stays at 0.
 /// Giving genesis the same encoding its children use makes the parent decode succeed,
 /// which is what [`canonicalize_payload!`] relies on.
 const GENESIS_EIP1559_EXTRA_DATA: &str = "0x0100000008000000020000000000000000";
@@ -41,9 +41,9 @@ const GENESIS_EIP1559_EXTRA_DATA: &str = "0x0100000008000000020000000000000000";
 /// carry a comment and nothing else explains them:
 ///
 /// * `config.jovianTime: 0` — Jovian from genesis, matching the devnet and every network this
-///   builds for. Until it was set, the whole suite ran on a fork the deployed node had already
-///   passed, and the paths Jovian changes — `blob_gas_used` carrying a block's DA footprint among
-///   them — went unexercised.
+///   builds for. Without it the whole suite runs on a fork the deployed node has already passed,
+///   leaving the paths Jovian changes — `blob_gas_used` carrying a block's DA footprint among them
+///   — unexercised.
 /// * the `L1Block` predeploy at `0x42..15`, holding the DA footprint gas scalar at slot 8, big-
 ///   endian at byte offset 18 (`DA_FOOTPRINT_GAS_SCALAR_SLOT` / `_OFFSET` in op-revm). On a real
 ///   chain that value arrives in each block's L1 info transaction; [`mantle_payload_attributes`]
@@ -622,7 +622,7 @@ pub const CANON_POLL_TICKS: usize = 200;
 ///
 /// `update_forkchoice` resolves as soon as the engine has accepted the forkchoice update;
 /// the provider starts serving the new head only once the canonical-chain update has been
-/// committed. Bridging that gap with a fixed `sleep`, as this suite used to, is a race:
+/// committed. Bridging that gap with a fixed `sleep` is a race:
 /// under parallel load the commit takes longer, the test reads pre-block state, and the
 /// failure surfaces as a wrong balance or a stale nonce rather than as "canonicalisation was
 /// slow". Polling on the
@@ -641,8 +641,8 @@ macro_rules! canonicalize_payload {
             let number = $payload.block().header().number;
             // Submitted through the engine handle rather than
             // `NodeTestContext::submit_payload`, which discards the
-            // `PayloadStatus` — an INVALID newPayload then only surfaced later as
-            // an FCU "links to previously rejected block", or not at all.
+            // `PayloadStatus` — an INVALID newPayload would then surface only later
+            // as an FCU "links to previously rejected block", or not at all.
             let new_head = $payload.block().hash();
             let np = $node
                 .inner

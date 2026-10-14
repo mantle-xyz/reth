@@ -121,10 +121,15 @@ pub struct PreconfTxEvent {
 /// it is still a status clients see.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PreconfStatus {
-    /// EVM apply succeeded; tx on chain.
+    /// EVM apply succeeded in the build that issued this event. Like every
+    /// field but `tx_hash`, a prediction of that one build rather than
+    /// canonical inclusion — see the notes on this type.
     #[serde(rename = "success")]
     Success,
-    /// EVM apply revert or halt; tx on chain, nonce consumed.
+    /// EVM apply reverted or halted in the build that issued this event: the
+    /// transaction executed and produced a receipt, so this is an outcome
+    /// rather than a refusal. Carries the same build-scoped caveat as
+    /// `Success`.
     ///
     /// **Narrower than op-geth's `failed`, deliberately.** The two agree
     /// everywhere else: an admission refusal (base fee, funds, tx type) is a
@@ -1922,8 +1927,7 @@ mod tests {
     #[test]
     fn preconf_status_wire_serde_has_four_variants() {
         // The wire enum matches op-geth's four variants. Regression guard
-        // against silently re-introducing `Canceled`, which this node's queue
-        // no longer has a state for.
+        // against silently re-introducing `Canceled`.
         for (variant, expected) in [
             (PreconfStatus::Success, r#""success""#),
             (PreconfStatus::Failed, r#""failed""#),
@@ -1934,12 +1938,12 @@ mod tests {
             let back: PreconfStatus = serde_json::from_str(expected).unwrap();
             assert_eq!(back, variant);
         }
-        // `"canceled"` must NOT deserialize (variant was deleted).
+        // `"canceled"` must NOT deserialize.
         assert!(serde_json::from_str::<PreconfStatus>(r#""canceled""#).is_err());
     }
 
     /// Regression for the cross-client `eth_estimateTotalFee` divergence at Sepolia-QA4
-    /// block 597707 (PR #73). `token_ratio` (`GasPriceOracle` slot 0) changed `3231` ->
+    /// block 597707. `token_ratio` (`GasPriceOracle` slot 0) changed `3231` ->
     /// `3224` *inside* that block, so reading it from the parent block (`3231`) instead of
     /// the target block's post-state (`3224`) inflated the L1 data fee. `token_ratio` is
     /// the last (multiplicative) factor in the Arsia L1 cost, so the per-client delta is

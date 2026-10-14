@@ -10,8 +10,8 @@
 //!   returns `Success` must leave a matching `JournalEntry` on disk. Guards `rpc.rs`'s
 //!   `journal.append_promised` call + the on-disk format.
 //! - `rpc_revert_but_sealed_is_journaled` — a preconf tx that **reverts** but still lands must ALSO
-//!   be journaled. Regression guard: the write used to be gated on wire `Success`, which dropped
-//!   reverted-but-sealed commitments.
+//!   be journaled. Regression guard: gating the write on wire `Success` drops reverted-but-sealed
+//!   commitments.
 //! - `an_ordinary_submission_is_not_journaled` — a whitelisted tx submitted through the **plain**
 //!   `eth_sendRawTransaction` path lands on chain by the pool arm but must **not** be journaled.
 //!   Guards the "only a commitment persists" scope: nobody was promised anything, so there is
@@ -169,11 +169,10 @@ async fn signed_reverting_call(
 }
 
 /// A preconf tx that **reverts** but still lands MUST be journaled. The write
-/// used to be gated on wire `Success`, so a reverted-but-sealed commitment was
-/// dropped — lost on restart (the tx is
+/// is keyed on *any* receipt: gated on wire `Success` instead, a
+/// reverted-but-sealed commitment is dropped — lost on restart (the tx is
 /// `TransactionOrigin::External`, so not in reth's local-tx backup either),
-/// even though the client already holds a receipt. The fix journals on *any*
-/// receipt.
+/// even though the client already holds a receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_revert_but_sealed_is_journaled() {
     let contract: Address = REVERT_CONTRACT.parse().unwrap();

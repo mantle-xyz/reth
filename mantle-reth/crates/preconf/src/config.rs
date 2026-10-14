@@ -86,16 +86,16 @@ pub const DEFAULT_JOURNAL_MAX_SIZE: u64 = 1_073_741_824;
 /// sequencer working set.
 ///
 /// Consumers receive `Lagged(n)` and fall back to snapshot reconcile when
-/// the channel overflows. Bumped from 4096 → 65536 to give wide headroom
-/// for prolonged builder stalls under prod-shape throughput without forcing
-/// the (slower) snapshot-reconcile path.
+/// the channel overflows. Sized for wide headroom across prolonged builder
+/// stalls under prod-shape throughput, so the (slower) snapshot-reconcile
+/// path stays a rarity.
 pub const DEFAULT_BROADCAST_CAP: usize = 65536;
 
 /// Runtime preconf configuration; distributed as `Arc<PreconfConfig>` after
 /// construction.
 ///
 /// Lifecycle: build → [`Self::validate`] → `Arc::new`. Every field is immutable
-/// afterwards. The mutable runtime state that used to live here — the
+/// afterwards. The one piece of preconf state that does change at runtime — the
 /// allowlists — belongs to
 /// [`PreconfClassifier`](crate::classifier::PreconfClassifier), which owns them
 /// privately so there is one copy of the lists and every reader has to name
@@ -137,8 +137,10 @@ pub struct PreconfConfig {
     /// Ceiling on the remaining-time input to the pool gas quota schedule, not
     /// a divisor: `builder::pacing::derive_pool_quota_schedule` clamps the time
     /// left to the slot deadline at this value, then divides `block_gas_limit`
-    /// evenly across the [`sweep_interval`](Self::sweep_interval) ticks that
-    /// fit in it. Default 2s (OP-stack block time).
+    /// evenly across the ticks that fit in it. The tick is the flashblock
+    /// slice interval when the publisher is enabled and
+    /// [`sweep_interval`](Self::sweep_interval) otherwise — see
+    /// `flashblocks::tick_interval`. Default 2s (OP-stack block time).
     pub slot_duration: Duration,
 
     // ===== Operator hardening =====

@@ -4,10 +4,10 @@
 //! meaning the block's DA footprint. The sealed block gets it from the
 //! executor, which accumulates a per-transaction estimate it does not hand out
 //! through any trait — so the slice path, which assembles its own
-//! `BlockExecutionResult`, has nothing to copy and used to leave the field at
-//! zero. Subscribers reconstructing a header from a slice would then read zero
-//! for a block that will seal with a real number: on the devnet 12% of blocks
-//! sealed with a non-zero footprint.
+//! `BlockExecutionResult`, has nothing to copy and nothing stopping the field
+//! from sitting at zero. Subscribers reconstructing a header from a slice would
+//! then read zero for a block that will seal with a real number: on the devnet
+//! 12% of blocks sealed with a non-zero footprint.
 //!
 //! It does not have to come from the executor. The builder already accumulates
 //! the same per-transaction estimate for its own limit checks, and the scalar

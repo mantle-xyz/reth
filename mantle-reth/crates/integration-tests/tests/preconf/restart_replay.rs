@@ -138,13 +138,10 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
 /// returns `Err`, restore logs and skips, and the commitment is **silently
 /// dropped**: the client was told it succeeded and nothing lands.
 ///
-/// This used to work by accident: cold start ran *after* restore, so the
-/// allowlists were still empty, every restored tx classified as ineligible, and
-/// the ceiling never applied. Cold start now runs ahead of restore (it has to:
-/// restore must judge a commitment against the policy in force), which removed
-/// the accident; the receipt-already-sent exemption
-/// replaces it with something explicit. This test fails on a build that has the
-/// new ordering but not the exemption.
+/// Cold start runs *ahead* of restore — it has to, because restore must judge a
+/// commitment against the policy in force — so the lowered ceiling is live by
+/// the time `recover_envelope` runs, and the exemption is the only thing
+/// carrying the entry past it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn journal_replay_survives_a_lowered_per_tx_gas_cap() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -281,10 +278,9 @@ async fn a_resubmit_cannot_disturb_a_replaying_commitment() {
         "expected AlreadyInProgress, got {err:?}",
     );
 
-    // Observable 1: the commitment is still queued. This used to read the
-    // transaction pool, because restore put a copy there and `mark_timeout`
-    // evicted it; commitments do not enter the pool any more, so the queue is
-    // the only place the survival is visible — and the more direct one.
+    // Observable 1: the commitment is still queued. Commitments do not enter
+    // the transaction pool, so the queue is the only place the survival is
+    // visible — and the more direct one.
     assert!(
         fifo.contains(&tx_hash).await,
         "the replaying commitment must survive this client's timeout",

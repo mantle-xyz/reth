@@ -296,8 +296,7 @@ pub enum PreconfError {
     /// the point where it can be replaced.
     ///
     /// Distinct from [`Self::AlreadyInProgress`], which is the same hash
-    /// arriving twice. The `pool rejected:` prefix is carried on purpose: this
-    /// refusal used to reach the client through the pool validator, and the
+    /// arriving twice. The `pool rejected:` prefix is carried on purpose: the
     /// wording is what clients already parse.
     #[error("pool rejected: cannot replace active preconf commitment for the same (sender, nonce)")]
     ReplaceActiveCommitment,

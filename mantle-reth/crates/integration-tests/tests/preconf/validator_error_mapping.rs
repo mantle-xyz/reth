@@ -16,9 +16,6 @@
 //!   checks, and why they are **green today and must stay green** rather than being staged behind
 //!   `#[ignore]`.
 //!
-//! This file supersedes `validation_reject.rs`'s three `*_pool_rejects` tests,
-//! which assert the wrapper itself and so cannot survive the change.
-//!
 //! Two reasons from the full set are deliberately absent:
 //!
 //! - **`--rpc.txfeecap`** — set from the node's RPC config, which this suite's launch harness does

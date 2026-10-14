@@ -303,9 +303,9 @@ async fn waiting_slot_blocks_different_hash_replacement() {
         .expect_err("different-hash submission against active Waiting slot must be rejected");
     let elapsed = start.elapsed();
 
-    // The refusal moved — the queue itself now says the nonce is spoken for,
-    // where the pool's validator used to — but the wording did not, because
-    // this is what clients already parse.
+    // The queue itself says the nonce is spoken for, not the pool's validator;
+    // the `pool rejected:` wording is kept all the same, because this is what
+    // clients already parse.
     match err {
         ClientError::Call(ref e) => {
             assert_eq!(

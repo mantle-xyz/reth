@@ -27,9 +27,9 @@
 //!
 //! ## Locking
 //!
-//! `parking_lot`, because the builder reads the snapshot from a sync `fn`. The
-//! commitment records that used to share this type live in
-//! [`crate::commitments`] now; they never shared a lock with the lists.
+//! `parking_lot`, because the builder reads the snapshot from a sync `fn`. This
+//! lock covers the lists and nothing else: commitment records live in
+//! [`crate::commitments`], behind their own lock.
 
 use alloy_primitives::{Address, map::foldhash::HashSet};
 use parking_lot::RwLock;
@@ -84,18 +84,18 @@ impl Whitelist {
 /// (the only writer), admission's early-rejection preview, and the payload
 /// builder's per-block snapshot.
 ///
-/// The commitment records used to live here too. They moved to
+/// Commitment records are not here: they live in
 /// [`Commitments`](crate::commitments::Commitments), owned by the fifo — the two
-/// halves never shared a lock, a consumer, or a method.
+/// halves share no lock, no consumer, and no method.
 #[derive(Debug)]
 pub struct PreconfClassifier {
     /// Mirrors `PreconfConfig::enabled`. When false this node runs no preconf
     /// machinery at all, so nothing is classified and **nothing is cached**.
     ///
-    /// The leak this originally guarded against is gone — a node that has not
-    /// opted in no longer builds the RPC handler, so nothing reaches the
-    /// classifier to cache anything. Refusing here anyway keeps the invariant
-    /// the classifier's own, rather than a consequence of how it is wired.
+    /// Nothing else depends on this check: a node that has not opted in never
+    /// builds the RPC handler, so nothing reaches the classifier to cache
+    /// anything. Refusing here anyway keeps the invariant the classifier's own,
+    /// rather than a consequence of how it is wired.
     enabled: bool,
 
     /// Mirrors `PreconfConfig::all_preconfs`: bypass the allowlists entirely.

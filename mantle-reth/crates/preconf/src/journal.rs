@@ -768,11 +768,6 @@ pub trait CommitmentChainView: Send + Sync {
     /// straight back in the queue. Only when the nonce is *gone* is there
     /// anything to investigate, and only then is the more expensive
     /// [`Self::commitment_on_chain`] worth paying for.
-    ///
-    /// This is the judgement the transaction pool's validator used to make on
-    /// restore's behalf, as a side effect of refusing the transaction. It is
-    /// asked directly now, because the pool no longer sees these transactions
-    /// at all.
     fn account_nonce(&self, sender: &Address) -> Option<u64>;
 }
 
@@ -786,11 +781,6 @@ pub trait CommitmentChainView: Send + Sync {
 pub enum RestoreSkip {
     /// Corrupt bytes, or a variant that cannot be preconfirmed. A real
     /// failure — the commitment is lost.
-    ///
-    /// "The nonce is already gone" used to be a second variant here, because
-    /// the transaction pool reported it as a refusal. Restore asks the chain
-    /// for that now, so it is a fact about the world rather than an error
-    /// from a decoder.
     Rejected(String),
 }
 
@@ -943,9 +933,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
             //
             // Only when the nonce *is* gone is there anything to investigate,
             // and only then is the transaction-lookup query below worth
-            // paying for. This is the judgement the pool's validator used to
-            // make as a side effect of refusing the transaction; the pool no
-            // longer sees these at all, so it is asked directly.
+            // paying for.
             Ok(rec) if nonce_still_free(chain, &rec) => rec,
             Ok(rec) => {
                 let reason = format!(
@@ -2452,11 +2440,10 @@ mod tests {
     ///
     /// There is nothing to forget: the transaction that took the nonce may itself
     /// be reverted, and then this commitment applies again. So restore must not
-    /// record it as landed, and `retain_tracked` must therefore keep it. Until
-    /// 2026-08-05 this case was indistinguishable from "kept" —
-    /// `is_nonce_too_low()` reduces to `tx.nonce < account.nonce` and never looks
-    /// at the hash — so the entry was dropped at the next rotation and counted as
-    /// honoured.
+    /// record it as landed, and `retain_tracked` must therefore keep it. A
+    /// nonce-only test cannot tell this case from "kept": `tx.nonce <
+    /// account.nonce` holds either way and never looks at the hash, so the
+    /// entry would be dropped at the next rotation and counted as honoured.
     #[tokio::test]
     async fn a_stolen_nonce_keeps_its_entry_through_rotation() {
         let (_dir, j) = fresh_journal().await;
@@ -2891,8 +2878,8 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_resets_size_counter_to_true_on_disk_size() {
-        // Approach-A invariant: `size_bytes` tracks the real on-disk size
-        // without a stat syscall on the hot path. It must stay equal to the
+        // `size_bytes` tracks the real on-disk size without a stat syscall on
+        // the hot path. It must stay equal to the
         // file's true length across both `write_lines` (+= the bytes just
         // written) and `rotate` (reset to kept-bytes). Drift here silently
         // breaks the size trigger (it would fire late, or never).

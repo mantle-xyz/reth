@@ -23,8 +23,7 @@
 //!   `(sender, nonce)`. Every entry present is live, so the incumbent always wins — a commitment
 //!   that ends is removed rather than parked. See [`crate::types::PreconfStatus`].
 //! - At most one responder per hash, and it lives inside the entry. It is installed with the entry,
-//!   under the same lock, so the builder cannot reach an entry that has nobody to answer — which is
-//!   what let the stash this replaced be deleted.
+//!   under the same lock, so the builder cannot reach an entry that has nobody to answer.
 //! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and reconcile via
 //!   `snapshot()`.
 //!
@@ -49,7 +48,7 @@
 //! `BuilderRejected`. Not a safety problem, and strictly better than waiting
 //! out the timeout.
 //!
-//! Sibling of the older invariant on [`TxEntry::apply_lock`] — never acquired
+//! Sibling of the invariant on [`TxEntry::apply_lock`] — never acquired
 //! while holding `inner`.
 
 use alloy_consensus::{Transaction, TxEnvelope};
@@ -1059,8 +1058,8 @@ impl PreconfTxSet {
     ///
     /// The production caller is the `PayloadJob` prologue
     /// (`builder::payload_builder`'s `sync_fifo_forward_to_head`), which reads
-    /// each sender's nonce from the parent-block state. It used to run in
-    /// `canon_handler`; that sweep was moved because it raced new payload jobs.
+    /// each sender's nonce from the parent-block state. Not `canon_handler`: a
+    /// sweep there races new payload jobs.
     ///
     /// The predicate is "this sender's nonce has moved past the entry", which
     /// is **not** the same as "this entry's tx landed" — a different tx taking
@@ -1658,8 +1657,8 @@ mod admit_tests {
     // `admit` rustdoc.
 
     /// A fee cap far under any plausible base fee is still queued. The refusal
-    /// comes from the EVM, as `BuilderRejected::BaseFeeTooLow`, and reaches the
-    /// client under the same name it used to carry from here.
+    /// comes from the EVM, as `BuilderRejected::BaseFeeTooLow`, and that is the
+    /// name the client sees.
     #[tokio::test]
     async fn a_fee_cap_under_any_base_fee_is_still_queued() {
         let set = PreconfTxSet::new(8);
@@ -2167,11 +2166,11 @@ mod tests {
         );
     }
 
-    /// **§2.3.** The slice boundary raises the pool's nonce for every sender it
-    /// executed, so the repair has to know about every one of them. It used to
-    /// walk an index that held pool-arm senders only, which left a sender who
-    /// sent nothing but preconf transactions with a pool nonce ahead of the
-    /// chain for as long as the block failed to land.
+    /// The slice boundary raises the pool's nonce for every sender it
+    /// executed, so the repair has to know about every one of them — including
+    /// a sender who sent nothing but preconf transactions, whose pool nonce
+    /// would otherwise stay ahead of the chain for as long as the block failed
+    /// to land.
     #[tokio::test]
     async fn the_landed_claim_sweep_sees_preconf_senders_too() {
         let set = PreconfTxSet::new(16);
@@ -2325,10 +2324,10 @@ mod tests {
     /// fails on the first round if an `await` appears between the removal and
     /// the send — which is the regression worth guarding, since that is what
     /// widens the window to something a client can land in. It does **not**
-    /// fail on the ordering this replaced, where the send merely moved after
-    /// the guard was dropped: an observer has to take `inner` to learn the
-    /// entry is gone, and being woken for that lock costs far more than the
-    /// handful of instructions to the send, so the observer always loses. That
+    /// fail when the send merely sits after the guard is dropped: an observer
+    /// has to take `inner` to learn the entry is gone, and being woken for that
+    /// lock costs far more than the handful of instructions to the send, so the
+    /// observer always loses. That
     /// window is real but unobservable from inside the process, which is also
     /// why the fix is an ordering argument rather than a test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2748,18 +2747,18 @@ mod tests {
 
     /// The per-build canon-forward stays linear in the number of held entries.
     ///
-    /// Two things used to make it grow faster than that, both invisible at the
+    /// Two things make it grow faster than that, both invisible at the
     /// handful of commitments preconf alone holds and ruinous at the tens of
-    /// thousands a journal replay restores: the fifo was asked once per sender
-    /// and walked every entry for each answer, and every dropped entry was then
-    /// hunted down in a queue that has no index. Measured with both in place,
+    /// thousands a journal replay restores: asking the fifo once per sender and
+    /// walking every entry for each answer, and then hunting every dropped
+    /// entry down in a queue that has no index. Measured with both in place,
     /// ten times the entries and ten times the senders cost seventy-four times
     /// the work — 75ms, ahead of the block's first transaction.
     ///
     /// Asserts the ratio rather than a wall-clock figure, which would only be
     /// flaky on shared CI. Ten times the input should cost about ten times the
     /// work; the bound leaves room for the constants without leaving room for
-    /// either of those two coming back.
+    /// either of those two.
     #[tokio::test]
     async fn forwarding_every_sender_stays_linear_in_the_entries_held() {
         let small = sweep(4_000, 400).await;

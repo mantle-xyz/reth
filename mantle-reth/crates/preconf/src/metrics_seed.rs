@@ -4,11 +4,13 @@
 //! The `metrics` facade creates a series lazily on the first emit, so a
 //! rare-event counter (`preconf.api.timeout_total`,
 //! `preconf.build.panic_total`, `preconf.whitelist.reload_failed`, ...) has no
-//! Prometheus series until it first fires — exactly when an alert most needs a
+//! Prometheus until it first fires — exactly when an alert most needs a
 //! stable `0` baseline, and when dashboards would otherwise show "no data"
 //! (indistinguishable from a broken pipeline). [`seed_preconf_metrics`]
-//! registers every metric emitted under either prefix up front so scrapes
-//! carry a `0` from node start.
+//! registers every metric emitted under either prefix up front, so every
+//! counter and gauge carries a `0` from node start. Histograms are registered
+//! but deliberately not observed, so their `_count` / `_bucket` series still
+//! appear only with the first real observation — see [`HISTOGRAMS`].
 //!
 //! Names MUST match the inline emit sites verbatim (dot-separated) — a mismatch
 //! registers a shadow series that collides on export. The
@@ -131,8 +133,9 @@ const HISTOGRAMS: &[&str] = &[
 ];
 
 /// Pre-register every metric this crate emits — `preconf.*` and
-/// `flashblock.*` — so its Prometheus series exists from node start with a `0`
-/// baseline instead of appearing only on the first emit.
+/// `flashblock.*` — so counter and gauge series exist from node start with a
+/// `0` baseline instead of appearing only on the first emit. Histograms are
+/// registered without an observation, so theirs still appear on first use.
 ///
 /// Call once at startup, **only when preconf is enabled**, so other nodes
 /// don't expose phantom series. Requires the metrics recorder to be

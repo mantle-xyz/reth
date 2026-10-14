@@ -679,8 +679,8 @@ mod tests {
     }
 
     /// A compressing upstream sends binary frames, since a brotli payload is
-    /// never valid UTF-8. Dropping them — as the code did when first ported —
-    /// silently starves every downstream subscriber.
+    /// never valid UTF-8. Dropping them silently starves every downstream
+    /// subscriber.
     #[test]
     fn a_brotli_binary_frame_is_decompressed() {
         let json = r#"{"index":4,"metadata":{"block_number":123},"diff":{}}"#;

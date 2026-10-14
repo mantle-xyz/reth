@@ -1,11 +1,11 @@
-//! Regression coverage for the two ways a runtime allowlist change used to
+//! Regression coverage for the two ways a runtime allowlist change can
 //! split a transaction's classification.
 //!
 //! Eligibility is decided once, at pool admission, and frozen (`PreconfClassifier`). That
 //! matters because the pool arm and the preconf arm are a **partition**: the pool arm skips
 //! a tx precisely because the preconf arm is expected to apply it, so both must read the
-//! same record. When each derived eligibility live from the allowlists, an update landing
-//! mid-flight broke the partition in both directions:
+//! same record. If each derived eligibility live from the allowlists, an update landing
+//! mid-flight would break the partition in both directions:
 //!
 //! * **Case A** (eligible → not eligible): a fifo entry exists and the client holds a receipt, but
 //!   the pool arm stops skipping. The tx lands via the normal path, nobody applies the fifo entry,
@@ -69,8 +69,8 @@ async fn signed_transfer_from(
 /// The flip replaces `(wallet, RECIPIENT)` with `(other, RECIPIENT)`, so a single
 /// `update_whitelist` **removes** the sender of a parked commitment (Case A) and **adds**
 /// the sender of a tx already frozen as ineligible (Case B). Both assertions read off one
-/// block. Merged into one test because two node launches measurably raised this suite's
-/// unrelated flakiness and one does not.
+/// block. One test rather than two, because a second node launch costs reliability
+/// under this suite's parallel load.
 ///
 /// Sequence:
 /// 1. `other` (not allowlisted) submits a plain tx → nothing is recorded for it.

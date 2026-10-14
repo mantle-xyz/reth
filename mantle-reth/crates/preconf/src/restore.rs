@@ -7,10 +7,9 @@
 //! - [`ProviderChainView`] lets a node provider answer what restore asks of the chain: where a
 //!   sender's nonce stands, and whether a commitment already landed.
 //!
-//! **Neither touches the transaction pool.** Restore used to re-admit every
-//! commitment there and read the outcome off the pool's validator; since direct
-//! admission a commitment never enters the pool at all, so what is left is
-//! decoding plus two chain reads. [`RestoreDirect`] holds nothing — it is
+//! **Neither touches the transaction pool.** A commitment never enters the
+//! pool at all, so restore is decoding plus two chain reads — the nonce and,
+//! only when the nonce is gone, the landing. [`RestoreDirect`] holds nothing — it is
 //! generic over the pool's transaction type only because the journal stores wire
 //! bytes and decoding them needs a type to decode *into*.
 //!
@@ -45,11 +44,9 @@ use crate::{
 
 /// Turns journal bytes back into something the queue can hold.
 ///
-/// Holds nothing. What this replaces wrapped a live `TransactionPool`,
-/// because restore used to re-admit every commitment there and read the
-/// outcome off the pool's validator. Commitments do not enter the pool any
-/// more, so all that is left of the job is decoding — and the questions the
-/// pool used to answer as a side effect are now asked of the chain directly.
+/// Holds nothing. Commitments do not enter the transaction pool, so the whole
+/// job is decoding — and what restore needs to know about a commitment's fate
+/// it asks the chain directly, through [`ProviderChainView`].
 ///
 /// Still generic over the pool's `Transaction` type: the journal holds wire
 /// bytes, and decoding them needs a pooled envelope type to decode *into*.
