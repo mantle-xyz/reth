@@ -216,8 +216,7 @@ mod test {
     }
 
     /// The `debug` RPC namespace gates whether the runtime-reloadable log filter layer is
-    /// installed (backing `debug_verbosity` / `debug_vmodule`). Guards the wiring in
-    /// `CliApp::init_tracing`, which previously hardcoded `false`.
+    /// installed. Guards the wiring in `CliApp::init_tracing`, which previously hardcoded `false`.
     ///
     /// Note: `is_namespace_enabled` treats IPC (on by default) as exposing every namespace, so
     /// the negative case must also pass `--ipcdisable`.
