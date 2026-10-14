@@ -118,8 +118,9 @@ pub enum FlashblockProducerConfigError {
         /// Slot duration the leeway was compared against.
         slot: Duration,
     },
-    /// The archive is smaller than the live channel, so a subscriber could
-    /// lag past what the ring can replay and never be able to resume.
+    /// The archive is smaller than the live channel. A subscriber may lag by a
+    /// whole channel before it is dropped, so it could fall behind by more
+    /// than the ring can replay and never be able to resume.
     #[error("flashblocks ring_capacity ({ring}) must be >= broadcast_capacity ({broadcast})")]
     RingSmallerThanBroadcast {
         /// Configured ring capacity.
@@ -147,9 +148,10 @@ pub enum FlashblockProducerConfigError {
     /// own index. The consumer's replayed pending/preconf overlay does not
     /// reproduce that surrounding machinery, so it omits the refunds until the
     /// next canonical block resynchronises state — a transient pending-state
-    /// inaccuracy, not a chain split. The 1.6.3 wire protocol has an
-    /// out-of-band field for the post-exec transaction that no producer fills
-    /// yet.
+    /// inaccuracy, not a chain split. The 1.6.3 wire protocol carries the
+    /// post-exec transaction out of band instead, in the slice's
+    /// `post_exec_tx` field and with replace-not-append semantics; no producer
+    /// fills it yet.
     ///
     /// This only gates the boot-time flag (`--rollup.operator-sdm-opt-in`):
     /// `admin_setOperatorSdmOptIn` can still flip SDM on at runtime after a
@@ -314,8 +316,8 @@ mod tests {
         ));
     }
 
-    /// A subscriber resuming from the ring must find every slice the channel
-    /// could have dropped, so the archive cannot be the smaller of the two.
+    /// The archive cannot be the smaller of the two; see
+    /// [`FlashblockProducerConfigError::RingSmallerThanBroadcast`].
     #[test]
     fn validate_rejects_ring_smaller_than_broadcast() {
         let cfg = FlashblockProducerConfig { ring_capacity: 8, broadcast_capacity: 16, ..cfg() };
@@ -347,10 +349,9 @@ mod tests {
         ));
     }
 
-    /// The producer appends the SDM post-exec transaction to the closing
-    /// slice's `transactions`. Until that carriage moves out of band (the
-    /// 1.6.3 consumer protocol's `post_exec_tx` field), it is not an
-    /// accurately-replayable combination: enabling both at boot is refused.
+    /// Enabling both at boot is refused, and the SDM flag is what decides it:
+    /// no other field in this config can make the combination safe. See
+    /// [`FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks`].
     #[test]
     fn validate_rejects_sdm_together_with_flashblocks() {
         let preconf = preconf_with_slot(Duration::from_secs(2));

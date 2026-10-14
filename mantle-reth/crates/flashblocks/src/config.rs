@@ -9,10 +9,12 @@ use crate::DEFAULT_MAX_CACHE_AHEAD_BLOCKS;
 /// Default interval between upstream websocket ping frames.
 pub const DEFAULT_SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Default number of canonical blocks the pending overlay may trail behind.
+/// Default number of canonical blocks the pending overlay may trail behind
+/// before it is rebuilt from canonical state.
 pub const DEFAULT_MAX_TRAILING_DEPTH: u64 = 3;
 
-/// Default number of blocks the pending overlay may lead canonical by.
+/// Default number of blocks the pending overlay may lead canonical by before
+/// the guard fires.
 pub const DEFAULT_MAX_LEADING_DEPTH: u64 = 3;
 
 /// Flashblocks-specific configuration knobs.
@@ -20,14 +22,13 @@ pub const DEFAULT_MAX_LEADING_DEPTH: u64 = 3;
 pub struct FlashblocksConfig {
     /// The websocket endpoint that streams flashblock updates.
     pub websocket_url: Url,
-    /// Canonical blocks the pending overlay may trail behind before a rebuild.
+    /// See [`DEFAULT_MAX_TRAILING_DEPTH`].
     pub max_trailing_depth: u64,
-    /// Blocks the pending overlay may lead canonical by before the guard fires.
+    /// See [`DEFAULT_MAX_LEADING_DEPTH`].
     pub max_leading_depth: u64,
-    /// Blocks past the next block to be produced for which early flashblocks
-    /// are cached; the cache admits up to `canonical + this + 1`.
+    /// See [`DEFAULT_MAX_CACHE_AHEAD_BLOCKS`].
     pub max_cache_ahead_blocks: u64,
-    /// Interval between upstream websocket ping frames.
+    /// See [`DEFAULT_SUBSCRIBER_PING_INTERVAL`].
     pub subscriber_ping_interval: Duration,
 }
 
@@ -43,25 +44,25 @@ impl FlashblocksConfig {
         }
     }
 
-    /// Set the canonical blocks the pending overlay may trail behind.
+    /// See [`Self::max_trailing_depth`].
     pub const fn with_max_trailing_depth(mut self, max_trailing_depth: u64) -> Self {
         self.max_trailing_depth = max_trailing_depth;
         self
     }
 
-    /// Set the blocks the pending overlay may lead canonical by.
+    /// See [`Self::max_leading_depth`].
     pub const fn with_max_leading_depth(mut self, max_leading_depth: u64) -> Self {
         self.max_leading_depth = max_leading_depth;
         self
     }
 
-    /// Set the blocks ahead of canonical for which early flashblocks are cached.
+    /// See [`Self::max_cache_ahead_blocks`].
     pub const fn with_max_cache_ahead_blocks(mut self, max_cache_ahead_blocks: u64) -> Self {
         self.max_cache_ahead_blocks = max_cache_ahead_blocks;
         self
     }
 
-    /// Set the interval between upstream websocket ping frames.
+    /// See [`Self::subscriber_ping_interval`]. Panics on a zero interval.
     pub const fn with_subscriber_ping_interval(
         mut self,
         subscriber_ping_interval: Duration,

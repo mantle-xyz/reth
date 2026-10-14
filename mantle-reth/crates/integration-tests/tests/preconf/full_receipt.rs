@@ -7,11 +7,9 @@
 //! shapes.
 //!
 //! **Known limitation of the L1 fee comparison.** [`chain_spec_with_l1_fee_scalars`]
-//! seeds the `L1Block` predeploy's Ecotone fee-scalar storage directly,
-//! because this predeploy's deployed bytecode predates the Jovian/Arsia
-//! `setL1BlockValues*` selectors — there is no transaction this test (or
-//! production, against this same snapshot) could send to set them instead.
-//! That makes `assert_receipts_agree`'s whole-`l1_block_info` comparison
+//! has to hand-align the `L1Block` predeploy's fee scalars across the two
+//! sides, for the reason given on that function. That makes
+//! `assert_receipts_agree`'s whole-`l1_block_info` comparison
 //! weaker than it looks: of the twelve fields it compares, `l1BaseFeeScalar`,
 //! `l1BlobBaseFee`, `l1BlobBaseFeeScalar` and `daFootprintGasScalar` are
 //! hand-matched constants (seeded on one side, described by [`l1_info_tx`]'s
@@ -115,34 +113,30 @@ fn chain_spec_with_l1_fee_scalars(chain_id: u64) -> Arc<OpChainSpec> {
 /// usual "attrs carries no transactions" shortcut does not apply here.
 ///
 /// Jovian/Arsia-format calldata, matching
-/// [`chain_spec_with_l1_fee_scalars`]'s seeded storage field for field —
+/// [`chain_spec_with_l1_fee_scalars`]'s seeded storage field for field.
 /// `op_revm::L1BlockInfo::try_fetch` (the preconf side, reading seeded
 /// storage) and `reth_optimism_evm::parse_l1_info`'s Jovian/Arsia branch (the
 /// sealed-receipt side, reading this calldata) must land on identical
 /// `L1BlockInfo` values for `assert_receipts_agree`'s L1 fee comparison to be
-/// meaningful, and this tx never actually executes against a real setter (see
-/// [`chain_spec_with_l1_fee_scalars`]), so the two can only agree if told the
-/// same numbers twice. `operatorFeeScalar`/`operatorFeeConstant` are left `0`
+/// meaningful. `operatorFeeScalar`/`operatorFeeConstant` are left `0`
 /// (unused by every assertion — both vanish to `None` at the wire regardless
-/// of source once they are zero) and `daFootprintGasScalar` matches
-/// [`chain_spec_with_l1_fee_scalars`]'s seeded slot 8.
+/// of source once they are zero) and `daFootprintGasScalar` matches the
+/// seeded slot 8.
 ///
 /// Duplicates `helpers::l1_info_deposit` (`tests/preconf/helpers.rs:924`),
 /// which this test does not reuse because its hardcoded `base_fee_scalar`
 /// and lack of DA-footprint/blob fields can't be told the numbers this test
 /// needs. Two further differences from that helper are also deliberate, not
 /// drift:
-/// - `from` is the real op-stack L1-info depositor address
-///   (`0xdead…0001`), not `Address::ZERO` — `assert_receipts_agree` checks
-///   `from` against the sealed receipt's, so it has to be the address
-///   `reth_optimism_evm::extract_l1_info` actually attributes the deposit to.
-/// - `is_system_transaction` is left `false` (`..Default::default()`), not
-///   `true` — this transaction is actually executed (unlike
-///   `l1_info_deposit`'s callers, which only hash or re-encode its bytes
-///   without running it through the EVM), and `OpRevm`'s `validate_env`
-///   rejects a system-flagged deposit outright once Regolith is active
-///   (`OpTransactionError::DepositSystemTxPostRegolith`,
-///   `op-revm/src/handler.rs`) — which this chain is, from genesis.
+/// - `from` is the real op-stack L1-info depositor address (`0xdead…0001`), not `Address::ZERO` —
+///   `assert_receipts_agree` checks `from` against the sealed receipt's, so it has to be the
+///   address `reth_optimism_evm::extract_l1_info` actually attributes the deposit to.
+/// - `is_system_transaction` is left `false` (`..Default::default()`), not `true` — this
+///   transaction is actually executed (unlike `l1_info_deposit`'s callers, which only hash or
+///   re-encode its bytes without running it through the EVM), and `OpRevm`'s `validate_env` rejects
+///   a system-flagged deposit outright once Regolith is active
+///   (`OpTransactionError::DepositSystemTxPostRegolith`, `op-revm/src/handler.rs`) — which this
+///   chain is, from genesis.
 fn l1_info_tx(timestamp: u64) -> alloy_primitives::Bytes {
     let mut payload = [0u8; 174];
     payload[0..4].copy_from_slice(&L1_BASE_FEE_SCALAR.to_be_bytes());

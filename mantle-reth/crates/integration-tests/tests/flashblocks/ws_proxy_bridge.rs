@@ -75,7 +75,7 @@ enum Upstream {
     Close,
 }
 
-/// An `index == 0` base slice for `block_number`, as the sequencer sends it.
+/// [`base_slice`] for `block_number`, as a frame the stub sequencer sends.
 fn slice_frame(block_number: u64) -> Upstream {
     Upstream::Frame(WsMessage::text(
         serde_json::to_string(&base_slice(block_number)).expect("serialise slice"),

@@ -20,8 +20,9 @@
 //! ## Invariants
 //!
 //! - At most one entry per `(sender, nonce)`, and it blocks a push for a different hash on that
-//!   `(sender, nonce)`. Every entry present is live, so the incumbent always wins — a commitment
-//!   that ends is removed rather than parked. See [`crate::types::PreconfStatus`].
+//!   `(sender, nonce)`. Every entry present is live — still to be applied, or already in a block —
+//!   so the incumbent always wins and never hands its nonce over; replacing it would double-apply.
+//!   A commitment that ends is removed rather than parked. See [`crate::types::PreconfStatus`].
 //! - At most one responder per hash, and it lives inside the entry. It is installed with the entry,
 //!   under the same lock, so the builder cannot reach an entry that has nobody to answer.
 //! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and reconcile via
@@ -174,8 +175,9 @@ pub struct TxEntryView {
     pub source: PreconfSource,
 }
 
-/// How much the queue may hold, read from the node's own `PoolConfig` so
-/// that tuning `--txpool.*` moves both paths together.
+/// How much the queue may hold — built by
+/// [`capacity_from_pool_config`](crate::admission::capacity_from_pool_config),
+/// which is where every one of these ceilings comes from.
 ///
 /// Passed in rather than stored: the queue exists before the pool config is
 /// known, and the alternative is a setter nobody can see was never called.
@@ -191,11 +193,9 @@ pub struct Capacity {
     pub max_inflight_delegated: usize,
     /// Summed `gas_limit` over every entry.
     ///
-    /// The other three bound what the queue costs to hold. This one bounds
-    /// whether it can drain: a block absorbs at most `preconf_max_gas_per_block`
-    /// of preconf gas, so a backlog larger than a client's deadline is worth of
-    /// blocks is a queue of promises that cannot be kept. Refusing on arrival
-    /// beats accepting and timing out.
+    /// What this ceiling catches that the other three cannot, and why it is a
+    /// multiple of the per-block budget:
+    /// [`DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`](crate::config::DEFAULT_PRECONF_QUEUE_GAS_BLOCKS).
     pub max_queued_gas: u64,
 }
 
@@ -306,9 +306,8 @@ impl PreconfTxSetInner {
     ///
     /// Leaving `order` is what costs: a queue has no index, so removing one
     /// hash means finding it, and doing that per hash costs the queue's length
-    /// each time. Nothing at the handful of commitments preconf alone holds;
-    /// quadratic at the tens of thousands a journal replay restores. One pass
-    /// drops them all.
+    /// each time — quadratic at the volumes [`PreconfTxSet::forward_all`]
+    /// names. One pass drops them all.
     fn drop_hashes(&mut self, hashes: &[TxHash]) {
         if hashes.is_empty() {
             return;
@@ -755,14 +754,13 @@ impl PreconfTxSet {
         // outlasts the entry — a commitment whose receipt has gone out keeps
         // its nonce through the retention window with nothing left in here.
         //
-        // The incumbent always wins: a queued entry is either still to be
-        // applied or already in a block, so neither hands its nonce over.
+        // The incumbent always wins — see the module's "Invariants".
         if let Some(incumbent) = held.and_then(|nonces| nonces.get(&nonce)).copied() {
             if inner.entries.contains_key(&incumbent) {
                 return Err(PreconfError::ReplaceActiveCommitment);
             }
-            // The queue's two indices disagree. Production heals and carries on
-            // rather than tearing down the sequencer.
+            // The queue's two indices disagree — the same repair as in
+            // `push_with_status`, where it is explained.
             error!(
                 target: "mantle::preconf",
                 sender = ?from, nonce, dangling_hash = ?incumbent,
@@ -885,7 +883,7 @@ impl PreconfTxSet {
         }
 
         // Replacement check: same `(sender, nonce)`, different hash. The
-        // incumbent never releases the slot — replacing it would double-apply.
+        // incumbent keeps it — see the module's "Invariants".
         if let Some(existing_hash) =
             inner.by_sender.get(&from).and_then(|nonces| nonces.get(&nonce)).copied()
         {
@@ -895,7 +893,9 @@ impl PreconfTxSet {
             // Invariant violation: `by_sender[from][nonce]` points at a hash
             // with no entry. Both halves are needed — `drop_hash` alone skips
             // `by_sender` because the entry is already gone, and the new insert
-            // cannot claim the slot until it is cleared.
+            // cannot claim the slot until it is cleared. Production heals and
+            // carries on rather than tearing down the sequencer; the
+            // `debug_assert!` is what makes it loud in development.
             error!(
                 target: "mantle::preconf",
                 sender = ?from,
@@ -1543,9 +1543,8 @@ mod admit_tests {
         assert!(matches!(out, Err(PreconfError::QueueFull { unit: "bytes", .. })), "{out:?}");
     }
 
-    /// **The ceiling the other three cannot express.** Entries and bytes bound
-    /// what the queue costs to hold; gas bounds whether it can ever drain,
-    /// because a block absorbs at most `preconf_max_gas_per_block` of it.
+    /// **The ceiling the other three cannot express** — see
+    /// [`Capacity::max_queued_gas`].
     ///
     /// Summed, not per-transaction: each of these two is comfortably under the
     /// ceiling on its own, and the pair is over.
@@ -2747,13 +2746,12 @@ mod tests {
 
     /// The per-build canon-forward stays linear in the number of held entries.
     ///
-    /// Two things make it grow faster than that, both invisible at the
-    /// handful of commitments preconf alone holds and ruinous at the tens of
-    /// thousands a journal replay restores: asking the fifo once per sender and
-    /// walking every entry for each answer, and then hunting every dropped
-    /// entry down in a queue that has no index. Measured with both in place,
-    /// ten times the entries and ten times the senders cost seventy-four times
-    /// the work — 75ms, ahead of the block's first transaction.
+    /// Two things make it grow faster than that, one named on `forward_all`
+    /// (asking the fifo once per sender and walking every entry for each
+    /// answer) and one on `drop_hashes` (hunting every dropped entry down in a
+    /// queue that has no index). Measured with both in place, ten times the
+    /// entries and ten times the senders cost seventy-four times the work —
+    /// 75ms, ahead of the block's first transaction.
     ///
     /// Asserts the ratio rather than a wall-clock figure, which would only be
     /// flaky on shared CI. Ten times the input should cost about ten times the

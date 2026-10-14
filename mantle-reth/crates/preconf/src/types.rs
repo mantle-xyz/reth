@@ -206,6 +206,8 @@ pub enum PreconfError {
     /// a sender can afford depends on what the block being built has already
     /// done to its balance, and summing queued costs against canonical state
     /// reads low when that block has spent and high when it has credited.
+    /// A journal-replayed entry carries no cost figure to sum in the first
+    /// place.
     ///
     /// The message still names a cumulative cost. That is the wording clients
     /// already parse, kept verbatim so the same fact reads the same way
@@ -341,8 +343,8 @@ pub enum PreconfError {
     },
     /// The preconf queue is at its configured entry or byte ceiling.
     ///
-    /// The ceiling mirrors the transaction pool's (`PoolConfig::pending_limit`),
-    /// read from the same instance so an operator tuning `--txpool.*` moves both.
+    /// Both ceilings are the transaction pool's own — see
+    /// [`capacity_from_pool_config`](crate::admission::capacity_from_pool_config).
     ///
     /// **Refused rather than evicted**, unlike the pool: every entry in this
     /// queue is a commitment awaiting settlement, so there is no "worst" one to
@@ -382,7 +384,8 @@ pub enum PreconfError {
     /// because only the EVM knows which block the transaction is being measured
     /// against: between payload jobs the newest base fee the queue has seen
     /// belongs to the block already sealed, and the two differ by up to a full
-    /// EIP-1559 adjustment.
+    /// EIP-1559 adjustment — 12.5% at Mantle's denominator of 8, enough to
+    /// refuse a transaction that would have executed perfectly well.
     ///
     /// The transaction pool would park such a transaction in its `BaseFee`
     /// sub-pool and promote it if the base fee later fell. This path has no

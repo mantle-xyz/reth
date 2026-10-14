@@ -35,10 +35,10 @@ pub struct FlashblocksProducer {
 /// and will be wired into the same node: at a use site the crate path is gone
 /// and a bare `Flashblocks*` says nothing about which half it belongs to.
 ///
-/// The endpoint is bound at construction, so a port clash fails the node's
-/// startup rather than a task nobody is watching. Dropping this closes the
-/// endpoint and every open subscription, which is why it is held for the
-/// node's lifetime rather than passed around by value.
+/// The endpoint is bound at construction — see
+/// [`MantleFlashblocksPublisher::bind`] for why that is synchronous. Dropping
+/// this closes the endpoint and every open subscription, which is why it is
+/// held for the node's lifetime rather than passed around by value.
 pub struct FlashblocksProducerHandles {
     /// Cloned into the payload builder: the cadence settings and a handle
     /// to publish through.
@@ -64,9 +64,8 @@ impl std::fmt::Debug for FlashblocksProducerHandles {
 impl FlashblocksProducerHandles {
     /// Bind the endpoint and assemble the producer side.
     ///
-    /// Synchronous on purpose: binding here rather than inside the accept loop
-    /// means a port already in use stops the node with a clear message,
-    /// instead of leaving it running with an endpoint nobody is serving.
+    /// Synchronous, and the accept loop is handed back rather than spawned,
+    /// both for the reasons in [`MantleFlashblocksPublisher::bind`].
     pub fn bind(cfg: FlashblockProducerConfig) -> io::Result<Self> {
         let (publisher, accepting) = MantleFlashblocksPublisher::bind(&cfg)?;
         let producer = FlashblocksProducer { cfg: Arc::new(cfg), publisher: publisher.handle() };
@@ -85,11 +84,8 @@ impl FlashblocksProducerHandles {
         &self.publisher
     }
 
-    /// Take the accept loop, for the caller to spawn.
-    ///
-    /// Deliberately not spawned here: how it runs, and what happens when it
-    /// stops, is a decision for whoever owns the node's tasks. `None` on
-    /// every call after the first.
+    /// Take the accept loop, for the caller to spawn. `None` on every call
+    /// after the first.
     pub fn take_accept_loop(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
         self.accepting.lock().take()
     }

@@ -403,12 +403,12 @@ async fn get_code_serves_a_contract_the_overlay_deployed() {
 
 /// A wallet the overlay touched must still report no code.
 ///
-/// Guards the REVM-padding trap rather than the overlay wiring: REVM pads
-/// bytecode for jump-destination analysis, so the execution-time form of empty
-/// code is a trailing `STOP`. Serving that from `eth_getCode` makes
-/// `EXTCODESIZE` report 1 for a plain wallet, flipping every `isContract()`
-/// guard. Canonical agrees with the overlay here, so this cannot fail on a
-/// missing override — only on a wrong one.
+/// Guards the same REVM-padding trap as
+/// `a_touched_account_without_code_stays_without_code_in_the_overrides`, one
+/// layer further out: there the padding would be written into the override,
+/// here it would be served straight to a client by `eth_getCode`. Canonical
+/// agrees with the overlay here, so this cannot fail on a missing override —
+/// only on a wrong one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wallet_touched_by_the_overlay_still_has_no_code_at_pending() {
     let (harness, node) = launch_flashblocks_node!(3, 3);

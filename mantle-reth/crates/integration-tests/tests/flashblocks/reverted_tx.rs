@@ -58,7 +58,8 @@ async fn call_the_reverting_contract(wallet: &Wallet, nonce: u64) -> Bytes {
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
 }
 
-/// Build one block and return the payload, receipts included.
+/// Build one block and return the payload, receipts included — see
+/// `producer_e2e::build_one_block`.
 macro_rules! build_one_block {
     ($node:expr, $pause:expr) => {{
         let attrs = $node.payload.next_attributes();

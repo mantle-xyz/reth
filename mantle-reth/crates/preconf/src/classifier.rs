@@ -89,13 +89,13 @@ impl Whitelist {
 /// halves share no lock, no consumer, and no method.
 #[derive(Debug)]
 pub struct PreconfClassifier {
-    /// Mirrors `PreconfConfig::enabled`. When false this node runs no preconf
-    /// machinery at all, so nothing is classified and **nothing is cached**.
+    /// Mirrors `PreconfConfig::enabled`: on a node that has not opted in,
+    /// [`Self::evaluate_whitelist`] is false whatever the allowlists hold.
     ///
-    /// Nothing else depends on this check: a node that has not opted in never
-    /// builds the RPC handler, so nothing reaches the classifier to cache
-    /// anything. Refusing here anyway keeps the invariant the classifier's own,
-    /// rather than a consequence of how it is wired.
+    /// Why the check is kept even though nothing can reach it on such a node:
+    /// the `enabled` field on
+    /// [`Commitments`](crate::commitments::Commitments), which makes the same
+    /// argument for the records.
     enabled: bool,
 
     /// Mirrors `PreconfConfig::all_preconfs`: bypass the allowlists entirely.
@@ -174,9 +174,12 @@ impl PreconfClassifier {
         self.whitelist.read().clone()
     }
 
-    /// Number of commitment records — for logging, metrics and assertions.
-    /// nothing, so it cannot pre-empt the record the apply establishes (see
-    /// [`crate::commitments::Commitments::record_announced`]).
+    /// **Non-authoritative** eligibility preview, for admission's early
+    /// rejection only — which of the two checks is the binding one is settled
+    /// in the module docs, "Where eligibility is decided".
+    ///
+    /// Writes nothing, so it cannot pre-empt the record the apply establishes
+    /// (see [`crate::commitments::Commitments::record_announced`]).
     pub fn preview_eligibility(&self, from: &Address, to: Option<&Address>) -> bool {
         self.evaluate_whitelist(from, to)
     }

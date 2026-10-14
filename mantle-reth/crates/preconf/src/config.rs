@@ -38,11 +38,16 @@ pub const DEFAULT_PRECONF_MAX_GAS_PER_TX: u64 = 2_000_000;
 /// Default backlog the preconf queue will hold, in blocks' worth of
 /// [`DEFAULT_PRECONF_MAX_GAS_PER_BLOCK`] — `8`.
 ///
+/// A multiplier rather than an absolute ceiling, so retuning the per-block
+/// budget carries the queue ceiling with it; the multiplication itself is
+/// [`capacity_from_pool_config`](crate::admission::capacity_from_pool_config).
+///
 /// **A backstop against a flood, not a restatement of the per-block budget.**
 /// Overflowing a single block is ordinary and already has a handler: dispatch
 /// refuses the transaction with `BlockGasBudgetExceeded` and the client may
 /// resubmit into the next slot. Refusing that at admission instead would
-/// remove a recovery path that exists on purpose.
+/// remove a recovery path that exists on purpose — which is also why lowering
+/// this towards `1` buys nothing: it only moves the refusal earlier.
 ///
 /// What this catches is the case the entry and byte ceilings cannot see. A
 /// hundred transactions at the per-tx cap is thirty-odd blocks of backlog and
@@ -157,14 +162,8 @@ pub struct PreconfConfig {
     /// How much backlog the queue will hold, in blocks' worth of
     /// [`preconf_max_gas_per_block`](Self::preconf_max_gas_per_block).
     ///
-    /// A multiplier rather than an absolute ceiling so that retuning the
-    /// per-block budget carries the queue ceiling with it.
-    ///
-    /// Lowering it towards `1` does not make the queue stricter in a useful
-    /// way — it only moves the refusal earlier, from the dispatch-time budget
-    /// gate to admission.
-    ///
-    /// See [`DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`].
+    /// Why it is a multiple rather than an absolute ceiling, and what the
+    /// default of `8` is defending against: [`DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`].
     pub preconf_queue_gas_blocks: u64,
 
     // ===== Journal persistence =====

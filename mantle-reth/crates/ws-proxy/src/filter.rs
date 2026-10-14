@@ -1,8 +1,10 @@
 //! Address and event-topic filtering of flashblock payloads.
 //!
-//! Reads `metadata.receipts[*].logs` from the slice JSON, so it depends on the
-//! producer populating that map. Decompresses brotli first when the upstream
-//! stream is compressed.
+//! Reads three places in the slice JSON — `metadata.new_account_balances`, the
+//! logs under `metadata.receipts`, and `diff.transactions`. Which of them a
+//! Mantle producer actually fills, and what that costs each kind of filter, is
+//! in `mantle_shape`. Decompresses brotli first when the upstream stream is
+//! compressed.
 
 use std::{borrow::Cow, collections::HashSet, io::Write};
 
@@ -156,9 +158,10 @@ impl FilterType {
     /// `OpReceipt` serialises flat — `{"type", "status", "cumulativeGasUsed",
     /// "logs"}` — so `logs` sits directly on the receipt. Base's `BaseReceipt`
     /// is an externally tagged enum, putting it one level down under the
-    /// variant name (`{"Deposit": {"logs": ...}}`). Both encodings are
-    /// accepted: reading only the nested form would make every filter silently
-    /// match nothing against a Mantle payload.
+    /// variant name (`{"Deposit": {"logs": ...}}`). Both are accepted so that
+    /// filtering works behind either a Mantle or a Base-derived upstream:
+    /// reading only the nested form would make every filter silently match
+    /// nothing against a Mantle payload.
     fn receipt_logs(json: &Value) -> impl Iterator<Item = &Value> {
         json.get("metadata")
             .and_then(|m| m.get("receipts"))
@@ -184,10 +187,14 @@ impl FilterType {
             })
     }
 
+    /// Whether any of `addresses` appears anywhere the slice carries one.
+    ///
+    /// Short-circuits in the order the three inputs are cheapest to read:
+    /// `metadata.new_account_balances` keys, then log emitters under
+    /// `metadata.receipts`, then a substring scan of the raw `diff.transactions`
+    /// hex. Against a Mantle producer the first two are empty, so the substring
+    /// scan is the one that answers — see `mantle_shape` for what that costs.
     fn contains_any_address(&self, json: &Value, addresses: &HashSet<String>) -> bool {
-        // Optimized search: early return on first match
-
-        // Check new_account_balances first (most direct lookup)
         if let Some(found) = json
             .get("metadata")
             .and_then(|m| m.get("new_account_balances"))
@@ -201,7 +208,6 @@ impl FilterType {
             }
         }
 
-        // Check logs in receipts (most common case for filtering)
         for log in Self::receipt_logs(json) {
             if let Some(addr_str) = log.get("address").and_then(|addr| addr.as_str()) &&
                 addresses.contains(&addr_str.to_lowercase())
@@ -211,7 +217,6 @@ impl FilterType {
             }
         }
 
-        // Check transactions (least efficient, check last)
         if let Some(transactions) =
             json.get("diff").and_then(|d| d.get("transactions")).and_then(|t| t.as_array())
         {
@@ -454,13 +459,45 @@ mod tests {
 /// `logs` sits directly on the receipt rather than one level down under a
 /// variant name.
 ///
-/// **Producer-side caveat**: these pass because the fixtures below populate
-/// `metadata.receipts` by hand. The Mantle producer does not — `build_flashblock`
-/// in `mantle-reth-preconf` leaves that field at `BTreeMap::default()` — so
-/// against a live producer today every address and topic filter matches
-/// nothing, and a subscriber using one receives no slices at all. These tests
-/// lock the matching logic; they do not show that filtering is usable end to
-/// end, which needs the producer to start filling `metadata.receipts`.
+/// # What a Mantle slice actually carries
+///
+/// Filtering reads three inputs, and two of them are empty on every slice the
+/// producer emits: `build_flashblock` in `mantle-reth-preconf` leaves both
+/// `MantleFlashblockMetadata` maps at `BTreeMap::default()`, and the fields
+/// themselves are documented as always empty.
+///
+/// | Input | Used for | State on a Mantle slice |
+/// |---|---|---|
+/// | `metadata.new_account_balances` keys | address filters | **always empty** |
+/// | `metadata.receipts[*].logs[*]` address/topics | address + topic filters | **always empty** |
+/// | `diff.transactions` hex, substring match | address filters, last resort | populated |
+///
+/// So against a live producer today a topic filter matches nothing at all —
+/// topics only ever come from receipt logs — and an address filter falls
+/// through to the last resort in `FilterType::contains_any_address`, a
+/// substring scan over the raw transaction hex. That still returns slices, but
+/// it matches an address appearing anywhere in calldata rather than one that
+/// emitted a log, so it over-matches rather than under-matches: a subscriber
+/// filtering on a single contract also receives slices whose transactions
+/// merely mention it as an argument. Neither case produces an error on either
+/// side.
+///
+/// The tests below pass because their fixtures populate `metadata.receipts` by
+/// hand. They lock the matching logic; they do not show that filtering is
+/// usable end to end, which needs the producer to start filling that map.
+///
+/// # For whoever implements the producer side
+///
+/// 1. Populate `metadata.receipts` when building each slice.
+/// 2. This module is the contract. Its fixtures build a real `MantleFlashblockPayload`, serialise
+///    it, and assert the filter matches — if they pass, this proxy will filter correctly.
+/// 3. `an_empty_receipts_map_matches_nothing` will start failing once the map is populated. That
+///    failure is the intended signal, not a regression: replace it with the populated-map
+///    assertion.
+/// 4. Keep the "consumers must not read it" guidance on the field. Once populated it carries
+///    *sequencer-claimed* receipts. This proxy may read them to route, because a wrong routing
+///    decision only costs a subscriber some slices; a consumer that believed them would be trusting
+///    unverified state.
 #[cfg(test)]
 mod mantle_shape {
     use alloy_consensus::Receipt;
@@ -539,8 +576,7 @@ mod mantle_shape {
 
     /// The state the producer ships today: the map is present but empty, so
     /// there are no logs to match. Locks the fact that this is a miss rather
-    /// than a match-everything, and will start failing once the producer
-    /// populates the map — which is the intended signal.
+    /// than a match-everything.
     #[test]
     fn an_empty_receipts_map_matches_nothing() {
         let slice = MantleFlashblockPayload::default();

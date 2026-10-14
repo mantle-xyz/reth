@@ -30,8 +30,9 @@ fn base() -> OpFlashblockPayloadBase {
     }
 }
 
-/// A block's worth of slices: index 0 carries `base`, later ones do not,
-/// and each carries only the transactions it added.
+/// A block's worth of slices, in the shape `consumer_helpers::FlashblockBuilder`
+/// documents — assembled by hand here, because the wire encoding is what is
+/// under test and a builder would hide it.
 fn sequence() -> Vec<MantleFlashblockPayload> {
     let payload_id = PayloadId::new([3u8; 8]);
 

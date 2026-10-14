@@ -367,9 +367,9 @@ fn parse_flashblock_position(data: &str) -> Option<(u64, u64)> {
 }
 
 /// Largest slice accepted from a binary frame, matching the consumer's
-/// `MAX_DECOMPRESSED_FLASHBLOCK_BYTES`. Bounds the allocation a hostile or
-/// misconfigured upstream can force by sending a small, highly compressible
-/// payload.
+/// `MAX_DECOMPRESSED_FLASHBLOCK_BYTES`. Checked both before and after
+/// decompression, so a small but highly compressible payload from a hostile or
+/// misconfigured upstream cannot force a large allocation.
 ///
 /// The two ceilings are hardcoded independently — `mantle-reth-flashblocks-types`
 /// is only a dev-dependency here — so changing one means changing the other.
@@ -379,8 +379,8 @@ const MAX_BINARY_SLICE_BYTES: usize = 5 * 1024 * 1024;
 ///
 /// Mirrors the consumer's `MantleFlashblockPayload::try_decode_message`: a
 /// first non-whitespace byte of `{` means the frame is already JSON, anything
-/// else is brotli. Without this the proxy would drop every frame from a
-/// compressing upstream, since a compressed slice is never valid UTF-8 and so
+/// else is brotli. Dropping binary frames instead, as Base's proxy does, would
+/// starve every subscriber: a compressed slice is never valid UTF-8 and so
 /// never arrives as [`Message::Text`].
 fn decode_binary_slice(data: &[u8]) -> Option<String> {
     if data.len() > MAX_BINARY_SLICE_BYTES {
@@ -678,9 +678,7 @@ mod tests {
         assert!(!messages.is_empty());
     }
 
-    /// A compressing upstream sends binary frames, since a brotli payload is
-    /// never valid UTF-8. Dropping them silently starves every downstream
-    /// subscriber.
+    /// The compressing-upstream case `decode_binary_slice` exists for.
     #[test]
     fn a_brotli_binary_frame_is_decompressed() {
         let json = r#"{"index":4,"metadata":{"block_number":123},"diff":{}}"#;
@@ -694,8 +692,8 @@ mod tests {
         assert_eq!(decode_binary_slice(&compressed).as_deref(), Some(json));
     }
 
-    /// An uncompressed upstream may still frame the slice as binary; the
-    /// sniff must accept it rather than run it through brotli.
+    /// The other half of the sniff in `decode_binary_slice`: an uncompressed
+    /// slice framed as binary must be passed through, not run through brotli.
     #[test]
     fn an_uncompressed_binary_frame_is_passed_through() {
         let json = r#"  {"index":0,"metadata":{"block_number":1},"diff":{}}"#;

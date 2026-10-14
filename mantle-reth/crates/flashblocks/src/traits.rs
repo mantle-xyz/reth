@@ -28,8 +28,8 @@ pub trait FlashblocksAPI {
 
 /// API for accessing pending blocks data.
 ///
-/// RPC-shaped values cross this boundary as [`serde_json::Value`] so the trait
-/// carries no network-specific generics, matching `MantleEthApiExt`.
+/// RPC-shaped values cross this boundary as [`serde_json::Value`] for the reason
+/// `EthApiOverride` documents.
 pub trait PendingBlocksAPI {
     /// Get the canonical block number on top of which all pending state is built.
     ///
@@ -55,13 +55,14 @@ pub trait PendingBlocksAPI {
     /// Gets balance for an address. Returns `None` if the address was not touched.
     fn get_balance(&self, address: Address) -> Option<U256>;
 
-    /// Gets code for an address. Returns `None` if the overlay holds no answer
-    /// and the caller must fall back to canonical state; empty bytes mean the
-    /// overlay knows the account holds no code.
+    /// Gets code for an address. `None` means fall back to canonical state;
+    /// empty bytes are a positive answer, not a miss. [`PendingBlocks::get_code`]
+    /// explains why.
     fn get_code(&self, address: Address) -> Option<Bytes>;
 
-    /// Gets a storage slot's value. Returns `None` if the overlay holds no
-    /// answer and the caller must fall back to canonical state.
+    /// Gets a storage slot's value. `None` means fall back to canonical state;
+    /// `Some(ZERO)` is a positive answer. [`PendingBlocks::get_storage_at`]
+    /// explains why.
     fn get_storage_at(&self, address: Address, slot: B256) -> Option<B256>;
 
     /// Gets the state overrides for the pending blocks.

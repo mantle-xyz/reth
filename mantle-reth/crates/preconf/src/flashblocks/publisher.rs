@@ -47,9 +47,14 @@ impl MantleFlashblocksPublisher {
     /// Bind the endpoint, returning the publisher and the loop that accepts
     /// subscribers.
     ///
+    /// Binding is synchronous, and happens here rather than inside the accept
+    /// loop: a port already in use then stops the node at startup with a clear
+    /// message, instead of leaving it running with an endpoint nobody serves
+    /// from inside a task nobody is watching. It also means binding does not
+    /// quietly require a runtime to already exist.
+    ///
     /// The loop is handed back rather than spawned so that how it runs — and
-    /// what happens if it stops — stays a decision for whoever owns the node,
-    /// and so binding does not quietly require a runtime to already exist.
+    /// what happens if it stops — stays a decision for whoever owns the node.
     /// Nothing is served until the loop is driven.
     pub fn bind(
         cfg: &FlashblockProducerConfig,
@@ -57,17 +62,14 @@ impl MantleFlashblocksPublisher {
         let ring_capacity = NonZeroUsize::new(cfg.ring_capacity)
             .ok_or_else(|| io::Error::other("flashblocks ring capacity must be non-zero"))?;
 
-        // Bound the archive below by the live channel: a subscriber may lag by
-        // a whole channel before it is dropped, and it must be able to resume
-        // from wherever it fell behind.
+        // Bound the archive below by the live channel; see
+        // `FlashblockProducerConfigError::RingSmallerThanBroadcast`.
         debug_assert!(cfg.ring_capacity >= cfg.broadcast_capacity);
 
         let (pipe, _) = broadcast::channel(cfg.broadcast_capacity.max(1));
         let ring = Arc::new(RwLock::new(FlashblockRingBuffer::new(ring_capacity)));
         let cancel = CancellationToken::new();
 
-        // Bind synchronously so a port clash surfaces at startup rather than
-        // inside a task nobody is watching.
         let std_listener = StdTcpListener::bind(SocketAddr::new(cfg.addr, cfg.port))?;
         std_listener.set_nonblocking(true)?;
         let local_addr = std_listener.local_addr()?;
@@ -127,12 +129,11 @@ impl PublisherHandle {
     }
 
     /// Where the most recently published slice sits, across every block this
-    /// producer has published.
+    /// producer has published. `None` means nothing has been published yet.
     ///
-    /// A block-scoped producer cannot know what preceded it, so this is what
-    /// lets one block's first slice point at the last slice of the previous
-    /// one. `None` means nothing has been published yet — a fresh start, which
-    /// is the one case with genuinely no predecessor.
+    /// Scoped to the producer rather than to a block because that is what lets
+    /// one block's first slice point at the last slice of the previous one —
+    /// see `SliceState::new`, which turns this into `prev_flashblock_id`.
     pub fn latest_position(&self) -> Option<FlashblockPosition> {
         self.ring.read().latest()
     }

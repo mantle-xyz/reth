@@ -22,8 +22,8 @@ use crate::helpers::{PreconfCfgBuilder, send_preconf};
 
 const RECIPIENT: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
 
-/// Slice fast enough that a block produces several inside a test's patience,
-/// and let the OS pick the port so concurrent tests never collide.
+/// The config `producer_e2e::flashblocks_cfg` documents, repeated here because
+/// each suite owns its own `[[test]]`-local helpers.
 fn flashblocks_cfg() -> FlashblockProducerConfig {
     FlashblockProducerConfig {
         addr: std::net::Ipv4Addr::LOCALHOST.into(),
@@ -66,9 +66,7 @@ async fn signed_transfer(wallet: &Wallet, chain_id: u64, nonce: u64) -> Bytes {
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
 }
 
-/// Drive one block: hand-rolled FCU, a pause long enough for the build loop to
-/// tick, then resolve. `advance_block()` waits on an event pair the preconf
-/// payload builder does not drive.
+/// Drive one block — see `producer_e2e::build_one_block`.
 macro_rules! build_one_block {
     ($node:expr, $pause:expr) => {{
         let attrs = $node.payload.next_attributes();

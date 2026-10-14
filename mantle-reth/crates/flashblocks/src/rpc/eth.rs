@@ -67,7 +67,8 @@ const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
 /// Implemented for the flashblocks state so `MantleEthApiExt::simulate_v1` can
 /// prepend pending state without depending on this crate's RPC layer.
 pub trait PendingStateOverrides: std::fmt::Debug + Send + Sync {
-    /// Canonical block the pending overlay is built on, or `pending` when absent.
+    /// Canonical block the pending overlay is built on, or `pending` when absent;
+    /// see [`PendingBlocksAPI::get_canonical_block_number`].
     fn pending_base_block(&self) -> BlockId;
 
     /// State overrides representing the pending overlay, if any.
@@ -329,8 +330,8 @@ where
         if block_id.is_pending() {
             Metrics::rpc_get_code().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            // Empty bytes are an answer, not a miss: the overlay knows this
-            // account holds no code. Only `None` falls through.
+            // Empty bytes are an answer, not a miss; only `None` falls through.
+            // See `PendingBlocks::get_code`.
             if let Some(code) = pending_blocks.get_code(address) {
                 return Ok(code);
             }

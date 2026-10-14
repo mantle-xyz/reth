@@ -56,6 +56,7 @@ async fn bulky_transaction(wallet: &Wallet, chain_id: u64, nonce: u64) -> Bytes 
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
 }
 
+/// Drive one block — see `producer_e2e::build_one_block`.
 macro_rules! build_one_block {
     ($node:expr, $pause:expr) => {{
         let attrs = $node.payload.next_attributes();
@@ -116,8 +117,8 @@ async fn a_sealed_block_carries_its_da_footprint() {
     );
 }
 
-/// Slice fast enough that a held-open block produces several, and let the OS
-/// pick the port so concurrent tests never collide.
+/// The config `producer_e2e::flashblocks_cfg` documents, repeated here because
+/// each suite owns its own `[[test]]`-local helpers.
 fn flashblocks_cfg() -> FlashblockProducerConfig {
     FlashblockProducerConfig {
         addr: std::net::Ipv4Addr::LOCALHOST.into(),

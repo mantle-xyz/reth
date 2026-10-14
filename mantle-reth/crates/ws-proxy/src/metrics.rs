@@ -160,11 +160,9 @@ mod tests {
         handle.render()
     }
 
-    /// Without the zeroing in [`Metrics::init`] a counter that has never fired
-    /// is absent from the scrape, and Prometheus answers queries against it
-    /// with no data rather than 0. The counters listed here are precisely the
-    /// ones that stay at zero in a healthy process, so they are the ones whose
-    /// absence would be mistaken for a scrape failure.
+    /// The counters that stay at zero in a healthy process — exactly the ones
+    /// whose absence from a scrape would be mistaken for a scrape failure. See
+    /// [`Metrics::init`] for why they are published rather than left absent.
     #[test]
     fn init_publishes_a_zero_for_counters_that_never_fire() {
         let scrape = scrape_after_init();
@@ -228,10 +226,8 @@ mod tests {
     /// A described-but-unobserved series is absent from the scrape entirely,
     /// and appears with its description once something records against it.
     ///
-    /// This is the exporter's behaviour, not a gap in [`Metrics::init`]: the
-    /// histogram has no zero to publish, and the labelled series have no known
-    /// label values at start-up. It does mean the three of them cannot be used
-    /// to check that the proxy is being scraped at all.
+    /// This is the exporter's behaviour, not a gap in [`Metrics::init`], which
+    /// documents why these three are the ones left unzeroed.
     #[test]
     fn described_series_appear_only_once_observed() {
         let recorder = PrometheusBuilder::new().build_recorder();

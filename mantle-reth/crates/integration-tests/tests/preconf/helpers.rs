@@ -507,6 +507,16 @@ impl PreconfCfgBuilder {
     }
 
     /// Client-visible RPC oneshot deadline, in milliseconds.
+    ///
+    /// Tests that drive a build and then assert on the RPC *answer* raise this
+    /// well above the 1.5s default. The suite spawns nodes in parallel, so a
+    /// build can take far longer than when a test runs alone, and the default
+    /// deadline is then the only thing that fires — turning the refusal or the
+    /// receipt under test into a spurious `Timeout`. Raising it costs nothing
+    /// on the happy path, since the call returns as soon as the build answers.
+    ///
+    /// Lowering it is the opposite move, and belongs to `timeout.rs`, where the
+    /// deadline firing *is* the behaviour under test.
     pub fn preconf_timeout_ms(mut self, ms: u64) -> Self {
         self.preconf_timeout_ms = ms;
         self

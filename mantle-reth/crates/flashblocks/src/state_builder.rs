@@ -301,9 +301,8 @@ where
                     let existing_override = self.state_overrides.entry(*addr).or_default();
                     existing_override.balance = Some(acc.info.balance);
                     existing_override.nonce = Some(acc.info.nonce);
-                    // `bytes()` is REVM's execution-padded form, where empty code becomes a
-                    // trailing `STOP`. Overrides must carry the unpadded original so
-                    // `EXTCODESIZE` stays 0 for accounts that hold no code.
+                    // Overrides must carry the unpadded original, for the reason
+                    // `PendingBlocks::get_code` gives.
                     existing_override.code =
                         acc.info.code.clone().map(|code| code.original_bytes());
 

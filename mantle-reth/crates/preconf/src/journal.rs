@@ -20,7 +20,10 @@
 //! because the only notion this layer could form — *canonical once* — is one a
 //! reorg can undo. Rotation receives that decision as the `retain` predicate
 //! [`PreconfJournal::rotate`] takes, and restore asks
-//! `Commitments::is_tracked` directly.
+//! `Commitments::is_tracked` directly. So this type owns no eviction policy of
+//! its own and reads no chain state: a second, journal-local rule could drop a
+//! record the registry still holds, which is exactly the divergence the two
+//! halves of commitment tracking must not have.
 //!
 //! **Two writers, and only one of them creates the record that keeps a line.**
 //! [`PreconfJournal::append_promised`] takes one commitment from the apply;
@@ -193,12 +196,8 @@ pub enum JournalError {
 /// (rotation). All writes serialise through an async `Mutex` around the file
 /// handle.
 ///
-/// It holds **no** view of which preconf commitments are still owed (see the
-/// module docs); that decision reaches rotation through the `retain` predicate
-/// [`Self::rotate`] takes.
-///
-/// It never reads the chain: rotation's eviction rule arrives as the `retain`
-/// predicate, and nothing else here needs state.
+/// What it does **not** hold — a view of which commitments are still owed, and
+/// any eviction rule of its own — is the module docs' first point.
 #[derive(Debug)]
 pub struct PreconfJournal {
     /// Path to the journal file. Stored for rotation, which writes a
@@ -228,10 +227,10 @@ pub struct PreconfJournal {
     /// has most likely sealed already — a record only matters until its block is
     /// canonical.
     ///
-    /// Distinct from the eviction `rotate` performs: that one decides which
-    /// *durable* records are still owed and is the caller's rule (`retain`).
-    /// This one is about records that never reached the disk at all, and is the
-    /// price of not blocking the build loop on a failing disk.
+    /// Distinct from the eviction [`Self::rotate`] performs: that one is about
+    /// *durable* records and is the caller's rule. This one is about records
+    /// that never reached the disk at all, and is the price of not blocking the
+    /// build loop on a failing disk.
     pending: SyncMutex<VecDeque<Vec<u8>>>,
     /// Running size of `pending`, so the byte fuse costs no walk.
     pending_bytes: AtomicUsize,
@@ -552,14 +551,9 @@ impl PreconfJournal {
 
         let (entries, bad_before) = self.load_upto(compacting_upto).await?;
 
-        // Which records may go is the caller's decision, not this type's, and it
-        // is the *only* rule here: `retain` asks the registry whether the
-        // commitment is still tracked. This type deliberately owns no eviction
-        // policy of its own — a second, journal-local rule could drop a record
-        // the registry still holds, which is precisely the divergence the two
-        // halves of commitment tracking must not have. Evaluated once per record,
-        // so a concurrent update lands in the *next* rotation rather than half of
-        // this one.
+        // `retain` is the caller's rule and the only one here (module docs).
+        // Evaluated once per record, so a concurrent update lands in the *next*
+        // rotation rather than half of this one.
         let mut kept = 0usize;
         let mut dropped = 0usize;
         let mut kept_bytes = 0u64;
@@ -734,11 +728,8 @@ pub trait RestoreSource: Send + Sync {
 pub enum OnChain {
     /// Found on the canonical chain, in the block at `height`.
     ///
-    /// The height is carried because "on chain" is revocable: restore has to
-    /// start the retention clock (`Commitments::mark_committed`) for this
-    /// commitment, and that clock is a block depth. Without it a restored
-    /// commitment that had already landed would keep a promise record that no
-    /// rotation could ever drop.
+    /// The height is carried because restore starts the commitment's retention
+    /// clock with it — see the `OnChain::Yes` arm of [`restore_preconf_state`].
     Yes {
         /// Canonical block number the transaction was found in.
         height: u64,
@@ -955,10 +946,8 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                         // it is already in the past, and every future restart
                         // would replay (and complain about) the same entry.
                         //
-                        // Starting the clock deliberately does not release the
-                        // tracking outright. Landing is revocable; if the block
-                        // is shallow, a reorg right after startup must still
-                        // find the commitment holding its nonce.
+                        // This does not release the tracking outright; see
+                        // `Commitments::mark_committed`.
                         claims.mark_committed(&entry.hash, height);
                         debug!(
                             target: "mantle::preconf::journal",
@@ -1120,12 +1109,8 @@ pub async fn run_rejournal_loop<F, T>(
 where
     F: Future<Output = T>,
 {
-    // The one eviction rule: a record may go once `claims` has stopped
-    // tracking its commitment. That happens when the commitment was kept and
-    // buried `SEAL_DEPTH` persisted blocks deep, when a promise can no longer
-    // reach the block it was made for, or when a build gave it up. Everything
-    // else — never landed but still reachable, landed but shallow, landed and
-    // then reorged out — is still owed and stays in the file.
+    // The one eviction rule: a record may go once `claims` has stopped tracking
+    // its commitment. When that happens is `Commitments::is_tracked`.
     let retain = |hash: &TxHash| claims.is_tracked(hash);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1263,9 +1248,8 @@ mod tests {
         (dir, j)
     }
 
-    /// A slice's transactions are written together. One write and one flush
-    /// rather than one per transaction: a slice can carry a thousand of them,
-    /// and the writer lock it takes is the one the RPC path appends through.
+    /// A slice's transactions are written together: one write and one flush
+    /// rather than one per transaction — see [`PreconfJournal::append_batch`].
     #[tokio::test]
     async fn append_batch_writes_every_entry_in_order() {
         let (_dir, j) = fresh_journal().await;
@@ -1787,10 +1771,8 @@ mod tests {
         assert_eq!(seen, vec![compacted], "read past the snapshot into {latecomer:?}");
     }
 
-    /// Compaction reads and rewrites the whole file — megabytes of it once a
-    /// block carries a thousand transactions. An append must not queue behind
-    /// that: a slice is journalled before it is broadcast, so an append that
-    /// waits is a broadcast that waits.
+    /// An append must not queue behind the compaction pass — see
+    /// [`PreconfJournal::rotate`] for why the pass runs unlocked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_append_does_not_wait_for_the_compaction_pass() {
         let dir = TempDir::new().unwrap();
@@ -2289,12 +2271,11 @@ mod tests {
     }
 
     /// An entry whose transaction is **already on chain** is the commitment
-    /// having been kept, not a failure. Landing starts the retention clock
-    /// rather than ending tracking: while the block is shallow a reorg could
-    /// bring the commitment back, so rotation keeps the record. Once
-    /// [`crate::commitments::SEAL_DEPTH`] persisted blocks sit on top, retention
-    /// expires and the record may go — which is what stops every future restart
-    /// replaying and complaining about the same entry forever.
+    /// having been kept, not a failure. What landing does and does not do to
+    /// the record is [`crate::commitments::Commitments::mark_committed`]; what
+    /// this pins is the consequence for the file — kept while the block is
+    /// shallow, droppable once retention expires, which is what stops every
+    /// future restart replaying and complaining about the same entry forever.
     ///
     /// That such an entry never reaches the fifo is covered separately, by
     /// `a_consumed_nonce_never_reaches_the_fifo`.
@@ -2317,10 +2298,7 @@ mod tests {
         )
         .await;
 
-        // Landing starts the retention clock — it does not end tracking. Until
-        // the block is buried, a reorg could bring the commitment back and it
-        // must still hold its nonce, so the release `forward` would attempt is
-        // refused and the record stays.
+        // Shallow, so the record is still held and the line with it.
         assert!(!c.release_unless_committed(&e.hash), "shallow: the record is held");
         let stats = j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();
@@ -2989,12 +2967,10 @@ mod tests {
 /// and the `size_bytes` counter agree with it. Guards the retention accounting
 /// against changes that leak entries or drift the counter.
 ///
-/// Which records may be dropped is the caller's decision, expressed through
-/// `rotate`'s `retain` predicate (production passes "`Commitments` is still
-/// tracking this"), so `Op::Untrack` mutates a tracking set the *test* owns.
-/// The model therefore poses the question the interface actually asks: does
-/// rotate drop exactly what it was told to, and does the file stay in
-/// lock-step. It also pins `abandoned` staying empty while no TTL is set.
+/// Which records may be dropped is the caller's rule, not the journal's (module
+/// docs), so `Op::Untrack` mutates a tracking set the *test* owns. The model
+/// therefore poses the question the interface actually asks: does rotate drop
+/// exactly what it was told to, and does the file stay in lock-step.
 #[cfg(test)]
 mod proptest_journal_model {
     use super::*;

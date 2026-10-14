@@ -27,8 +27,10 @@ pub struct SliceSchedule {
     /// Time left to build in, after leeway and clamping.
     pub drift: Duration,
     /// Slices the budget is divided by. Not a cap on how many slices get
-    /// published: if the build started early, more ticks will fire than this,
-    /// and those extra ones carry no per-slice limit.
+    /// published: if the build started early, more ticks will fire than this.
+    /// Those extra ones carry no per-slice limit and are not starved by it
+    /// either, because by then the accumulated allowance has already reached
+    /// the block limit.
     pub tick_count: u64,
     /// Gas each tick adds to the allowance.
     pub gas_per_batch: u64,
@@ -116,8 +118,9 @@ struct Budget {
 
 impl Budget {
     /// Opens holding one batch: the first slice is built before any tick has
-    /// fired, so starting empty would leave it with nothing to spend and push
-    /// every later slice one batch behind.
+    /// fired, so starting empty would leave it with nothing to spend, push
+    /// every later slice one batch behind, and leave the last batch reachable
+    /// only in the leeway window.
     const fn new(per_batch: u64, block_limit: u64) -> Self {
         let ceiling = if per_batch < block_limit { per_batch } else { block_limit };
         Self { used: 0, ceiling, per_batch, block_limit }
@@ -190,8 +193,8 @@ pub struct SlicePacer {
 }
 
 impl SlicePacer {
-    /// Opens with one batch of allowance already available, so the slice
-    /// published at the first tick carries a full share rather than nothing.
+    /// Build a pacer for `schedule`. Every dimension opens with one batch
+    /// already available — see `Budget::new`.
     pub fn new(schedule: &SliceSchedule) -> Self {
         let limits = schedule.limits;
         Self {
@@ -211,11 +214,8 @@ impl SlicePacer {
     /// Open the next slice's allowance by one more batch, up to the block
     /// limit.
     ///
-    /// The tick count a schedule derives is a divisor for the budget, not a
-    /// limit on how many slices a block may publish: a build that started
-    /// early outruns its own schedule. Those extra slices are not starved,
-    /// because by then the accumulated allowance has already reached the
-    /// block limit and there is no per-slice ceiling left to apply.
+    /// Safe to call more often than [`SliceSchedule::tick_count`], which is a
+    /// divisor rather than a limit on how many slices a block may publish.
     pub fn tick(&mut self) {
         self.gas.tick();
         if let Some(da) = self.da.as_mut() {
@@ -406,10 +406,8 @@ mod tests {
 
     // ── reserve / settle accounting ──────────────────────────────────────
 
-    /// The first slice is built before any tick has fired, so it has to open
-    /// holding a batch already. Starting drained would push every slice one
-    /// batch behind and leave the last one reachable only in the leeway
-    /// window.
+    /// A pacer opens with one batch already spendable, before any tick has
+    /// fired — see `Budget::new`.
     #[test]
     fn the_first_slice_opens_with_one_batch_available() {
         let mut pacer = pacer();
@@ -517,9 +515,8 @@ mod tests {
         assert!(!spend(&mut pacer, 1, 0));
     }
 
-    /// The tick count divides the budget; it does not limit how many slices a
-    /// block may publish. A build that started early keeps ticking past it,
-    /// and those slices carry only the block-level limit.
+    /// Ticking past [`SliceSchedule::tick_count`] opens the whole block rather
+    /// than capping or overshooting it.
     #[test]
     fn a_build_that_outruns_its_schedule_is_not_capped() {
         let s = schedule(SLOT, Duration::from_millis(50));

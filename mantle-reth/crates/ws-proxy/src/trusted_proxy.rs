@@ -93,10 +93,11 @@ impl TrustedProxyConfig {
     /// Resolves the client IP, trusting forwarding headers only from configured proxy CIDRs.
     ///
     /// Untrusted or direct peers resolve to their (canonicalized) socket
-    /// address and forwarding headers are ignored. A trusted proxy must
-    /// supply a valid forwarding header; a missing or invalid one surfaces
-    /// as an error for the caller to handle. If every forwarded hop is
-    /// trusted, the direct peer address is used.
+    /// address and forwarding headers are ignored. A trusted proxy must supply
+    /// a valid forwarding header, out of which [`Self::forwarded_client_ip`]
+    /// picks the client; a missing or invalid one surfaces as an error for the
+    /// caller to handle. If every forwarded hop is trusted, the direct peer
+    /// address is used.
     pub fn try_client_ip(
         &self,
         connect_addr: IpAddr,
@@ -115,11 +116,10 @@ impl TrustedProxyConfig {
         }
     }
 
-    /// Resolves the client IP, trusting forwarding headers only from configured proxy CIDRs.
+    /// Resolves the client IP like [`Self::try_client_ip`], but never fails.
     ///
-    /// Unlike [`Self::try_client_ip`], this is lenient: a missing or
-    /// invalid header from a trusted proxy falls back to the peer address
-    /// with a warning instead of failing.
+    /// A missing or invalid header from a trusted proxy falls back to the peer
+    /// address with a warning.
     pub fn client_ip(&self, connect_addr: IpAddr, headers: &HeaderMap) -> IpAddr {
         let connect_addr = connect_addr.to_canonical();
         match self.try_client_ip(connect_addr, headers) {

@@ -659,10 +659,11 @@ async fn raw_size_defer_preserves_same_sender_successors() {
 // ───────────────────────── which byte measure ─────────────────────────
 //
 // Every assertion above survives swapping `Encodable::length` for
-// `Encodable2718::encode_2718_len` at the builder's budget sites: a typed
-// transaction's RLP string wrapper is a few bytes against a ~110 KB
-// transaction, so the inclusion counts do not move. The two cases below are
-// sized so that they do.
+// `Encodable2718::encode_2718_len` at the builder's budget sites: the two
+// measures differ only by the wrapper
+// `pool_admission_counts_the_block_body_item_not_the_2718_payload` describes,
+// which is nothing against a ~110 KB transaction, so the inclusion counts do
+// not move. The two cases below are sized so that they do.
 
 /// Replay `txs` into a budget shaped exactly as the builder shapes one for a
 /// Mantle Osaka block, measuring each item with `measure`. `sdm_enabled` is the
@@ -702,6 +703,12 @@ fn largest_admissible(budget: &BlockSizeBudget) -> usize {
 /// A signature with a leading zero byte shifts the length, so this converges by
 /// measuring rather than by computing — and panics rather than returning a
 /// near-miss, because a probe outside the window proves nothing.
+///
+/// Callers pass the **lower half** of the span between the two budgets they are
+/// telling apart. The far edge of that span is where the probe's own
+/// contribution to the measure — its RLP wrapper, its refund reserve — is what
+/// tips the verdict, rather than the difference under test; staying low keeps
+/// the probe clear of it.
 async fn probe_sized_into(
     signer: PrivateKeySigner,
     chain_id: u64,
@@ -734,7 +741,8 @@ async fn probe_sized_into(
 }
 
 /// The budget counts a transaction's **block-body RLP item**, not its EIP-2718
-/// payload: for a typed transaction the two differ by the outer string wrapper.
+/// payload: for a typed transaction the two differ by the outer RLP string
+/// wrapper, four bytes at the ~110 KB sizes this file works at.
 ///
 /// The probe is sized into the gap between the two measures — above what the
 /// block-body measure leaves room for, and below what the 2718 measure would
@@ -758,8 +766,7 @@ async fn pool_admission_counts_the_block_body_item_not_the_2718_payload() {
 
     let signer = Wallet::new(20).with_chain_id(chain_id).wallet_gen()[19].clone();
     // One byte above what the block-body measure allows, up to what the 2718
-    // measure would allow. The lower half of that span keeps the probe clear of
-    // the far edge, where its own wrapper decides the verdict.
+    // measure would allow — lower half, per `probe_sized_into`.
     let span = undercount_headroom - headroom;
     let probe =
         probe_sized_into(signer.clone(), chain_id, 0, headroom + 1..=headroom + span / 2).await;
@@ -885,8 +892,7 @@ async fn sdm_production_appends_no_post_exec_transaction_under_the_shipped_refun
 
     let signer = Wallet::new(20).with_chain_id(chain_id).wallet_gen()[19].clone();
     // One byte above what the SDM-on budget allows, up to what the SDM-off
-    // budget would allow. The lower half of that span keeps the probe clear of
-    // the far edge, where its own reserve decides the verdict.
+    // budget would allow — lower half, per `probe_sized_into`.
     let span = off_headroom - on_headroom;
     let probe =
         probe_sized_into(signer.clone(), chain_id, 0, on_headroom + 1..=on_headroom + span / 2)
@@ -943,10 +949,11 @@ async fn sdm_production_appends_no_post_exec_transaction_under_the_shipped_refun
             assert_eq!(body.len(), mandatory.len(), "the block holds the mandatory txs alone");
             assert_valid_size(&node, &payload);
 
-            // Why the probe was left out, not just that it was: anything else
-            // that could have refused it — its gas, its DA footprint, its nonce,
-            // the pool never having held it — refuses it here too, against the
-            // same node and the same pool but a block with room to spare.
+            // Why the probe was left out, not just that it was — the same
+            // control block
+            // `pool_admission_counts_the_block_body_item_not_the_2718_payload`
+            // argues for, here against the operator gate: every other reason
+            // to refuse the probe refuses it in this block too.
             let head = node.submit_payload(payload.clone()).await.unwrap();
             node.update_forkchoice(head, head).await.unwrap();
             let attrs = node.payload.next_attributes();
@@ -992,9 +999,9 @@ const FIRST_LEG: Duration = Duration::from_millis(800);
 /// which the stall watchdog abandons the job.
 const SECOND_LEG: Duration = Duration::from_millis(2_000);
 
-/// Publisher config for the sliced case. The port is left to the OS so
-/// concurrent tests never collide; everything but the cadence is the shipped
-/// default.
+/// The config `flashblocks::producer_e2e::flashblocks_cfg` documents, with the
+/// cadence taken from [`SLICE_INTERVAL`] instead. Repeated here because each
+/// suite owns its own `[[test]]`-local helpers.
 fn flashblocks_cfg() -> FlashblockProducerConfig {
     FlashblockProducerConfig {
         addr: std::net::Ipv4Addr::LOCALHOST.into(),
@@ -1030,9 +1037,11 @@ fn collect_slices(
 
 /// The bytes a slice announced, measured as EIP-2718 payloads.
 ///
-/// A block-body item is that plus an RLP string wrapper — four bytes on a
-/// transaction of this size. The margins asserted against are megabytes, so the
-/// difference cannot decide anything here.
+/// That is one RLP string wrapper per transaction short of the block-body
+/// items the budget counts — see
+/// `pool_admission_counts_the_block_body_item_not_the_2718_payload`. The
+/// margins asserted against here are megabytes, so the difference cannot
+/// decide anything.
 fn slice_bytes(slice: &MantleFlashblockPayload) -> usize {
     slice.diff.transactions.iter().map(|tx| tx.len()).sum()
 }

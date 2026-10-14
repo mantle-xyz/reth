@@ -81,7 +81,8 @@ async fn both_arms_advance_the_account_view_in_one_block() {
         launch_preconf_node_with_fifo!(cfg).await;
     assert_eq!(preconf_wallet.inner.address(), preconf_sender);
 
-    // Before the FCU: the pool iterator is snapshotted at build start, so a
+    // Before the FCU: the pool iterator is the build-start snapshot pinned by
+    // `pool_tx_arriving_after_build_start_waits_for_the_next_block`, so a
     // transaction arriving later cannot be in this block whatever its nonce.
     let pool_tx = signed_transfer(chain_id, pool_signer, 0).await;
     let pool_hash: B256 = node.rpc.inject_tx(pool_tx).await.expect("pool sendTx accepted");

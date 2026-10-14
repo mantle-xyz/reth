@@ -1,23 +1,14 @@
 //! Which base fee a preconf transaction is held to, and who holds it there.
 //!
-//! A transaction whose `max_fee_per_gas` is under the base fee of the block it
-//! executes in cannot execute in it. The question is only ever *which* block,
-//! and the queue cannot answer it: between payload jobs the most recent base
-//! fee it has seen belongs to the block already sealed, not to the one the
-//! transaction will go into. Mantle's EIP-1559 denominator is 8, so those two
-//! differ by up to 12.5% — enough to refuse a transaction that would have
-//! executed perfectly well.
-//!
-//! So the queue holds no opinion and the EVM decides, against the block it is
-//! actually building. Two things have to hold for that to be workable, and
-//! there is a test for each:
+//! The queue holds no opinion; the EVM decides, against the block it is
+//! actually building. `PreconfError::BaseFeeTooLow` carries that argument.
+//! Two things have to hold for it to be workable, and there is a test for each:
 //!
 //! - the refusal must still **name the base fee**, so a client knows to raise its cap rather than
-//!   to retry unchanged. It reaches them as `BaseFeeTooLow` either way — see
-//!   `apply::BuilderRejected`.
+//!   to retry unchanged — `a_sub_basefee_tx_is_refused_by_the_builder`;
 //! - the judgement must **track the chain**: the same bytes refused against one block must be
-//!   accepted once the base fee falls below their cap. A threshold captured once would refuse them
-//!   forever.
+//!   accepted once the base fee falls below their cap, which a threshold captured once would refuse
+//!   forever — `a_cap_the_head_would_refuse_but_the_next_block_accepts_is_applied`.
 //!
 //! Both tests therefore drive a build. That is the cost of the change: with no
 //! build open there is nobody to refuse the transaction yet, and it waits in
@@ -74,13 +65,12 @@ async fn head_base_fee(http: &HttpClient) -> u128 {
 /// A transaction under the base fee is queued, then refused by the builder —
 /// and the refusal names the base fee.
 ///
-/// Both halves are the substance. The `wait_fifo_entry` before any build is
-/// driven pins that the queue really did take it: a reinstated admission-time
-/// threshold would refuse it there and the entry would never appear. The error
-/// assertion pins that moving the judgement to the EVM did not cost the client
-/// the reason — `GasPriceLessThanBasefee` carries neither figure, so a
-/// regression in `apply::classify` surfaces here as a generic
-/// `builder rejected: ...`.
+/// Both halves are the substance, in the shape
+/// `a_chain_over_the_balance_lands_as_far_as_the_balance_reaches` spells out:
+/// the `wait_fifo_entry` before any build pins that admission holds no
+/// threshold of its own, and the error assertion pins that the client is still
+/// handed the figure it has to raise — the EVM's own
+/// `GasPriceLessThanBasefee` carries neither.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sub_basefee_tx_is_refused_by_the_builder() {
     let recipient: Address = RECIPIENT.parse().unwrap();
@@ -89,8 +79,8 @@ async fn a_sub_basefee_tx_is_refused_by_the_builder() {
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        // Wide enough that the build below comfortably beats the client's
-        // deadline; a narrow one would turn a correct refusal into a timeout.
+        // Raised above the default for the reason `preconf_timeout_ms` gives:
+        // the build below has to beat the client's deadline.
         .preconf_timeout_ms(3_000)
         .build();
 
@@ -148,13 +138,8 @@ async fn a_sub_basefee_tx_is_refused_by_the_builder() {
 /// applied, because the next block is the one that decides.
 ///
 /// This is the case a queue-held threshold gets wrong, and the reason the
-/// threshold is taken from the block being built. The queue can only know a
-/// base fee a build published, so between jobs its newest value belongs to the
-/// block already sealed. The
-/// block being built has its own, and on a chain below its gas target that one
-/// is lower — by up to 12.5% at Mantle's EIP-1559 denominator of 8. Anything
-/// the client bids into that gap executes perfectly well, and a queue-held
-/// threshold refuses it.
+/// threshold is taken from the block being built — see
+/// `PreconfError::BaseFeeTooLow` for the gap the two base fees can open.
 ///
 /// Set up with no arithmetic about the decay: the head is genesis, which is
 /// empty, so the block built below is guaranteed to carry a lower base fee

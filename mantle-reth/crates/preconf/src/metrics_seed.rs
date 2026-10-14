@@ -26,11 +26,11 @@ const COUNTERS: &[&str] = &[
     "preconf.build.pool_tx_already_applied_total",
     "preconf.build.tx_nonce_already_used_total",
     "preconf.build.tx_over_block_limits_total",
-    // The two halves of the block's RLP budget verdict. Kept apart because
-    // they call for different responses: the first is a permanent property of
-    // the transaction (larger than a whole block), the second says only that
-    // this block filled up. Distinct from `tx_over_block_limits_total` above,
-    // which is the block's gas/DA ceilings rather than its RLP size.
+    // The two halves of the block's RLP budget verdict; why they are counted
+    // apart is at the `RawSizeAdmission` branch in
+    // `builder::payload_builder::apply_one_best_tx`. Distinct from
+    // `tx_over_block_limits_total` above, which is the block's gas/DA ceilings
+    // rather than its RLP size.
     "preconf.build.tx_exceeds_block_rlp_total",
     "preconf.build.block_rlp_full_skipped_total",
     "preconf.build.tx_rejected_by_evm_total",

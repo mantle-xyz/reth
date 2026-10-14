@@ -65,26 +65,20 @@ pub fn build_flashblock<T: SignedTransaction>(
         payload_id,
         index,
         // Only the first slice carries them; later ones would be repeating
-        // what the consumer already has.
+        // what the consumer already has. A subscriber that missed this slice
+        // cannot reconstruct the block and has to resume from earlier.
         base: (index == 0).then(|| invariants.base.clone()),
         diff: OpFlashblockPayloadDelta {
             // Intermediate slices do not pay for a state root. Zero is the
-            // agreed stand-in for "not computed".
+            // agreed stand-in for "not computed", not a claim about state.
             state_root: B256::ZERO,
             receipts_root: header.receipts_root,
             logs_bloom: header.logs_bloom,
             block_hash: header.block_hash,
             blob_gas_used: header.blob_gas_used,
-            // TODO(sdm): the 1.6.3 line carries the SDM post-exec (0x7D) transaction
-            // out of band with replace-not-append semantics. This producer still
-            // appends it to `transactions` in a closing slice, so a node producing
-            // flashblocks with SDM enabled publishes slices the 1.6.3 consumer
-            // protocol does not describe. `FlashblockProducerConfig::validate`
-            // refuses this combination at boot
-            // (`--rollup.operator-sdm-opt-in` together with
-            // `--flashblocks.enable`), but that only covers the CLI flag:
-            // `admin_setOperatorSdmOptIn` can still turn SDM on at runtime,
-            // after the gate has already passed.
+            // TODO(sdm): this producer still appends the SDM post-exec (0x7D)
+            // transaction to `transactions` rather than filling this field.
+            // See `FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks`.
             post_exec_tx: None,
             // Accumulating totals, so a consumer reads the header field it is
             // reconstructing rather than having to sum slices itself.
@@ -187,8 +181,8 @@ mod tests {
         payload
     }
 
-    /// The block-level fields ride on the first slice only; a subscriber that
-    /// missed it cannot reconstruct the block and has to resume earlier.
+    /// `base` is carried by index 0 and by no other slice — see
+    /// [`build_flashblock`].
     #[test]
     fn the_first_slice_carries_the_block_level_fields() {
         let mut info = Info::default();
@@ -257,8 +251,7 @@ mod tests {
         assert_eq!(info.pending_slice().len(), 1, "still pending until the slice has gone out");
     }
 
-    /// Gas is the block running total rather than the slice's own, so a
-    /// consumer reads the header field it is reconstructing.
+    /// `gas_used` is the block running total, not the slice's own.
     #[test]
     fn gas_used_is_the_block_total_not_the_slice_total() {
         let payload = build_flashblock(
@@ -273,8 +266,8 @@ mod tests {
         assert_eq!(payload.diff.gas_used, 63_000);
     }
 
-    /// Intermediate slices do not pay for a state root. Zero is the agreed
-    /// stand-in for "not computed"; a consumer must not read it as a claim.
+    /// Every slice publishes `B256::ZERO` for the state root — see
+    /// [`build_flashblock`] for what that stands in for.
     #[test]
     fn a_slice_leaves_the_state_root_unset() {
         let mut info = Info::default();

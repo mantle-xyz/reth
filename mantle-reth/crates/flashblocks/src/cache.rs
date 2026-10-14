@@ -9,9 +9,8 @@ use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 /// Default number of blocks past the next block to be produced for which
 /// flashblocks may be cached.
 ///
-/// [`FlashblockCache::is_cacheable`] admits block numbers up to
-/// `latest_canonical + max_ahead_blocks + 1`, so this default reaches the next
-/// block to be produced plus five more.
+/// Five, on top of the next block itself — see
+/// [`FlashblockCache::is_cacheable`] for the window that spells out.
 pub const DEFAULT_MAX_CACHE_AHEAD_BLOCKS: u64 = 5;
 
 /// Buffers flashblocks that cannot be applied to the overlay yet. Two paths in

@@ -15,13 +15,12 @@
 //!   `PayloadJob` start (`builder::payload_builder::sync_fifo_forward_to_head`), because the async
 //!   fanout of `CanonStateNotification` races the next FCU — a new job could otherwise observe a
 //!   stale `Success` entry and replay it via `reset_success_to_waiting`.
-//! - **Reverted chain**: `fifo.claims().uncommit` withdraws the "seen on chain" observation for
-//!   every reverted transaction, **keeping the promise record and the `(sender, nonce)` slot**, and
-//!   every commitment among them is pushed back into the queue as a replay. The commitment is live
-//!   again and must still refuse a same-nonce replacement. Its return value is the `reorg_drift`
-//!   signal. Re-injection happens here: each commitment the reverted chain carried is pushed back
-//!   with `PreconfSource::Replay`. The client-observed `block_height` may drift for reorged
-//!   commitments; op-geth has the same behavior.
+//! - **Reverted chain**: `fifo.claims().uncommit` is called for every reverted transaction — see
+//!   [`Commitments::uncommit`](crate::commitments::Commitments::uncommit) for what that one call
+//!   does and why its return value is the `reorg_drift` signal. Re-injection happens here: each
+//!   commitment the reverted chain carried is pushed back with `PreconfSource::Replay`. The
+//!   client-observed `block_height` may drift for reorged commitments; op-geth has the same
+//!   behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
 //! then spawned as a `spawn_critical_task` on the reth task executor.
@@ -117,12 +116,10 @@ where
                 ),
             }
 
-            // Record which of our commitments this chain contains, **with the
-            // height of the block each was in** — the retention period is a block
-            // depth, so a flat list of hashes would not do. `mark_committed`
-            // filters: it ignores any hash without a promise record, which is the
-            // overwhelming majority here (ordinary user transactions). Without
-            // that filter this loop would pin every sender's nonce in the block.
+            // Record which of our commitments this chain contains, with the
+            // height of the block each was in. Every hash in the block is fed
+            // in, ours and everyone else's; the filter `mark_committed` applies
+            // to them is load-bearing — see `Commitments::mark_committed`.
             let committed = notif.committed();
             let mut commitments = 0usize;
             for block in committed.blocks_iter() {
@@ -184,12 +181,8 @@ where
         let block_number = old.tip().number();
         for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
             let hash = *recovered.inner().tx_hash();
-            // One call, two jobs. It withdraws the "seen on chain" observation,
-            // stopping the retention clock, while **keeping** the promise record
-            // and the `(sender, nonce)` slot — that is what refuses the
-            // same-nonce replacement a reorg invites. And its return value is
-            // exactly the reorg-drift predicate: a reverted transaction we had
-            // recorded as committed is drift, one we never observed is not.
+            // One call, two jobs, and its return value is the reorg-drift
+            // predicate — see `Commitments::uncommit`.
             if self.fifo.claims().uncommit(&hash) {
                 warn!(
                     target: "mantle::preconf::canon",

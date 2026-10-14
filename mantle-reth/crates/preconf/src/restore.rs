@@ -7,11 +7,11 @@
 //! - [`ProviderChainView`] lets a node provider answer what restore asks of the chain: where a
 //!   sender's nonce stands, and whether a commitment already landed.
 //!
-//! **Neither touches the transaction pool.** A commitment never enters the
-//! pool at all, so restore is decoding plus two chain reads — the nonce and,
-//! only when the nonce is gone, the landing. [`RestoreDirect`] holds nothing — it is
-//! generic over the pool's transaction type only because the journal stores wire
-//! bytes and decoding them needs a type to decode *into*.
+//! **Neither touches the transaction pool** — what [`RestoreDirect`] does hold
+//! instead, and why it is still generic over the pool's transaction type, is on
+//! that type. A commitment never enters the pool at all, so restore is decoding
+//! plus two chain reads: the sender's nonce and, only when the nonce is gone,
+//! the landing.
 //!
 //! It shares admission's `op_envelope_to_alloy` helper so the "which OP tx
 //! variants are preconf-eligible" decision stays in one place.

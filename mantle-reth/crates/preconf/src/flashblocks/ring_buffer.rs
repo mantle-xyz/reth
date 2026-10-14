@@ -43,12 +43,13 @@ impl FlashblockRingBuffer {
     /// replaying them would hand a subscriber transactions that will never
     /// land. Dropping them also keeps positions ascending, which the lookups
     /// below rely on.
+    ///
+    /// This is the only point at which something a subscriber may already hold
+    /// stops being true, which is why the dropped slices are counted.
     pub fn push(&mut self, position: FlashblockPosition, payload: Utf8Bytes) {
-        // A slice at or past this position was published by a build that is
-        // being replaced — the only point at which something a subscriber may
-        // already hold stops being true. Counted because nothing else says it
-        // happened: the replacement carries `base` and restarts at index zero,
-        // which reads as a fresh block rather than as a retraction.
+        // Counted because nothing else says a retraction happened: the
+        // replacement carries `base` and restarts at index zero, which reads
+        // as a fresh block.
         let mut superseded = 0u64;
         while self.entries.back().is_some_and(|(stored, _)| *stored >= position) {
             self.entries.pop_back();
@@ -228,10 +229,8 @@ mod tests {
         assert_eq!(ring.latest(), None);
     }
 
-    /// Rebuilding a block restarts its slice indices, so a position can arrive
-    /// that is not after the last one stored. The superseded slices must go:
-    /// replaying them would hand a subscriber transactions from a payload that
-    /// was abandoned.
+    /// A position that is not after the last one stored evicts from the back
+    /// rather than being appended or refused — see [`FlashblockRingBuffer::push`].
     #[test]
     fn rebuilding_a_block_drops_the_slices_it_supersedes() {
         let mut ring = filled(8, [pos(10, 0), pos(10, 1), pos(10, 2)]);

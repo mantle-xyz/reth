@@ -1,17 +1,18 @@
 # `mantle-reth-ws-proxy`
 
-Subblock websocket fan-out proxy. Holds one upstream connection to the
-sequencer's slice stream and rebroadcasts each slice to many downstream
-subscribers, so the sequencer serves a single client no matter how many RPC
-nodes and third parties read the stream.
+Subblock websocket fan-out proxy: one upstream connection to the sequencer's
+slice stream, rebroadcast to many downstream subscribers. The crate doc on
+`mantle_reth_ws_proxy` (`src/lib.rs`) says what the proxy adds over plain
+rebroadcasting and how it treats the payload; this file is the operator's
+view — flags, routes, metrics, builds.
 
 "Subblock" is Optimism's current name for what this codebase calls a
 flashblock; the two mean the same thing. Optimism renamed the term in its
 documentation only, so every identifier here — flag names, metric series, type
 names — still reads `flashblock`, and so does the rest of this document.
 
-Ported from Base's `websocket-proxy`. It is a standalone binary — it is not
-linked into `op-reth` and does not run inside the node.
+It is a standalone binary — it is not linked into `op-reth` and does not run
+inside the node.
 
 ```
 sequencer (mantle-reth)  ──→  mantle-ws-proxy  ──→  N subscribers
@@ -22,8 +23,9 @@ sequencer (mantle-reth)  ──→  mantle-ws-proxy  ──→  N subscribers
 Mantle builds slices inside the sequencer rather than in a sidecar: the
 publisher is `MantleFlashblocksPublisher` in `mantle-reth-preconf`, enabled with
 `--flashblocks.enable` and listening on `--flashblocks.port` (1111 by default).
-Base's lineage puts a separate builder and a rollup-boost hop ahead of the
-proxy; Mantle deploys neither, so the upstream here is the sequencer itself.
+Base's lineage — this crate is a port of Base's `websocket-proxy` — puts a
+separate builder and a rollup-boost hop ahead of the proxy; Mantle deploys
+neither, so the upstream here is the sequencer itself.
 
 ## What it adds over plain rebroadcasting
 
@@ -82,33 +84,26 @@ Forwarding headers are ignored unless the direct peer falls inside
 which is correct for a directly exposed listener. Connection limits then bucket
 by the peer address.
 
-When the peer is trusted, every occurrence of `--ip-addr-http-header`
-(default `X-Forwarded-For`) is concatenated in order into one chain, which is
-scanned **right to left**, skipping addresses inside the trusted CIDRs. The
-first untrusted address is taken as the client; if every hop is trusted,
-resolution falls back to the peer address with a warning. Scanning right to
-left peels off each of our own hops rather than stopping at the innermost one,
-so clients arriving through several trusted hops still resolve individually.
+When the peer is trusted, the client is picked out of the
+`--ip-addr-http-header` chain (default `X-Forwarded-For`) by
+`TrustedProxyConfig::forwarded_client_ip`, whose doc gives the scan rule. Two
+things follow for configuration:
 
-`--trusted-proxy-cidrs` must therefore list **every** forwarding hop, not just
-the nearest. IPv4-mapped IPv6 addresses are canonicalised, so an IPv4 CIDR
-matches peers arriving on a dual-stack listener and rate-limit buckets stay
-consistent across address forms.
+- `--trusted-proxy-cidrs` must list **every** forwarding hop, not just the
+  nearest. The scan peels off the hops it recognises as ours, so a hop missing
+  from the list is reported as the client.
+- IPv4-mapped IPv6 addresses are canonicalised, so an IPv4 CIDR matches peers
+  arriving on a dual-stack listener and rate-limit buckets stay consistent
+  across address forms.
 
 ## Frame handling
 
-Text frames are forwarded as-is. Binary frames are sniffed the same way the
-consumer's `try_decode_message` does it — a first non-whitespace byte of `{`
-means the frame is already JSON, anything else is brotli — and decompressed
-before being placed on the broadcast channel. A compressing upstream therefore
-works; dropping binary frames, as Base's proxy does, would starve every
-subscriber because a compressed slice is never valid UTF-8 and so never
-arrives as a text frame.
-
-Slices larger than 5 MiB are refused, matching the consumer's
-`MAX_DECOMPRESSED_FLASHBLOCK_BYTES`. The check runs both before and after
-decompression, so a small highly-compressible frame cannot force a large
-allocation.
+Text frames are forwarded as-is. Binary frames are sniffed — already-JSON, or
+brotli to be decompressed — before being placed on the broadcast channel, so a
+compressing upstream works; `decode_binary_slice` in `subscriber.rs` carries the
+sniff rule and the reason dropping binary frames (as Base's proxy does) would
+starve every subscriber here. Slices larger than `MAX_BINARY_SLICE_BYTES`
+(5 MiB) are refused.
 
 Downstream compression is separate and opt-in via `--enable-compression`.
 
@@ -118,65 +113,21 @@ Beyond that framing, slices are forwarded unchanged. Nothing is validated or
 re-signed — the proxy is not a trust boundary, and a downstream consumer must
 still replay transactions locally rather than believe what arrives here.
 
-The exception is `filter`, which parses the slice as JSON to evaluate a
+The exception is `FilterType`, which parses the slice as JSON to evaluate a
 subscriber's address and topic filters.
 
-### ⚠️ Two of the three filter inputs are empty on Mantle today
+### ⚠️ Address and topic filters are unusable on Mantle today
 
-| Input | Used for | State on a Mantle slice |
-|---|---|---|
-| `metadata.new_account_balances` keys | address filters | **always empty** |
-| `metadata.receipts[*].logs[*].{address,topics}` | address and topic filters | **always empty** |
-| `diff.transactions` hex, substring match | address filters, last resort | populated |
+The two `metadata` maps the filter reads are empty on every slice the Mantle
+producer emits. Topic filters therefore match nothing, and address filters fall
+back to substring-matching the raw transaction hex, which over-matches: a
+subscriber filtering on one contract also receives slices whose transactions
+merely mention it as an argument. Neither case produces an error on either
+side.
 
-Both metadata maps are `BTreeMap::default()` on every slice the Mantle producer
-emits. They exist so the payload stays shaped like the upstream one; their doc
-comments say consumers must not read them.
-
-The consequences differ by filter kind:
-
-- **Topic filters match nothing.** Topics only ever come from receipt logs.
-- **Address filters fall back to substring matching over the raw transaction
-  hex.** That still returns results, but it matches an address appearing
-  anywhere in calldata, not just as a log emitter — so it over-matches rather
-  than under-matches. A subscriber filtering on one contract will also receive
-  slices whose transactions merely mention it as an argument.
-
-Neither case produces an error on either side.
-`filter::mantle_shape::an_empty_receipts_map_matches_nothing` locks the
-receipts half so it is visible rather than surprising.
-
-**For whoever implements the producer side:**
-
-1. Populate `metadata.receipts` when building each slice.
-2. `filter::mantle_shape` is the contract. Those tests build a real
-   `MantleFlashblockPayload`, serialise it, and assert the filter matches — if
-   they pass, this proxy will filter correctly.
-3. `an_empty_receipts_map_matches_nothing` will start failing once the map is
-   populated. That failure is the intended signal, not a regression: replace it
-   with the populated-map assertion.
-4. Keep the "consumers must not read it" guidance on the field. Once populated
-   it carries *sequencer-claimed* receipts. This proxy may read them to route,
-   because a wrong routing decision only costs a subscriber some slices. A
-   consumer that believed them would be trusting unverified state.
-
-### Two receipt encodings are accepted
-
-`OpReceipt` serialises flat, with `logs` directly on the receipt:
-
-```json
-{ "type": "0x7e", "status": "0x1", "cumulativeGasUsed": "0x5208", "logs": [ ... ] }
-```
-
-Base's `BaseReceipt` is an externally tagged enum, one level deeper:
-
-```json
-{ "Deposit": { "logs": [ ... ] } }
-```
-
-`FilterType::receipt_logs` reads both, so the proxy works behind either a Mantle
-or a Base-derived upstream. Reading only the nested form — as the code did when
-first ported — makes every filter silently match nothing against a Mantle slice.
+The full statement — which input feeds which filter, and the checklist for
+whoever populates the maps on the producer side — is the module doc on
+`filter::mantle_shape`.
 
 ## Metrics
 
@@ -184,13 +135,11 @@ Prometheus on `--metrics-addr`, series prefixed `flashblocks.proxy.`. Note this
 differs from Base's `websocket_proxy_*`, so Base dashboards need their queries
 rewritten.
 
-Every counter and gauge is published as `0` at start-up, so a series reading
-zero means "nothing has happened" rather than "not scraped". Three series are
-the exception and stay absent until first observed, because there is nothing to
-publish for them up front: `message_send_duration` (a histogram has no zero
-observation) and the two labelled series `connections_by_app` and
-`upstream_messages` (their label values are unknown until a client connects or
-an upstream delivers). Do not use those three to check that scraping works.
+`Metrics::init` publishes a zero for every counter and gauge at start-up, so a
+series reading zero means "nothing has happened" rather than "not scraped".
+Three series are the exception and stay absent until first observed:
+`message_send_duration`, `connections_by_app` and `upstream_messages`. Do not
+use those three to check that scraping works.
 
 Useful first checks:
 

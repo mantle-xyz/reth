@@ -78,9 +78,10 @@ impl PreconfRpcHandler {
     }
 
     /// Claim the `(sender, nonce)` slot for a commitment whose receipt is going
-    /// out, and record the promise in `Commitments` (`fifo.claims()`) — the
-    /// in-memory authority for slot retention. `mark_committed` needs that
-    /// record to recognise our transactions among a whole block's hashes.
+    /// out, and record the promise in `Commitments` (`fifo.claims()`).
+    ///
+    /// Why here and not at canonical time:
+    /// [`Commitments::mark_promised`](crate::commitments::Commitments::mark_promised).
     ///
     /// **Every receipt counts, not only `Success`.** A `Failed` event on a
     /// receipt path is an EVM revert that *produced* a receipt; every
@@ -96,10 +97,6 @@ impl PreconfRpcHandler {
         sender: &alloy_primitives::Address,
         nonce: u64,
     ) {
-        // Establishing the record here — at the receipt, which necessarily
-        // precedes the block — is what makes it available to both later events
-        // (`forward_all → release_unless_committed` and the canonical
-        // notification) no matter which of them runs first.
         if let Err(owner) =
             self.fifo.claims().mark_promised(hash, sender, nonce, event.block_height)
         {

@@ -920,9 +920,8 @@ where
 ///
 /// Both halves are deliberately whole-fifo rather than per-sender. Asking for
 /// the senders alone avoids cloning a view of every entry, and one sweep avoids
-/// re-reading every entry once per sender — which is nothing at the handful of
-/// commitments preconf alone holds, and quadratic at the tens of thousands a
-/// journal replay can restore.
+/// re-reading every entry once per sender — quadratic at the volumes
+/// [`PreconfTxSet::forward_all`] describes.
 async fn sync_fifo_forward_to_head<S>(fifo: &PreconfTxSet, state_provider: &S)
 where
     S: reth_storage_api::StateProvider + ?Sized,

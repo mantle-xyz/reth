@@ -16,9 +16,8 @@
 //!   slots; each canon runs `sync_fifo_forward_to_head` afresh. Guards against a caching bug that
 //!   would skip forward after the first `PayloadJob`.
 //!
-//! Several tests here raise `preconf_timeout_ms` well above the 1.5s default: they assert
-//! *where* a tx is routed after a canon commit, never how fast, so under parallel load the
-//! default deadline is the only thing that fires — as a spurious `Timeout`.
+//! Several tests here raise `preconf_timeout_ms` well above the 1.5s default — they assert
+//! *where* a tx is routed after a canon commit, never how fast.
 
 use super::helpers::{PreconfCfgBuilder, send_preconf};
 use crate::{canonicalize_payload, launch_preconf_node};

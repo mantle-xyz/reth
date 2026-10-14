@@ -5,11 +5,12 @@
 //! Both orders are covered, because they reach the same end state — one hash
 //! held by two independent queues — and must therefore give the same answer.
 //!
-//! Neither order has anything left to refuse the second submission with:
-//! nothing is recorded for an ordinary transaction, so ordinary admission
-//! cannot bar a later preconf call on that hash; and a preconf transaction
-//! never enters the pool, so an ordinary resubmission of the same hash is new
-//! to the pool's hash dedup rather than "already known".
+//! Neither order has anything left to refuse the second submission with: an
+//! ordinary submission records nothing for the hash, so ordinary admission
+//! cannot bar a later preconf call on it; and a preconf transaction never
+//! enters the pool (the `admission` module docs say why), so an ordinary
+//! resubmission of the same hash is new to the pool's hash dedup rather than
+//! "already known".
 //!
 //! Accepting both is a deliberate loosening, on the grounds that whatever lands
 //! was put there by the client itself: "your preconfirmation failed" and "the
@@ -213,7 +214,8 @@ async fn preconf_then_ordinary_is_no_longer_refused() {
 /// Both submissions land **before** the build opens, which is the ordering the
 /// other two do not reach.
 ///
-/// The pool arm iterates a snapshot taken when the build starts. In the other
+/// The pool arm iterates the build-start snapshot pinned by
+/// `pool_tx_arriving_after_build_start_waits_for_the_next_block`. In the other
 /// two tests the second submission arrives after that snapshot, so the pool arm
 /// never sees a transaction carrying a commitment record and the filter that
 /// would skip it never runs. Here it does: the transaction is in the pool, its

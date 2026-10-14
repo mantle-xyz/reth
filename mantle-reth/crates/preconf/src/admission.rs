@@ -182,8 +182,7 @@ pub struct PreconfAdmission<V> {
     /// check is the payload builder's, per block.
     classifier: Arc<PreconfClassifier>,
     cfg: Arc<PreconfConfig>,
-    /// What the queue may hold, taken from the node's own pool configuration
-    /// so that tuning one tunes both.
+    /// What the queue may hold — see [`capacity_from_pool_config`].
     capacity: Capacity,
 }
 
@@ -354,8 +353,7 @@ pub fn capacity_from_pool_config(
         max_size: cfg.pending_limit.max_size,
         max_account_slots: cfg.max_account_slots,
         max_inflight_delegated: cfg.max_inflight_delegated_slot_limit,
-        // Derived, not configured directly, so retuning the per-block budget
-        // carries the queue ceiling with it.
+        // Derived rather than configured — see `DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`.
         max_queued_gas: preconf
             .preconf_max_gas_per_block
             .saturating_mul(preconf.preconf_queue_gas_blocks),
@@ -709,9 +707,8 @@ mod tests {
         assert_eq!(cap.max_size, pool.pending_limit.max_size);
         assert_eq!(cap.max_account_slots, pool.max_account_slots);
         assert_eq!(cap.max_inflight_delegated, pool.max_inflight_delegated_slot_limit);
-        // The one ceiling the pool has no opinion on: it is the preconf
-        // per-block budget times the backlog we will hold, so retuning the
-        // budget moves it without anyone remembering to.
+        // The one ceiling the pool has no opinion on — see
+        // `DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`.
         assert_eq!(
             cap.max_queued_gas,
             preconf.preconf_max_gas_per_block * preconf.preconf_queue_gas_blocks,

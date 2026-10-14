@@ -7,23 +7,9 @@
 //! both, the block executes tx0, and tx1 is refused against the balance tx0
 //! left behind — `~0.4 B`.
 //!
-//! ## Why the queue does not pre-empt that
-//!
-//! It cannot do it correctly. Summing a sender's queued costs against its
-//! canonical balance is wrong in both directions: the block being built may
-//! already have spent that balance (so the sum reads low) or credited it (so
-//! the sum reads high and refuses a transaction that was in order). Neither is
-//! visible from the queue, and journal-replayed entries carry no cost figure at
-//! all. There was such a check; it was written for an earlier shape of this
-//! path, where a preconf transaction went through the transaction pool and the
-//! pool would park it on `!ENOUGH_BALANCE` — a parked transaction never reaching
-//! `Pending` got no queue entry, and the client waited out the whole timeout for
-//! nothing. The preconf path no longer goes through the pool, so there is
-//! nothing to park and nothing to predict.
-//!
-//! What the client is told does not change: `InsufficientFunds`, with the same
-//! wording, from the builder instead of from admission — see
-//! `apply::BuilderRejected`.
+//! Why the queue does not pre-empt that, and why the client still reads the
+//! same cumulative-cost wording whichever stage refused, is on
+//! `PreconfError::InsufficientFunds`.
 //!
 //! ## Both transactions are preconf, and that is load-bearing
 //!
@@ -87,9 +73,8 @@ async fn a_chain_over_the_balance_lands_as_far_as_the_balance_reaches() {
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        // Comfortably longer than the build driven below; both requests are
-        // in flight across it, and a deadline firing first would turn a refusal
-        // into a timeout.
+        // Raised above the default for the reason `preconf_timeout_ms` gives;
+        // both requests are in flight across the build driven below.
         .preconf_timeout_ms(10_000)
         .build();
 

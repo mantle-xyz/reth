@@ -299,9 +299,7 @@ mod tests {
     #[case(&[0x01, 0x02], &[0x02, 0x01], ReorgDetectionResult::ReorgDetected { tracked_count: 2, canonical_count: 2 })]
     #[case(&[0x01, 0x02, 0x03], &[0x01, 0x02], ReorgDetectionResult::ReorgDetected { tracked_count: 3, canonical_count: 2 })]
     #[case(&[0x01], &[0x01, 0x02, 0x03], ReorgDetectionResult::ReorgDetected { tracked_count: 1, canonical_count: 3 })]
-    // An untracked canonical block is not a reorg: the overlay simply held nothing
-    // for it. Every L2 block carries an L1-attributes deposit, so a block the overlay
-    // does track is never legitimately empty.
+    // An untracked canonical block is not a reorg; see `ReorgDetector::detect`.
     #[case(&[], &[0x01], ReorgDetectionResult::NoReorg)]
     #[case(&[], &[0x01, 0x02, 0x03], ReorgDetectionResult::NoReorg)]
     #[case(&[0x01], &[], ReorgDetectionResult::ReorgDetected { tracked_count: 1, canonical_count: 0 })]

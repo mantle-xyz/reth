@@ -164,12 +164,12 @@ pub const WHITELIST_WARN_THRESHOLD: usize = 1_000_000;
 ///
 /// `read_preconf_set` takes the array length from **the `list_slot` it was
 /// passed** (slot 2 or slot 4 of the configured address), so a wrong-but-deployed
-/// contract supplies that number: the has-code check in [`bootstrap_whitelist`]
-/// proves *something* is deployed there, not
-/// that it is a `PreconfWhitelist`. A value that cannot be a length at all is
-/// refused in O(1) by [`WhitelistError::ImplausibleLength`] and never reaches
-/// this budget; what is left for it is the plausible-but-wrong middle, which is
-/// also where the nastiest case lives:
+/// contract supplies that number — see [`WhitelistError::ContractHasNoCode`] for
+/// why reaching this point proves so little about what is at that address. A
+/// value that cannot be a length at all is refused in O(1) by
+/// [`WhitelistError::ImplausibleLength`] and never reaches this budget; what is
+/// left for it is the plausible-but-wrong middle, which is also where the
+/// nastiest case lives:
 ///
 /// | that length slot happens to hold | value | blocked for (at 1.06 µs/entry) |
 /// |---|---|---|
@@ -226,11 +226,9 @@ struct BudgetSpent {
 /// single-array entry points build their own. `pub(crate)` only because it
 /// appears in the `_within` signatures; nothing outside this module builds one.
 ///
-/// Two counters and two clocks, because those two scopes both matter: the
-/// budget is enforced against the whole read, but an abort has to say *which
-/// list* it stopped in and how much of the spend happened there — otherwise a
-/// budget eaten by `exactPairs` is reported against `fromWildcards`, naming the
-/// innocent array.
+/// Two counters and two clocks, because the budget is enforced against the
+/// whole read while an abort has to name the array it stopped in — see
+/// [`WhitelistError::ReadBudgetExceeded`].
 pub(crate) struct ReadBudget {
     started: Instant,
     budget: Duration,
@@ -298,6 +296,12 @@ pub enum WhitelistError {
     /// "governance currently allows nobody". Proving there is a contract there
     /// first means a later empty read can be trusted as policy rather than
     /// silently masking a typo.
+    ///
+    /// It proves only that *something* is deployed, never that the something is
+    /// a `PreconfWhitelist`: every later guard in this module —
+    /// [`Self::LayoutVersionMismatch`], [`Self::ImplausibleLength`],
+    /// [`WHITELIST_READ_BUDGET`] — exists to catch what passing this check
+    /// still leaves open.
     #[error(
         "preconf whitelist contract {0} has no code — check --preconf.whitelist-contract and that the contract is deployed"
     )]
@@ -306,10 +310,10 @@ pub enum WhitelistError {
     /// The contract at `whitelist_contract` declares a storage layout this binary
     /// cannot read.
     ///
-    /// Fatal for the same reason [`Self::ContractHasNoCode`] is. The has-code
-    /// check proves *something* is deployed there, not that it is a
-    /// `PreconfWhitelist` at the layout these slot constants describe — and a
-    /// skew is silent and actively wrong rather than merely stale.
+    /// Fatal for the same reason [`Self::ContractHasNoCode`] is, and it settles
+    /// what that check cannot: whether the deployed contract is a
+    /// `PreconfWhitelist` at the layout these slot constants describe. A skew is
+    /// silent and actively wrong rather than merely stale.
     ///
     /// Take the contract this layout replaced. It stored a sender list and a
     /// recipient list and authorized their **cross product** — `from` in the one
@@ -425,11 +429,10 @@ fn array_data_base(slot: u64) -> U256 {
 }
 
 /// Reads the `address[]` at `list_slot` out of `contract`'s storage, against a
-/// full fresh [`WHITELIST_READ_BUDGET`].
+/// full fresh [`WHITELIST_READ_BUDGET`] — which bounds the time, not the length.
 ///
-/// The length is not capped, only the time spent reading it — see
-/// [`WHITELIST_READ_BUDGET`]. Zero entries are skipped; see `report_zero_entries`
-/// for why one is a signal rather than an empty slot.
+/// Zero entries are skipped; see `report_zero_entries` for why one is a signal
+/// rather than an empty slot.
 pub fn read_preconf_set(
     state: &StateProviderBox,
     contract: Address,
@@ -481,9 +484,8 @@ pub(crate) fn read_preconf_set_within(
 /// Reads the contract's `Rule[]` at `list_slot` out of its storage.
 ///
 /// Same budget and same zero handling as [`read_preconf_set`]; the difference is
-/// the **stride**. A `Rule` is two `address` fields and cannot pack into one
-/// slot, so element `i` occupies `base + 2i` (`from`) and `base + 2i + 1`
-/// (`to`) — see [`PAIRS_SLOT`], and the `vm.load` assertions that pin it.
+/// the **stride**, a `Rule` element spanning two slots rather than one — see
+/// [`PAIRS_SLOT`].
 ///
 /// A pair with either half zero is discarded whole: the contract never stores a
 /// zero in `exactPairs`, so a zero half means we are reading the wrong layout,
@@ -752,8 +754,7 @@ type AllowlistSets = (HashSet<(Address, Address)>, HashSet<Address>, HashSet<Add
 /// already been revoked, say. `latest()` is taken once by the caller and shared
 /// here, so the three reads see the same state.
 ///
-/// One [`ReadBudget`] for all three for a different reason: what it bounds is how
-/// long a caller stalls, and a caller stalls once for the whole allowlist. See
+/// One [`ReadBudget`] for all three for a different reason — see
 /// [`WHITELIST_READ_BUDGET`].
 fn read_all(state: &StateProviderBox, contract: Address) -> Result<AllowlistSets, WhitelistError> {
     read_all_within(state, contract, &mut ReadBudget::new(WHITELIST_READ_BUDGET))
@@ -779,9 +780,12 @@ fn read_all_within(
 ///
 /// The has-code check is deliberately fatal — see
 /// [`WhitelistError::ContractHasNoCode`] for why the split between "this node's
-/// configuration" and "governance's policy" falls where it does. Checked once,
-/// because deployed code does not disappear (post-Cancun `selfdestruct` no
-/// longer clears it), so the watcher never repeats it.
+/// configuration" and "governance's policy" falls where it does. It and the
+/// layout-version check both run **once**, because both answers are fixed for
+/// this process's lifetime: deployed code does not disappear (post-Cancun
+/// `selfdestruct` no longer clears it), and a different layout means a redeploy,
+/// which means a new `--preconf.whitelist-contract`. The watcher repeats
+/// neither.
 ///
 /// It is not the only fatal check. `build_pool` (`mantle-reth-cli`) propagates
 /// every `Err` from here, so a [`WhitelistError::LayoutVersionMismatch`] or a
@@ -820,9 +824,7 @@ pub fn bootstrap_whitelist<P: WhitelistState>(
         return Err(WhitelistError::ContractHasNoCode(contract));
     }
 
-    // Checked once, for the same reason the has-code check is: the answer is
-    // fixed for this process's lifetime — a different layout means a redeploy,
-    // which means a new `--preconf.whitelist-contract`.
+    // Checked once, like the has-code check above.
     let found = state
         .storage(contract, B256::from(U256::from(LAYOUT_VERSION_SLOT)))?
         .unwrap_or_default()
@@ -1118,10 +1120,8 @@ mod tests {
         out
     }
 
-    /// Storage words for a `Rule[]` at `slot`. Element `i` occupies **two**
-    /// slots — `from` at `base + 2i`, `to` at `base + 2i + 1` — which is the
-    /// layout `test_storageLayout_matchesRethExpectations_succeeds` pins with
-    /// `vm.load` on the Solidity side.
+    /// Storage words for a `Rule[]` at `slot`, laid out with the two-slot
+    /// element stride [`PAIRS_SLOT`] describes.
     fn pair_array_storage(slot: u64, entries: &[(Address, Address)]) -> Vec<(B256, U256)> {
         let mut out = vec![(B256::from(U256::from(slot)), U256::from(entries.len()))];
         let base = array_data_base(slot);
@@ -1261,9 +1261,8 @@ mod tests {
         assert_eq!(c.whitelist_counts(), (0, 0, 0), "and nothing was loaded from it");
     }
 
-    /// A *future* layout is refused too. The comparison is exact rather than a
-    /// minimum: a later version moves slots, so this binary has no business
-    /// reading it either.
+    /// A *future* layout is refused too, the comparison being exact rather than
+    /// a minimum — see [`EXPECTED_LAYOUT_VERSION`].
     #[test]
     fn bootstrap_refuses_a_newer_layout() {
         let provider = provider_with_layout(&[], &[], &[], true, 3);
@@ -1408,9 +1407,7 @@ mod tests {
 
     /// [`ReadBudget`]'s own contract: one charge per **storage read**, checked on
     /// a stride, and a zero budget does no work at all. This is where the counting
-    /// unit is pinned for the type itself; that the `Rule[]` loop charges twice
-    /// per element is pinned by
-    /// `read_all_spends_a_single_budget_across_all_three_arrays`.
+    /// unit is pinned for the type itself.
     #[test]
     fn read_budget_charges_per_read_and_a_zero_budget_does_no_work() {
         let mut spent = ReadBudget::new(Duration::ZERO);
@@ -1427,11 +1424,9 @@ mod tests {
     /// **The stride restarts with each array**, so a list reached after the
     /// budget is already spent still aborts on its *first* charge.
     ///
-    /// The regression this guards: with one stride counter shared across
-    /// [`read_all`]'s three reads, the second array would start mid-stride, and
-    /// any list shorter than [`BUDGET_CHECK_STRIDE`] could then run to
-    /// completion without checking the budget once — silently overshooting the
-    /// bound this whole type exists to enforce.
+    /// The regression this guards is the one [`BUDGET_CHECK_STRIDE`] describes:
+    /// with a single stride counter shared across [`read_all`]'s three reads, a
+    /// later array could run to completion without checking the budget once.
     ///
     /// The budget is shortened mid-test rather than waited out, because the
     /// alternative is a timing-dependent test of a time-based guard.
@@ -1503,10 +1498,9 @@ mod tests {
     ///
     /// Here `exactPairs` reads fine and then the budget is spent, so the
     /// `fromWildcards` read aborts immediately. `slot` / `read` / `claimed_len`
-    /// point at `fromWildcards` because that is where it stopped — but
-    /// `on_this_array` is near zero, which is what tells an operator the cost
-    /// was incurred earlier. Without that field the message reads "slot 2
-    /// abandoned after 30s: read 0 of 1 entries" and indicts a one-element list.
+    /// point at `fromWildcards` because that is where it stopped, and
+    /// `on_this_array` is near zero — the misreading that pair of facts exists
+    /// to prevent is spelled out at [`WhitelistError::ReadBudgetExceeded`].
     #[test]
     fn a_budget_spent_by_an_earlier_array_is_not_blamed_on_the_next_one() {
         let provider = provider_with(&[(addr(1), addr(2))], &[addr(3)], &[], true);
@@ -1614,10 +1608,9 @@ mod tests {
         assert_eq!(budget.reads, 0, "the refusal must not cost a single storage read");
     }
 
-    /// **The case this check exists for**: an address in the length slot, which
-    /// is what a `--preconf.whitelist-contract` aimed at some other contract's
-    /// storage looks like from here. As a `U256` an address is ~1.46e48, so it
-    /// can never be mistaken for a length.
+    /// **The case this check exists for** — an address in the length slot, which
+    /// as a `U256` can never be mistaken for a length. See
+    /// [`WhitelistError::ImplausibleLength`].
     #[test]
     fn an_address_in_the_length_slot_is_refused_rather_than_read() {
         let planted = U256::from_be_bytes(addr(0xab).into_word().0);

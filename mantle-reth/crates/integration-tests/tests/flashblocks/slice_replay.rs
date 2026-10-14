@@ -31,8 +31,8 @@ const RECIPIENT: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
 /// keyed on the `(from, to)` pair, not on the sender alone.
 const OTHER: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
 
-/// Slice fast enough that a held-open block produces several, and let the OS
-/// pick the endpoint port so concurrent tests never collide.
+/// The config `producer_e2e::flashblocks_cfg` documents, repeated here because
+/// each suite owns its own `[[test]]`-local helpers.
 fn flashblocks_cfg() -> FlashblockProducerConfig {
     FlashblockProducerConfig {
         addr: std::net::Ipv4Addr::LOCALHOST.into(),
@@ -42,7 +42,8 @@ fn flashblocks_cfg() -> FlashblockProducerConfig {
     }
 }
 
-/// A journal path under a fresh directory, for two nodes to share.
+/// Like `slice_journal::fresh_journal_path`, but handed to two nodes in turn —
+/// the second starts against what the first left.
 fn shared_journal_path() -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "mantle-flashblocks-slice-replay-{}",
@@ -96,7 +97,7 @@ macro_rules! hold_a_block_open {
     }};
 }
 
-/// Build one block and return it.
+/// Build one block and return it — see `producer_e2e::build_one_block`.
 macro_rules! build_one_block {
     ($node:expr, $pause:expr) => {{
         let attrs = $node.payload.next_attributes();

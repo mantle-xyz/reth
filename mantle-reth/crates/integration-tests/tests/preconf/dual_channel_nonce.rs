@@ -8,10 +8,10 @@
 //!
 //! Today the preconf handler asks the transaction pool, so it sees the sender's
 //! ordinary transactions whether or not they have executed. The direct-admission
-//! design does not read the pool at all: its view starts from the **chain**
-//! nonce and advances as transactions **execute**. The difference shows up in
-//! exactly one window — an ordinary transaction sitting in the pool that has not
-//! run yet:
+//! design does not read the pool at all (the `admission` module docs say why):
+//! its view starts from the **chain** nonce and advances as transactions
+//! **execute**. The difference shows up in exactly one window — an ordinary
+//! transaction sitting in the pool that has not run yet:
 //!
 //! | ordinary tx state | today | after |
 //! |---|---|---|
@@ -198,9 +198,10 @@ async fn a_preconf_tx_behind_an_unexecuted_normal_tx_never_lands_either_way() {
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        // Long enough that today's path reaches the builder and comes back
-        // with its apply rejection, rather than timing out first — a timeout
-        // would satisfy "did not land" for the wrong reason.
+        // Raised for the reason `preconf_timeout_ms` gives, plus one of this
+        // test's own: a timeout would satisfy "did not land" for the wrong
+        // reason, so today's path must have room to come back with its apply
+        // rejection instead.
         .preconf_timeout_ms(3_000)
         .build();
 

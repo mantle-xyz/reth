@@ -108,7 +108,7 @@ async fn stub_server(script: Vec<Script>) -> (Url, UnboundedReceiver<String>) {
     (url, uri_rx)
 }
 
-/// An `index == 0` base slice for `block_number`, as the sequencer sends it.
+/// [`base_slice`] for `block_number`, as a websocket text frame.
 fn slice_message(block_number: u64) -> Message {
     Message::text(serde_json::to_string(&base_slice(block_number)).expect("serialise slice"))
 }

@@ -415,6 +415,11 @@ impl Commitments {
     /// "this is one of ours" has to be established earlier (see
     /// [`Self::mark_promised`]).
     ///
+    /// **Landing starts the retention clock; it does not end tracking.** Until
+    /// [`SEAL_DEPTH`] persisted blocks bury `height`, a reorg can hand the
+    /// commitment back its nonce, so the record and the slot stay — see
+    /// [`Self::release_unless_committed`] and [`Self::sweep`].
+    ///
     /// Returns whether a record was updated, so the caller can count how many of
     /// a block's transactions were commitments.
     pub fn mark_committed(&self, hash: &TxHash, height: u64) -> bool {

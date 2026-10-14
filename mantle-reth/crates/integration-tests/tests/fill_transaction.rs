@@ -45,10 +45,8 @@ where
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
     config.network.discovery.discv5_port = Some(0);
     config.network.discovery.discv5_port_ipv6 = Some(0);
-    // An isolated single node has no peers to discover, and building the
-    // resolver reads the host's nameserver list: hickory 0.26 rejects a scoped
-    // link-local entry (`fe80::...%en0`), which some machines get from IPv6
-    // router advertisements, and the node then fails to launch.
+    // Off for the reason `launch_mantle_node!` spells out: building the DNS
+    // resolver can fail on the host's nameserver list and sink the launch.
     config.network.discovery.disable_dns_discovery = true;
 
     let db = create_test_rw_db_with_path(

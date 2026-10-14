@@ -45,9 +45,10 @@ pub struct ReplayOutcome {
 pub enum SubscriptionExit {
     /// The publisher is shutting down.
     Cancelled,
-    /// The subscriber fell far enough behind that slices were dropped, so it
-    /// is disconnected to reconnect and replay rather than served a stream
-    /// with holes in it.
+    /// The subscriber fell far enough behind that the channel dropped slices
+    /// for it. It is disconnected rather than served a stream with holes in
+    /// it, which is worse than no stream; its reconnect replays from the
+    /// archive, so this is recoverable. Carries the number of slices skipped.
     Lagged(u64),
     /// The subscriber went away.
     ClientClosed,
@@ -177,10 +178,9 @@ impl Subscription {
     /// Record how the subscription ended, before dropping the count.
     fn leave(self, exit: &SubscriptionExit) {
         if let SubscriptionExit::Lagged(skipped) = exit {
-            // The subscriber could not keep up and was cut off rather than
-            // handed a stream with holes in it. Its reconnect replays from the
-            // archive, so this is recoverable — but a rising rate says the
-            // channel is too small for the traffic, or the subscriber too slow.
+            // Recoverable on its own (see `SubscriptionExit::Lagged`), but a
+            // rising rate says the channel is too small for the traffic, or
+            // the subscriber too slow.
             metrics::counter!("flashblock.slow_subscriber_dropped_total").increment(1);
             metrics::counter!("flashblock.slices_missed_by_slow_subscribers_total")
                 .increment(*skipped);
@@ -275,9 +275,8 @@ pub(crate) async fn pump_live(
                         return SubscriptionExit::SendFailed;
                     }
                 }
-                // Dropping a lagging subscriber is deliberate: a stream with
-                // holes in it is worse than no stream, and reconnecting
-                // replays from the archive.
+                // Ending the subscription here is deliberate; see
+                // `SubscriptionExit::Lagged`.
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     return SubscriptionExit::Lagged(skipped);
                 }
@@ -376,9 +375,8 @@ mod tests {
         ring
     }
 
-    /// A slice published while the archive is still being replayed belongs to
-    /// neither phase on its own: too late for the snapshot, too early for the
-    /// live loop. The drain is what keeps it from being dropped.
+    /// What the drain phase of [`replay`] exists for: a slice published while
+    /// the archive is still being sent must still reach the subscriber.
     #[tokio::test]
     async fn catch_up_delivers_what_arrived_while_the_archive_was_replayed() {
         let (mut server, mut client) = socket_pair().await;
@@ -505,9 +503,8 @@ mod tests {
         assert!(!outcome.ahead_of_archive, "with nothing archived there is no head to be ahead of",);
     }
 
-    /// A subscriber slow enough to be dropped from the channel is disconnected
-    /// rather than served a stream with holes in it; reconnecting replays from
-    /// the archive.
+    /// Falling behind the channel must end the subscription, not silently skip
+    /// the dropped slices — see [`SubscriptionExit::Lagged`].
     #[tokio::test]
     async fn a_subscriber_that_falls_behind_the_channel_is_disconnected() {
         let (mut server, _client) = socket_pair().await;

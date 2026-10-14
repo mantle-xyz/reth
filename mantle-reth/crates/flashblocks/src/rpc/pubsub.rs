@@ -130,7 +130,8 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
         )
     }
 
-    /// Yields latest-flashblock transactions with at least one log matching the filter.
+    /// Yields latest-flashblock transactions the filter selects, as
+    /// [`FlashblocksSubscriptionKind::NewFlashblockTransactions`] defines it.
     fn new_flashblock_transactions_filtered_stream(
         flashblocks_state: Arc<FB>,
         filter: Filter,

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// A full transaction object with its associated logs and receipt-equivalent fields.
 ///
-/// Returned by `newFlashblockTransactions` when `full = true` or a log filter is given.
+/// The full-object item of [`FlashblocksSubscriptionKind::NewFlashblockTransactions`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionWithLogs {

@@ -440,8 +440,6 @@ async fn ticks_keep_coming_while_the_pool_arm_has_work() {
 /// slices would describe a block the network already has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_derivation_build_publishes_nothing() {
-    // The address comes from the key, not the chain id, so no id is needed
-    // here — and the harness has not been launched yet to tell us one.
     let sender = Wallet::default().inner.address();
     let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
     let (mut node, _http, wallet, chain_id, fb_addr) =
@@ -523,8 +521,6 @@ async fn the_opening_slice_predates_every_pool_transaction() {
 /// that block contains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_slice_is_published_after_the_payload_is_resolved() {
-    // The address comes from the key, not the chain id, so no id is needed
-    // here — and the harness has not been launched yet to tell us one.
     let sender = Wallet::default().inner.address();
     let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
     let (mut node, _http, wallet, chain_id, fb_addr) =
@@ -563,8 +559,6 @@ async fn no_slice_is_published_after_the_payload_is_resolved() {
 /// which node you asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_producers_own_rpc_does_not_answer_from_slices() {
-    // The address comes from the key, not the chain id, so no id is needed
-    // here — and the harness has not been launched yet to tell us one.
     let sender = Wallet::default().inner.address();
     let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
     let (mut node, http, wallet, chain_id, fb_addr) =

@@ -247,8 +247,8 @@ mod tests {
         br#"{"index":0,"metadata":{"block_number":1,"receipts":{}}}"#.to_vec()
     }
 
-    /// Dropping a ping for a filtered client makes it miss its pong deadline
-    /// and get disconnected, so every control frame must bypass the filter.
+    /// Locks the control-frame bypass in [`should_forward`]: a filtered client
+    /// must still receive every ping, pong and close.
     #[test]
     fn control_frames_bypass_the_filter() {
         let filter = FilterType::new_addresses(vec![WATCHED.to_owned()]);
