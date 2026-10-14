@@ -384,7 +384,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-evm"
 version = "0.32.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -401,7 +401,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-hardforks"
 version = "0.5.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-chains",
  "alloy-hardforks",
@@ -5829,7 +5829,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "op-alloy"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "op-alloy-consensus",
  "op-alloy-network",
@@ -5841,7 +5841,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-consensus"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5871,7 +5871,7 @@ checksum = "a79f352fc3893dcd670172e615afef993a41798a1d3fc0db88a3e60ef2e70ecc"
 [[package]]
 name = "op-alloy-network"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -5884,7 +5884,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-provider"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -5898,7 +5898,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-jsonrpsee"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-primitives",
  "jsonrpsee",
@@ -5907,7 +5907,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5928,7 +5928,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types-engine"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6007,7 +6007,7 @@ dependencies = [
 [[package]]
 name = "op-revm"
 version = "20.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#c83e535a091f18b1299ea1041d1a472e8f7e5297"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=dev%2Fmantle-v1.6.3#4a4f0ec8c1b641e3f59c9d6174c860df30c6e82b"
 dependencies = [
  "alloy-sol-types",
  "auto_impl",
