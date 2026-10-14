@@ -441,7 +441,7 @@ mod tests {
         Address, B256, LogData, bytes,
         map::{AddressMap, B256Map, HashMap},
     };
-    use op_alloy_consensus::{SDMGasEntry, build_post_exec_tx};
+    use op_alloy_consensus::{SDMGasEntry, TxDeposit, build_post_exec_tx};
     use op_revm::OpSpecId;
     use reth_chainspec::ChainSpec;
     use reth_evm::execute::ProviderError;
@@ -510,13 +510,16 @@ mod tests {
         SealedBlock::new_unhashed(Block::<OpTransactionSigned> {
             header: Header { number, timestamp, ..Default::default() },
             body: BlockBody {
-                transactions: vec![OpTransactionSigned::PostExec(
-                    build_post_exec_tx(
-                        tx_block_number,
-                        vec![SDMGasEntry { index: 0, gas_refund: 1 }],
-                    )
-                    .seal_slow(),
-                )],
+                transactions: vec![
+                    OpTransactionSigned::Deposit(TxDeposit::default().seal_slow()),
+                    OpTransactionSigned::PostExec(
+                        build_post_exec_tx(
+                            tx_block_number,
+                            vec![SDMGasEntry { index: 0, gas_refund: 1 }],
+                        )
+                        .seal_slow(),
+                    ),
+                ],
                 ..Default::default()
             },
         })
