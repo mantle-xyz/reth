@@ -22,8 +22,9 @@ use crate::flashblocks::{Reservation, SlicePacer, SliceSchedule};
 /// mapping is unit-testable without a real payload build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PoolQuotaSchedule {
-    /// Time-until-slot-deadline used for the derivation, clamped to
-    /// `[sweep_interval, slot_duration]`.
+    /// Time-until-slot-deadline used for the derivation, capped at
+    /// `slot_duration`. No lower bound here — the caller passes the
+    /// already-saturated value.
     pub(super) time_drift: Duration,
     /// Number of quota ticks fitting in `time_drift` (rounded up so a
     /// residual remainder gets its own tick). Always ≥ 1.

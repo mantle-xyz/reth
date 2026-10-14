@@ -84,7 +84,7 @@ type LiveBuild = (JobCancel, Arc<OnceLock<B256>>);
 /// attributes and [`OpPayloadBuilderAttributes<N::SignedTx>`] (builder
 /// variant) for internal block building. This mirrors upstream's
 /// `OpPayloadBuilder::try_build` / `convert_build_args` split — see
-/// `op-reth/crates/payload/src/builder.rs:344`. A generic `Attrs`
+/// `op-reth/crates/payload/src/builder.rs`. A generic `Attrs`
 /// parameter cannot express the wrapper-unwrap step
 /// (`OpPayloadAttrs.0 → OpPayloadAttributes → from_rpc_attrs`)
 /// through the trait system cleanly; going OP-specific is the path
@@ -201,7 +201,7 @@ where
         // (`OpPayloadBuilderAttributes<N::SignedTx>`), so we unwrap
         // `rpc_attrs.0 → OpPayloadAttributes` and feed it through
         // `from_rpc_attrs` — same shape as upstream's private
-        // `convert_build_args` (op-reth payload/src/builder.rs:344).
+        // `convert_build_args` (op-reth `payload/src/builder.rs`).
         let attributes_for_job = rpc_attrs.clone();
         let builder_attrs =
             OpPayloadBuilderAttributes::<TxTy<N>>::from_rpc_attrs(parent_hash, id, rpc_attrs.0)

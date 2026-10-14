@@ -156,9 +156,9 @@ impl FilterType {
     /// `OpReceipt` serialises flat — `{"type", "status", "cumulativeGasUsed",
     /// "logs"}` — so `logs` sits directly on the receipt. Base's `BaseReceipt`
     /// is an externally tagged enum, putting it one level down under the
-    /// variant name (`{"Deposit": {"logs": ...}}`). Both upstreams are accepted:
-    /// reading only the nested form would make every filter silently match
-    /// nothing against a Mantle payload.
+    /// variant name (`{"Deposit": {"logs": ...}}`). Both encodings are
+    /// accepted: reading only the nested form would make every filter silently
+    /// match nothing against a Mantle payload.
     fn receipt_logs(json: &Value) -> impl Iterator<Item = &Value> {
         json.get("metadata")
             .and_then(|m| m.get("receipts"))
@@ -448,11 +448,11 @@ mod tests {
 
 /// Filtering against a payload built from the real Mantle wire types.
 ///
-/// The fixtures in [`tests`] above are Base-shaped JSON, kept because a
-/// Base-derived upstream (rollup-boost) may still emit them. These lock the
-/// shape this proxy will actually see from a Mantle producer: `OpReceipt`
-/// serialises flat, so `logs` sits directly on the receipt rather than one
-/// level down under a variant name.
+/// The fixtures in [`tests`] above are Base-shaped JSON, which keeps the nested
+/// branch of [`FilterType::receipt_logs`] covered. A Mantle sequencer never
+/// emits that shape. These lock the one it does: `OpReceipt` serialises flat, so
+/// `logs` sits directly on the receipt rather than one level down under a
+/// variant name.
 ///
 /// **Producer-side caveat**: these pass because the fixtures below populate
 /// `metadata.receipts` by hand. The Mantle producer does not — `build_flashblock`

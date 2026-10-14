@@ -1,4 +1,4 @@
-//! Reconnect and resume behaviour of [`FlashblocksSubscriber`] (E1, E4).
+//! Reconnect and resume behaviour of [`FlashblocksSubscriber`].
 //!
 //! A stub websocket server stands in for the sequencer: it records the request
 //! URI of every connection, replays a scripted set of slices, then closes. No

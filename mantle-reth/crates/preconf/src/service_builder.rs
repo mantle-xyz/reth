@@ -6,7 +6,7 @@
 //! [`Arc<PreconfTxSet>`], and a mandatory [`Arc<PreconfJournal>`] — and
 //! exposes typed factories for the per-task handlers that consume them:
 //!
-//! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical- state notifications and
+//! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical-state notifications and
 //!   forward the fifo past sealed block nonces.
 //! - [`PreconfServiceBuilder::rpc_handler`] — to back the local `eth_sendRawTransactionWithPreconf`
 //!   entry on the sequencer node.
@@ -24,9 +24,9 @@
 //! keeps the service builder free of reth `TaskExecutor` and lifecycle
 //! plumbing.
 //!
-//! Pool integration lives on [`MantlePoolBuilder::with_preconf`](crate)
-//! and is driven directly from the cli crate's component-builder code —
-//! it consumes the same `cfg` and `fifo` handles via
+//! Pool integration lives on `MantlePoolBuilder::with_preconf` (in the
+//! `mantle-reth-cli` crate) and is driven directly from the cli crate's
+//! component-builder code — it consumes the same `cfg` and `fifo` handles via
 //! [`PreconfServiceBuilder::cfg`] / [`PreconfServiceBuilder::fifo`].
 
 use std::sync::{Arc, OnceLock};
@@ -79,9 +79,11 @@ pub enum PreconfStartError {}
 #[derive(Debug)]
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
-    /// Owns the allowlists and the per-tx commitment records. Built
-    /// here so every consumer — admission, payload builder, canon handler —
-    /// shares one instance; two classifiers would mean two answers.
+    /// Owns the preconf allowlists — the per-tx commitment records live in
+    /// [`Commitments`](crate::commitments::Commitments), owned by the fifo and
+    /// reached through `fifo.claims()`. Built here so every consumer — the
+    /// whitelist watcher, admission, the payload builder — shares one
+    /// instance; two classifiers would mean two answers.
     classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
     /// Commitment journal — always present. Opened at construction from
@@ -208,9 +210,10 @@ impl PreconfServiceBuilder {
     /// TxHashRef` is satisfied automatically.
     ///
     /// `Pr` must also be a `BlockNumReader`: the handler publishes
-    /// `last_block_number()` (the **persisted** tip) to the classifier each
-    /// notification, which is the ruler the retention period is measured
-    /// against — see `classifier::SEAL_DEPTH`.
+    /// `last_block_number()` (the **persisted** tip) to `Commitments` via
+    /// `fifo.claims().observe_persisted` each notification, which is the ruler
+    /// the retention period is measured against — see
+    /// `commitments::SEAL_DEPTH`.
     pub fn canon_handler<Pr, N>(&self, provider: Pr) -> PreconfCanonHandler<Pr, N>
     where
         Pr: CanonStateSubscriptions<Primitives = N> + reth_storage_api::BlockNumReader + 'static,
@@ -537,7 +540,7 @@ mod tests {
     /// A restore that cannot re-admit an entry gives the commitment up, and the
     /// journal line goes with it — `start`'s prune runs *after* the replay pass,
     /// keyed on the records that pass established, so there is no window in which
-    /// the file and the classifier disagree.
+    /// the file and the commitment records disagree.
     #[tokio::test]
     async fn start_prunes_an_entry_whose_commitment_cannot_be_honoured() {
         use crate::journal::{JournalEntry, RestoreSkip, RestoredEnvelope};

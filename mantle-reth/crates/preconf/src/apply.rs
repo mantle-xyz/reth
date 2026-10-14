@@ -170,7 +170,7 @@ fn classify(error: &dyn alloy_evm::InvalidTxError, fees: FeeFacts) -> BuilderRej
 ///
 /// The supplied transaction is committed to the builder's running state on
 /// success (`BlockBuilder::execute_transaction_with_result_closure` always
-/// commits — see reth-evm `crates/evm/evm/src/execute.rs:334-344`).
+/// commits — see reth-evm `crates/evm/evm/src/execute.rs`).
 ///
 /// Errors ([`ApplyError`]):
 /// - [`ApplyError::Rejected`] — the EVM rejected the transaction as invalid

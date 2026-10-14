@@ -126,9 +126,9 @@ where
 // receiver has already been dropped alongside the job (see
 // `payload_job_generator.rs::new_payload_job` for the send-fail log).
 //
-// Idempotent with respect to `resolve_kind`'s own `cancel.signal()` —
-// `JobCancel::signal` is a single `watch::Sender::send(true)` and a
-// second call is a no-op. It is also complementary to the generator's
+// Idempotent with respect to `resolve_kind`'s own `cancel.resolve()` — both
+// write through one `watch::Sender<Option<CancelReason>>`, and the first reason
+// recorded is the one that sticks. It is also complementary to the generator's
 // `ensure_only_one_payload` (see `payload_job_generator.rs`), which cancels the
 // *previous* job when a *new* one is spawned: Drop covers the eviction path,
 // `ensure_only_one_payload` the supersede path; both funnel to the same signal.
@@ -343,7 +343,7 @@ mod tests {
 
     /// Drop after cancel has already been signalled (either by
     /// `resolve_kind` or an external caller) is a no-op —
-    /// `JobCancel::signal` is idempotent. Locks the invariant so the
+    /// `JobCancel::abandon` is idempotent. Locks the invariant so the
     /// Drop-triggered cancel can't accidentally regress state when it
     /// races with a resolve_kind-triggered cancel.
     #[tokio::test]

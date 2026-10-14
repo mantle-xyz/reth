@@ -311,9 +311,9 @@ where
     // "committed to builder state ⇒ wire not Timeout".
     //
     // **Absent counts as changed.** `lock_for_apply` awaits outside `inner`, so
-    // `forward_all` can take the entry in that gap and leave us holding a mutex
-    // that belongs to nothing. Treating `None` as unchanged would apply the
-    // pre-gate snapshot — the one case this lock exists to prevent.
+    // `complete_failure` can take the entry in that gap and leave us holding a
+    // mutex that belongs to nothing. Treating `None` as unchanged would apply
+    // the pre-gate snapshot — the one case this lock exists to prevent.
     match fifo.find_by_hash(&hash).await {
         Some(re_entry) if re_entry.status == PreconfStatus::Waiting => {}
         other => {
@@ -544,17 +544,14 @@ mod tests {
         assert_eq!(st.sender_blocked_at(&s, 4), Some(BlockKind::Reject));
     }
 
-    /// Test apply closure that fabricates an always-success receipt using
-    /// `tx.gas_limit()` as the reported `gas_used`, so the dispatch state
-    /// machine can be exercised without standing up a real EVM.
     /// The entry can go while dispatch is between "I have the lock's handle"
     /// and "I have the lock".
     ///
     /// `lock_for_apply` clones the `Arc<Mutex<_>>` under `inner`, drops `inner`,
     /// and only then awaits — it has to, or waiters would hold the queue's lock.
-    /// `forward_all` takes `inner` in that gap and removes the entry without
-    /// consulting `apply_lock`, so what dispatch finally acquires is a mutex
-    /// belonging to nothing.
+    /// `complete_failure` takes `inner` in that gap and removes the entry
+    /// without consulting `apply_lock`, so what dispatch finally acquires is a
+    /// mutex belonging to nothing.
     ///
     /// The re-read under the lock must therefore treat **absent** as a stop,
     /// not as "nothing has changed". Reading it the other way applies the
@@ -681,6 +678,9 @@ mod tests {
         );
     }
 
+    /// Test apply closure that fabricates an always-success receipt using
+    /// `tx.gas_limit()` as the reported `gas_used`, so the dispatch state
+    /// machine can be exercised without standing up a real EVM.
     fn synthetic_ok(
         tx: Arc<TxEnvelope>,
         hash: TxHash,
@@ -1516,7 +1516,7 @@ mod tests {
     /// `apply_one_preconf` is inside `apply_fn`. The per-entry
     /// `apply_lock` acquired by dispatch before `apply_fn` must block
     /// the RPC's `lock_for_apply` acquisition until dispatch finishes
-    /// `mark_succeeded` + `resp.send(...)`. When the RPC finally
+    /// `begin_success` + `SuccessTicket::send`. When the RPC finally
     /// acquires the lock, fifo status is `Success` and `resp_rx` has
     /// the receipt queued — so `try_recv` returns it, and the client
     /// sees `Success`, not `Timeout`.
@@ -1585,7 +1585,7 @@ mod tests {
 
         // Simulate the RPC-side deadline branch: acquire apply_lock.
         // Dispatch is inside apply_fn → this must block until dispatch
-        // finishes mark_succeeded + send + drop guard.
+        // finishes begin_success + send + drop guard.
         let acquire_start = std::time::Instant::now();
         let guard = fifo.lock_for_apply(&hash).await;
         let acquire_duration = acquire_start.elapsed();
@@ -1600,13 +1600,13 @@ mod tests {
         );
 
         // Under the lock, fifo status must be final and the receipt
-        // must be queued in resp_rx (dispatch's `resp.send(...)`
+        // must be queued in resp_rx (dispatch's `SuccessTicket::send`
         // completed inside the critical section).
         let final_status = fifo.find_by_hash(&hash).await.map(|e| e.status);
         assert_eq!(
             final_status,
             Some(PreconfStatus::Success),
-            "dispatch must have finished mark_succeeded before releasing apply_lock",
+            "dispatch must have finished begin_success before releasing apply_lock",
         );
 
         match resp_rx.try_recv() {

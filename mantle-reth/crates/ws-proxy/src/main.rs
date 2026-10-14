@@ -312,8 +312,8 @@ mod tests {
         );
     }
 
-    /// `--upstream-ws` is the one argument with no useful default: without it
-    /// the proxy would start and serve an empty stream forever.
+    /// One `--upstream-ws` value may carry several comma-separated URIs, which
+    /// `value_delimiter = ','` splits into one entry each.
     #[test]
     fn upstream_ws_accepts_a_comma_separated_list() {
         let args =

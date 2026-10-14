@@ -9,7 +9,8 @@
 //! per-client address/topic filtering.
 //!
 //! Ported from Base's `websocket-proxy`. The payload is treated as opaque JSON
-//! except in [`filter`], which reads `metadata.receipts` to evaluate a
+//! except in [`FilterType`], which reads `metadata.new_account_balances`, the
+//! logs under `metadata.receipts` and `diff.transactions` to evaluate a
 //! subscriber's address and topic filters.
 
 /// The frame type carried on the broadcast channel between the upstream

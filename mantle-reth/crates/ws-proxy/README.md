@@ -14,10 +14,16 @@ Ported from Base's `websocket-proxy`. It is a standalone binary — it is not
 linked into `op-reth` and does not run inside the node.
 
 ```
-producer (op-rbuilder)  ──→  rollup-boost  ──→  mantle-ws-proxy  ──→  N subscribers
-                                                (this crate)          RPC nodes,
-                                                                      third parties
+sequencer (mantle-reth)  ──→  mantle-ws-proxy  ──→  N subscribers
+                              (this crate)          RPC nodes,
+                                                    third parties
 ```
+
+Mantle builds slices inside the sequencer rather than in a sidecar: the
+publisher is `MantleFlashblocksPublisher` in `mantle-reth-preconf`, enabled with
+`--flashblocks.enable` and listening on `--flashblocks.port` (1111 by default).
+Base's lineage puts a separate builder and a rollup-boost hop ahead of the
+proxy; Mantle deploys neither, so the upstream here is the sequencer itself.
 
 ## What it adds over plain rebroadcasting
 
@@ -36,7 +42,7 @@ equivalent uppercase environment variable.
 
 ```bash
 mantle-ws-proxy \
-  --upstream-ws ws://mantle-rollup-boost:1111 \
+  --upstream-ws ws://mantle-sequencer:1111 \
   --listen-addr 0.0.0.0:8545 \
   --metrics-addr 0.0.0.0:9000
 ```
@@ -198,8 +204,8 @@ Useful first checks:
 
 ## Building and testing
 
-The binary is not in the workspace's default-run set, so `-p` is required —
-without it `cargo` reports `no bin target named mantle-ws-proxy`.
+The binary's package is not in the workspace's `default-members`, so `-p` is
+required — without it `cargo` reports `no bin target named mantle-ws-proxy`.
 
 ```bash
 # Build the binary; lands in target/release/mantle-ws-proxy

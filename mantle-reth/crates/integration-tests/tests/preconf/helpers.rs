@@ -399,8 +399,8 @@ pub fn with_sentinel_whitelist(
     Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis))
 }
 
-/// Fluent builder for `PreconfConfig` inside tests. Every knob has a
-/// safe default; individual test cases tweak only what they exercise.
+/// Fluent builder for the [`PreconfSetup`] a test launches with. Every knob has
+/// a safe default; individual test cases tweak only what they exercise.
 ///
 /// Decoupled from `PreconfConfig::default` so a future production
 /// default change (e.g. `preconf_timeout` bumped fleet-wide) does not
@@ -551,15 +551,12 @@ impl PreconfCfgBuilder {
         self
     }
 
-    /// Materialise the config plus the allowlists to seed. Panics on invariant
-    /// violations because these are test-controlled inputs — a panic is more
-    /// useful than threading a `Result` through every launch call site.
+    /// Materialise the config plus the allowlists to seed.
     ///
     /// Returns a [`PreconfSetup`] rather than a bare `PreconfConfig` because the
-    /// allowlists no longer live on the config: they belong to the
-    /// `PreconfClassifier`, which only exists once the `PreconfServiceBuilder`
-    /// has been constructed. `launch_preconf_node!` does that and then calls
-    /// [`PreconfSetup::seed`].
+    /// allowlists no longer live on the config: `launch_preconf_node!`
+    /// destructures this struct and writes them into genesis through
+    /// [`with_sentinel_whitelist`], before the chain spec is finalised.
     pub fn build(self) -> PreconfSetup {
         let cfg = PreconfConfig {
             enabled: true,

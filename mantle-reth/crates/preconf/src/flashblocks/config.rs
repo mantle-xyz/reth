@@ -139,15 +139,17 @@ pub enum FlashblockProducerConfigError {
     /// does — the gas refunds the entries describe are applied by the
     /// surrounding post-exec machinery, not by executing this transaction.
     /// What the consumer skips are the two payload checks the canonical
-    /// executor additionally runs against it: `verify_post_exec_tx`, which
+    /// executor additionally runs against it, both in the `alloy-op-evm`
+    /// dependency (`block/mod.rs`): `PostExecState::verify_post_exec_tx`, which
     /// matches the transaction's payload against the entries the executor
-    /// accumulated, and `verifier_post_exec_refund_for_tx`, which rejects a
-    /// Verify entry that targets the post-exec transaction's own index. The
-    /// consumer's replayed pending/preconf overlay does not reproduce that
-    /// surrounding machinery, so it omits the refunds until the next canonical
-    /// block resynchronises state — a transient pending-state inaccuracy, not
-    /// a chain split. The 1.6.3 wire protocol has an out-of-band field for the
-    /// post-exec transaction that no producer fills yet.
+    /// accumulated, and `OpBlockExecutor::verifier_post_exec_refund_for_tx`,
+    /// which rejects a payload entry that targets the post-exec transaction's
+    /// own index. The consumer's replayed pending/preconf overlay does not
+    /// reproduce that surrounding machinery, so it omits the refunds until the
+    /// next canonical block resynchronises state — a transient pending-state
+    /// inaccuracy, not a chain split. The 1.6.3 wire protocol has an
+    /// out-of-band field for the post-exec transaction that no producer fills
+    /// yet.
     ///
     /// This only gates the boot-time flag (`--rollup.operator-sdm-opt-in`):
     /// `admin_setOperatorSdmOptIn` can still flip SDM on at runtime after a

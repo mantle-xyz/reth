@@ -50,24 +50,26 @@ reth-evm.workspace = true
 # alloy-evm — for the TxResult trait + ExecutionResult re-exports
 alloy-evm.workspace = true
 
-# reth-transaction-pool — for the TransactionValidator trait wrapped by
-# `PreconfAwareValidator` and the TransactionPool trait consumed by
-# `PreconfPoolListener`
+# reth-transaction-pool — for the `TransactionValidator` trait wrapped by
+# `admission.rs`, the `PoolConfig` it reads the queue's capacity from, and the
+# `TransactionPoolExt` bound on the payload service builder and the
+# flashblocks slice-boundary pool maintenance
 reth-transaction-pool.workspace = true
 
 # futures — `StreamExt::next` used to drive
-# `TransactionPool::new_pending_pool_transactions_listener` (returns a
-# Stream rather than an mpsc::Receiver)
+# `CanonStateSubscriptions::canonical_state_stream` (`canon_handler.rs`,
+# `whitelist.rs`): it returns a Stream rather than an mpsc::Receiver
 futures.workspace = true
 
 # reth-optimism-txpool — for `OpPooledTx` trait bound on the wrapped tx type
 reth-optimism-txpool.workspace = true
 
-# reth-primitives-traits — for SealedBlock used in `on_new_head_block`
+# reth-primitives-traits — for `NodePrimitives` / `HeaderTy` / `TxTy` /
+# `SignedTransaction` / `SealedBlock`
 reth-primitives-traits.workspace = true
 
-# OP-stack consensus types — listener bridges `OpTxEnvelope` to alloy
-# `TxEnvelope` and drops Deposit / PostExec variants
+# OP-stack consensus types — `admission::op_envelope_to_alloy` bridges
+# `OpTxEnvelope` to alloy `TxEnvelope` and drops Deposit / PostExec variants
 op-alloy-consensus.workspace = true
 # `OpFlashblockPayloadBase` / `OpFlashblockPayloadDelta` — the halves of the
 # wire payload reused verbatim from upstream.
@@ -97,7 +99,7 @@ reth-payload-builder.workspace = true
 reth-payload-builder-primitives.workspace = true
 reth-payload-primitives.workspace = true
 
-# P5f fork dependencies — mantle's preconf payload builder is a fork of
+# Fork dependencies — mantle's preconf payload builder is a fork of
 # `OpPayloadBuilder`.
 # We import upstream's `OpPayloadBuilderCtx` / `ExecutionInfo` /
 # `OpBuiltPayload` / `OpPayloadBuilderAttributes` directly, only the
@@ -168,7 +170,7 @@ tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread
 tempfile.workspace = true
 proptest.workspace = true
 
-# P6 e2e harness — in-process EVM tests for build_payload
+# e2e harness — in-process EVM tests for build_payload
 # (`tests/fork_builder.rs`).
 reth-provider = { workspace = true, features = ["test-utils"] }
 # `testing_pool()` + `MockTransaction` — the slice-boundary pool maintenance

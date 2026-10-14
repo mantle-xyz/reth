@@ -47,7 +47,7 @@ pub struct JobCancel {
     tx: Arc<watch::Sender<Option<CancelReason>>>,
     rx: watch::Receiver<Option<CancelReason>>,
     /// Serializes cancelling against work that must not be cut in half — see
-    /// [`Self::unless_cancelled`].
+    /// [`Self::unless_abandoned`].
     gate: Arc<Mutex<()>>,
 }
 
@@ -82,7 +82,7 @@ impl JobCancel {
     /// and the job is dropped straight after — and what the build has to know
     /// is what stopped it, not what happened to the handle afterwards.
     ///
-    /// Waits for any [`Self::unless_cancelled`] work already in flight, so a
+    /// Waits for any [`Self::unless_abandoned`] work already in flight, so a
     /// cancel cannot land in the middle of one. Whoever got past the check
     /// finishes first, then this takes effect.
     fn signal_with(&self, reason: CancelReason) {

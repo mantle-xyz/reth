@@ -119,14 +119,15 @@ async fn a_slice_for_an_already_canonical_block_is_skipped() {
 /// A slice carrying an SDM post-exec transaction replays it as a no-op.
 ///
 /// The canonical block executor recognises `POST_EXEC_TX_TYPE_ID` and returns
-/// before handing the transaction to the EVM. The v2.4.2 line gives replay paths
-/// the same treatment: `transact_raw` short-circuits the type and synthesizes the
-/// consensus-defined no-op result, so the transaction joins the overlay instead of
-/// failing pre-validation and taking the whole slice — L1-attributes deposit
-/// included — with it.
+/// before handing the transaction to the EVM. op-reth v2.4.2 gives replay paths
+/// the same treatment: `alloy_op_evm`'s `transact_raw` short-circuits the type and
+/// synthesizes the consensus-defined no-op result, so the transaction joins the
+/// overlay — landing in the `OpTxType::PostExec` arm of
+/// `mantle-reth/crates/flashblocks/src/receipt_builder.rs` — instead of failing
+/// pre-validation and taking the whole slice, L1-attributes deposit included, with it.
 ///
 /// This still only covers a post-exec transaction appended to `transactions`.
-/// The 1.6.3 consumer protocol carries it out of band in the slice's
+/// The mantle v1.6.3 consumer protocol carries it out of band in the slice's
 /// `post_exec_tx` field with replace-not-append semantics, and our producer does
 /// not yet do that — so producing flashblocks with SDM enabled remains an
 /// untested combination. `FlashblockProducerConfig::validate` refuses it at

@@ -210,7 +210,7 @@ pub struct AdmitRequest {
     /// being built on top of it — see [`PreconfTxSet::next_nonce`].
     pub chain_nonce: u64,
     /// The sender's on-chain code hash, from the validator's outcome. Neither
-    /// absent nor `KECCAK_EMPTY` means it carries an EIP-7702 delegation.
+    /// absent nor `KECCAK256_EMPTY` means it carries an EIP-7702 delegation.
     pub bytecode_hash: Option<B256>,
 }
 
@@ -251,7 +251,7 @@ struct PreconfTxSetInner {
     /// answers each by scanning every entry in the fifo.
     by_sender: HashMap<Address, BTreeMap<u64, TxHash>>,
 
-    /// The registry, for releasing a record from [`Self::drop_hash`].
+    /// The registry, for releasing a record from [`Self::unindex`].
     claims: Arc<Commitments>,
 }
 
@@ -263,12 +263,8 @@ impl PreconfTxSetInner {
     /// Removes a hash from all indices (`entries` / `by_sender` / `order`).
     /// Returns the evicted entry if one existed.
     ///
-    /// Fast path uses `entry.from + entry.nonce` to key into `by_sender`
-    /// directly. Slow path (below) is a defensive fallback: no known caller
-    /// path should ever hit it — all normal eviction routes populate
-    /// `entries[hash]` before calling `drop_hash`. It exists purely to
-    /// recover from unexpected torn state (e.g. a future bug that partially
-    /// evicts an entry) so the "clean all indices" contract stays honest.
+    /// Everything except `order` happens in [`Self::unindex`], including the
+    /// defensive fallback for torn index state.
     fn drop_hash(&mut self, hash: &TxHash) -> Option<TxEntry> {
         let entry = self.unindex(hash);
         if let Some(pos) = self.order.iter().position(|h| h == hash) {
@@ -360,7 +356,7 @@ impl PreconfTxSetInner {
         // grabbing a tx that still has a live commitment, and on most removal
         // paths there no longer is one.
         //
-        // `forward` is a known gap — its predicate is "the sender's nonce moved
+        // `forward_all` is a known gap — its predicate is "the sender's nonce moved
         // past this entry", which neither establishes that *this* tx landed nor
         // that the landing is irrevocable, so the commitment can still be live
         // here. Do not read this callback as proof that it is over.
@@ -522,7 +518,7 @@ pub struct PreconfTxSet {
     ///
     /// Owned here because every removal path already runs under this type.
     /// `PreconfTxSetInner` holds the same `Arc` and releases records straight
-    /// from `drop_hash`, where a registered callback used to go.
+    /// from `unindex`.
     claims: Arc<Commitments>,
 }
 
@@ -1305,8 +1301,10 @@ impl PreconfTxSet {
     ///
     /// A `Success` entry that still exists in the fifo means "applied
     /// to some in-flight builder, but that builder's block never made
-    /// it to canon" — `forward()` would have dropped the entry
-    /// entirely on canon commit. On a new payload job start, such
+    /// it to canon" — had it landed, the opening `forward_all` sweep of
+    /// this same payload job (`sync_fifo_forward_to_head` in
+    /// `payload_builder`, which runs before the carryover) would have
+    /// dropped the entry entirely. On a new payload job start, such
     /// entries represent commitments the client was already promised;
     /// the mantle preconf SLA ("receipt returned → tx must land on
     /// chain") requires re-applying them to the new build.
@@ -1341,7 +1339,7 @@ impl PreconfTxSet {
         // without touching `preconf.tx.commitment_broken_total` while each round
         // bumps `preconf.tx.success_total` — a stuck commitment reading as
         // throughput. Steady state is ~0 (a canonical block advances the nonce
-        // and `forward` drops the entry first); a rising rate means blocks are
+        // and `forward_all` drops the entry first); a rising rate means blocks are
         // built and not adopted, so pair it with
         // `preconf.build.watchdog_cancel_total`.
         metrics::counter!("preconf.tx.replay_round_total").increment(1);
@@ -2209,7 +2207,7 @@ mod tests {
     }
 
     /// Every fifo removal path must release the commitment record, because
-    /// `drop_hash` is the single point they all converge on. Asserted through
+    /// `unindex` is the single point they all converge on. Asserted through
     /// two different public entry points so the release is proven to sit at that
     /// convergence point rather than on one route.
     #[tokio::test]
@@ -2232,7 +2230,7 @@ mod tests {
         assert!(!set.claims().is_tracked(&h(2)), "forward_all must release it too");
     }
 
-    /// A removal with no record to release must stay valid — `drop_hash` runs
+    /// A removal with no record to release must stay valid — `unindex` runs
     /// on every removal, including for transactions that never got a receipt.
     #[tokio::test]
     async fn removal_without_a_record_is_a_noop() {
@@ -2639,10 +2637,10 @@ mod tests {
         assert_eq!(err, MarkError::NotFound);
     }
 
-    // ============ forward ============
+    // ============ forward_all ============
 
     #[tokio::test]
-    async fn forward_drops_older_nonces_only() {
+    async fn forward_all_drops_older_nonces_only() {
         let set = PreconfTxSet::new(16);
         let t5 = make_tx(5, 5);
         let t6 = make_tx(6, 6);

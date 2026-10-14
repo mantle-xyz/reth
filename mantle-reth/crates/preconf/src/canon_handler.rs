@@ -4,23 +4,24 @@
 //! and drives best-effort cleanups on committed / reverted chain events:
 //!
 //! - **Committed chain**: publishes the persisted block height (the ruler the retention period is
-//!   measured against — see `classifier::SEAL_DEPTH`) and records every hash that has a promise
+//!   measured against — see `commitments::SEAL_DEPTH`) and records every hash that has a promise
 //!   record as committed at its block's height.
 //!
-//!   There is no sweep of ended commitments to do here: one that cannot be honoured is removed
-//!   when it ends, not parked in a terminal state for a later pass to find.
+//!   `Commitments::sweep` then runs once per notification, dropping records that are out of reorg
+//!   reach and have no fifo entry left. It is a record-cache sweep, not a pass over commitments
+//!   parked in a terminal state: one that cannot be honoured is removed when it ends.
 //!
 //!   The per-sender nonce-frontier `forward()` deliberately does **not** run here: it runs at
 //!   `PayloadJob` start (`builder::payload_builder::sync_fifo_forward_to_head`), because the async
 //!   fanout of `CanonStateNotification` races the next FCU — a new job could otherwise observe a
 //!   stale `Success` entry and replay it via `reset_success_to_waiting`.
-//! - **Reverted chain**: `classifier.uncommit` withdraws the "seen on chain" observation for every
-//!   reverted transaction, **keeping the promise record and the `(sender, nonce)` slot**, and every
-//!   commitment among them is pushed back into the queue as a replay. The commitment is live again
-//!   and must still refuse a same-nonce replacement. Its return value is the `reorg_drift` signal.
-//!   Re-injection happens here: each commitment the reverted chain carried is pushed back with
-//!   `PreconfSource::Replay`. The client-observed `block_height` may drift for reorged commitments;
-//!   op-geth has the same behavior.
+//! - **Reverted chain**: `fifo.claims().uncommit` withdraws the "seen on chain" observation for
+//!   every reverted transaction, **keeping the promise record and the `(sender, nonce)` slot**, and
+//!   every commitment among them is pushed back into the queue as a replay. The commitment is live
+//!   again and must still refuse a same-nonce replacement. Its return value is the `reorg_drift`
+//!   signal. Re-injection happens here: each commitment the reverted chain carried is pushed back
+//!   with `PreconfSource::Replay`. The client-observed `block_height` may drift for reorged
+//!   commitments; op-geth has the same behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
 //! then spawned as a `spawn_critical_task` on the reth task executor.
@@ -73,9 +74,9 @@ where
 {
     /// Construct a handler bound to `provider`'s canonical-state stream.
     ///
-    /// Takes no journal handle: `mark_committed` on the classifier owns the
-    /// retention decision, and the reorg-drift signal is `uncommit`'s return
-    /// value.
+    /// Takes no journal handle: `mark_committed` on `Commitments` (reached
+    /// through `fifo.claims()`) owns the retention decision, and the
+    /// reorg-drift signal is `uncommit`'s return value.
     pub const fn new(provider: Pr, fifo: Arc<PreconfTxSet>) -> Self {
         Self { provider, fifo, _n: PhantomData }
     }
@@ -93,7 +94,7 @@ where
             }
 
             // Committed chain — record every promised hash as committed at its
-            // block height on the classifier. The owned-clone iter
+            // block height on `Commitments` (`fifo.claims()`). The owned-clone iter
             // (`clone_transactions_recovered`) is needed because the borrowed
             // `&Tx` variants require `&Tx: alloy_consensus::Transaction`, gated
             // by `Transaction: 'static`, which does not fire for non-static
@@ -103,7 +104,7 @@ where
             // `last_block_number()` (**on disk**), deliberately not
             // `best_block_number()` — retention means "durable and buried", and
             // an in-memory canonical block is lost on a non-graceful exit (see
-            // `classifier::SEAL_DEPTH`). A read error is logged and skipped
+            // `commitments::SEAL_DEPTH`). A read error is logged and skipped
             // rather than propagated: a stale watermark only delays releases,
             // while tearing down this task would stop the fifo cleanup and the
             // sweep too.
@@ -151,8 +152,8 @@ where
             // **Must stay below the `mark_committed` loop above.** A commitment
             // whose block just became canonical has usually lost its fifo entry
             // already, so what holds its record is depth rather than age. For a
-            // promise made more than `SEAL_DEPTH` blocks ago, `sweep`'s
-            // promise-recoverable arm has already lapsed, which leaves
+            // promise made more than `commitments::SEAL_DEPTH` blocks ago,
+            // `sweep`'s promise-recoverable arm has already lapsed, which leaves
             // `committed_height` as the only thing holding it — and
             // `mark_committed` sets that from *this* notification. Hoisted above
             // the loop, the sweep could drop a commitment in the very

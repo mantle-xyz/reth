@@ -159,8 +159,9 @@ impl CommitmentStore {
     /// Claims `key` for `hash` when the slot is free, and records the reverse
     /// link so every removal path can release it again.
     ///
-    /// Only [`Commitments::mark_promised`] reaches here: a slot exists for
-    /// a commitment whose receipt has gone out, and nothing else creates one.
+    /// Two callers: [`Commitments::record_announced`] at the apply and
+    /// [`Commitments::mark_promised`] at the receipt. A slot exists for every
+    /// commitment record, whichever of the two doors created it.
     /// An occupant is reported rather than displaced — who owns the nonce is
     /// settled a layer up, by the queue.
     fn claim(&mut self, key: (Address, u64), hash: TxHash) -> SlotClaim {
@@ -207,9 +208,14 @@ pub type SlotClaim = Result<(), TxHash>;
 /// The claims this node has made, and the nonces they hold.
 ///
 /// Held by [`PreconfTxSet`](crate::preconf_tx_set::PreconfTxSet) and shared
-/// through it. The writers are the RPC handler (the instant a client is handed
-/// an event) and journal restore; the readers are the canonical handler, the
-/// payload builder and rotation.
+/// through it. The writers are the payload builder's apply
+/// ([`Self::record_announced`]), the RPC handler the instant a client is handed
+/// an event ([`Self::mark_promised`]), journal restore, the canonical handler
+/// ([`Self::observe_persisted`], [`Self::mark_committed`], [`Self::uncommit`],
+/// [`Self::sweep`]) and the fifo's removal path
+/// ([`Self::release_unless_committed`]). The readers are journal rotation
+/// ([`Self::is_tracked`]), fifo admission ([`Self::slot_conflict`]) and the pool
+/// best-tx step ([`Self::slot_owner`]).
 #[derive(Debug)]
 pub struct Commitments {
     /// Mirrors `PreconfConfig::enabled`. When false this node runs no preconf
@@ -358,7 +364,7 @@ impl Commitments {
     ///
     /// **Do not move this to canonical time.** A canonical notification carries
     /// bare hashes; picking out our own needs a record that already exists, and
-    /// `forward → release_unless_committed` races the notification. A receipt
+    /// `forward_all → release_unless_committed` races the notification. A receipt
     /// necessarily precedes the block. See [`Self::mark_committed`].
     ///
     /// **Never displaces an existing owner.** A taken slot means the incumbent
@@ -458,9 +464,10 @@ impl Commitments {
     /// build gives the commitment up. Keying rotation on this makes the two
     /// halves of commitment tracking unable to disagree.
     ///
-    /// This is also *the* partition predicate the pool arm reads: a record
-    /// exists exactly for a transaction the preconf arm owns, so no record
-    /// means the pool arm takes it. Synchronous, because that arm cannot wait.
+    /// **Not** the pool-vs-preconf partition predicate: the pool arm
+    /// (`builder::payload_builder::apply_one_best_tx`) asks the fifo itself, via
+    /// `PreconfTxSet::status_of`. A record outlives its fifo entry, so the two
+    /// answers differ over exactly the retention window.
     pub fn is_tracked(&self, hash: &TxHash) -> bool {
         self.store.read().by_hash.contains_key(hash)
     }
@@ -541,10 +548,12 @@ impl Commitments {
     /// [`SEAL_DEPTH`] deep**, in which case the record is kept.
     ///
     /// Driven by the fifo's `drop_hash`, the single convergence point of every
-    /// fifo removal path, and by the validator when admission is rejected.
+    /// fifo removal path, and by journal restore when a restored entry cannot
+    /// be decoded and so can never be honoured.
     ///
-    /// The exemption exists because one of those removal paths — `forward()` —
-    /// fires on "this sender's nonce moved past the entry", which is both
+    /// The exemption exists because one of those removal paths —
+    /// `PreconfTxSet::forward_all` — fires on "this sender's nonce moved past
+    /// the entry", which is both
     /// ambiguous about *which* transaction advanced it and, even when it was
     /// ours, revocable: releasing there would let a reorg strand a commitment
     /// without its nonce. Every other path removes a transaction that was never
@@ -601,10 +610,9 @@ impl Commitments {
         let persisted = self.persisted_height.load(Ordering::Relaxed);
         let mut released: Vec<(TxHash, Commitment)> = Vec::new();
         store.by_hash.retain(|hash, cached| {
-            // Held by block depth, not by the time-based grace above — see the
-            // third criterion in this method's docs.
             // Whichever height still has reorg reach over this commitment: the
-            // block it landed in, or the one it was promised for.
+            // block it landed in, or the one it was promised for. Both criteria
+            // in this method's docs come down to that one depth check.
             let reachable = cached.committed_height.unwrap_or(cached.promised_height);
             let keep = reachable.saturating_add(SEAL_DEPTH) > persisted || live.contains(hash);
             if !keep {
@@ -644,7 +652,7 @@ impl Commitments {
     }
 
     /// Number of claimed `(sender, nonce)` slots — for assertions. Always
-    /// `<= record_count()`, since only commitment records claim a slot.
+    /// `<= commitment_count()`, since only commitment records claim a slot.
     #[cfg(test)]
     fn slot_count(&self) -> usize {
         self.store.read().by_slot.len()
@@ -654,8 +662,9 @@ impl Commitments {
     /// crossing. Never deletes.
     ///
     /// Deleting under pressure would break commitments, and would not even be the
-    /// useful thing to do: a record is a hash, an enum, an `Instant` and an
-    /// optional slot key, while a fifo entry holds a whole `Arc<TxEnvelope>` and
+    /// useful thing to do: a record is a hash, a [`ClaimKind`], two block
+    /// heights and an optional slot key, while a fifo entry holds a whole
+    /// `Arc<TxEnvelope>` and
     /// the fifo has no bound of its own — its removal is entirely canon-driven, so
     /// a stalled chain grows it without limit. If memory is the problem, the fifo
     /// is the problem; crossing this threshold is a symptom to alert on, not a
@@ -806,13 +815,13 @@ mod tests {
 
     // ===== the allowlist rule: a three-way OR =====
 
-    /// **The core of the scheme.** `forward()` removes the fifo entry as soon as
+    /// **The core of the scheme.** `forward_all` removes the fifo entry as soon as
     /// the sender's nonce advances, and that fires `release_unless_committed` —
     /// which must *not* release a commitment whose block could still be reorged
     /// away, or a same-nonce replacement could take the nonce and earn a second
     /// receipt.
     #[test]
-    fn a_committed_record_survives_the_fifo_forward() {
+    fn a_committed_record_survives_the_fifo_forward_all() {
         let c = classifier();
         committed_commitment(&c);
 
@@ -856,9 +865,9 @@ mod tests {
     /// its removal path is a timeout or a rejection, and holding its nonce would
     /// block the sender behind a transaction that is not coming.
     ///
-    /// This is the case `forward()` also hits when a *different* transaction
-    /// advanced the nonce — the ambiguity that makes `forward` unable to decide
-    /// this itself.
+    /// This is the case `forward_all` also hits when a *different* transaction
+    /// advanced the nonce — the ambiguity that makes `forward_all` unable to
+    /// decide this itself.
     #[test]
     fn an_uncommitted_record_is_released_immediately() {
         let c = classifier();
@@ -886,7 +895,7 @@ mod tests {
         assert!(!c.release_unless_committed(&hash(1)), "held by its depth");
     }
 
-    /// Both orders end in the same state. `forward → release_unless_committed`
+    /// Both orders end in the same state. `forward_all → release_unless_committed`
     /// and the canonical notification run on different tasks with nothing
     /// ordering them, so the scheme cannot depend on which lands first — which is
     /// why the promise record is established at the receipt, before either can
@@ -929,7 +938,7 @@ mod tests {
 
         // With the observation withdrawn, depth no longer holds the record: it is
         // back to being an ordinary in-flight commitment, so the release
-        // `forward` attempts is no longer refused.
+        // `forward_all` attempts is no longer refused.
         c.observe_persisted(AT + SEAL_DEPTH);
         assert!(c.release_unless_committed(&hash(1)), "no observation ⇒ nothing holds it");
     }
@@ -1163,7 +1172,7 @@ mod tests {
             "the door refuses that sender"
         );
         assert!(c.is_tracked(&hash(1)), "the record survives it");
-        assert!(c.is_tracked(&hash(1)), "and it is still a promise");
+        assert!(c.was_promised(&hash(1)), "and it is still a promise");
     }
 
     /// The journal-restore path in one call: record the promise **and** claim the
@@ -1179,7 +1188,7 @@ mod tests {
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)));
-        assert!(c.is_tracked(&hash(1)));
+        assert!(c.was_promised(&hash(1)));
         assert!(c.is_tracked(&hash(1)), "an unseen hash restores with a record of its own");
 
         c.release_unless_committed(&hash(1));
@@ -1224,11 +1233,11 @@ mod tests {
         assert_eq!(c.mark_promised(hash(1), &addr(1), 7, 0), Ok(()));
 
         assert!(c.is_tracked(&hash(1)), "record untouched");
-        assert!(c.is_tracked(&hash(1)), "but the promise is recorded");
+        assert!(c.was_promised(&hash(1)), "but the promise is recorded");
     }
 
     #[test]
-    fn forget_drops_only_the_named_record() {
+    fn release_unless_committed_drops_only_the_named_record() {
         let c = classifier();
         c.registered_via_preconf_rpc(hash(1), &addr(1));
         c.registered_via_preconf_rpc(hash(2), &addr(1));
@@ -1478,7 +1487,7 @@ mod tests {
         let (registered, claim) = c.admit_via_preconf_rpc(hash(2), &addr(1), 7);
 
         assert!(registered, "the losing commitment keeps its record");
-        assert!(c.is_tracked(&hash(2)), "and it is still a promise");
+        assert!(c.was_promised(&hash(2)), "and it is still a promise");
         assert_eq!(claim, Err(hash(1)), "the incumbent is reported, not silently overwritten");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps the slot");
     }
@@ -1513,11 +1522,11 @@ mod tests {
         assert_eq!(c.slot_count(), 2);
     }
 
-    /// `forget` is the fifo's removal callback and the validator's
-    /// rejection path; it must release the slot or the nonce stays blocked
-    /// until the next sweep.
+    /// [`Commitments::release_unless_committed`] is the fifo's removal callback
+    /// and journal restore's rejection path; it must release the slot or the
+    /// nonce stays blocked until the next sweep.
     #[test]
-    fn forget_releases_the_slot() {
+    fn release_unless_committed_releases_the_slot() {
         let c = classifier();
 
         assert_eq!(c.admit_via_preconf_rpc(hash(1), &addr(1), 7).1, Ok(()));

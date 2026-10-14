@@ -78,9 +78,9 @@ impl PreconfRpcHandler {
     }
 
     /// Claim the `(sender, nonce)` slot for a commitment whose receipt is going
-    /// out, and record the promise with the classifier — the in-memory authority
-    /// for slot retention. `mark_committed` needs that record to recognise our
-    /// transactions among a whole block's hashes.
+    /// out, and record the promise in `Commitments` (`fifo.claims()`) — the
+    /// in-memory authority for slot retention. `mark_committed` needs that
+    /// record to recognise our transactions among a whole block's hashes.
     ///
     /// **Every receipt counts, not only `Success`.** A `Failed` event on a
     /// receipt path is an EVM revert that *produced* a receipt; every
@@ -98,8 +98,8 @@ impl PreconfRpcHandler {
     ) {
         // Establishing the record here — at the receipt, which necessarily
         // precedes the block — is what makes it available to both later events
-        // (`forward → release_unless_committed` and the canonical notification)
-        // no matter which of them runs first.
+        // (`forward_all → release_unless_committed` and the canonical
+        // notification) no matter which of them runs first.
         if let Err(owner) =
             self.fifo.claims().mark_promised(hash, sender, nonce, event.block_height)
         {
@@ -320,7 +320,6 @@ fn build_timeout_event(
 
 // `DynPreconfHandler` is the dyn-safe trait declared in `rpc-ext`; this is
 // the impl behind the `Arc<dyn DynPreconfHandler>` `MantleRpcExt` holds.
-// `Option<Arc<dyn DynPreconfHandler>>`.
 #[async_trait]
 impl DynPreconfHandler for PreconfRpcHandler {
     async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
@@ -621,7 +620,7 @@ mod tests {
     ///
     /// `builder::dispatch` marks the fifo entry `Success` regardless of
     /// `receipt.status`, so a gate here would leave the fifo saying "committed"
-    /// about a transaction the classifier had never heard of.
+    /// about a transaction `Commitments` had never heard of.
     #[tokio::test]
     async fn a_reverted_receipt_is_still_recorded_as_a_commitment() {
         let h = harness();
@@ -654,7 +653,7 @@ mod tests {
 
         assert!(
             h.fifo.claims().is_tracked(&hash),
-            "the classifier must know the commitment, or a reorg reinject is \
+            "`Commitments` must know the commitment, or a reorg reinject is \
              re-gated as a fresh submission and `mark_committed` cannot count it",
         );
     }

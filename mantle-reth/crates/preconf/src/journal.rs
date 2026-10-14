@@ -212,11 +212,12 @@ pub struct PreconfJournal {
     /// Config validation guarantees a positive value whenever the journal
     /// is enabled (see [`crate::PreconfConfig`]).
     max_size: u64,
-    /// Running on-disk byte count. Maintained by `append_promised`
-    /// (`+= line.len()`, under the writer lock) and reset by `rotate`
-    /// to the kept-bytes total. Avoids a `stat` syscall on the hot path.
+    /// Running on-disk byte count. Maintained by `write_lines`
+    /// (`+= buf.len()`, the whole write at once, under the writer lock) and
+    /// reset by `rotate` to the kept-bytes total. Avoids a `stat` syscall on
+    /// the hot path.
     size_bytes: AtomicU64,
-    /// Pinged by `append_promised` when `size_bytes` crosses `max_size`,
+    /// Pinged by `write_lines` when `size_bytes` crosses `max_size`,
     /// waking [`run_rejournal_loop`] to force a rotation off the hot
     /// path. `notify_one` coalesces a burst of appends into a single
     /// pending permit.
@@ -245,7 +246,7 @@ impl PreconfJournal {
     /// to append.
     ///
     /// `max_size` is the on-disk size cap that arms size-triggered
-    /// rotation: once the file grows to `max_size` bytes, `append_promised`
+    /// rotation: once the file grows to `max_size` bytes, `write_lines`
     /// wakes [`run_rejournal_loop`] to rotate off the hot path. The byte
     /// counter is seeded from the existing file so the cap is enforced
     /// across restarts against pre-existing survivors. Config validation
@@ -2844,7 +2845,8 @@ mod tests {
     async fn rotate_does_not_self_retrigger_when_survivors_exceed_cap() {
         // A size-triggered `rotate()` whose survivors still exceed
         // `max_size` must NOT keep the loop rotating on its own: the size
-        // trigger fires only from `append_promised`, never from `rotate`.
+        // trigger fires only from `write_lines` — the append path, whether
+        // `append_promised` or `append_batch` — never from `rotate`.
         // Guards against a future change that re-notifies inside `rotate`
         // (which would spin the full-file rewrite on every wake while the
         // file stays over the cap).
@@ -2893,9 +2895,9 @@ mod tests {
     async fn rotate_resets_size_counter_to_true_on_disk_size() {
         // Approach-A invariant: `size_bytes` tracks the real on-disk size
         // without a stat syscall on the hot path. It must stay equal to the
-        // file's true length across both `append_promised` (+= line) and
-        // `rotate` (reset to kept-bytes). Drift here silently breaks the
-        // size trigger (it would fire late, or never).
+        // file's true length across both `write_lines` (+= the bytes just
+        // written) and `rotate` (reset to kept-bytes). Drift here silently
+        // breaks the size trigger (it would fire late, or never).
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         // `max_size` is irrelevant to the counter mechanics; 0 keeps the
@@ -2936,7 +2938,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_drops_corrupt_lines_and_reports_count() {
-        // `rotate()` rewrites the file via `load()`, which skips corrupt
+        // `rotate()` rewrites the file via `load_upto()`, which skips corrupt
         // lines. The corrupt line must NOT be carried into the new
         // generation, and its count must surface as `bad_lines_skipped`.
         let dir = TempDir::new().unwrap();

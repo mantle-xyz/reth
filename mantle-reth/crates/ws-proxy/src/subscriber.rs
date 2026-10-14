@@ -343,13 +343,8 @@ where
     }
 }
 
-/// Extracts `(block_number, flashblock_index)` from a flashblock JSON payload.
-///
-/// Reads `metadata.block_number` and the top-level `index` field, matching the
-/// wire format of [`FlashblocksPayloadV1`]. Returns `None` if the JSON is not
-/// a valid flashblock payload or either field is missing.
-///
-/// Uses a minimal typed struct to avoid materializing the entire JSON tree.
+/// The fields [`parse_flashblock_position`] needs, and nothing else, so that
+/// deserializing a slice does not materialize the entire JSON tree.
 #[derive(serde::Deserialize)]
 struct PositionExtract {
     index: u64,
@@ -361,6 +356,11 @@ struct MetadataExtract {
     block_number: u64,
 }
 
+/// Extracts `(block_number, flashblock_index)` from a flashblock JSON payload.
+///
+/// Reads `metadata.block_number` and the top-level `index` field, matching the
+/// wire format of `MantleFlashblockPayload`. Returns `None` if the JSON is not
+/// a valid flashblock payload or either field is missing.
 fn parse_flashblock_position(data: &str) -> Option<(u64, u64)> {
     let extract: PositionExtract = serde_json::from_str(data).ok()?;
     Some((extract.metadata.block_number, extract.index))

@@ -522,7 +522,7 @@ async fn a_commitment_is_not_handed_back_to_the_pool() {
     std::fs::remove_dir_all(&journal_dir).ok();
 }
 
-/// The same hand-back, reached the way the technical design names it: a reorg.
+/// The same hand-back, reached by a reorg.
 ///
 /// A reorg arrives as a forkchoice update whose head points elsewhere, and the
 /// generator supersedes the job in flight — which is the same `abandon` any
@@ -580,25 +580,15 @@ async fn a_build_a_reorg_threw_away_gives_back_what_it_pruned() {
 /// Two builds at one height: the first announces and prunes a transaction, then
 /// is superseded; the second seals the block that lands and goes canonical.
 ///
-/// **What this test actually exercises today is the landed branch**: the second
-/// build has room and takes the transaction, so what is pinned is that the next
-/// build does not hand it out again. Without that, a transaction that reached
-/// the canonical block would be replayed into the one after it and mined twice.
-///
-/// **It does not cover the whole-group-clear hole.** The bug that shape guards
-/// against — `drop_landed_groups` clearing the entire index instead of only the
-/// group whose sealed hash matches `parent_hash` — is only observable when the
-/// second build cannot carry the transaction, and nothing in this fixture fills
-/// the block, so that branch never runs. The `landed_in_second == false` arm is
-/// written out because the invariant is stated for both, not because this
-/// harness reaches it. **Anyone looking for coverage of the grouping hole has
-/// not found it here**: its guard is the unit test
-/// `a_group_that_did_not_seal_the_parent_survives_and_needs_checking` in
-/// `mantle-reth/crates/preconf/src/unlanded.rs`.
-///
-/// Making the branch reachable means packing the first build's block to near
-/// capacity so the second has no room. That is a deliberate follow-up, deferred
-/// as an expensive and timing-sensitive fixture.
+/// Covers the landed branch only. The third build's parent is the block the
+/// second one sealed, so `parent_is_ours` holds and
+/// `PreconfTxSet::drop_landed_claims` clears the entry instead of replaying it
+/// into the next block — without that, a transaction already on chain is mined
+/// twice. The other branch in `payload_builder.rs` — parent not ours, pool
+/// repaired through `senders_with_landed_claims` — is covered by
+/// `a_payload_the_consensus_layer_did_not_use_hands_back` above. The
+/// `landed_in_second == false` arm below is written out because the invariant is
+/// stated for both, not because this harness reaches it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_superseded_builds_announcement_outlives_the_block_that_replaced_it() {
     let sender = Wallet::default().inner.address();

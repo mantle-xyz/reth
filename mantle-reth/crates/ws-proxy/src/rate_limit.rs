@@ -65,7 +65,7 @@ pub trait RateLimit: Send + Sync {
     fn try_acquire(self: Arc<Self>, addr: IpAddr) -> Result<Ticket, RateLimitError>;
 
     /// Release a connection slot for the given address.
-    fn release(&self, ticket: IpAddr);
+    fn release(&self, addr: IpAddr);
 }
 
 #[derive(Debug)]

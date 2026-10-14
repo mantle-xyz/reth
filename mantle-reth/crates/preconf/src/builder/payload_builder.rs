@@ -93,7 +93,7 @@ use crate::{
 /// the whitelist updates any of them carried.
 ///
 /// **Replicated from `OpPayloadBuilderCtx::execute_sequencer_transactions`**
-/// (`op-reth/crates/payload/src/builder.rs:724-765` as of this fork), with
+/// (`op-reth/crates/payload/src/builder.rs` as of this fork), with
 /// `execute_transaction` → `execute_transaction_with_result_closure` so the
 /// per-transaction `ExecutionResult` becomes visible. Upstream changes to that
 /// function will **not** reach this copy.
@@ -1312,7 +1312,8 @@ where
     };
     // One clone of the block's transactions per slice: the assembler takes them
     // owned. Bounded by the assembler's signature rather than by choice, and
-    // the reason `flashblock.tick_duration` is worth watching on full blocks.
+    // the reason `flashblock.publish_interval_ms` is worth watching on full
+    // blocks.
     let transactions = info.executed().iter().map(|tx| tx.inner().clone()).collect::<Vec<_>>();
 
     let block = ctx
@@ -1471,7 +1472,7 @@ impl SliceState {
     /// announced but not persisted, which is the case the journal exists for.
     ///
     /// The write stays outside the cancel gate because it cannot go inside:
-    /// [`JobCancel::unless_cancelled`] takes a synchronous closure. The cost is
+    /// [`JobCancel::unless_abandoned`] takes a synchronous closure. The cost is
     /// that a slice dropped by that guard is already journaled — harmless,
     /// since its transactions belong in this block either way, and a restart
     /// finds them already on chain once it seals.
