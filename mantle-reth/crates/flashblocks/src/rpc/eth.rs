@@ -3,14 +3,21 @@
 //! `eth_simulateV1` is deliberately absent: it is owned by `MantleEthApiExt`,
 //! which injects pending overrides via [`PendingStateOverrides`].
 //!
-//! # Two overlay representations, and what is not covered
+//! # Four overlay representations, and what is not covered
 //!
-//! The state reads here (`eth_getCode`, `eth_getStorageAt`) answer from the
-//! overlay's [`BundleState`], while `eth_call`, `eth_estimateGas` and
-//! `eth_simulateV1` answer from its `state_overrides`. Those are maintained
-//! separately and the bundle is the larger of the two — it also carries the
-//! EIP-4788 and EIP-2935 pre-execution writes and the writes of a cached
-//! replay. Do not assume the two agree on a given slot.
+//! The overlay keeps the same execution in four separately maintained shapes on
+//! [`PendingBlocks`], and each overridden method answers from exactly one:
+//!
+//! | Source | Methods served from it |
+//! |---|---|
+//! | [`BundleState`] | `eth_getCode`, `eth_getStorageAt` |
+//! | `state_overrides` | `eth_call`, `eth_estimateGas`, `eth_simulateV1` |
+//! | `account_balances` | `eth_getBalance` |
+//! | `transaction_count` (a delta added to the canonical count) | `eth_getTransactionCount` |
+//!
+//! Nothing keeps the four in step, so do not assume they agree on a given
+//! account or slot. The bundle is the widest of them — it also carries the
+//! EIP-4788 and EIP-2935 pre-execution writes and the writes of a cached replay.
 //!
 //! Methods that read state but are **not** overridden still resolve `pending`
 //! through reth's own pending block, which this consumer never feeds, so they
@@ -19,6 +26,7 @@
 //! particular can therefore disagree with `eth_getStorageAt` on the same slot.
 //!
 //! [`BundleState`]: reth_revm::db::BundleState
+//! [`PendingBlocks`]: crate::PendingBlocks
 
 use std::{sync::Arc, time::Duration};
 
@@ -171,7 +179,9 @@ pub trait EthApiOverride {
     #[method(name = "getTransactionByHash")]
     async fn transaction_by_hash(&self, tx_hash: TxHash) -> RpcResult<Option<serde_json::Value>>;
 
-    /// Sends a raw transaction and waits for inclusion in a flashblock.
+    /// Sends a raw transaction and waits for its receipt from either a
+    /// flashblock or a canonical block, whichever answers first, until
+    /// `timeout_ms` elapses.
     #[method(name = "sendRawTransactionSync")]
     async fn send_raw_transaction_sync(
         &self,

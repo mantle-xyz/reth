@@ -1,12 +1,14 @@
-//! Startup pre-registration ("seeding") of preconf metric series.
+//! Startup pre-registration ("seeding") of this crate's metric series —
+//! `preconf.*` and `flashblock.*` alike.
 //!
 //! The `metrics` facade creates a series lazily on the first emit, so a
-//! rare-event counter (timeouts, failures, replacement rejections, ...) has no
+//! rare-event counter (`preconf.api.timeout_total`,
+//! `preconf.build.panic_total`, `preconf.whitelist.reload_failed`, ...) has no
 //! Prometheus series until it first fires — exactly when an alert most needs a
 //! stable `0` baseline, and when dashboards would otherwise show "no data"
 //! (indistinguishable from a broken pipeline). [`seed_preconf_metrics`]
-//! registers every preconf metric up front so scrapes carry a `0` from node
-//! start.
+//! registers every metric emitted under either prefix up front so scrapes
+//! carry a `0` from node start.
 //!
 //! Names MUST match the inline emit sites verbatim (dot-separated) — a mismatch
 //! registers a shadow series that collides on export. The
@@ -61,7 +63,7 @@ const COUNTERS: &[&str] = &[
     "preconf.dispatch.deadline_skipped_total",
     "preconf.dispatch.gas_budget_skipped_total",
     // What the EVM refused, under the reason the client is told — the
-    // builder-stage counterpart of the `preconf.admit.rejected_*` pair.
+    // builder-stage counterpart of the `preconf.admit.rejected_*` counters.
     "preconf.execute.rejected_funds_total",
     "preconf.execute.rejected_base_fee_total",
     "preconf.execute.rejected_other_total",
@@ -128,11 +130,12 @@ const HISTOGRAMS: &[&str] = &[
     "preconf.journal.rotate_locked_ms",
 ];
 
-/// Pre-register every preconf metric so its Prometheus series exists from node
-/// start with a `0` baseline instead of appearing only on the first emit.
+/// Pre-register every metric this crate emits — `preconf.*` and
+/// `flashblock.*` — so its Prometheus series exists from node start with a `0`
+/// baseline instead of appearing only on the first emit.
 ///
-/// Call once at startup, **only when preconf is enabled**, so non-preconf nodes
-/// don't expose phantom preconf series. Requires the metrics recorder to be
+/// Call once at startup, **only when preconf is enabled**, so other nodes
+/// don't expose phantom series. Requires the metrics recorder to be
 /// installed already (true by the `on_node_started` hook). Idempotent.
 pub fn seed_preconf_metrics() {
     for &name in COUNTERS {

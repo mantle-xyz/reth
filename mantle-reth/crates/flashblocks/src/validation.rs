@@ -19,11 +19,13 @@ pub enum SequenceValidationResult {
         /// Actual incoming flashblock index.
         actual: u64,
     },
-    /// New block received with non-zero index - missed the base flashblock.
+    /// Incoming flashblock cannot be linked to the tracked block: either the
+    /// next block opened with a non-zero index, or the block number is neither
+    /// the tracked one nor its successor — in which case `index` may well be 0.
     InvalidNewBlockIndex {
         /// Block number of the incoming flashblock.
         block_number: u64,
-        /// The invalid (non-zero) index received.
+        /// Index received alongside that block number; not necessarily non-zero.
         index: u64,
     },
     /// Incoming flashblock does not link back to the currently tracked latest flashblock.
@@ -159,11 +161,13 @@ pub enum ReconciliationStrategy {
     CatchUp,
     /// Transaction sequences diverged; rebuild pending state from canonical.
     HandleReorg,
-    /// Pending state spans more blocks than allowed; rebuild from canonical.
+    /// Canonical has moved too far past the overlay's earliest block; rebuild
+    /// from canonical.
     DepthLimitExceeded {
-        /// Current depth of pending blocks.
+        /// How far the overlay's earliest block trails behind canonical,
+        /// `canonical_block_number - earliest` — not the overlay's own span.
         depth: u64,
-        /// Configured maximum depth.
+        /// Configured maximum trailing depth.
         max_depth: u64,
     },
     /// Canonical is behind the latest pending block; keep extending pending state.

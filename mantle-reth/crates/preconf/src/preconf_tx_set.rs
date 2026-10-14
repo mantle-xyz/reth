@@ -5,7 +5,8 @@
 //! 1. Track in-flight preconf-eligible transactions in FIFO order
 //! 2. Notify the builder via [`tokio::sync::broadcast`] (the single fifo event source)
 //! 3. Hold RPC `oneshot::Sender` responders attached by the RPC handler
-//! 4. Survive across slots — buffers requests during dead window
+//! 4. Survive across slots — entries a build does not apply stay queued, and the next build's
+//!    carryover preamble re-dispatches them
 //!
 //! ## Concurrency model
 //!
@@ -74,12 +75,17 @@ use crate::{
     types::{MarkError, PreconfError, PreconfReceipt, PreconfSource, PreconfStatus, PushResult},
 };
 
-/// How many executed-but-unconfirmed entries the queue holds before the oldest
-/// start falling out — 4096.
+/// How many entries the queue holds before the oldest evictable ones start
+/// falling out — 4096.
+///
+/// Counted over `entries` as a whole, `Waiting` included, while only `Success`
+/// entries are ever evicted: a backlog of still-to-be-applied entries consumes
+/// the cap and pushes executed-but-unconfirmed ones out.
 ///
 /// A full block carries on the order of 1400 ordinary transactions, so this is
 /// roughly three blocks' worth: long enough to cover a run of blocks that do
-/// not land, short enough that the staging half stays about a megabyte.
+/// not land, short enough that 4096 encoded transactions of a few hundred
+/// bytes each stay on the order of a megabyte.
 ///
 /// **A backstop, not a working limit.** Every build clears these on a chain
 /// that is producing, so reaching the cap means several have not — worth
@@ -91,8 +97,10 @@ pub const STAGED_CAP: usize = 4096;
 
 /// A single fifo entry.
 ///
-/// Cloned for `snapshot` / `find_*` queries; the responder field is
-/// **never** cloned (it's a `oneshot::Sender`, take-once semantics).
+/// Not `Clone`: read-only queries (`entries` / `find_by_hash` /
+/// `find_by_sender_nonce`) hand out a [`TxEntryView`] built by
+/// [`TxEntry::snapshot_view`], which leaves the responder behind (it's a
+/// `oneshot::Sender`, take-once semantics). `snapshot` returns hashes only.
 #[derive(Debug)]
 pub struct TxEntry {
     /// Transaction hash.
@@ -614,9 +622,14 @@ impl PreconfTxSet {
     /// quantities, so slot-level granularity is enough and keeps the mutation
     /// paths free of the scan.
     ///
-    /// All three ceilings `admit` enforces are reported, because a ceiling
-    /// without a utilisation reading fails silently: requests start being
-    /// refused and nothing says which limit did it.
+    /// The three queue-wide ceilings `admit` enforces (`max_txs`, `max_size`,
+    /// `max_queued_gas`) are reported, because a ceiling without a utilisation
+    /// reading fails silently: requests start being refused and nothing says
+    /// which limit did it. The two per-sender ceilings — `max_account_slots`
+    /// and `max_inflight_delegated` — have no queue-wide figure to publish, so
+    /// they show up only once they refuse something, in
+    /// `preconf.admit.rejected_account_slots_total` and
+    /// `preconf.admit.rejected_delegated_total`.
     pub async fn publish_pending_gauge(&self) {
         let inner = self.inner.lock().await;
         let pending = inner.entries.values().filter(|e| e.status == PreconfStatus::Waiting).count();
@@ -1418,7 +1431,7 @@ impl std::fmt::Debug for PreconfTxSet {
 
 #[cfg(test)]
 mod admit_tests {
-    //! The seven rules admission applies, one at a time.
+    //! The rules admission applies, one at a time.
     //!
     //! All of them run under one hold of the lock, which is the point — but it
     //! also means a rule that never fires is indistinguishable from one that

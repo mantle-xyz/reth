@@ -198,7 +198,7 @@ where
         while let Some((update, waiting)) = self.queue.recv().await {
             Metrics::queue_depth().set(waiting as f64);
 
-            // Read once per update and threaded down: three guards consult it, and
+            // Read once per update and threaded down to every guard below it:
             // re-reading would let them disagree within one iteration, which shows up
             // as self-contradicting logs rather than as a wrong decision.
             let tip = self.canonical_tip();

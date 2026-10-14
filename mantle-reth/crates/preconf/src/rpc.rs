@@ -342,16 +342,12 @@ impl DynPreconfHandler for PreconfRpcHandler {
 /// success). Both cases mean the tx **is on chain** — the receipt would
 /// not exist otherwise.
 ///
-/// Note the semantic mismatch with a commitment the builder refused
-/// pre-apply (nonce-too-low, block gas budget, ...) — tx **NOT on chain**.
-/// That never reaches this conversion: it ends the queue entry and flows to
-/// the client as a `PreconfError`, not through the receipt path.
-///
-/// `Waiting` / `Timeout` are constructed directly by the RPC handler's
-/// other arms and never routed through this `From` impl. There is no
-/// wire `Canceled` variant — server pre-apply rejections (the block-gas-budget
-/// gate, admin action) are surfaced as wire `Failed` with the specific reason
-/// in `PreconfTxEvent::reason`.
+/// A commitment the builder refused instead (nonce-too-low, block gas budget,
+/// DA budget) never reaches this conversion: there is no receipt, so it leaves
+/// through the handler's `Some(Ok(Err(err)))` arm as a JSON-RPC error, tx
+/// **not on chain**. That is also why no wire `Canceled` variant is needed
+/// here. `Waiting` / `Timeout` are built by the handler's other arms and do not
+/// come through this impl either.
 impl From<PreconfReceipt> for PreconfTxEvent {
     fn from(r: PreconfReceipt) -> Self {
         let status = if r.status { WireStatus::Success } else { WireStatus::Failed };

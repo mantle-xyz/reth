@@ -8,6 +8,13 @@ use thiserror::Error;
 #[derive(Debug, Clone, Eq, PartialEq, Error)]
 pub enum ProtocolError {
     /// Invalid flashblock sequence or ordering.
+    ///
+    /// Reserved for sequence faults; it has no construction site today. Ordering
+    /// is reported through [`SequenceValidationResult`] and
+    /// [`StateProcessorError::NonConsecutiveBlock`] instead, so this message
+    /// never reaches a log.
+    ///
+    /// [`SequenceValidationResult`]: crate::SequenceValidationResult
     #[error("invalid flashblock sequence: flashblocks must be processed in order")]
     InvalidSequence,
 
@@ -80,6 +87,12 @@ pub enum ExecutionError {
     BlockConversion(String),
 
     /// Failed to load cache account for depositor.
+    ///
+    /// Reserved; it has no construction site today. The receipt builder raises
+    /// [`ReceiptBuildError::DepositAccountLoad`], which converts into
+    /// [`Self::RpcReceiptBuild`], so this message never reaches a log.
+    ///
+    /// [`ReceiptBuildError::DepositAccountLoad`]: crate::ReceiptBuildError::DepositAccountLoad
     #[error("failed to load cache account for deposit transaction sender")]
     DepositAccountLoad,
 
@@ -103,7 +116,12 @@ impl From<crate::ReceiptBuildError> for ExecutionError {
 /// Errors related to pending blocks construction.
 #[derive(Debug, Clone, Eq, PartialEq, Error)]
 pub enum BuildError {
-    /// Cannot build pending blocks without headers.
+    /// Cannot build pending blocks: the builder holds no headers, or no base
+    /// payload could be found for the latest block.
+    ///
+    /// `PendingBlocksBuilder::build` returns this for both, so the "missing
+    /// headers" wording understates the second case — a log line naming it can
+    /// mean the headers are fine and the base payload is the one missing.
     #[error("missing headers: cannot build pending blocks without header information")]
     MissingHeaders,
 
@@ -193,8 +211,9 @@ mod tests {
         B256::with_last_byte(0xAA)
     }
 
-    /// Messages reaching operators through logs; the interpolated fields are the
-    /// part worth pinning, since a silent reordering makes triage reports wrong.
+    /// Display strings, most of which reach operators through logs; the
+    /// interpolated fields are the part worth pinning, since a silent reordering
+    /// makes triage reports wrong.
     #[rstest]
     #[case(ProtocolError::InvalidSequence.into(), "must be processed in order")]
     #[case(ProtocolError::MissingBase.into(), "first flashblock in sequence")]

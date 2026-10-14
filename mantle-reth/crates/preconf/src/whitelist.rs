@@ -21,8 +21,8 @@
 //!
 //! * **Governance owns *who* is eligible.** Whatever the contract says — including empty sets,
 //!   meaning nobody — is authoritative. The node mirrors it and never overrides it, so an empty
-//!   allowlist is a legitimate state that warns but does not stop the node. This is the one place
-//!   that rule is argued; everything below just refers to it.
+//!   allowlist is a legitimate state that warns but does not stop the node. What makes tolerating
+//!   it safe is the has-code check — see [`WhitelistError::ContractHasNoCode`].
 //! * **This node owns its own configuration.** A `--preconf.whitelist-contract` that holds no code
 //!   is reth's mistake, not governance's, and is fatal.
 //! * **The operator owns the on/off switch** (`--preconf.enable` for a full rollback to the
@@ -36,8 +36,9 @@
 //! links them at compile time, so both sides assert them:
 //! `test/PreconfWhitelist.t.sol` pins the layout with `vm.load`, and the tests
 //! at the bottom of this file pin the derived slot bases. Changing the contract's
-//! state-variable order without updating [`FROM_WILDCARDS_SLOT`] / [`TO_WILDCARDS_SLOT`]
-//! would make the sequencer read garbage — or, worse, an empty list.
+//! state-variable order without updating [`PAIRS_SLOT`] / [`FROM_WILDCARDS_SLOT`] /
+//! [`TO_WILDCARDS_SLOT`] / [`LAYOUT_VERSION_SLOT`] would make the sequencer read
+//! garbage — or, worse, an empty list.
 //!
 //! The contract occupies slots 0..=7; this module reads 0, 2, 4 and 6. Slots 1, 3
 //! and 5 are the membership mappings, and slot 7 is `authorizedL1`, the one L1
@@ -119,7 +120,7 @@ pub const WHITELIST_UPDATED_TOPIC0: B256 = B256::new([
     0x5b, 0x25, 0x5b, 0x36, 0x42, 0x9e, 0xd9, 0x0f, 0x86, 0x5b, 0xd2, 0xa3, 0x13, 0x1e, 0xf1, 0xbc,
 ]);
 
-/// Warn once a list passes this size — **advisory only, never rejects**.
+/// Warn once a list reaches this size — **advisory only, never rejects**.
 ///
 /// The list length is a governance decision (see the module docs), so it is
 /// deliberately **unbounded**; what is bounded is how long reading it may block,
@@ -161,15 +162,16 @@ pub const WHITELIST_WARN_THRESHOLD: usize = 1_000_000;
 /// [`read_preconf_set`] / [`read_preconf_pairs`] entry points each still get a
 /// full fresh budget; they read one array by definition.)
 ///
-/// `read_preconf_set` takes the array length from **slot 0 of the configured
-/// address**, so a wrong-but-deployed contract supplies that number: the has-code
-/// check in [`bootstrap_whitelist`] proves *something* is deployed there, not
+/// `read_preconf_set` takes the array length from **the `list_slot` it was
+/// passed** (slot 2 or slot 4 of the configured address), so a wrong-but-deployed
+/// contract supplies that number: the has-code check in [`bootstrap_whitelist`]
+/// proves *something* is deployed there, not
 /// that it is a `PreconfWhitelist`. A value that cannot be a length at all is
 /// refused in O(1) by [`WhitelistError::ImplausibleLength`] and never reaches
 /// this budget; what is left for it is the plausible-but-wrong middle, which is
 /// also where the nastiest case lives:
 ///
-/// | slot 0 happens to hold | value | blocked for (at 1.06 µs/entry) |
+/// | that length slot happens to hold | value | blocked for (at 1.06 µs/entry) |
 /// |---|---|---|
 /// | a timestamp (`lastUpdated`, …) | ~1.77e9 | **~31 minutes** |
 /// | a wei amount / `totalSupply` | ~1e18 | ~34,000 years |
@@ -307,12 +309,17 @@ pub enum WhitelistError {
     /// Fatal for the same reason [`Self::ContractHasNoCode`] is. The has-code
     /// check proves *something* is deployed there, not that it is a
     /// `PreconfWhitelist` at the layout these slot constants describe — and a
-    /// skew is silent and actively wrong rather than merely stale: read against
-    /// the previous cross-product contract, [`FROM_WILDCARDS_SLOT`] lands on its
-    /// **recipient** list, which would then be installed as sender wildcards, so
-    /// every transaction *from* a former recipient becomes preconf-eligible,
-    /// authorized by nobody. (`found: 0` is that contract's signature — it never
-    /// wrote the slot.)
+    /// skew is silent and actively wrong rather than merely stale.
+    ///
+    /// Take the contract this layout replaced. It stored a sender list and a
+    /// recipient list and authorized their **cross product** — `from` in the one
+    /// *and* `to` in the other, the model op-geth still uses in `IsPreconfTx`
+    /// (`preconf/tx_pool_config.go`, `FromPreconfs` / `ToPreconfs`) — rather than
+    /// the explicit `(from, to)` rules read here. Against that storage,
+    /// [`FROM_WILDCARDS_SLOT`] lands on its **recipient** list, which would then
+    /// be installed as sender wildcards, so every transaction *from* a former
+    /// recipient becomes preconf-eligible, authorized by nobody. (`found: 0` is
+    /// that contract's signature — it never wrote the slot.)
     #[error(
         "preconf whitelist contract {contract} declares storage layout {found}, but this build reads layout {expected} — deploy the matching PreconfWhitelist, or run a binary built for layout {found}"
     )]
@@ -359,8 +366,8 @@ pub enum WhitelistError {
     /// Two very different causes, and this error cannot tell them apart — hence
     /// a message that names both:
     ///
-    /// * the address does not point at a `PreconfWhitelist`, so slot 0 supplied a nonsense length
-    ///   (by far the likelier cause — see [`WHITELIST_READ_BUDGET`]);
+    /// * the address does not point at a `PreconfWhitelist`, so the array's length slot supplied a
+    ///   nonsense length (by far the likelier cause — see [`WHITELIST_READ_BUDGET`]);
     /// * the list is genuine but larger than this machine can read inside the budget.
     ///
     /// **Two durations, because the budget spans three arrays and the abort
@@ -576,7 +583,7 @@ fn read_address(
 /// Surfaces zero entries, which the contract cannot produce.
 ///
 /// **The zero address is a calldata-only marker** that routes a rule to a
-/// wildcard set — this is the one place that rule is stated. All three arrays
+/// wildcard set — [`apply_delta`] is where that routing happens. All three arrays
 /// store real addresses only, and `updatePreconfs` rejects the all-zero form
 /// outright, so a zero read back here means the layout is wrong, the address is
 /// not a `PreconfWhitelist`, or the contract changed without these constants
@@ -637,7 +644,7 @@ fn apply_whitelist(
     metrics::gauge!("preconf.whitelist.from_wildcard_count").set(from_len as f64);
     metrics::gauge!("preconf.whitelist.to_wildcard_count").set(to_len as f64);
     // Published so a dashboard can alert on the *ratio* without hard-coding the
-    // cap, which would then drift from the binary.
+    // threshold, which would then drift from the binary.
     metrics::gauge!("preconf.whitelist.warn_threshold").set(WHITELIST_WARN_THRESHOLD as f64);
 
     // A large list is legitimate — nothing rejects it — but worth saying out
@@ -770,11 +777,18 @@ fn read_all_within(
 /// Returns `Ok(())` without touching state when preconf is disabled or running
 /// in `all_preconfs` mode.
 ///
-/// The has-code check is deliberately fatal and the *only* fatal check here —
-/// see [`WhitelistError::ContractHasNoCode`] for why the split between "this
-/// node's configuration" and "governance's policy" falls where it does. Checked
-/// once, because deployed code does not disappear (post-Cancun `selfdestruct` no
+/// The has-code check is deliberately fatal — see
+/// [`WhitelistError::ContractHasNoCode`] for why the split between "this node's
+/// configuration" and "governance's policy" falls where it does. Checked once,
+/// because deployed code does not disappear (post-Cancun `selfdestruct` no
 /// longer clears it), so the watcher never repeats it.
+///
+/// It is not the only fatal check. `build_pool` (`mantle-reth-cli`) propagates
+/// every `Err` from here, so a [`WhitelistError::LayoutVersionMismatch`] or a
+/// failed read of the three lists aborts the launch just as hard. That is the
+/// cold-start side of the split every read error takes: at reload the same
+/// failure only warns and the previous lists stay in force. What is *not* fatal,
+/// at either end, is an empty allowlist.
 pub fn bootstrap_whitelist<P: WhitelistState>(
     provider: &P,
     cfg: &PreconfConfig,
@@ -835,9 +849,9 @@ pub fn bootstrap_whitelist<P: WhitelistState>(
 
 /// Whether `chain` contains a `WhitelistUpdated` log emitted by `contract`.
 ///
-/// Split out from the watcher loop so it can be unit-tested against a
-/// hand-built log set — constructing a full `CanonStateNotification` is far more
-/// work than the logic warrants.
+/// Split out from [`should_reload`], which adds the reorg rule on top: this half
+/// is a pure scan over a committed segment, so it can be unit-tested against a
+/// hand-built `Chain` carrying nothing but the logs under test.
 pub fn has_whitelist_event<N: NodePrimitives>(chain: &Chain<N>, contract: Address) -> bool {
     chain.receipts_iter().flat_map(TxReceipt::logs).any(|log| {
         log.address == contract && log.topics().first() == Some(&WHITELIST_UPDATED_TOPIC0)
@@ -1142,8 +1156,8 @@ mod tests {
     }
 
     /// As [`provider_with`], but declaring an arbitrary layout version. `0` is
-    /// the signature of the previous cross-product contract, which never wrote
-    /// that slot.
+    /// the signature of the contract this layout replaced (see
+    /// [`WhitelistError::LayoutVersionMismatch`]), which never wrote that slot.
     fn provider_with_layout(
         pairs: &[(Address, Address)],
         from_wildcards: &[Address],
@@ -1226,7 +1240,7 @@ mod tests {
         };
     }
 
-    /// **The skew this check exists for**: the previous cross-product contract
+    /// **The skew this check exists for**: the contract this layout replaced
     /// never wrote the marker, so it reads back as `0`. Without the check this
     /// same state would load, silently — see
     /// [`WhitelistError::LayoutVersionMismatch`] for what it would install.
@@ -1373,10 +1387,11 @@ mod tests {
         assert_eq!(got, HashSet::from_iter([(addr(1), addr(2))]));
     }
 
-    /// **The budget is spent in storage reads, not array elements.** A pair costs
-    /// two reads, so a budget that expires mid-element must still abort — with
-    /// element-based counting this would sail past the check and only notice at
-    /// the next element boundary.
+    /// **The budget is spent in storage reads, not array elements.** The pairs
+    /// reader charges the shared budget like every other, so a budget already
+    /// spent aborts it **before its first storage read** — `read: 0` of the one
+    /// pair the array claims. That an element costs *two* charges rather than one
+    /// is pinned by `read_all_spends_a_single_budget_across_all_three_arrays`.
     #[test]
     fn read_preconf_pairs_charges_the_budget_per_slot_read() {
         let provider = provider_with(&[(addr(1), addr(2))], &[], &[], true);
@@ -1393,8 +1408,9 @@ mod tests {
 
     /// [`ReadBudget`]'s own contract: one charge per **storage read**, checked on
     /// a stride, and a zero budget does no work at all. This is where the counting
-    /// unit is pinned; that the `Rule[]` loop charges twice per element is
-    /// arithmetic no deterministic test can observe without a fake clock.
+    /// unit is pinned for the type itself; that the `Rule[]` loop charges twice
+    /// per element is pinned by
+    /// `read_all_spends_a_single_budget_across_all_three_arrays`.
     #[test]
     fn read_budget_charges_per_read_and_a_zero_budget_does_no_work() {
         let mut spent = ReadBudget::new(Duration::ZERO);

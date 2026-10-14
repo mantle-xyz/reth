@@ -24,7 +24,8 @@ pub struct FlashblocksConfig {
     pub max_trailing_depth: u64,
     /// Blocks the pending overlay may lead canonical by before the guard fires.
     pub max_leading_depth: u64,
-    /// Blocks ahead of canonical for which early flashblocks are cached.
+    /// Blocks past the next block to be produced for which early flashblocks
+    /// are cached; the cache admits up to `canonical + this + 1`.
     pub max_cache_ahead_blocks: u64,
     /// Interval between upstream websocket ping frames.
     pub subscriber_ping_interval: Duration,

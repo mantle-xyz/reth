@@ -1,21 +1,23 @@
-//! Mantle CLI arguments — flattens upstream `RollupArgs` with mantle-specific
-//! extensions (currently: preconf configuration).
+//! Mantle CLI arguments — flattens upstream `RollupArgs` with three
+//! mantle-specific groups: [`PreconfArgs`], [`FlashblocksArgs`] (the
+//! sequencer-side publisher) and [`FlashblocksConsumerArgs`].
 //!
 //! Composition strategy (see `main.rs`):
 //!
 //! ```text
 //! Cli::<MantleChainSpecParser, MantleArgs>::parse().run(|builder, args| {
-//!     let node = MantleNode::new(args.rollup);
-//!     let node = if let Some(cfg) = args.preconf.into_config() {
-//!         node.with_preconf(PreconfServiceBuilder::from_config(cfg).await?)
-//!     } else { node };
+//!     let mut node = MantleNode::new(args.rollup.clone());
+//!     let MantleConfigs { preconf, publisher, consumer } = args.into_configs()?;
+//!     // `publisher` is bound onto the preconf service, which `with_preconf` takes
 //!     ...
 //! })
 //! ```
 //!
-//! All `--preconf.*` flags are CLI-only (no env-var fallback), matching the
-//! upstream `RollupArgs` convention — every configuration knob lives on the
-//! command line and is discoverable via `--help`.
+//! [`MantleArgs::into_configs`] is the single resolution point, and the place
+//! combinations that cannot work are rejected before the node starts.
+//!
+//! No flag in these three groups has an env-var fallback: every knob lives on
+//! the command line and is discoverable via `--help`.
 
 use std::{net::IpAddr, path::PathBuf, time::Duration};
 
@@ -140,19 +142,22 @@ pub struct FlashblocksConsumerArgs {
     #[arg(long = "flashblocks.websocket-url", alias = "subblocks.websocket-url")]
     pub websocket_url: Option<Url>,
 
-    /// Interval between upstream websocket ping frames, in seconds.
+    /// Interval between upstream websocket ping frames, in seconds. Default 30.
     #[arg(long = "flashblocks.ping-interval-secs", alias = "subblocks.ping-interval-secs")]
     pub ping_interval_secs: Option<u64>,
 
     /// Canonical blocks the pending overlay may trail behind before a rebuild.
+    /// Default 3.
     #[arg(long = "flashblocks.max-trailing-depth", alias = "subblocks.max-trailing-depth")]
     pub max_trailing_depth: Option<u64>,
 
     /// Blocks the pending overlay may lead canonical by before slices are dropped.
+    /// Default 3.
     #[arg(long = "flashblocks.max-leading-depth", alias = "subblocks.max-leading-depth")]
     pub max_leading_depth: Option<u64>,
 
     /// Blocks ahead of canonical for which early-arriving slices are cached.
+    /// Default 5.
     #[arg(long = "flashblocks.max-cache-ahead-blocks", alias = "subblocks.max-cache-ahead-blocks")]
     pub max_cache_ahead_blocks: Option<u64>,
 }
@@ -342,10 +347,12 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.sweep-interval-ms")]
     pub sweep_interval_ms: Option<u64>,
 
-    /// Slot duration in milliseconds — denominator of the pool best-tx
-    /// gas quota schedule: `pool_cumulative_quota(t) = min(t /
-    /// slot_duration, 1.0) × block_gas_limit`. Default 2000ms (OP-stack
-    /// block time). Change only on chains with non-standard cadence.
+    /// Slot duration in milliseconds — the ceiling on the remaining-time input
+    /// to the pool best-tx gas schedule. `derive_pool_quota_schedule` clamps
+    /// the time left to the slot deadline at this value, then divides
+    /// `block_gas_limit` evenly across the `--preconf.sweep-interval-ms` ticks
+    /// that fit in it. Default 2000ms (OP-stack block time). Change only on
+    /// chains with non-standard cadence.
     #[arg(long = "preconf.slot-duration-ms")]
     pub slot_duration_ms: Option<u64>,
 
@@ -367,14 +374,16 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.queue-gas-blocks")]
     pub queue_gas_blocks: Option<u64>,
 
-    /// Journal rotation interval, in seconds. Default 60s. Only meaningful
-    /// when `--preconf.journal-path` is set.
+    /// Journal rotation interval, in seconds. Default 60s. Always in effect
+    /// when preconf is enabled: the journal has no disabled mode, and an unset
+    /// `--preconf.journal-path` only selects the datadir default.
     #[arg(long = "preconf.rejournal-interval-secs")]
     pub rejournal_interval_secs: Option<u64>,
 
     /// Journal file size ceiling, in bytes. Default 1 GiB (`1_073_741_824`).
     /// Above this, rotation renames the current file and starts a new one.
-    /// Only meaningful when `--preconf.journal-path` is set.
+    /// Always in effect when preconf is enabled, like
+    /// `--preconf.rejournal-interval-secs`.
     #[arg(long = "preconf.journal-max-size")]
     pub journal_max_size: Option<u64>,
 

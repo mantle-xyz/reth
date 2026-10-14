@@ -37,7 +37,10 @@ pub trait PendingBlocksAPI {
     /// left for the standard implementation to resolve.
     fn get_canonical_block_number(&self) -> BlockNumberOrTag;
 
-    /// Get the pending transaction count for an address.
+    /// Get how many transactions the address sent in pending state.
+    ///
+    /// A delta, not a nonce: the caller adds it to the address's canonical
+    /// transaction count to answer `eth_getTransactionCount` on `pending`.
     fn get_transaction_count(&self, address: Address) -> U256;
 
     /// Retrieves the current block. If `full` is true, includes full transaction details.

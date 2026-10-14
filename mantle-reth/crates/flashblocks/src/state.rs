@@ -28,7 +28,9 @@ use crate::{
 /// Roughly four seconds of flashblocks.
 const BUFFER_SIZE: usize = 20;
 
-/// Manages the pending flashblock state and processes incoming updates.
+/// Holds the pending flashblock state and queues incoming updates for the
+/// [`StateProcessor`] that [`FlashblocksState::start`] spawns; the processing
+/// itself happens there, not here.
 #[derive(Debug)]
 pub struct FlashblocksState {
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,

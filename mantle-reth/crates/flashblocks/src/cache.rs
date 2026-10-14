@@ -1,17 +1,34 @@
-//! Cache for flashblocks that arrive before their canonical block.
+//! Cache for flashblocks that cannot be applied yet — because their canonical
+//! block has not landed, or because their predecessor slice is missing.
 
 use std::collections::HashMap;
 
 use alloy_primitives::BlockNumber;
 use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 
-/// Default number of blocks ahead of the latest canonical block for which
+/// Default number of blocks past the next block to be produced for which
 /// flashblocks may be cached.
+///
+/// [`FlashblockCache::is_cacheable`] admits block numbers up to
+/// `latest_canonical + max_ahead_blocks + 1`, so this default reaches the next
+/// block to be produced plus five more.
 pub const DEFAULT_MAX_CACHE_AHEAD_BLOCKS: u64 = 5;
 
-/// Buffers flashblocks that arrive before their parent canonical block has been
-/// processed. Once the canonical block lands, the caller drains the
-/// corresponding entries and feeds them through normal execution.
+/// Buffers flashblocks that cannot be applied to the overlay yet. Two paths in
+/// `StateProcessor::apply_flashblock` feed it: slices whose canonical block has
+/// not landed ([`ProviderError::MissingCanonicalHeader`]), and slices that
+/// cannot extend the tracked overlay ([`StateProcessorError::MissingFirstFlashblock`],
+/// [`StateProcessorError::NonConsecutiveBlock`]) but are a valid restart point.
+/// Once the gap closes, the caller drains the corresponding entries and feeds
+/// them through normal execution.
+///
+/// The second path is the only caller of [`FlashblockCache::has_flashblock`]:
+/// a slice with `index > 0` is worth keeping only when its predecessor is
+/// already buffered, otherwise a replay would start mid-block.
+///
+/// [`ProviderError::MissingCanonicalHeader`]: crate::ProviderError::MissingCanonicalHeader
+/// [`StateProcessorError::MissingFirstFlashblock`]: crate::StateProcessorError::MissingFirstFlashblock
+/// [`StateProcessorError::NonConsecutiveBlock`]: crate::StateProcessorError::NonConsecutiveBlock
 #[derive(Debug)]
 pub struct FlashblockCache {
     entries: HashMap<BlockNumber, HashMap<u64, MantleFlashblockPayload>>,
@@ -26,12 +43,16 @@ impl FlashblockCache {
     }
 
     /// Returns `true` when the flashblock is cached.
+    ///
+    /// Used to decide whether a slice with `index > 0` is a usable restart
+    /// point: it only is when its predecessor is already buffered here.
     pub fn has_flashblock(&self, block_number: BlockNumber, index: u64) -> bool {
         self.entries.get(&block_number).and_then(|by_index| by_index.get(&index)).is_some()
     }
 
-    /// Returns `true` when the flashblock's block number is within the configured
-    /// cache-ahead window of the latest known canonical block.
+    /// Returns `true` when the flashblock's block number is no higher than
+    /// `latest_canonical + max_ahead_blocks + 1` — the next block to be
+    /// produced, plus `max_ahead_blocks` beyond it.
     pub const fn is_cacheable(&self, block_number: BlockNumber) -> bool {
         match self.latest_canonical {
             Some(canonical) => block_number <= canonical + self.max_ahead_blocks + 1,

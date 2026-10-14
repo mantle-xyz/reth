@@ -1,8 +1,11 @@
 //! Mantle node type configuration.
 //!
-//! [`MantleNode`] is a thin wrapper over [`OpNode`] that substitutes the standard
-//! [`OpPoolBuilder`] with [`MantlePoolBuilder`], adding Mantle-specific transaction
-//! validation on top of the OP stack checks.
+//! [`MantleNode`] wraps [`OpNode`](reth_optimism_node::OpNode) and swaps two of
+//! its component builders: the pool builder becomes [`MantlePoolBuilder`],
+//! which layers Mantle-specific transaction validation on top of the OP stack
+//! checks, and the payload builder becomes [`MantlePreconfServiceBuilder`].
+//! When a flashblock consumer is configured it also installs `eth_*` RPC
+//! overrides that answer the `pending` tag from flashblock state.
 
 use crate::txpool::MantleTransactionValidator;
 use mantle_reth_flashblocks::{
@@ -175,10 +178,11 @@ where
         let blob_store = reth_node_builder::components::create_blob_store(ctx)?;
 
         // Resolve preconf wiring once. When no caller has wired up preconf
-        // (`with_preconf` not invoked), supply default-disabled handles so the
-        // journal restore below is a no-op (empty fifo + disabled cfg).
+        // (`with_preconf` not invoked), `preconf_svc` is `None` and the journal
+        // restore below is skipped outright; the default-disabled cfg /
+        // classifier / fifo exist only so these bindings are unconditional.
         // No journal handle is pulled out here: nothing in this scope needs one —
-        // rotation reaches it through `svc.journal()` below.
+        // rotation reaches it through `svc.journal()` in `MantleNode::add_ons`.
         let (preconf_cfg, preconf_classifier, preconf_fifo, preconf_svc) =
             match self.preconf.clone() {
                 Some(p) => (p.cfg, p.classifier, p.fifo, p.svc),
@@ -343,9 +347,12 @@ pub type MantleNodeComponentBuilder<N> = ComponentsBuilder<
 
 /// Mantle node type configuration.
 ///
-/// A newtype wrapper over [`OpNode`](reth_optimism_node::OpNode) that replaces
-/// [`OpPoolBuilder`] with [`MantlePoolBuilder`] to enforce Mantle-specific
-/// transaction-pool validation rules.
+/// Wraps [`OpNode`](reth_optimism_node::OpNode) and carries the two Mantle
+/// subsystems that change how it is built. [`MantleNode::components`] swaps in
+/// [`MantlePoolBuilder`] for the pool and [`MantlePreconfServiceBuilder`] for
+/// the payload builder; [`MantleNode::add_ons`] registers the preconf RPC
+/// handler and, when a consumer is configured, the flashblock `eth_*`
+/// overrides.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct MantleNode {
@@ -612,7 +619,7 @@ where
                         use tokio_stream::StreamExt as _;
                         while let Some(Ok(notification)) = canonical_stream.next().await {
                             for block in notification.committed().blocks_iter() {
-                                // v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
+                                // op-reth v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
                                 state_for_canonical
                                     .on_canonical_block_received(block.as_ref().clone());
                             }

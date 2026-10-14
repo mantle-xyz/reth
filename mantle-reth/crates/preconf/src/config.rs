@@ -22,10 +22,10 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Default slot duration — 2 seconds.
 ///
-/// Governs the time-proportional pool gas quota:
-/// `pool_cumulative_quota(t) = min(t / slot_duration, 1.0) × block_gas_limit`.
-/// Matches the OP-stack default block time. Change only if operating on a
-/// chain with non-standard slot cadence.
+/// Caps the remaining-time input to the pool gas quota schedule: see
+/// [`slot_duration`](PreconfConfig::slot_duration). Matches the OP-stack
+/// default block time. Change only if operating on a chain with non-standard
+/// slot cadence.
 pub const DEFAULT_SLOT_DURATION: Duration = Duration::from_secs(2);
 
 /// Default per-tx gas limit for preconf-eligible transactions — `2_000_000`.
@@ -134,9 +134,11 @@ pub struct PreconfConfig {
     /// — default 200ms.
     pub sweep_interval: Duration,
 
-    /// Total slot duration used as the denominator of the pool gas
-    /// quota schedule: `pool_cumulative_quota(t) = (t / slot_duration)
-    /// × block_gas_limit`. Default 2s (OP-stack block time).
+    /// Ceiling on the remaining-time input to the pool gas quota schedule, not
+    /// a divisor: `builder::pacing::derive_pool_quota_schedule` clamps the time
+    /// left to the slot deadline at this value, then divides `block_gas_limit`
+    /// evenly across the [`sweep_interval`](Self::sweep_interval) ticks that
+    /// fit in it. Default 2s (OP-stack block time).
     pub slot_duration: Duration,
 
     // ===== Operator hardening =====

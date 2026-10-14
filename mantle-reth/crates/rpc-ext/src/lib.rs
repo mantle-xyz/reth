@@ -109,23 +109,35 @@ pub struct PreconfTxEvent {
 /// Preconfirmation status.
 ///
 /// Matches op-geth's 4-variant `PreconfStatus` for cross-client SDK
-/// compatibility. Server pre-apply rejection (e.g. block gas budget) is
-/// collapsed into `Failed` at this wire boundary — the fine-grained reason
-/// travels in [`PreconfTxEvent::reason`].
+/// compatibility.
 ///
-/// **This enum is wider than what the node can be in.** The queue's own status
-/// is `Waiting` or `Success` and nothing else: a commitment that ends is
-/// removed rather than parked in a terminal state, so there is no `Canceled`
-/// or `Failed` to map from. The extra variants exist because the wire shape is
-/// op-geth's, not because this node has four states.
+/// **Two different things wear this name, and only one of them is this enum.**
+/// The queue's own entry status is `Waiting` or `Success` and nothing else —
+/// a commitment that ends is removed rather than parked in a terminal state.
+/// The wire status here is derived separately, from the EVM execution outcome:
+/// `impl From<PreconfReceipt> for PreconfTxEvent` in `mantle_reth_preconf::rpc`
+/// maps `receipt.status` to `Success` / `Failed`, and the handler's deadline
+/// arm builds `Timeout`. So `Failed` has no queue counterpart to map from, but
+/// it is still a status clients see.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PreconfStatus {
     /// EVM apply succeeded; tx on chain.
     #[serde(rename = "success")]
     Success,
-    /// Either (a) EVM apply revert/halt (tx on chain) OR (b) builder
-    /// pre-apply reject / server-side cancel (tx NOT on chain). The
-    /// [`PreconfTxEvent::reason`] field disambiguates.
+    /// EVM apply revert or halt; tx on chain, nonce consumed.
+    ///
+    /// **Narrower than op-geth's `failed`, deliberately.** The two agree
+    /// everywhere else: an admission refusal (base fee, funds, tx type) is a
+    /// JSON-RPC error on both, a revert is `Failed` on both, an expired
+    /// deadline is `Timeout` on both. They differ once the builder has the
+    /// transaction and cannot fit it: op-geth reports that as `failed` with
+    /// `ErrPreconfBlockFull` in the reason, while this node answers the
+    /// JSON-RPC call with an error — `PreconfError::BlockGasBudgetExceeded` and
+    /// its DA counterparts leave through the handler's `Some(Ok(Err(err)))`
+    /// arm, which sends no event at all.
+    ///
+    /// So `Failed` from this node always means the transaction executed and is
+    /// on chain. From op-geth it may also mean it never ran.
     #[serde(rename = "failed")]
     Failed,
     /// Client-side deadline elapsed (`preconf_timeout`); tx NOT on chain.
@@ -144,15 +156,21 @@ pub enum PreconfStatus {
 /// Preconfirmation transaction receipt.
 ///
 /// `logs` is `Option` rather than a plain `Vec` so absence semantics
-/// can be expressed on the wire: `null` when no EVM apply happened
-/// (Timeout / server pre-apply reject), `[]` when apply happened but
-/// emitted no logs. SDKs treat both as "no logs" but the wire shape
-/// preserves the distinction.
+/// can be expressed on the wire: `null` when no EVM apply happened,
+/// `[]` when apply happened but emitted no logs. SDKs treat both as
+/// "no logs" but the wire shape preserves the distinction.
 ///
-/// Every field but `logs` is `Option` and omitted when absent. An absent field
-/// means the sequencer did not send one — an op-geth sequencer sends only
-/// `logs` — so a forwarding reth node reproduces its response byte for byte.
-/// A zero would be a number this node invented; absence is the honest answer.
+/// This node sends `null` only on `Timeout`; it answers a builder refusal with
+/// a JSON-RPC error rather than an event (see [`PreconfStatus::Failed`]). An
+/// event deserialised from an op-geth sequencer can carry `null` on `failed`
+/// as well.
+///
+/// Apart from `logs`, every scalar field is `Option` and omitted when absent;
+/// `l1_fields` is a flattened struct whose own fields are each `Option` and
+/// each omitted individually. An absent field means the sequencer did not send
+/// one — an op-geth sequencer sends only `logs` — so a forwarding reth node
+/// reproduces its response byte for byte. A zero would be a number this node
+/// invented; absence is the honest answer.
 #[derive(Debug, Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreconfTxReceipt {
@@ -400,7 +418,7 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         let Some(overlay) = self.pending_overrides.as_ref() else {
             return Ok((payload, block_number));
         };
-        // Counted here rather than right after the `pending` check: unlike the nine
+        // Counted here rather than right after the `pending` check: unlike the
         // `flashblocks.rpc.*` counters in the override module, this method is
         // registered whether or not the consumer is enabled.
         Metrics::rpc_simulate_v1().increment(1);

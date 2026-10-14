@@ -20,8 +20,7 @@
 //! because the only notion this layer could form — *canonical once* — is one a
 //! reorg can undo. Rotation receives that decision as the `retain` predicate
 //! [`PreconfJournal::rotate`] takes, and restore asks
-//! `Commitments::is_tracked` directly. This is the sole statement of that
-//! division; the rest of the file assumes it.
+//! `Commitments::is_tracked` directly.
 //!
 //! **Two writers, and only one of them creates the record that keeps a line.**
 //! [`PreconfJournal::append_promised`] takes one commitment from the apply;
@@ -1133,7 +1132,7 @@ pub async fn run_rejournal_loop<F, T>(
 where
     F: Future<Output = T>,
 {
-    // The one eviction rule: a record may go once the classifier has stopped
+    // The one eviction rule: a record may go once `claims` has stopped
     // tracking its commitment. That happens when the commitment was kept and
     // buried `SEAL_DEPTH` persisted blocks deep, when a promise can no longer
     // reach the block it was made for, or when a build gave it up. Everything
@@ -1482,7 +1481,7 @@ mod tests {
         let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
         let kept = entry(3, 12);
         j.append_batch(&[entry(1, 10), entry(2, 11), kept.clone()]).await.unwrap();
-        let c = classifier_done_with(&[TxHash::from([1; 32]), TxHash::from([2; 32])]);
+        let c = commitments_done_with(&[TxHash::from([1; 32]), TxHash::from([2; 32])]);
         still_owed(&c, kept.hash);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1510,15 +1509,15 @@ mod tests {
     }
 
     /// Age is not an eviction rule here. An entry stamped at the epoch is kept
-    /// as long as the classifier still tracks its commitment — the journal has
+    /// as long as `Commitments` still tracks its commitment — the journal has
     /// no clock of its own to overrule that with.
     #[tokio::test]
-    async fn rotate_keeps_an_ancient_entry_the_classifier_still_tracks() {
+    async fn rotate_keeps_an_ancient_entry_commitments_still_tracks() {
         let (_dir, j) = fresh_journal().await;
         let ancient = entry_at(1, 10, 1_000);
         j.append_promised(&ancient).await.unwrap();
 
-        let c = empty_classifier();
+        let c = empty_commitments();
         c.mark_promised(ancient.hash, &Address::from([0xEE; 20]), 0, ancient.block_height).unwrap();
 
         let stats = j.rotate(|h| c.is_tracked(h)).await.unwrap();
@@ -1527,17 +1526,17 @@ mod tests {
         assert_eq!(survivors, vec![ancient], "still tracked ⇒ still owed ⇒ kept");
     }
 
-    /// The entry leaves the file exactly when the classifier stops tracking its
+    /// The entry leaves the file exactly when `Commitments` stops tracking its
     /// commitment — nothing else. When that happens (buried `SEAL_DEPTH` deep, a
-    /// promise out of reach, a build giving up) is the classifier's question, and
+    /// promise out of reach, a build giving up) is `Commitments`' question, and
     /// is pinned by its own `sweep` tests.
     #[tokio::test]
-    async fn rotate_drops_an_entry_the_classifier_gave_up() {
+    async fn rotate_drops_an_entry_commitments_gave_up() {
         let (_dir, j) = fresh_journal().await;
         let e = entry_at(1, 10, 1_000);
         j.append_promised(&e).await.unwrap();
 
-        let c = empty_classifier();
+        let c = empty_commitments();
         c.mark_promised(e.hash, &Address::from([0xEE; 20]), 0, e.block_height).unwrap();
         assert_eq!(j.rotate(|h| c.is_tracked(h)).await.unwrap().dropped, 0);
 
@@ -1545,7 +1544,7 @@ mod tests {
         let stats = j.rotate(|h| c.is_tracked(h)).await.unwrap();
         assert_eq!(stats.dropped, 1);
         let (survivors, _) = j.load().await.unwrap();
-        assert!(survivors.is_empty(), "the journal follows the classifier");
+        assert!(survivors.is_empty(), "the journal follows `Commitments`");
     }
 
     #[tokio::test]
@@ -1616,8 +1615,8 @@ mod tests {
         assert_eq!(bad, 0);
     }
 
-    /// Rotation keeps whatever `retain` says to keep. Production passes "the
-    /// classifier is still tracking this".
+    /// Rotation keeps whatever `retain` says to keep. Production passes
+    /// "`Commitments` is still tracking this".
     #[tokio::test]
     async fn rotate_keeps_exactly_what_retain_accepts() {
         let (_dir, j) = fresh_journal().await;
@@ -1639,8 +1638,7 @@ mod tests {
     }
 
     /// The safe direction: a predicate that keeps everything drops nothing, so a
-    /// classifier that is still tracking every commitment cannot lose one to a
-    /// rotation tick.
+    /// rotation tick cannot lose a commitment `Commitments` is still tracking.
     #[tokio::test]
     async fn rotate_keeps_everything_when_retain_always_true() {
         let (_dir, j) = fresh_journal().await;
@@ -1979,14 +1977,14 @@ mod tests {
     /// relative to the persisted watermark they publish.
     const LANDED_AT: u64 = 10;
 
-    /// The production rotation predicate: a record stays while the classifier is
+    /// The production rotation predicate: a record stays while `Commitments` is
     /// still tracking its commitment. Tests use it so they exercise the same
     /// decision production does, rather than a hand-written stand-in.
     fn retain_tracked(c: &Commitments) -> impl Fn(&TxHash) -> bool + '_ {
         move |h| c.is_tracked(h)
     }
 
-    /// Classifier for restore tests, with **empty allowlists on purpose**: cold
+    /// `Commitments` for restore tests, with **empty allowlists on purpose**: cold
     /// start may legitimately have loaded two empty lists (governance allows
     /// nobody) and restore must still bring commitments back. `restart_replay.rs`
     /// structurally cannot reproduce that, since it seeds the lists before the
@@ -1994,21 +1992,21 @@ mod tests {
     ///
     /// Built **enabled**, because `PreconfConfig::default()` has
     /// `enabled: false`, which short-circuits every write on this type — restore
-    /// would appear to run and record nothing. Any classifier a test hands to
+    /// would appear to run and record nothing. Any `Commitments` a test hands to
     /// `restore_preconf_state` must be enabled for the same reason.
-    fn empty_classifier() -> Commitments {
+    fn empty_commitments() -> Commitments {
         Commitments::from_config(&crate::PreconfConfig {
             enabled: true,
             ..crate::PreconfConfig::default()
         })
     }
 
-    /// A classifier that has finished tracking `hashes`: each was promised,
+    /// A `Commitments` that has finished tracking `hashes`: each was promised,
     /// observed on chain, and has since been buried `SEAL_DEPTH` persisted
-    /// blocks deep. That is the only state in which rotation may drop a record,
-    /// so it is what the rejournal-loop tests need to set up.
-    fn classifier_done_with(hashes: &[TxHash]) -> Arc<Commitments> {
-        let c = empty_classifier();
+    /// blocks deep. Rotation may drop a record in that state, which is what the
+    /// rejournal-loop tests need to set up.
+    fn commitments_done_with(hashes: &[TxHash]) -> Arc<Commitments> {
+        let c = empty_commitments();
         for (i, h) in hashes.iter().enumerate() {
             // Distinct (sender, nonce) per hash so the claims do not collide.
             let _ = c.mark_promised(*h, &Address::from([0xEE; 20]), i as u64, 0);
@@ -2025,11 +2023,11 @@ mod tests {
         Arc::new(c)
     }
 
-    /// A classifier with the watermark already high enough that anything
+    /// A `Commitments` with the watermark already high enough that anything
     /// [`finish_tracking`] marks becomes immediately releasable. For tests that
     /// need to finish a commitment *after* the rotation loop has started.
-    fn classifier_with_high_watermark() -> Arc<Commitments> {
-        let c = empty_classifier();
+    fn commitments_with_high_watermark() -> Arc<Commitments> {
+        let c = empty_commitments();
         c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         Arc::new(c)
     }
@@ -2043,7 +2041,7 @@ mod tests {
         assert!(c.is_tracked(&hash));
     }
 
-    /// Take `hash` through promise → committed → released, so the classifier is
+    /// Take `hash` through promise → committed → released, so `Commitments` is
     /// done with it — i.e. finish tracking a commitment mid-flight.
     ///
     /// The release is the point: rotation keys on the record, and retention
@@ -2086,10 +2084,10 @@ mod tests {
             let pool = StubPool::new();
             let chain = landed();
             let fifo = Arc::new(PreconfTxSet::new(1 << 16));
-            let classifier = empty_classifier();
+            let claims = empty_commitments();
 
             let started = std::time::Instant::now();
-            restore_preconf_state(&journal, &pool, &chain, &fifo, &classifier).await;
+            restore_preconf_state(&journal, &pool, &chain, &fifo, &claims).await;
             started.elapsed()
         }
 
@@ -2112,7 +2110,7 @@ mod tests {
         let (_dir, j) = fresh_journal().await;
         let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
         assert!(pool.add_calls.lock().unwrap().is_empty());
         assert!(fifo.snapshot().await.is_empty());
     }
@@ -2125,7 +2123,7 @@ mod tests {
 
         let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
 
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "both txs admitted");
         let snapshot = fifo.snapshot().await;
@@ -2140,7 +2138,7 @@ mod tests {
 
         let pool = StubPool::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_classifier()).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
 
         assert_eq!(pool.add_calls.lock().unwrap().len(), 1);
         assert_eq!(fifo.snapshot().await.len(), 1);
@@ -2155,7 +2153,7 @@ mod tests {
         /// Pool that, on each tx it is handed, snapshots the promise flag of **all**
         /// journal hashes — including the ones not offered yet.
         struct RecordSpyPool {
-            classifier: Arc<Commitments>,
+            claims: Arc<Commitments>,
             hashes: Vec<TxHash>,
             seen: std::sync::Mutex<Vec<Vec<bool>>>,
         }
@@ -2179,7 +2177,7 @@ mod tests {
                 self.seen
                     .lock()
                     .unwrap()
-                    .push(self.hashes.iter().map(|h| self.classifier.is_tracked(h)).collect());
+                    .push(self.hashes.iter().map(|h| self.claims.is_tracked(h)).collect());
                 Ok(RestoredEnvelope {
                     envelope: TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash)),
                     from: Address::from([seed; 20]),
@@ -2195,14 +2193,14 @@ mod tests {
         j.append_promised(&entry(2, 11)).await.unwrap();
         j.append_promised(&entry(3, 12)).await.unwrap();
 
-        let classifier = Arc::new(empty_classifier());
+        let claims = Arc::new(empty_commitments());
         let pool = RecordSpyPool {
-            classifier: classifier.clone(),
+            claims: claims.clone(),
             hashes: (1u8..=3).map(|b| TxHash::from([b; 32])).collect(),
             seen: std::sync::Mutex::new(vec![]),
         };
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &classifier).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &claims).await;
 
         let seen = pool.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 3, "every entry must be offered to the pool");
@@ -2230,16 +2228,16 @@ mod tests {
     /// network), so this pins the property that the *index* enforces it rather
     /// than startup order.
     ///
-    /// NB the classifier here is **enabled** with empty allowlists, not
-    /// `empty_classifier()` (which is built from a default config, i.e. disabled).
-    /// `mark_promised` returns early on a disabled classifier and records
-    /// nothing at all, which would make this test vacuous.
+    /// NB the `Commitments` here has to be **enabled**: `mark_promised` returns
+    /// early on a disabled one and records nothing at all, which would make this
+    /// test vacuous. `empty_commitments()` would serve equally well — it builds
+    /// the same thing.
     #[tokio::test]
     async fn restore_claims_every_slot_before_admitting_any() {
         /// Pool that, on each tx it is handed, snapshots the owner of **all** the
         /// journal entries' slots — including those not offered yet.
         struct SlotSpyPool {
-            classifier: Arc<Commitments>,
+            claims: Arc<Commitments>,
             slots: Vec<(Address, u64)>,
             seen: std::sync::Mutex<Vec<Vec<Option<TxHash>>>>,
         }
@@ -2260,7 +2258,7 @@ mod tests {
                 self.seen.lock().unwrap().push(
                     self.slots
                         .iter()
-                        .map(|(from, nonce)| self.classifier.slot_owner(from, *nonce))
+                        .map(|(from, nonce)| self.claims.slot_owner(from, *nonce))
                         .collect(),
                 );
                 let inner = TxLegacy { nonce: u64::from(seed), ..Default::default() };
@@ -2280,15 +2278,15 @@ mod tests {
         j.append_promised(&entry(2, 11)).await.unwrap();
         j.append_promised(&entry(3, 12)).await.unwrap();
 
-        let classifier =
+        let claims =
             Arc::new(Commitments::enabled(crate::commitments::DEFAULT_COMMITMENT_CACHE_CAP));
         let pool = SlotSpyPool {
-            classifier: classifier.clone(),
+            claims: claims.clone(),
             slots: (1u8..=3).map(|b| (Address::from([b; 20]), u64::from(b))).collect(),
             seen: std::sync::Mutex::new(vec![]),
         };
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &classifier).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &claims).await;
 
         let seen = pool.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 3, "every entry must be offered to the pool");
@@ -2318,7 +2316,7 @@ mod tests {
         let e = entry(1, 10);
         j.append_promised(&e).await.unwrap();
 
-        let c = empty_classifier();
+        let c = empty_commitments();
         // Coherent rather than `landed()`: a transaction that is on chain has
         // necessarily taken its nonce, and it is the *nonce* that sends
         // restore looking for the hash in the first place.
@@ -2402,7 +2400,7 @@ mod tests {
         j.append_promised(&loser).await.unwrap();
 
         let fifo = Arc::new(PreconfTxSet::new(16));
-        let c = empty_classifier();
+        let c = empty_commitments();
         restore_preconf_state(&j, &SameSlotPool, &landed(), &fifo, &c).await;
 
         // The pre-pass gives the slot to whoever asks first; the other loses it.
@@ -2465,7 +2463,7 @@ mod tests {
         let e = entry(1, 10);
         j.append_promised(&e).await.unwrap();
 
-        let c = empty_classifier();
+        let c = empty_commitments();
         restore_preconf_state(
             &j,
             &OnChainPool,
@@ -2475,8 +2473,8 @@ mod tests {
         )
         .await;
 
-        // `retain_tracked`, not `|_| true`: the entry survives because the
-        // classifier still has its record, which is what the old behaviour got
+        // `retain_tracked`, not `|_| true`: the entry survives because
+        // `Commitments` still has its record, which is what the old behaviour got
         // wrong — treating the consumed nonce as "kept" dropped the line here.
         j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();
@@ -2489,7 +2487,7 @@ mod tests {
         // And the record is un-landed, not landed-and-shallow: only an un-landed
         // one can be released outright. A commitment observed on chain would be
         // held by its retention depth instead. How long an un-landed promise is
-        // kept is `sweep`'s question, pinned in the classifier's own tests.
+        // kept is `sweep`'s question, pinned in `Commitments`' own tests.
         assert!(c.release_unless_committed(&e.hash), "restore must not record it as landed");
     }
 
@@ -2501,7 +2499,7 @@ mod tests {
         let e = entry(1, 10);
         j.append_promised(&e).await.unwrap();
 
-        let c = empty_classifier();
+        let c = empty_commitments();
         restore_preconf_state(
             &j,
             &OnChainPool,
@@ -2526,7 +2524,7 @@ mod tests {
         let e = entry(1, 10);
         j.append_promised(&e).await.unwrap();
 
-        let c = empty_classifier();
+        let c = empty_commitments();
         restore_preconf_state(
             &j,
             &OnChainPool,
@@ -2557,7 +2555,7 @@ mod tests {
                 &OnChainPool,
                 &StubChain(answer, NONCE_IS_GONE),
                 &fifo,
-                &empty_classifier(),
+                &empty_commitments(),
             )
             .await;
 
@@ -2577,7 +2575,7 @@ mod tests {
         let mut pool = StubPool::new();
         pool.reject_add = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
-        let c = empty_classifier();
+        let c = empty_commitments();
         restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
 
         // Both entries' recover_envelope calls return Err — the function
@@ -2602,7 +2600,7 @@ mod tests {
         let mut pool = StubPool::new();
         pool.undecodable = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
-        let c = empty_classifier();
+        let c = empty_commitments();
         restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
 
         assert!(!c.is_tracked(&e.hash), "an entry that cannot be named holds no record");
@@ -2618,7 +2616,7 @@ mod tests {
         let (_dir, j) = fresh_journal().await;
         let e_a = entry(1, 10);
         j.append_promised(&e_a).await.unwrap();
-        let c = classifier_done_with(&[e_a.hash]);
+        let c = commitments_done_with(&[e_a.hash]);
 
         let j = Arc::new(j);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -2659,7 +2657,7 @@ mod tests {
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
         j.append_promised(&e3).await.unwrap();
-        let c = classifier_done_with(&[e1.hash, e2.hash]);
+        let c = commitments_done_with(&[e1.hash, e2.hash]);
         still_owed(&c, e3.hash);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -2716,7 +2714,7 @@ mod tests {
         // `graceful_shutdown_performs_final_rotate` for that behavior.)
         let handle = spawn_rejournal_loop(
             j.clone(),
-            empty_classifier().into(),
+            empty_commitments().into(),
             Duration::from_secs(60),
             shutdown_rx,
         );
@@ -2740,7 +2738,7 @@ mod tests {
         j.append_promised(&entry(1, 100)).await.unwrap();
         let j = Arc::new(j);
 
-        let c = classifier_with_high_watermark();
+        let c = commitments_with_high_watermark();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         // Interval large — no periodic tick will fire during the test.
         let handle =
@@ -2782,7 +2780,7 @@ mod tests {
         let shutdown = async { Sentinel(7) };
         let out = run_rejournal_loop(
             j.clone(),
-            empty_classifier().into(),
+            empty_commitments().into(),
             Duration::from_secs(60),
             shutdown,
         )
@@ -2808,7 +2806,7 @@ mod tests {
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
         j.append_promised(&e3).await.unwrap();
-        let c = classifier_with_high_watermark();
+        let c = commitments_with_high_watermark();
         finish_tracking(&c, e1.hash);
         still_owed(&c, e2.hash);
         still_owed(&c, e3.hash);
@@ -2858,7 +2856,7 @@ mod tests {
         let e2 = entry(2, 11);
         j.append_promised(&e1).await.unwrap();
         j.append_promised(&e2).await.unwrap();
-        let c = classifier_with_high_watermark();
+        let c = commitments_with_high_watermark();
         finish_tracking(&c, e1.hash);
         still_owed(&c, e2.hash);
 
@@ -3005,7 +3003,7 @@ mod tests {
 /// against changes that leak entries or drift the counter.
 ///
 /// Which records may be dropped is the caller's decision, expressed through
-/// `rotate`'s `retain` predicate (production passes "the classifier is still
+/// `rotate`'s `retain` predicate (production passes "`Commitments` is still
 /// tracking this"), so `Op::Untrack` mutates a tracking set the *test* owns.
 /// The model therefore poses the question the interface actually asks: does
 /// rotate drop exactly what it was told to, and does the file stay in
