@@ -91,8 +91,9 @@ use crate::{
 /// that is producing, so reaching the cap means several have not — worth
 /// alerting on rather than growing silently.
 ///
-/// Only `Announced` claims are evictable; a `Promised` one is never dropped
-/// for being old.
+/// An entry is evictable only when it is `Success` and no promise was recorded
+/// for it: a commitment whose receipt went out is never dropped for being old,
+/// and neither is anything still `Waiting`.
 pub const STAGED_CAP: usize = 4096;
 
 /// A single fifo entry.
@@ -891,11 +892,13 @@ impl PreconfTxSet {
                 return PushResult::ConflictActive(existing_hash);
             }
             // Invariant violation: `by_sender[from][nonce]` points at a hash
-            // with no entry. Both halves are needed — `drop_hash` alone skips
-            // `by_sender` because the entry is already gone, and the new insert
-            // cannot claim the slot until it is cleared. Production heals and
-            // carries on rather than tearing down the sequencer; the
-            // `debug_assert!` is what makes it loud in development.
+            // with no entry. `unindex_sender_nonce` frees the slot the new
+            // insert needs, in constant time; `drop_hash` then takes the stale
+            // hash out of `order`. (Its `unindex` would reach `by_sender` too,
+            // but only through the defensive sweep over every sender.)
+            // Production heals and carries on rather than tearing down the
+            // sequencer; the `debug_assert!` is what makes it loud in
+            // development.
             error!(
                 target: "mantle::preconf",
                 sender = ?from,
@@ -2184,7 +2187,7 @@ mod tests {
 
         assert!(
             set.senders_with_landed_claims().await.contains(&preconf_only),
-            "the pool-nonce repair must cover a sender the old unlanded index never held",
+            "the pool-nonce repair must cover a sender that sent nothing but preconf transactions",
         );
     }
 

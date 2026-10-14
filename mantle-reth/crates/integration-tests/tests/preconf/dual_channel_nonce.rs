@@ -6,26 +6,22 @@
 //! has two possible answers, and which one the preconf admission uses is a
 //! client-visible decision.
 //!
-//! Today the preconf handler asks the transaction pool, so it sees the sender's
-//! ordinary transactions whether or not they have executed. The direct-admission
-//! design does not read the pool at all (the `admission` module docs say why):
-//! its view starts from the **chain** nonce and advances as transactions
-//! **execute**. The difference shows up in exactly one window — an ordinary
-//! transaction sitting in the pool that has not run yet:
+//! Preconf admission does not read the pool at all (the `admission` module docs
+//! say why): its view starts from the **chain** nonce and advances as
+//! transactions **execute**. So the two channels answer differently in exactly
+//! one window — an ordinary transaction sitting in the pool that has not run
+//! yet. That one is not counted, and a preconf transaction on top of it is
+//! refused with `NonceGap`. Once it has executed, this block or canonically,
+//! both channels count it.
 //!
-//! | ordinary tx state | today | after |
-//! |---|---|---|
-//! | queued in the pool, not executed | counted → next preconf nonce admitted | not counted → `NonceGap` |
-//! | executed (this block or canonical) | counted | counted |
-//!
-//! The first row is a deliberate narrowing, not a regression to fix: the
-//! preconf arm dispatches ahead of the pool arm, so a preconf transaction
+//! Refusing the first case is a deliberate narrowing, not a regression to fix:
+//! the preconf arm dispatches ahead of the pool arm, so a preconf transaction
 //! admitted on top of an unexecuted pool transaction would usually fail at
 //! execution anyway with nonce-too-high. Refusing at admission is the same
 //! outcome delivered a couple of orders of magnitude sooner, and `NonceGap` is
 //! already specified as "resend in nonce order".
 //!
-//! The second row is the one that must not move, and is what
+//! The executed case is the one that must not move, and is what
 //! `a_preconf_tx_after_a_canonical_normal_tx_is_admitted` guards.
 //!
 //! Not covered here: the *mid-block* case — an ordinary transaction executed by

@@ -126,15 +126,11 @@ async fn a_slice_for_an_already_canonical_block_is_skipped() {
 /// `mantle-reth/crates/flashblocks/src/receipt_builder.rs` — instead of failing
 /// pre-validation and taking the whole slice, L1-attributes deposit included, with it.
 ///
-/// This still only covers a post-exec transaction appended to `transactions`.
-/// The mantle v1.6.3 consumer protocol carries it out of band in the slice's
-/// `post_exec_tx` field with replace-not-append semantics, and our producer does
-/// not yet do that — so producing flashblocks with SDM enabled remains an
-/// untested combination. `FlashblockProducerConfig::validate` refuses it at
-/// boot (`--rollup.operator-sdm-opt-in` together with `--flashblocks.enable`),
-/// but that gate only sees the CLI flag: `admin_setOperatorSdmOptIn` can still
-/// turn SDM on at runtime after a node has started with flashblocks already
-/// publishing.
+/// This covers only a post-exec transaction appended to `transactions`. The
+/// wire protocol carries it out of band instead, so producing flashblocks with
+/// SDM enabled stays an untested combination — see
+/// `FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks` for the gate
+/// that refuses it at boot, and for the hole that gate leaves open.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_carrying_a_post_exec_transaction_replays_it_as_a_noop() {
     use alloy_network::eip2718::Encodable2718;
