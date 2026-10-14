@@ -65,6 +65,7 @@ reth-tracing = { workspace = true }
 # alloy
 alloy-genesis = { workspace = true }
 alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 alloy-rpc-types-engine = { workspace = true }
 alloy-network = { workspace = true }
