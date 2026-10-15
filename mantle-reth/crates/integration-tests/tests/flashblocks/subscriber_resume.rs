@@ -49,6 +49,9 @@ enum Script {
     /// A slice, then silence: the connection is never read again, so pings go
     /// unanswered.
     Deaf(u64),
+    /// A slice, then the TCP stream is dropped — an end with no close frame,
+    /// which is what a draining load balancer or a killed upstream looks like.
+    Abort(u64),
 }
 
 /// Serves `script[n]` on the n-th connection, repeating the last entry, and
@@ -96,6 +99,11 @@ async fn stub_server(script: Vec<Script>) -> (Url, UnboundedReceiver<String>) {
                         websocket.send(slice_message(*block_number)).await?;
                         // Never polled again, so tungstenite never answers a ping.
                         std::future::pending::<()>().await;
+                    }
+                    Some(Script::Abort(block_number)) => {
+                        websocket.send(slice_message(*block_number)).await?;
+                        drop(websocket);
+                        return Ok(());
                     }
                     None => {}
                 }
@@ -211,4 +219,29 @@ async fn an_unanswered_ping_reconnects_and_resumes() {
     assert_eq!(next(&mut slices).await.metadata.block_number, 9);
 
     assert_eq!(next(&mut uris).await, "/ws?block_number=9&flashblock_index=0");
+}
+
+/// An upstream that ends the stream without a close frame is noticed at once,
+/// not at the next keepalive.
+///
+/// The read branch is written `Some(msg) = read.next()`, which would leave the
+/// loop waiting on the keepalive if the stream ever yielded `None` — two ping
+/// intervals to infer what the socket already reported. It does not: tungstenite
+/// surfaces an abrupt end as an error, so the error arm reconnects immediately.
+/// This holds that arm in place; the keepalive is left effectively off so that
+/// anything reconnecting here did so because the read side said so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_that_ends_the_stream_is_noticed_without_waiting_for_a_ping() {
+    let (url, mut uris) = stub_server(vec![Script::Abort(1), Script::Slices(vec![2])]).await;
+    let mut slices = subscribe(url);
+
+    assert_eq!(next(&mut uris).await, "/ws");
+    assert_eq!(next(&mut slices).await.metadata.block_number, 1);
+
+    assert_eq!(
+        next(&mut uris).await,
+        "/ws?block_number=1&flashblock_index=0",
+        "the reconnect must name the last slice received",
+    );
+    assert_eq!(next(&mut slices).await.metadata.block_number, 2);
 }

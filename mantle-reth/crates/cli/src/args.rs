@@ -142,7 +142,7 @@ pub struct FlashblocksConsumerArgs {
     #[arg(long = "flashblocks.websocket-url", alias = "subblocks.websocket-url")]
     pub websocket_url: Option<Url>,
 
-    /// Interval between upstream websocket ping frames, in seconds. Default 30.
+    /// Interval between upstream websocket ping frames, in seconds. Default 2.
     #[arg(long = "flashblocks.ping-interval-secs", alias = "subblocks.ping-interval-secs")]
     pub ping_interval_secs: Option<u64>,
 
