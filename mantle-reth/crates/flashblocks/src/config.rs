@@ -6,8 +6,22 @@ use url::Url;
 
 use crate::DEFAULT_MAX_CACHE_AHEAD_BLOCKS;
 
-/// Default interval between upstream websocket ping frames.
-pub const DEFAULT_SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Default interval between upstream websocket ping frames — 2s.
+///
+/// Half of a budget the producer sets: it archives `ring_capacity` slices for a
+/// subscriber to resume from, roughly six seconds at the default capacity and
+/// slice interval, after which a reconnect comes back with a gap and the
+/// consumer loses the rest of that block. Detection has to fit inside that,
+/// with room left for the handshake and the replay.
+///
+/// A dead connection is noticed after two ticks — one to send a ping, one to
+/// find it unanswered — so this bounds detection at 4s. Only a connection that
+/// goes quiet without ending needs it: a stream that ends is reported by the
+/// socket and reconnects at once (`subscriber_resume.rs` pins that). Those are
+/// rarer, which makes the keepalive cheap; it is one frame per interval on one
+/// connection, against a reconnect that resumes from the archive at no cost
+/// when it is wrong.
+pub const DEFAULT_SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default number of canonical blocks the pending overlay may trail behind
 /// before it is rebuilt from canonical state.

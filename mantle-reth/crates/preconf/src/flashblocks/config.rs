@@ -50,6 +50,12 @@ pub const DEFAULT_FLASHBLOCK_PORT: u16 = 1111;
 /// At eleven slices per block that is a little under three blocks, so a
 /// subscriber has roughly six seconds to reconnect before it has to fall
 /// back to canonical sync.
+///
+/// That six seconds is a budget shared with the consumer's keepalive, which
+/// is sized to notice a dead connection well inside it
+/// (`DEFAULT_SUBSCRIBER_PING_INTERVAL` in `mantle-reth-flashblocks`). Shrink
+/// this capacity and that interval has to follow, or a reconnect arrives after
+/// the slices it needed were already dropped.
 pub const DEFAULT_RING_CAPACITY: usize = 32;
 
 /// Default capacity of the live broadcast channel — 32.
