@@ -532,7 +532,7 @@ mod reorg_tests {
         assert_ne!(reverted_hash, rival_hash, "the rival has to be a different transaction");
 
         // The rival occupies `(sender, 0)` in the queue.
-        let rival_envelope = op_envelope_to_alloy(OpTxEnvelope::from(rival)).expect("a user type");
+        let rival_envelope = op_envelope_to_alloy(rival).expect("a user type");
         assert_eq!(
             fifo.push_if_absent(Arc::new(rival_envelope), sender(), PreconfSource::Rpc).await,
             PushResult::Inserted,
