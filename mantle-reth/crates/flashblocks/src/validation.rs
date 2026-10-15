@@ -12,6 +12,13 @@ pub enum SequenceValidationResult {
     FirstOfNextBlock,
     /// Duplicate flashblock (same block and index) - should be ignored.
     Duplicate,
+    /// First slice of a *different* build of the block already being tracked.
+    ///
+    /// A second payload job for one height starts its slice index at zero
+    /// again and re-sends the base, so the index moving backwards alongside a
+    /// base payload is the sequencer saying it began the block again. The
+    /// slice replaces the overlay rather than extending it.
+    RebuiltBlock,
     /// Non-sequential index within the same block - indicates missed flashblocks.
     NonSequentialGap {
         /// Expected flashblock index.
@@ -43,15 +50,31 @@ pub struct FlashblockSequenceValidator;
 
 impl FlashblockSequenceValidator {
     /// Validates whether an incoming flashblock links to the current latest flashblock.
+    ///
+    /// `incoming_starts_a_new_build` says the slice carries a base payload and
+    /// names a payload id other than the one the overlay is tracking — i.e. it
+    /// comes from a different build of its block.
     pub fn validate(
         latest_block_number: u64,
         latest_flashblock_index: u64,
         incoming_block_number: u64,
         incoming_index: u64,
         incoming_prev_flashblock_id: FlashblockId,
+        incoming_starts_a_new_build: bool,
     ) -> SequenceValidationResult {
         let latest_flashblock_id =
             FlashblockId { block_number: latest_block_number, index: latest_flashblock_index };
+
+        // Ahead of the duplicate check, which this would otherwise fall into
+        // whenever the overlay has not yet moved past its own base slice: both
+        // attempts put a base at index 0, so position alone cannot separate a
+        // rebuild from a retransmission.
+        if incoming_block_number == latest_block_number &&
+            incoming_index == 0 &&
+            incoming_starts_a_new_build
+        {
+            return SequenceValidationResult::RebuiltBlock;
+        }
 
         if incoming_block_number == latest_block_number && incoming_index == latest_flashblock_index
         {
@@ -224,17 +247,43 @@ mod tests {
     use super::*;
 
     #[rstest]
-    #[case(100, 5, 100, 6, FlashblockId { block_number: 100, index: 5 }, SequenceValidationResult::NextInSequence)]
-    #[case(100, 5, 100, 6, FlashblockId::NO_PREV, SequenceValidationResult::NextInSequence)]
-    #[case(100, 5, 101, 0, FlashblockId { block_number: 100, index: 5 }, SequenceValidationResult::FirstOfNextBlock)]
-    #[case(100, 5, 101, 0, FlashblockId::NO_PREV, SequenceValidationResult::FirstOfNextBlock)]
-    #[case(100, 5, 100, 5, FlashblockId::NO_PREV, SequenceValidationResult::Duplicate)]
+    #[case(100, 5, 100, 6, FlashblockId { block_number: 100, index: 5 }, false, SequenceValidationResult::NextInSequence)]
+    #[case(100, 5, 100, 6, FlashblockId::NO_PREV, false, SequenceValidationResult::NextInSequence)]
+    #[case(100, 5, 101, 0, FlashblockId { block_number: 100, index: 5 }, false, SequenceValidationResult::FirstOfNextBlock)]
+    #[case(
+        100,
+        5,
+        101,
+        0,
+        FlashblockId::NO_PREV,
+        false,
+        SequenceValidationResult::FirstOfNextBlock
+    )]
+    #[case(100, 5, 100, 5, FlashblockId::NO_PREV, false, SequenceValidationResult::Duplicate)]
+    // The next block's base slice is a new build by definition; the rebuild
+    // branch must not claim it, because it belongs on top of the overlay
+    // rather than in place of it.
+    #[case(100, 5, 101, 0, FlashblockId { block_number: 100, index: 5 }, true, SequenceValidationResult::FirstOfNextBlock)]
+    // A rebuild, with the overlay partway through the block it replaces.
+    #[case(100, 5, 100, 0, FlashblockId { block_number: 100, index: 5 }, true, SequenceValidationResult::RebuiltBlock)]
+    // The same rebuild, arriving while the overlay still holds only the base
+    // slice: same position as what it replaces, so only the build it names
+    // separates it from a retransmission.
+    #[case(100, 0, 100, 0, FlashblockId { block_number: 100, index: 0 }, true, SequenceValidationResult::RebuiltBlock)]
+    #[case(100, 0, 100, 0, FlashblockId { block_number: 100, index: 0 }, false, SequenceValidationResult::Duplicate)]
+    // Index 0 without a base payload is not a build starting over, whatever
+    // else it is.
+    #[case(100, 5, 100, 0, FlashblockId { block_number: 100, index: 5 }, false, SequenceValidationResult::NonSequentialGap { expected: 6, actual: 0 })]
+    // An index that moves backwards without reaching 0 is a stream fault
+    // either way.
+    #[case(100, 5, 100, 3, FlashblockId { block_number: 100, index: 5 }, false, SequenceValidationResult::NonSequentialGap { expected: 6, actual: 3 })]
     #[case(
         100,
         5,
         100,
         7,
         FlashblockId { block_number: 100, index: 5 },
+        false,
         SequenceValidationResult::NonSequentialGap { expected: 6, actual: 7 }
     )]
     #[case(
@@ -243,6 +292,7 @@ mod tests {
         101,
         3,
         FlashblockId { block_number: 100, index: 5 },
+        false,
         SequenceValidationResult::InvalidNewBlockIndex { block_number: 101, index: 3 }
     )]
     #[case(
@@ -251,6 +301,7 @@ mod tests {
         105,
         0,
         FlashblockId { block_number: 100, index: 5 },
+        false,
         SequenceValidationResult::InvalidNewBlockIndex { block_number: 105, index: 0 }
     )]
     #[case(
@@ -259,6 +310,7 @@ mod tests {
         101,
         0,
         FlashblockId { block_number: 100, index: 4 },
+        false,
         SequenceValidationResult::NonSequentialPredecessor {
             expected: FlashblockId { block_number: 100, index: 5 },
             actual: FlashblockId { block_number: 100, index: 4 },
@@ -270,6 +322,7 @@ mod tests {
         99,
         0,
         FlashblockId { block_number: 100, index: 5 },
+        false,
         SequenceValidationResult::InvalidNewBlockIndex { block_number: 99, index: 0 }
     )]
     fn test_sequence_validator(
@@ -278,6 +331,7 @@ mod tests {
         #[case] incoming_block: u64,
         #[case] incoming_idx: u64,
         #[case] incoming_prev_flashblock_id: FlashblockId,
+        #[case] incoming_starts_a_new_build: bool,
         #[case] expected: SequenceValidationResult,
     ) {
         let result = FlashblockSequenceValidator::validate(
@@ -286,6 +340,7 @@ mod tests {
             incoming_block,
             incoming_idx,
             incoming_prev_flashblock_id,
+            incoming_starts_a_new_build,
         );
         assert_eq!(result, expected);
     }

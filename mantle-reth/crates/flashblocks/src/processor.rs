@@ -31,7 +31,7 @@ use reth_provider::{BlockReaderIdExt, StateProviderBox, StateProviderFactory};
 use reth_revm::{State, database::StateProviderDatabase};
 use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver, oneshot};
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks,
@@ -571,6 +571,7 @@ where
             flashblock.metadata.block_number,
             flashblock.index,
             flashblock.metadata.prev_flashblock_id,
+            flashblock.base.is_some() && flashblock.payload_id != pending_blocks.payload_id(),
         );
 
         match validation_result {
@@ -588,6 +589,29 @@ where
                     flashblock_index = %flashblock.index,
                 );
                 Ok(prev_pending_blocks)
+            }
+            SequenceValidationResult::RebuiltBlock => {
+                // Not `unexpected_block_order`: a second build of a height is
+                // something the sequencer does on purpose, and counting it
+                // there would drown the stream faults that counter is read for.
+                Metrics::rebuilt_block().increment(1);
+                info!(
+                    message = "the sequencer started this block again; rebuilding from its new base slice",
+                    curr_block = %pending_blocks.latest_block_number(),
+                    curr_flashblock_index = %pending_blocks.latest_flashblock_index(),
+                );
+                // The overlay is replaced rather than extended, so the live
+                // state it was carrying belongs to the abandoned attempt.
+                self.clear_live_state();
+                // Only the rebuilt block is dropped. The blocks under it are
+                // usually not canonical yet — the overlay is what runs ahead of
+                // the chain — so rebuilding from canonical state alone could
+                // not reach the rebuilt block's parent.
+                let mut flashblocks = pending_blocks.get_flashblocks();
+                flashblocks
+                    .retain(|fb| fb.metadata.block_number < flashblock.metadata.block_number);
+                flashblocks.push(flashblock.clone());
+                self.build_pending_state(None, &flashblocks)
             }
             SequenceValidationResult::InvalidNewBlockIndex { block_number, index } => {
                 Metrics::unexpected_block_order().increment(1);

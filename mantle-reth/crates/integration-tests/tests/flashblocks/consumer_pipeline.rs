@@ -7,14 +7,31 @@ use mantle_reth_flashblocks::{
     FlashblocksAPI, FlashblocksReceiver, FlashblocksState, PendingBlocksAPI,
 };
 
+use alloy_primitives::keccak256;
+use alloy_rpc_types_engine::PayloadId;
+
 use crate::consumer_helpers::{
-    FlashblockBuilder, base_slice, base_slice_builder, l1_info_deposit, launch_flashblocks_node,
-    mine_canonical_block as mine,
+    FlashblockBuilder, base_slice, base_slice_builder, filler_deposit, l1_info_deposit,
+    launch_flashblocks_node, mine_canonical_block as mine,
 };
 
 /// Default depths: three blocks of trailing history, three of leading slack.
 macro_rules! launch {
     () => {{ launch_flashblocks_node!(3, 3) }};
+}
+
+/// Payload id of a second build of a block. Slices built by [`FlashblockBuilder`]
+/// default to `PayloadId::default()`, so a rebuild has to say it is one: two
+/// payload jobs never share an id, and a test that lets them share it is asking
+/// about an input the sequencer cannot produce.
+fn rebuild_id() -> PayloadId {
+    PayloadId::new([0xff; 8])
+}
+
+/// Payload id of the job that builds block `n`. Distinct per block, as the
+/// sequencer's are, and never equal to [`rebuild_id`].
+fn job_id(n: u8) -> PayloadId {
+    PayloadId::new([n; 8])
 }
 
 /// The base slice of the next block opens an overlay on the canonical tip.
@@ -69,6 +86,55 @@ async fn a_gap_in_the_index_sequence_clears_the_overlay() {
     assert!(harness.pending().is_none(), "a skipped index must clear the overlay");
 }
 
+/// A rebuild of the block being built restarts at index 0, and the consumer has
+/// to follow it.
+///
+/// A second forkchoice update on the same parent starts a fresh payload job,
+/// whose slice counter begins at zero again — so the rebuild's first slice is
+/// `(N, 0)` carrying a base, linked to the last slice of the attempt it
+/// replaces. That is an ordinary sequencer event, not a malformed stream.
+///
+/// The index moving *backwards* is the signal; it cannot be read as a gap,
+/// because the slice it arrives with is the one thing that can open an overlay
+/// from nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuilt_block_restarting_at_index_zero_reopens_the_overlay() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).build()).await;
+    harness.send(FlashblockBuilder::new(1, 2).prev(1, 1).build()).await;
+
+    harness.send(base_slice_builder(1).prev(1, 2).payload_id(rebuild_id()).build()).await;
+
+    let pending = harness.pending().expect("the rebuild's base slice must open an overlay");
+    assert_eq!(pending.latest_block_number(), 1);
+    assert_eq!(pending.latest_flashblock_index(), 0, "the rebuild's own index");
+}
+
+/// The cost of getting the slice above wrong, stated separately: the rest of
+/// the rebuilt block has to remain usable.
+///
+/// A dropped base slice is not recoverable later in the same block — nothing
+/// after it carries one — so the consumer would serve `latest` until the *next*
+/// block's base slice arrives, a whole block of staleness for an event the
+/// sequencer treats as routine.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuilt_block_keeps_extending_after_its_base_slice() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).build()).await;
+
+    // The rebuild, then the slice that follows it.
+    harness.send(base_slice_builder(1).prev(1, 1).payload_id(rebuild_id()).build()).await;
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).build()).await;
+
+    let pending = harness.pending().expect("the rebuild must still be extendable");
+    assert_eq!(pending.latest_block_number(), 1);
+    assert_eq!(pending.latest_flashblock_index(), 1);
+}
+
 /// Re-sending the current slice is ignored and leaves the overlay untouched.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_duplicate_slice_is_ignored() {
@@ -79,6 +145,83 @@ async fn a_duplicate_slice_is_ignored() {
 
     let pending = harness.pending().expect("overlay should survive a duplicate");
     assert_eq!(pending.latest_flashblock_index(), 0);
+}
+
+/// A rebuild of the overlay's latest block keeps the blocks under it.
+///
+/// The overlay runs ahead of canonical, so the rebuilt block's parent is
+/// usually the overlay's previous block rather than anything the chain holds.
+/// Rebuilding from canonical state alone cannot reach it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuilt_latest_block_keeps_the_block_under_it() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice_builder(1).payload_id(job_id(1)).build()).await;
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).payload_id(job_id(1)).build()).await;
+    harness.send(base_slice_builder(2).prev(1, 1).payload_id(job_id(2)).build()).await;
+    harness.send(FlashblockBuilder::new(2, 1).prev(2, 0).payload_id(job_id(2)).build()).await;
+
+    {
+        let before = harness.pending().expect("premise: two blocks are in the overlay");
+        assert_eq!(before.earliest_block_number(), 1, "premise: earliest");
+        assert_eq!(before.latest_block_number(), 2, "premise: latest");
+        assert_eq!(before.latest_flashblock_index(), 1, "premise: index");
+    }
+
+    // Block 2 is built again, while block 1 is still only in the overlay.
+    let only_in_the_rebuild = filler_deposit(9);
+    let rebuilt_tx_hash = keccak256(&only_in_the_rebuild);
+    harness
+        .send(
+            base_slice_builder(2)
+                .prev(2, 1)
+                .transactions(vec![l1_info_deposit(2), only_in_the_rebuild])
+                .payload_id(rebuild_id())
+                .build(),
+        )
+        .await;
+
+    let pending = harness.pending().expect("the rebuild must produce an overlay");
+    assert_eq!(pending.latest_block_number(), 2);
+    assert_eq!(pending.earliest_block_number(), 1, "block 1 is only in the overlay");
+    assert!(
+        pending.has_transaction_hash(&rebuilt_tx_hash),
+        "the overlay has to hold the rebuild's base, not the one it replaced",
+    );
+}
+
+/// A rebuild that lands while the overlay still holds only the base slice is
+/// not a retransmission of that slice.
+///
+/// The duplicate check is positional, so a second attempt's index-0 slice
+/// cannot be told apart from a resend of the first attempt's. Whichever base
+/// the overlay keeps is the one every later slice of that block is applied
+/// against, so keeping the wrong one is not a dropped update — it is a block
+/// assembled from two attempts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuilt_base_slice_replaces_the_one_it_supersedes() {
+    let (harness, _node) = launch!();
+
+    // Attempt 1 publishes its base slice and is then abandoned.
+    harness.send(base_slice(1)).await;
+
+    // Attempt 2 starts over at the same position with different contents.
+    let only_in_the_rebuild = filler_deposit(7);
+    let rebuilt_tx_hash = keccak256(&only_in_the_rebuild);
+    harness
+        .send(
+            base_slice_builder(1)
+                .transactions(vec![l1_info_deposit(1), only_in_the_rebuild])
+                .payload_id(rebuild_id())
+                .build(),
+        )
+        .await;
+
+    let pending = harness.pending().expect("overlay should survive a rebuild");
+    assert!(
+        pending.has_transaction_hash(&rebuilt_tx_hash),
+        "the overlay has to hold the base that the slices after it were built against",
+    );
 }
 
 /// A slice leading canonical beyond `max_leading_depth` is dropped.

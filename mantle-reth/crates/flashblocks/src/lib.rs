@@ -6,6 +6,9 @@
 mod block_assembler;
 pub use block_assembler::{AssembledBlock, BlockAssembler};
 
+mod canonical;
+pub use canonical::{await_canonical_match, forward_canonical_state};
+
 mod cache;
 pub use cache::{DEFAULT_MAX_CACHE_AHEAD_BLOCKS, FlashblockCache};
 

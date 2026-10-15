@@ -449,12 +449,21 @@ impl Commitments {
     /// the `reorg_drift` predicate the canonical handler wants (a reverted
     /// transaction that we had recorded as committed is drift; one we never saw
     /// is not).
-    pub fn uncommit(&self, hash: &TxHash) -> bool {
+    ///
+    /// The [`ClaimKind`] comes back with it because the handler asks two
+    /// questions of one withdrawal and they have different answers: everything
+    /// withdrawn here has to be put back, while only [`ClaimKind::Promised`] is
+    /// drift. An `Announced` record is a transaction the slice stream
+    /// published and every consumer reconciles for itself, so a reorg taking it
+    /// back is ordinary chain behaviour. Both come from the same critical
+    /// section, so the two cannot disagree.
+    pub fn uncommit(&self, hash: &TxHash) -> Option<ClaimKind> {
         if !self.enabled {
-            return false;
+            return None;
         }
         let mut store = self.store.write();
-        store.by_hash.get_mut(hash).and_then(|cached| cached.committed_height.take()).is_some()
+        let cached = store.by_hash.get_mut(hash)?;
+        cached.committed_height.take().map(|_| cached.kind)
     }
 
     /// Whether this hash still has a record here at all — the journal's only
@@ -934,8 +943,12 @@ mod tests {
         let c = classifier();
         committed_commitment(&c);
 
-        assert!(c.uncommit(&hash(1)), "we had observed it on chain — that is drift");
-        assert!(!c.uncommit(&hash(1)), "idempotent: the second call reports nothing");
+        assert_eq!(
+            c.uncommit(&hash(1)),
+            Some(ClaimKind::Promised),
+            "we had observed it on chain, and a client holds its receipt — that is drift"
+        );
+        assert_eq!(c.uncommit(&hash(1)), None, "idempotent: the second call reports nothing");
 
         assert!(c.is_tracked(&hash(1)), "still an owed commitment");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps its nonce");
@@ -953,8 +966,37 @@ mod tests {
     fn uncommit_reports_nothing_for_a_transaction_we_never_committed() {
         let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert!(!c.uncommit(&hash(1)));
-        assert!(!c.uncommit(&hash(9)));
+        assert_eq!(c.uncommit(&hash(1)), None);
+        assert_eq!(c.uncommit(&hash(9)), None);
+    }
+
+    /// The same guard, reached the way production reaches it.
+    ///
+    /// The test above withholds the record by never creating one, which no
+    /// longer matches the build loop: `apply_one_best_tx` calls
+    /// [`Commitments::record_announced`] for **every** pool transaction it
+    /// executes, so an ordinary transaction does have a record here by the
+    /// time its block is canonical. `mark_committed` then stamps it, because
+    /// it keys on the hash alone and does not read [`ClaimKind`].
+    ///
+    /// Drift is a preconf signal — a transaction a client was promised and
+    /// then saw reverted. An announced-only record was promised to nobody, so
+    /// reverting it is ordinary chain behaviour, not drift.
+    #[test]
+    fn an_executed_pool_transaction_is_not_reorg_drift() {
+        let c = classifier();
+
+        // What the build loop does with a pool transaction it just executed.
+        assert_eq!(c.record_announced(hash(3), &addr(3), 0, AT), Ok(()));
+        // What the canonical handler does with every hash in the block.
+        c.mark_committed(&hash(3), AT);
+
+        assert_eq!(
+            c.uncommit(&hash(3)),
+            Some(ClaimKind::Announced),
+            "withdrawn like any other observation, so it is still put back — but announced \
+             rather than promised, so reverting it is not a broken preconf promise"
+        );
     }
 
     /// The sweep runs on the same cadence and would otherwise undo the scheme:

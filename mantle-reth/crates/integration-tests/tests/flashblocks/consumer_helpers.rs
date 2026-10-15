@@ -73,6 +73,13 @@ impl FlashblockBuilder {
         self
     }
 
+    /// Sets the payload id, which is what tells one build of a block apart
+    /// from another build of the same block.
+    pub const fn payload_id(mut self, payload_id: PayloadId) -> Self {
+        self.payload_id = payload_id;
+        self
+    }
+
     /// Links this slice to its predecessor.
     pub const fn prev(mut self, block_number: u64, index: u64) -> Self {
         self.prev = mantle_reth_flashblocks_types::FlashblockId { block_number, index };

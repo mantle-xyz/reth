@@ -609,19 +609,17 @@ where
                     subscriber.start();
 
                     let state_for_canonical = Arc::clone(&state);
-                    let mut canonical_stream = tokio_stream::wrappers::BroadcastStream::new(
+                    tokio::spawn(mantle_reth_flashblocks::forward_canonical_state(
+                        "flashblocks_overlay",
                         ctx.node().provider().subscribe_to_canonical_state(),
-                    );
-                    tokio::spawn(async move {
-                        use tokio_stream::StreamExt as _;
-                        while let Some(Ok(notification)) = canonical_stream.next().await {
+                        move |notification| {
                             for block in notification.committed().blocks_iter() {
                                 // op-reth v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
                                 state_for_canonical
                                     .on_canonical_block_received(block.as_ref().clone());
                             }
-                        }
-                    });
+                        },
+                    ));
 
                     let eth_api_ext = FlashblocksEthApiExt::new(
                         ctx.registry.eth_api().clone(),
