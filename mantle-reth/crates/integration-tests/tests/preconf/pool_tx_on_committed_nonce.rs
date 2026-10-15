@@ -18,14 +18,20 @@
 //! and the commitment is brought back through the journal rather than a reorg:
 //! restore's pre-pass calls `mark_promised`, so the slot is claimed exactly as
 //! it would be after a reorg took the commitment's block back.
+//!
+//! The second test is the boundary of that rule rather than another case of
+//! it: a submission that is still queued has had no event go out, so the hold
+//! has not started and an ordinary transaction may take the nonce. What it
+//! pins is that the client is told so.
 
-use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec};
+use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf, wait_fifo_entry};
 use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use mantle_reth_preconf::JournalEntry;
+use mantle_reth_rpc_ext::PreconfStatus;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 use reth_optimism_payload_builder::config::OpDAConfig;
@@ -198,4 +204,101 @@ async fn a_pool_tx_cannot_take_the_nonce_of_a_deferred_commitment() {
     );
 
     let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+/// Where the nonce hold starts, from the other side.
+///
+/// `tx_hash` binds from the moment the event goes out, and the apply that
+/// produces that event is also what claims the slot. A submission that is only
+/// *queued* has no event behind it, so an ordinary transaction on the same
+/// `(sender, nonce)` is free to take it — and the sender's own wallet is the
+/// one likely to: preconf transactions never enter the pool, so
+/// `eth_getTransactionCount(sender, "pending")` does not count them and a
+/// retry reuses the nonce.
+///
+/// The rule that has to hold is the other one: nothing binding may be handed
+/// out for a transaction that then does not land. The client here is answered
+/// with an error, not with an event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_commitment_that_loses_its_nonce_is_answered_with_an_error() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_id = mantle_test_chain_spec().chain().id();
+
+    let wallet_a = Wallet::default().with_chain_id(chain_id);
+    let sender_a = wallet_a.inner.address();
+    let signer_b = Wallet::new(3).with_chain_id(chain_id).wallet_gen()[2].clone();
+    let sender_b = signer_b.address();
+
+    // No journal entries, so no restore pre-pass: the commitment below reaches
+    // the queue with nothing recorded against its slot, the state every fresh
+    // submission passes through.
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(sender_a)
+        .whitelist_from(sender_b)
+        .whitelist_to(recipient)
+        .max_gas_per_tx(5_000_000)
+        .max_gas_per_block(20_000_000)
+        .preconf_timeout_ms(3_000)
+        .build();
+
+    let da_config = OpDAConfig::new(MAX_DA_TX_SIZE, MAX_DA_BLOCK_SIZE);
+    let (mut node, http, _wallet, _chain_id, _classifier, fifo, _fb) = launch_preconf_node!(
+        @build cfg, mantle_test_chain_spec(),
+        |svc| mantle_reth_cli::node::MantleNode::default()
+            .with_preconf(svc)
+            .with_da_config(da_config)
+    )
+    .await;
+
+    // Filler — lands, and leaves the block's DA budget too small for the
+    // submission queued behind it, which is what holds that submission in the
+    // queue long enough for the rival to be offered.
+    let tx_a =
+        signed_call(wallet_a.inner.clone(), chain_id, 0, incompressible_calldata(8_192), 600_000)
+            .await;
+    let hash_a = keccak256(&tx_a);
+    let http_a = http.clone();
+    let filler_task = tokio::spawn(async move { send_preconf(&http_a, tx_a).await });
+    wait_fifo_entry(&fifo, sender_a, 0).await;
+
+    let tx_b =
+        signed_call(signer_b.clone(), chain_id, 0, incompressible_calldata(8_192), 600_000).await;
+    let hash_b = keccak256(&tx_b);
+    let http_b = http.clone();
+    let queued_task = tokio::spawn(async move { send_preconf(&http_b, tx_b).await });
+    wait_fifo_entry(&fifo, sender_b, 0).await;
+
+    // The sender's own ordinary transaction on the nonce it just queued.
+    let tx_c = signed_call(signer_b, chain_id, 0, Vec::new(), 100_000).await;
+    let hash_c = keccak256(&tx_c);
+    assert_ne!(hash_c, hash_b, "the rival has to be a different transaction");
+    node.rpc.inject_tx(tx_c).await.expect("ordinary submission accepted");
+
+    build_block!(node, sealed1, _payload1);
+
+    assert!(sealed1.contains(&hash_a), "the filler must land; sealed={sealed1:?}");
+    assert!(
+        !sealed1.contains(&hash_b),
+        "precondition: the queued submission defers on block DA; sealed={sealed1:?}",
+    );
+    assert!(
+        sealed1.contains(&hash_c),
+        "precondition: the rival takes the nonce while the submission waits; sealed={sealed1:?}",
+    );
+
+    // The rule. Whatever the queue decides, the client must not be holding a
+    // binding `tx_hash` for a transaction whose nonce is gone.
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), queued_task)
+        .await
+        .expect("the preconf call has to answer within the deadline")
+        .expect("the rpc task must not panic");
+    match answer {
+        Err(_) => {}
+        Ok(event) => assert!(
+            matches!(event.status, PreconfStatus::Timeout),
+            "no binding event may go out for a transaction that cannot land; got {event:?}",
+        ),
+    }
+
+    filler_task.abort();
 }

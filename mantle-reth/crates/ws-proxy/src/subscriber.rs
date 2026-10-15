@@ -607,6 +607,78 @@ mod tests {
         let _ = timeout(Duration::from_secs(1), subscriber_task).await;
     }
 
+    /// An upstream that ends the stream without a close frame is reconnected on
+    /// the backoff schedule, not as fast as a TCP handshake completes.
+    ///
+    /// A load balancer draining, a sequencer restarting and a middlebox idle
+    /// timeout all look alike from here: the connection is accepted, the
+    /// handshake completes, and then the stream simply ends. tungstenite
+    /// reports that as an error rather than as end-of-stream, so `run` takes
+    /// its `Err` arm and consults the backoff. `run` also has an `Ok(())` arm
+    /// that reconnects without one; this is what holds that arm out of reach of
+    /// the abrupt-close cases it would otherwise cover.
+    #[tokio::test]
+    async fn an_upstream_that_ends_the_stream_is_reconnected_on_the_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let uri: Uri = format!("ws://{addr}").parse().unwrap();
+
+        let shutdown = CancellationToken::new();
+        let shutdown_server = shutdown.clone();
+
+        let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let accepts_server = Arc::clone(&accepts);
+
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = shutdown_server.cancelled() => break,
+                    accept_result = listener.accept() => {
+                        if let Ok((stream, _)) = accept_result {
+                            accepts_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // Complete the handshake, then drop the stream.
+                            tokio::spawn(async move { drop(accept_async(stream).await) });
+                        }
+                    }
+                }
+            }
+        });
+
+        // Keepalive far longer than the test, so the only thing driving a
+        // reconnect is the stream ending.
+        let options = SubscriberOptions::default()
+            .with_backoff_initial_interval(Duration::from_millis(200))
+            .with_ping_interval(Duration::from_secs(30))
+            .with_pong_timeout(Duration::from_secs(30))
+            .with_initial_grace_period(Duration::from_millis(50));
+
+        let mut subscriber = WebsocketSubscriber::new(uri, |_data: String| {}, options);
+        let subscriber_task = {
+            let token = shutdown.clone();
+            tokio::spawn(async move {
+                subscriber.run(token).await;
+            })
+        };
+
+        sleep(Duration::from_secs(1)).await;
+        let attempts = accepts.load(std::sync::atomic::Ordering::SeqCst);
+
+        shutdown.cancel();
+        let _ = timeout(Duration::from_secs(1), subscriber_task).await;
+
+        // A 200ms initial interval, doubling, cannot fit many attempts into a
+        // second. Loose enough to survive a slow machine, tight enough that an
+        // unthrottled loop (hundreds) cannot pass.
+        assert!(
+            attempts >= 2,
+            "the premise: the subscriber has to be reconnecting at all, got {attempts}"
+        );
+        assert!(
+            attempts <= 8,
+            "reconnects must be paced by the backoff, got {attempts} in one second"
+        );
+    }
+
     #[tokio::test]
     async fn test_multiple_subscribers_single_listener() {
         let server1 = MockServer::new().await;
