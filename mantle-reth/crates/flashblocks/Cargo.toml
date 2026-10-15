@@ -35,6 +35,7 @@ reth-optimism-evm = { workspace = true, features = ["std"] }
 reth-optimism-forks.workspace = true
 reth-optimism-primitives = { workspace = true, features = ["std"] }
 reth-optimism-rpc.workspace = true
+reth-chain-state.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-rpc.workspace = true
@@ -64,6 +65,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+reth-execution-types.workspace = true
 alloy-op-hardforks.workspace = true
 mantle-reth-chainspec.workspace = true
 reth-optimism-chainspec.workspace = true

@@ -54,7 +54,6 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::EthApiError;
 use tokio::{sync::broadcast::error::RecvError, time};
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
 use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
@@ -623,22 +622,16 @@ where
     }
 
     async fn wait_for_canonical_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Optimism>> {
-        let mut stream =
-            BroadcastStream::new(self.eth_api.provider().subscribe_to_canonical_state());
+        let mut receiver = self.eth_api.provider().subscribe_to_canonical_state();
 
-        while let Some(Ok(canon_state)) = stream.next().await {
-            for (block_receipt, _) in canon_state.block_receipts() {
-                for (canonical_tx_hash, _) in &block_receipt.tx_receipts {
-                    if *canonical_tx_hash == tx_hash {
-                        debug!(message = "found receipt in canonical state", tx_hash = %tx_hash);
-                        return EthTransactions::transaction_receipt(&self.eth_api, tx_hash)
-                            .await
-                            .ok()
-                            .flatten();
-                    }
-                }
-            }
-        }
-        None
+        crate::await_canonical_match("send_raw_transaction_sync", &mut receiver, |canon_state| {
+            canon_state.block_receipts().into_iter().any(|(block_receipt, _)| {
+                block_receipt.tx_receipts.iter().any(|(canonical, _)| *canonical == tx_hash)
+            })
+        })
+        .await?;
+
+        debug!(message = "found receipt in canonical state", tx_hash = %tx_hash);
+        EthTransactions::transaction_receipt(&self.eth_api, tx_hash).await.ok().flatten()
     }
 }
