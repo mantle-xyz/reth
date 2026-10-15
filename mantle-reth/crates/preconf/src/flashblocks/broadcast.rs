@@ -171,7 +171,7 @@ struct Subscription;
 
 impl Subscription {
     fn join() -> Self {
-        metrics::gauge!("flashblock.subscribers").increment(1.0);
+        metrics::gauge!("flashblocks.subscribers").increment(1.0);
         Self
     }
 
@@ -181,8 +181,8 @@ impl Subscription {
             // Recoverable on its own (see `SubscriptionExit::Lagged`), but a
             // rising rate says the channel is too small for the traffic, or
             // the subscriber too slow.
-            metrics::counter!("flashblock.slow_subscriber_dropped_total").increment(1);
-            metrics::counter!("flashblock.slices_missed_by_slow_subscribers_total")
+            metrics::counter!("flashblocks.slow_subscriber_dropped_total").increment(1);
+            metrics::counter!("flashblocks.slices_missed_by_slow_subscribers_total")
                 .increment(*skipped);
         }
     }
@@ -190,7 +190,7 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        metrics::gauge!("flashblock.subscribers").decrement(1.0);
+        metrics::gauge!("flashblocks.subscribers").decrement(1.0);
     }
 }
 

@@ -112,7 +112,7 @@ impl PublisherHandle {
         let size = json.len();
         // Against the decoder's 5 MiB ceiling, and the input to whether
         // compression is worth adding to the wire.
-        metrics::histogram!("flashblock.byte_size").record(size as f64);
+        metrics::histogram!("flashblocks.byte_size").record(size as f64);
         let text = Utf8Bytes::from(json);
         let position = FlashblockPosition {
             block_number: payload.metadata.block_number,

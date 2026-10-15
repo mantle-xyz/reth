@@ -1167,7 +1167,7 @@ where
         // The one rejection slicing introduces, and the one to watch: a rate
         // that climbs means the per-slice allowance is holding transactions
         // back that the block itself had room for.
-        metrics::counter!("flashblock.slice_allowance_exhausted_total").increment(1);
+        metrics::counter!("flashblocks.slice_allowance_exhausted_total").increment(1);
         best_txs.mark_invalid(tx.signer(), tx.nonce());
         return Ok(BestTxStep::Continue);
     };
@@ -1311,7 +1311,7 @@ where
     };
     // One clone of the block's transactions per slice: the assembler takes them
     // owned. Bounded by the assembler's signature rather than by choice, and
-    // the reason `flashblock.publish_interval_ms` is worth watching on full
+    // the reason `flashblocks.publish_interval_ms` is worth watching on full
     // blocks.
     let transactions = info.executed().iter().map(|tx| tx.inner().clone()).collect::<Vec<_>>();
 
@@ -1514,7 +1514,7 @@ impl SliceState {
             // could put a tick over its interval.
             let started = std::time::Instant::now();
             let write = journal.append_batch(&entries).await;
-            metrics::histogram!("flashblock.journal_write_duration_ms")
+            metrics::histogram!("flashblocks.journal_write_duration_ms")
                 .record(started.elapsed().as_secs_f64() * 1000.0);
             if let Err(err) = write {
                 warn!(
@@ -1617,7 +1617,7 @@ impl SliceState {
                 // The build was thrown away while this slice was being put
                 // together. Its transactions go back to the pool below, so
                 // announcing them would name a block that will never exist.
-                metrics::counter!("flashblock.dropped_after_abandon_total").increment(1);
+                metrics::counter!("flashblocks.dropped_after_abandon_total").increment(1);
                 debug!(
                     target: "mantle::preconf::flashblocks",
                     index = self.next_index,
@@ -1642,9 +1642,9 @@ impl SliceState {
         // has no predecessor to measure against and is reported separately.
         let now = std::time::Instant::now();
         match self.last_published {
-            Some(previous) => metrics::histogram!("flashblock.publish_interval_ms")
+            Some(previous) => metrics::histogram!("flashblocks.publish_interval_ms")
                 .record(now.duration_since(previous).as_secs_f64() * 1000.0),
-            None => metrics::histogram!("flashblock.first_slice_offset_ms")
+            None => metrics::histogram!("flashblocks.first_slice_offset_ms")
                 .record(now.duration_since(self.opened_at).as_secs_f64() * 1000.0),
         }
         self.last_published = Some(now);
@@ -2051,7 +2051,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             // already, and the sweep below drops the ones the chain took.
             let staged = self.fifo.senders_with_landed_claims().await;
             if !staged.is_empty() {
-                metrics::counter!("flashblock.unlanded_sweep_slow_total").increment(1);
+                metrics::counter!("flashblocks.unlanded_sweep_slow_total").increment(1);
                 let balances = ProviderBalances(state_provider_for_finish.as_ref());
                 let mut changed: Vec<ChangedAccount> = Vec::with_capacity(staged.len());
                 for sender in staged {
@@ -2065,7 +2065,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         // Skipping is free: the sweep below keeps any entry it
                         // got no nonce for, and asks again next build.
                         Err(err) => {
-                            metrics::counter!("flashblock.unlanded_nonce_unreadable_total")
+                            metrics::counter!("flashblocks.unlanded_nonce_unreadable_total")
                                 .increment(1);
                             warn!(
                                 target: "mantle::preconf::flashblocks",
@@ -2295,7 +2295,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             // starts early or late, which the budget allows for by design — a
             // distribution that stops matching the configured interval is the
             // signal, not any single block.
-            metrics::histogram!("flashblock.slices_per_block").record(state.next_index as f64);
+            metrics::histogram!("flashblocks.slices_per_block").record(state.next_index as f64);
         }
 
         // No hand-back stage here, deliberately. How a build ended is not
