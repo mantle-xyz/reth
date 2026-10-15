@@ -20,6 +20,7 @@ pub mod consumer_helpers;
 mod cache_replay;
 mod consumer_pipeline;
 mod da_footprint_header;
+mod producer_consumer_loop;
 mod producer_e2e;
 mod reconciliation;
 mod reverted_tx;
