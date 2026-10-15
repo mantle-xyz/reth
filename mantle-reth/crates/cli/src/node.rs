@@ -613,6 +613,18 @@ where
                         "flashblocks_overlay",
                         ctx.node().provider().subscribe_to_canonical_state(),
                         move |notification| {
+                            // `committed()` only, `reverted()` never: on a reorg
+                            // it is the new chain, and the overlay is reconciled
+                            // against each block as it arrives rather than
+                            // rolled back, so the blocks that replace a reverted
+                            // one carry everything the consumer acts on. It
+                            // re-executes for itself, so it needs nothing out of
+                            // the chain that went away.
+                            //
+                            // The cost is that a reorg is inferred from a tx
+                            // list that stopped matching, not reported: one
+                            // reaching only heights the overlay does not track
+                            // passes unnoticed.
                             for block in notification.committed().blocks_iter() {
                                 // op-reth v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
                                 state_for_canonical
