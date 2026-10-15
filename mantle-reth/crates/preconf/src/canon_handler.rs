@@ -39,8 +39,10 @@ use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing::{debug, error, warn};
 
 use crate::{
-    admission::op_envelope_to_alloy, commitments::ClaimKind, preconf_tx_set::PreconfTxSet,
-    types::PreconfSource,
+    admission::op_envelope_to_alloy,
+    commitments::ClaimKind,
+    preconf_tx_set::PreconfTxSet,
+    types::{PreconfSource, PushResult},
 };
 
 /// What one read of the canonical-state subscription produced.
@@ -288,9 +290,41 @@ where
             let (signed, _) = recovered.into_parts();
             match op_envelope_to_alloy(OpTxEnvelope::from(signed)) {
                 Some(envelope) => {
-                    self.fifo
+                    match self
+                        .fifo
                         .push_if_absent(Arc::new(envelope), signer, PreconfSource::Replay)
-                        .await;
+                        .await
+                    {
+                        PushResult::Inserted => {}
+                        // The queue still holds it, so it is already owed and
+                        // this call had nothing to add.
+                        PushResult::AlreadyExists => debug!(
+                            target: "mantle::preconf::canon",
+                            ?hash,
+                            "a reverted commitment was still queued; nothing to put back"
+                        ),
+                        // Unreachable while the bookkeeping holds: `uncommit`
+                        // keeps the slot, so admission refuses anything else on
+                        // that nonce for as long as the record stands. Reaching
+                        // here means the record was released early — a reorg
+                        // deeper than `SEAL_DEPTH`, or a `mark_committed` that
+                        // never ran because its notification was dropped.
+                        //
+                        // Reported rather than resolved: both transactions may
+                        // have had a receipt go out, so there is no longer a
+                        // choice that keeps every promise. Someone has to know.
+                        PushResult::ConflictActive(incumbent) => {
+                            error!(
+                                target: "mantle::preconf::canon",
+                                ?hash,
+                                ?incumbent,
+                                sender = ?signer,
+                                "a reverted commitment's nonce is held by another live entry; \
+                                 it cannot be put back"
+                            );
+                            metrics::counter!("preconf.canon.reinject_conflict_total").increment(1);
+                        }
+                    }
                 }
                 // A commitment is always one of the user types, so this
                 // says the reverted block held a system transaction we had

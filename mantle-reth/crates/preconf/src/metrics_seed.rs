@@ -1,5 +1,5 @@
 //! Startup pre-registration ("seeding") of this crate's metric series —
-//! `preconf.*` and `flashblock.*` alike.
+//! `preconf.*`, `flashblocks.*` and the shared `mantle.*` alike.
 //!
 //! The `metrics` facade creates a series lazily on the first emit, so a
 //! rare-event counter (`preconf.api.timeout_total`,
@@ -19,7 +19,7 @@
 /// Counter series. Registered at their true starting value (`0`) —
 /// `increment(0)` never clobbers.
 const COUNTERS: &[&str] = &[
-    "flashblock.slice_allowance_exhausted_total",
+    "flashblocks.slice_allowance_exhausted_total",
     "preconf.build.failed_total",
     "preconf.build.resolved_payload_superseded_total",
     "preconf.build.pool_tx_on_committed_nonce_total",
@@ -40,13 +40,13 @@ const COUNTERS: &[&str] = &[
     "preconf.admit.rejected_gas_total",
     "preconf.admit.rejected_account_slots_total",
     "preconf.admit.rejected_delegated_total",
-    "flashblock.deadline_already_passed_total",
-    "flashblock.dropped_after_abandon_total",
-    "flashblock.unlanded_sweep_slow_total",
-    "flashblock.unlanded_nonce_unreadable_total",
-    "flashblock.slices_missed_by_slow_subscribers_total",
-    "flashblock.slow_subscriber_dropped_total",
-    "flashblock.superseded_slices_total",
+    "flashblocks.deadline_already_passed_total",
+    "flashblocks.dropped_after_abandon_total",
+    "flashblocks.unlanded_sweep_slow_total",
+    "flashblocks.unlanded_nonce_unreadable_total",
+    "flashblocks.slices_missed_by_slow_subscribers_total",
+    "flashblocks.slow_subscriber_dropped_total",
+    "flashblocks.superseded_slices_total",
     "preconf.api.timeout_total",
     // The completion protocol was broken: an entry finished without a result
     // reaching its client. Should stay flat at zero.
@@ -70,6 +70,10 @@ const COUNTERS: &[&str] = &[
     "preconf.execute.rejected_base_fee_total",
     "preconf.execute.rejected_other_total",
     // Commitment retention + on-chain allowlist governance.
+    // Shared with `mantle-reth-flashblocks`, which emits the same series under
+    // its own `subscriber` label and cannot seed it — see `PREFIXES`.
+    "mantle.canon.notifications_lagged_total",
+    "preconf.canon.reinject_conflict_total",
     "preconf.canon.reorg_drift_total",
     "preconf.tx.announced_dropped_total",
     "preconf.tx.commitment_broken_total",
@@ -94,8 +98,8 @@ const COUNTERS: &[&str] = &[
 /// `set(0.0)` here could clobber it back to `0` depending on call ordering; a
 /// zero increment only registers the series, leaving any existing value intact.
 const GAUGES: &[&str] = &[
-    "flashblock.endpoint_serving",
-    "flashblock.subscribers",
+    "flashblocks.endpoint_serving",
+    "flashblocks.subscribers",
     "preconf.fifo.pending",
     "preconf.fifo.entries",
     "preconf.fifo.bytes_used",
@@ -119,11 +123,12 @@ const GAUGES: &[&str] = &[
 /// almost immediately so the gap is negligible; the list exists mainly so the
 /// drift test covers histograms too.
 const HISTOGRAMS: &[&str] = &[
-    "flashblock.byte_size",
-    "flashblock.first_slice_offset_ms",
-    "flashblock.journal_write_duration_ms",
-    "flashblock.publish_interval_ms",
-    "flashblock.slices_per_block",
+    "flashblocks.byte_size",
+    "flashblocks.first_slice_offset_ms",
+    "flashblocks.journal_write_duration_ms",
+    "flashblocks.publish_interval_ms",
+    "flashblocks.slices_per_block",
+    "mantle.canon.notification_duration",
     "preconf.api.handle_duration_ms",
     "preconf.build.lock_wait_ms",
     "preconf.execute.duration_ms",
@@ -133,7 +138,7 @@ const HISTOGRAMS: &[&str] = &[
 ];
 
 /// Pre-register every metric this crate emits — `preconf.*` and
-/// `flashblock.*` — so counter and gauge series exist from node start with a
+/// `flashblocks.*` — so counter and gauge series exist from node start with a
 /// `0` baseline instead of appearing only on the first emit. Histograms are
 /// registered without an observation, so theirs still appear on first use.
 ///
@@ -171,24 +176,39 @@ mod tests {
         }
     }
 
-    /// Namespaces this crate emits under. Both are scanned, so a metric added
-    /// under either one is held to the same seeding rule.
-    const PREFIXES: &[&str] = &["preconf.", "flashblock."];
+    /// Namespaces this crate emits under. All three are scanned, so a metric
+    /// added under any of them is held to the same seeding rule.
+    ///
+    /// `mantle.` is the shared namespace for a series more than one crate
+    /// emits under one name, so a single alert covers every emitter.
+    ///
+    /// `flashblocks.` is shared differently: the producer metrics here and the
+    /// consumer metrics in `mantle-reth-flashblocks` sit in one namespace, but
+    /// only the producer half is seeded. This test reads **this** crate's
+    /// sources, and that crate has no seeding of its own — so a consumer
+    /// metric can be added without anything noticing.
+    const PREFIXES: &[&str] = &["preconf.", "flashblocks.", "mantle."];
 
     /// Extract every name passed to `<macro>!("<prefix>…"` in the source (i.e.
     /// the inline emit sites; the seed lists use a variable, not a literal, so
     /// they don't match).
     fn emitted_names(src: &str, macro_name: &str) -> HashSet<String> {
         let mut names = HashSet::new();
-        for prefix in PREFIXES {
-            let needle = format!("{macro_name}!(\"{prefix}");
-            let mut rest = src;
-            while let Some(pos) = rest.find(&needle) {
-                let after = &rest[pos + needle.len() - prefix.len()..];
-                if let Some(end) = after.find('"') {
-                    names.insert(after[..end].to_string());
-                }
-                rest = &rest[pos + needle.len()..];
+        let open = format!("{macro_name}!(");
+        let mut rest = src;
+        while let Some(pos) = rest.find(&open) {
+            let after = &rest[pos + open.len()..];
+            rest = after;
+
+            // The name is not always adjacent to the paren: labels push the
+            // call past the line width and rustfmt then puts the name on its
+            // own line. Requiring adjacency used to let every labelled emit
+            // through unchecked.
+            let Some(body) = after.trim_start().strip_prefix('"') else { continue };
+            let Some(end) = body.find('"') else { continue };
+            let name = &body[..end];
+            if PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
+                names.insert(name.to_string());
             }
         }
         names

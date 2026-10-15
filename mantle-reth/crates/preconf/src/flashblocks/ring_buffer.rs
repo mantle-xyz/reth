@@ -56,7 +56,7 @@ impl FlashblockRingBuffer {
             superseded += 1;
         }
         if superseded > 0 {
-            metrics::counter!("flashblock.superseded_slices_total").increment(superseded);
+            metrics::counter!("flashblocks.superseded_slices_total").increment(superseded);
         }
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
