@@ -77,7 +77,7 @@ pub fn derive_slice_schedule(
     // whole gas limit opens at once, which is the budget doing nothing.
     // Counted because it is otherwise indistinguishable from a normal block.
     if drift_ms == 0 {
-        metrics::counter!("flashblock.deadline_already_passed_total").increment(1);
+        metrics::counter!("flashblocks.deadline_already_passed_total").increment(1);
     }
 
     // The remainder goes to the first tick so every later one lands on the
