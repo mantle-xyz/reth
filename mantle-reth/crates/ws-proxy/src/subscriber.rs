@@ -10,8 +10,8 @@ use backoff::{ExponentialBackoff, backoff::Backoff};
 use futures::{SinkExt, StreamExt};
 use tokio::{select, sync::oneshot};
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Error, Error::ConnectionClosed, Message},
+    connect_async_with_config,
+    tungstenite::{Error, Error::ConnectionClosed, Message, protocol::WebSocketConfig},
 };
 use tokio_util::{bytes, sync::CancellationToken};
 use tracing::{error, info, trace, warn};
@@ -205,16 +205,19 @@ where
 
         Metrics::upstream_connection_attempts().increment(1);
 
-        let (ws_stream, _) = match connect_async(&connect_uri).await {
-            Ok(connection) => {
-                Metrics::upstream_connection_successes().increment(1);
-                connection
-            }
-            Err(e) => {
-                Metrics::upstream_connection_failures().increment(1);
-                return Err(e);
-            }
-        };
+        // Refusing to buffer a frame we would refuse to read; see `MAX_SLICE_BYTES`.
+        let config = WebSocketConfig::default().max_message_size(Some(MAX_SLICE_BYTES));
+        let (ws_stream, _) =
+            match connect_async_with_config(&connect_uri, Some(config), false).await {
+                Ok(connection) => {
+                    Metrics::upstream_connection_successes().increment(1);
+                    connection
+                }
+                Err(e) => {
+                    Metrics::upstream_connection_failures().increment(1);
+                    return Err(e);
+                }
+            };
 
         info!(message = "websocket connection established", uri = %connect_uri);
 
@@ -294,6 +297,16 @@ where
 
         match msg {
             Message::Text(text) => {
+                if text.len() > MAX_SLICE_BYTES {
+                    warn!(
+                        message = "dropping oversized text message",
+                        uri = %self.uri,
+                        size = text.len(),
+                        max = MAX_SLICE_BYTES
+                    );
+                    return Ok(());
+                }
+
                 trace!(
                     message = "received text message",
                     uri = %self.uri,
@@ -366,15 +379,24 @@ fn parse_flashblock_position(data: &str) -> Option<(u64, u64)> {
     Some((extract.metadata.block_number, extract.index))
 }
 
-/// Largest slice accepted from a binary frame, matching the consumer's
-/// `MAX_DECOMPRESSED_FLASHBLOCK_BYTES`. Checked both before and after
-/// decompression, so a small but highly compressible payload from a hostile or
-/// misconfigured upstream cannot force a large allocation.
+/// Largest slice accepted from the upstream, matching the consumer's
+/// `MAX_DECOMPRESSED_FLASHBLOCK_BYTES`.
+///
+/// Applies to **both** frame types. A binary frame is checked before and after
+/// decompression, so a small but highly compressible payload cannot force a
+/// large allocation; a text frame is checked as it arrives. Text is the one
+/// Mantle's publisher actually sends, so guarding only binary would leave the
+/// production path unguarded.
+///
+/// Also the websocket connection's `max_message_size`, which is where a
+/// hostile upstream is stopped: the checks below run on a frame that has
+/// already been buffered whole, and refusing to buffer what we would refuse to
+/// read is the only version of this limit that bounds memory.
 ///
 /// The two ceilings are declared independently — `mantle-reth-flashblocks-types`
 /// is only a dev-dependency here — and held equal by
 /// `the_ceiling_matches_the_consumer_s` rather than by convention.
-const MAX_BINARY_SLICE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_SLICE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Recovers the slice JSON from a binary frame.
 ///
@@ -384,8 +406,8 @@ const MAX_BINARY_SLICE_BYTES: usize = 5 * 1024 * 1024;
 /// starve every subscriber: a compressed slice is never valid UTF-8 and so
 /// never arrives as [`Message::Text`].
 fn decode_binary_slice(data: &[u8]) -> Option<String> {
-    if data.len() > MAX_BINARY_SLICE_BYTES {
-        warn!(size = data.len(), max = MAX_BINARY_SLICE_BYTES, "binary frame exceeds the limit");
+    if data.len() > MAX_SLICE_BYTES {
+        warn!(size = data.len(), max = MAX_SLICE_BYTES, "binary frame exceeds the limit");
         return None;
     }
 
@@ -400,17 +422,17 @@ fn decode_binary_slice(data: &[u8]) -> Option<String> {
     // whole expansion. Mirrors the consumer's `decompress`. The decoder's own
     // window is separate and not bounded by this.
     if let Err(error) = brotli::Decompressor::new(data, 4096)
-        .take(MAX_BINARY_SLICE_BYTES as u64 + 1)
+        .take(MAX_SLICE_BYTES as u64 + 1)
         .read_to_end(&mut decompressed)
     {
         warn!(%error, "failed to brotli-decompress a binary frame");
         return None;
     }
 
-    if decompressed.len() > MAX_BINARY_SLICE_BYTES {
+    if decompressed.len() > MAX_SLICE_BYTES {
         warn!(
             size = decompressed.len(),
-            max = MAX_BINARY_SLICE_BYTES,
+            max = MAX_SLICE_BYTES,
             "decompressed frame exceeds the limit"
         );
         return None;
@@ -778,7 +800,7 @@ mod tests {
     fn undecodable_binary_frames_are_rejected() {
         assert_eq!(decode_binary_slice(&[0xff, 0xfe, 0xfd]), None, "neither JSON nor brotli");
         assert_eq!(
-            decode_binary_slice(&vec![b'x'; MAX_BINARY_SLICE_BYTES + 1]),
+            decode_binary_slice(&vec![b'x'; MAX_SLICE_BYTES + 1]),
             None,
             "over the size limit"
         );
@@ -796,11 +818,11 @@ mod tests {
         let mut bomb = Vec::new();
         {
             let mut compressor = brotli::CompressorWriter::new(&mut bomb, 4096, 5, 22);
-            compressor.write_all(&vec![b'a'; MAX_BINARY_SLICE_BYTES * 2]).expect("compresses");
+            compressor.write_all(&vec![b'a'; MAX_SLICE_BYTES * 2]).expect("compresses");
         }
 
         assert!(
-            bomb.len() < MAX_BINARY_SLICE_BYTES,
+            bomb.len() < MAX_SLICE_BYTES,
             "the frame itself must clear the pre-decompression check, got {} bytes",
             bomb.len()
         );
@@ -815,10 +837,53 @@ mod tests {
     #[test]
     fn the_ceiling_matches_the_consumer_s() {
         assert_eq!(
-            MAX_BINARY_SLICE_BYTES,
+            MAX_SLICE_BYTES,
             mantle_reth_flashblocks_types::MAX_DECOMPRESSED_FLASHBLOCK_BYTES,
             "a proxy that accepts a different size than the consumer forwards slices it cannot read",
         );
+    }
+
+    /// The ceiling has to cover the frame type the producer actually sends.
+    /// Mantle's publisher writes `Message::Text`, so a ceiling that only
+    /// guards `Message::Binary` guards nothing on the path in use.
+    #[tokio::test]
+    async fn an_oversized_text_frame_is_refused_like_an_oversized_binary_one() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&delivered);
+        let mut subscriber = WebsocketSubscriber::new(
+            "ws://127.0.0.1:1".parse().expect("a uri"),
+            move |text: String| recorded.lock().unwrap().push(text.len()),
+            SubscriberOptions::default(),
+        );
+        let mut pong_deadline = Instant::now() + Duration::from_secs(60);
+
+        let oversized = "x".repeat(MAX_SLICE_BYTES + 1);
+        subscriber
+            .handle_message(
+                Ok(Message::Text(oversized.into())),
+                &mut pong_deadline,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("an oversized frame is dropped, not a connection error");
+
+        assert!(
+            delivered.lock().unwrap().is_empty(),
+            "an oversized text frame must not reach the subscribers",
+        );
+
+        // The premise: the same path does forward a frame within the ceiling,
+        // so the assertion above is about the size and not about the path.
+        subscriber
+            .handle_message(
+                Ok(Message::Text("{}".to_string().into())),
+                &mut pong_deadline,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("a frame within the ceiling is handled");
+
+        assert_eq!(delivered.lock().unwrap().as_slice(), &[2]);
     }
 
     #[test]
