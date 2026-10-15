@@ -345,11 +345,7 @@ where
         let timestamp = payload.payload.timestamp();
         let block_number = payload.payload.block_number();
 
-        // [MANTLE] Mantle-aware spec picker: it resolves Skadi/Limb/Arsia, which the standard
-        // OP progression does not, so the engine-API payload path agrees with the block
-        // executor and the RPC handlers on which fork a payload belongs to.
-        let spec =
-            alloy_op_evm::spec_by_timestamp_after_bedrock(self.chain_spec().as_ref(), timestamp);
+        let spec = revm_spec_by_timestamp_after_bedrock(self.chain_spec(), timestamp);
 
         let mut cfg_env = CfgEnv::new()
             .with_chain_id(self.chain_spec().chain().id())

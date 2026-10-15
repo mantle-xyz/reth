@@ -111,7 +111,6 @@ serde = [
     "reth-optimism-forks/serde",
     "reth-optimism-primitives/serde",
     "reth-primitives-traits/serde",
-    "alloy-op-hardforks/serde",
     "op-alloy-consensus/serde",
     "alloy-op-hardforks/serde",
     "toml/serde",
