@@ -1,6 +1,6 @@
 //! Optimism-specific implementation and utilities for the executor
 
-use crate::{OpBlockExecutionError, error::L1BlockInfoError};
+use crate::{OpBlockExecutionError, error::L1BlockInfoError, revm_spec_by_timestamp_after_bedrock};
 use alloy_consensus::Transaction;
 use alloy_primitives::{U16, U256, hex};
 use op_revm::L1BlockInfo;
@@ -340,7 +340,7 @@ impl RethL1BlockInfo for L1BlockInfo {
             return Ok(U256::ZERO);
         }
 
-        let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
+        let spec_id = revm_spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
         Ok(self.calculate_tx_l1_cost(input, spec_id))
     }
 
@@ -350,7 +350,7 @@ impl RethL1BlockInfo for L1BlockInfo {
         timestamp: u64,
         input: &[u8],
     ) -> Result<U256, BlockExecutionError> {
-        let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
+        let spec_id = revm_spec_by_timestamp_after_bedrock(&chain_spec, timestamp);
         Ok(self.data_gas(input, spec_id))
     }
 }
