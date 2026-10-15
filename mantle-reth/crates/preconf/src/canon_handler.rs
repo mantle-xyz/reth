@@ -154,7 +154,16 @@ where
             // Reverted chain — withdraw the "seen on chain" observation and
             // emit the drift signal; see `observe_reorg`.
             if let Some(old) = notif.reverted() {
-                self.observe_reorg(&old).await;
+                let outcome = reinject_reverted(&self.fifo, &old).await;
+                // Counted from what the pass actually found, so the series and
+                // the tests are reading the same numbers.
+                if outcome.drift > 0 {
+                    metrics::counter!("preconf.canon.reorg_drift_total").increment(outcome.drift);
+                }
+                if outcome.conflicts > 0 {
+                    metrics::counter!("preconf.canon.reinject_conflict_total")
+                        .increment(outcome.conflicts);
+                }
             }
 
             // Committed chain — record every promised hash as committed at its
@@ -240,104 +249,129 @@ where
         }
         debug!(target: "mantle::preconf::canon", "canonical state stream closed");
     }
+}
 
-    async fn observe_reorg(&self, old: &Chain<N>) {
-        // `clone_transactions_recovered` for the same `Transaction: 'static`
-        // reason as the committed-side iteration above.
+/// What one reverted chain held, as [`reinject_reverted`] found it.
+///
+/// Returned rather than counted in place so the caller owns the metrics and a
+/// test can read the same numbers the series report.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReorgOutcome {
+    /// Commitments a client was promised, which the reorg took back.
+    drift: u64,
+    /// Transactions put back in the queue.
+    reinjected: u64,
+    /// Transactions whose `(sender, nonce)` is held by a different live entry,
+    /// so they cannot go back.
+    conflicts: u64,
+}
+
+/// Withdraws the on-chain observation for every transaction a reorg took back,
+/// and puts the ones this node owes back in the queue.
+///
+/// Free rather than a method: it needs the queue and nothing else, and a
+/// handler cannot be built without a provider.
+async fn reinject_reverted<N>(fifo: &PreconfTxSet, old: &Chain<N>) -> ReorgOutcome
+where
+    N: NodePrimitives,
+    N::SignedTx: Transaction + TxHashRef,
+    OpTxEnvelope: From<N::SignedTx>,
+{
+    let mut outcome = ReorgOutcome::default();
+
+    // `clone_transactions_recovered` for the same `Transaction: 'static`
+    // reason as the committed-side iteration above.
+    //
+    // `block_number` is the tip of the reverted chain, not the per-tx block:
+    // a multi-block reorg tags every warning with this tip, which is precise
+    // enough for reorg-drift aggregation and avoids an outer loop over
+    // blocks.
+    let block_number = old.tip().number();
+    for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
+        let hash = *recovered.inner().tx_hash();
+        // One call, two answers: whether there is an observation to withdraw,
+        // and how strong the claim behind it was — see `Commitments::uncommit`.
+        let Some(kind) = fifo.claims().uncommit(&hash) else { continue };
+
+        // Only a promise is drift. An announced transaction went out on the
+        // slice stream, which every consumer reconciles for itself, so a
+        // reorg taking it back is ordinary chain behaviour — and counting
+        // it here would put every transaction in the reverted blocks on a
+        // metric that exists to report broken preconfirmations.
+        if kind == ClaimKind::Promised {
+            outcome.drift += 1;
+            warn!(
+                target: "mantle::preconf::canon",
+                ?hash,
+                block = block_number,
+                "reverted block contains a preconf commitment; it keeps its nonce and will be \
+                 re-applied (reorg_drift)"
+            );
+        }
+
+        // And put it back, because nothing else will. The queue entry
+        // is gone by now — it was removed when the commitment landed —
+        // so `uncommit` alone would leave a promise nobody is going to
+        // keep.
         //
-        // `block_number` is the tip of the reverted chain, not the per-tx block:
-        // a multi-block reorg tags every warning with this tip, which is precise
-        // enough for reorg-drift aggregation and avoids an outer loop over
-        // blocks.
-        let block_number = old.tip().number();
-        for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
-            let hash = *recovered.inner().tx_hash();
-            // One call, two answers: whether there is an observation to withdraw,
-            // and how strong the claim behind it was — see `Commitments::uncommit`.
-            let Some(kind) = self.fifo.claims().uncommit(&hash) else { continue };
-
-            // Only a promise is drift. An announced transaction went out on the
-            // slice stream, which every consumer reconciles for itself, so a
-            // reorg taking it back is ordinary chain behaviour — and counting
-            // it here would put every transaction in the reverted blocks on a
-            // metric that exists to report broken preconfirmations.
-            if kind == ClaimKind::Promised {
-                warn!(
-                    target: "mantle::preconf::canon",
-                    ?hash,
-                    block = block_number,
-                    "reverted block contains a preconf commitment; it keeps its nonce and will be \
-                     re-applied (reorg_drift)"
-                );
-                metrics::counter!("preconf.canon.reorg_drift_total").increment(1);
-            }
-
-            // And put it back, because nothing else will. The queue entry
-            // is gone by now — it was removed when the commitment landed —
-            // so `uncommit` alone would leave a promise nobody is going to
-            // keep.
-            //
-            // The transaction comes from the reverted chain itself, which
-            // carries it whole; there is no need to ask the journal, and
-            // no window in which the chain has dropped it but the journal
-            // has not caught up.
-            //
-            // `Replay`, not `Rpc`: the receipt went out before the reorg,
-            // so this is a commitment being honoured rather than a fresh
-            // request, and the dispatch gates that protect a waiting
-            // client must not apply to it.
-            let signer = recovered.signer();
-            let (signed, _) = recovered.into_parts();
-            match op_envelope_to_alloy(OpTxEnvelope::from(signed)) {
-                Some(envelope) => {
-                    match self
-                        .fifo
-                        .push_if_absent(Arc::new(envelope), signer, PreconfSource::Replay)
-                        .await
-                    {
-                        PushResult::Inserted => {}
-                        // The queue still holds it, so it is already owed and
-                        // this call had nothing to add.
-                        PushResult::AlreadyExists => debug!(
+        // The transaction comes from the reverted chain itself, which
+        // carries it whole; there is no need to ask the journal, and
+        // no window in which the chain has dropped it but the journal
+        // has not caught up.
+        //
+        // `Replay`, not `Rpc`: the receipt went out before the reorg,
+        // so this is a commitment being honoured rather than a fresh
+        // request, and the dispatch gates that protect a waiting
+        // client must not apply to it.
+        let signer = recovered.signer();
+        let (signed, _) = recovered.into_parts();
+        match op_envelope_to_alloy(OpTxEnvelope::from(signed)) {
+            Some(envelope) => {
+                match fifo.push_if_absent(Arc::new(envelope), signer, PreconfSource::Replay).await {
+                    PushResult::Inserted => outcome.reinjected += 1,
+                    // The queue still holds it, so it is already owed and
+                    // this call had nothing to add.
+                    PushResult::AlreadyExists => debug!(
+                        target: "mantle::preconf::canon",
+                        ?hash,
+                        "a reverted commitment was still queued; nothing to put back"
+                    ),
+                    // Unreachable while the bookkeeping holds: `uncommit`
+                    // keeps the slot, so admission refuses anything else on
+                    // that nonce for as long as the record stands. Reaching
+                    // here means the record was released early — a reorg
+                    // deeper than `SEAL_DEPTH`, or a `mark_committed` that
+                    // never ran because its notification was dropped.
+                    //
+                    // Reported rather than resolved: both transactions may
+                    // have had a receipt go out, so there is no longer a
+                    // choice that keeps every promise. Someone has to know.
+                    PushResult::ConflictActive(incumbent) => {
+                        outcome.conflicts += 1;
+                        error!(
                             target: "mantle::preconf::canon",
                             ?hash,
-                            "a reverted commitment was still queued; nothing to put back"
-                        ),
-                        // Unreachable while the bookkeeping holds: `uncommit`
-                        // keeps the slot, so admission refuses anything else on
-                        // that nonce for as long as the record stands. Reaching
-                        // here means the record was released early — a reorg
-                        // deeper than `SEAL_DEPTH`, or a `mark_committed` that
-                        // never ran because its notification was dropped.
-                        //
-                        // Reported rather than resolved: both transactions may
-                        // have had a receipt go out, so there is no longer a
-                        // choice that keeps every promise. Someone has to know.
-                        PushResult::ConflictActive(incumbent) => {
-                            error!(
-                                target: "mantle::preconf::canon",
-                                ?hash,
-                                ?incumbent,
-                                sender = ?signer,
-                                "a reverted commitment's nonce is held by another live entry; \
-                                 it cannot be put back"
-                            );
-                            metrics::counter!("preconf.canon.reinject_conflict_total").increment(1);
-                        }
+                            ?incumbent,
+                            sender = ?signer,
+                            "a reverted commitment's nonce is held by another live entry; \
+                             it cannot be put back"
+                        );
                     }
                 }
-                // A commitment is always one of the user types, so this
-                // says the reverted block held a system transaction we had
-                // somehow recorded as ours. Loud rather than silent: it
-                // would mean the promise bookkeeping is wrong.
-                None => error!(
-                    target: "mantle::preconf::canon",
-                    ?hash,
-                    "a reverted commitment is not a user transaction; not replaying it"
-                ),
             }
+            // A commitment is always one of the user types, so this
+            // says the reverted block held a system transaction we had
+            // somehow recorded as ours. Loud rather than silent: it
+            // would mean the promise bookkeeping is wrong.
+            None => error!(
+                target: "mantle::preconf::canon",
+                ?hash,
+                "a reverted commitment is not a user transaction; not replaying it"
+            ),
         }
     }
+
+    outcome
 }
 
 #[cfg(test)]
@@ -380,5 +414,140 @@ mod tests {
         drop(sender);
 
         assert!(matches!(receive_canonical(&mut receiver).await, CanonUpdate::Closed));
+    }
+}
+
+#[cfg(test)]
+mod reorg_tests {
+    use std::collections::BTreeMap;
+
+    use alloy_consensus::{BlockBody, Header, TxEip1559};
+    use alloy_primitives::{Address, Signature, U256};
+    use op_alloy_consensus::OpTypedTransaction;
+    use reth_execution_types::{Chain, ExecutionOutcome};
+    use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
+    use reth_primitives_traits::RecoveredBlock;
+
+    use super::*;
+    use crate::types::PreconfStatus;
+
+    /// Height of the reverted block; nothing here depends on the value.
+    const REVERTED_AT: u64 = 7;
+
+    fn sender() -> Address {
+        Address::from([1; 20])
+    }
+
+    /// Two calls with the same `nonce` and different `salt` differ in hash,
+    /// which is what makes them rivals for one `(sender, nonce)`.
+    fn op_tx(nonce: u64, salt: u8) -> OpTransactionSigned {
+        let inner = TxEip1559 { nonce, value: U256::from(salt), ..Default::default() };
+        OpTransactionSigned::new_unhashed(
+            OpTypedTransaction::Eip1559(inner),
+            Signature::test_signature(),
+        )
+    }
+
+    /// A reverted chain of one block holding `tx` from [`sender`].
+    fn reverted_chain(tx: OpTransactionSigned) -> Chain<OpPrimitives> {
+        let body = BlockBody { transactions: vec![tx], ommers: vec![], withdrawals: None };
+        let block = alloy_consensus::Block {
+            header: Header { number: REVERTED_AT, ..Default::default() },
+            body,
+        };
+        Chain::new(
+            vec![RecoveredBlock::new_unhashed(block, vec![sender()])],
+            ExecutionOutcome::default(),
+            BTreeMap::default(),
+        )
+    }
+
+    fn fifo() -> PreconfTxSet {
+        PreconfTxSet::new(8)
+    }
+
+    /// The case the whole mechanism exists for: a receipt went to a client,
+    /// the block was taken back, and nothing else would put it back — the
+    /// queue entry went when it landed.
+    #[tokio::test]
+    async fn a_promised_commitment_is_drift_and_goes_back() {
+        let fifo = fifo();
+        let tx = op_tx(0, 1);
+        let hash = tx.tx_hash();
+        assert_eq!(fifo.claims().mark_promised(hash, &sender(), 0, REVERTED_AT), Ok(()));
+        assert!(fifo.claims().mark_committed(&hash, REVERTED_AT));
+
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+
+        assert_eq!(outcome, ReorgOutcome { drift: 1, reinjected: 1, conflicts: 0 });
+        assert_eq!(fifo.status_of(&hash).await, Some(PreconfStatus::Waiting));
+        assert_eq!(
+            fifo.claims().slot_owner(&sender(), 0),
+            Some(hash),
+            "the slot is kept, or a replacement could take the nonce",
+        );
+    }
+
+    /// The build loop records every pool transaction it executes, so most of
+    /// what a reverted block holds has a record here. Those go back too — the
+    /// slice path pruned them from the pool — but they are not broken
+    /// preconfirmations and must not be counted as drift.
+    #[tokio::test]
+    async fn an_executed_pool_transaction_goes_back_without_counting_as_drift() {
+        let fifo = fifo();
+        let tx = op_tx(0, 1);
+        let hash = tx.tx_hash();
+        assert_eq!(fifo.claims().record_announced(hash, &sender(), 0, REVERTED_AT), Ok(()));
+        assert!(fifo.claims().mark_committed(&hash, REVERTED_AT));
+
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+
+        assert_eq!(outcome, ReorgOutcome { drift: 0, reinjected: 1, conflicts: 0 });
+    }
+
+    /// A transaction this node never claimed is somebody else's business.
+    #[tokio::test]
+    async fn a_transaction_we_never_recorded_is_left_alone() {
+        let fifo = fifo();
+        let tx = op_tx(0, 1);
+        let hash = tx.tx_hash();
+
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+
+        assert_eq!(outcome, ReorgOutcome::default());
+        assert_eq!(fifo.status_of(&hash).await, None);
+    }
+
+    /// The case that should not be reachable: the commitment's nonce is held
+    /// by a different live entry, so it cannot go back. Both may have had a
+    /// receipt go out, so nothing here can keep every promise — it is reported
+    /// instead, and the report is what this pins.
+    #[tokio::test]
+    async fn a_nonce_held_by_another_live_entry_is_reported() {
+        let fifo = fifo();
+        let reverted = op_tx(0, 1);
+        let rival = op_tx(0, 2);
+        let reverted_hash = reverted.tx_hash();
+        let rival_hash = rival.tx_hash();
+        assert_ne!(reverted_hash, rival_hash, "the rival has to be a different transaction");
+
+        // The rival occupies `(sender, 0)` in the queue.
+        let rival_envelope = op_envelope_to_alloy(OpTxEnvelope::from(rival)).expect("a user type");
+        assert_eq!(
+            fifo.push_if_absent(Arc::new(rival_envelope), sender(), PreconfSource::Rpc).await,
+            PushResult::Inserted,
+        );
+
+        assert_eq!(fifo.claims().mark_promised(reverted_hash, &sender(), 0, REVERTED_AT), Ok(()));
+        assert!(fifo.claims().mark_committed(&reverted_hash, REVERTED_AT));
+
+        let outcome = reinject_reverted(&fifo, &reverted_chain(reverted)).await;
+
+        assert_eq!(
+            outcome,
+            ReorgOutcome { drift: 1, reinjected: 0, conflicts: 1 },
+            "drift is still reported — the promise was broken either way",
+        );
+        assert_eq!(fifo.status_of(&reverted_hash).await, None, "it could not go back");
     }
 }
