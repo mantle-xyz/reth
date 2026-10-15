@@ -132,6 +132,20 @@ async fn wait_for_overlay_tx(state: &FlashblocksState, tee: &Tee, tx_hash: B256)
     );
 }
 
+/// Polls until the socket has delivered `(block_number, index)`.
+///
+/// Reading `tee.seen()` straight after a build resolves races the slices still
+/// in flight; under a loaded suite that race is lost often enough to matter.
+async fn wait_for_slice(tee: &Tee, slice: (u64, u64)) {
+    for _ in 0..200 {
+        if tee.seen().contains(&slice) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the producer never published {slice:?}; delivered: {:?}", tee.seen());
+}
+
 /// What the whole subsystem is for: a transaction the producer sliced is
 /// visible on the consumer's `pending` overlay before the block is sealed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -187,34 +201,35 @@ async fn the_overlay_survives_a_second_build_of_one_height() {
     reth_tracing::init_test_tracing();
     let sender = Wallet::default().inner.address();
     let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
-    let (node, _http, wallet, chain_id, fb_addr) =
+    let (node, _http, _wallet, _chain_id, fb_addr) =
         crate::launch_flashblocks_node!(cfg, producer_cfg()).await;
 
     let (consumer, tee) = attach_consumer!(node, fb_addr);
     let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
 
+    // The two builds are told apart by their L1 origin, which decides the
+    // L1-attributes deposit each one puts at tx[0]. Every block has one, so
+    // nothing here waits on the transaction pool — the discriminator is
+    // already in the block the producer is obliged to build.
+    let abandoned_deposit = keccak256(crate::helpers::l1_info_deposit(100));
+    let rebuilt_deposit = keccak256(crate::helpers::l1_info_deposit(200));
+    assert_ne!(abandoned_deposit, rebuilt_deposit);
+
     // First attempt at height 1, sliced and then left behind.
     let _abandoned = crate::fcu_v3_start!(node, genesis, crate::helpers::l1_attrs(1, 100));
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_for_slice(&tee, (1, 0)).await;
 
     // Second attempt at the same height against a different L1 origin, which
     // is what an L1 reorg produces. Its slice indices restart at zero.
-    let raw = signed_transfer(&wallet, chain_id, 0).await;
-    let tx_hash = keccak256(&raw);
-    node.rpc.inject_tx(raw).await.expect("inject transfer");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     let pid = crate::fcu_v3_start!(node, genesis, crate::helpers::l1_attrs(1, 200));
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let payload = crate::get_payload_v5!(node, pid);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _payload = crate::get_payload_v5!(node, pid);
 
+    wait_for_overlay_tx(&consumer, &tee, rebuilt_deposit).await;
+
+    let pending = consumer.get_pending_blocks().as_ref().cloned().expect("an overlay");
     assert!(
-        payload.block().body().transactions().any(|tx| keccak256(tx.encoded_2718()) == tx_hash),
-        "the premise: the rebuild is the one that carries the transaction",
+        !pending.has_transaction_hash(&abandoned_deposit),
+        "the overlay must hold the rebuild's base alone, not the two attempts merged",
     );
-
-    let restarts = tee.seen().iter().filter(|(_, index)| *index == 0).count();
-    assert!(restarts >= 2, "the premise: the producer restarted the indices; saw {:?}", tee.seen());
-
-    wait_for_overlay_tx(&consumer, &tee, tx_hash).await;
 }
