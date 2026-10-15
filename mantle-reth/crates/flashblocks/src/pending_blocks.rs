@@ -413,10 +413,16 @@ impl PendingBlocks {
         self.earliest_header.number
     }
 
-    /// Returns the payload ID for the current build attempt.
+    /// Returns the payload ID of the build that produced the latest block
+    /// here.
+    ///
+    /// A snapshot can hold several blocks, each from its own payload job, so
+    /// the id that says which build this overlay is tracking is the newest
+    /// slice's. Reading the oldest would judge a slice for the latest block
+    /// against an id from a block before it.
     #[inline]
     pub fn payload_id(&self) -> PayloadId {
-        self.flashblocks.iter().next().map(|fb| fb.payload_id).unwrap_or_default()
+        self.flashblocks.last().map(|fb| fb.payload_id).unwrap_or_default()
     }
 
     /// Returns the index of the latest flashblock.

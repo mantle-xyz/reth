@@ -30,6 +30,7 @@ flashblock_metrics! {
     histogram block_processing_duration                 => "flashblocks.block_processing_duration";
     histogram sender_recovery_duration                  => "flashblocks.sender_recovery_duration";
     counter   unexpected_block_order                    => "flashblocks.unexpected_block_order";
+    counter   rebuilt_block                             => "flashblocks.rebuilt_block";
     histogram flashblocks_in_block                      => "flashblocks.flashblocks_in_block";
     counter   block_processing_error                    => "flashblocks.block_processing_error";
     counter   pending_clear_catchup                     => "flashblocks.pending_clear_catchup";
