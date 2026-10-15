@@ -46,6 +46,7 @@ use jsonrpsee::{
 };
 use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use op_alloy_network::Optimism;
+use reth_execution_types::BlockReceipts;
 use reth_provider::CanonStateSubscriptions;
 use reth_rpc::eth::EthFilter;
 use reth_rpc_eth_api::{
@@ -625,13 +626,66 @@ where
         let mut receiver = self.eth_api.provider().subscribe_to_canonical_state();
 
         crate::await_canonical_match("send_raw_transaction_sync", &mut receiver, |canon_state| {
-            canon_state.block_receipts().into_iter().any(|(block_receipt, _)| {
-                block_receipt.tx_receipts.iter().any(|(canonical, _)| *canonical == tx_hash)
-            })
+            names_a_canonical_receipt(&canon_state.block_receipts(), tx_hash)
         })
         .await?;
 
         debug!(message = "found receipt in canonical state", tx_hash = %tx_hash);
         EthTransactions::transaction_receipt(&self.eth_api, tx_hash).await.ok().flatten()
+    }
+}
+
+/// Whether `receipts` names `tx_hash` in a block that is still canonical.
+///
+/// `CanonStateNotification::block_receipts` returns the reverted side of a
+/// reorg alongside the committed one, flagged by the `bool`.
+fn names_a_canonical_receipt<R>(receipts: &[(BlockReceipts<R>, bool)], tx_hash: TxHash) -> bool {
+    receipts.iter().any(|(block_receipt, reverted)| {
+        !reverted && block_receipt.tx_receipts.iter().any(|(canonical, _)| *canonical == tx_hash)
+    })
+}
+
+#[cfg(test)]
+mod canonical_receipt_tests {
+    use alloy_eips::BlockNumHash;
+
+    use super::*;
+
+    fn receipts_naming(tx_hash: TxHash, reverted: bool) -> (BlockReceipts<()>, bool) {
+        (
+            BlockReceipts {
+                block: BlockNumHash::new(1, B256::ZERO),
+                tx_receipts: vec![(tx_hash, ())],
+                timestamp: 0,
+            },
+            reverted,
+        )
+    }
+
+    /// A reorg carries the receipts it took back. Reading one as a
+    /// confirmation ends `eth_sendRawTransactionSync`'s wait on a transaction
+    /// that is no longer on the chain — and the authoritative lookup that
+    /// follows then finds nothing, so the caller is told its transaction timed
+    /// out while the next block may be about to include it.
+    #[test]
+    fn a_reverted_receipt_is_not_a_confirmation() {
+        let tx_hash = B256::from([7; 32]);
+
+        assert!(
+            !names_a_canonical_receipt(&[receipts_naming(tx_hash, true)], tx_hash),
+            "a receipt the reorg took back confirms nothing",
+        );
+
+        // The premise: the same receipt on the committed side does confirm, so
+        // the assertion above is about the flag and not about the lookup.
+        assert!(names_a_canonical_receipt(&[receipts_naming(tx_hash, false)], tx_hash));
+    }
+
+    #[test]
+    fn an_unrelated_receipt_is_not_a_confirmation() {
+        let tx_hash = B256::from([7; 32]);
+        let other = B256::from([8; 32]);
+
+        assert!(!names_a_canonical_receipt(&[receipts_naming(other, false)], tx_hash));
     }
 }
