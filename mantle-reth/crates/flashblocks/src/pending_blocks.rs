@@ -473,10 +473,13 @@ impl PendingBlocks {
         self.latest_header.clone()
     }
 
-    /// Returns the parent hash of the earliest pending block.
+    /// Returns the parent hash of the earliest pending block — the canonical
+    /// block the snapshot was built on.
     ///
-    /// This pins the ancestor the snapshot was built on; a reorg or failover can
-    /// produce a different parent hash at the same block number.
+    /// `StateProcessor::base_is_canonical` compares this against the chain's
+    /// actual hash at that height before publishing. Every other guard there
+    /// compares heights only, and a reorg or a sequencer failover puts a
+    /// different block at the same height, so this is the one that notices.
     #[inline]
     pub fn parent_hash(&self) -> B256 {
         self.earliest_header.parent_hash
