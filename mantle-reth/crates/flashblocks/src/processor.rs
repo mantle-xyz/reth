@@ -163,6 +163,12 @@ where
             return Ok(None);
         }
 
+        if !self.base_is_canonical(&pending_blocks) {
+            Metrics::pending_drop_base_mismatch().increment(1);
+            self.clear_live_state();
+            return Ok(None);
+        }
+
         self.set_live_state(db, state_overrides);
 
         Ok(Some(pending_blocks))
@@ -308,6 +314,62 @@ where
         tip: Option<BlockNumber>,
     ) -> bool {
         tip.is_none_or(|tip| pending_blocks.latest_block_number() > tip)
+    }
+
+    /// Returns `true` when the snapshot's base block is still the canonical block
+    /// at that height.
+    ///
+    /// Every other guard here compares heights only, so this is the one that
+    /// catches a reorg or a failover putting a different block at the same height.
+    ///
+    /// Read on every publish rather than driven by canonical notifications: a head
+    /// rollback whose target has left the engine's in-memory tree emits none, and a
+    /// guard waiting to be told would never run for that shape.
+    ///
+    /// Fails closed — a base that cannot be confirmed is treated as a bad one. This
+    /// is a publish-time check, not a continuous invariant: a snapshot that already
+    /// published and is later invalidated keeps being served until the next publish
+    /// attempt runs this check again.
+    fn base_is_canonical(&self, pending_blocks: &PendingBlocks) -> bool {
+        // Saturating to 0 would compare against genesis and always mismatch, logging
+        // a reorg that did not happen. There is no flashblock for block 0, so this is
+        // unreachable; the assert catches a violation instead of misdiagnosing it.
+        debug_assert!(
+            pending_blocks.earliest_block_number() >= 1,
+            "pending overlay's earliest block cannot be genesis"
+        );
+        let base_number = pending_blocks.earliest_block_number().saturating_sub(1);
+        let declared = pending_blocks.parent_hash();
+
+        match self.client.block_hash(base_number) {
+            Ok(Some(canonical)) if canonical == declared => true,
+            Ok(Some(canonical)) => {
+                warn!(
+                    message = "pending snapshot is anchored to a block that is no longer canonical",
+                    base_number,
+                    declared = %declared,
+                    canonical = %canonical,
+                );
+                false
+            }
+            Ok(None) => {
+                warn!(
+                    message = "pending snapshot is anchored to a height the chain no longer has",
+                    base_number,
+                    declared = %declared,
+                );
+                false
+            }
+            Err(err) => {
+                warn!(
+                    message = "could not confirm the pending snapshot's base block",
+                    base_number,
+                    declared = %declared,
+                    %err,
+                );
+                false
+            }
+        }
     }
 
     /// Returns `true` when the snapshot has fallen too far behind to be worth keeping.

@@ -38,6 +38,7 @@ flashblock_metrics! {
     counter   flashblock_superseded                     => "flashblocks.flashblock_superseded";
     counter   pending_drop_not_ahead                    => "flashblocks.pending_drop_not_ahead";
     counter   pending_drop_stranded                     => "flashblocks.pending_drop_stranded";
+    counter   pending_drop_base_mismatch                => "flashblocks.pending_drop_base_mismatch";
     gauge     pending_snapshot_fb_index                 => "flashblocks.pending_snapshot_fb_index";
     gauge     pending_snapshot_height                   => "flashblocks.pending_snapshot_height";
     counter   leading_depth_exceeded                    => "flashblocks.leading_depth_exceeded";

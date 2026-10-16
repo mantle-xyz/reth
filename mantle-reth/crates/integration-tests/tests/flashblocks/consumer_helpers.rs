@@ -155,24 +155,66 @@ macro_rules! launch_flashblocks_node {
         ));
         state.start(node.inner.provider.clone());
 
-        (crate::consumer_helpers::FlashblocksHarness::new(state), node)
+        (crate::consumer_helpers::FlashblocksHarness::new(state, node.inner.provider.clone()), node)
     }};
 }
 
 pub(crate) use launch_flashblocks_node;
 
-/// Mines one canonical block and returns it as the consumer would see it.
-macro_rules! mine_canonical_block {
-    ($node:expr) => {{
-        let payload = $node.advance_block().await.expect("mine canonical block");
-        $node.sync_to(payload.block().hash()).await.expect("settle canonical block");
+/// Queries a block by hash as the consumer would see it: canonical, with its
+/// transactions recovered.
+///
+/// Shared by every macro below so the coupling to the vendored
+/// `BlockReader::recovered_block` / `TransactionVariant` API lives in exactly
+/// one place.
+macro_rules! canonical_block_by_hash {
+    ($node:expr, $hash:expr) => {{
         reth_provider::BlockReader::recovered_block(
             &$node.inner.provider,
-            payload.block().hash().into(),
+            $hash.into(),
             reth_provider::TransactionVariant::WithHash,
         )
         .expect("canonical block query")
-        .expect("mined block must be canonical")
+        .expect("block must be canonical")
+    }};
+}
+
+pub(crate) use canonical_block_by_hash;
+
+/// Builds and submits a block via `engine_newPayload` without making it
+/// canonical, returning its hash.
+///
+/// A sequencer knows a block's hash as soon as it has built and sealed it,
+/// independent of whether a follower has imported it yet. This is what lets a
+/// test declare a slice's real parent hash while that parent still fails the
+/// processor's canonical-header lookup: [`FlashblocksHarness::send`]'s own
+/// backfill cannot do this, since the chain does not have the hash either
+/// until [`commit_submitted_block`] runs.
+macro_rules! submit_uncommitted_block {
+    ($node:expr) => {{
+        let payload = $node.build_and_submit_payload().await.expect("build and submit block");
+        payload.block().hash()
+    }};
+}
+
+pub(crate) use submit_uncommitted_block;
+
+/// Makes a block previously built by [`submit_uncommitted_block`] canonical,
+/// returning it as the consumer would see it.
+macro_rules! commit_submitted_block {
+    ($node:expr, $hash:expr) => {{
+        $node.sync_to($hash).await.expect("settle canonical block");
+        crate::consumer_helpers::canonical_block_by_hash!($node, $hash)
+    }};
+}
+
+pub(crate) use commit_submitted_block;
+
+/// Mines one canonical block and returns it as the consumer would see it.
+macro_rules! mine_canonical_block {
+    ($node:expr) => {{
+        let hash = crate::consumer_helpers::submit_uncommitted_block!($node);
+        crate::consumer_helpers::commit_submitted_block!($node, hash)
     }};
 }
 
@@ -217,18 +259,39 @@ pub fn filler_deposit(seed: u64) -> Bytes {
 
 /// Convenience accessors over a running [`FlashblocksState`].
 #[derive(Debug)]
-pub struct FlashblocksHarness {
+pub struct FlashblocksHarness<P> {
     state: Arc<FlashblocksState>,
+    provider: P,
 }
 
-impl FlashblocksHarness {
+impl<P> FlashblocksHarness<P> {
     /// Wraps an already-started state.
-    pub const fn new(state: Arc<FlashblocksState>) -> Self {
-        Self { state }
+    pub const fn new(state: Arc<FlashblocksState>, provider: P) -> Self {
+        Self { state, provider }
     }
+}
 
+impl<P: reth_provider::BlockHashReader> FlashblocksHarness<P> {
     /// Pushes a slice and waits for the processor to finish with it.
-    pub async fn send(&self, flashblock: MantleFlashblockPayload) {
+    ///
+    /// A base payload declaring a zero parent is anchored to the chain the node
+    /// actually has, when it has that height. A real sequencer declares the head it built on, so a
+    /// slice built in a test should declare the same thing: that is what lets a guard
+    /// comparing the overlay's anchor against the chain's real hash at that height
+    /// tell a slice built on the real chain apart from one built on a fork, rather
+    /// than reading a declared-nothing slice as a free pass. A non-zero hash is
+    /// left untouched: that is a test deliberately claiming a parent, and it is
+    /// allowed to claim one the chain does not have.
+    pub async fn send(&self, mut flashblock: MantleFlashblockPayload) {
+        if let Some(base) = flashblock.base.as_mut().filter(|base| base.parent_hash.is_zero()) &&
+            let Some(parent) = base
+                .block_number
+                .checked_sub(1)
+                .and_then(|number| self.provider.block_hash(number).ok().flatten())
+        {
+            base.parent_hash = parent;
+        }
+
         self.state
             .process_flashblock_for_testing(flashblock)
             .await
