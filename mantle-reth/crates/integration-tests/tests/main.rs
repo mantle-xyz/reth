@@ -10,6 +10,7 @@ mod estimate_total_fee_zero_base_fee;
 mod fill_transaction;
 mod gas_estimation;
 mod gas_limit;
+mod get_proof;
 mod payload_block_size;
 mod preconf_forwarding;
 mod proofs_history;

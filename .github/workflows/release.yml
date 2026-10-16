@@ -35,6 +35,11 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build ${{ matrix.target }}
+        # The cross container has no git, so the version build script reads the tag and commit
+        # from these (passed through in Cross.toml) instead of from the checkout.
+        env:
+          MANTLE_BUILD_REF: ${{ github.ref_name }}
+          MANTLE_BUILD_SHA: ${{ github.sha }}
         run: just build-cross ${{ matrix.target }}
 
       - name: Package tarball
