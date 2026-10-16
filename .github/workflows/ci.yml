@@ -1,10 +1,13 @@
 name: ci
 
 on:
+  # `branches` filters on the base branch, and this repo has no fallback workflow:
+  # a branch missing here gets no CI at all.
   pull_request:
-    branches: [mantle-stage2, main, dev/mantle-v1.6.2]
+    branches: [mantle-stage2, main, "dev/**", "release/**"]
   push:
-    branches: [mantle-stage2, main, dev/mantle-v1.6.2]
+    branches: [mantle-stage2, main, "dev/**", "release/**"]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -31,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           components: clippy
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -58,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
         with:

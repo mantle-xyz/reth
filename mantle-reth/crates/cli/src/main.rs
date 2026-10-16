@@ -3,8 +3,9 @@
 use clap::Parser;
 use eyre::ErrReport;
 use mantle_reth_cli::{
-    MantleArgs, MantleChainSpecParser, MantleNode, proofs_history::with_proofs_history_launch_ctx,
-    seed_blockchain_tree_metrics, spawn_proofs_db_metrics,
+    MantleArgs, MantleChainSpecParser, MantleConfigs, MantleNode,
+    proofs_history::with_proofs_history_launch_ctx, seed_blockchain_tree_metrics,
+    spawn_proofs_db_metrics,
 };
 use mantle_reth_preconf::{PreconfServiceBuilder, seed_preconf_metrics};
 use reth_db::DatabaseEnv;
@@ -17,7 +18,7 @@ use reth_optimism_trie::{
     db::{MdbxProofsStorage, MdbxProofsStorageV2},
 };
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
@@ -40,8 +41,36 @@ fn main() {
         async move |builder, args| {
             info!(target: "reth::cli", "Launching Mantle node");
             let mut node = MantleNode::new(args.rollup.clone());
-            let preconf_cfg = args.preconf.into_config();
+            let rollup = args.rollup.clone();
+            let sweep_interval_given = args.preconf.sweep_interval_ms.is_some();
+            let MantleConfigs { preconf: preconf_cfg, publisher: flashblocks_cfg, consumer } =
+                args.into_configs()?;
             let preconf_enabled = preconf_cfg.is_some();
+            if flashblocks_cfg.is_some() && consumer.is_some() {
+                warn!(
+                    target: "reth::cli",
+                    "Mantle flashblocks publisher and consumer are both enabled; this node will \
+                     subscribe to a stream it may itself produce",
+                );
+            }
+            if let Some(fb) = flashblocks_cfg.as_ref() {
+                info!(
+                    target: "reth::cli",
+                    "Mantle flashblocks ENABLED (publish={}:{}, block_time={:?}, leeway={:?})",
+                    fb.addr, fb.port, fb.block_time, fb.leeway_time,
+                );
+                if sweep_interval_given {
+                    info!(
+                        target: "reth::cli",
+                        "--preconf.sweep-interval-ms is superseded by --flashblocks.block-time while flashblocks are enabled",
+                    );
+                }
+            } else {
+                info!(
+                    target: "reth::cli",
+                    "Mantle flashblocks DISABLED (pass --flashblocks.enable to opt in)",
+                );
+            }
             match preconf_cfg {
                 Some(mut cfg) => {
                     let all = cfg.all_preconfs;
@@ -59,13 +88,23 @@ fn main() {
                         );
                     }
                     let journal = cfg.journal_path.clone();
-                    let svc = PreconfServiceBuilder::from_config(cfg)
+                    let whitelist = cfg.whitelist_contract;
+                    let mut svc = PreconfServiceBuilder::from_config(cfg)
                         .await
                         .map_err(|e| eyre::eyre!("preconf service init: {e}"))?;
+                    // Bind here rather than inside a task: a port already in
+                    // use should stop the node with a clear message, not leave
+                    // it running with an endpoint nobody is serving.
+                    if let Some(fb) = flashblocks_cfg {
+                        let addr = format!("{}:{}", fb.addr, fb.port);
+                        svc.bind_flashblocks(fb).map_err(|e| {
+                            eyre::eyre!("flashblocks publisher could not bind {addr}: {e}")
+                        })?;
+                    }
                     node = node.with_preconf(svc);
                     info!(
                         target: "reth::cli",
-                        "Mantle preconf ENABLED (all_preconfs={all}, journal={journal:?})",
+                        "Mantle preconf ENABLED (all_preconfs={all}, whitelist_contract={whitelist:?}, journal={journal:?})",
                     );
                 }
                 None => {
@@ -75,7 +114,25 @@ fn main() {
                     );
                 }
             }
-            launch_node(builder, node, args.rollup, preconf_enabled).await
+            match consumer {
+                Some(cfg) => {
+                    info!(
+                        target: "reth::cli",
+                        url = %cfg.websocket_url,
+                        max_leading_depth = cfg.max_leading_depth,
+                        "Mantle flashblock consumer ENABLED",
+                    );
+                    node = node.with_flashblocks(cfg);
+                }
+                None => {
+                    info!(
+                        target: "reth::cli",
+                        "Mantle flashblock consumer DISABLED (pass --flashblocks.websocket-url to opt in)",
+                    );
+                }
+            }
+
+            launch_node(builder, node, rollup, preconf_enabled).await
         },
     ) {
         eprintln!("Error: {err:?}");
@@ -88,6 +145,13 @@ fn main() {
 /// Without the flag this is the plain launch path. With it, the ExEx (write side), the
 /// `eth_getProof` / `debug_*` RPC overrides (read side), and the storage metrics task are
 /// wired up against a shared MDBX sidecar handle.
+///
+/// The preconf whitelist cold start + watcher deliberately do **not** live in the
+/// `on_node_started` hooks below. Those run once the RPC server, payload builder and
+/// consensus engine are already accepting work, and a preconf tx admitted before the
+/// allowlists have loaded would be refused for good — the door is asked once
+/// per transaction and never again. They run inside
+/// `MantlePoolBuilder::build_pool` instead; see the comment there.
 async fn launch_node(
     builder: WithLaunchContext<NodeBuilder<DatabaseEnv, OpChainSpec>>,
     node: MantleNode,
@@ -110,12 +174,9 @@ async fn launch_node(
         return handle.node_exit_future.await;
     }
 
-    let path = args
-        .proofs_history_storage_path
-        .clone()
-        .ok_or_else(|| eyre::eyre!("--proofs-history.storage-path is required"))?;
+    let path = args.history.resolve_storage_path(builder.config().datadir().as_ref());
 
-    match args.proofs_history_storage_version {
+    match args.history.storage_version {
         ProofsStorageVersion::V1 => {
             info!(target: "reth::cli", "Using on-disk storage for proofs history (v1)");
             let mdbx = Arc::new(

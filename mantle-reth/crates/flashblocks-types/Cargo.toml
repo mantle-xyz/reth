@@ -1,0 +1,23 @@
+[package]
+name = "mantle-reth-flashblocks-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Mantle flashblock wire format — shared by the sequencer producer and the RPC consumer"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true, features = ["std", "serde"] }
+alloy-rpc-types-engine = { workspace = true, features = ["std", "serde"] }
+op-alloy-consensus = { workspace = true, features = ["std", "serde"] }
+op-alloy-rpc-types-engine = { workspace = true, features = ["std", "serde"] }
+
+brotli = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true, features = ["std"] }

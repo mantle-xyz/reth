@@ -238,8 +238,16 @@ fn replay_fixture(fixture_json: &str) {
         .with_chain(l1_block_info)
         .with_block(block_env)
         .modify_cfg_chained(|cfg| {
-            cfg.spec = spec_id;
+            // Must be `set_spec_and_mainnet_gas_params`, not `cfg.spec = spec_id`: revm 40
+            // split the gas parameters out of the spec, so assigning the field alone leaves
+            // `gas_params` at `OpSpecId::default()` and the EIP-7623 calldata floor never
+            // applies -- every gas comparison here would be quietly wrong.
+            cfg.set_spec_and_mainnet_gas_params(spec_id);
             cfg.chain_id = 5000;
+            // This builds its own `CfgEnv` and so bypasses the production env builders, where
+            // Mantle's EIP-7825 exemption is applied. Without it the Arsia fixtures fail:
+            // they replay real transactions whose gas limit is far above the 16,777,216 cap.
+            cfg.tx_gas_limit_cap = spec_id.tx_gas_limit_cap_override();
         })
         .with_tx(op_tx);
 

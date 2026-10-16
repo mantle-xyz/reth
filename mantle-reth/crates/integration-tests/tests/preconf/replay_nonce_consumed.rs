@@ -24,8 +24,7 @@
 //!   - the apply loop additionally tolerates `is_nonce_too_low()` without `mark_invalid`, as a
 //!     second-line defense if a stale entry still reaches apply.
 //!
-//! The Replay path was previously untested (`nonce_too_low` skip was only
-//! covered on the pool-sweep path). These tests assert the
+//! These tests assert the
 //! observable contract — hash on chain exactly once, node healthy — rather
 //! than which layer did the skipping.
 
