@@ -9,11 +9,14 @@
 
 use super::helpers::{
     PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, mantle_test_chain_spec, send_preconf,
-    wait_pending_nonce,
+    wait_fifo_entry,
 };
-use crate::{canonize_built, launch_preconf_node};
+use crate::{
+    canonicalize_payload, launch_preconf_node, launch_preconf_node_with_classifier,
+    launch_preconf_node_with_fifo,
+};
 use alloy_network::eip2718::Encodable2718;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, bytes};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_chainspec::EthChainSpec;
@@ -40,6 +43,130 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
         ..Default::default()
     };
     TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
+}
+
+/// Build a signed **contract creation** for `wallet[0]` at the given nonce.
+///
+/// The init code is the minimal valid deployer — `PUSH1 0 PUSH1 0 RETURN` —
+/// which returns zero-length runtime code. What is being exercised is the
+/// transaction *shape*, not the contract: a creation carries `TxKind::Create`
+/// and therefore has no `to` at all.
+async fn signed_creation(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_primitives::Bytes {
+    let request = TransactionRequest {
+        chain_id: Some(chain_id),
+        nonce: Some(nonce),
+        to: Some(TxKind::Create),
+        // Intrinsic cost of a creation is 53k (21k base + 32k create), so 21k
+        // would be rejected before the allowlist ever mattered.
+        gas: Some(200_000),
+        max_fee_per_gas: Some(20e9 as u128),
+        max_priority_fee_per_gas: Some(20e9 as u128),
+        value: Some(U256::ZERO),
+        input: TransactionInput::new(bytes!("60006000f3")),
+        ..Default::default()
+    };
+    TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into()
+}
+
+/// **The two things the pair rework adds, on one node**: wildcards loaded from
+/// genesis, and a contract creation reaching the preconf fast path.
+///
+/// A creation has no recipient — `TxKind::Create`, not `Call(0x0)` — so neither
+/// an exact pair nor a recipient wildcard can match it. A sender wildcard is the
+/// only rule that can, which is what "every transaction from this sender" means.
+/// The setup installs **no pairs at all**, so a `Success` here cannot have come
+/// from any other arm.
+///
+/// The creation is the one genuinely new end-to-end path. Everything downstream
+/// of classification reads only the frozen `Record` — admission and the
+/// payload builder both go through `record(..).is_preconf()` — so *which* arm
+/// matched is invisible to them, and
+/// the rest of this suite covers them equally well with pairs. What none of it
+/// covered is a transaction with no `to` travelling the whole pipeline, because
+/// until now `to == None` was refused at classification and never got in.
+///
+/// The wildcard-loading assertions ride along on the same launch rather than
+/// taking a second one: a second node launch costs reliability under this
+/// suite's parallel load (see `classifier_freeze.rs`). Cold start reads both
+/// wildcard arrays out of the sentinel
+/// contract's genesis storage, which is the part a mock-backed unit test cannot
+/// reach: those build their storage with the same code that computes the slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wildcards_load_from_genesis_and_carry_a_contract_creation() {
+    let sender = Wallet::default().with_chain_id(1).inner.address();
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let stranger = Address::from([0x99; 20]);
+
+    // One wildcard on each side, no pairs.
+    let setup = PreconfCfgBuilder::new()
+        .whitelist_from_wildcard(sender)
+        .whitelist_to_wildcard(recipient)
+        .build();
+
+    let (mut node, http, wallet, chain_id, classifier) =
+        launch_preconf_node_with_classifier!(setup, mantle_test_chain_spec()).await;
+
+    // Cold start ran inside `build_pool`; nothing in this test loaded anything.
+    assert_eq!(classifier.whitelist_counts(), (0, 1, 1), "no pairs, one of each wildcard");
+    assert!(classifier.preview_eligibility(&sender, Some(&stranger)), "sender wildcard, any to");
+    assert!(classifier.preview_eligibility(&stranger, Some(&recipient)), "recipient wildcard");
+    assert!(classifier.preview_eligibility(&sender, None), "sender wildcard covers a creation");
+    assert!(!classifier.preview_eligibility(&stranger, Some(&stranger)), "no rule");
+    assert!(
+        !classifier.preview_eligibility(&stranger, None),
+        "a creation from an uncovered sender has no route at all",
+    );
+
+    let raw_tx = signed_creation(chain_id, &wallet, 0).await;
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id must be present when attributes are supplied");
+
+    let http_clone = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_clone, raw_tx).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind not cancelled")
+        .expect("payload build must produce a sealed payload");
+
+    let event = rpc_task.await.expect("rpc task join").expect("preconf RPC must succeed");
+
+    assert!(
+        matches!(event.status, PreconfStatus::Success),
+        "a creation covered by a sender wildcard must take the fast path, got {:?} (reason={:?})",
+        event.status,
+        event.reason
+    );
+    assert!(
+        event.receipt.logs.is_some(),
+        "success path must carry Some(logs), not None (which signals no-apply)"
+    );
+
+    let block = payload.block();
+    let sealed_hashes: Vec<B256> = block
+        .body()
+        .transactions()
+        .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
+        .collect();
+    assert!(
+        sealed_hashes.contains(&event.tx_hash),
+        "the creation must land in the sealed block; sealed = {sealed_hashes:?}"
+    );
 }
 
 /// Whitelisted (sender, to) pair + `send_preconf` returns `Success`;
@@ -199,7 +326,7 @@ async fn multi_nonce_same_sender_land_in_one_block() {
 
     let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     let attrs = node.payload.next_attributes();
     let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
@@ -227,10 +354,10 @@ async fn multi_nonce_same_sender_land_in_one_block() {
     // dictates the sealed-block index order asserted below.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    wait_pending_nonce(&http, wallet_addr, 1).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    wait_pending_nonce(&http, wallet_addr, 2).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2).await });
 
@@ -544,8 +671,7 @@ async fn weth_transfer_over_balance_lands_as_reverted() {
     // Canonicalise the block so the state provider serves post-execution
     // state, then confirm the failed transfer left `balanceOf[recipient]`
     // untouched at 0 — the revert must have rolled back EVM state.
-    canonize_built!(node, payload);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _new_head = canonicalize_payload!(node, payload).await;
     let state = node.inner.provider.latest().expect("state provider");
     let recipient_balance = state
         .storage(WETH9, weth_balance_slot(recipient))
@@ -667,8 +793,7 @@ async fn weth_deposit_carries_log_through_to_receipt() {
     // WETH9's `balanceOf[wallet_addr]` must now equal the deposited wad.
     // This guards against a hypothetical regression where the receipt
     // reports success but the state write was silently dropped.
-    canonize_built!(node, payload);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _new_head = canonicalize_payload!(node, payload).await;
     let state = node.inner.provider.latest().expect("state provider");
     let wallet_weth = state
         .storage(WETH9, weth_balance_slot(wallet_addr))

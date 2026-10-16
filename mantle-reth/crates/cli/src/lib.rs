@@ -7,7 +7,10 @@ mod chainspec;
 pub use chainspec::MantleChainSpecParser;
 
 pub mod args;
-pub use args::{MantleArgs, PreconfArgs};
+pub use args::{
+    FlashblocksArgs, FlashblocksConsumerArgs, MantleArgs, MantleArgsError, MantleConfigs,
+    PreconfArgs,
+};
 
 pub mod txpool;
 pub use txpool::{MantleTransactionValidator, MetaTxDisabled, UnprotectedTxDisabled};

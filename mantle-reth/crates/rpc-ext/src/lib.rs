@@ -20,11 +20,15 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
-use alloy_rpc_types_eth::{EIP1186AccountProofResponse, TransactionRequest, state::EvmOverrides};
+use alloy_primitives::{Address, B256, Bloom, Bytes, TxKind, U256};
+use alloy_rpc_types_eth::{
+    EIP1186AccountProofResponse, TransactionRequest,
+    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
+};
 use alloy_serde::JsonStorageKey;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
+use mantle_reth_flashblocks::{Metrics, PendingStateOverrides};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_errors::RethError;
@@ -47,16 +51,60 @@ use std::sync::Arc;
 use tracing::debug;
 
 /// Preconfirmation transaction event returned by `eth_sendRawTransactionWithPreconf`.
+///
+/// # What a preconfirmation does and does not promise
+///
+/// This event is produced the moment the sequencer applies the transaction to the
+/// block it is **currently building** — before that block is sealed, and long
+/// before it is canonical. So it is a prediction, not a record:
+///
+/// - **`tx_hash` is binding.** The sequencer has committed to landing *this* transaction, and holds
+///   the `(sender, nonce)` it occupies against any other transaction for as long as the commitment
+///   stands. The one exception is a breach: if the transaction later proves un-appliable (its nonce
+///   was consumed elsewhere, its balance spent), the sequencer releases the nonce so the sender is
+///   not wedged, and logs `COMMITMENT BROKEN` / `preconf.tx.commitment_broken_total`. A client that
+///   re-submits the same hash then gets `CommitmentBroken` — the only channel through which the
+///   breach is reported.
+/// - **Everything else is a prediction of one particular build.** If that in-flight block is
+///   discarded (a competing block takes the height, the payload job is superseded, the process
+///   restarts), the sequencer re-applies the transaction to a *later* block — honouring the
+///   promise, but against different state. `block_height`, `status` and `receipt.logs` are all
+///   recomputed then, and the client is **not** sent a corrected event: the response to this call
+///   has already been delivered.
+/// - The fields added to `receipt` are all **positions and figures from one particular build**.
+///   `transactionIndex`, `cumulativeGasUsed` and each log's `logIndex` say where this transaction
+///   sat in the block that was being built; a replay puts it somewhere else, and no corrected event
+///   is sent. `gasUsed`, `logsBloom`, `status`, `effectiveGasPrice` and the L1 fee fields are all
+///   recomputed on replay too.
+/// - `blockHash` is absent and always will be: the block is not sealed when this event is produced,
+///   so its header does not exist yet.
+/// - Fields being absent altogether means the sequencer did not send them — an op-geth sequencer
+///   sends only `logs`.
+///
+/// Consequently, **do not reconcile on the fields of this event**. Treat it as
+/// "accepted, will land", and read the authoritative outcome from
+/// `eth_getTransactionReceipt` once the transaction is on chain. In particular a
+/// `Success` here can be followed by a failed on-chain receipt if the
+/// transaction reverts when replayed against later state.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreconfTxEvent {
-    /// Transaction hash
+    /// Transaction hash. The one field that is binding — see the type docs.
     pub tx_hash: B256,
-    /// Preconfirmation status
+    /// Preconfirmation status, as evaluated against the in-flight block.
+    ///
+    /// **May differ from the eventual on-chain receipt.** A cross-block replay
+    /// re-executes against different state, so a `Success` here can end up as a
+    /// reverted on-chain receipt (and vice versa). Not a reconciliation source.
     pub status: PreconfStatus,
     /// Optional failure message
     pub reason: String,
-    /// Predicted L2 block number (hex-encoded quantity)
+    /// **Predicted** L2 block number (hex-encoded quantity).
+    ///
+    /// Computed as `parent_number + 1` for the block being built when this
+    /// preconfirmation was issued. If that block is discarded the transaction
+    /// lands at a **later** height and this value is never corrected. Use
+    /// `eth_getTransactionReceipt` for the authoritative height.
     #[serde(with = "alloy_serde::quantity")]
     pub block_height: u64,
     /// Preconfirmation transaction receipt
@@ -66,26 +114,51 @@ pub struct PreconfTxEvent {
 /// Preconfirmation status.
 ///
 /// Matches op-geth's 4-variant `PreconfStatus` for cross-client SDK
-/// compatibility. Server pre-apply rejection (e.g. block gas budget) is
-/// collapsed into `Failed` at this wire boundary — the fine-grained
-/// reason travels in [`PreconfTxEvent::reason`]. The internal fifo state
-/// machine still distinguishes `Canceled` from `Failed` for replacement
-/// / clean-up semantics.
+/// compatibility.
+///
+/// **Two different things wear this name, and only one of them is this enum.**
+/// The queue's own entry status is `Waiting` or `Success` and nothing else —
+/// a commitment that ends is removed rather than parked in a terminal state.
+/// The wire status here is derived separately, from the EVM execution outcome:
+/// `impl From<PreconfReceipt> for PreconfTxEvent` in `mantle_reth_preconf::rpc`
+/// maps `receipt.status` to `Success` / `Failed`, and the handler's deadline
+/// arm builds `Timeout`. So `Failed` has no queue counterpart to map from, but
+/// it is still a status clients see.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PreconfStatus {
-    /// EVM apply succeeded; tx on chain.
+    /// EVM apply succeeded in the build that issued this event. Like every
+    /// field but `tx_hash`, a prediction of that one build rather than
+    /// canonical inclusion — see the notes on this type.
     #[serde(rename = "success")]
     Success,
-    /// Either (a) EVM apply revert/halt (tx on chain) OR (b) builder
-    /// pre-apply reject / server-side cancel (tx NOT on chain). The
-    /// [`PreconfTxEvent::reason`] field disambiguates.
+    /// EVM apply reverted or halted in the build that issued this event: the
+    /// transaction executed and produced a receipt, so this is an outcome
+    /// rather than a refusal. Carries the same build-scoped caveat as
+    /// `Success`.
+    ///
+    /// **Narrower than op-geth's `failed`, deliberately.** The two agree
+    /// everywhere else: an admission refusal (base fee, funds, tx type) is a
+    /// JSON-RPC error on both, a revert is `Failed` on both, an expired
+    /// deadline is `Timeout` on both. They differ once the builder has the
+    /// transaction and cannot fit it: op-geth reports that as `failed` with
+    /// `ErrPreconfBlockFull` in the reason, while this node answers the
+    /// JSON-RPC call with an error — `PreconfError::BlockGasBudgetExceeded` and
+    /// its DA counterparts leave through the handler's `Some(Ok(Err(err)))`
+    /// arm, which sends no event at all.
+    ///
+    /// So `Failed` from this node always means the transaction executed and is
+    /// on chain. From op-geth it may also mean it never ran.
     #[serde(rename = "failed")]
     Failed,
     /// Client-side deadline elapsed (`preconf_timeout`); tx NOT on chain.
     #[serde(rename = "timeout")]
     Timeout,
-    /// Preconfirmation is waiting (intermediate state; typically not
-    /// broadcast to subscribers).
+    /// Preconfirmation is still waiting on the builder.
+    ///
+    /// **Never sent by this node.** `eth_sendRawTransactionWithPreconf` only
+    /// answers once the commitment has ended, so the client sees one of the
+    /// three above. Carried for op-geth wire compatibility, and so a client
+    /// deserialising another implementation's event does not fail on it.
     #[serde(rename = "waiting")]
     Waiting,
 }
@@ -93,11 +166,23 @@ pub enum PreconfStatus {
 /// Preconfirmation transaction receipt.
 ///
 /// `logs` is `Option` rather than a plain `Vec` so absence semantics
-/// can be expressed on the wire: `null` when no EVM apply happened
-/// (Timeout / server pre-apply reject), `[]` when apply happened but
-/// emitted no logs. SDKs treat both as "no logs" but the wire shape
-/// preserves the distinction.
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+/// can be expressed on the wire: `null` when no EVM apply happened,
+/// `[]` when apply happened but emitted no logs. SDKs treat both as
+/// "no logs" but the wire shape preserves the distinction.
+///
+/// This node sends `null` only on `Timeout`; it answers a builder refusal with
+/// a JSON-RPC error rather than an event (see [`PreconfStatus::Failed`]). An
+/// event deserialised from an op-geth sequencer can carry `null` on `failed`
+/// as well.
+///
+/// Apart from `logs`, every scalar field is `Option` and omitted when absent;
+/// `l1_fields` is a flattened struct whose own fields are each `Option` and
+/// each omitted individually. An absent field means the sequencer did not send
+/// one — an op-geth sequencer sends only `logs` — so a forwarding reth node
+/// reproduces its response byte for byte. A zero would be a number this node
+/// invented; absence is the honest answer.
+#[derive(Debug, Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreconfTxReceipt {
     /// Event logs, echoed verbatim from the sequencer.
     ///
@@ -107,24 +192,96 @@ pub struct PreconfTxReceipt {
     /// wire (`invalid type: null, expected a sequence`) *and* would re-serialize an empty result
     /// as `[]`, diverging from geth. `Option<Vec<_>>` deserializes null→None and re-serializes
     /// None→null, so a forwarding reth node returns byte-identical shape to the geth sequencer.
+    /// The `null` / `[]` distinction is the one described on the type above.
     ///
-    /// (Internally the preconf handler also uses this: `None` ⇒ no EVM apply happened —
-    /// Timeout / server pre-apply reject — while `Some(vec![])` ⇒ apply happened but emitted
-    /// no logs.)
+    /// Like every other field of [`PreconfTxEvent`] except `tx_hash`, these are
+    /// the logs of one particular in-flight execution. A cross-block replay
+    /// re-executes against different state and can emit different logs, with no
+    /// corrected event sent. Read `eth_getTransactionReceipt` to reconcile.
     #[serde(default)]
     pub logs: Option<Vec<PreconfLog>>,
+
+    /// EVM status — `0x1` on success, `0x0` on revert or halt.
+    ///
+    /// Not to be confused with [`PreconfTxEvent::status`], which is the
+    /// preconfirmation's own four-state outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub status: Option<u64>,
+    /// Gas this transaction alone used, after the post-exec refund — the same
+    /// figure `eth_getTransactionReceipt` reports.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub gas_used: Option<u64>,
+    /// Block gas used through this transaction, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub cumulative_gas_used: Option<u64>,
+    /// This transaction's index in the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub transaction_index: Option<u64>,
+    /// Bloom over this transaction's logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_bloom: Option<Bloom>,
+    /// EIP-2718 transaction type byte.
+    #[serde(
+        default,
+        rename = "type",
+        skip_serializing_if = "Option::is_none",
+        with = "alloy_serde::quantity::opt"
+    )]
+    pub tx_type: Option<u64>,
+    /// Sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Address>,
+    /// Recipient — absent for a creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Address>,
+    /// Address a creation deployed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<Address>,
+    /// What this transaction paid per unit of gas.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub effective_gas_price: Option<u128>,
+    /// The eleven L1 fee fields, flattened so their shape matches
+    /// `eth_getTransactionReceipt` exactly. Every field inside is `Option` and
+    /// omitted when the fork that introduced it is not active, so an op-geth
+    /// sequencer's response is unaffected.
+    ///
+    /// The type also carries `opGasRefund`, `depositNonce` and
+    /// `depositReceiptVersion`. None of the three is ever set here — a preconf
+    /// transaction can never be a deposit, and `opGasRefund` is left unset for
+    /// the reason given at its `OpReceiptFieldsBuilder` call site in
+    /// `apply_preconf_with_da` — so all three stay absent from the wire.
+    #[serde(flatten)]
+    pub l1_fields: op_alloy_rpc_types::OpTransactionReceiptFields,
 }
 
 /// Preconfirmation log entry
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreconfLog {
     /// Log address
-    pub address: alloy_primitives::Address,
+    pub address: Address,
     /// Log topics
     pub topics: Vec<B256>,
     /// Log data
     pub data: Bytes,
+    /// Number of the block being built when this log was emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub block_number: Option<u64>,
+    /// Timestamp of the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub block_timestamp: Option<u64>,
+    /// Hash of the transaction that emitted this log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_hash: Option<B256>,
+    /// Index of that transaction in the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub transaction_index: Option<u64>,
+    /// This log's index across the whole block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub log_index: Option<u64>,
+    /// Geth compatibility field — always `false` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<bool>,
 }
 
 // ─── Preconf handler indirection ─────────────────────────────────────────────
@@ -243,6 +400,10 @@ pub struct MantleRpcExt<Provider, EthApi> {
     /// `None` ⇒ fall back to `sequencer_client` forward / "not implemented"
     /// stub.
     preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
+    /// Pending flashblock overlay. `Some` only when the flashblock consumer is
+    /// enabled; supplies the state overrides `eth_simulateV1` prepends for the
+    /// `pending` tag.
+    pending_overrides: Option<Arc<dyn PendingStateOverrides>>,
 }
 
 impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
@@ -253,12 +414,75 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         sequencer_client: Option<SequencerClient>,
         preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
     ) -> Self {
-        Self { provider, eth_api, sequencer_client, preconf_handler }
+        Self { provider, eth_api, sequencer_client, preconf_handler, pending_overrides: None }
+    }
+
+    /// Attaches the flashblock pending overlay used by `eth_simulateV1`.
+    #[must_use]
+    pub fn with_pending_overrides(
+        mut self,
+        pending_overrides: Option<Arc<dyn PendingStateOverrides>>,
+    ) -> Self {
+        self.pending_overrides = pending_overrides;
+        self
     }
 
     #[inline]
     fn provider(&self) -> &Provider {
         &self.provider
+    }
+
+    /// Rewrites a `pending`-tagged `eth_simulateV1` request to run against the
+    /// flashblock overlay's base block with the overlay's state prepended.
+    ///
+    /// Returns the request unchanged when the tag is not `pending` or no overlay
+    /// is attached. User-supplied overrides win per address.
+    fn apply_pending_overrides(
+        &self,
+        payload: serde_json::Value,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<(serde_json::Value, Option<BlockId>)> {
+        let block_id = block_number.unwrap_or_default();
+        if !block_id.is_pending() {
+            return Ok((payload, block_number));
+        }
+        let Some(overlay) = self.pending_overrides.as_ref() else {
+            return Ok((payload, block_number));
+        };
+        // Counted here rather than right after the `pending` check: unlike the
+        // `flashblocks.rpc.*` counters in the override module, this method is
+        // registered whether or not the consumer is enabled.
+        Metrics::rpc_simulate_v1().increment(1);
+        let Some(pending) = overlay.pending_state_overrides() else {
+            return Ok((payload, Some(overlay.pending_base_block())));
+        };
+
+        let mut payload = payload;
+        if let Some(calls) =
+            payload.get_mut("blockStateCalls").and_then(serde_json::Value::as_array_mut)
+        {
+            for call in calls.iter_mut() {
+                let user: StateOverride = match call.get("stateOverrides") {
+                    Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
+                        invalid_params_rpc_err(format!("invalid stateOverrides: {e}"))
+                    })?,
+                    None => StateOverride::default(),
+                };
+                let merged = StateOverridesBuilder::new(pending.clone()).extend(user).build();
+                let merged = serde_json::to_value(merged).map_err(|e| {
+                    ErrorObject::owned(
+                        -32000,
+                        format!("failed to serialise stateOverrides: {e}"),
+                        None::<()>,
+                    )
+                })?;
+                if let Some(obj) = call.as_object_mut() {
+                    obj.insert("stateOverrides".to_string(), merged);
+                }
+            }
+        }
+
+        Ok((payload, Some(overlay.pending_base_block())))
     }
 
     #[inline]
@@ -826,6 +1050,10 @@ where
             }
         }
 
+        // Flashblocks: for the `pending` tag, resolve to the overlay's base block and
+        // prepend its state overrides to every `blockStateCalls` entry.
+        let (payload, block_number) = self.apply_pending_overrides(payload, block_number)?;
+
         // Not a boundary-crossing simulation: hand off to the standard implementation. Round-trip
         // through JSON so the network-specific payload/result generics stay behind `EthApi`.
         let typed_payload = serde_json::from_value(payload)
@@ -982,6 +1210,8 @@ fn build_unsigned_tx_envelope(
 
 #[cfg(test)]
 mod tests {
+    use jsonrpsee::types::error::INVALID_PARAMS_CODE;
+
     use super::*;
     use alloy_consensus::TxEnvelope;
     use alloy_eips::{
@@ -1036,6 +1266,196 @@ mod tests {
     ) -> Vec<u8> {
         build_unsigned_tx_envelope(request, gas_estimate, base_fee, chain_id)
             .expect("valid fee envelope request")
+    }
+
+    // ─── pending overlay injection into eth_simulateV1 ──────────────────
+
+    /// Stands in for the flashblock overlay. The real implementor is
+    /// `mantle-reth-flashblocks`'s state; this crate only consumes the trait.
+    #[derive(Debug)]
+    struct StubOverlay {
+        base_block: BlockId,
+        overrides: Option<StateOverride>,
+    }
+
+    impl PendingStateOverrides for StubOverlay {
+        fn pending_base_block(&self) -> BlockId {
+            self.base_block
+        }
+
+        fn pending_state_overrides(&self) -> Option<StateOverride> {
+            self.overrides.clone()
+        }
+    }
+
+    const OVERLAY_ONLY: Address = Address::repeat_byte(0xA1);
+    const CONTESTED: Address = Address::repeat_byte(0xB2);
+
+    fn state_override(address: Address, balance: &str) -> StateOverride {
+        serde_json::from_value(serde_json::json!({
+            format!("{address:#x}"): { "balance": balance }
+        }))
+        .expect("a valid state override")
+    }
+
+    /// `MantleRpcExt`'s inherent impl carries no bounds on either generic, so the
+    /// overlay path can be exercised without standing up a provider or eth API.
+    fn ext(overlay: Option<StubOverlay>) -> MantleRpcExt<(), ()> {
+        MantleRpcExt::new((), Arc::new(()), None, None)
+            .with_pending_overrides(overlay.map(|o| Arc::new(o) as Arc<dyn PendingStateOverrides>))
+    }
+
+    fn overlay_at_block_9() -> StubOverlay {
+        StubOverlay {
+            base_block: BlockId::from(9u64),
+            overrides: Some(state_override(OVERLAY_ONLY, "0x64")),
+        }
+    }
+
+    fn payload_with_user_override() -> serde_json::Value {
+        serde_json::json!({
+            "blockStateCalls": [
+                { "calls": [], "stateOverrides": state_override(CONTESTED, "0x2") },
+                { "calls": [] },
+            ]
+        })
+    }
+
+    fn overrides_of(payload: &serde_json::Value, call: usize) -> StateOverride {
+        serde_json::from_value(payload["blockStateCalls"][call]["stateOverrides"].clone())
+            .expect("a valid state override")
+    }
+
+    fn balance_of(overrides: &StateOverride, address: Address) -> Option<U256> {
+        overrides.get(&address).and_then(|account| account.balance)
+    }
+
+    /// A concrete tag names a settled block; the overlay must not be consulted.
+    #[test]
+    fn a_non_pending_tag_is_left_alone() {
+        let payload = payload_with_user_override();
+        let block = Some(BlockId::from(BlockNumberOrTag::Latest));
+
+        let (out, out_block) = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload.clone(), block)
+            .expect("no rewrite");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, block);
+    }
+
+    /// The default tag is `latest`, so an absent block number is also left alone.
+    #[test]
+    fn an_absent_block_number_is_left_alone() {
+        let payload = payload_with_user_override();
+
+        let (out, out_block) = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload.clone(), None)
+            .expect("no rewrite");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, None);
+    }
+
+    /// Without the flashblock consumer the `pending` tag stays untouched, so the
+    /// standard implementation keeps resolving it.
+    #[test]
+    fn pending_passes_through_when_no_overlay_is_attached() {
+        let payload = payload_with_user_override();
+        let block = Some(BlockId::pending());
+
+        let (out, out_block) =
+            ext(None).apply_pending_overrides(payload.clone(), block).expect("no rewrite");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, block, "the tag must survive for the standard implementation");
+    }
+
+    /// An attached overlay that holds no state still pins the simulation to its
+    /// base block, so a later canonical commit cannot move the ground underneath.
+    #[test]
+    fn an_empty_overlay_still_pins_the_base_block() {
+        let payload = payload_with_user_override();
+        let overlay = StubOverlay { base_block: BlockId::from(9u64), overrides: None };
+
+        let (out, out_block) = ext(Some(overlay))
+            .apply_pending_overrides(payload.clone(), Some(BlockId::pending()))
+            .expect("rewrite");
+
+        assert_eq!(out, payload, "no overlay state means no override merging");
+        assert_eq!(out_block, Some(BlockId::from(9u64)));
+    }
+
+    /// R4: the overlay's state is prepended to every entry, and a user override
+    /// for the same address wins — the caller's intent is not silently replaced.
+    #[test]
+    fn the_overlay_is_prepended_to_every_call_and_user_overrides_win() {
+        let overlay = StubOverlay {
+            base_block: BlockId::from(9u64),
+            overrides: Some(
+                serde_json::from_value(serde_json::json!({
+                    format!("{OVERLAY_ONLY:#x}"): { "balance": "0x64" },
+                    format!("{CONTESTED:#x}"): { "balance": "0x1" },
+                }))
+                .expect("a valid state override"),
+            ),
+        };
+
+        let (out, out_block) = ext(Some(overlay))
+            .apply_pending_overrides(payload_with_user_override(), Some(BlockId::pending()))
+            .expect("rewrite");
+
+        assert_eq!(out_block, Some(BlockId::from(9u64)));
+
+        let first = overrides_of(&out, 0);
+        assert_eq!(
+            balance_of(&first, OVERLAY_ONLY),
+            Some(U256::from(0x64)),
+            "overlay-only address"
+        );
+        assert_eq!(
+            balance_of(&first, CONTESTED),
+            Some(U256::from(2)),
+            "the user's 0x2 must win over the overlay's 0x1"
+        );
+
+        let second = overrides_of(&out, 1);
+        assert_eq!(
+            balance_of(&second, OVERLAY_ONLY),
+            Some(U256::from(0x64)),
+            "an entry without user overrides still receives the overlay"
+        );
+        assert_eq!(balance_of(&second, CONTESTED), Some(U256::from(1)), "overlay value stands");
+    }
+
+    /// A malformed `stateOverrides` must be reported as a bad request rather than
+    /// dropped, which would run the simulation against unintended state.
+    #[test]
+    fn a_malformed_state_override_is_rejected() {
+        let payload = serde_json::json!({
+            "blockStateCalls": [{ "calls": [], "stateOverrides": "not an object" }]
+        });
+
+        let error = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload, Some(BlockId::pending()))
+            .expect_err("must not be silently dropped");
+
+        assert_eq!(error.code(), INVALID_PARAMS_CODE);
+        assert!(error.message().contains("invalid stateOverrides"));
+    }
+
+    /// A payload without `blockStateCalls` is malformed for `eth_simulateV1`, but
+    /// this stage must not panic on it — rejection belongs to the typed decode.
+    #[test]
+    fn a_payload_without_block_state_calls_is_only_repointed() {
+        let payload = serde_json::json!({});
+
+        let (out, out_block) = ext(Some(overlay_at_block_9()))
+            .apply_pending_overrides(payload.clone(), Some(BlockId::pending()))
+            .expect("no panic");
+
+        assert_eq!(out, payload);
+        assert_eq!(out_block, Some(BlockId::from(9u64)));
     }
 
     // ─── gas price selection ────────────────────────────────────────────
@@ -1537,22 +1957,21 @@ mod tests {
 
     // ─── PreconfTxReceipt.logs three-state serde ────────────────────
     //
-    // R6/T7 — `logs` distinguishes "no EVM apply happened" (`null`)
-    // from "apply happened but no logs" (`[]`) on the wire. This is a
-    // deliberate contract that R5/D1 wire refactor introduced (changed
-    // from `Vec<PreconfLog>` to `Option<Vec<PreconfLog>>`). SDKs rely
-    // on the distinction to build UX around Timeout vs revert.
+    // `logs` distinguishes "no EVM apply happened" (`null`) from "apply
+    // happened but no logs" (`[]`) on the wire — which is why the field is
+    // `Option<Vec<PreconfLog>>` rather than a plain `Vec`. SDKs rely on the
+    // distinction to tell a timeout from a revert.
 
     #[test]
     fn preconf_tx_receipt_logs_none_serializes_as_null() {
-        let r = PreconfTxReceipt { logs: None };
+        let r = PreconfTxReceipt { logs: None, ..Default::default() };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(json, r#"{"logs":null}"#);
     }
 
     #[test]
     fn preconf_tx_receipt_logs_empty_vec_serializes_as_empty_array() {
-        let r = PreconfTxReceipt { logs: Some(vec![]) };
+        let r = PreconfTxReceipt { logs: Some(vec![]), ..Default::default() };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(json, r#"{"logs":[]}"#);
     }
@@ -1565,7 +1984,9 @@ mod tests {
                 address: addr,
                 topics: vec![B256::from([0xCD; 32])],
                 data: Bytes::from(vec![0xEF, 0xEF]),
+                ..Default::default()
             }]),
+            ..Default::default()
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: PreconfTxReceipt = serde_json::from_str(&json).unwrap();
@@ -1583,8 +2004,8 @@ mod tests {
 
     #[test]
     fn preconf_status_wire_serde_has_four_variants() {
-        // R5/D1 decision 8B — wire enum matches op-geth's 4 variants.
-        // Regression guard against silently re-introducing `Canceled`.
+        // The wire enum matches op-geth's four variants. Regression guard
+        // against silently re-introducing `Canceled`.
         for (variant, expected) in [
             (PreconfStatus::Success, r#""success""#),
             (PreconfStatus::Failed, r#""failed""#),
@@ -1595,12 +2016,12 @@ mod tests {
             let back: PreconfStatus = serde_json::from_str(expected).unwrap();
             assert_eq!(back, variant);
         }
-        // `"canceled"` must NOT deserialize (variant was deleted).
+        // `"canceled"` must NOT deserialize.
         assert!(serde_json::from_str::<PreconfStatus>(r#""canceled""#).is_err());
     }
 
     /// Regression for the cross-client `eth_estimateTotalFee` divergence at Sepolia-QA4
-    /// block 597707 (PR #73). `token_ratio` (`GasPriceOracle` slot 0) changed `3231` ->
+    /// block 597707. `token_ratio` (`GasPriceOracle` slot 0) changed `3231` ->
     /// `3224` *inside* that block, so reading it from the parent block (`3231`) instead of
     /// the target block's post-state (`3224`) inflated the L1 data fee. `token_ratio` is
     /// the last (multiplicative) factor in the Arsia L1 cost, so the per-client delta is
@@ -1829,5 +2250,26 @@ mod tests {
         assert_eq!(parse_quantity_u64(&serde_json::json!("2a")), None);
         assert_eq!(parse_quantity_u64(&serde_json::json!("0xzz")), None);
         assert_eq!(parse_quantity_u64(&serde_json::Value::Null), None);
+    }
+
+    // ─── preconf event forwarding: byte-identity round-trip ─────────────
+
+    /// A reth follower forwarding an op-geth sequencer's response deserializes
+    /// it into `PreconfTxEvent` and re-serializes. op-geth does not send any of
+    /// the fields added here, so every one of them must vanish on the way out —
+    /// a zero would be a number this node invented.
+    #[test]
+    fn geth_shaped_event_round_trips_byte_for_byte() {
+        let geth = r#"{"txHash":"0x0101010101010101010101010101010101010101010101010101010101010101","status":"failed","reason":"execution reverted","blockHeight":"0x1","receipt":{"logs":null}}"#;
+        let decoded: PreconfTxEvent = serde_json::from_str(geth).expect("decode geth shape");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-encode"), geth);
+    }
+
+    /// Same, for op-geth's log shape: three fields and nothing else.
+    #[test]
+    fn geth_shaped_logs_round_trip_byte_for_byte() {
+        let geth = r#"{"txHash":"0x0202020202020202020202020202020202020202020202020202020202020202","status":"success","reason":"","blockHeight":"0x2","receipt":{"logs":[{"address":"0x0000000000000000000000000000000000000001","topics":["0x0303030303030303030303030303030303030303030303030303030303030303"],"data":"0x"}]}}"#;
+        let decoded: PreconfTxEvent = serde_json::from_str(geth).expect("decode geth shape");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-encode"), geth);
     }
 }

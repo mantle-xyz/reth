@@ -1,7 +1,6 @@
 //! P6 in-process EVM tests for the preconf fork (`PreconfPayloadBuilder`).
 //!
-//! See `docs/design/preconf-dev-plan.md` §P6 for the test plan. This
-//! file holds the 6 EVM tests carry-over from P5f Step 9; shared
+//! This file holds the 6 EVM tests carry-over from P5f Step 9; shared
 //! fixtures live in [`mod fixtures`].
 //!
 //! Step 2 (this commit): harness scaffolding + a wiring smoke test
@@ -202,8 +201,7 @@ async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
 // What remains for real EVM apply verification:
 // - Either: build a `BlockBuilder` over MockEthProvider with the missing system-contract seeds
 //   (significant, ~500-800 LoC fixture)
-// - Or: drop into devnet-level integration testing (P6.5 — outside P6 in-process scope per
-//   dev-plan)
+// - Or: drop into devnet-level integration testing (P6.5 — outside P6 in-process scope)
 //
 // The 6 `#[ignore]`d tests below remain as documented design intent
 // for that future work; their bodies are pre-fleshed unimplemented!()
