@@ -61,6 +61,12 @@ impl FlashblockCache {
 
     /// Inserts a flashblock into the cache.
     ///
+    /// Slices already held for this height under a different payload id are
+    /// dropped first: they belong to a build that was replaced, and draining
+    /// them alongside this one would hand the consumer two builds spliced
+    /// together. Same rule the live path applies as
+    /// [`SequenceValidationResult::RebuiltBlock`](crate::SequenceValidationResult::RebuiltBlock).
+    ///
     /// Returns `true` if the flashblock was cached, `false` if it was rejected
     /// because its block number exceeds the cache-ahead limit.
     pub fn insert(&mut self, flashblock: MantleFlashblockPayload) -> bool {
@@ -70,6 +76,18 @@ impl FlashblockCache {
         }
         let min_block_number_to_retain = block_number.saturating_sub(self.max_ahead_blocks);
         self.entries.retain(|&bn, _| bn > min_block_number_to_retain);
+        // Not gated on `base.is_some()`: a later index arriving under a new
+        // payload id means the rest of this height is stale too, and keeping it
+        // would splice. Dropping leaves the replacement unable to open a block
+        // on its own, which the consumer already handles.
+        if self
+            .entries
+            .get(&block_number)
+            .and_then(|held| held.values().next())
+            .is_some_and(|held| held.payload_id != flashblock.payload_id)
+        {
+            self.entries.remove(&block_number);
+        }
         self.entries.entry(block_number).or_default().insert(flashblock.index, flashblock);
         true
     }
@@ -205,6 +223,29 @@ mod tests {
         let drained = cache.drain(11);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].diff.state_root, fb_new.diff.state_root);
+    }
+
+    /// A new build may arrive while its canonical parent is still missing.
+    /// Replaying it must not append a higher index from the abandoned build.
+    #[test]
+    fn rebuilt_base_discards_cached_slices_from_previous_payload() {
+        use alloy_rpc_types_engine::PayloadId;
+
+        let mut cache = cache_at(10);
+        let mut old_base = make_flashblock(11, 0);
+        old_base.payload_id = PayloadId::new([1; 8]);
+        let mut old_following = make_flashblock(11, 1);
+        old_following.payload_id = old_base.payload_id;
+        let mut new_base = make_flashblock(11, 0);
+        new_base.payload_id = PayloadId::new([2; 8]);
+
+        assert!(cache.insert(old_base));
+        assert!(cache.insert(old_following));
+        assert!(cache.insert(new_base.clone()));
+
+        let replay = cache.drain(11);
+        assert_eq!(replay.len(), 1, "old index 1 must not follow the replacement base");
+        assert_eq!(replay[0].payload_id, new_base.payload_id);
     }
 
     #[test]

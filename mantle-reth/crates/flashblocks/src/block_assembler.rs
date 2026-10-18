@@ -13,6 +13,24 @@ use reth_optimism_primitives::OpBlock;
 
 use crate::{ExecutionError, ProtocolError, Result};
 
+/// What a pending header reports for `withdrawals_root`: nothing.
+///
+/// Post-Isthmus the field is the `L2ToL1MessagePasser` storage root, which is
+/// only meaningful once the block is sealed. A slice is a *prefix* of a block,
+/// so any value computed for it answers a question nobody asks: too early for
+/// an L1 withdrawal proof, redundant for "did my withdrawal execute" (the
+/// slice carries the transactions), and not to be believed without a local
+/// replay that would compute it anyway.
+///
+/// Zero rather than the producer's figure for the same reason `state_root` is
+/// zero here: `EMPTY_ROOT_HASH` is `0x56e81f17…`, so zero is not a root any
+/// state can produce and cannot be mistaken for one. The producer currently
+/// sends the *parent's* root — well-formed, stale on any block containing a
+/// withdrawal, and indistinguishable from a correct answer.
+const fn withdrawals_root_of_a_prefix() -> B256 {
+    B256::ZERO
+}
+
 /// Result of assembling a block from flashblocks.
 #[derive(Debug, Clone)]
 pub struct AssembledBlock {
@@ -67,6 +85,8 @@ impl BlockAssembler {
 
         // `OpExecutionPayloadV4` sets `withdrawals_root` directly instead of
         // computing it from the list.
+        //
+        // Zeroed rather than copied — see `withdrawals_root_of_a_prefix` below.
         let execution_payload = OpExecutionPayloadV4 {
             payload_inner: ExecutionPayloadV3 {
                 blob_gas_used: latest_flashblock.diff.blob_gas_used.unwrap_or_default(),
@@ -91,7 +111,7 @@ impl BlockAssembler {
                     },
                 },
             },
-            withdrawals_root: latest_flashblock.diff.withdrawals_root,
+            withdrawals_root: withdrawals_root_of_a_prefix(),
         };
 
         let block: OpBlock = OpExecutionPayloadEnvelope::V4 {
@@ -128,7 +148,7 @@ impl BlockAssembler {
         header.logs_bloom = latest_flashblock.diff.logs_bloom;
         header.gas_used = latest_flashblock.diff.gas_used;
         if header.withdrawals_root.is_some() {
-            header.withdrawals_root = Some(latest_flashblock.diff.withdrawals_root);
+            header.withdrawals_root = Some(withdrawals_root_of_a_prefix());
         }
         if previous_header.inner().blob_gas_used.is_some() {
             header.blob_gas_used = Some(latest_flashblock.diff.blob_gas_used.unwrap_or_default());
@@ -226,6 +246,33 @@ mod tests {
 
         let assembled = BlockAssembler::assemble(&flashblocks).unwrap();
         assert_eq!(assembled.flashblocks.len(), 3);
+    }
+
+    /// The producer sends the *parent's* `L2ToL1MessagePasser` root here —
+    /// well-formed, stale on any block containing a withdrawal, and
+    /// indistinguishable from a correct answer. A pending header must not
+    /// repeat it; see `withdrawals_root_of_a_prefix`.
+    ///
+    /// Asserted against a deliberately non-zero slice value, because the
+    /// shared fixture already zeroes the field and would pass either way.
+    #[test]
+    fn a_pending_header_reports_no_withdrawals_root() {
+        let stale = B256::repeat_byte(0xab);
+        let mut fb = create_test_flashblock(0, true);
+        fb.diff.withdrawals_root = stale;
+
+        let assembled = BlockAssembler::assemble(&[fb]).unwrap();
+
+        assert_eq!(
+            assembled.header.withdrawals_root,
+            Some(B256::ZERO),
+            "a slice is a prefix of a block; the root only means something once it is sealed",
+        );
+        assert_ne!(
+            assembled.header.withdrawals_root,
+            Some(stale),
+            "and above all it must not be the producer's stale figure",
+        );
     }
 
     #[test]

@@ -11,8 +11,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 /// A superset of the metadata `op-alloy` defines: same three fields, plus the
 /// predecessor pointer. `block_number` is required; the other three carry
 /// `#[serde(default)]`, so metadata produced elsewhere parses as long as it
-/// names the block. A payload omitting the `metadata` object entirely is also
-/// accepted — see [`MantleFlashblockPayload`](crate::MantleFlashblockPayload).
+/// names the block.
+///
+/// Omitting the `metadata` object entirely is accepted too — see
+/// [`MantleFlashblockPayload`](crate::MantleFlashblockPayload) — but note the
+/// asymmetry: that yields `block_number: 0`, whereas an object present without
+/// the field is a decode error. A producer that leaves the object out is
+/// claiming block 0, silently.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MantleFlashblockMetadata {
     /// L2 block this slice belongs to.

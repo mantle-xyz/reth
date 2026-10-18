@@ -5,7 +5,7 @@
 //! its methods are called directly rather than over JSON-RPC.
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
+use alloy_rpc_types_eth::{BlockNumberOrTag, BlockOverrides, Filter};
 use mantle_reth_flashblocks::EthApiOverrideServer;
 
 use crate::consumer_helpers::{
@@ -273,14 +273,57 @@ async fn estimate_gas_at_pending_sees_the_overlay_balance() {
     });
 
     let gas = api
-        .estimate_gas(request.clone(), Some(BlockNumberOrTag::Pending.into()), None)
+        .estimate_gas(request.clone(), Some(BlockNumberOrTag::Pending.into()), None, None)
         .await
         .expect("the overlay funds the sender");
     assert!(gas >= U256::from(21_000), "a plain transfer costs at least the intrinsic gas");
 
     assert!(
-        api.estimate_gas(request, Some(BlockNumberOrTag::Latest.into()), None).await.is_err(),
+        api.estimate_gas(request, Some(BlockNumberOrTag::Latest.into()), None, None)
+            .await
+            .is_err(),
         "canonically the sender cannot cover the transfer"
+    );
+}
+
+/// The override version of `eth_estimateGas` has to honour `blockOverrides`.
+///
+/// It is declared with three parameters where upstream takes four, so a
+/// caller's fourth argument never reaches the estimate — no error, just an
+/// answer computed against the unmodified block. Pinned with a block gas
+/// limit below the intrinsic cost of a transfer, which can only change the
+/// outcome if the override arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn estimate_gas_honours_a_block_override() {
+    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let api = eth_api!(node, harness);
+
+    overlay_with_user_call!(harness);
+
+    let request = serde_json::json!({
+        "from": format!("{LOGGER:#x}"),
+        "to": format!("{:#x}", Address::ZERO),
+        "value": format!("{VALUE:#x}"),
+    });
+
+    // Sanity: without the override the estimate succeeds, so a failure below
+    // is the override and not the request.
+    api.estimate_gas(request.clone(), Some(BlockNumberOrTag::Pending.into()), None, None)
+        .await
+        .expect("premise: the overlay funds this transfer");
+
+    let starved = BlockOverrides { gas_limit: Some(20_000), ..Default::default() };
+    assert!(
+        api.estimate_gas(
+            request,
+            Some(BlockNumberOrTag::Pending.into()),
+            None,
+            Some(Box::new(starved)),
+        )
+        .await
+        .is_err(),
+        "a block gas limit under the 21000 intrinsic cost must make the estimate fail; \
+         succeeding means the override was dropped on the way in",
     );
 }
 

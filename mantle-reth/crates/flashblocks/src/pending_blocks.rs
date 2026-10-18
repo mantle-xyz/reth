@@ -350,6 +350,14 @@ impl PendingBlocksBuilder {
 }
 
 /// Aggregated pending block state from flashblocks.
+///
+/// Spans `[earliest_header, latest_header]`, which is usually more than one
+/// block, and the accessors do **not** all honour that span: lookups by hash
+/// (receipts, transactions) and the per-sender counts cover the whole range,
+/// while [`get_latest_block`](Self::get_latest_block) returns only the latest
+/// block's transactions. An indexer written as "fetch the pending block, walk
+/// its transactions" therefore skips every block under the top one. Use the
+/// by-hash accessors, or walk the range explicitly.
 #[derive(Debug, Clone)]
 pub struct PendingBlocks {
     earliest_header: Sealed<Header>,
@@ -523,8 +531,23 @@ impl PendingBlocks {
         self.transactions.iter().filter(move |tx| tx.block_number.unwrap_or(0) == block_number)
     }
 
+    /// Filtered to the latest block, like the transactions beside it in
+    /// [`Self::get_latest_block`].
+    ///
+    /// The result is empty either way today — OP consensus requires the block
+    /// body's withdrawals list to be empty, so every slice carries an empty
+    /// one and concatenating them changes nothing. The filter is here because
+    /// the unfiltered version is only correct *because of* that rule: the
+    /// overlay spans more than one block, and the day the rule relaxes this
+    /// would start reporting a neighbouring block's withdrawals without
+    /// anything failing.
     fn get_withdrawals(&self) -> Vec<Withdrawal> {
-        self.flashblocks.iter().flat_map(|fb| fb.diff.withdrawals.clone()).collect()
+        let latest = self.latest_block_number();
+        self.flashblocks
+            .iter()
+            .filter(|fb| fb.metadata.block_number == latest)
+            .flat_map(|fb| fb.diff.withdrawals.clone())
+            .collect()
     }
 
     /// Returns the latest block, optionally with full transaction details.
