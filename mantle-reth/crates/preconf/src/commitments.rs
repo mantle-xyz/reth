@@ -28,6 +28,7 @@ use alloy_primitives::{
     },
 };
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::warn;
 
@@ -113,7 +114,13 @@ impl Commitment {
 /// share a record, a slot and the must-land machinery. They differ in **who
 /// cleans up if the claim turns out false**, and the per-kind behaviour below
 /// follows from that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized into [`JournalEntry`](crate::journal::JournalEntry), so the
+/// variant names are an on-disk format: renaming one makes older journals
+/// unreadable. The explicit `rename_all` keeps the file independent of the
+/// Rust spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaimKind {
     /// Executed and announced on the slice stream, but no client holds a
     /// receipt. Consumers serve it as `pending` and reconcile on their own —
@@ -205,6 +212,14 @@ impl CommitmentStore {
 /// nothing about fifo status.
 pub type SlotClaim = Result<(), TxHash>;
 
+/// The block the last build sealed, and which build sealed it.
+#[derive(Debug, Default)]
+struct SealedPayload {
+    block: Option<B256>,
+    /// Generation of the build that wrote `block`; `0` before any seal.
+    generation: u64,
+}
+
 /// The claims this node has made, and the nonces they hold.
 ///
 /// Held by [`PreconfTxSet`](crate::preconf_tx_set::PreconfTxSet) and shared
@@ -245,7 +260,12 @@ pub struct Commitments {
     ///
     /// `parking_lot::Mutex` rather than the store's lock: it is written once per
     /// build and read once per build, and it has nothing to do with the records.
-    sealed_payload: parking_lot::Mutex<Option<B256>>,
+    sealed_payload: parking_lot::Mutex<SealedPayload>,
+
+    /// Handed out by `lock_for_build`, one per build, in the order builds
+    /// take the queue. What [`Self::note_sealed`] uses to tell a late seal
+    /// from the current one.
+    build_generation: AtomicU64,
 
     /// Last known **persisted** block height — the reading of the ruler
     /// described on [`SEAL_DEPTH`]. Fed by the canonical-state handler once per
@@ -278,7 +298,8 @@ impl Commitments {
             store: RwLock::new(CommitmentStore::default()),
             capacity,
             over_capacity: AtomicBool::new(false),
-            sealed_payload: parking_lot::Mutex::new(None),
+            sealed_payload: parking_lot::Mutex::new(SealedPayload::default()),
+            build_generation: AtomicU64::new(0),
             persisted_height: AtomicU64::new(0),
         }
     }
@@ -445,25 +466,28 @@ impl Commitments {
     /// is withdrawn is only the retention clock, which was counting toward
     /// forgetting it.
     ///
-    /// Returns whether this hash had been observed on chain — which is precisely
-    /// the `reorg_drift` predicate the canonical handler wants (a reverted
-    /// transaction that we had recorded as committed is drift; one we never saw
-    /// is not).
+    /// Returns the claim behind the record, if there is one — which is the
+    /// `reorg_drift` predicate the canonical handler wants: a reverted
+    /// transaction this node made a claim about is drift when the claim was a
+    /// promise, and ordinary chain behaviour when it was only announced (the
+    /// slice stream published it and every consumer reconciles for itself). A
+    /// transaction with no record here is somebody else's.
     ///
-    /// The [`ClaimKind`] comes back with it because the handler asks two
-    /// questions of one withdrawal and they have different answers: everything
-    /// withdrawn here has to be put back, while only [`ClaimKind::Promised`] is
-    /// drift. An `Announced` record is a transaction the slice stream
-    /// published and every consumer reconciles for itself, so a reorg taking it
-    /// back is ordinary chain behaviour. Both come from the same critical
-    /// section, so the two cannot disagree.
+    /// Keyed on the record, not on `committed_height`: the hash comes out of a
+    /// block the chain just took back, so it was on chain whether or not the
+    /// notification that would have stamped it arrived. A dropped
+    /// notification (`CanonUpdate::Gap`) leaves the stamp empty, and the
+    /// record is then the only thing left that says the transaction has to go
+    /// back — the fifo entry went when the nonce moved on, and the pool's copy
+    /// went at the slice boundary.
     pub fn uncommit(&self, hash: &TxHash) -> Option<ClaimKind> {
         if !self.enabled {
             return None;
         }
         let mut store = self.store.write();
         let cached = store.by_hash.get_mut(hash)?;
-        cached.committed_height.take().map(|_| cached.kind)
+        cached.committed_height = None;
+        Some(cached.kind)
     }
 
     /// Whether this hash still has a record here at all — the journal's only
@@ -500,11 +524,30 @@ impl Commitments {
         self.store.read().by_slot.get(&(*sender, nonce)).copied()
     }
 
+    /// The generation of the build that is taking the queue now.
+    ///
+    /// Called by `lock_for_build` under the build mutex, so generations are
+    /// handed out in the order builds run.
+    pub(crate) fn next_build_generation(&self) -> u64 {
+        self.build_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
     /// Record the block this build sealed. Paired with
     /// [`Self::parent_is_ours`] to answer "did what I executed last time land?"
     /// with one comparison and no chain reads.
-    pub fn note_sealed(&self, block: B256) {
-        *self.sealed_payload.lock() = Some(block);
+    ///
+    /// `generation` is the sealing build's, from `BuildGuard::generation`. A
+    /// seal from an older generation than the one already recorded is dropped:
+    /// the seal runs after the build has handed the queue on, so a build that
+    /// was slow to seal can arrive here after its successor did, and taking
+    /// its block would make the next prologue read the successor's executed
+    /// transactions as landed in a block that never carried them.
+    pub fn note_sealed(&self, block: B256, generation: u64) {
+        let mut sealed = self.sealed_payload.lock();
+        if generation < sealed.generation {
+            return;
+        }
+        *sealed = SealedPayload { block: Some(block), generation };
     }
 
     /// Forget which block the last build sealed.
@@ -519,7 +562,9 @@ impl Commitments {
     /// Reached through `BuildGuard`'s `Drop` and nowhere else: what makes it
     /// safe is being ordered before the queue is handed on.
     pub(crate) fn clear_sealed(&self) {
-        *self.sealed_payload.lock() = None;
+        // The generation stays: it is what keeps a late seal from an older
+        // build out, and clearing it would let that seal back in.
+        self.sealed_payload.lock().block = None;
     }
 
     /// Whether `parent_hash` is the block the last build sealed — if so,
@@ -531,7 +576,7 @@ impl Commitments {
     /// Asked through `BuildGuard`, which is what makes the answer good: the
     /// hash is cleared the moment the queue is handed on.
     pub(crate) fn parent_is_ours(&self, parent_hash: B256) -> bool {
-        *self.sealed_payload.lock() == Some(parent_hash)
+        self.sealed_payload.lock().block == Some(parent_hash)
     }
 
     /// Publishes the current **persisted** block height — the reading of the
@@ -560,17 +605,18 @@ impl Commitments {
     /// transaction has been observed on chain and is not yet buried
     /// [`SEAL_DEPTH`] deep**, in which case the record is kept.
     ///
-    /// Driven by the fifo's `drop_hash`, the single convergence point of every
-    /// fifo removal path, and by journal restore when a restored entry cannot
-    /// be decoded and so can never be honoured.
+    /// Driven by the fifo's `unindex` for a removal that ended the commitment
+    /// (`Removal::Ended`), and by journal restore when a restored entry cannot
+    /// be decoded and so can never be honoured. A removal because the sender's
+    /// nonce moved past the entry (`Removal::Landed`) does not come here at
+    /// all: that is ambiguous about *which* transaction advanced the nonce
+    /// and, even when it was ours, revocable, so the record stays for the
+    /// sweep to retire by depth.
     ///
-    /// The exemption exists because one of those removal paths —
-    /// `PreconfTxSet::forward_all` — fires on "this sender's nonce moved past
-    /// the entry", which is both
-    /// ambiguous about *which* transaction advanced it and, even when it was
-    /// ours, revocable: releasing there would let a reorg strand a commitment
-    /// without its nonce. Every other path removes a transaction that was never
-    /// on chain, so it has no `committed_height` and is released.
+    /// What reaches here was never observed on chain and is released. The
+    /// exemption is a guard for the case that should not arise: a record with
+    /// an observation is kept rather than released on a path that cannot know
+    /// whether a reorg could still want it.
     ///
     /// Note the condition is **"observed on chain"**, not "has a promise
     /// record". A commitment whose receipt went out but which never landed must
@@ -948,7 +994,11 @@ mod tests {
             Some(ClaimKind::Promised),
             "we had observed it on chain, and a client holds its receipt — that is drift"
         );
-        assert_eq!(c.uncommit(&hash(1)), None, "idempotent: the second call reports nothing");
+        assert_eq!(
+            c.uncommit(&hash(1)),
+            Some(ClaimKind::Promised),
+            "a second withdrawal still names the record: the block it was in was reverted again",
+        );
 
         assert!(c.is_tracked(&hash(1)), "still an owed commitment");
         assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps its nonce");
@@ -960,14 +1010,28 @@ mod tests {
         assert!(c.release_unless_committed(&hash(1)), "no observation ⇒ nothing holds it");
     }
 
-    /// A transaction the node never promised is not drift, however deep the
-    /// reorg. Guards the metric against counting every reverted transaction.
+    /// A transaction the node never made a claim about is not drift, however
+    /// deep the reorg. Guards the metric against counting every reverted
+    /// transaction.
     #[test]
-    fn uncommit_reports_nothing_for_a_transaction_we_never_committed() {
+    fn uncommit_reports_nothing_for_a_transaction_we_never_claimed() {
+        let c = classifier();
+        assert_eq!(c.uncommit(&hash(9)), None);
+    }
+
+    /// A promise whose block the canonical handler never heard of — the
+    /// notification was dropped — is still withdrawn when that block is
+    /// reverted. The record is what says the transaction has to go back; a
+    /// missing stamp must not be read as "never on chain".
+    #[test]
+    fn uncommit_withdraws_a_promise_whose_commit_notification_was_lost() {
         let c = classifier();
         let _ = c.admit_via_preconf_rpc(hash(1), &addr(1), 7);
-        assert_eq!(c.uncommit(&hash(1)), None);
-        assert_eq!(c.uncommit(&hash(9)), None);
+        // No `mark_committed`: the handler fell behind and skipped the block.
+
+        assert_eq!(c.uncommit(&hash(1)), Some(ClaimKind::Promised));
+        assert!(c.is_tracked(&hash(1)), "still an owed commitment");
+        assert_eq!(c.slot_owner(&addr(1), 7), Some(hash(1)), "and it keeps its nonce");
     }
 
     /// The same guard, reached the way production reaches it.
@@ -1657,7 +1721,7 @@ mod tests {
     fn the_block_this_node_sealed_is_recognised_as_its_own() {
         let c = classifier();
         let ours = B256::repeat_byte(7);
-        c.note_sealed(ours);
+        c.note_sealed(ours, c.next_build_generation());
 
         assert!(c.parent_is_ours(ours));
         assert!(!c.parent_is_ours(B256::repeat_byte(8)), "another chain's block is not ours");
@@ -1670,7 +1734,7 @@ mod tests {
     fn clearing_sends_the_next_build_back_to_asking_the_chain() {
         let c = classifier();
         let previous = B256::repeat_byte(7);
-        c.note_sealed(previous);
+        c.note_sealed(previous, c.next_build_generation());
 
         c.clear_sealed();
 
@@ -1684,12 +1748,28 @@ mod tests {
     #[test]
     fn the_seal_after_a_clear_restores_the_shortcut() {
         let c = classifier();
-        c.note_sealed(B256::repeat_byte(7));
+        c.note_sealed(B256::repeat_byte(7), c.next_build_generation());
         c.clear_sealed();
 
         let ours = B256::repeat_byte(9);
-        c.note_sealed(ours);
+        c.note_sealed(ours, c.next_build_generation());
 
         assert!(c.parent_is_ours(ours));
+    }
+
+    /// A seal stamped with an older generation than the one recorded is
+    /// refused, and a clear in between does not let it back in.
+    #[test]
+    fn a_seal_from_an_older_generation_is_refused() {
+        let c = classifier();
+        let (older, newer) = (c.next_build_generation(), c.next_build_generation());
+
+        c.note_sealed(B256::repeat_byte(2), newer);
+        c.note_sealed(B256::repeat_byte(1), older);
+        assert!(c.parent_is_ours(B256::repeat_byte(2)), "the newer seal stands");
+
+        c.clear_sealed();
+        c.note_sealed(B256::repeat_byte(1), older);
+        assert!(!c.parent_is_ours(B256::repeat_byte(1)), "still refused after a clear");
     }
 }

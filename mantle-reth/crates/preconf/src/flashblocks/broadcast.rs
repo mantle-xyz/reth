@@ -3,6 +3,7 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use alloy_rpc_types_engine::PayloadId;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use tokio::{net::TcpStream, sync::broadcast};
@@ -211,12 +212,15 @@ async fn replay(
         (ring.entries_after(&cutoff), ring.precedes_window(&cutoff), ring.exceeds_window(&cutoff))
     };
 
-    let mut delivered: HashSet<FlashblockPosition> =
+    // Keyed by build as well as position: a rebuild reuses positions, so
+    // position alone would read its slices as repeats of the ones they replace
+    // and withhold the base that says the block started over.
+    let mut delivered: HashSet<(FlashblockPosition, PayloadId)> =
         HashSet::with_capacity(snapshot.len().saturating_add(receiver.len()));
     let mut sent = 0usize;
 
-    for (position, text) in snapshot {
-        delivered.insert(position);
+    for (position, payload_id, text) in snapshot {
+        delivered.insert((position, payload_id));
         send_with_timeout(stream, text).await?;
         sent += 1;
     }
@@ -226,9 +230,9 @@ async fn replay(
     let mut pending = Vec::new();
     loop {
         match receiver.try_recv() {
-            Ok((position, text)) => {
-                if delivered.insert(position) {
-                    pending.push(text);
+            Ok(slice) => {
+                if delivered.insert((slice.position, slice.payload_id)) {
+                    pending.push(slice.text);
                 }
             }
             Err(broadcast::error::TryRecvError::Empty) => break,
@@ -270,8 +274,8 @@ pub(crate) async fn pump_live(
             () = cancel.cancelled() => return SubscriptionExit::Cancelled,
 
             published = receiver.recv() => match published {
-                Ok((_, text)) => {
-                    if stream.send(Message::Text(text)).await.is_err() {
+                Ok(slice) => {
+                    if stream.send(Message::Text(slice.text)).await.is_err() {
                         return SubscriptionExit::SendFailed;
                     }
                 }
@@ -308,6 +312,7 @@ mod tests {
         MaybeTlsStream, WebSocketStream, accept_async, client_async,
         tungstenite::{Message, Utf8Bytes},
     };
+    use alloy_rpc_types_engine::PayloadId;
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -320,11 +325,33 @@ mod tests {
         FlashblockPosition { block_number, flashblock_index }
     }
 
+    /// The build these fixtures publish under unless a case needs two.
+    fn one_build() -> PayloadId {
+        PayloadId::default()
+    }
+
     fn slice(position: FlashblockPosition) -> PositionedSlice {
-        (
+        PositionedSlice {
             position,
-            Utf8Bytes::from(format!("{}-{}", position.block_number, position.flashblock_index)),
-        )
+            payload_id: one_build(),
+            text: Utf8Bytes::from(format!(
+                "{}-{}",
+                position.block_number, position.flashblock_index
+            )),
+        }
+    }
+
+    /// The same position under a named build, with the build in the text so an
+    /// assertion says which of the two a subscriber was handed.
+    fn slice_of(position: FlashblockPosition, payload_id: PayloadId, build: &str) -> PositionedSlice {
+        PositionedSlice {
+            position,
+            payload_id,
+            text: Utf8Bytes::from(format!(
+                "{}-{}@{build}",
+                position.block_number, position.flashblock_index
+            )),
+        }
     }
 
     /// A connected `WebSocket` pair over loopback: the server half is what the
@@ -369,8 +396,8 @@ mod tests {
         let ring = FlashblockRingBuffer::new(NonZeroUsize::new(16).expect("non-zero"));
         let ring = Arc::new(RwLock::new(ring));
         for position in positions {
-            let (position, text) = slice(position);
-            ring.write().push(position, text);
+            let s = slice(position);
+            ring.write().push(s.position, s.payload_id, s.text);
         }
         ring
     }
@@ -410,6 +437,34 @@ mod tests {
 
         assert_eq!(outcome.sent, 3, "10-2 is in both the archive and the channel");
         assert_eq!(drain(&mut client, 4).await, ["10-1", "10-2", "10-3"]);
+    }
+
+    /// A rebuild lands while the snapshot is being handed over, republishing
+    /// positions the snapshot already holds. Those are different slices: the
+    /// index restarts per build, so sharing a position says nothing about
+    /// sharing content. Dropping them as repeats withholds the replacement's
+    /// base — the one slice that tells a consumer the block started over.
+    #[tokio::test]
+    async fn catch_up_does_not_mistake_a_rebuild_for_a_repeat() {
+        let (mut server, mut client) = socket_pair().await;
+        let ring = ring_with([pos(9, 9), pos(10, 0), pos(10, 1)]);
+        let (pipe, mut receiver) = broadcast::channel(8);
+
+        let rebuild = PayloadId::new([0xff; 8]);
+        for index in 0..=2 {
+            pipe.send(slice_of(pos(10, index), rebuild, "B")).expect("receiver is alive");
+        }
+
+        let outcome = replay(&mut server, &mut receiver, &ring, pos(9, 9))
+            .await
+            .expect("catch-up completes");
+
+        assert_eq!(
+            drain(&mut client, 6).await,
+            ["10-0", "10-1", "10-0@B", "10-1@B", "10-2@B"],
+            "the rebuild's slices are not the archived ones they share a position with",
+        );
+        assert_eq!(outcome.sent, 5);
     }
 
     #[tokio::test]

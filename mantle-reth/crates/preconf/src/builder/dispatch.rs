@@ -41,7 +41,7 @@ use tracing::{debug, error, trace, warn};
 use reth_payload_builder_primitives::PayloadBuilderError;
 
 use crate::{
-    PreconfConfig, PreconfTxSet,
+    ClaimKind, PreconfConfig, PreconfTxSet,
     apply::{ApplyError, BuilderRejected},
     journal::{JournalEntry, PreconfJournal},
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
@@ -389,6 +389,7 @@ where
                     hash,
                     entry.tx.as_ref(),
                     loop_state.predicted_height,
+                    ClaimKind::Promised,
                 );
                 if let Err(e) = journal.append_promised(&record).await {
                     warn!(

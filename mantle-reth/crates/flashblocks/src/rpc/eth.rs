@@ -117,7 +117,11 @@ impl<'de> serde::Deserialize<'de> for BlockNumberOrTagExt {
             }
 
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                if v == "unsafe" {
+                // Case-insensitive, because the delegation below is:
+                // alloy's `FromStr` lowercases first, so `"LATEST"` parses
+                // while `"UNSAFE"` would fall through to the hex branch and
+                // fail on a missing `0x`. Two rules in one visitor.
+                if v.eq_ignore_ascii_case("unsafe") {
                     return Ok(BlockNumberOrTagExt(BlockNumberOrTag::Latest));
                 }
                 v.parse::<BlockNumberOrTag>().map(BlockNumberOrTagExt).map_err(E::custom)
@@ -201,12 +205,18 @@ pub trait EthApiOverride {
     ) -> RpcResult<Bytes>;
 
     /// Estimates gas with flashblock state support.
+    ///
+    /// Takes `block_overrides` for the same reason [`Self::call`] does: the
+    /// override version has to accept every parameter the method it replaces
+    /// accepts, or a caller that sends one gets an answer computed without it
+    /// and no indication that anything was dropped.
     #[method(name = "estimateGas")]
     async fn estimate_gas(
         &self,
         transaction: serde_json::Value,
         block_number: Option<BlockId>,
         overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<U256>;
 
     /// Returns logs matching the filter, including pending flashblock logs.
@@ -413,7 +423,15 @@ where
     ) -> RpcResult<serde_json::Value> {
         debug!(message = "rpc::send_raw_transaction_sync");
 
-        let timeout_ms = match timeout_ms {
+        // `0` means "unset", as it does upstream (`.filter(|ms| *ms > 0)`).
+        // Taken literally it is a `sleep(0)`, which times the caller out
+        // before the transaction could possibly land — an answer that is
+        // always wrong, so there is nothing to preserve in honouring it.
+        //
+        // Refusing an over-long timeout, by contrast, is left alone: upstream
+        // clamps instead, but which of the two is right is a question about
+        // what the client should be told, not a bug. See `API-A`.
+        let timeout_ms = match timeout_ms.filter(|ms| *ms > 0) {
             Some(ms) if ms > MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS => {
                 return Err(ErrorObjectOwned::owned(
                     INVALID_PARAMS_CODE,
@@ -424,7 +442,7 @@ where
                 ));
             }
             Some(ms) => ms,
-            _ => MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS,
+            None => MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS,
         };
 
         let tx_hash = EthTransactions::send_raw_transaction(&self.eth_api, transaction).await?;
@@ -492,6 +510,7 @@ where
         transaction: serde_json::Value,
         block_number: Option<BlockId>,
         overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<U256> {
         debug!(message = "rpc::estimate_gas", block_number = ?block_number);
 
@@ -514,7 +533,7 @@ where
             &self.eth_api,
             transaction,
             block_id,
-            EvmOverrides::new(Some(final_overrides), None),
+            EvmOverrides::new(Some(final_overrides), block_overrides),
         )
         .await
         .map_err(Into::into)

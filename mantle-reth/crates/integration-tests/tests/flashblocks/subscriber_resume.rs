@@ -6,6 +6,10 @@
 //!
 //! What this cannot cover: whether a producer honours the resume parameters.
 //! That is the other half of the contract and needs a producer.
+//!
+//! Scripted slices sit past index 0 on purpose. A reconnect lands mid-block far
+//! more often than on a block boundary, and a resume that always reported
+//! index 0 would have passed against base slices alone.
 
 use std::{sync::Arc, time::Duration};
 
@@ -25,7 +29,10 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use crate::consumer_helpers::base_slice;
+use crate::consumer_helpers::FlashblockBuilder;
+
+/// A slice's place in the stream: `(block_number, index)`.
+type Position = (u64, u64);
 
 /// Long enough that the keepalive never fires during a test.
 const NO_PINGS: Duration = Duration::from_secs(600);
@@ -42,16 +49,16 @@ impl FlashblocksReceiver for Recorder {
 
 /// What one connection to the stub server sends before closing.
 enum Script {
-    /// Slices for these block numbers, each an `index == 0` base slice.
-    Slices(Vec<u64>),
+    /// A slice at each of these positions, in order.
+    Slices(Vec<Position>),
     /// A message that is neither JSON nor brotli, then a slice.
-    Garbage(u64),
+    Garbage(Position),
     /// A slice, then silence: the connection is never read again, so pings go
     /// unanswered.
-    Deaf(u64),
+    Deaf(Position),
     /// A slice, then the TCP stream is dropped — an end with no close frame,
     /// which is what a draining load balancer or a killed upstream looks like.
-    Abort(u64),
+    Abort(Position),
 }
 
 /// Serves `script[n]` on the n-th connection, repeating the last entry, and
@@ -83,25 +90,25 @@ async fn stub_server(script: Vec<Script>) -> (Url, UnboundedReceiver<String>) {
                     .await?;
 
                 match script.get(step) {
-                    Some(Script::Slices(block_numbers)) => {
-                        for block_number in block_numbers {
-                            websocket.send(slice_message(*block_number)).await?;
+                    Some(Script::Slices(positions)) => {
+                        for position in positions {
+                            websocket.send(slice_message(*position)).await?;
                         }
                     }
-                    Some(Script::Garbage(block_number)) => {
+                    Some(Script::Garbage(position)) => {
                         websocket.send(Message::binary(vec![0xff; 32])).await?;
-                        websocket.send(slice_message(*block_number)).await?;
+                        websocket.send(slice_message(*position)).await?;
                         // Held open: the decode error must not drop the connection.
                         while websocket.next().await.is_some() {}
                         return Ok(());
                     }
-                    Some(Script::Deaf(block_number)) => {
-                        websocket.send(slice_message(*block_number)).await?;
+                    Some(Script::Deaf(position)) => {
+                        websocket.send(slice_message(*position)).await?;
                         // Never polled again, so tungstenite never answers a ping.
                         std::future::pending::<()>().await;
                     }
-                    Some(Script::Abort(block_number)) => {
-                        websocket.send(slice_message(*block_number)).await?;
+                    Some(Script::Abort(position)) => {
+                        websocket.send(slice_message(*position)).await?;
                         drop(websocket);
                         return Ok(());
                     }
@@ -116,9 +123,15 @@ async fn stub_server(script: Vec<Script>) -> (Url, UnboundedReceiver<String>) {
     (url, uri_rx)
 }
 
-/// [`base_slice`] for `block_number`, as a websocket text frame.
-fn slice_message(block_number: u64) -> Message {
-    Message::text(serde_json::to_string(&base_slice(block_number)).expect("serialise slice"))
+/// The slice at `position`, as a websocket text frame.
+fn slice_message((block_number, index): Position) -> Message {
+    let slice = FlashblockBuilder::new(block_number, index).build();
+    Message::text(serde_json::to_string(&slice).expect("serialise slice"))
+}
+
+/// Where a delivered slice sits in the stream.
+fn position_of(slice: &MantleFlashblockPayload) -> Position {
+    (slice.metadata.block_number, slice.index)
 }
 
 /// Starts a subscriber against `url` and returns the slices it delivers.
@@ -148,37 +161,38 @@ async fn next<T>(receiver: &mut UnboundedReceiver<T>) -> T {
 /// Slices from the stream reach the receiver in order.
 #[tokio::test(flavor = "multi_thread")]
 async fn slices_are_forwarded_in_order() {
-    let (url, _uris) = stub_server(vec![Script::Slices(vec![1, 2])]).await;
+    let (url, _uris) = stub_server(vec![Script::Slices(vec![(1, 0), (1, 1), (2, 0)])]).await;
     let mut slices = subscribe(url);
 
-    assert_eq!(next(&mut slices).await.metadata.block_number, 1);
-    assert_eq!(next(&mut slices).await.metadata.block_number, 2);
+    assert_eq!(position_of(&next(&mut slices).await), (1, 0));
+    assert_eq!(position_of(&next(&mut slices).await), (1, 1));
+    assert_eq!(position_of(&next(&mut slices).await), (2, 0));
 }
 
 /// The first connection has no position to resume from.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_connection_carries_no_resume_parameters() {
-    let (url, mut uris) = stub_server(vec![Script::Slices(vec![1])]).await;
+    let (url, mut uris) = stub_server(vec![Script::Slices(vec![(1, 0)])]).await;
     let _slices = subscribe(url);
 
     assert_eq!(next(&mut uris).await, "/ws");
 }
 
 /// After the upstream closes, the subscriber reconnects and asks to resume from
-/// the last slice it saw.
+/// the last slice it saw — mid-block, so the index is part of what it names.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reconnect_resumes_from_the_last_delivered_slice() {
     let (url, mut uris) =
-        stub_server(vec![Script::Slices(vec![1, 2]), Script::Slices(vec![])]).await;
+        stub_server(vec![Script::Slices(vec![(2, 0), (2, 3)]), Script::Slices(vec![])]).await;
     let mut slices = subscribe(url);
 
     assert_eq!(next(&mut uris).await, "/ws");
-    assert_eq!(next(&mut slices).await.metadata.block_number, 1);
-    assert_eq!(next(&mut slices).await.metadata.block_number, 2);
+    assert_eq!(position_of(&next(&mut slices).await), (2, 0));
+    assert_eq!(position_of(&next(&mut slices).await), (2, 3));
 
     assert_eq!(
         next(&mut uris).await,
-        "/ws?block_number=2&flashblock_index=0",
+        "/ws?block_number=2&flashblock_index=3",
         "the reconnect must name the last slice received"
     );
 }
@@ -186,22 +200,23 @@ async fn a_reconnect_resumes_from_the_last_delivered_slice() {
 /// Resume parameters are appended to a URL that already carries a query.
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_parameters_extend_an_existing_query() {
-    let (base, mut uris) = stub_server(vec![Script::Slices(vec![7]), Script::Slices(vec![])]).await;
+    let (base, mut uris) =
+        stub_server(vec![Script::Slices(vec![(7, 1)]), Script::Slices(vec![])]).await;
     let url: Url = format!("{base}?token=abc").parse().expect("url with query");
     let _slices = subscribe(url);
 
     assert_eq!(next(&mut uris).await, "/ws?token=abc");
-    assert_eq!(next(&mut uris).await, "/ws?token=abc&block_number=7&flashblock_index=0");
+    assert_eq!(next(&mut uris).await, "/ws?token=abc&block_number=7&flashblock_index=1");
 }
 
 /// An undecodable message is skipped; the connection survives it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_undecodable_message_does_not_drop_the_connection() {
-    let (url, mut uris) = stub_server(vec![Script::Garbage(4)]).await;
+    let (url, mut uris) = stub_server(vec![Script::Garbage((4, 2))]).await;
     let mut slices = subscribe(url);
 
     assert_eq!(next(&mut uris).await, "/ws");
-    assert_eq!(next(&mut slices).await.metadata.block_number, 4, "the valid slice still arrives");
+    assert_eq!(position_of(&next(&mut slices).await), (4, 2), "the valid slice still arrives");
 
     // Longer than the first backoff, so a dropped connection would have shown
     // up as a second request by now.
@@ -212,13 +227,13 @@ async fn an_undecodable_message_does_not_drop_the_connection() {
 /// An unanswered ping reconnects, and the reconnect still resumes.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_ping_reconnects_and_resumes() {
-    let (url, mut uris) = stub_server(vec![Script::Deaf(9), Script::Slices(vec![])]).await;
+    let (url, mut uris) = stub_server(vec![Script::Deaf((9, 4)), Script::Slices(vec![])]).await;
     let mut slices = subscribe_every(url, Duration::from_millis(200));
 
     assert_eq!(next(&mut uris).await, "/ws");
-    assert_eq!(next(&mut slices).await.metadata.block_number, 9);
+    assert_eq!(position_of(&next(&mut slices).await), (9, 4));
 
-    assert_eq!(next(&mut uris).await, "/ws?block_number=9&flashblock_index=0");
+    assert_eq!(next(&mut uris).await, "/ws?block_number=9&flashblock_index=4");
 }
 
 /// An upstream that ends the stream without a close frame is noticed at once,
@@ -232,16 +247,17 @@ async fn an_unanswered_ping_reconnects_and_resumes() {
 /// anything reconnecting here did so because the read side said so.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_that_ends_the_stream_is_noticed_without_waiting_for_a_ping() {
-    let (url, mut uris) = stub_server(vec![Script::Abort(1), Script::Slices(vec![2])]).await;
+    let (url, mut uris) =
+        stub_server(vec![Script::Abort((1, 2)), Script::Slices(vec![(1, 3)])]).await;
     let mut slices = subscribe(url);
 
     assert_eq!(next(&mut uris).await, "/ws");
-    assert_eq!(next(&mut slices).await.metadata.block_number, 1);
+    assert_eq!(position_of(&next(&mut slices).await), (1, 2));
 
     assert_eq!(
         next(&mut uris).await,
-        "/ws?block_number=1&flashblock_index=0",
+        "/ws?block_number=1&flashblock_index=2",
         "the reconnect must name the last slice received",
     );
-    assert_eq!(next(&mut slices).await.metadata.block_number, 2);
+    assert_eq!(position_of(&next(&mut slices).await), (1, 3));
 }

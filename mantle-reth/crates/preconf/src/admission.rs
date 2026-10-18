@@ -234,6 +234,7 @@ where
         let ty = peek_tx_type(bytes)
             .ok_or_else(|| PreconfError::Internal("empty transaction payload".to_string()))?;
         if !TxType::try_from(ty).is_ok_and(accepts) {
+            metrics::counter!("preconf.admit.rejected_tx_type_total").increment(1);
             return Err(PreconfError::UnsupportedTxType { ty });
         }
 
@@ -255,20 +256,28 @@ where
         // for where that is. This is here so a sender who was never allowlisted
         // is turned away before a state read and a validator round trip.
         if !self.classifier.preview_eligibility(&sender, to.as_ref()) {
+            // The one rejection an operator chases most often — a misconfigured
+            // allowlist looks, from the client's side, exactly like a node that
+            // is ignoring it. `trace!` alone never reaches a production log, and
+            // the nearby `preconf.whitelist.*` series cannot stand in: they
+            // report the list's *size*, and `revoked_total` only fires after a
+            // transaction was already admitted.
+            metrics::counter!("preconf.admit.rejected_not_eligible_total").increment(1);
             trace!(target: "mantle::preconf::admission", ?sender, ?to, ?hash, "not allowlisted");
             return Err(PreconfError::NotPreconfEligible);
         }
 
         if gas_limit > self.cfg.preconf_max_gas_per_tx {
+            metrics::counter!("preconf.admit.rejected_tx_gas_total").increment(1);
             return Err(PreconfError::PreconfGasLimitExceeded {
                 gas_limit,
                 max: self.cfg.preconf_max_gas_per_tx,
             });
         }
 
-        // Nothing is recorded on the way in, so nothing is owed back on the
-        // way out: the queue creates the entry, and the classifier's record is
-        // not written until a receipt goes out (`mark_promised`).
+        // Admission records no claim, so nothing is owed back on a refusal
+        // below: the queue creates the entry, and the `(sender, nonce)` is not
+        // claimed until the tx applies (`Commitments::record_announced`).
         match self.decide(pool_tx, sender, hash, origin_instant, responder).await {
             Ok(()) => Ok(AdmittedTx { hash, sender, nonce }),
             Err(err) => {

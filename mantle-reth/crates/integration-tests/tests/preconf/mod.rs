@@ -22,6 +22,7 @@ mod chain_id_pair;
 mod classifier_freeze;
 mod da_footprint;
 mod delegated_sender;
+mod dual_channel_concurrent;
 mod dual_channel_nonce;
 mod dual_channel_same_hash;
 mod full_receipt;

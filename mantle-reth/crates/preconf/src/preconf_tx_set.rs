@@ -273,8 +273,8 @@ impl PreconfTxSetInner {
     ///
     /// Everything except `order` happens in [`Self::unindex`], including the
     /// defensive fallback for torn index state.
-    fn drop_hash(&mut self, hash: &TxHash) -> Option<TxEntry> {
-        let entry = self.unindex(hash);
+    fn drop_hash(&mut self, hash: &TxHash, why: Removal) -> Option<TxEntry> {
+        let entry = self.unindex(hash, why);
         if let Some(pos) = self.order.iter().position(|h| h == hash) {
             self.order.remove(pos);
         }
@@ -309,12 +309,12 @@ impl PreconfTxSetInner {
     /// hash means finding it, and doing that per hash costs the queue's length
     /// each time — quadratic at the volumes [`PreconfTxSet::forward_all`]
     /// names. One pass drops them all.
-    fn drop_hashes(&mut self, hashes: &[TxHash]) {
+    fn drop_hashes(&mut self, hashes: &[TxHash], why: Removal) {
         if hashes.is_empty() {
             return;
         }
         for hash in hashes {
-            let entry = self.unindex(hash);
+            let entry = self.unindex(hash, why);
             Self::report_unanswered(entry.as_ref());
         }
         let dropping: HashSet<TxHash> = hashes.iter().copied().collect();
@@ -345,7 +345,7 @@ impl PreconfTxSetInner {
     /// Split from [`Self::drop_hash`] because `order` is the one index that
     /// cannot be left in constant time, so the two ways of leaving it — find
     /// this one, or sweep for all of them — share everything else.
-    fn unindex(&mut self, hash: &TxHash) -> Option<TxEntry> {
+    fn unindex(&mut self, hash: &TxHash, why: Removal) -> Option<TxEntry> {
         let entry = self.entries.remove(hash);
         if let Some(ref e) = entry {
             Self::unindex_sender_nonce(&mut self.by_sender, e.from, e.nonce);
@@ -359,20 +359,79 @@ impl PreconfTxSetInner {
             });
         }
 
-        // The commitment record goes with the entry: it exists to stop the pool arm
-        // grabbing a tx that still has a live commitment, and on most removal
-        // paths there no longer is one.
+        // Only [`Removal::Ended`] knows the commitment is over; see `Removal`.
         //
-        // `forward_all` is a known gap — its predicate is "the sender's nonce moved
-        // past this entry", which neither establishes that *this* tx landed nor
-        // that the landing is irrevocable, so the commitment can still be live
-        // here. Do not read this callback as proof that it is over.
-        //
-        // Runs under the inner mutex. The registry has its own `parking_lot`
-        // lock and this is the only place the two are nested, so there is one
-        // order and nothing to get wrong.
-        self.claims.release_unless_committed(hash);
+        // Runs under the inner mutex, so the registry's `parking_lot` lock is
+        // taken inside it. Always that order: `Commitments` holds no reference
+        // back to the fifo, so it cannot take the two in reverse.
+        if why == Removal::Ended {
+            self.claims.release_unless_committed(hash);
+        }
         entry
+    }
+}
+
+/// Why a fifo entry is being removed — and therefore whether its commitment
+/// record may go with it.
+///
+/// The record outlives the entry on purpose: `Commitments` is what a reorg
+/// consults to put a commitment back, and what the journal's rotation keeps a
+/// line for. Releasing it early is unrecoverable — every later
+/// `mark_committed` is a no-op on a record that is gone.
+///
+/// Only the call site knows which case this is, so it says. The two are not
+/// distinguishable from the record: a claim that landed and a claim that
+/// timed out look the same until the canonical notification arrives, and that
+/// notification is exactly what these paths race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// The commitment is over: it timed out, failed, or was evicted. It never
+    /// landed and the sender's nonce never moved, so the slot has to come
+    /// back now — holding it would park the sender behind their own nonce
+    /// until the retention window expired.
+    Ended,
+    /// The entry went away because the chain moved past it — the sealed block
+    /// was ours, or the sender's nonce advanced. Whether that is irrevocable
+    /// is not knowable here: the canonical notification that would set
+    /// `committed_height` races this call. So the record stays and
+    /// [`Commitments::sweep`] releases it on depth, using the same ruler.
+    Landed,
+}
+
+/// Which refusal to report when `(sender, nonce)` is already taken.
+///
+/// All but one incumbent is a preconfirmation, so the long-standing wording
+/// is the default. The exception is what [`PreconfTxSet::stage_executed`]
+/// creates: the sender's own pool transaction, which the builder's pool arm
+/// executes and files here as `Replay` with no client parked on it and no
+/// receipt ever sent. Naming a commitment there sends whoever reads the error
+/// hunting for one that does not exist.
+///
+/// The three conditions are each needed. `Replay` alone also covers journal
+/// restore and reorg reinject — real commitments, which hold a `Promised`
+/// claim. A responder alone is absent for a preconfirmation whose receipt has
+/// already gone out, and present for one `reset_success_to_waiting` put back
+/// as `Replay` with its client still waiting.
+///
+/// `entry` is `None` when the claim outlived its queue entry: a removal
+/// because the nonce moved on (`Removal::Landed`) keeps the record for either
+/// kind, so this is a commitment whose receipt went out *or* a pool
+/// transaction a build executed. Both are reported with the commitment
+/// wording; telling them apart would need the record's kind, and the pool
+/// case is rare enough that nothing reads it here yet.
+fn nonce_held_by(
+    claims: &Commitments,
+    incumbent: &TxHash,
+    entry: Option<&TxEntry>,
+) -> PreconfError {
+    let staged_pool_tx = entry.is_some_and(|e| {
+        e.source == PreconfSource::Replay && e.responder.is_none()
+    }) && !claims.was_promised(incumbent);
+
+    if staged_pool_tx {
+        PreconfError::NonceUsedByExecutedTx
+    } else {
+        PreconfError::ReplaceActiveCommitment
     }
 }
 
@@ -484,6 +543,8 @@ pub struct BuildGuard {
     claims: Arc<Commitments>,
     /// `Option` so the mutex can be released inside `drop`, after the clear.
     lock: Option<OwnedMutexGuard<()>>,
+    /// This build's place in the order builds took the queue.
+    generation: u64,
 }
 
 impl BuildGuard {
@@ -495,6 +556,12 @@ impl BuildGuard {
     /// after writes a new one.
     pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
         self.claims.parent_is_ours(parent_hash)
+    }
+
+    /// This build's generation, to hand to `Commitments::note_sealed` once
+    /// the build seals — which happens after this guard is gone.
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -575,10 +642,10 @@ impl PreconfTxSet {
     /// a build and touches nothing shared. The wait costs one in-flight
     /// dispatch instead: the loop takes its cancel arm first.
     pub async fn lock_for_build(&self) -> BuildGuard {
-        BuildGuard {
-            claims: self.claims.clone(),
-            lock: Some(self.build_lock.clone().lock_owned().await),
-        }
+        let lock = self.build_lock.clone().lock_owned().await;
+        // Under the mutex, so generations run in the order builds do.
+        let generation = self.claims.next_build_generation();
+        BuildGuard { claims: self.claims.clone(), lock: Some(lock), generation }
     }
 
     /// The claims this node has made. Read synchronously — the registry uses
@@ -757,8 +824,8 @@ impl PreconfTxSet {
         //
         // The incumbent always wins — see the module's "Invariants".
         if let Some(incumbent) = held.and_then(|nonces| nonces.get(&nonce)).copied() {
-            if inner.entries.contains_key(&incumbent) {
-                return Err(PreconfError::ReplaceActiveCommitment);
+            if let Some(entry) = inner.entries.get(&incumbent) {
+                return Err(nonce_held_by(&self.claims, &incumbent, Some(entry)));
             }
             // The queue's two indices disagree — the same repair as in
             // `push_with_status`, where it is explained.
@@ -769,7 +836,9 @@ impl PreconfTxSet {
             );
             debug_assert!(false, "by_sender[{from:?}][{nonce}] -> {incumbent:?} but entry missing");
             PreconfTxSetInner::unindex_sender_nonce(&mut inner.by_sender, from, nonce);
-            inner.drop_hash(&incumbent);
+            // Repairing a torn index, not reporting an outcome: there is no entry
+            // left for the record to outlive.
+            inner.drop_hash(&incumbent, Removal::Ended);
         }
         if let Err(owner) = self.claims.slot_conflict(hash, &from, nonce) {
             debug!(
@@ -777,7 +846,7 @@ impl PreconfTxSet {
                 ?hash, ?owner, sender = ?from, nonce,
                 "nonce already owned by another commitment"
             );
-            return Err(PreconfError::ReplaceActiveCommitment);
+            return Err(nonce_held_by(&self.claims, &owner, inner.entries.get(&owner)));
         }
 
         // ── Delegated senders ──────────────────────────────────────────
@@ -856,6 +925,17 @@ impl PreconfTxSet {
     ///
     /// Sends no broadcast — the notifier means "there is work to dispatch",
     /// and this has run already.
+    ///
+    /// **A `Waiting` entry under the same hash is not upgraded** —
+    /// `push_with_status` returns `AlreadyExists` and leaves it alone. What
+    /// keeps that from mattering is a gate in the caller, not anything here:
+    /// `apply_one_best_tx` reads `status_of` before executing and
+    /// `mark_invalid`s a candidate the preconf arm still owes, so the pool arm
+    /// never reaches this function with a hash the queue is holding. Remove
+    /// that gate and the pool arm would execute the transaction, fail to
+    /// record it as applied, and have the preconf arm's later apply refused
+    /// as nonce-too-low — the client told its transaction failed while it is
+    /// in the block.
     pub async fn stage_executed(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
         let out =
             self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await;
@@ -911,7 +991,8 @@ impl PreconfTxSet {
                 "by_sender[{from:?}][{nonce}] -> {existing_hash:?} but entry missing"
             );
             PreconfTxSetInner::unindex_sender_nonce(&mut inner.by_sender, from, nonce);
-            inner.drop_hash(&existing_hash);
+            // Same torn-index repair as in `admit`.
+            inner.drop_hash(&existing_hash, Removal::Ended);
         }
 
         // No responder: the only path that has one installs it with the
@@ -980,7 +1061,9 @@ impl PreconfTxSet {
             "staged entries past the cap — the chain has not taken what this node built for \
              several blocks",
         );
-        inner.drop_hashes(&doomed);
+        // Only `Success` entries with no promise behind them reach `doomed`,
+        // so nothing here is owed to a client.
+        inner.drop_hashes(&doomed, Removal::Ended);
     }
 
     /// Returns true if the hash is currently present in `entries`.
@@ -1154,7 +1237,9 @@ impl PreconfTxSet {
                 entry.responder.take().map(|resp| (entry.nonce, resp))
             })
             .collect();
-        inner.drop_hashes(&to_drop);
+        // The nonce moved past, which is not proof that *our* transaction is
+        // what moved it, nor that the move is irrevocable — see `Removal`.
+        inner.drop_hashes(&to_drop, Removal::Landed);
         // Still under `inner` — see "Completion protocol" for why the answer
         // may not wait until after the lock.
         for (tx_nonce, resp) in stranded {
@@ -1199,7 +1284,9 @@ impl PreconfTxSet {
             .filter(|(_, e)| e.status == PreconfStatus::Success)
             .map(|(hash, _)| *hash)
             .collect();
-        inner.drop_hashes(&landed);
+        // `parent_is_ours` is not the canonical notification. Releasing the
+        // records here would race it, and losing that race is unrecoverable.
+        inner.drop_hashes(&landed, Removal::Landed);
         landed.len()
     }
 
@@ -1258,7 +1345,9 @@ impl PreconfTxSet {
         // The responder leaves with the entry, so nothing can observe one that
         // owes an answer.
         let responder = entry.responder.take();
-        inner.drop_hash(hash);
+        // The one path that knows the commitment is over: nothing landed and
+        // the nonce never moved, so the slot has to come back now.
+        inner.drop_hash(hash, Removal::Ended);
         // Still under `inner` — see "Completion protocol" above.
         if let Some(r) = responder {
             let _ = r.send(Err(err));
@@ -1795,6 +1884,167 @@ mod admit_tests {
         assert!(matches!(out, Err(PreconfError::ReplaceActiveCommitment)), "{out:?}");
     }
 
+    /// The sender's own ordinary transaction took the nonce: the builder
+    /// executed it, staged it like a commitment and recorded an `Announced`
+    /// claim (`payload_builder`'s pool arm). A preconf arriving afterwards is
+    /// still refused, but **no client is parked on the incumbent and none was
+    /// told about it**, so the refusal must not name a commitment — that sends
+    /// whoever reads it looking for one that does not exist.
+    #[tokio::test]
+    async fn a_nonce_spent_by_an_ordinary_tx_is_not_reported_as_a_commitment() {
+        let set = PreconfTxSet::new(8);
+        let alice = addr(1);
+        let pool_tx = tx(0, 1, 0);
+        let pool_hash = *pool_tx.tx_hash();
+
+        set.stage_executed(pool_tx, alice).await;
+        set.claims().record_announced(pool_hash, &alice, 0, 7).expect("the slot was free");
+        assert!(!set.claims().was_promised(&pool_hash), "the premise: no receipt went out");
+
+        let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;
+
+        assert!(
+            matches!(out, Err(PreconfError::NonceUsedByExecutedTx)),
+            "nobody is waiting on the incumbent and nobody was told; got {out:?}",
+        );
+    }
+
+    /// The counterpart: once a receipt has gone out the incumbent really is a
+    /// preconfirmation, and the long-standing wording is the right one.
+    #[tokio::test]
+    async fn a_nonce_held_by_a_promised_commitment_still_reports_one() {
+        let set = PreconfTxSet::new(8);
+        let alice = addr(1);
+        let first = *tx(0, 1, 0).tx_hash();
+
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        set.claims().mark_promised(first, &alice, 0, 7).expect("the slot was free");
+
+        let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;
+
+        assert!(matches!(out, Err(PreconfError::ReplaceActiveCommitment)), "{out:?}");
+    }
+
+    // ── Removal must not outrun the canonical notification ────────────
+    //
+    // Four cases pinning one rule: a record may only be released when the
+    // removal *knows* the commitment is over. Two of the removal paths do
+    // not know — the canonical notification that would say so races them —
+    // so they leave the record to `sweep`'s depth check.
+
+    /// `forward_all` fires on "this sender's nonce moved past the entry",
+    /// which says nothing about whether *our* transaction is the one that
+    /// advanced it, nor whether that is irrevocable. The code has long
+    /// carried a comment calling this a known gap; this pins the fix.
+    #[tokio::test]
+    async fn forward_all_leaves_the_record_for_the_sweep() {
+        let set = PreconfTxSet::new(8);
+        let alice = addr(1);
+        let hash = *tx(0, 1, 0).tx_hash();
+
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
+        set.mark_succeeded(&hash).await.unwrap();
+
+        // The nonce moved past — but no canonical notification has arrived,
+        // so `committed_height` is still unset.
+        set.forward_all(&std::collections::HashMap::from([(alice, 1u64)])).await;
+
+        assert!(set.find_by_sender_nonce(&alice, 0).await.is_none(), "the entry is gone");
+        assert!(
+            set.claims().is_tracked(&hash),
+            "the record must outlive the entry: a reorg within SEAL_DEPTH still needs it",
+        );
+    }
+
+    /// The same rule on the build-start fast path — this is the sequence
+    /// that loses a commitment outright: the record goes before
+    /// `mark_committed` can run, so every later `mark_committed` is a no-op
+    /// and a reorg finds nothing to re-inject.
+    #[tokio::test]
+    async fn the_landed_fast_path_leaves_the_record_for_the_sweep() {
+        let set = PreconfTxSet::new(8);
+        let alice = addr(1);
+        let hash = *tx(0, 1, 0).tx_hash();
+
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
+        set.mark_succeeded(&hash).await.unwrap();
+
+        assert_eq!(set.drop_landed_claims().await, 1);
+
+        assert!(
+            set.claims().is_tracked(&hash),
+            "`parent_is_ours` is not the canonical notification; it may not release the record",
+        );
+    }
+
+    /// The counterweight, and the reason the rule is keyed on *why* the entry
+    /// left rather than on the claim's kind: a commitment that timed out
+    /// never landed and its nonce never moved, so holding the slot would
+    /// park the sender behind their own nonce for `SEAL_DEPTH` blocks.
+    #[tokio::test]
+    async fn a_failed_commitment_releases_its_slot_at_once() {
+        let set = PreconfTxSet::new(8);
+        let alice = addr(1);
+        let hash = *tx(0, 1, 0).tx_hash();
+
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
+
+        set.complete_failure(&hash, PreconfError::Internal("timed out".into()))
+            .await
+            .expect("the entry is there to fail");
+
+        assert!(!set.claims().is_tracked(&hash), "nothing landed, so nothing is owed");
+        assert!(
+            set.claims().slot_owner(&alice, 0).is_none(),
+            "the sender must be free to resubmit on this nonce immediately",
+        );
+    }
+
+    /// And the records kept above are not a leak: once `SEAL_DEPTH` persisted
+    /// blocks bury the promise, `sweep` lets go.
+    #[tokio::test]
+    async fn a_kept_record_is_released_once_it_is_buried() {
+        let set = PreconfTxSet::new(8);
+        let alice = addr(1);
+        let hash = *tx(0, 1, 0).tx_hash();
+
+        admit(&set, Req::new(tx(0, 1, 0), alice), cap()).await.unwrap();
+        set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
+        set.mark_succeeded(&hash).await.unwrap();
+        set.forward_all(&std::collections::HashMap::from([(alice, 1u64)])).await;
+        assert!(set.claims().is_tracked(&hash), "the premise: still held");
+
+        set.claims().observe_persisted(7 + crate::commitments::SEAL_DEPTH);
+        assert_eq!(set.claims().sweep(&Default::default()), 1);
+
+        assert!(!set.claims().is_tracked(&hash));
+        assert!(set.claims().slot_owner(&alice, 0).is_none(), "the slot comes back with it");
+    }
+
+    /// A reorg reinject or a journal restore looks like the staged pool
+    /// transaction above in two of three respects — `Replay`, no responder —
+    /// and is a real commitment. The `Promised` claim is the only thing
+    /// telling them apart, which is why the carve-out checks all three.
+    #[tokio::test]
+    async fn a_reinjected_commitment_is_not_mistaken_for_a_pool_tx() {
+        let set = PreconfTxSet::new(8);
+        let alice = addr(1);
+        let restored = tx(0, 1, 0);
+        let hash = *restored.tx_hash();
+
+        // `Replay`, no client parked — the shape `restore_preconf_state` and
+        // the canon handler push.
+        set.push_if_absent(restored, alice, PreconfSource::Replay).await;
+        set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
+
+        let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;
+
+        assert!(matches!(out, Err(PreconfError::ReplaceActiveCommitment)), "{out:?}");
+    }
+
     // ── Same hash again ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2111,7 +2361,10 @@ mod tests {
     async fn handing_the_queue_on_forgets_the_last_sealed_block() {
         let set = Arc::new(PreconfTxSet::new(16));
         let previous = B256::repeat_byte(7);
-        set.claims().note_sealed(previous);
+        let before = set.lock_for_build().await;
+        let generation = before.generation();
+        drop(before);
+        set.claims().note_sealed(previous, generation);
 
         let guard = set.lock_for_build().await;
         assert!(guard.parent_is_ours(previous), "the holding build reads it in its own prologue",);
@@ -2220,28 +2473,115 @@ mod tests {
         assert_eq!(set.status_of(&h(0xcc)).await, None, "a hash the fifo never held");
     }
 
-    /// Every fifo removal path must release the commitment record, because
-    /// `unindex` is the single point they all converge on. Asserted through
-    /// two different public entry points so the release is proven to sit at that
-    /// convergence point rather than on one route.
+    // ── Can the fast path drop an entry the parent block never carried? ──
+    //
+    // `drop_landed_claims` takes **every** `Success` entry on the strength of
+    // one comparison — "the parent is the block the last build sealed" — so
+    // the question is whether a `Success` entry can be present while that
+    // comparison is true without being in that block. The guard below is what
+    // makes the answer no, and it is the whole of the answer: nothing else
+    // bounds which build the shortcut speaks for.
+
+    /// A build that stops without sealing leaves the next one no shortcut.
+    ///
+    /// `BuildGuard`'s `Drop` clears unconditionally, and the builder calls
+    /// `note_sealed` *after* dropping the guard — so an abandoned build
+    /// clears and never writes. The build after it therefore falls back to
+    /// asking the chain, and the entries the abandoned build staged survive
+    /// to be replayed rather than dropped as landed.
     #[tokio::test]
-    async fn removal_paths_release_the_commitment_record() {
+    async fn an_abandoned_build_leaves_no_shortcut_for_the_next_one() {
+        let set = PreconfTxSet::new(16);
+        let sealed_by_the_build_before = h(0xaa);
+
+        // Build N: seals, so the shortcut is available to whoever is next.
+        let build_n = set.lock_for_build().await;
+        let generation_n = build_n.generation();
+        drop(build_n);
+        set.claims().note_sealed(sealed_by_the_build_before, generation_n);
+
+        // Build A: stages a transaction, then stops without sealing.
+        let guard = set.lock_for_build().await;
+        assert!(
+            set.claims().parent_is_ours(sealed_by_the_build_before),
+            "premise: the shortcut was there for this build to read",
+        );
+        set.push_if_absent(make_tx(0, 1), addr(1), PreconfSource::Rpc).await;
+        set.mark_succeeded(&h(1)).await.unwrap();
+        drop(guard);
+
+        // Build B: the shortcut is gone, so the fast path cannot fire and the
+        // entry A staged is still here for the carryover to replay.
+        assert!(
+            !set.claims().parent_is_ours(sealed_by_the_build_before),
+            "a build that sealed nothing must not leave the previous build's hash standing",
+        );
+        assert!(set.contains(&h(1)).await, "and its staged entry survives to be replayed");
+    }
+
+    /// **A build that is slow to seal cannot overwrite its successor's seal.**
+    ///
+    /// The seal runs after the queue is handed on, so build A can still be
+    /// sealing while build B takes the queue, executes and seals. If A's seal
+    /// then landed, the build after B would read "parent is A" as "everything
+    /// in the queue is on chain" and drop what only B carried. The seal is
+    /// stamped with the sealing build's generation and an older one is
+    /// refused.
+    #[tokio::test]
+    async fn a_late_seal_from_an_earlier_build_does_not_replace_the_newer_one() {
+        let set = PreconfTxSet::new(16);
+        let (sealed_by_a, sealed_by_b) = (h(0xaa), h(0xbb));
+
+        let a = set.lock_for_build().await;
+        let generation_a = a.generation();
+        drop(a);
+        let b = set.lock_for_build().await;
+        let generation_b = b.generation();
+        drop(b);
+
+        // B seals first; A's seal arrives late.
+        set.claims().note_sealed(sealed_by_b, generation_b);
+        set.claims().note_sealed(sealed_by_a, generation_a);
+
+        let c = set.lock_for_build().await;
+        assert!(c.parent_is_ours(sealed_by_b), "B is the last build that sealed");
+        assert!(!c.parent_is_ours(sealed_by_a), "A's late seal must not stand");
+    }
+
+    /// `unindex` is the point every removal converges on, and it releases the
+    /// commitment record only for [`Removal::Ended`]. Asserted on both routes
+    /// through it — the single-entry `drop_hash` and the bulk `drop_hashes` —
+    /// so the dispatch is proven to sit at the convergence point rather than
+    /// on one route.
+    ///
+    /// This used to assert that **every** path releases the record. That rule
+    /// was the defect: `forward_all` fires on "the sender's nonce moved past",
+    /// which races the canonical notification that would mark the commitment
+    /// as landed, and releasing there is unrecoverable.
+    #[tokio::test]
+    async fn removal_releases_the_record_only_when_the_commitment_ended() {
         let set = PreconfTxSet::new(16);
 
-        // Route 1 — `complete_failure`, the single-entry removal, via `drop_hash`.
+        // Route 1 — `complete_failure`, the single-entry removal, via
+        // `drop_hash`. Nothing landed and the nonce never moved, so the slot
+        // has to come back at once.
         set.push_if_absent(make_tx(0, 1), addr(1), PreconfSource::Rpc).await;
         set.claims().mark_promised(h(1), &addr(1), 0, 0).unwrap();
         assert!(set.claims().is_tracked(&h(1)), "premise: the record exists");
         set.complete_failure(&h(1), PreconfError::BuilderRejected("rejected".into()))
             .await
             .unwrap();
-        assert!(!set.claims().is_tracked(&h(1)), "complete_failure must release it");
+        assert!(!set.claims().is_tracked(&h(1)), "an ended commitment releases its record");
 
-        // Route 2 — `forward_all`, the bulk removal, via `drop_hashes`.
+        // Route 2 — `forward_all`, the bulk removal, via `drop_hashes`. The
+        // chain moved past, which is not the same as knowing it is over.
         set.push_if_absent(make_tx(7, 2), addr(2), PreconfSource::Rpc).await;
         set.claims().mark_promised(h(2), &addr(2), 7, 0).unwrap();
         forward_one(&set, &addr(2), 8).await;
-        assert!(!set.claims().is_tracked(&h(2)), "forward_all must release it too");
+        assert!(
+            set.claims().is_tracked(&h(2)),
+            "the record outlives the entry until `sweep` can prove it is buried",
+        );
     }
 
     /// A removal with no record to release must stay valid — `unindex` runs
@@ -2863,7 +3203,7 @@ mod tests {
         // be cleaned.
         {
             let mut inner = set.inner.lock().await;
-            let evicted = inner.drop_hash(&ghost);
+            let evicted = inner.drop_hash(&ghost, Removal::Ended);
             assert!(evicted.is_none());
             assert!(inner.order.is_empty());
             assert!(inner.by_sender.is_empty());

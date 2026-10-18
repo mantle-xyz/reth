@@ -7,6 +7,7 @@
 
 use std::{collections::VecDeque, num::NonZeroUsize};
 
+use alloy_rpc_types_engine::PayloadId;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 
 /// Where a slice sits in the stream. Ordered by block first, then by index
@@ -25,7 +26,7 @@ pub struct FlashblockPosition {
 /// and every replay is a refcount bump.
 #[derive(Debug)]
 pub struct FlashblockRingBuffer {
-    entries: VecDeque<(FlashblockPosition, Utf8Bytes)>,
+    entries: VecDeque<(FlashblockPosition, PayloadId, Utf8Bytes)>,
     capacity: usize,
 }
 
@@ -46,12 +47,17 @@ impl FlashblockRingBuffer {
     ///
     /// This is the only point at which something a subscriber may already hold
     /// stops being true, which is why the dropped slices are counted.
-    pub fn push(&mut self, position: FlashblockPosition, payload: Utf8Bytes) {
+    pub fn push(
+        &mut self,
+        position: FlashblockPosition,
+        payload_id: PayloadId,
+        payload: Utf8Bytes,
+    ) {
         // Counted because nothing else says a retraction happened: the
         // replacement carries `base` and restarts at index zero, which reads
         // as a fresh block.
         let mut superseded = 0u64;
-        while self.entries.back().is_some_and(|(stored, _)| *stored >= position) {
+        while self.entries.back().is_some_and(|(stored, ..)| *stored >= position) {
             self.entries.pop_back();
             superseded += 1;
         }
@@ -61,7 +67,7 @@ impl FlashblockRingBuffer {
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
         }
-        self.entries.push_back((position, payload));
+        self.entries.push_back((position, payload_id, payload));
     }
 
     /// Slices published strictly after `cutoff`, oldest first.
@@ -71,8 +77,8 @@ impl FlashblockRingBuffer {
     pub fn entries_after(
         &self,
         cutoff: &FlashblockPosition,
-    ) -> Vec<(FlashblockPosition, Utf8Bytes)> {
-        let start = self.entries.partition_point(|(stored, _)| stored <= cutoff);
+    ) -> Vec<(FlashblockPosition, PayloadId, Utf8Bytes)> {
+        let start = self.entries.partition_point(|(stored, ..)| stored <= cutoff);
         self.entries.iter().skip(start).cloned().collect()
     }
 
@@ -84,12 +90,12 @@ impl FlashblockRingBuffer {
 
     /// Position of the oldest slice still held.
     pub fn oldest(&self) -> Option<FlashblockPosition> {
-        self.entries.front().map(|(position, _)| *position)
+        self.entries.front().map(|(position, ..)| *position)
     }
 
     /// Position of the newest slice held.
     pub fn latest(&self) -> Option<FlashblockPosition> {
-        self.entries.back().map(|(position, _)| *position)
+        self.entries.back().map(|(position, ..)| *position)
     }
 
     /// Whether `cutoff` sits past everything held. Either the subscriber's
@@ -114,9 +120,15 @@ impl FlashblockRingBuffer {
 mod tests {
     use std::num::NonZeroUsize;
 
+    use alloy_rpc_types_engine::PayloadId;
     use tokio_tungstenite::tungstenite::Utf8Bytes;
 
     use super::{FlashblockPosition, FlashblockRingBuffer};
+
+    /// The build these fixtures publish under unless a case needs two.
+    fn one_build() -> PayloadId {
+        PayloadId::default()
+    }
 
     fn cap(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).expect("capacity is non-zero")
@@ -138,13 +150,13 @@ mod tests {
     ) -> FlashblockRingBuffer {
         let mut ring = FlashblockRingBuffer::new(cap(capacity));
         for position in positions {
-            ring.push(position, payload(position));
+            ring.push(position, one_build(), payload(position));
         }
         ring
     }
 
-    fn texts(entries: Vec<(FlashblockPosition, Utf8Bytes)>) -> Vec<String> {
-        entries.into_iter().map(|(_, text)| text.as_str().to_owned()).collect()
+    fn texts(entries: Vec<(FlashblockPosition, PayloadId, Utf8Bytes)>) -> Vec<String> {
+        entries.into_iter().map(|(_, _, text)| text.as_str().to_owned()).collect()
     }
 
     /// A subscriber names the last slice it already has, so replay must start
@@ -235,7 +247,7 @@ mod tests {
     fn rebuilding_a_block_drops_the_slices_it_supersedes() {
         let mut ring = filled(8, [pos(10, 0), pos(10, 1), pos(10, 2)]);
 
-        ring.push(pos(10, 1), Utf8Bytes::from("rebuilt-10-1"));
+        ring.push(pos(10, 1), one_build(), Utf8Bytes::from("rebuilt-10-1"));
 
         assert_eq!(ring.len(), 2, "10-1 and 10-2 are superseded by the rebuild");
         assert_eq!(texts(ring.entries_after(&pos(10, 0))), ["rebuilt-10-1"]);
@@ -245,7 +257,7 @@ mod tests {
     fn rebuilding_from_the_base_slice_drops_the_whole_block() {
         let mut ring = filled(8, [pos(9, 4), pos(10, 0), pos(10, 1)]);
 
-        ring.push(pos(10, 0), Utf8Bytes::from("rebuilt-10-0"));
+        ring.push(pos(10, 0), one_build(), Utf8Bytes::from("rebuilt-10-0"));
 
         assert_eq!(texts(ring.entries_after(&pos(9, 3))), ["9-4", "rebuilt-10-0"]);
     }

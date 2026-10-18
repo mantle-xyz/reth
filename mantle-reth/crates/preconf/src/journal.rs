@@ -71,7 +71,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{Commitments, PreconfTxSet};
+use crate::{ClaimKind, Commitments, PreconfTxSet};
 
 /// One persisted preconf commitment. Carries everything needed to
 /// put the transaction back in the queue on restart and to recognise
@@ -89,6 +89,30 @@ pub struct JournalEntry {
     /// Wall-clock ms at which the commitment was made. Used by
     /// operators to correlate journal entries against logs / metrics.
     pub committed_at_ms: u64,
+    /// Which claim this node made about the transaction.
+    ///
+    /// The two writers put different things here — the apply writes a
+    /// commitment, a slice writes the ordinary pool transactions it carried —
+    /// and restore cannot work it out on its own: the registry is empty at
+    /// that point, because the restore pass is what fills it. Without this
+    /// field every replayed record is read as a commitment, and a sender
+    /// replacing their own pending transaction lands in the branch that
+    /// reports a receipt nobody can honour.
+    ///
+    /// Absent from files written before this field existed. Those files hold
+    /// both kinds — the slice path journaled pool transactions before it said
+    /// which were which — and nothing in a record tells them apart, so every
+    /// one is read as a commitment: the kind that is never dropped. The cost
+    /// is on the first restart after an upgrade only, and is what the apply
+    /// path has always done with such a record.
+    #[serde(default = "promised_by_default")]
+    pub kind: ClaimKind,
+}
+
+/// Default [`JournalEntry::kind`] for a record written before the field
+/// existed. See that field.
+const fn promised_by_default() -> ClaimKind {
+    ClaimKind::Promised
 }
 
 /// Current wall-clock milliseconds since the Unix epoch, for stamping
@@ -103,15 +127,22 @@ pub(crate) fn now_unix_ms() -> u64 {
 impl JournalEntry {
     /// The record for a transaction just executed into the block being built.
     ///
-    /// One definition for both writers: preconf commitments are recorded from
-    /// the apply, pool transactions from the slice that carries them, and what
-    /// a record *is* must not depend on which of the two wrote it.
-    pub(crate) fn for_executed(hash: TxHash, tx: &impl Encodable2718, block_height: u64) -> Self {
+    /// One shape for both writers, with `kind` as the one thing that differs:
+    /// preconf commitments are recorded from the apply, pool transactions from
+    /// the slice that carries them, and a restart has no other way to tell the
+    /// two apart — see [`JournalEntry::kind`].
+    pub(crate) fn for_executed(
+        hash: TxHash,
+        tx: &impl Encodable2718,
+        block_height: u64,
+        kind: ClaimKind,
+    ) -> Self {
         Self {
             hash,
             tx_rlp: tx.encoded_2718().into(),
             block_height,
             committed_at_ms: now_unix_ms(),
+            kind,
         }
     }
 }
@@ -368,7 +399,8 @@ impl PreconfJournal {
         let len = buf.len() as u64;
 
         if let Err(e) = writer.write_all(&buf).await.and(writer.flush().await) {
-            drop(writer);
+            // Refill under the guard, or a concurrent append writes ahead of
+            // these older records — the reorder the lock above exists to prevent.
             retried.append(&mut lines);
             self.buffer(retried);
             return Err(JournalError::Io(e));
@@ -517,10 +549,11 @@ impl PreconfJournal {
     /// then atomically swap it for the live file.
     ///
     /// Implementation: read all entries, filter, write to a sibling
-    /// `<path>.tmp`, then `rename` over the live file. On Unix the
-    /// rename is atomic with respect to crashes — a power loss
-    /// mid-rotate leaves either the old file or the new one intact,
-    /// never a half-written hybrid.
+    /// `<path>.tmp`, then `rename` over the live file. The rename is atomic
+    /// against a process crash — never a half-written hybrid. It is not a
+    /// durability guarantee: the tmp file is only `flush`ed and nothing here
+    /// fsyncs it or the directory, so a power loss can leave the rename
+    /// applied and the new file's tail missing. Same trade as `append`.
     ///
     /// The caller is expected to be the rotation loop, not the hot RPC path.
     ///
@@ -745,8 +778,8 @@ pub enum OnChain {
 /// The chain-side lookup [`restore_preconf_state`] needs to tell "this
 /// commitment landed" apart from "some other transaction consumed its nonce".
 ///
-/// Separate from [`RestoreSource`] because the pool has no way to answer it — see
-/// the chain's account nonce.
+/// Separate from [`RestoreSource`], which only decodes bytes: answering this
+/// needs the chain's account nonce, which the bytes cannot supply.
 pub trait CommitmentChainView: Send + Sync {
     /// Is `hash` on the canonical chain?
     fn commitment_on_chain(&self, hash: &TxHash) -> OnChain;
@@ -839,14 +872,25 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     let (entries, bad_lines) = match journal.load().await {
         Ok(v) => v,
         Err(e) => {
-            warn!(
+            // Every commitment whose receipt already went out is abandoned
+            // here: it enters neither the fifo nor `Commitments`, so it will
+            // not land and its nonce reads as free. The file not existing is
+            // *not* this path (that is `Ok((vec![], 0))`, the ordinary first
+            // start) and neither is a corrupt line — only a real IO failure
+            // reaches here, which is why it is `error!` rather than `warn!`.
+            // A single unparseable line was already the louder of the two.
+            metrics::counter!("preconf.journal.restore_load_failed_total").increment(1);
+            error!(
                 target: "mantle::preconf::journal",
                 ?e,
-                "journal load failed; continuing without restore"
+                "journal load failed; every in-flight commitment is abandoned"
             );
             return;
         }
     };
+    // Counted, not merely logged: a file that is quietly shedding lines looks
+    // identical to a quiet chain from the outside.
+    metrics::counter!("preconf.journal.restore_bad_lines_total").increment(bad_lines as u64);
     info!(
         target: "mantle::preconf::journal",
         count = entries.len(),
@@ -861,18 +905,32 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     // admitting the first would put the *second* through the replacement guard instead of
     // treating it as the commitment it is.
     //
-    // **The slot.** `mark_promised` both records "a receipt for this went out in a previous
-    // process" and claims the `(sender, nonce)`, from what `recover_slot` hands it. Back-filling
-    // the claim at validator time would leave the nonce reading free in between, so a same-nonce
-    // transaction admitted there would take a nonce the client was already told it had. Startup
-    // ordering closes that window today (`cli::node` runs restore before the pool loader, the RPC
-    // server and the network); claiming here makes it structural instead.
+    // **The slot.** Both record functions claim the `(sender, nonce)` from what
+    // `recover_slot` hands them. Back-filling the claim at validator time would
+    // leave the nonce reading free in between, so a same-nonce transaction
+    // admitted there would take a nonce the client was already told it had.
+    // Startup ordering closes that window today (`cli::node` runs restore before
+    // the pool loader, the RPC server and the network); claiming here makes it
+    // structural instead.
+    //
+    // **The kind.** Each record is re-established as what it was written as, not
+    // as a commitment: a slice's ordinary pool transactions are `Announced`, and
+    // reading them back as `Promised` would route a sender's own replacement
+    // into the branch that reports a receipt nobody can honour. Both kinds claim
+    // the slot and both keep the same reorg reach — the kind decides who is told
+    // when the claim fails, not how long it is kept.
     for entry in &entries {
         match source.recover_slot(&entry.tx_rlp) {
             Some((from, nonce)) => {
-                if let Err(owner) =
-                    claims.mark_promised(entry.hash, &from, nonce, entry.block_height)
-                {
+                let claimed = match entry.kind {
+                    ClaimKind::Promised => {
+                        claims.mark_promised(entry.hash, &from, nonce, entry.block_height)
+                    }
+                    ClaimKind::Announced => {
+                        claims.record_announced(entry.hash, &from, nonce, entry.block_height)
+                    }
+                };
+                if let Err(owner) = claimed {
                     // Someone already owns the nonce, so this commitment is the
                     // one that will lose it. Deliberately not seized — see
                     // `mark_promised`. `recover_envelope` below decides the outcome
@@ -1238,7 +1296,33 @@ mod tests {
             tx_rlp: Bytes::from(vec![byte; 4]),
             block_height: height,
             committed_at_ms: 1_000 + u64::from(byte),
+            kind: ClaimKind::Promised,
         }
+    }
+
+    /// The record a slice writes for an ordinary pool transaction it carried.
+    fn announced_entry(byte: u8, height: u64) -> JournalEntry {
+        JournalEntry { kind: ClaimKind::Announced, ..entry(byte, height) }
+    }
+
+    /// A journal written before `kind` existed holds nothing but commitments:
+    /// pool transactions were not journaled yet. Such a record has to read back
+    /// as one — without the default it would not parse at all, and with the
+    /// wrong default every pre-upgrade commitment would stop being reported as
+    /// broken when it cannot be kept.
+    #[test]
+    fn a_record_written_before_the_kind_field_reads_back_as_a_commitment() {
+        let legacy = serde_json::json!({
+            "hash": TxHash::from([1; 32]),
+            "tx_rlp": Bytes::from(vec![1u8; 4]),
+            "block_height": 10,
+            "committed_at_ms": 1_001,
+        });
+
+        let parsed: JournalEntry =
+            serde_json::from_value(legacy).expect("a record from before the field still parses");
+
+        assert_eq!(parsed.kind, ClaimKind::Promised);
     }
 
     async fn fresh_journal() -> (TempDir, PreconfJournal) {
@@ -1477,6 +1561,7 @@ mod tests {
             tx_rlp: Bytes::from(vec![byte; 4]),
             block_height: height,
             committed_at_ms,
+            kind: ClaimKind::Promised,
         }
     }
 
@@ -1859,7 +1944,7 @@ mod tests {
     /// don't go through real reth pool machinery — that's wired in by
     /// the cli crate at a later phase. The stub fabricates plausible
     /// envelopes for every `recover_envelope` call.
-    struct StubPool {
+    struct StubSource {
         // Counts for assertions.
         add_calls: std::sync::Mutex<Vec<Bytes>>,
         // Whether recover_envelope should return Err.
@@ -1868,7 +1953,7 @@ mod tests {
         undecodable: bool,
     }
 
-    impl StubPool {
+    impl StubSource {
         fn new() -> Self {
             Self {
                 add_calls: std::sync::Mutex::new(Vec::new()),
@@ -1879,7 +1964,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RestoreSource for StubPool {
+    impl RestoreSource for StubSource {
         /// Must agree with the `(from, nonce)` `recover_envelope` fabricates below —
         /// restore claims the slot from this and pushes the fifo entry from that,
         /// so a mismatch would silently test nothing.
@@ -2051,7 +2136,7 @@ mod tests {
                 .collect();
             journal.append_batch(&entries).await.unwrap();
 
-            let pool = StubPool::new();
+            let pool = StubSource::new();
             let chain = landed();
             let fifo = Arc::new(PreconfTxSet::new(1 << 16));
             let claims = empty_commitments();
@@ -2078,11 +2163,37 @@ mod tests {
     #[tokio::test]
     async fn restore_from_empty_journal_is_noop() {
         let (_dir, j) = fresh_journal().await;
-        let pool = StubPool::new();
+        let pool = StubSource::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
         restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
         assert!(pool.add_calls.lock().unwrap().is_empty());
         assert!(fifo.snapshot().await.is_empty());
+    }
+
+    /// A slice writes the ordinary pool transactions it carried, and those are
+    /// not commitments: nobody holds a receipt for them, and a consumer that
+    /// sees one reconciles on its own. Restoring them as `Promised` makes a
+    /// sender replacing their own pending transaction indistinguishable from a
+    /// receipt this node cannot honour — which is what
+    /// `preconf.tx.commitment_broken_total` exists to count.
+    #[tokio::test]
+    async fn restore_keeps_the_kind_each_record_was_written_with() {
+        let (_dir, j) = fresh_journal().await;
+        j.append_promised(&entry(1, 10)).await.unwrap();
+        j.append_batch(&[announced_entry(2, 10)]).await.unwrap();
+
+        let claims = Arc::new(empty_commitments());
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        restore_preconf_state(&j, &StubSource::new(), &landed(), &fifo, &claims).await;
+
+        assert!(
+            claims.was_promised(&TxHash::from([1; 32])),
+            "a commitment has to come back as one",
+        );
+        assert!(
+            !claims.was_promised(&TxHash::from([2; 32])),
+            "a pool transaction a slice carried must not come back as a receipt nobody can repair",
+        );
     }
 
     #[tokio::test]
@@ -2091,7 +2202,7 @@ mod tests {
         j.append_promised(&entry(1, 10)).await.unwrap();
         j.append_promised(&entry(2, 11)).await.unwrap();
 
-        let pool = StubPool::new();
+        let pool = StubSource::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
         restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
 
@@ -2106,7 +2217,7 @@ mod tests {
         let e1 = entry(3, 30);
         j.append_promised(&e1).await.unwrap();
 
-        let pool = StubPool::new();
+        let pool = StubSource::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
         restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
 
@@ -2122,13 +2233,13 @@ mod tests {
     async fn restore_marks_every_entry_promised_before_admitting_any() {
         /// Pool that, on each tx it is handed, snapshots the promise flag of **all**
         /// journal hashes — including the ones not offered yet.
-        struct RecordSpyPool {
+        struct RecordSpySource {
             claims: Arc<Commitments>,
             hashes: Vec<TxHash>,
             seen: std::sync::Mutex<Vec<Vec<bool>>>,
         }
         #[async_trait::async_trait]
-        impl RestoreSource for RecordSpyPool {
+        impl RestoreSource for RecordSpySource {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((Address::from([seed; 20]), u64::from(seed)))
@@ -2164,7 +2275,7 @@ mod tests {
         j.append_promised(&entry(3, 12)).await.unwrap();
 
         let claims = Arc::new(empty_commitments());
-        let pool = RecordSpyPool {
+        let pool = RecordSpySource {
             claims: claims.clone(),
             hashes: (1u8..=3).map(|b| TxHash::from([b; 32])).collect(),
             seen: std::sync::Mutex::new(vec![]),
@@ -2206,13 +2317,13 @@ mod tests {
     async fn restore_claims_every_slot_before_admitting_any() {
         /// Pool that, on each tx it is handed, snapshots the owner of **all** the
         /// journal entries' slots — including those not offered yet.
-        struct SlotSpyPool {
+        struct SlotSpySource {
             claims: Arc<Commitments>,
             slots: Vec<(Address, u64)>,
             seen: std::sync::Mutex<Vec<Vec<Option<TxHash>>>>,
         }
         #[async_trait::async_trait]
-        impl RestoreSource for SlotSpyPool {
+        impl RestoreSource for SlotSpySource {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 Some((Address::from([seed; 20]), u64::from(seed)))
@@ -2250,7 +2361,7 @@ mod tests {
 
         let claims =
             Arc::new(Commitments::enabled(crate::commitments::DEFAULT_COMMITMENT_CACHE_CAP));
-        let pool = SlotSpyPool {
+        let pool = SlotSpySource {
             claims: claims.clone(),
             slots: (1u8..=3).map(|b| (Address::from([b; 20]), u64::from(b))).collect(),
             seen: std::sync::Mutex::new(vec![]),
@@ -2291,7 +2402,7 @@ mod tests {
         // restore looking for the hash in the first place.
         restore_preconf_state(
             &j,
-            &OnChainPool,
+            &OnChainSource,
             &StubChain(OnChain::Yes { height: LANDED_AT }, NONCE_IS_GONE),
             &Arc::new(PreconfTxSet::new(16)),
             &c,
@@ -2332,13 +2443,13 @@ mod tests {
     async fn restore_never_leaves_a_fifo_entry_without_its_slot() {
         /// Every entry decodes to the *same* `(sender, nonce)` but a hash taken
         /// from its first rlp byte — the collision the invariant forbids.
-        struct SameSlotPool;
+        struct SameSlotSource;
 
         const SHARED_SENDER: Address = Address::new([0xAB; 20]);
         const SHARED_NONCE: u64 = 7;
 
         #[async_trait::async_trait]
-        impl RestoreSource for SameSlotPool {
+        impl RestoreSource for SameSlotSource {
             fn recover_slot(&self, _tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 Some((SHARED_SENDER, SHARED_NONCE))
             }
@@ -2367,7 +2478,7 @@ mod tests {
 
         let fifo = Arc::new(PreconfTxSet::new(16));
         let c = empty_commitments();
-        restore_preconf_state(&j, &SameSlotPool, &landed(), &fifo, &c).await;
+        restore_preconf_state(&j, &SameSlotSource, &landed(), &fifo, &c).await;
 
         // The pre-pass gives the slot to whoever asks first; the other loses it.
         let owner = c.slot_owner(&SHARED_SENDER, SHARED_NONCE).expect("someone owns the nonce");
@@ -2388,10 +2499,10 @@ mod tests {
 
     /// A decoder that always succeeds. What the entry's fate is depends on
     /// the chain now, not on this.
-    struct OnChainPool;
+    struct OnChainSource;
 
     #[async_trait::async_trait]
-    impl RestoreSource for OnChainPool {
+    impl RestoreSource for OnChainSource {
         fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
             let seed = tx_rlp.first().copied().unwrap_or(0);
             Some((Address::from([seed; 20]), u64::from(seed)))
@@ -2431,7 +2542,7 @@ mod tests {
         let c = empty_commitments();
         restore_preconf_state(
             &j,
-            &OnChainPool,
+            &OnChainSource,
             &StubChain(OnChain::No, NONCE_IS_GONE),
             &Arc::new(PreconfTxSet::new(16)),
             &c,
@@ -2467,7 +2578,7 @@ mod tests {
         let c = empty_commitments();
         restore_preconf_state(
             &j,
-            &OnChainPool,
+            &OnChainSource,
             &StubChain(OnChain::Unknown, NONCE_IS_GONE),
             &Arc::new(PreconfTxSet::new(16)),
             &c,
@@ -2492,7 +2603,7 @@ mod tests {
         let c = empty_commitments();
         restore_preconf_state(
             &j,
-            &OnChainPool,
+            &OnChainSource,
             &StubChain(OnChain::Yes { height: LANDED_AT }, NONCE_IS_GONE),
             &Arc::new(PreconfTxSet::new(16)),
             &c,
@@ -2517,7 +2628,7 @@ mod tests {
 
             restore_preconf_state(
                 &j,
-                &OnChainPool,
+                &OnChainSource,
                 &StubChain(answer, NONCE_IS_GONE),
                 &fifo,
                 &empty_commitments(),
@@ -2537,7 +2648,7 @@ mod tests {
         j.append_promised(&entry(4, 40)).await.unwrap();
         j.append_promised(&entry(5, 50)).await.unwrap();
 
-        let mut pool = StubPool::new();
+        let mut pool = StubSource::new();
         pool.reject_add = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
         let c = empty_commitments();
@@ -2562,7 +2673,7 @@ mod tests {
         let e = entry(6, 60);
         j.append_promised(&e).await.unwrap();
 
-        let mut pool = StubPool::new();
+        let mut pool = StubSource::new();
         pool.undecodable = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
         let c = empty_commitments();
@@ -2993,6 +3104,7 @@ mod proptest_journal_model {
             tx_rlp: Bytes::from(vec![byte; 4]),
             block_height: u64::from(byte),
             committed_at_ms: 1_000 + u64::from(byte),
+            kind: ClaimKind::Promised,
         }
     }
 

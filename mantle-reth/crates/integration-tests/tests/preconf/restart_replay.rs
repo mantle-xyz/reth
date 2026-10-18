@@ -33,6 +33,7 @@ use crate::{launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+use mantle_reth_preconf::ClaimKind;
 use mantle_reth_preconf::JournalEntry;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
@@ -77,7 +78,7 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
     let journal_file = journal_dir.join("preconf.journal");
 
     let entry =
-        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0 };
+        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised };
     let mut line = serde_json::to_vec(&entry).expect("encode JournalEntry");
     line.push(b'\n');
     std::fs::write(&journal_file, &line).expect("write journal file");
@@ -157,6 +158,7 @@ async fn journal_replay_survives_a_lowered_per_tx_gas_cap() {
         tx_rlp: raw_tx.clone(),
         block_height: 1,
         committed_at_ms: 0,
+        kind: ClaimKind::Promised,
     }]);
 
     // Allowlisted *and* over the cap: the tx would be classified `Eligible` on a
@@ -254,6 +256,7 @@ async fn a_resubmit_cannot_disturb_a_replaying_commitment() {
         tx_rlp: raw_tx.clone(),
         block_height: 1,
         committed_at_ms: 0,
+        kind: ClaimKind::Promised,
     }]);
 
     let cfg = PreconfCfgBuilder::new()
@@ -345,9 +348,9 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
     let hash2 = keccak256(&tx2);
 
     let entries = [
-        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash1, tx_rlp: tx1.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash2, tx_rlp: tx2.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry { hash: hash1, tx_rlp: tx1.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry { hash: hash2, tx_rlp: tx2.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 
@@ -444,9 +447,9 @@ async fn journal_replay_out_of_nonce_order_still_lands_every_commitment() {
 
     // Reversed: the highest nonce is the first line in the file.
     let entries = [
-        JournalEntry { hash: hash2, tx_rlp: tx2.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash1, tx_rlp: tx1.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash2, tx_rlp: tx2.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry { hash: hash1, tx_rlp: tx1.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 
@@ -535,8 +538,8 @@ async fn journal_replay_across_multiple_senders() {
     let hash_b = keccak256(&tx_b);
 
     let entries = [
-        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 

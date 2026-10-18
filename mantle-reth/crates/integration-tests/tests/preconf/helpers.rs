@@ -1335,3 +1335,49 @@ macro_rules! launch_flashblocks_node {
         }
     };
 }
+
+/// What the preconf call may answer once the race is over, whichever arm won.
+///
+/// Which arm lands the transaction is a race, so the *status* is not fixed.
+/// What each status means is: [`PreconfStatus`] defines `Timeout` as "tx NOT
+/// on chain" and `Success` as an apply that happened. Both are checkable
+/// against `sealed` without knowing who won, and that is what this asserts.
+///
+/// It also joins the task rather than dropping it: a panic inside the spawned
+/// RPC call used to pass silently.
+pub fn assert_preconf_answer_matches_the_block(
+    joined: Result<
+        Result<PreconfTxEvent, jsonrpsee::core::ClientError>,
+        tokio::task::JoinError,
+    >,
+    hash: B256,
+    sealed: &[B256],
+) {
+    use mantle_reth_rpc_ext::PreconfStatus;
+
+    let landed = sealed.contains(&hash);
+    let result = joined.expect("the preconf RPC task must not panic");
+
+    let Ok(event) = result else {
+        // A refusal is a legitimate outcome of losing the race; the call
+        // simply never produced an event. Nothing to cross-check.
+        return;
+    };
+
+    assert_eq!(event.tx_hash, hash, "an event must be about the transaction that was submitted");
+    match event.status {
+        PreconfStatus::Success | PreconfStatus::Failed => assert!(
+            landed,
+            "{:?} means the transaction executed, so it must be in the block; sealed = {sealed:?}",
+            event.status,
+        ),
+        PreconfStatus::Timeout => assert!(
+            !landed,
+            "`PreconfStatus::Timeout` is documented as `tx NOT on chain`, but this \
+             transaction is in the block; sealed = {sealed:?}",
+        ),
+        PreconfStatus::Waiting => {
+            panic!("`PreconfStatus::Waiting` is documented as never sent by this node")
+        }
+    }
+}

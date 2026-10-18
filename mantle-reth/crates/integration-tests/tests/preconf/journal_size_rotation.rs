@@ -21,6 +21,7 @@ use crate::{canonicalize_payload, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+use mantle_reth_preconf::ClaimKind;
 use mantle_reth_preconf::JournalEntry;
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_chainspec::EthChainSpec;
@@ -85,6 +86,7 @@ async fn size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet() {
         tx_rlp: tx0.clone(),
         block_height: 1,
         committed_at_ms: 1_700_000_000_000,
+        kind: ClaimKind::Promised,
     };
     let line_len = serde_json::to_vec(&sample).expect("encode sample").len() as u64 + 1;
     let cap = line_len + line_len / 2;

@@ -24,12 +24,15 @@
 //! has not started and an ordinary transaction may take the nonce. What it
 //! pins is that the client is told so.
 
-use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf, wait_fifo_entry};
-use crate::{canonize_built, launch_preconf_node};
+use super::helpers::{
+    PreconfCfgBuilder, mantle_test_chain_spec, send_preconf, wait_fifo_entry, wait_latest_nonce,
+};
+use crate::{canonize_built, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
+use mantle_reth_preconf::ClaimKind;
 use mantle_reth_preconf::JournalEntry;
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_chainspec::EthChainSpec;
@@ -154,8 +157,8 @@ async fn a_pool_tx_cannot_take_the_nonce_of_a_deferred_commitment() {
     let hash_b = keccak256(&tx_b);
 
     let entries = [
-        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 
@@ -301,4 +304,80 @@ async fn a_queued_commitment_that_loses_its_nonce_is_answered_with_an_error() {
     }
 
     filler_task.abort();
+}
+
+/// A submission still queued when the chain spends its nonce is answered with
+/// `NonceSuperseded`, by name, so the client can tell "re-sign with the next
+/// nonce" apart from "try again".
+///
+/// The nonce is taken by a transaction forced into a derivation block. A
+/// derivation build dispatches nothing from the queue, so the submission is
+/// still waiting when that block becomes canonical; the next ordinary build's
+/// prologue syncs the queue to the new head and finds the entry behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_submission_overtaken_by_the_chain_is_told_its_nonce_was_superseded() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_id = mantle_test_chain_spec().chain().id();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(Wallet::default().with_chain_id(chain_id).inner.address())
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(10_000)
+        .build();
+    let (mut node, http, wallet, _chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
+    let sender = wallet.inner.address();
+
+    // Queued while no build is running, so it parks as `Waiting`.
+    let queued = signed_call(wallet.inner.clone(), chain_id, 0, Vec::new(), 90_000).await;
+    let queued_hash = keccak256(&queued);
+    let http_q = http.clone();
+    let queued_task = tokio::spawn(async move { send_preconf(&http_q, queued).await });
+    wait_fifo_entry(&fifo, sender, 0).await;
+
+    // The chain spends nonce 0 on a different transaction, delivered the way
+    // derived blocks are: forced in, with the pool and the queue both off.
+    let rival = signed_call(wallet.inner.clone(), chain_id, 0, Vec::new(), 100_000).await;
+    let rival_hash = keccak256(&rival);
+    let mut attrs = node.payload.next_attributes();
+    attrs.0.no_tx_pool = Some(true);
+    attrs.0.transactions = Some(vec![rival]);
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let payload1 = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+    let sealed1: Vec<B256> =
+        payload1.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(sealed1.contains(&rival_hash), "premise: the rival lands; sealed={sealed1:?}");
+    assert!(!sealed1.contains(&queued_hash), "premise: a derivation build dispatches nothing");
+    canonize_built!(node, payload1);
+    wait_latest_nonce(&http, sender, 1).await;
+
+    // The next ordinary build looks at the queue against the new head.
+    build_block!(node, sealed2, _payload2);
+    assert!(!sealed2.contains(&queued_hash), "a superseded submission cannot land");
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), queued_task)
+        .await
+        .expect("the preconf call has to answer once the build has synced the queue")
+        .expect("the rpc task must not panic");
+    match answer {
+        Err(jsonrpsee::core::ClientError::Call(e)) => assert_eq!(
+            e.message(),
+            "sender nonce has advanced past 0; this transaction can no longer be applied",
+        ),
+        other => panic!("expected the NonceSuperseded refusal, got {other:?}"),
+    }
 }

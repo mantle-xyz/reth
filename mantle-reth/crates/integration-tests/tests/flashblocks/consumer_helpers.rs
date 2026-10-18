@@ -137,9 +137,13 @@ impl FlashblockBuilder {
 
 /// Launches a node and returns a harness over a processor bound to its provider.
 ///
+/// Named for the side it stands up: `crate::launch_flashblocks_node!` (from
+/// `preconf/helpers.rs`) launches a node that slices blocks; this one launches
+/// a node that consumes hand-built slices.
+///
 /// The node context is returned so the caller keeps it alive for the test's
 /// duration; dropping it tears the provider down.
-macro_rules! launch_flashblocks_node {
+macro_rules! launch_flashblocks_consumer {
     ($max_trailing_depth:expr, $max_leading_depth:expr) => {{
         let (node, _http, _wallet, _chain_id) = mantle_reth_integration_tests::launch_mantle_node!(
             crate::consumer_helpers::flashblocks_test_chain_spec(),
@@ -159,7 +163,7 @@ macro_rules! launch_flashblocks_node {
     }};
 }
 
-pub(crate) use launch_flashblocks_node;
+pub(crate) use launch_flashblocks_consumer;
 
 /// Queries a block by hash as the consumer would see it: canonical, with its
 /// transactions recovered.

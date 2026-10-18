@@ -19,7 +19,7 @@ use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 use reth_provider::BlockNumReader;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use crate::helpers::PreconfCfgBuilder;
+use crate::helpers::{PreconfCfgBuilder, mantle_chain_spec_with_predeploys_for, send_preconf};
 
 type Subscriber = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -53,9 +53,18 @@ async fn signed_transfer(wallet: &Wallet, chain_id: u64, nonce: u64) -> Bytes {
 }
 
 async fn subscribe(addr: std::net::SocketAddr) -> Subscriber {
-    let (stream, _) =
-        connect_async(format!("ws://{addr}")).await.expect("subscriber connects to the publisher");
+    subscribe_at(format!("ws://{addr}")).await
+}
+
+/// [`subscribe`] with the full URL, so a resume position can be carried.
+async fn subscribe_at(url: String) -> Subscriber {
+    let (stream, _) = connect_async(url).await.expect("subscriber connects to the publisher");
     stream
+}
+
+/// Where a slice sits in the stream.
+fn position_of(slice: &MantleFlashblockPayload) -> (u64, u64) {
+    (slice.metadata.block_number, slice.index)
 }
 
 /// Drain whatever the publisher has sent within `window`.
@@ -481,6 +490,16 @@ async fn a_derivation_build_publishes_nothing() {
         "a derivation build published {} slices; it must publish none",
         slices.len(),
     );
+
+    // Same node, same subscriber, an ordinary build: this one has to publish,
+    // or the silence above says nothing about derivation.
+    let _payload = build_one_block!(node, Duration::from_millis(600));
+    let slices = drain(&mut subscriber, Duration::from_millis(500)).await;
+    assert!(
+        !slices.is_empty(),
+        "an ordinary build on the same node published nothing, so the derivation build's \
+         silence was never evidence",
+    );
 }
 
 /// The opening slice goes out before any pool or preconf transaction has been
@@ -707,5 +726,208 @@ async fn a_lead_keeps_a_mid_build_transaction_out_of_the_block() {
     assert!(
         !a_mid_build_transaction_lands(10).await,
         "the snapshot that would carry it is still waiting out its lead"
+    );
+}
+
+/// The closing slice reports the header the chain seals: `receipts_root` and
+/// `logs_bloom` are the sealed block's, not a running estimate.
+///
+/// A consumer rebuilds the pending header from these fields, so the closing
+/// slice is the one place it can learn the block's real roots. `state_root`
+/// and `block_hash` are left out on purpose: the slice is sealed over an empty
+/// bundle state, so neither can match, by design.
+///
+/// The pool transaction is a WETH `deposit()` so the block has a log, and
+/// `logs_bloom` is a value rather than zero agreeing with zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_closing_slice_carries_the_sealed_blocks_receipts_root_and_logs_bloom() {
+    const WETH9: Address = address!("4200000000000000000000000000000000000006");
+    const DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
+
+    let sender = Wallet::default().inner.address();
+    let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
+    let (mut node, _http, wallet, chain_id, fb_addr) = crate::launch_flashblocks_node!(
+        cfg,
+        mantle_chain_spec_with_predeploys_for(5000),
+        flashblocks_cfg()
+    )
+    .await;
+    let mut subscriber = subscribe(fb_addr).await;
+
+    let request = TransactionRequest {
+        chain_id: Some(chain_id),
+        nonce: Some(0),
+        to: Some(TxKind::Call(WETH9)),
+        gas: Some(100_000),
+        max_fee_per_gas: Some(20e9 as u128),
+        max_priority_fee_per_gas: Some(20e9 as u128),
+        value: Some(alloy_primitives::U256::from(1_000u64)),
+        input: TransactionInput::new(DEPOSIT_SELECTOR.into()),
+        ..Default::default()
+    };
+    let raw: Bytes =
+        TransactionTestContext::sign_tx(wallet.inner.clone(), request).await.encoded_2718().into();
+    node.rpc.inject_tx(raw).await.expect("inject deposit");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = build_one_block!(node, Duration::from_millis(600));
+    let slices = drain(&mut subscriber, Duration::from_millis(500)).await;
+    let closing = slices.last().expect("the resolved build publishes a closing slice");
+
+    let header = payload.block().header();
+    assert!(!header.logs_bloom.is_zero(), "the deposit's log must be in the block");
+    assert_eq!(
+        closing.diff.receipts_root, header.receipts_root,
+        "the closing slice's receipts root must be the sealed block's",
+    );
+    assert_eq!(
+        closing.diff.logs_bloom, header.logs_bloom,
+        "the closing slice's logs bloom must be the sealed block's",
+    );
+}
+
+/// A preconfirmation made while the block is open reaches subscribers in a
+/// later slice of that block — its receipt went out, so the stream has to
+/// show it too, not just the sealed block.
+///
+/// Whether a transaction is in a slice is decided separately from whether it
+/// is in the block: the executor seals what it ran, the slice carries what was
+/// recorded for publishing. This pins the second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preconf_sent_mid_build_appears_in_a_later_slice() {
+    let sender = Wallet::default().inner.address();
+    let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
+    let (mut node, http, wallet, chain_id, fb_addr) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+    let mut subscriber = subscribe(fb_addr).await;
+
+    // Open the block and let the opening slice go out before the
+    // preconfirmation arrives, so it cannot be in index 0.
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let event = send_preconf(&http, raw.clone()).await.expect("the commitment is accepted");
+    assert_eq!(event.status, mantle_reth_rpc_ext::PreconfStatus::Success, "{:?}", event.reason);
+
+    // A few more ticks, then seal.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+    let slices = drain(&mut subscriber, Duration::from_millis(500)).await;
+
+    let sealed: Vec<Bytes> =
+        payload.block().body().transactions().map(|tx| Bytes::from(tx.encoded_2718())).collect();
+    assert!(sealed.contains(&raw), "premise: the preconfirmation landed in the sealed block");
+
+    let carrying: Vec<u64> = slices
+        .iter()
+        .filter(|slice| slice.diff.transactions.contains(&raw))
+        .map(|slice| slice.index)
+        .collect();
+    assert_eq!(
+        carrying.len(),
+        1,
+        "the preconfirmation must be in exactly one slice; it is in {carrying:?} of {} slices",
+        slices.len(),
+    );
+    assert!(carrying[0] > 0, "it arrived after the opening slice, so it cannot be in it");
+}
+
+/// A subscriber reconnecting with a position gets everything after it, in
+/// order, and nothing at or before it.
+///
+/// The stub-server tests pin what the consumer asks for; this is the producer
+/// honouring the ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_request_is_served_from_the_slice_after_the_named_one() {
+    let sender = Wallet::default().inner.address();
+    let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
+    let (mut node, _http, wallet, chain_id, fb_addr) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+    let mut live = subscribe(fb_addr).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    node.rpc.inject_tx(raw).await.expect("inject transfer");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _payload = build_one_block!(node, Duration::from_millis(600));
+    let published: Vec<(u64, u64)> =
+        drain(&mut live, Duration::from_millis(500)).await.iter().map(position_of).collect();
+    assert!(published.len() >= 3, "premise: enough slices to resume from the middle");
+
+    let middle = published.len() / 2;
+    let (block_number, index) = published[middle];
+    let mut resumed = subscribe_at(format!(
+        "ws://{fb_addr}/?block_number={block_number}&flashblock_index={index}"
+    ))
+    .await;
+    let replayed: Vec<(u64, u64)> =
+        drain(&mut resumed, Duration::from_millis(500)).await.iter().map(position_of).collect();
+
+    assert_eq!(
+        replayed,
+        published[middle + 1..],
+        "replay starts right after the named slice and runs to the end of what was published",
+    );
+}
+
+/// A position the archive no longer holds is answered with the whole window
+/// the archive does hold: the cost of falling that far behind is the slices
+/// that aged out, and nothing newer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_from_before_the_archive_replays_the_whole_window() {
+    const WINDOW: usize = 4;
+
+    let sender = Wallet::default().inner.address();
+    let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
+    let fb_cfg = FlashblockProducerConfig {
+        ring_capacity: WINDOW,
+        broadcast_capacity: WINDOW,
+        ..flashblocks_cfg()
+    };
+    let (mut node, _http, wallet, chain_id, fb_addr) =
+        crate::launch_flashblocks_node!(cfg, fb_cfg).await;
+    let mut live = subscribe(fb_addr).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    node.rpc.inject_tx(raw).await.expect("inject transfer");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _payload = build_one_block!(node, Duration::from_millis(800));
+    let published: Vec<(u64, u64)> =
+        drain(&mut live, Duration::from_millis(500)).await.iter().map(position_of).collect();
+    assert!(
+        published.len() > WINDOW,
+        "premise: the block produced more slices than the archive holds; got {}",
+        published.len(),
+    );
+
+    // The opening slice has aged out of the archive by now.
+    let (block_number, index) = published[0];
+    let mut resumed = subscribe_at(format!(
+        "ws://{fb_addr}/?block_number={block_number}&flashblock_index={index}"
+    ))
+    .await;
+    let replayed: Vec<(u64, u64)> =
+        drain(&mut resumed, Duration::from_millis(500)).await.iter().map(position_of).collect();
+
+    assert_eq!(
+        replayed,
+        published[published.len() - WINDOW..],
+        "everything the archive still holds is replayed, oldest first",
     );
 }

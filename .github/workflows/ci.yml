@@ -52,7 +52,10 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Measured 50–59 min on a Swatinem cache miss (eight runs, 2026-10-15/16),
+    # almost all of it compilation; see the `test-ci` recipe in `justfile`.
+    # The old 60 left single-digit minutes of headroom.
+    timeout-minutes: 90
     # Tests compile a lot of code; do not fail the build on warnings here
     # (warnings are already gated by the clippy job above).
     env:
@@ -71,4 +74,30 @@ jobs:
         with:
           tool: nextest
       - run: just test-ci
+      # A test that passed only on a retry is a `FLAKY` line somewhere in the
+      # thousands above. This puts it on the run's summary page as a warning;
+      # it does not fail the job.
+      - name: Annotate retried passes
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          report = pathlib.Path("target/nextest/default/junit.xml")
+          if not report.exists():
+              raise SystemExit
+          for case in ET.parse(report).getroot().iter("testcase"):
+              if case.find("flakyFailure") is not None or case.find("flakyError") is not None:
+                  print(
+                      f"::warning title=flaky test::{case.get('classname')} "
+                      f"{case.get('name')} passed only after a retry"
+                  )
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nextest-junit
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore
       - run: sccache --show-stats

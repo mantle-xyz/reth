@@ -33,15 +33,16 @@
 //!
 //! Adjacent coverage worth knowing about:
 //!
-//! - `nonce_too_low` (stale nonce, `tx.nonce < on_chain_nonce`) needs a two-slot setup (commit +
-//!   canon first); not covered anywhere yet.
+//! - A stale nonce (`tx.nonce < on_chain_nonce`) is the validator's refusal, relayed by admission:
+//!   `a_stale_nonce_is_refused_at_admission` below. A nonce the chain takes *after* the submission
+//!   was queued is `NonceSuperseded`, covered in `pool_tx_on_committed_nonce.rs`.
 //! - Base-fee routing: `timeout::basefee_orphan_returns_timeout_and_clears_responder` pins today's
 //!   behaviour (parked, then `Ok(Timeout)`); `basefee_threshold.rs` holds the synchronous refusal
 //!   that replaces it.
 //! - The same-sender, both-channels nonce interaction is in `dual_channel_nonce.rs`.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf};
-use crate::launch_preconf_node;
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_latest_nonce};
+use crate::{canonize_built, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -217,5 +218,70 @@ async fn per_tx_gas_ceiling_rejected_at_rpc_not_by_the_pool() {
     assert!(
         elapsed < std::time::Duration::from_millis(500),
         "per-tx cap rejection must fail fast; took {elapsed:?} — did the handler park a responder?",
+    );
+}
+
+/// A nonce the chain has already spent is refused at admission, synchronously,
+/// with the validator's own reason and nothing queued.
+///
+/// Admission runs the shared validator over canonical state, so this is the
+/// one nonce rule it does not decide for itself. The sender's nonce is
+/// advanced by landing an ordinary transaction first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_nonce_is_refused_at_admission() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let sender = Wallet::default().with_chain_id(1).inner.address();
+    let cfg = PreconfCfgBuilder::new().whitelist_from(sender).whitelist_to(recipient).build();
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
+
+    // Spend nonce 0 through the pool and make the block canonical.
+    let spent = signed_transfer(chain_id, &wallet, 0, 21_000).await;
+    node.rpc.inject_tx(spent).await.expect("the pool takes the transfer");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+    canonize_built!(node, payload);
+    wait_latest_nonce(&http, sender, 1).await;
+
+    // A different transaction signed for the nonce that is now gone.
+    let stale = signed_transfer(chain_id, &wallet, 0, 30_000).await;
+    let stale_hash = alloy_primitives::keccak256(&stale);
+    let start = std::time::Instant::now();
+    let err = send_preconf(&http, stale).await.expect_err("a spent nonce cannot be preconfirmed");
+    let elapsed = start.elapsed();
+
+    match err {
+        ClientError::Call(ref e) => assert_eq!(
+            e.message(),
+            "pool rejected: transaction nonce is not consistent: next nonce 1, tx nonce 0",
+        ),
+        other => panic!("expected Call error, got {other:?}"),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "refused synchronously; took {elapsed:?}"
+    );
+    // The queue does hold `(sender, 0)`: the landed transfer's own record. The
+    // refused submission must not have joined it.
+    assert!(
+        fifo.find_by_hash(&stale_hash).await.is_none(),
+        "a refused submission must leave nothing in the queue",
     );
 }

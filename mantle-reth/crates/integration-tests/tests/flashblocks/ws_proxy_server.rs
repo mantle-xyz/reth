@@ -34,7 +34,10 @@ use tokio::{
     },
     task::JoinHandle,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Error as WsError};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Error as WsError, client::IntoClientRequest, http::HeaderValue},
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::consumer_helpers::base_slice;
@@ -112,6 +115,11 @@ struct Config {
     /// `false`, as the binary does, so a test that needs filtering has to say
     /// so and a test that does not exercises the shipped configuration.
     enable_filters: bool,
+    /// Peers whose `X-Forwarded-For` is believed. Empty, as the binary
+    /// defaults, so a test that wants the header honoured has to say so.
+    trusted_proxy_cidrs: Vec<&'static str>,
+    /// How long one frame may take to reach a client before it is dropped.
+    send_timeout: Duration,
 }
 
 impl Default for Config {
@@ -123,6 +131,8 @@ impl Default for Config {
             client_ping_enabled: false,
             client_pong_timeout_ms: 30_000,
             enable_filters: false,
+            trusted_proxy_cidrs: Vec::new(),
+            send_timeout: Duration::from_millis(1_000),
         }
     }
 }
@@ -187,11 +197,18 @@ impl Harness {
                 false,
                 config.client_ping_enabled,
                 config.client_pong_timeout_ms,
-                Duration::from_millis(1_000),
+                config.send_timeout,
             ),
             rate_limiter,
             config.authentication,
-            TrustedProxyConfig::new("X-Forwarded-For".to_owned(), Vec::new()),
+            TrustedProxyConfig::new(
+                "X-Forwarded-For".to_owned(),
+                config
+                    .trusted_proxy_cidrs
+                    .iter()
+                    .map(|cidr| TrustedProxyConfig::parse_cidr(cidr).expect("a valid CIDR"))
+                    .collect(),
+            ),
             false,
             config.enable_filters,
         );
@@ -225,7 +242,25 @@ impl Harness {
 
     /// Connects a recording client, or `None` if the upgrade was rejected.
     async fn connect_client(&self, path: &str) -> Option<Client> {
-        let (stream, _) = connect_async(format!("ws://{}/{path}", self.addr)).await.ok()?;
+        self.connect_client_forwarded_as(path, None).await
+    }
+
+    /// [`Self::connect_client`] with an `X-Forwarded-For` naming `forwarded`,
+    /// as a proxy in front of this one would send.
+    async fn connect_client_forwarded_as(
+        &self,
+        path: &str,
+        forwarded: Option<&str>,
+    ) -> Option<Client> {
+        let mut request =
+            format!("ws://{}/{path}", self.addr).into_client_request().expect("client request");
+        if let Some(ip) = forwarded {
+            request.headers_mut().insert(
+                "X-Forwarded-For",
+                HeaderValue::from_str(ip).expect("a header-safe address"),
+            );
+        }
+        let (stream, _) = connect_async(request).await.ok()?;
         let (tx, frames) = unbounded_channel();
 
         let task = tokio::spawn(async move {
@@ -280,6 +315,11 @@ impl Harness {
     /// Broadcasts a ping, as the binary's client-ping task does.
     fn broadcast_ping(&self) {
         self.sender.send(Message::Ping(Vec::new().into())).expect("a receiver is held open");
+    }
+
+    /// Broadcasts a text frame of `bytes` bytes.
+    fn broadcast_bulk(&self, bytes: usize) {
+        self.sender.send(Message::Text("x".repeat(bytes).into())).expect("a receiver is held open");
     }
 }
 
@@ -515,4 +555,90 @@ async fn a_filtered_client_is_still_pinged_and_survives() {
         filtered.frames.try_recv().is_err(),
         "the filter must still suppress data frames that match nothing",
     );
+}
+
+// ------------------------------------------------------------- client address
+
+/// Behind a trusted proxy, the client is whoever `X-Forwarded-For` names, and
+/// that is what the per-IP limit counts.
+///
+/// Every connection here comes from the same peer, so with the header ignored
+/// a limit of one would refuse the second client; with it honoured the second
+/// client is a different address and the third, repeating the first, is the
+/// one refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trusted_proxys_forwarded_address_is_what_the_per_ip_limit_counts() {
+    let harness = Harness::start(Config {
+        instance_limit: 10,
+        per_ip_limit: 1,
+        trusted_proxy_cidrs: vec!["127.0.0.0/8"],
+        ..Config::default()
+    })
+    .await;
+
+    let _one = harness
+        .connect_client_forwarded_as("ws", Some("10.0.0.1"))
+        .await
+        .expect("the first forwarded address");
+    let _two = harness
+        .connect_client_forwarded_as("ws", Some("10.0.0.2"))
+        .await
+        .expect("a second forwarded address is a second client, not the same peer again");
+    harness.await_clients(2).await;
+
+    assert!(
+        harness.connect_client_forwarded_as("ws", Some("10.0.0.1")).await.is_none(),
+        "the first forwarded address is at its limit",
+    );
+}
+
+/// A peer outside the trusted CIDRs cannot rename itself: its `X-Forwarded-For`
+/// is ignored and the per-IP limit counts the peer.
+///
+/// The shipped default trusts nobody, so this is the configuration a proxy
+/// exposed directly runs with — and the one where believing the header would
+/// let any client dodge the limit by making up an address.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untrusted_peers_forwarded_address_is_ignored() {
+    let harness =
+        Harness::start(Config { instance_limit: 10, per_ip_limit: 1, ..Config::default() }).await;
+
+    let _one = harness
+        .connect_client_forwarded_as("ws", Some("10.0.0.1"))
+        .await
+        .expect("the peer's first connection");
+    harness.await_clients(1).await;
+
+    assert!(
+        harness.connect_client_forwarded_as("ws", Some("10.0.0.2")).await.is_none(),
+        "a made-up forwarded address must not buy the peer a second slot",
+    );
+}
+
+// ------------------------------------------------------------- slow client
+
+/// A client that stops reading is dropped once a frame cannot be delivered
+/// within the send timeout.
+///
+/// Pings are off, as the binary ships, so this is the only thing that frees
+/// a slot held by a dead or wedged client. The frames are large so the
+/// socket buffers fill in a few sends; one frame per timeout keeps the
+/// broadcast channel from lagging, which would end the client for a
+/// different reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_stops_reading_is_dropped_on_the_send_timeout() {
+    let send_timeout = Duration::from_millis(200);
+    let harness = Harness::start(Config { send_timeout, ..Config::default() }).await;
+
+    let _deaf = harness.connect_deaf_client("ws").await;
+    harness.await_clients(1).await;
+
+    for _ in 0..60 {
+        harness.broadcast_bulk(1 << 20);
+        tokio::time::sleep(send_timeout + Duration::from_millis(50)).await;
+        if harness.client_count() == 0 {
+            return;
+        }
+    }
+    panic!("the client that stopped reading was never dropped");
 }

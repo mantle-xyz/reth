@@ -47,8 +47,28 @@ equivalent uppercase environment variable.
 mantle-ws-proxy \
   --upstream-ws ws://mantle-sequencer:1111 \
   --listen-addr 0.0.0.0:8545 \
-  --metrics-addr 0.0.0.0:9000
+  --metrics-addr 0.0.0.0:9000 \
+  --api-keys 'indexer:<key>'
 ```
+
+`--api-keys` is not optional furniture: **the proxy refuses to start without
+it**, unless `--public-access-enabled` is passed to say the network in front
+of it is the access control. What it serves is the preconfirmation stream —
+transactions that have been executed and not yet put on chain — and that is
+not something a process should end up publishing by omission.
+
+**There is no TLS anywhere in this binary.** `tokio-tungstenite` and axum's
+`ws` are both pulled in with default features, so the upstream connection and
+the downstream listener are plaintext `ws://`, and an API key travels in the
+URL path in the clear. The network has to be the trust boundary; no
+configuration makes it otherwise. The proxy says so in a startup warning.
+
+**Run it behind an ingress or load balancer, and let that layer bound the
+connection before the upgrade.** The proxy's own limits — `--instance-connection-limit`
+and `--per-ip-connection-limit` — are applied once a request has been parsed,
+so a connection that never finishes sending its headers is not counted by
+either. Header read timeouts and a cap on open connections are the front
+layer's job; the proxy does not implement them.
 
 ## Routing depends on whether keys are configured
 
@@ -58,7 +78,7 @@ was started with.
 
 | Started with | Routes served |
 |---|---|
-| no `--api-keys` | `/ws` only |
+| no `--api-keys`, with `--public-access-enabled` | `/ws` only |
 | `--api-keys` | `/ws/{api_key}` and `/ws/{api_key}/filter` only |
 | `--api-keys --public-access-enabled` | all three |
 
@@ -121,14 +141,10 @@ subscriber's address and topic filters.
 ### ⚠️ Filters are off by default, because this upstream cannot feed them
 
 Both filter kinds read `metadata.receipts` and `metadata.new_account_balances`,
-which the Mantle producer leaves empty on every slice. Topic filters would
-therefore match nothing at all — topics come only from receipt logs. Address
-filters would fall back to substring-matching the raw transaction hex, which
-answers differently depending on how the address was written: a `0x`-prefixed
-address, the form every tool emits, matches **nothing**, because a transaction
-hex carries one `0x` at the front and embedded addresses are bare. A bare
-40-digit address over-matches instead, hitting anything that mentions it in
-calldata.
+which the Mantle producer leaves empty on every slice. A topic filter therefore
+matches nothing at all, and an address filter answers differently depending on
+how the address was written — neither usefully. The derivation lives next to
+the code, in the `FilterType` docs in `src/filter.rs`.
 
 Rather than accept a filter and silently return an empty stream,
 `/ws/{api_key}/filter` refuses a subscription carrying filter parameters with

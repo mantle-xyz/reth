@@ -939,11 +939,19 @@ where
 }
 
 /// Preamble that walks the fifo snapshot in insertion order and returns the
-/// carryover hashes to (re)dispatch for this build, in order:
+/// hashes to (re)dispatch for this build.
 ///
-/// - **`Waiting`** — journal-restored or dead-window RPC pushes whose broadcast never reached this
-///   job's subscriber. Returned with the original `source` intact so genuinely stale `Rpc` entries
-///   get timed out by the deadline gate.
+/// Despite the name, this is not only about leftovers: it takes **every**
+/// `Waiting` entry in the snapshot, including one an RPC push queued a moment
+/// ago. That is the structural guarantee that a queued preconfirmation is not
+/// overtaken by the pool arm — the caller runs this before any arm of the
+/// loop.
+///
+/// The two statuses it can see:
+///
+/// - **`Waiting`** — anything not yet applied: journal-restored, carried over from a discarded
+///   job, or freshly pushed. Returned with the original `source` intact so genuinely stale `Rpc`
+///   entries get timed out by the deadline gate.
 /// - **`Success`** — stale in-flight from a discarded prior job. A canon'd entry would have been
 ///   removed by the immediately-preceding [`sync_fifo_forward_to_head`], so any Success reaching
 ///   here is an un-canon'd in-flight (client already got a receipt; must land).
@@ -952,12 +960,12 @@ where
 ///
 /// There is no third case: a commitment that ended is not in the queue to be carried over.
 ///
-/// The caller dispatches each hash through [`admit_and_dispatch`] **before**
-/// draining the broadcast / pool arms, so carryover lands ahead of any
-/// concurrently-queued fresh RPC pushes.
-/// `apply_one_preconf`'s dedup gate prevents double-apply if a carryover hash is
-/// also observed via broadcast later. Returning a plan (rather than applying
-/// inline) keeps this helper free of EVM/builder types and unit-testable.
+/// What the ordering actually buys is precedence over pushes that arrive
+/// **after** this snapshot — those reach the build through the loop's arms.
+/// A hash in the snapshot whose broadcast also lands is handled twice over;
+/// `apply_one_preconf`'s dedup gate is what makes that harmless. Returning a
+/// plan (rather than applying inline) keeps this helper free of EVM/builder
+/// types and unit-testable.
 async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
     use crate::types::PreconfStatus;
     let mut carryover: Vec<TxEntryView> = Vec::new();
@@ -972,6 +980,19 @@ async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
         }
     }
     ordered_for_dispatch(&carryover)
+}
+
+/// How many slices were published for a block the seal then failed to produce.
+///
+/// Zero on a healthy chain. Non-zero says subscribers were shown a prefix of
+/// a block that does not exist — recoverable (the rebuild replaces their
+/// overlay) but worth knowing the rate of, since nothing downstream
+/// distinguishes it from an ordinary rebuild.
+fn count_slices_outliving_their_block(slices: Option<&SliceState>) {
+    let published = slices.map_or(0, SliceState::published_count);
+    if published > 0 {
+        metrics::counter!("flashblocks.slices_outliving_their_block_total").increment(published);
+    }
 }
 
 /// Order carried-over commitments: each sender's by nonce, senders in the order
@@ -1071,13 +1092,16 @@ where
     // above cannot see it, and neither can the pool — nothing on its admission
     // path consults the slot index.
     //
-    // Only a reorg makes it reachable: while the chain holds the claim its
-    // nonce is spent, so anything else for it is nonce-too-low anyway.
+    // Reachable while a claim is still owed but its nonce is not yet spent on
+    // chain: a claim deferred for block capacity, or a reorg notification that
+    // has not reached the fifo yet.
     //
-    // The last line, not the only one — the carryover preamble usually takes
-    // the nonce first. This covers the builds where it does not: a claim
-    // deferred for block capacity, or a reorg notification that has not
-    // reached the fifo yet.
+    // Claims are all this gate checks, and all it needs to. A queued entry
+    // that has not applied holds no claim and needs none: the carryover
+    // preamble dispatches every `Waiting` entry before this arm runs. What is
+    // left is a preconf admitted mid-build against a pool transaction already
+    // in flight on its nonce, and execution order settles that one on purpose
+    // — a preconfirmation does not preempt an ordinary transaction.
     //
     // Same rule as `Commitments::slot_conflict`: the slot's own transaction
     // resubmitted is not a conflict.
@@ -1196,7 +1220,13 @@ where
         }
     };
     let tx_gas_used = gas_used.tx_gas_used();
-    pacer.settle(ticket, tx_gas_used);
+    // Settled against the **pre-refund** figure, for the same reason the block
+    // gas limit is: the pacer's budget stands in for the work a slice has to
+    // seal and serialise, and an SDM refund gives none of that work back. The
+    // canonical total can fall to zero while the EVM burnt a whole block, so
+    // settling with it would hand the budget back gas that was really spent
+    // and let the grid over-admit.
+    pacer.settle(ticket, evm_gas_used);
     // The pre-refund (EVM) total is the one the block gas limit is enforced
     // against: `is_tx_over_limits` reads `cumulative_evm_gas_used` and never
     // the canonical total, so advancing only the latter would leave the gas
@@ -1326,12 +1356,23 @@ where
             &output,
             // Empty, so post-Isthmus the slice header reports the *parent's*
             // `L2ToL1MessagePasser` root — wrong on any block containing a
-            // withdrawal. Passing the live bundle does not fix it (slicing
-            // never merges transitions, so ours is as empty as this one);
-            // getting the figure means assembling it from pending transitions.
+            // withdrawal. Passing the live bundle does not fix it: a bundle
+            // holds only what `merge_transitions` has folded in, and slicing
+            // never merges — `slice_state_invariants` pins why. Getting the
+            // figure means assembling it from the pending transitions for this
+            // one predeploy, without touching the bundle.
             //
-            // Left until a consumer is known to read the field. Everything else
-            // in the slice header is exact.
+            // Not left open any more: the figure is not worth having. A slice
+            // is a prefix, and this root only means something once the block
+            // is sealed — too early for an L1 proof, redundant against the
+            // transactions the slice already carries, and not to be believed
+            // without a replay that would compute it anyway. The consumer
+            // zeroes the field for that reason (`BlockAssembler`), which is
+            // also what keeps a stale-looking root off `eth_getBlockByNumber`.
+            //
+            // The wire value follows the same rule, and is zeroed where it is
+            // read out of the assembled header — see `block_invariants`.
+            // Everything else in the slice header is exact.
             &BundleState::default(),
             state_provider,
             B256::ZERO,
@@ -1377,7 +1418,14 @@ fn block_invariants<B: reth_primitives_traits::Block>(sealed: &SealedBlock<B>) -
             base_fee_per_gas: U256::from(header.base_fee_per_gas().unwrap_or_default()),
         },
         withdrawals: sealed.body().withdrawals().cloned().unwrap_or_default().into_inner(),
-        withdrawals_root: header.withdrawals_root().unwrap_or_default(),
+        // Not `header.withdrawals_root()`: the assembler derives that from the
+        // empty bundle above, so it is the *parent's* root — well-formed,
+        // stale on any block containing a withdrawal, and indistinguishable
+        // from a correct answer. A slice is a prefix of a block and this root
+        // only means something once the block is sealed, so the wire says so
+        // the same way `state_root` does. `EMPTY_ROOT_HASH` is `0x56e81f17…`,
+        // so zero is not a root any state can produce.
+        withdrawals_root: B256::ZERO,
     }
 }
 
@@ -1433,6 +1481,15 @@ struct SliceState {
 }
 
 impl SliceState {
+    /// Slices published for this block so far.
+    ///
+    /// `next_index` is the index the next slice will carry, and it only
+    /// advances on a successful publish — so it is also the count of the ones
+    /// that went out.
+    const fn published_count(&self) -> u64 {
+        self.next_index
+    }
+
     fn new(producer: &FlashblocksProducer, da_footprint_gas_scalar: Option<u16>) -> Self {
         // The predecessor of this block's first slice is the last slice of the
         // previous block, which a block-scoped builder does not know — so it
@@ -1567,6 +1624,10 @@ impl SliceState {
         // about it. A resolved one does: it is being sealed with exactly what
         // this slice describes.
         if cancel.reason() == Some(CancelReason::Abandoned) {
+            // Same event as `dropped_after_abandon_total` below, caught one
+            // step earlier — counted on the same series so that counter stops
+            // under-reporting the thing it is named for.
+            metrics::counter!("flashblocks.dropped_after_abandon_total").increment(1);
             debug!(
                 target: "mantle::preconf::flashblocks",
                 index = self.next_index,
@@ -1575,6 +1636,13 @@ impl SliceState {
             return;
         }
 
+        // Timed separately from `flashblocks.publish_interval_ms`, which
+        // measures wall-clock between slices and so folds seal, publish and
+        // idle waiting into one number. This is the only series that can tell
+        // "slices are slow because the chain is busy" apart from "slices are
+        // slow because sealing is quadratic" — `seal_block_so_far` copies the
+        // whole block twice per slice, so its cost grows with the prefix.
+        let seal_started = std::time::Instant::now();
         let sealed = match seal_block_so_far(
             ctx,
             builder,
@@ -1584,6 +1652,12 @@ impl SliceState {
         ) {
             Ok(sealed) => sealed,
             Err(err) => {
+                // The cursor does not advance here, so the next slice carries
+                // these transactions and the index chain stays unbroken: a
+                // subscriber sees *fewer* slices, not a gap. A block whose
+                // every tick fails therefore publishes nothing and still seals
+                // normally; the counter and the WARN are what says so.
+                metrics::counter!("flashblocks.slice_assembly_failed_total").increment(1);
                 warn!(
                     target: "mantle::preconf::flashblocks",
                     %err,
@@ -1593,6 +1667,8 @@ impl SliceState {
                 return;
             }
         };
+        metrics::histogram!("flashblocks.slice_seal_duration_ms")
+            .record(seal_started.elapsed().as_secs_f64() * 1000.0);
         let invariants = self.invariants.get_or_insert_with(|| block_invariants(&sealed));
         let payload = build_flashblock(
             invariants,
@@ -1626,6 +1702,9 @@ impl SliceState {
                 return;
             }
             Some(Err(err)) => {
+                // Invisible downstream for the same reason as the assembly
+                // failure above.
+                metrics::counter!("flashblocks.slice_serialize_failed_total").increment(1);
                 warn!(
                     target: "mantle::preconf::flashblocks",
                     %err,
@@ -2145,10 +2224,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // arm, and `replay_fifo_carryover` resets every `Success` entry before
         // it returns anything.
         if allow_preconf && !cancel.is_abandoned() {
-            // Dispatch carryover entries through the admission gate before the
-            // select! loop's arms, so they land ahead of any concurrently
-            // queued fresh RPC pushes. `admit_and_dispatch` builds the apply
-            // closure (which folds gas/DA into `info`) internally per hash.
+            // Dispatch every `Waiting` entry through the admission gate before
+            // the select! loop's arms, so a queued preconf is not overtaken by
+            // the pool arm. `admit_and_dispatch` builds the apply closure
+            // (which folds gas/DA into `info`) internally per hash.
             for hash in replay_fifo_carryover(&self.fifo).await {
                 if cancel.is_abandoned() {
                     break;
@@ -2309,7 +2388,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Explicit, because everything below is this build's own arithmetic
         // and the next one should not wait on it. Dropping also clears the
         // sealed-block hash, which the seal below re-establishes — see
-        // `BuildGuard`.
+        // `BuildGuard`. The generation is what lets that seal be refused if
+        // a later build has sealed in the meantime.
+        let build_generation = build_guard.generation();
         drop(build_guard);
 
         // ── Stage 4: SDM post-exec refund tx ───────────────────────────
@@ -2385,10 +2466,25 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             block,
             // EIP-7928 block access list; the preconf builder does not produce one.
             block_access_list: _,
-        } = builder.finish(state_provider_for_finish, None)?;
+        } = builder.finish(state_provider_for_finish, None).inspect_err(|_| {
+            count_slices_outliving_their_block(slices.as_ref());
+        })?;
 
+        // Slices for this block are already out — every one of them, not just
+        // the closing one: a slice is published as it is assembled, and the
+        // block does not exist until the line above. A failure here therefore
+        // leaves subscribers holding an overlay for a block that never sealed.
+        //
+        // Not fixed by moving the closing slice after `finish`: that would
+        // cover the last slice of N and nothing else, and it would mean
+        // rebuilding it from `BlockBuilderOutcome.block` because `finish`
+        // consumes the builder `seal_block_so_far` needs. Counted instead,
+        // because the consumer already recovers on its own — the rebuild
+        // arrives from index 0 with a `base`, which it reads as
+        // `RebuiltBlock` and uses to replace the overlay.
         info.block_size
             .validate_final_rlp_length(block.rlp_length())
+            .inspect_err(|_| count_slices_outliving_their_block(slices.as_ref()))
             .map_err(PayloadBuilderError::other)?;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
@@ -2397,7 +2493,19 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // without a single state read — which is the healthy path, and the
         // reason the sweep costs nothing on a chain that is working.
         // Not gated on the journal any more: the registry exists either way.
-        self.fifo.claims().note_sealed(sealed_block.hash());
+        //
+        // Gated on `allow_preconf`, because the claim is "this block carries
+        // what the queue staged" and a derivation build never staged any of
+        // it — it executes exactly what its attributes name. Claiming it
+        // anyway would let the next build's fast path drop entries this block
+        // never carried, and nothing brings those back: the pool's copy went
+        // at the slice boundary, and a block that never sealed leaves the
+        // reorg path nothing to re-inject from. Leaving the hash unset costs
+        // the next build one slow scan, which reads the chain and is the
+        // safe direction by construction.
+        if allow_preconf {
+            self.fifo.claims().note_sealed(sealed_block.hash(), build_generation);
+        }
         debug!(
             target: "mantle::preconf::payload_builder",
             id = %ctx.attributes().payload_id(),

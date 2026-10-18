@@ -59,7 +59,7 @@ async fn signed_transfer(wallet: &Wallet, chain_id: u64, nonce: u64) -> Bytes {
 /// producer's own chain.
 ///
 /// A macro rather than a function so the provider's bounds stay where the node
-/// builder already satisfies them, the same reason `launch_flashblocks_node!`
+/// builder already satisfies them, the same reason `launch_flashblocks_consumer!`
 /// is one. The subscriber is dropped on return: `start` spawns the connection
 /// and the delivery loop, which hold what they need.
 macro_rules! attach_consumer {

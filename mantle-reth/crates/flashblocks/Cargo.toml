@@ -67,6 +67,8 @@ url.workspace = true
 
 [dev-dependencies]
 alloy-op-hardforks.workspace = true
+# Only to prove `Metrics::init` actually pre-registers; see `metrics::tests`.
+metrics-exporter-prometheus = { workspace = true }
 mantle-reth-chainspec.workspace = true
 reth-optimism-chainspec.workspace = true
 rstest.workspace = true

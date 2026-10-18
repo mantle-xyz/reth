@@ -15,7 +15,8 @@ use jsonrpsee::{
 };
 
 use crate::consumer_helpers::{
-    FlashblockBuilder, LOGGER, l1_info_deposit, launch_flashblocks_node, signed_call, test_sender,
+    FlashblockBuilder, LOGGER, l1_info_deposit, launch_flashblocks_consumer, signed_call,
+    test_sender,
 };
 
 /// Value the overlay's user transaction moves into [`LOGGER`].
@@ -73,7 +74,7 @@ async fn next_item(subscription: &mut Subscription<serde_json::Value>) -> serde_
 /// `newFlashblocks` carries the whole pending block on every slice.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblocks_carries_the_pending_block() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let (client, _handle) = pubsub_client!(node, harness);
 
     let mut subscription: Subscription<serde_json::Value> = client
@@ -93,7 +94,7 @@ async fn new_flashblocks_carries_the_pending_block() {
 /// `pendingLogs` yields the latest slice's logs matching the filter.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_logs_yields_matching_logs() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let (client, _handle) = pubsub_client!(node, harness);
 
     let filter = serde_json::json!({ "address": format!("{LOGGER:#x}") });
@@ -112,7 +113,7 @@ async fn pending_logs_yields_matching_logs() {
 /// `newFlashblockTransactions` defaults to hashes only.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblock_transactions_defaults_to_hashes() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let (client, _handle) = pubsub_client!(node, harness);
 
     let mut subscription: Subscription<serde_json::Value> = client
@@ -130,7 +131,7 @@ async fn new_flashblock_transactions_defaults_to_hashes() {
 /// `newFlashblockTransactions` with `true` yields full transactions with logs.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblock_transactions_with_true_yields_full_objects() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let (client, _handle) = pubsub_client!(node, harness);
 
     let mut subscription: Subscription<serde_json::Value> = client
@@ -153,7 +154,7 @@ async fn new_flashblock_transactions_with_true_yields_full_objects() {
 /// `newFlashblockTransactions` with a log filter selects only matching transactions.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblock_transactions_with_a_filter_selects_matching_transactions() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let (client, _handle) = pubsub_client!(node, harness);
 
     let filter = serde_json::json!({ "address": format!("{LOGGER:#x}") });
@@ -178,7 +179,7 @@ async fn new_flashblock_transactions_with_a_filter_selects_matching_transactions
 /// Standard kinds are delegated to reth's own pubsub implementation.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standard_kind_is_delegated() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let (client, _handle) = pubsub_client!(node, harness);
 
     let subscription: Subscription<serde_json::Value> = client

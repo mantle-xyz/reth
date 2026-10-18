@@ -46,6 +46,7 @@ fn main() {
             let MantleConfigs { preconf: preconf_cfg, publisher: flashblocks_cfg, consumer } =
                 args.into_configs()?;
             let preconf_enabled = preconf_cfg.is_some();
+            let consumer_enabled = consumer.is_some();
             if flashblocks_cfg.is_some() && consumer.is_some() {
                 warn!(
                     target: "reth::cli",
@@ -132,7 +133,7 @@ fn main() {
                 }
             }
 
-            launch_node(builder, node, rollup, preconf_enabled).await
+            launch_node(builder, node, rollup, preconf_enabled, consumer_enabled).await
         },
     ) {
         eprintln!("Error: {err:?}");
@@ -157,6 +158,7 @@ async fn launch_node(
     node: MantleNode,
     args: RollupArgs,
     preconf_enabled: bool,
+    consumer_enabled: bool,
 ) -> eyre::Result<(), ErrReport> {
     if !args.proofs_history {
         let handle = builder
@@ -166,6 +168,12 @@ async fn launch_node(
                 // Pre-register preconf metric series (0 baseline). Preconf-only.
                 if preconf_enabled {
                     seed_preconf_metrics();
+                }
+                // Same for the consumer's own series, which are seeded by its
+                // crate rather than by `seed_preconf_metrics` — a node can run
+                // the consumer without preconf at all.
+                if consumer_enabled {
+                    mantle_reth_flashblocks::Metrics::init();
                 }
                 Ok(())
             })
@@ -183,7 +191,7 @@ async fn launch_node(
                 MdbxProofsStorage::new(&path)
                     .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
             );
-            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled).await
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled).await
         }
         ProofsStorageVersion::V2 => {
             info!(target: "reth::cli", "Using on-disk storage for proofs history (v2)");
@@ -191,7 +199,7 @@ async fn launch_node(
                 MdbxProofsStorageV2::new(&path)
                     .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorageV2: {e}"))?,
             );
-            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled).await
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled).await
         }
     }
 }
@@ -203,6 +211,7 @@ async fn launch_with_proof_history<S>(
     args: RollupArgs,
     mdbx: Arc<S>,
     preconf_enabled: bool,
+    consumer_enabled: bool,
 ) -> eyre::Result<(), ErrReport>
 where
     S: OpProofsStore + DatabaseMetrics + Send + Sync + 'static,
@@ -214,6 +223,10 @@ where
         // Pre-register preconf metric series (0 baseline). Preconf-only.
         if preconf_enabled {
             seed_preconf_metrics();
+        }
+        // See the matching block in `launch_node`.
+        if consumer_enabled {
+            mantle_reth_flashblocks::Metrics::init();
         }
         spawn_proofs_db_metrics(
             full_node.task_executor,

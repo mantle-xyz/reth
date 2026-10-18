@@ -258,8 +258,21 @@ where
                         break Err(ConnectionClosed);
                     }
                 }
-                Ok(ping_err) = &mut ping_error_rx => {
-                    break Err(ping_err);
+                // `result =`, not `Ok(..) =`: a pattern that fails to match
+                // leaves the branch disabled only for *this* `select!`, and
+                // the loop builds a new one every iteration — while
+                // `oneshot`'s `poll` clears its inner state on both the Ok and
+                // the Err path, so the next poll panics with "called after
+                // complete". The deadline tick below guarantees there is a
+                // next iteration, so a dropped sender turned into a panic
+                // inside about 50ms.
+                result = &mut ping_error_rx => {
+                    match result {
+                        Ok(ping_err) => break Err(ping_err),
+                        // The ping task is gone without having reported
+                        // anything. Nothing left to keep this connection for.
+                        Err(_) => break Err(ConnectionClosed),
+                    }
                 }
                 message = read.next() => {
                     let Some(msg) = message else {

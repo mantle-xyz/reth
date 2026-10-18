@@ -38,7 +38,9 @@ pub use builder::{
 };
 pub use canon_handler::PreconfCanonHandler;
 pub use classifier::{PreconfClassifier, Whitelist};
-pub use commitments::{Commitments, DEFAULT_COMMITMENT_CACHE_CAP, SEAL_DEPTH, SlotClaim};
+pub use commitments::{
+    ClaimKind, Commitments, DEFAULT_COMMITMENT_CACHE_CAP, SEAL_DEPTH, SlotClaim,
+};
 pub use config::{DEFAULT_PRECONF_QUEUE_GAS_BLOCKS, DEFAULT_SAFETY_MARGIN, PreconfConfig};
 pub use flashblocks::{
     FlashblockProducerConfig, FlashblockProducerConfigError, FlashblocksProducer,

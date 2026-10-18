@@ -12,18 +12,23 @@ use alloy_rpc_types_engine::PayloadId;
 
 use crate::consumer_helpers::{
     FlashblockBuilder, base_slice, base_slice_builder, filler_deposit, l1_info_deposit,
-    launch_flashblocks_node, mine_canonical_block as mine,
+    launch_flashblocks_consumer, mine_canonical_block as mine,
 };
 
 /// Default depths: three blocks of trailing history, three of leading slack.
 macro_rules! launch {
-    () => {{ launch_flashblocks_node!(3, 3) }};
+    () => {{ launch_flashblocks_consumer!(3, 3) }};
 }
 
 /// Payload id of a second build of a block. Slices built by [`FlashblockBuilder`]
-/// default to `PayloadId::default()`, so a rebuild has to say it is one: two
-/// payload jobs never share an id, and a test that lets them share it is asking
-/// about an input the sequencer cannot produce.
+/// default to `PayloadId::default()`, so a rebuild has to say it is one.
+///
+/// A real rebuild can carry the *same* id: the engine derives it from the
+/// parent and the attributes, and op-node retries a height with the
+/// attributes unchanged. The consumer then does not see a rebuild — the base
+/// slice at index 0 reads as a sequence fault, the overlay is cleared, and the
+/// block stays dark until the next one. That is fail-safe and left as is; what
+/// these tests cover is the id-changing rebuild, where the consumer can follow.
 fn rebuild_id() -> PayloadId {
     PayloadId::new([0xff; 8])
 }
@@ -126,13 +131,46 @@ async fn a_rebuilt_block_keeps_extending_after_its_base_slice() {
     harness.send(base_slice(1)).await;
     harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).build()).await;
 
-    // The rebuild, then the slice that follows it.
+    // The rebuild, then the slice that follows it. Both carry the rebuild's
+    // payload id: a continuation of build B that named build A's id is an input
+    // no payload job can emit, and the consumer now refuses it as such.
     harness.send(base_slice_builder(1).prev(1, 1).payload_id(rebuild_id()).build()).await;
-    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).build()).await;
+    harness
+        .send(FlashblockBuilder::new(1, 1).prev(1, 0).payload_id(rebuild_id()).build())
+        .await;
 
     let pending = harness.pending().expect("the rebuild must still be extendable");
     assert_eq!(pending.latest_block_number(), 1);
     assert_eq!(pending.latest_flashblock_index(), 1);
+}
+
+/// A rebuilt block's continuation must not extend the overlay the abandoned
+/// build left behind.
+///
+/// Indices restart per build, so build B's `(1,3)` names `(1,2)` as its
+/// predecessor — the very position build A's overlay sits at. Position and
+/// link both agree; only the payload id says the two chains never met.
+/// Extending here executes B's transactions on A's state and serves a pending
+/// block no build ever produced, with no counter or log saying so.
+///
+/// Reached when a subscriber reconnects mid-rebuild: the archive no longer
+/// holds the replacement's base, so the first slice it sees of build B is a
+/// later index. Dropping the overlay costs the rest of this block; splicing
+/// costs correctness.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_builds_continuation_does_not_extend_the_overlay() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).build()).await;
+    harness.send(FlashblockBuilder::new(1, 2).prev(1, 1).build()).await;
+
+    harness.send(FlashblockBuilder::new(1, 3).prev(1, 2).payload_id(rebuild_id()).build()).await;
+
+    assert!(
+        harness.pending().is_none(),
+        "a slice from another build of this height must clear the overlay, not extend it",
+    );
 }
 
 /// Re-sending the current slice is ignored and leaves the overlay untouched.
@@ -243,7 +281,7 @@ async fn a_slice_beyond_the_leading_depth_is_dropped() {
 /// itself: superseded payloads occupy the one consumer while fresh ones wait.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_for_an_already_canonical_block_is_skipped() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     for _ in 0..3 {
         mine!(node);

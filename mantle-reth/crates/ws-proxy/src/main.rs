@@ -30,12 +30,28 @@ struct Args {
     #[arg(long, env, default_value = "0.0.0.0:8545")]
     listen_addr: SocketAddr,
 
-    /// Websocket URIs of the upstream flashblock sources. Repeat or comma-separate.
-    #[arg(long, env, value_delimiter = ',')]
-    upstream_ws: Vec<Uri>,
+    /// Websocket URI of the upstream flashblock source — the sequencer.
+    ///
+    /// One, not a list. The plural form this used to accept promised a
+    /// topology the proxy does not implement: each subscriber kept its own
+    /// resume position and fed the same broadcast channel, with no
+    /// de-duplication anywhere, so two upstreams carrying one stream
+    /// delivered every slice twice and interleaved. Redundancy belongs in
+    /// front of the proxy, not inside it.
+    #[arg(long, env)]
+    upstream_ws: Uri,
 
     /// Messages to buffer for lagging clients.
-    #[arg(long, env, default_value = "20")]
+    ///
+    /// Has to clear the producer's archive, not merely approach it. A
+    /// reconnecting subscriber is replayed up to `ring_capacity` slices
+    /// (32 by default in `mantle-reth-preconf`) with no throttling, and
+    /// `broadcast::channel` rounds its capacity up to a power of two — so the
+    /// old default of 20 was really 32, exactly the replay burst, leaving no
+    /// room for the live slices arriving alongside it. One overflow drops
+    /// every downstream client, and they have no resume to recover the gap
+    /// with. 128 costs a few hundred KiB.
+    #[arg(long, env, default_value = "128")]
     message_buffer_size: usize,
 
     /// Maximum concurrently connected clients for this instance.
@@ -58,7 +74,8 @@ struct Args {
     #[arg(long, env, value_delimiter = ',', value_parser = TrustedProxyConfig::parse_cidr)]
     trusted_proxy_cidrs: Vec<IpNet>,
 
-    /// API keys as `<app>:<key>` pairs. Absent leaves the endpoint unauthenticated.
+    /// API keys as `<app>:<key>` pairs. Required unless `--public-access-enabled`
+    /// says the network in front of the proxy is the access control.
     #[arg(long, env, value_delimiter = ',')]
     api_keys: Vec<String>,
 
@@ -118,6 +135,57 @@ struct Args {
     client_send_timeout_ms: u64,
 }
 
+/// Everything a bad flag combination should be refused for, in one place and
+/// before the runtime exists — so the message reaches whoever started the
+/// process instead of a task nobody is watching.
+///
+/// Returns the non-empty API keys, since the caller needs them next and
+/// filtering them is part of deciding.
+fn refuse_unusable_args(args: &Args) -> eyre::Result<Vec<String>> {
+    // Refused here, where the message reaches whoever started the process.
+    // Three of these fail loudly on their own — the channel's own assertion,
+    // or a task whose death cancels the token — but
+    // `--client-pong-timeout-ms` below 4 does not: `pong_timeout_ms / 4`
+    // rounds to zero, `tokio::time::interval` panics in the per-connection
+    // read task, and the proxy goes on accepting connections and answering
+    // `/healthz` while every client is disconnected the moment it arrives.
+    if args.message_buffer_size == 0 {
+        eyre::bail!("--message-buffer-size must be greater than zero");
+    }
+    if args.client_ping_interval_ms == 0 {
+        eyre::bail!("--client-ping-interval-ms must be greater than zero");
+    }
+    if args.client_pong_timeout_ms < 4 {
+        eyre::bail!(
+            "--client-pong-timeout-ms must be at least 4: the read task ticks at a quarter of \
+             it, and a zero interval is not a valid tokio timer"
+        );
+    }
+    if args.subscriber_ping_interval_ms == 0 {
+        eyre::bail!("--subscriber-ping-interval-ms must be greater than zero");
+    }
+
+    // Fail closed. An unauthenticated endpoint is a supported configuration —
+    // this proxy runs inside trusted networks — but it is not one a process
+    // should fall into by omission. What it serves is the preconfirmation
+    // stream: transactions that have been executed and not yet put on chain.
+    //
+    // `--public-access-enabled` already means "serve unauthenticated clients"
+    // when keys are set, so it is the opt-in here too, rather than a second
+    // flag saying the same thing.
+    let api_keys: Vec<String> =
+        args.api_keys.iter().filter(|s| !s.is_empty()).cloned().collect();
+    if api_keys.is_empty() && !args.public_access_enabled {
+        eyre::bail!(
+            "refusing to start an unauthenticated endpoint: pass --api-keys, or \
+             --public-access-enabled to say the network in front of this proxy is the \
+             access control"
+        );
+    }
+
+    Ok(api_keys)
+}
+
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
 
@@ -125,11 +193,8 @@ fn main() -> eyre::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    if args.upstream_ws.is_empty() {
-        eyre::bail!("--upstream-ws is required: the proxy has nothing to subscribe to");
-    }
+    let api_keys = refuse_unusable_args(&args)?;
 
-    let api_keys: Vec<String> = args.api_keys.iter().filter(|s| !s.is_empty()).cloned().collect();
     let authentication = if api_keys.is_empty() {
         None
     } else {
@@ -138,6 +203,18 @@ fn main() -> eyre::Result<()> {
                 .map_err(|e| eyre::eyre!("failed to parse --api-keys: {e}"))?,
         )
     };
+
+    // Said once, at startup, where an operator reads it. Nothing in this
+    // binary speaks TLS — `tokio-tungstenite` is pulled in with default
+    // features only, and so is axum's `ws` — so the upstream connection and
+    // the downstream listener are both plaintext, and an API key travels in
+    // the URL path in the clear. The network has to be the trust boundary;
+    // there is no configuration that makes it otherwise.
+    warn!(
+        target: "ws-proxy",
+        "this proxy speaks no TLS: both the upstream connection and the downstream \
+         listener are plaintext ws://, so it must run inside a trusted network"
+    );
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -160,7 +237,7 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
         Metrics::init();
     }
 
-    info!(target: "ws-proxy", uris = ?args.upstream_ws, "using upstream URIs");
+    info!(target: "ws-proxy", uri = %args.upstream_ws, "using upstream URI");
 
     // `_rec` keeps the channel alive through any moment with no clients, and is
     // discounted from the connection gauge by `upstream_listener`.
@@ -168,25 +245,23 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
     let listener = upstream_listener(sender.clone(), args.enable_compression);
 
     let token = CancellationToken::new();
-    let mut subscriber_tasks = Vec::new();
 
-    for (index, uri) in args.upstream_ws.iter().enumerate() {
-        let options = SubscriberOptions::default()
-            .with_max_backoff_interval(Duration::from_millis(args.subscriber_max_interval_ms))
-            .with_ping_interval(Duration::from_millis(args.subscriber_ping_interval_ms))
-            .with_pong_timeout(Duration::from_millis(args.subscriber_pong_timeout_ms))
-            .with_backoff_initial_interval(Duration::from_millis(500))
-            .with_initial_grace_period(Duration::from_secs(5));
+    let options = SubscriberOptions::default()
+        .with_max_backoff_interval(Duration::from_millis(args.subscriber_max_interval_ms))
+        .with_ping_interval(Duration::from_millis(args.subscriber_ping_interval_ms))
+        .with_pong_timeout(Duration::from_millis(args.subscriber_pong_timeout_ms))
+        .with_backoff_initial_interval(Duration::from_millis(500))
+        .with_initial_grace_period(Duration::from_secs(5));
 
-        let uri = uri.clone();
-        let mut subscriber = WebsocketSubscriber::new(uri.clone(), listener.clone(), options);
+    let subscriber_task = {
+        let uri = args.upstream_ws.clone();
+        let mut subscriber = WebsocketSubscriber::new(uri.clone(), listener, options);
         let token = token.clone();
-
-        subscriber_tasks.push(tokio::spawn(async move {
-            info!(target: "ws-proxy", index, uri = %uri, "starting subscriber");
+        tokio::spawn(async move {
+            info!(target: "ws-proxy", uri = %uri, "starting subscriber");
             subscriber.run(token).await;
-        }));
-    }
+        })
+    };
 
     let ping_task = if args.client_ping_enabled {
         let ping_sender = sender.clone();
@@ -246,7 +321,7 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
     let mut terminate = signal(SignalKind::terminate())?;
 
     tokio::select! {
-        _ = futures::future::join_all(subscriber_tasks) => {
+        _ = subscriber_task => {
             info!(target: "ws-proxy", "all subscriber tasks terminated");
         }
         _ = server_task => info!(target: "ws-proxy", "server task terminated"),
@@ -324,13 +399,94 @@ mod tests {
         );
     }
 
-    /// One `--upstream-ws` value may carry several comma-separated URIs, which
-    /// `value_delimiter = ','` splits into one entry each.
+    /// `--upstream-ws` takes exactly one URI.
+    ///
+    /// The comma-separated form used to parse into several, which read as
+    /// support for a redundant-source topology the proxy never implemented —
+    /// no de-duplication across subscribers, so one stream behind two
+    /// upstreams was delivered twice. Refusing it at the flag is the honest
+    /// version.
     #[test]
-    fn upstream_ws_accepts_a_comma_separated_list() {
-        let args =
+    fn upstream_ws_takes_one_uri_and_refuses_a_list() {
+        let one = Args::try_parse_from(["mantle-ws-proxy", "--upstream-ws", "ws://a:1111"])
+            .expect("a single URI parses");
+        assert_eq!(one.upstream_ws.to_string(), "ws://a:1111/");
+
+        assert!(
             Args::try_parse_from(["mantle-ws-proxy", "--upstream-ws", "ws://a:1111,ws://b:1111"])
-                .expect("comma-separated URIs parse");
-        assert_eq!(args.upstream_ws.len(), 2);
+                .is_err(),
+            "a comma-separated list must not be read as several upstreams",
+        );
+    }
+
+    /// And the flag is required: a proxy with no upstream has nothing to do.
+    #[test]
+    fn upstream_ws_is_required() {
+        assert!(Args::try_parse_from(["mantle-ws-proxy"]).is_err());
+    }
+
+    fn args_with(extra: &[&str]) -> Args {
+        let mut argv = vec!["mantle-ws-proxy", "--upstream-ws", "ws://sequencer:1111"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("the base arguments parse")
+    }
+
+    /// An endpoint with no keys and no acknowledgement does not start.
+    ///
+    /// Unauthenticated is a supported configuration — this proxy runs inside
+    /// trusted networks — but it has to be asked for. What it serves is the
+    /// preconfirmation stream: executed, not-yet-on-chain transactions.
+    #[test]
+    fn an_unauthenticated_endpoint_has_to_be_asked_for() {
+        let err = refuse_unusable_args(&args_with(&[]))
+            .expect_err("no keys and no opt-in must not start");
+        assert!(
+            err.to_string().contains("unauthenticated"),
+            "the message has to say what was refused: {err}",
+        );
+
+        refuse_unusable_args(&args_with(&["--api-keys", "app:key"]))
+            .expect("keys are one way to satisfy it");
+        refuse_unusable_args(&args_with(&["--public-access-enabled"]))
+            .expect("and saying so explicitly is the other");
+    }
+
+    /// `--client-pong-timeout-ms` below 4 is the one of these that does not
+    /// fail loudly on its own: `pong_timeout_ms / 4` rounds to zero, the
+    /// per-connection read task panics on the zero interval, and the proxy
+    /// keeps accepting connections and answering `/healthz` while every
+    /// client is disconnected on arrival.
+    #[test]
+    fn a_pong_timeout_that_rounds_to_a_zero_interval_is_refused() {
+        for value in ["0", "1", "3"] {
+            assert!(
+                refuse_unusable_args(&args_with(&[
+                    "--public-access-enabled",
+                    "--client-pong-timeout-ms",
+                    value,
+                ]))
+                .is_err(),
+                "--client-pong-timeout-ms {value} ticks at zero",
+            );
+        }
+        refuse_unusable_args(&args_with(&[
+            "--public-access-enabled",
+            "--client-pong-timeout-ms",
+            "4",
+        ]))
+        .expect("4 is the smallest that still ticks");
+    }
+
+    /// The three that would fail loudly anyway are refused here too, so the
+    /// message names the flag instead of surfacing as a panic.
+    #[test]
+    fn the_zero_valued_timing_flags_are_refused_by_name() {
+        for flag in
+            ["--message-buffer-size", "--client-ping-interval-ms", "--subscriber-ping-interval-ms"]
+        {
+            let err = refuse_unusable_args(&args_with(&["--public-access-enabled", flag, "0"]))
+                .expect_err("zero is not a usable value");
+            assert!(err.to_string().contains(flag), "the message must name {flag}: {err}");
+        }
     }
 }

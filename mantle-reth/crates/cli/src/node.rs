@@ -421,10 +421,10 @@ impl MantleNode {
         }
 
         // Construct the preconf-aware payload service. When
-        // `self.preconf == None` we still supply a default-empty
-        // `(cfg, fifo)` — no whitelist, no broadcast events. The fork's
-        // select! loop then sits idle waiting for cancel, and the
-        // block seals at CL `getPayload` time.
+        // `self.preconf == None` the config passed down has `enabled ==
+        // false`, and `spawn_payload_builder_service` then delegates to
+        // upstream's `BasicPayloadServiceBuilder<OpPayloadBuilder>`; the
+        // preconf fork is not constructed at all.
         let mut builder_config = OpBuilderConfig::new(
             self.op_node.da_config.clone(),
             self.op_node.gas_limit_config.clone(),
@@ -621,10 +621,18 @@ where
                             // re-executes for itself, so it needs nothing out of
                             // the chain that went away.
                             //
-                            // The cost is that a reorg is inferred from a tx
-                            // list that stopped matching, not reported: one
-                            // reaching only heights the overlay does not track
-                            // passes unnoticed.
+                            // The cost is that a reorg is inferred, not
+                            // reported: `ReorgDetector::detect` compares the
+                            // overlay's tx list for a height with the canonical
+                            // block's, and `base_is_canonical` checks the hash
+                            // under the overlay's earliest block. A reorg that
+                            // re-seals a tracked height with the same
+                            // transactions and a different header passes
+                            // both, and the overlay keeps publishing on the
+                            // old block's hash until the next `CatchUp`.
+                            // Accepted: an OP sequencer does not re-seal a
+                            // block with identical contents, and the window
+                            // closes at the next canonical block.
                             for block in notification.committed().blocks_iter() {
                                 // op-reth v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
                                 state_for_canonical

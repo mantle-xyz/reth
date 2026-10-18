@@ -5261,6 +5261,7 @@ dependencies = [
  "mantle-reth-chainspec",
  "mantle-reth-flashblocks-types",
  "metrics",
+ "metrics-exporter-prometheus",
  "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types",

@@ -39,8 +39,8 @@ use crate::{
     StateProcessorError,
     metrics::Metrics,
     validation::{
-        CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
-        ReorgDetector, SequenceValidationResult,
+        CanonicalBlockReconciler, FlashblockSequenceValidator, IncomingBuild,
+        ReconciliationStrategy, ReorgDetector, SequenceValidationResult,
     },
 };
 
@@ -462,9 +462,20 @@ where
         }
 
         let start_time = Instant::now();
+        // Kept to tell "the overlay moved" from "the slice was ignored": the
+        // `Duplicate` arm hands the previous snapshot straight back, and
+        // re-broadcasting it makes subscribers replay a batch of transactions
+        // they have already seen. The published value is a *delta* —
+        // `get_latest_flashblock_logs` skips the first
+        // `latest_flashblock_tx_start`, a field frozen when the snapshot was
+        // built — so sending the same `Arc` twice recomputes the same
+        // non-empty slice rather than an empty one.
+        let previous = prev_pending_blocks.clone();
         match self.process_flashblock(prev_pending_blocks, &flashblock) {
             Ok(new_pending_blocks) => {
-                if let Some(ref pb) = new_pending_blocks {
+                if let Some(ref pb) = new_pending_blocks
+                    && !previous.as_ref().is_some_and(|old| Arc::ptr_eq(old, pb))
+                {
                     _ = self.sender.send(Arc::clone(pb));
                 }
                 self.pending_blocks.swap(new_pending_blocks);
@@ -627,13 +638,21 @@ where
             }
         };
 
+        let incoming_build = if flashblock.payload_id == pending_blocks.payload_id() {
+            IncomingBuild::Same
+        } else if flashblock.base.is_some() {
+            IncomingBuild::OtherWithBase
+        } else {
+            IncomingBuild::OtherWithoutBase
+        };
+
         let validation_result = FlashblockSequenceValidator::validate(
             pending_blocks.latest_block_number(),
             pending_blocks.latest_flashblock_index(),
             flashblock.metadata.block_number,
             flashblock.index,
             flashblock.metadata.prev_flashblock_id,
-            flashblock.base.is_some() && flashblock.payload_id != pending_blocks.payload_id(),
+            incoming_build,
         );
 
         match validation_result {
@@ -674,6 +693,22 @@ where
                     .retain(|fb| fb.metadata.block_number < flashblock.metadata.block_number);
                 flashblocks.push(flashblock.clone());
                 self.build_pending_state(None, &flashblocks)
+            }
+            SequenceValidationResult::ForeignBuild => {
+                // Its own counter, not `unexpected_block_order`: the stream is
+                // not faulty, it is a correct stream of a build this node never
+                // saw the start of. What it reports is that a resume handed
+                // over a replacement's continuation without its base — the one
+                // signal that situation otherwise leaves.
+                Metrics::foreign_build_slice().increment(1);
+                warn!(
+                    message = "received a slice from another build of the tracked block; dropping the overlay rather than splicing",
+                    block = %flashblock.metadata.block_number,
+                    new_flashblock_index = %flashblock.index,
+                    curr_flashblock_index = %pending_blocks.latest_flashblock_index(),
+                );
+                self.clear_live_state();
+                Ok(None)
             }
             SequenceValidationResult::InvalidNewBlockIndex { block_number, index } => {
                 Metrics::unexpected_block_order().increment(1);
@@ -742,6 +777,15 @@ where
 
         // Taken through a temporary guard: the rebuild in the fallback below writes the
         // live state back, so holding the guard across it deadlocks this thread.
+        //
+        // Taken, and on every failure below **not put back**. That is the
+        // point: each fallible step from here owns the `db`, so a failure
+        // leaves it holding half a transaction's writes. Returning that to the
+        // slot would hand the next slice a state no block ever had. The cost
+        // of dropping it is one full rebuild — `build_pending_state` replays
+        // the overlay from the canonical parent, the same path a cold start
+        // takes — and `state_overrides` survives it because replaying the same
+        // slices yields the same values (last writer wins per address/slot).
         let live_state = self.lock_live_state().take();
         let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
@@ -868,6 +912,15 @@ where
 
         // Taken through a temporary guard: the rebuild in the fallback below writes the
         // live state back, so holding the guard across it deadlocks this thread.
+        //
+        // Taken, and on every failure below **not put back**. That is the
+        // point: each fallible step from here owns the `db`, so a failure
+        // leaves it holding half a transaction's writes. Returning that to the
+        // slot would hand the next slice a state no block ever had. The cost
+        // of dropping it is one full rebuild — `build_pending_state` replays
+        // the overlay from the canonical parent, the same path a cold start
+        // takes — and `state_overrides` survives it because replaying the same
+        // slices yields the same values (last writer wins per address/slot).
         let live_state = self.lock_live_state().take();
         let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(

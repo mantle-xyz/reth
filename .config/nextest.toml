@@ -1,0 +1,13 @@
+# Read by every `cargo nextest run` in this repo — `just test-ci` locally and in
+# CI — so a pass on a retry is reported the same way in both places.
+
+[profile.default]
+# A test that fails and then passes is printed as `FLAKY` in the run summary
+# and recorded in the JUnit report below with the failed attempts as
+# `<flakyFailure>` elements, which is what `ci.yml` turns into a warning on the
+# run page. Retries absorb a timing blip; they do not hide it.
+retries = 2
+
+[profile.default.junit]
+# Lands at `target/nextest/default/junit.xml`.
+path = "junit.xml"

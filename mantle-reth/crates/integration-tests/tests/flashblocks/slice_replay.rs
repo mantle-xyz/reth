@@ -53,12 +53,12 @@ fn shared_journal_path() -> (std::path::PathBuf, std::path::PathBuf) {
     (dir.join("preconf.journal"), dir)
 }
 
+/// What the journal holds, read the way the node reads it: a line that does
+/// not decode is skipped. An append cut short leaves one, and the next append
+/// closes it.
 fn read_journal(path: &std::path::Path) -> Vec<JournalEntry> {
     let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
-    raw.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<JournalEntry>(line).expect("valid JournalEntry line"))
-        .collect()
+    raw.lines().filter_map(|line| serde_json::from_str::<JournalEntry>(line).ok()).collect()
 }
 
 async fn signed_transfer(wallet: &Wallet, chain_id: u64, nonce: u64) -> Bytes {
@@ -713,6 +713,85 @@ async fn a_derivation_build_replays_no_unlanded_transaction() {
         ordinary_transactions(&ordinary).contains(&hash),
         "the next ordinary build must still replay it, or the assertion above only \
          proved the index was empty",
+    );
+
+    std::fs::remove_dir_all(&journal_dir).ok();
+}
+
+/// A derivation block becoming the parent must not make the next build think
+/// it carried anything.
+///
+/// The sibling above stops one step short: it resolves the derivation payload
+/// but never makes it canonical, so the build after it has the *same* parent
+/// as the derivation build did. This one canonicalises it, which is the state
+/// a real reorg recovery leaves behind — and the state that puts
+/// `drop_landed_claims` on a block that executed none of what it is about to
+/// drop.
+///
+/// What is at stake is the one guarantee the subsystem exists for. The pool's
+/// own copy of the transaction is gone by then (`prune_transactions` at the
+/// slice boundary), the slow scan only repairs nonces, and a block that never
+/// sealed leaves nothing for the reorg path to re-inject — so the fifo entry
+/// is the only thing that can still bring it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_canonical_derivation_block_does_not_claim_what_it_never_built() {
+    let sender = Wallet::default().inner.address();
+    let (journal_file, journal_dir) = shared_journal_path();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_pair(sender, RECIPIENT)
+        .journal_path(journal_file.clone())
+        .build();
+    let (mut node, _http, wallet, chain_id, _fb) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+
+    let raw = signed_transfer(&wallet, chain_id, 0).await;
+    let hash = keccak256(&raw);
+    node.rpc.inject_tx(raw).await.expect("inject");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Announced on the slice stream, pruned from the pool, and left unlanded:
+    // the fifo entry is now the only copy.
+    hold_a_block_open!(node, Duration::from_millis(500));
+
+    let announced: Vec<B256> = read_journal(&journal_file).iter().map(|e| e.hash).collect();
+    assert!(
+        announced.contains(&hash),
+        "precondition: there must be an unlanded announcement to lose; journaled={announced:?}",
+    );
+
+    // A derivation slot, and then the step the sibling test leaves out.
+    let mut attrs = node.payload.next_attributes();
+    attrs.0.no_tx_pool = Some(true);
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let derived = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+    assert!(
+        !ordinary_transactions(&derived).contains(&hash),
+        "precondition: a derivation build carries only what its attributes name",
+    );
+    crate::canonicalize_payload!(node, derived).await;
+
+    // The next build's parent is now the derivation block.
+    let ordinary = build_one_block!(node, Duration::from_millis(500));
+    assert!(
+        ordinary_transactions(&ordinary).contains(&hash),
+        "the derivation block executed none of this, so the build after it must still \
+         replay the transaction rather than drop it as landed",
     );
 
     std::fs::remove_dir_all(&journal_dir).ok();

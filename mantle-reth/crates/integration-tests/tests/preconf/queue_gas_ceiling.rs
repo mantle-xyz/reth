@@ -114,11 +114,18 @@ async fn a_larger_backlog_allowance_admits_the_pair_that_was_refused() {
 
     let second = signed_transfer(chain_id, &wallet, 1).await;
     let http_second = http.clone();
-    let parked_b = tokio::spawn(async move { send_preconf(&http_second, second).await });
+    let mut parked_b = tokio::spawn(async move { send_preconf(&http_second, second).await });
 
     // Reaching the queue is the assertion: both are parked waiting for a build
-    // that never comes, so neither call returns.
-    wait_fifo_entry(&fifo, sender, 1).await;
+    // that never comes, so neither call returns. A refusal returns at once, and
+    // it is the refusal that should fail the test — not the queue poll giving
+    // up on an entry that was never going to arrive.
+    tokio::select! {
+        () = wait_fifo_entry(&fifo, sender, 1) => {}
+        answer = &mut parked_b => {
+            panic!("the second submission was answered instead of parked: {answer:?}")
+        }
+    }
 
     parked_a.abort();
     parked_b.abort();

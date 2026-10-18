@@ -332,6 +332,12 @@ where
                 let meta = TransactionMeta {
                     tx_hash,
                     index: idx as u64,
+                    // A pending block has no hash, and the two upstream types
+                    // spell that differently: this one is a bare `B256`, so
+                    // zero is its only "unknown", while the `Transaction` above
+                    // has `Option<B256>` and uses `None`. Receipts therefore
+                    // report `0x00..0` where transactions report `null` for the
+                    // same block. Reconciling them would mean lying in one.
                     block_hash: B256::ZERO,
                     block_number: self.pending_block.number,
                     base_fee: self.pending_block.base_fee_per_gas,

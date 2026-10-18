@@ -55,3 +55,44 @@ pub fn upstream_listener(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use super::*;
+
+    fn frame_bytes(message: Message) -> Vec<u8> {
+        match message {
+            Message::Text(text) => text.as_bytes().to_vec(),
+            Message::Binary(bytes) => bytes.to_vec(),
+            other => panic!("not a data frame: {other:?}"),
+        }
+    }
+
+    /// Without compression the payload bytes go out untouched.
+    #[test]
+    fn an_uncompressed_payload_is_forwarded_as_is() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+        upstream_listener(sender, false)("{\"index\":3}".to_owned());
+
+        let frame = receiver.try_recv().expect("one frame");
+        assert_eq!(frame_bytes(frame), b"{\"index\":3}");
+    }
+
+    /// With compression the frame is brotli, and decodes back to the payload.
+    #[test]
+    fn a_compressed_payload_decodes_back_to_the_original() {
+        let payload = "{\"index\":3,\"padding\":\"".to_owned() + &"a".repeat(2_000) + "\"}";
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+        upstream_listener(sender, true)(payload.clone());
+
+        let frame = frame_bytes(receiver.try_recv().expect("one frame"));
+        assert!(frame.len() < payload.len(), "a repetitive payload must shrink");
+        let mut decoded = String::new();
+        brotli::Decompressor::new(frame.as_slice(), 4096)
+            .read_to_string(&mut decoded)
+            .expect("the frame is brotli");
+        assert_eq!(decoded, payload);
+    }
+}

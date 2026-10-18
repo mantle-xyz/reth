@@ -263,14 +263,13 @@ async fn tx_outside_chain_whitelist_is_not_preconf_eligible() {
     let result = send_preconf(&http, raw_tx).await;
 
     match result {
-        Err(err) => {
-            // Typed rejection from the RPC layer is the expected outcome.
-            let msg = err.to_string();
-            assert!(
-                msg.to_lowercase().contains("preconf") || msg.to_lowercase().contains("eligible"),
-                "expected a not-eligible rejection, got: {msg}",
-            );
+        // The refusal has to be the allowlist's own. Nearly every preconf error
+        // mentions "preconf", so anything looser would also pass a transaction
+        // refused for some other reason.
+        Err(jsonrpsee::core::ClientError::Call(err)) => {
+            assert_eq!(err.message(), "transaction is not preconf eligible (whitelist miss)")
         }
+        Err(other) => panic!("expected the allowlist's refusal, got {other:?}"),
         Ok(event) => assert!(
             !matches!(event.status, mantle_reth_rpc_ext::PreconfStatus::Success),
             "a tx outside the on-chain allowlist must not be preconfirmed, got {:?}",
