@@ -463,3 +463,139 @@ async fn a_wallet_touched_by_the_overlay_still_has_no_code_at_pending() {
         api.get_code(test_sender(), Some(BlockNumberOrTag::Pending.into())).await.expect("query");
     assert_eq!(pending, Bytes::new());
 }
+
+/// Reads a hex-quantity field off a JSON-RPC object.
+fn hex_u64(value: &serde_json::Value) -> u64 {
+    let text = value.as_str().expect("a hex quantity");
+    u64::from_str_radix(text.trim_start_matches("0x"), 16).expect("a hex quantity")
+}
+
+/// A gap mid-block tears the overlay down whole: nothing it held is served any
+/// more, and `pending` goes back to meaning `latest`.
+///
+/// The consumer cannot tell what the missing slices did, so a receipt or a
+/// transaction from the torn overlay would be an answer with nothing behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_mid_block_leaves_no_orphan_receipt_and_pending_falls_back_to_latest() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let tx_hash = overlay_with_user_call!(harness);
+    api.get_transaction_receipt(tx_hash)
+        .await
+        .expect("query succeeds")
+        .expect("premise: the overlay serves the receipt before the gap");
+
+    // Index 3 straight after index 0: the slices in between never arrived.
+    harness.send(FlashblockBuilder::new(1, 3).prev(1, 0).build()).await;
+    assert!(harness.pending().is_none(), "a skipped index clears the overlay");
+
+    assert!(
+        api.get_transaction_receipt(tx_hash).await.expect("query succeeds").is_none(),
+        "a receipt from the torn overlay must not survive it",
+    );
+    assert!(
+        api.transaction_by_hash(tx_hash).await.expect("query succeeds").is_none(),
+        "nor the transaction",
+    );
+    let block = api
+        .block_by_number(pending_tag(), false)
+        .await
+        .expect("query succeeds")
+        .expect("the standard implementation resolves the tag");
+    assert_eq!(block["number"], "0x0", "with the overlay gone, `pending` is `latest` again");
+}
+
+/// A transaction that reverts is still a transaction the block holds: its
+/// receipt reports status 0 and its nonce is spent.
+///
+/// Only an invalid transaction fails a slice; a revert is an outcome the EVM
+/// produced and the sequencer sealed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reverted_transaction_in_the_overlay_has_a_status_zero_receipt() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    // Init code `PUSH0 PUSH0 REVERT`: the deployment reverts at once.
+    let raw = signed_deploy(0, Bytes::from_static(&[0x5f, 0x5f, 0xfd])).await;
+    let tx_hash = keccak256(&raw);
+    harness
+        .send(FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw]).build())
+        .await;
+    assert!(harness.pending().is_some(), "a revert must not fail the slice");
+
+    let receipt = api
+        .get_transaction_receipt(tx_hash)
+        .await
+        .expect("query succeeds")
+        .expect("a reverted transaction still has a receipt");
+    assert_eq!(receipt["status"], "0x0", "the revert must be reported, not papered over");
+    assert!(hex_u64(&receipt["gasUsed"]) > 0, "a revert still burns gas");
+
+    let block = api
+        .block_by_number(pending_tag(), false)
+        .await
+        .expect("query succeeds")
+        .expect("the overlay is served");
+    let hashes = block["transactions"].as_array().expect("transaction hashes");
+    assert_eq!(hashes.len(), 2, "the deposit and the reverted deployment are both in the block");
+    assert_eq!(hashes[1].as_str().expect("hash"), format!("{tx_hash:#x}"));
+
+    let nonce = api
+        .get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+        .await
+        .expect("query");
+    assert_eq!(nonce, U256::from(1), "a reverted transaction still spends its nonce");
+}
+
+/// Receipt positions are block-global, so a transaction in a later slice
+/// continues from where the earlier slices left off: its index, its
+/// cumulative gas and its logs' indices all carry the earlier slices' totals.
+///
+/// Each slice executes on its own, so the offsets have to be handed across
+/// explicitly; without that, every slice would report positions from zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_positions_continue_across_slices() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let first_hash = overlay_with_user_call!(harness);
+    let second = signed_call(1, LOGGER, VALUE).await;
+    let second_hash = keccak256(&second);
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).transactions(vec![second]).build()).await;
+    assert!(harness.pending().is_some(), "the second slice extends the overlay");
+
+    let receipt = |hash| {
+        let api = &api;
+        async move {
+            api.get_transaction_receipt(hash)
+                .await
+                .expect("query succeeds")
+                .expect("the overlay holds the receipt")
+        }
+    };
+    let first = receipt(first_hash).await;
+    let second = receipt(second_hash).await;
+
+    assert_eq!(first["blockNumber"], "0x1");
+    assert_eq!(second["blockNumber"], "0x1");
+    // The L1-attributes deposit is index 0, so the first user call is 1.
+    assert_eq!(hex_u64(&first["transactionIndex"]), 1);
+    assert_eq!(
+        hex_u64(&second["transactionIndex"]),
+        2,
+        "the second slice's transaction follows the first slice's, not index 0 again",
+    );
+    assert_eq!(
+        hex_u64(&second["cumulativeGasUsed"]),
+        hex_u64(&first["cumulativeGasUsed"]) + hex_u64(&second["gasUsed"]),
+        "cumulative gas carries the earlier slice's total",
+    );
+    let log_index = |receipt: &serde_json::Value| {
+        let logs = receipt["logs"].as_array().expect("logs");
+        assert_eq!(logs.len(), 1, "each call to LOGGER emits one log");
+        hex_u64(&logs[0]["logIndex"])
+    };
+    assert_eq!(log_index(&first), 0);
+    assert_eq!(log_index(&second), 1, "log indices are block-global too");
+}

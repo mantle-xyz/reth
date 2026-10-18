@@ -54,7 +54,7 @@ where
     Receiver: FlashblocksReceiver + Send + Sync + 'static,
 {
     /// Max duration of backoff before reconnecting to upstream.
-    pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
+    pub const MAX_BACKOFF: Duration = MAX_BACKOFF;
 
     /// Creates a new flashblocks subscriber.
     pub const fn new(
@@ -190,13 +190,30 @@ where
     async fn sleep(backoff: Duration) -> Duration {
         Metrics::reconnect_attempts().increment(1);
         tokio::time::sleep(backoff).await;
-        std::cmp::min(backoff * 2, Self::MAX_BACKOFF)
+        next_backoff(backoff)
     }
+}
+
+/// Longest wait between reconnect attempts.
+const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// The wait after `current`: doubled, capped at [`MAX_BACKOFF`].
+fn next_backoff(current: Duration) -> Duration {
+    std::cmp::min(current.saturating_mul(2), MAX_BACKOFF)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The schedule a dead upstream produces: 1, 2, 4, 8, then 10 for good.
+    #[test]
+    fn backoff_doubles_up_to_the_cap() {
+        let secs = |n: u64| Duration::from_secs(n);
+        for (current, next) in [(1, 2), (2, 4), (4, 8), (8, 10), (10, 10), (7, 10)] {
+            assert_eq!(next_backoff(secs(current)), secs(next), "after {current}s");
+        }
+    }
 
     #[test]
     fn resume_url_without_position_is_unchanged() {

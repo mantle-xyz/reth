@@ -8,10 +8,10 @@
 //!   `SAFETY_MARGIN` before the SLA deadline) fires from within `apply_one_preconf`, surfacing as
 //!   `Err(Call)` at the wire (distinct from RPC-layer `Ok(Timeout)`).
 //!
-//! - `race_resolution_returns_success_when_apply_completes_after_deadline` — RPC deadline fires
-//!   while dispatch is mid-apply; `rpc.rs`'s `lock_for_apply` + `try_recv` fallback harvests the
-//!   receipt so the client sees `Success`. Exercises the branch by disabling `safety_margin` (which
-//!   would otherwise preemptively abort dispatch and hide the race).
+//! The race where the RPC deadline fires while dispatch is mid-apply (the `lock_for_apply` and
+//! `try_recv` fallback in `rpc.rs` harvesting the receipt) has no end-to-end test here:
+//! reproducing it needs a wall-clock guess that misses often enough to be noise. It is pinned
+//! without a clock by `builder::dispatch::tests::apply_lock_blocks_rpc_timeout_race_and_yields_success`.
 //!
 //! Timeout entry releasing the `(sender, nonce)` slot for a differently-
 //! signed tx is a **replacement** semantic and lives in
@@ -222,121 +222,6 @@ async fn timeout_recovered_by_same_hash_resubmit() {
     assert!(
         sealed.contains(&expected_hash),
         "revived tx must land in the next block; sealed = {sealed:?}",
-    );
-}
-
-/// Race resolution: RPC deadline fires while dispatch has already
-/// applied (or is about to send the receipt) — the client must observe
-/// `Success`, not `Timeout`, because the tx did land on chain.
-///
-/// `rpc.rs::handle_inner`'s `None` arm (deadline expired) acquires
-/// `lock_for_apply`, reads the definitive fifo status under the lock,
-/// and — if it finds `Success` / `Failed` — harvests the receipt from
-/// `resp_rx` via `try_recv`. This closes the "wire Timeout but tx
-/// landed" SLA gap.
-///
-/// The dispatch-side `SAFETY_MARGIN` gate preemptively aborts apply
-/// when `elapsed + safety_margin >= preconf_timeout`, so in production
-/// (default `safety_margin=40ms`) the race window is sub-millisecond
-/// and scheduler-random. To exercise the branch deterministically the
-/// test sets `safety_margin=0`, letting dispatch complete apply right
-/// past the RPC deadline.
-///
-/// **Quarantined (`#[ignore]`)**, measured rather than assumed: it fails roughly 1 run in
-/// 3 even alone and serially, so this is not the suite's parallel-load problem. The test
-/// needs dispatch to be mid-apply at the instant the client deadline fires, and the only
-/// lever from outside the node is the 195 ms sleep below guessing that the following FCU
-/// round-trip lands inside the remaining 5 ms. When it does not, race resolution finds a
-/// `Waiting` entry and correctly reports `Timeout` for a tx that really had not been
-/// applied — the assertion fails with nothing actually wrong. Determinism would need a
-/// production hook to pause dispatch mid-apply; not worth it, because
-/// `builder::dispatch::tests::apply_lock_blocks_rpc_timeout_race_and_yields_success` pins
-/// the same lock ordering with no clock involved. Kept as a manual end-to-end check:
-///
-/// ```text
-/// cargo test -p mantle-reth-integration-tests --test preconf \
-///     timeout::race_resolution -- --ignored
-/// ```
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "~us-wide race reproduced by a wall-clock guess; fails ~1/3 even alone. \
-            Covered deterministically by dispatch's apply_lock unit test."]
-async fn race_resolution_returns_success_when_apply_completes_after_deadline() {
-    let recipient: Address = RECIPIENT.parse().unwrap();
-    let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
-
-    let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
-        .whitelist_to(recipient)
-        .preconf_timeout_ms(200)
-        // Disable the dispatch-side preemption gate — otherwise dispatch
-        // aborts before RPC's deadline fires and the race-resolution
-        // branch is unreachable.
-        .safety_margin_ms(0)
-        .build();
-
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
-    let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
-    let expected_hash = alloy_primitives::keccak256(&raw_tx);
-
-    let http_c = http.clone();
-    let rpc_task = tokio::spawn(async move { send_preconf(&http_c, raw_tx).await });
-
-    // Delay build start so dispatch runs apply right around the RPC
-    // deadline. 195ms leaves ~5ms until deadline, well within EVM apply
-    // + `take_responder.send` latency for a simple transfer.
-    tokio::time::sleep(std::time::Duration::from_millis(195)).await;
-
-    let attrs = node.payload.next_attributes();
-    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
-    let payload_id = node
-        .inner
-        .add_ons_handle
-        .beacon_engine_handle
-        .fork_choice_updated(fcu_state, Some(attrs))
-        .await
-        .expect("FCU must succeed")
-        .payload_id
-        .expect("payload_id present");
-
-    // Let dispatch finish apply even if the deadline has already
-    // expired — race resolution's `lock_for_apply` will block on
-    // dispatch's apply_lock and only proceed once the receipt is
-    // queued in `resp_rx`.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let payload = node
-        .inner
-        .payload_builder_handle
-        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
-        .await
-        .expect("resolve_kind")
-        .expect("payload build");
-
-    let event = rpc_task
-        .await
-        .expect("rpc join")
-        .expect("race resolution must return Ok, not an RPC error");
-
-    // The SLA: whichever internal branch fires (direct `resp_rx` recv
-    // or race-resolution `lock_for_apply` + `try_recv`), the wire
-    // outcome must reflect on-chain reality.
-    assert!(
-        matches!(event.status, PreconfStatus::Success),
-        "wire status must be Success (not Timeout) whenever tx actually applied; \
-         got {:?} reason={:?}",
-        event.status,
-        event.reason,
-    );
-
-    let sealed: Vec<alloy_primitives::B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
-        .collect();
-    assert!(
-        sealed.contains(&expected_hash),
-        "tx must be on chain for the race resolution SLA to make sense; sealed={sealed:?}",
     );
 }
 
