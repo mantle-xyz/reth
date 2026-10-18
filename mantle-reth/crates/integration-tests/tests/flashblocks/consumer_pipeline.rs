@@ -12,12 +12,12 @@ use alloy_rpc_types_engine::PayloadId;
 
 use crate::consumer_helpers::{
     FlashblockBuilder, base_slice, base_slice_builder, filler_deposit, l1_info_deposit,
-    launch_flashblocks_node, mine_canonical_block as mine,
+    launch_flashblocks_consumer, mine_canonical_block as mine,
 };
 
 /// Default depths: three blocks of trailing history, three of leading slack.
 macro_rules! launch {
-    () => {{ launch_flashblocks_node!(3, 3) }};
+    () => {{ launch_flashblocks_consumer!(3, 3) }};
 }
 
 /// Payload id of a second build of a block. Slices built by [`FlashblockBuilder`]
@@ -276,7 +276,7 @@ async fn a_slice_beyond_the_leading_depth_is_dropped() {
 /// itself: superseded payloads occupy the one consumer while fresh ones wait.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_for_an_already_canonical_block_is_skipped() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     for _ in 0..3 {
         mine!(node);

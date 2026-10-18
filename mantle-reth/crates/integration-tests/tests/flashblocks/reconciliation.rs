@@ -9,7 +9,7 @@ use alloy_rpc_types_engine::PayloadId;
 
 use crate::consumer_helpers::{
     FlashblockBuilder, base_slice, base_slice_builder, filler_deposit, l1_info_deposit,
-    launch_flashblocks_node, mine_canonical_block as mine,
+    launch_flashblocks_consumer, mine_canonical_block as mine,
 };
 
 /// Overlay spans blocks 1 to 3, then canonical advances to block 2 and is
@@ -23,7 +23,7 @@ use crate::consumer_helpers::{
 /// time it is sent, the same way `FlashblocksHarness::send`'s backfill expects.
 macro_rules! canonical_two_under_overlay_three {
     ($max_trailing_depth:expr) => {{
-        let (harness, mut node) = launch_flashblocks_node!($max_trailing_depth, 3);
+        let (harness, mut node) = launch_flashblocks_consumer!($max_trailing_depth, 3);
 
         harness.send(base_slice(1)).await;
         mine!(node);
@@ -44,7 +44,7 @@ macro_rules! canonical_two_under_overlay_three {
 /// Canonical reaching the overlay's tip retires the overlay.
 #[tokio::test(flavor = "multi_thread")]
 async fn canonical_catching_up_to_the_overlay_clears_it() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(1)).await;
     assert!(harness.pending().is_some(), "the base slice should open an overlay");
@@ -67,7 +67,7 @@ async fn canonical_catching_up_to_the_overlay_clears_it() {
 /// only block 2 survives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_canonical_block_missing_a_tracked_transaction_rebuilds_the_overlay() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(1)).await;
     harness
@@ -125,7 +125,7 @@ async fn an_overlay_deeper_than_the_trailing_limit_is_rebuilt_from_canonical() {
 /// A canonical block arriving with no overlay is a no-op.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_canonical_block_without_an_overlay_is_a_no_op() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     let block = mine!(node);
     harness.send_canonical(block).await;
@@ -141,7 +141,7 @@ async fn a_canonical_block_without_an_overlay_is_a_no_op() {
 /// from a historical base — which is slow enough to deepen the backlog that caused it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_backlogged_canonical_notification_is_judged_against_the_tip() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(1)).await;
     harness.send(base_slice_builder(2).prev(1, 0).build()).await;
@@ -172,7 +172,7 @@ async fn a_backlogged_canonical_notification_is_judged_against_the_tip() {
 /// answering from that anchor, which by then is historical state.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_stranded_behind_the_tip_is_dropped_without_a_notification() {
-    let (harness, mut node) = launch_flashblocks_node!(1, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(1, 3);
 
     harness.send(base_slice(1)).await;
     assert!(harness.pending().is_some(), "the base slice should open an overlay");
@@ -198,7 +198,7 @@ async fn a_snapshot_stranded_behind_the_tip_is_dropped_without_a_notification() 
 /// guard rests on this.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_harness_anchors_slices_to_the_real_chain() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(1)).await;
 
@@ -218,7 +218,7 @@ async fn the_harness_anchors_slices_to_the_real_chain() {
 /// cached execution was computed somewhere this node is not.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_declaring_a_foreign_parent_is_not_published() {
-    let (harness, _node) = launch_flashblocks_node!(3, 3);
+    let (harness, _node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice_builder(1).parent_hash(B256::repeat_byte(0xff)).build()).await;
 
@@ -232,7 +232,7 @@ async fn a_slice_declaring_a_foreign_parent_is_not_published() {
 /// the head this node also has.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_on_the_canonical_head_is_published() {
-    let (harness, _node) = launch_flashblocks_node!(3, 3);
+    let (harness, _node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(1)).await;
     harness.send(base_slice_builder(2).prev(1, 0).build()).await;
@@ -250,7 +250,7 @@ async fn a_slice_on_the_canonical_head_is_published() {
 /// state, and `apply_flashblock` drops the overlay for any rejected build.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_build_after_a_rejected_build_carries_only_its_own_transaction() {
-    let (harness, _node) = launch_flashblocks_node!(3, 3);
+    let (harness, _node) = launch_flashblocks_consumer!(3, 3);
 
     // A first build of block 1 carrying one transaction beyond the mandatory
     // L1-attributes deposit.

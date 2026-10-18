@@ -1,11 +1,11 @@
-//! P6 in-process EVM tests for the preconf fork (`PreconfPayloadBuilder`).
+//! In-process tests for the preconf fork (`PreconfPayloadBuilder`): the parts
+//! that need no EVM — fixture wiring, provider seeding, signing and the queue
+//! round-trip. Shared fixtures live in [`mod fixtures`].
 //!
-//! This file holds the 6 EVM tests carry-over from P5f Step 9; shared
-//! fixtures live in [`mod fixtures`].
-//!
-//! Step 2 (this commit): harness scaffolding + a wiring smoke test
-//! that proves the test crate compiles and all fixture helpers are
-//! callable. Steps 3-8 will land the 6 real tests one at a time.
+//! Anything that executes a transaction needs a `BlockBuilder` over real
+//! state, which the in-process `MockEthProvider` stack cannot stand up. Those
+//! scenarios run against a launched node in `mantle-reth-integration-tests`
+//! instead; the note at the end of this file says where each one went.
 
 // Integration tests can't `pub` items meaningfully (the test crate is
 // not a library), but the fixture helpers still want `pub` so they're
@@ -105,7 +105,8 @@ fn step3_seed_pattern_verifies_provider_serves_header_and_balance() {
 /// Together these cover everything the **non-EVM** parts of the fork
 /// rely on. Verifying the actual EVM `apply_preconf_tx` call requires
 /// a working `BlockBuilder` over real state — fundamentally a devnet
-/// concern, not an in-process unit test (see "EVM apply gap" below).
+/// concern, not an in-process unit test (see the note at the end of
+/// this file).
 #[tokio::test]
 async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
     use alloy_consensus::TxEnvelope;
@@ -176,76 +177,21 @@ async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
     assert_eq!(by_index.hash, *tx.tx_hash());
 }
 
-// ── EVM apply gap ──────────────────────────────────────────────────
+// ── Where the EVM scenarios went ─────────────────────────────────────
 //
-// The 6 EVM tests below remain `#[ignore]` until a follow-up phase
-// (Step 9 / P6.5 — devnet-driven) provides a real BlockBuilder over a
-// seeded State<DB>. In the in-process MockEthProvider stack we cannot
-// realistically:
+// Each of these needs a transaction actually applied, so each runs against a
+// launched node in `mantle-reth-integration-tests` (`tests/preconf/`):
 //
-// - Seed the L1 block contract code + storage (would need to embed the compiled OP system contracts
-//   as test fixtures, ~50 KB each)
-// - Stand up a `BlockBuilder` over `MockEthProvider`'s state (the trait integration goes through
-//   ConfigurePostExecEvm which constructs a real `OpEvm` — needs production state-provider impl)
-//
-// What WAS verified in this session (Step 1-4):
-// - Fork mode preserves type signatures (cli wiring compiles)
-// - Fifo state machine + responder ownership (109 lib unit tests)
-// - Dispatch closure invocation + branching (4 dispatch tests)
-// - PayloadJob future semantics + flashblock-prep watch handling (5 payload_job tests, candidate-A
-//   refactor)
-// - Test harness fixture wiring (Step 2)
-// - Provider seed pattern (Step 3)
-// - Signing + fifo integration + tx conversion path (Step 4 — this commit)
-//
-// What remains for real EVM apply verification:
-// - Either: build a `BlockBuilder` over MockEthProvider with the missing system-contract seeds
-//   (significant, ~500-800 LoC fixture)
-// - Or: drop into devnet-level integration testing (P6.5 — outside P6 in-process scope)
-//
-// The 6 `#[ignore]`d tests below remain as documented design intent
-// for that future work; their bodies are pre-fleshed unimplemented!()
-// to keep the test surface complete.
-
-#[test]
-#[ignore = "Real EVM apply requires BlockBuilder over seeded state; see EVM apply gap note above. \
-            Verifies receipt.gas_used == real EVM usage (~21000 for transfer)"]
-fn apply_preconf_tx_on_top_of_sequencer_state_produces_receipt_with_real_gas() {
-    // Skeleton — see EVM apply gap note above.
-    unimplemented!("requires real BlockBuilder over seeded State<DB>");
-}
-
-#[test]
-#[ignore = "Step 5 (TODO): two preconf-txs from same sender (nonce N, N+1); \
-            second tx's receipt must see the first's state changes"]
-fn two_preconf_txs_compound_state_changes() {
-    unimplemented!("see ignore reason");
-}
-
-#[test]
-#[ignore = "Step 6 (TODO): tx that reverts (e.g. SSTORE to protected slot); \
-            verify receipt.status == false + revert_data non-empty"]
-fn preconf_tx_revert_yields_status_false_with_revert_data() {
-    unimplemented!("see ignore reason");
-}
-
-#[test]
-#[ignore = "Step 7 (TODO): apply 1 preconf-tx, then signal cancel; \
-            finalize must seal a block containing exactly that tx"]
-fn cancel_during_select_seals_partial_block() {
-    unimplemented!("see ignore reason");
-}
-
-#[test]
-#[ignore = "Step 8 (TODO): pool best-tx mock with 1 normal tx + fifo with 1 preconf-tx; \
-            sealed block must contain both, receipts root reflects compound state"]
-fn preconf_and_best_txs_share_state() {
-    unimplemented!("see ignore reason");
-}
-
-#[test]
-#[ignore = "Step 9 (TODO): entry with inserted_at past timeout-margin; \
-            apply skipped, cancel_responder Timeout, tx not in sealed block"]
-fn pre_apply_deadline_skip_excludes_tx_from_block() {
-    unimplemented!("see ignore reason");
-}
+// - receipt `gas_used` is the chain's figure, not the EVM's raw one:
+//   `full_receipt.rs` `preconf_receipt_matches_sealed_receipt`
+// - same sender, consecutive nonces, the second seeing the first's state:
+//   `happy_path.rs` `multi_nonce_same_sender_land_in_one_block`
+// - a revert is `status == 0` with the gas still charged:
+//   `full_receipt.rs` `revert_tx_receipt_matches_sealed_receipt`
+// - cancelling after one apply seals a block holding that transaction:
+//   `happy_path.rs` `success_returns_receipt_and_lands_on_chain`
+// - a preconf and a pool transaction share one block's state:
+//   `race_pool_arm.rs` `preconf_and_pool_txs_coexist_in_one_block`
+// - an entry past the dispatch deadline is skipped, answered `Timeout`, and
+//   kept out of the sealed block:
+//   `timeout.rs` `dispatch_safety_margin_marks_timeout_before_apply`

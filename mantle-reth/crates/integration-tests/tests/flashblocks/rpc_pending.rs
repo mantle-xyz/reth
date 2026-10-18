@@ -11,7 +11,7 @@ use mantle_reth_flashblocks::EthApiOverrideServer;
 use crate::consumer_helpers::{
     DEPLOY_INIT_CODE, DEPLOYED_RUNTIME, FlashblockBuilder, LOGGER, SETTER, SETTER_SLOT,
     SETTER_UNWRITTEN_SLOT, SETTER_UNWRITTEN_VALUE, SETTER_VALUE, l1_info_deposit,
-    launch_flashblocks_node, signed_call, signed_deploy, test_sender,
+    launch_flashblocks_consumer, signed_call, signed_deploy, test_sender,
 };
 
 /// Value the overlay's user transaction moves into [`LOGGER`].
@@ -51,7 +51,7 @@ macro_rules! overlay_with_user_call {
 /// through to the standard implementation when there is none.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_block_by_number_serves_the_overlay_and_passes_pending_through() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let fallback = api
@@ -80,7 +80,7 @@ async fn get_block_by_number_serves_the_overlay_and_passes_pending_through() {
 /// `eth_getBlockTransactionCountByNumber("pending")` counts the overlay's tip block.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_block_transaction_count_counts_the_overlay_tip() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
@@ -96,7 +96,7 @@ async fn get_block_transaction_count_counts_the_overlay_tip() {
 /// A transaction that exists only in the overlay is served by hash, with a receipt.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_in_the_overlay_is_served_by_hash_and_has_a_receipt() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let tx_hash = overlay_with_user_call!(harness);
@@ -120,7 +120,7 @@ async fn a_transaction_in_the_overlay_is_served_by_hash_and_has_a_receipt() {
 /// `eth_getBalance` sees the overlay's transfer under `pending` only.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_balance_sees_the_overlay_only_under_pending() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
@@ -137,7 +137,7 @@ async fn get_balance_sees_the_overlay_only_under_pending() {
 /// `eth_getTransactionCount` adds the overlay's nonce bumps to the canonical count.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_transaction_count_adds_the_overlay_to_canonical() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
@@ -158,7 +158,7 @@ async fn get_transaction_count_adds_the_overlay_to_canonical() {
 /// `eth_getLogs` appends the overlay's logs when the range ends at `pending`.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_logs_appends_the_overlay_when_the_range_ends_at_pending() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
@@ -188,7 +188,7 @@ async fn get_logs_appends_the_overlay_when_the_range_ends_at_pending() {
 /// `EXTCODESIZE` report 1 for a plain wallet, which flips every `isContract()` guard.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_touched_account_without_code_stays_without_code_in_the_overrides() {
-    let (harness, _node) = launch_flashblocks_node!(3, 3);
+    let (harness, _node) = launch_flashblocks_consumer!(3, 3);
 
     overlay_with_user_call!(harness);
 
@@ -214,7 +214,7 @@ async fn a_touched_account_without_code_stays_without_code_in_the_overrides() {
 async fn get_logs_at_pending_without_an_overlay_passes_through() {
     use crate::consumer_helpers::mine_canonical_block;
 
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let raw = signed_call(0, LOGGER, VALUE).await;
@@ -236,7 +236,7 @@ async fn get_logs_at_pending_without_an_overlay_passes_through() {
 /// `eth_call` at `pending` executes against the overlay's state overrides.
 #[tokio::test(flavor = "multi_thread")]
 async fn call_at_pending_executes_against_the_overlay_state() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
@@ -261,7 +261,7 @@ async fn call_at_pending_executes_against_the_overlay_state() {
 /// funded only there can be estimated for.
 #[tokio::test(flavor = "multi_thread")]
 async fn estimate_gas_at_pending_sees_the_overlay_balance() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
@@ -295,7 +295,7 @@ async fn estimate_gas_at_pending_sees_the_overlay_balance() {
 /// outcome if the override arrived.
 #[tokio::test(flavor = "multi_thread")]
 async fn estimate_gas_honours_a_block_override() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
@@ -330,7 +330,7 @@ async fn estimate_gas_honours_a_block_override() {
 /// `eth_sendRawTransactionSync` rejects a timeout above the configured ceiling.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_raw_transaction_sync_rejects_an_overlong_timeout() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let raw = signed_call(0, LOGGER, VALUE).await;
@@ -342,7 +342,7 @@ async fn send_raw_transaction_sync_rejects_an_overlong_timeout() {
 /// `eth_sendRawTransactionSync` returns once the transaction shows up in a slice.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_raw_transaction_sync_returns_the_flashblock_receipt() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let raw = signed_call(0, LOGGER, VALUE).await;
@@ -378,7 +378,7 @@ macro_rules! overlay_with_storage_write {
 /// `eth_getStorageAt` sees the overlay's write under `pending` only.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_storage_at_sees_the_overlay_only_under_pending() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_storage_write!(harness);
@@ -404,7 +404,7 @@ async fn get_storage_at_sees_the_overlay_only_under_pending() {
 /// proof is `get_storage_at_sees_the_overlay_only_under_pending`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unwritten_slot_of_a_touched_account_falls_back_to_canonical() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_storage_write!(harness);
@@ -424,7 +424,7 @@ async fn an_unwritten_slot_of_a_touched_account_falls_back_to_canonical() {
 /// `eth_getCode` at `pending` serves a contract that exists only in the overlay.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_code_serves_a_contract_the_overlay_deployed() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let raw = signed_deploy(0, DEPLOY_INIT_CODE).await;
@@ -454,7 +454,7 @@ async fn get_code_serves_a_contract_the_overlay_deployed() {
 /// only on a wrong one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wallet_touched_by_the_overlay_still_has_no_code_at_pending() {
-    let (harness, node) = launch_flashblocks_node!(3, 3);
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);

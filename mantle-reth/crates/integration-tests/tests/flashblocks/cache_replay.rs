@@ -6,14 +6,14 @@
 
 use crate::consumer_helpers::{
     FlashblockBuilder, base_slice, base_slice_builder, commit_submitted_block,
-    launch_flashblocks_node, mine_canonical_block as mine, submit_uncommitted_block,
+    launch_flashblocks_consumer, mine_canonical_block as mine, submit_uncommitted_block,
 };
 
 /// A slice whose canonical parent has not been imported yet is parked, then
 /// replayed when that parent arrives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_ahead_of_canonical_is_replayed_once_its_parent_lands() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     // Block 1 is built and submitted, so its hash is real, but it is not yet
     // canonical — mirroring a sequencer that has already built the block while
@@ -36,7 +36,7 @@ async fn a_slice_ahead_of_canonical_is_replayed_once_its_parent_lands() {
 /// rather than dropped, and replays once canonical reaches its parent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_base_slice_for_a_skipped_block_is_parked_and_resumes_the_overlay() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(1)).await;
 
@@ -67,7 +67,7 @@ async fn a_base_slice_for_a_skipped_block_is_parked_and_resumes_the_overlay() {
 /// that does continue the tracked sequence still extends it.
 #[tokio::test(flavor = "multi_thread")]
 async fn parking_a_skipped_block_does_not_disturb_the_overlay() {
-    let (harness, _node) = launch_flashblocks_node!(3, 3);
+    let (harness, _node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(1)).await;
     harness.send(base_slice(3)).await;
@@ -82,7 +82,7 @@ async fn parking_a_skipped_block_does_not_disturb_the_overlay() {
 /// anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_slice_is_evicted_when_canonical_passes_it() {
-    let (harness, mut node) = launch_flashblocks_node!(3, 3);
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
 
     harness.send(base_slice(2)).await;
     assert!(harness.pending().is_none());
