@@ -133,26 +133,34 @@ lint: fmt clippy
 # plus ALL Mantle integration suites (offline `replay`/`token_ratio_midblock` and the
 # node-spawning `it` harness, incl. the estimate_total_fee token_ratio regression).
 #
-# Two invocations on purpose: `-p mantle-reth-integration-tests --tests` runs *every*
-# test target of that crate, so newly-added suites are covered automatically without
-# editing a name list — and it is scoped to the Mantle crate, so it does NOT pull in
-# the ~24 upstream op-reth integration tests a bare `--workspace --tests` would.
-# Measured: the second invocation only re-links the Mantle test binaries (~45s, no
-# op-reth/revm/alloy recompile), so the resolver thrash this previously feared does
-# not occur for this lib-then-tests ordering.
+# `--lib --bins`, not `--lib`: `--lib` never compiles a crate's `main.rs`, so a bin
+# crate's own `mod tests` (ws-proxy's startup-argument checks live there) would run
+# nowhere and the gap would not show — the run still prints `N passed`.
+#
+# Separate invocations on purpose: `-p mantle-reth-integration-tests --tests` runs
+# *every* test target of that crate, so newly-added suites are covered automatically
+# without editing a name list — and it is scoped to the Mantle crate, so it does NOT
+# pull in the ~24 upstream op-reth integration tests a bare `--workspace --tests`
+# would. The price is paid in CI: the `-p` invocations resolve features differently
+# from `--workspace`, so each recompiles a slice of alloy/revm/reth (measured on
+# 2026-10-16, run 38862570322: 889 + 317 + 202 crates across the first three).
 #
 # Doctests run here too, but with DEFAULT features so they reuse the codegen from the
 # `--lib` build above (~30s incremental). The exhaustive `--all-features` doctest pass
 # is a full from-scratch build (~11min) and stays in nightly (`just test-doc`).
 #
-# The node-spawning integration tests run under nextest with `--retries 2`: an
-# irreducible ~1-in-8 timing blip hits a different test each run (systematic
-# classes are already code-fixed), and retries absorb it while still reporting
-# any flaky-passed test. Doctests stay on `cargo test` (nextest can't run them).
+# The node-spawning integration tests run under nextest; its retries and JUnit
+# report are set in `.config/nextest.toml`, so a pass on a retry is reported the
+# same way here and in CI (`FLAKY` in the summary, a warning on the CI run page).
+# Doctests stay on `cargo test` (nextest can't run them).
+#
+# CI wall clock, same run: 57 min, of which ~54 min is compilation and 2.6 min is
+# nextest running its 267 tests. `ci.yml`'s `timeout-minutes` is sized against the
+# compile, not the test count.
 test-ci:
-  cargo test --workspace --lib
+  cargo test --workspace --lib --bins
   cargo test -p mantle-reth-cli --test build_version
-  cargo nextest run -p mantle-reth-integration-tests --tests --retries 2
+  cargo nextest run -p mantle-reth-integration-tests --tests
   cargo test --doc --workspace
 
 # Run the full local test suite (examples + benches + all features)
