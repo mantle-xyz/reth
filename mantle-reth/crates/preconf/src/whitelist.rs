@@ -960,15 +960,14 @@ pub async fn run_whitelist_watcher<Pr, N>(
     let mut retry_pending = false;
 
     loop {
-        // Carried out of the match because the failure log below reports it,
-        // and a gap has no notification to ask.
-        let reverted;
-        match receiver.recv().await {
+        // The failure log below reports whether this pass was triggered by a
+        // reorg; a gap has no notification to ask, so it answers `false`.
+        let reverted = match receiver.recv().await {
             Ok(notif) => {
                 if !should_reload(&notif, contract) && !retry_pending {
                     continue;
                 }
-                reverted = notif.reverted().is_some();
+                notif.reverted().is_some()
             }
             // A gap may have carried the governance event this watcher exists
             // for, and there is no way to ask which blocks were skipped. So
@@ -987,10 +986,10 @@ pub async fn run_whitelist_watcher<Pr, N>(
                     "canonical notifications dropped; reloading the allowlist in case one \
                      carried a governance event"
                 );
-                reverted = false;
+                false
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        }
+        };
 
         match reload_whitelist(&provider, &cfg, &classifier) {
             Ok(()) => {

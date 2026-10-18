@@ -174,7 +174,7 @@ mod tests {
             "premise: nothing has observed it yet",
         );
 
-        metrics::with_local_recorder(&recorder, || Metrics::init());
+        metrics::with_local_recorder(&recorder, Metrics::init);
 
         let after = handle.render();
         assert!(
@@ -195,7 +195,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
 
-        metrics::with_local_recorder(&recorder, || Metrics::init());
+        metrics::with_local_recorder(&recorder, Metrics::init);
 
         assert!(
             !handle.render().contains("flashblocks_consumer_block_processing_duration"),
