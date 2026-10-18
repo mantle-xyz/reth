@@ -288,11 +288,11 @@ async fn estimate_gas_at_pending_sees_the_overlay_balance() {
 
 /// The override version of `eth_estimateGas` has to honour `blockOverrides`.
 ///
-/// It is declared with three parameters where upstream takes four, so a
-/// caller's fourth argument never reaches the estimate — no error, just an
-/// answer computed against the unmodified block. Pinned with a block gas
-/// limit below the intrinsic cost of a transfer, which can only change the
-/// outcome if the override arrived.
+/// It once declared three parameters where upstream takes four, so a caller's
+/// fourth argument never reached the estimate — no error, just an answer
+/// computed against the unmodified block. Pinned with a block gas limit below
+/// the intrinsic cost of a transfer, which can only change the outcome if the
+/// override arrived.
 #[tokio::test(flavor = "multi_thread")]
 async fn estimate_gas_honours_a_block_override() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);

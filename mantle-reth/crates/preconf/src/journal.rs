@@ -99,8 +99,12 @@ pub struct JournalEntry {
     /// replacing their own pending transaction lands in the branch that
     /// reports a receipt nobody can honour.
     ///
-    /// Absent from files written before pool transactions were journaled.
-    /// Those need no guess: every record in them is a commitment.
+    /// Absent from files written before this field existed. Those files hold
+    /// both kinds — the slice path journaled pool transactions before it said
+    /// which were which — and nothing in a record tells them apart, so every
+    /// one is read as a commitment: the kind that is never dropped. The cost
+    /// is on the first restart after an upgrade only, and is what the apply
+    /// path has always done with such a record.
     #[serde(default = "promised_by_default")]
     pub kind: ClaimKind,
 }

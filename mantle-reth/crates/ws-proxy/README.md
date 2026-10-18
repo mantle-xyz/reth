@@ -63,6 +63,13 @@ the downstream listener are plaintext `ws://`, and an API key travels in the
 URL path in the clear. The network has to be the trust boundary; no
 configuration makes it otherwise. The proxy says so in a startup warning.
 
+**Run it behind an ingress or load balancer, and let that layer bound the
+connection before the upgrade.** The proxy's own limits — `--instance-connection-limit`
+and `--per-ip-connection-limit` — are applied once a request has been parsed,
+so a connection that never finishes sending its headers is not counted by
+either. Header read timeouts and a cap on open connections are the front
+layer's job; the proxy does not implement them.
+
 ## Routing depends on whether keys are configured
 
 Authentication decides the base routes; `--public-access-enabled` adds the

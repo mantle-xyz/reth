@@ -171,6 +171,11 @@ test:
 test-doc:
   cargo test --doc --workspace --all-features
 
+# Tests quarantined with `#[ignore]` for failing under parallel load only. Run
+# serially (`--test-threads=1`) they are deterministic; nightly runs this.
+test-quarantined:
+  cargo test -p mantle-reth-integration-tests --test preconf -- --ignored --test-threads=1
+
 # Full pre-PR check: lint + CI tests + doc tests (use `just test` for the exhaustive suite)
 pr: lint test-ci test-doc
 

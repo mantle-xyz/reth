@@ -50,6 +50,9 @@ FROM ubuntu:24.04 AS runtime
 #    downstream listener can use `wss://` — both ends must be plaintext `ws://`
 #    on a trusted network. Adding a TLS feature is what would make certificates
 #    necessary; installing them first would only make the image look capable.
+#    The same front layer that terminates TLS is expected to bound connections
+#    before the websocket upgrade (header read timeout, open-connection cap):
+#    the proxy's own limits apply only to requests it has finished parsing.
 #  - No init shim: the binary installs SIGINT/SIGTERM handlers itself
 #    (`main.rs`), so it shuts down cleanly as PID 1, and it spawns no child
 #    processes, so there are no zombies to reap.

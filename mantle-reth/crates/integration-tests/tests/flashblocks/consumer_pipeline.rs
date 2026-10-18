@@ -21,9 +21,14 @@ macro_rules! launch {
 }
 
 /// Payload id of a second build of a block. Slices built by [`FlashblockBuilder`]
-/// default to `PayloadId::default()`, so a rebuild has to say it is one: two
-/// payload jobs never share an id, and a test that lets them share it is asking
-/// about an input the sequencer cannot produce.
+/// default to `PayloadId::default()`, so a rebuild has to say it is one.
+///
+/// A real rebuild can carry the *same* id: the engine derives it from the
+/// parent and the attributes, and op-node retries a height with the
+/// attributes unchanged. The consumer then does not see a rebuild — the base
+/// slice at index 0 reads as a sequence fault, the overlay is cleared, and the
+/// block stays dark until the next one. That is fail-safe and left as is; what
+/// these tests cover is the id-changing rebuild, where the consumer can follow.
 fn rebuild_id() -> PayloadId {
     PayloadId::new([0xff; 8])
 }

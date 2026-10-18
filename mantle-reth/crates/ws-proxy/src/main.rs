@@ -74,7 +74,8 @@ struct Args {
     #[arg(long, env, value_delimiter = ',', value_parser = TrustedProxyConfig::parse_cidr)]
     trusted_proxy_cidrs: Vec<IpNet>,
 
-    /// API keys as `<app>:<key>` pairs. Absent leaves the endpoint unauthenticated.
+    /// API keys as `<app>:<key>` pairs. Required unless `--public-access-enabled`
+    /// says the network in front of the proxy is the access control.
     #[arg(long, env, value_delimiter = ',')]
     api_keys: Vec<String>,
 

@@ -491,10 +491,10 @@ mod tests {
 /// quiet chain.
 ///
 /// The tests below populate `metadata.receipts` by hand, so they lock the
-/// matching logic without showing that filtering works end to end. If a
-/// producer ever starts filling that map,
-/// `an_empty_receipts_map_matches_nothing` is the test that should fail —
-/// that is the signal, not a regression.
+/// matching logic without showing that filtering works end to end. None of
+/// them goes through a producer, so none will notice when a producer starts
+/// filling that map; that is the point at which `--enable-filters` can be
+/// turned on, and the end-to-end check belongs with that change.
 #[cfg(test)]
 mod mantle_shape {
     use alloy_consensus::Receipt;

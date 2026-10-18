@@ -30,8 +30,8 @@
 //!
 //! - `state_root` — never computed for a slice; the producer sends zero.
 //! - `withdrawals_root` — post-Isthmus the `L2ToL1MessagePasser` storage root. The producer sends
-//!   the *parent's*, which is stale on any block containing a withdrawal; [`BlockAssembler`]
-//!   replaces it with zero.
+//!   zero too, and [`BlockAssembler`] writes zero whatever arrives: a figure here would be a
+//!   well-formed root for a block that is not finished.
 //!
 //! Zero is safe to read as "not computed" because `EMPTY_ROOT_HASH` is
 //! `0x56e81f17…` — no state produces a zero root, so the sentinel cannot be

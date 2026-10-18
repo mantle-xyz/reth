@@ -22,11 +22,10 @@ use crate::{ExecutionError, ProtocolError, Result};
 /// slice carries the transactions), and not to be believed without a local
 /// replay that would compute it anyway.
 ///
-/// Zero rather than the producer's figure for the same reason `state_root` is
+/// Zero rather than the wire's figure for the same reason `state_root` is
 /// zero here: `EMPTY_ROOT_HASH` is `0x56e81f17…`, so zero is not a root any
-/// state can produce and cannot be mistaken for one. The producer currently
-/// sends the *parent's* root — well-formed, stale on any block containing a
-/// withdrawal, and indistinguishable from a correct answer.
+/// state can produce and cannot be mistaken for one. The producer sends zero
+/// as well; not reading the field keeps that true of a producer that does not.
 const fn withdrawals_root_of_a_prefix() -> B256 {
     B256::ZERO
 }
