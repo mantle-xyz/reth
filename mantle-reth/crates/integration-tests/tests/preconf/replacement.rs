@@ -4,8 +4,8 @@
 //!
 //! 1. {existing fifo state} × {new submission kind} — the 2×2 below.
 //! 2. **{replacement passes its own checks} × {replacement is itself rejected}** —
-//!    `rejected_replacement_leaves_the_reclaimable_holder_intact`. Deciding a holder is reclaimable
-//!    must not tear it down before the newcomer has cleared its own gates.
+//!    `ending_a_commitment_releases_its_slot_and_a_rejected_successor_adds_nothing`. A rejected
+//!    successor must leave no record and claim no slot.
 //!
 //! ---
 //!
@@ -61,38 +61,19 @@ use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
 const RECIPIENT: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
+/// A 21k transfer of 1 wei. A replacement that needs a different hash signs
+/// its own request with another `value`; no fee bump is involved, because
+/// admission has no transaction pool and reth's price-bump rule is never on
+/// this path.
 async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_primitives::Bytes {
-    signed_transfer_with(chain_id, wallet, nonce, U256::from(1u64)).await
-}
-
-/// `signed_transfer` with an explicit value, so two txs can share
-/// `(sender, nonce)` while hashing differently.
-async fn signed_transfer_with(
-    chain_id: u64,
-    wallet: &Wallet,
-    nonce: u64,
-    value: U256,
-) -> alloy_primitives::Bytes {
-    signed_transfer_bumped(chain_id, wallet, nonce, value, 20e9 as u128).await
-}
-
-/// `signed_transfer_with` plus an explicit gas price, so a replacement can
-/// clear reth's own price-bump rule and actually reach the preconf guard.
-async fn signed_transfer_bumped(
-    chain_id: u64,
-    wallet: &Wallet,
-    nonce: u64,
-    value: U256,
-    fee: u128,
-) -> alloy_primitives::Bytes {
     let request = TransactionRequest {
         chain_id: Some(chain_id),
         nonce: Some(nonce),
         to: Some(TxKind::Call(RECIPIENT.parse().unwrap())),
         gas: Some(21_000),
-        max_fee_per_gas: Some(fee),
-        max_priority_fee_per_gas: Some(fee),
-        value: Some(value),
+        max_fee_per_gas: Some(20e9 as u128),
+        max_priority_fee_per_gas: Some(20e9 as u128),
+        value: Some(U256::from(1u64)),
         input: TransactionInput::default(),
         ..Default::default()
     };
@@ -517,7 +498,7 @@ async fn canceled_slot_replaceable_by_different_hash() {
 ///
 /// Guards the "Failed is in the replacement release set" invariant
 /// end-to-end — the unit test
-/// `preconf_tx_set::tests::push_conflict_after_failed_evicts_and_inserts`
+/// `preconf_tx_set::tests::a_failed_commitment_releases_its_slot_at_once`
 /// covers the fifo-layer state transition; this test covers the wire
 /// contract through validator + pool + fifo + dispatch.
 ///

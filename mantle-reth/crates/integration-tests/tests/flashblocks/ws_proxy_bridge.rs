@@ -47,7 +47,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::{CancellationToken, DropGuard};
 use url::Url;
 
-use crate::consumer_helpers::base_slice;
+use crate::consumer_helpers::FlashblockBuilder;
 
 /// Awaits one item, failing the test rather than hanging.
 async fn recv_next<T>(receiver: &mut UnboundedReceiver<T>) -> T {
@@ -75,11 +75,10 @@ enum Upstream {
     Close,
 }
 
-/// [`base_slice`] for `block_number`, as a frame the stub sequencer sends.
-fn slice_frame(block_number: u64) -> Upstream {
-    Upstream::Frame(WsMessage::text(
-        serde_json::to_string(&base_slice(block_number)).expect("serialise slice"),
-    ))
+/// The slice at `(block_number, index)`, as the sequencer would send it.
+fn slice_frame(block_number: u64, index: u64) -> Upstream {
+    let slice = FlashblockBuilder::new(block_number, index).build();
+    Upstream::Frame(WsMessage::text(serde_json::to_string(&slice).expect("serialise slice")))
 }
 
 /// A stub sequencer the test drives frame by frame.
@@ -285,8 +284,8 @@ async fn plaintext_slices_reach_the_consumer_through_the_proxy() {
     let mut slices = subscribe(proxy.url.clone(), NO_PINGS);
     proxy.await_client().await;
 
-    sequencer.send(slice_frame(1)).expect("stub sequencer accepts frames");
-    sequencer.send(slice_frame(2)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(1, 0)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(2, 0)).expect("stub sequencer accepts frames");
 
     assert_eq!(recv_next(&mut slices).await.metadata.block_number, 1);
     assert_eq!(recv_next(&mut slices).await.metadata.block_number, 2);
@@ -303,7 +302,7 @@ async fn brotli_frames_reach_the_consumer_through_the_proxy() {
     let mut slices = subscribe(proxy.url.clone(), NO_PINGS);
     proxy.await_client().await;
 
-    sequencer.send(slice_frame(3)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(3, 0)).expect("stub sequencer accepts frames");
 
     assert_eq!(recv_next(&mut slices).await.metadata.block_number, 3);
 }
@@ -320,13 +319,13 @@ async fn an_idle_consumer_is_ponged_and_keeps_its_connection() {
     let mut slices = subscribe(proxy.url.clone(), Duration::from_millis(200));
     proxy.await_client().await;
 
-    sequencer.send(slice_frame(1)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(1, 0)).expect("stub sequencer accepts frames");
     assert_eq!(recv_next(&mut slices).await.metadata.block_number, 1);
 
     // Several ping intervals with no traffic in either direction.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
-    sequencer.send(slice_frame(2)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(2, 0)).expect("stub sequencer accepts frames");
     assert_eq!(
         recv_next(&mut slices).await.metadata.block_number,
         2,
@@ -350,17 +349,18 @@ async fn the_proxy_resumes_upstream_without_disturbing_the_consumer() {
 
     assert_eq!(recv_next(&mut uris).await, "/ws", "the first connection has no position to resume");
 
-    sequencer.send(slice_frame(5)).expect("stub sequencer accepts frames");
-    assert_eq!(recv_next(&mut slices).await.metadata.block_number, 5);
+    sequencer.send(slice_frame(5, 2)).expect("stub sequencer accepts frames");
+    let delivered = recv_next(&mut slices).await;
+    assert_eq!((delivered.metadata.block_number, delivered.index), (5, 2));
 
     sequencer.send(Upstream::Close).expect("stub sequencer accepts instructions");
     assert_eq!(
         recv_next(&mut uris).await,
-        "/ws?block_number=5&flashblock_index=0",
+        "/ws?block_number=5&flashblock_index=2",
         "the proxy's reconnect must name the last slice it received",
     );
 
-    sequencer.send(slice_frame(6)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(6, 0)).expect("stub sequencer accepts frames");
     assert_eq!(
         recv_next(&mut slices).await.metadata.block_number,
         6,
@@ -384,7 +384,7 @@ async fn a_resume_request_from_the_consumer_is_accepted_and_ignored() {
     let proxy = spawn_proxy(upstream, false).await;
 
     // Delivered before any client is attached, so it is genuinely missed.
-    sequencer.send(slice_frame(10)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(10, 0)).expect("stub sequencer accepts frames");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let resuming =
@@ -392,7 +392,7 @@ async fn a_resume_request_from_the_consumer_is_accepted_and_ignored() {
     let mut slices = subscribe(resuming, NO_PINGS);
     proxy.await_client().await;
 
-    sequencer.send(slice_frame(11)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(11, 0)).expect("stub sequencer accepts frames");
     assert_eq!(
         recv_next(&mut slices).await.metadata.block_number,
         11,
@@ -425,15 +425,16 @@ async fn the_consumer_authenticates_by_url_and_keeps_the_key_across_a_reconnect(
     proxy.await_client().await;
 
     assert_eq!(recv_next(&mut uris).await, "/ws");
-    sequencer.send(slice_frame(1)).expect("stub sequencer accepts frames");
-    assert_eq!(recv_next(&mut slices).await.metadata.block_number, 1);
+    sequencer.send(slice_frame(1, 1)).expect("stub sequencer accepts frames");
+    let delivered = recv_next(&mut slices).await;
+    assert_eq!((delivered.metadata.block_number, delivered.index), (1, 1));
 
     // Drop the upstream so the proxy reconnects; the consumer's own connection
     // to the proxy is untouched and must keep delivering.
     sequencer.send(Upstream::Close).expect("stub sequencer accepts instructions");
-    assert_eq!(recv_next(&mut uris).await, "/ws?block_number=1&flashblock_index=0");
+    assert_eq!(recv_next(&mut uris).await, "/ws?block_number=1&flashblock_index=1");
 
-    sequencer.send(slice_frame(2)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(2, 0)).expect("stub sequencer accepts frames");
     assert_eq!(
         recv_next(&mut slices).await.metadata.block_number,
         2,
@@ -460,7 +461,7 @@ async fn a_consumer_without_the_key_in_its_url_never_receives_a_slice() {
 
     // Let the subscriber attempt its connection and back off.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    sequencer.send(slice_frame(1)).expect("stub sequencer accepts frames");
+    sequencer.send(slice_frame(1, 0)).expect("stub sequencer accepts frames");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert!(slices.try_recv().is_err(), "an unauthenticated consumer must receive nothing");

@@ -486,6 +486,12 @@ mod reorg_tests {
             Some(hash),
             "the slot is kept, or a replacement could take the nonce",
         );
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.map(|entry| entry.source),
+            Some(PreconfSource::Replay),
+            "it goes back as a commitment being honoured, not a fresh request: the dispatch \
+             gates that protect a waiting client must not apply to it",
+        );
     }
 
     /// The build loop records every pool transaction it executes, so most of

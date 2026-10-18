@@ -53,12 +53,12 @@ fn shared_journal_path() -> (std::path::PathBuf, std::path::PathBuf) {
     (dir.join("preconf.journal"), dir)
 }
 
+/// What the journal holds, read the way the node reads it: a line that does
+/// not decode is skipped. An append cut short leaves one, and the next append
+/// closes it.
 fn read_journal(path: &std::path::Path) -> Vec<JournalEntry> {
     let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
-    raw.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<JournalEntry>(line).expect("valid JournalEntry line"))
-        .collect()
+    raw.lines().filter_map(|line| serde_json::from_str::<JournalEntry>(line).ok()).collect()
 }
 
 async fn signed_transfer(wallet: &Wallet, chain_id: u64, nonce: u64) -> Bytes {

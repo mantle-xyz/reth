@@ -481,6 +481,16 @@ async fn a_derivation_build_publishes_nothing() {
         "a derivation build published {} slices; it must publish none",
         slices.len(),
     );
+
+    // Same node, same subscriber, an ordinary build: this one has to publish,
+    // or the silence above says nothing about derivation.
+    let _payload = build_one_block!(node, Duration::from_millis(600));
+    let slices = drain(&mut subscriber, Duration::from_millis(500)).await;
+    assert!(
+        !slices.is_empty(),
+        "an ordinary build on the same node published nothing, so the derivation build's \
+         silence was never evidence",
+    );
 }
 
 /// The opening slice goes out before any pool or preconf transaction has been
