@@ -28,6 +28,7 @@ use alloy_primitives::{
     },
 };
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::warn;
 
@@ -113,7 +114,13 @@ impl Commitment {
 /// share a record, a slot and the must-land machinery. They differ in **who
 /// cleans up if the claim turns out false**, and the per-kind behaviour below
 /// follows from that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized into [`JournalEntry`](crate::journal::JournalEntry), so the
+/// variant names are an on-disk format: renaming one makes older journals
+/// unreadable. The explicit `rename_all` keeps the file independent of the
+/// Rust spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaimKind {
     /// Executed and announced on the slice stream, but no client holds a
     /// receipt. Consumers serve it as `pending` and reconcile on their own —

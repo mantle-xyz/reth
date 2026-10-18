@@ -302,6 +302,21 @@ pub enum PreconfError {
     /// wording is what clients already parse.
     #[error("pool rejected: cannot replace active preconf commitment for the same (sender, nonce)")]
     ReplaceActiveCommitment,
+    /// An **ordinary** transaction already took this `(sender, nonce)` in the
+    /// block being built — no preconfirmation is involved.
+    ///
+    /// Split out from [`Self::ReplaceActiveCommitment`] because that wording
+    /// names a commitment. The way to reach this one is the sender's own pool
+    /// transaction: the builder's pool arm executes it, stages it in the queue
+    /// and records an `Announced` claim, which is a commitment record in the
+    /// bookkeeping sense only — no client is parked on it and none was told.
+    /// The older message sent whoever read it hunting for a preconfirmation
+    /// that does not exist.
+    ///
+    /// Keeps the `pool rejected:` prefix for the same reason the variant above
+    /// does.
+    #[error("pool rejected: (sender, nonce) already used by a transaction in the block being built")]
+    NonceUsedByExecutedTx,
     /// The transaction's own `gas_limit` exceeds `preconf_max_gas_per_tx`, the
     /// operator's per-transaction ceiling for the preconf fast path.
     ///
@@ -486,6 +501,14 @@ mod tests {
         assert_eq!(
             PreconfError::ReplaceActiveCommitment.to_string(),
             "pool rejected: cannot replace active preconf commitment for the same (sender, nonce)",
+        );
+        // The same refusal when no preconfirmation is involved — the sender's
+        // own pool transaction already executed on the nonce. Both keep the
+        // `pool rejected:` prefix clients parse; only the clause after it says
+        // which situation this is.
+        assert_eq!(
+            PreconfError::NonceUsedByExecutedTx.to_string(),
+            "pool rejected: (sender, nonce) already used by a transaction in the block being built",
         );
 
         // --- borrowed from `eth_sendRawTransaction` ------------------------

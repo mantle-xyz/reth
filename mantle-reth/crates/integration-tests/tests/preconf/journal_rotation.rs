@@ -25,7 +25,7 @@ use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use mantle_reth_preconf::{JournalEntry, PreconfJournal};
+use mantle_reth_preconf::{ClaimKind, JournalEntry, PreconfJournal};
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
@@ -51,7 +51,7 @@ async fn signed_nonce0_transfer(
 }
 
 fn journal_entry(raw: &alloy_primitives::Bytes) -> JournalEntry {
-    JournalEntry { hash: keccak256(raw), tx_rlp: raw.clone(), block_height: 1, committed_at_ms: 0 }
+    JournalEntry { hash: keccak256(raw), tx_rlp: raw.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised }
 }
 
 /// Append three commitments (independent senders, each nonce 0), mark one

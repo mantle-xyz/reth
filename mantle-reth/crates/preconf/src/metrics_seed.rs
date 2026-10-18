@@ -40,8 +40,29 @@ const COUNTERS: &[&str] = &[
     "preconf.admit.rejected_gas_total",
     "preconf.admit.rejected_account_slots_total",
     "preconf.admit.rejected_delegated_total",
+    // The three policy rejections, as opposed to the capacity ones above.
+    // `rejected_not_eligible_total` is the one that matters: an allowlist
+    // misconfiguration is indistinguishable, from outside, from a node that
+    // is ignoring preconf requests.
+    "preconf.admit.rejected_tx_type_total",
+    "preconf.admit.rejected_not_eligible_total",
+    "preconf.admit.rejected_tx_gas_total",
+    // Restore-path losses. `restore_load_failed_total` is whole-file; the
+    // per-line counters beside it already existed, which is the asymmetry
+    // that made a total loss quieter than a single bad line.
+    "preconf.journal.restore_load_failed_total",
+    "preconf.journal.restore_bad_lines_total",
     "flashblocks.deadline_already_passed_total",
     "flashblocks.dropped_after_abandon_total",
+    // The two slice losses that used to leave only a WARN behind. Neither
+    // breaks the index chain — a subscriber sees fewer slices, not a gap —
+    // which is exactly why they need counting.
+    "flashblocks.slice_assembly_failed_total",
+    "flashblocks.slice_serialize_failed_total",
+    // Slices published for a block whose seal then failed. Zero on a healthy
+    // chain; non-zero means subscribers held a prefix of a block that does
+    // not exist, which the rebuild replaces but nothing else reports.
+    "flashblocks.slices_outliving_their_block_total",
     "flashblocks.unlanded_sweep_slow_total",
     "flashblocks.unlanded_nonce_unreadable_total",
     "flashblocks.slices_missed_by_slow_subscribers_total",
@@ -124,6 +145,9 @@ const GAUGES: &[&str] = &[
 /// drift test covers histograms too.
 const HISTOGRAMS: &[&str] = &[
     "flashblocks.byte_size",
+    // Isolates sealing from the wall-clock `publish_interval_ms`, which also
+    // contains publishing and idle waiting.
+    "flashblocks.slice_seal_duration_ms",
     "flashblocks.first_slice_offset_ms",
     "flashblocks.journal_write_duration_ms",
     "flashblocks.publish_interval_ms",

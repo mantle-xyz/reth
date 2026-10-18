@@ -14,7 +14,7 @@ use reth_optimism_payload_builder::{
 use reth_optimism_primitives::OpTransaction;
 use reth_primitives_traits::SignedTransaction;
 
-use crate::{journal::JournalEntry, preconf_tx_set::PreconfTxSet};
+use crate::{ClaimKind, journal::JournalEntry, preconf_tx_set::PreconfTxSet};
 
 /// Whether this transaction's nonce field is its sender's account nonce.
 ///
@@ -171,7 +171,7 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
             .iter()
             .map(|&at| {
                 let tx = &self.executed[at];
-                JournalEntry::for_executed(*tx.tx_hash(), tx, block_height)
+                JournalEntry::for_executed(*tx.tx_hash(), tx, block_height, ClaimKind::Announced)
             })
             .collect();
         self.journaled_upto = self.journalable.len();

@@ -49,7 +49,6 @@
 use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::foldhash::HashSet};
 use alloy_sol_types::{SolCall, sol};
-use futures::StreamExt;
 use reth_chain_state::{CanonStateNotification, CanonStateSubscriptions};
 use reth_execution_types::Chain;
 use reth_primitives_traits::NodePrimitives;
@@ -787,6 +786,16 @@ fn read_all_within(
 /// which means a new `--preconf.whitelist-contract`. The watcher repeats
 /// neither.
 ///
+/// **Both of those hold only because the contract cannot sit behind a proxy**,
+/// and that is a property of the contract rather than an assumption made here:
+/// `PreconfWhitelist.sol` writes `layoutVersion` in its **constructor**, with
+/// no `initialize()`. Deployed behind a proxy, the proxy's own storage would
+/// read `layoutVersion = 0` and `authorizedL1 = 0` — `onlyL1Gov` would be
+/// permanently unsatisfiable, and this bootstrap would refuse to start with
+/// `LayoutVersionMismatch { found: 0 }`. So a proxy upgrade cannot silently
+/// change the layout under a running node; it cannot be deployed at all.
+/// Reading the version once is sound for that reason, not by assumption.
+///
 /// It is not the only fatal check. `build_pool` (`mantle-reth-cli`) propagates
 /// every `Err` from here, so a [`WhitelistError::LayoutVersionMismatch`] or a
 /// failed read of the three lists aborts the launch just as hard. That is the
@@ -928,7 +937,14 @@ pub async fn run_whitelist_watcher<Pr, N>(
         return;
     };
 
-    let mut stream = provider.canonical_state_stream();
+    // The raw receiver, not `canonical_state_stream()`: that helper's `Stream`
+    // impl swallows `Lagged` internally and yields only notifications, so a
+    // gap is invisible here. A skipped `WhitelistUpdated` would then leave
+    // this node on a stale allowlist **indefinitely** — there is no timer and
+    // no polling, only `should_reload` and `retry_pending`, and neither fires
+    // for a notification that never arrived. Every gauge keeps reporting the
+    // last good read, so a stuck node is indistinguishable from a healthy one.
+    let mut receiver = provider.subscribe_to_canonical_state();
     info!(target: "mantle::preconf::whitelist", %contract, "whitelist watcher started");
 
     // How many refreshes in a row have failed. Published as a gauge because the
@@ -943,9 +959,37 @@ pub async fn run_whitelist_watcher<Pr, N>(
     // governance event, which on a quiet chain may never come.
     let mut retry_pending = false;
 
-    while let Some(notif) = stream.next().await {
-        if !should_reload(&notif, contract) && !retry_pending {
-            continue;
+    loop {
+        // Carried out of the match because the failure log below reports it,
+        // and a gap has no notification to ask.
+        let reverted;
+        match receiver.recv().await {
+            Ok(notif) => {
+                if !should_reload(&notif, contract) && !retry_pending {
+                    continue;
+                }
+                reverted = notif.reverted().is_some();
+            }
+            // A gap may have carried the governance event this watcher exists
+            // for, and there is no way to ask which blocks were skipped. So
+            // reload unconditionally rather than record the gap and move on:
+            // `reload_whitelist` reads `latest()` and is idempotent, which
+            // makes an unnecessary refresh free and a missed one impossible.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                metrics::counter!(
+                    "mantle.canon.notifications_lagged_total",
+                    "subscriber" => "preconf_whitelist",
+                )
+                .increment(1);
+                warn!(
+                    target: "mantle::preconf::whitelist",
+                    skipped,
+                    "canonical notifications dropped; reloading the allowlist in case one \
+                     carried a governance event"
+                );
+                reverted = false;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
 
         match reload_whitelist(&provider, &cfg, &classifier) {
@@ -965,7 +1009,7 @@ pub async fn run_whitelist_watcher<Pr, N>(
                 retry_pending = true;
                 warn!(
                     target: "mantle::preconf::whitelist",
-                    %err, %contract, reverted = notif.reverted().is_some(),
+                    %err, %contract, reverted,
                     consecutive_failures,
                     "whitelist refresh failed; keeping previous allowlists, retrying every block",
                 );

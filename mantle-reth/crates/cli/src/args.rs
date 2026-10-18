@@ -180,6 +180,15 @@ impl FlashblocksConsumerArgs {
             return Err(FlashblocksConsumerArgsError::ConflictingConsumers);
         }
 
+        // Checked here rather than through `with_subscriber_ping_interval`,
+        // which asserts: a refused flag should name itself to the operator,
+        // not abort the process.
+        let subscriber_ping_interval = match self.ping_interval_secs {
+            Some(0) => return Err(FlashblocksConsumerArgsError::ZeroPingInterval),
+            Some(secs) => Duration::from_secs(secs),
+            None => DEFAULT_SUBSCRIBER_PING_INTERVAL,
+        };
+
         Ok(Some(FlashblocksConfig {
             websocket_url,
             max_trailing_depth: self.max_trailing_depth.unwrap_or(DEFAULT_MAX_TRAILING_DEPTH),
@@ -187,10 +196,7 @@ impl FlashblocksConsumerArgs {
             max_cache_ahead_blocks: self
                 .max_cache_ahead_blocks
                 .unwrap_or(DEFAULT_MAX_CACHE_AHEAD_BLOCKS),
-            subscriber_ping_interval: self
-                .ping_interval_secs
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_SUBSCRIBER_PING_INTERVAL),
+            subscriber_ping_interval,
         }))
     }
 }
@@ -204,6 +210,13 @@ pub enum FlashblocksConsumerArgsError {
          op-reth flashblock consumers are independent implementations and must not both run"
     )]
     ConflictingConsumers,
+    /// `--flashblocks.ping-interval-secs 0`.
+    #[error(
+        "--flashblocks.ping-interval-secs must be positive: the subscriber builds a \
+         `tokio::time::interval` from it once the node is running, and a zero period panics \
+         that task rather than the startup"
+    )]
+    ZeroPingInterval,
 }
 
 /// Flashblocks publisher CLI flags.
@@ -785,6 +798,23 @@ mod tests {
         assert_eq!(cfg.max_leading_depth, DEFAULT_MAX_LEADING_DEPTH);
         assert_eq!(cfg.max_cache_ahead_blocks, DEFAULT_MAX_CACHE_AHEAD_BLOCKS);
         assert_eq!(cfg.subscriber_ping_interval, DEFAULT_SUBSCRIBER_PING_INTERVAL);
+    }
+
+    /// `tokio::time::interval` panics on a zero period, and the subscriber
+    /// builds one from this value only once the node is already running. The
+    /// refusal belongs here, where it still reaches an operator.
+    #[test]
+    fn a_zero_ping_interval_is_refused() {
+        let args = parse_consumer(&[
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+            "--flashblocks.ping-interval-secs",
+            "0",
+        ]);
+        assert!(matches!(
+            args.flashblocks_consumer.into_config(args.rollup.flashblocks_url.as_ref()),
+            Err(FlashblocksConsumerArgsError::ZeroPingInterval)
+        ));
     }
 
     #[test]

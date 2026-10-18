@@ -65,6 +65,9 @@ use tracing::debug;
 ///   not wedged, and logs `COMMITMENT BROKEN` / `preconf.tx.commitment_broken_total`. A client that
 ///   re-submits the same hash then gets `CommitmentBroken` — the only channel through which the
 ///   breach is reported.
+/// - **A preconfirmation does not preempt an ordinary transaction.** Whichever of the two the
+///   builder executes first takes the `(sender, nonce)`. The hold above begins when this event is
+///   produced; before that, queueing is only queueing and reserves no nonce.
 /// - **Everything else is a prediction of one particular build.** If that in-flight block is
 ///   discarded (a competing block takes the height, the payload job is superseded, the process
 ///   restarts), the sequencer re-applies the transaction to a *later* block — honouring the

@@ -124,6 +124,14 @@ impl JobCancel {
     ///
     /// `work` must not `.await`: the gate is a blocking mutex, and holding it
     /// across a yield point deadlocks whoever is ending the job.
+    ///
+    /// It also has to be **short**, which the deadlock warning alone does not
+    /// say. `resolve()` and `abandon()` take the same gate, so whatever `work`
+    /// spends is spent by whoever ends the job — on the critical path of
+    /// `engine_getPayload`. Today's caller serialises one slice's delta
+    /// (tens to hundreds of microseconds, low single-digit milliseconds on a
+    /// slice carrying most of a block), which is why this is not a problem;
+    /// it stops being true the moment something larger is put inside.
     pub fn unless_abandoned<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
         let _gate = self.gate.lock();
         (*self.rx.borrow() != Some(CancelReason::Abandoned)).then(work)

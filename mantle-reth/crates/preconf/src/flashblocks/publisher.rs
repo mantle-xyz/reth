@@ -11,6 +11,7 @@ use std::{
 use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 use parking_lot::RwLock;
 use tokio::{net::TcpListener, sync::broadcast};
+use alloy_rpc_types_engine::PayloadId;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -20,8 +21,21 @@ use crate::flashblocks::{
     config::FlashblockProducerConfig,
 };
 
-/// A slice paired with where it sits in the stream.
-pub type PositionedSlice = (FlashblockPosition, Utf8Bytes);
+/// A slice paired with where it sits in the stream and which build produced it.
+///
+/// The build is carried because position alone does not identify a slice: a
+/// rebuild restarts its indices, so two different slices can hold the same
+/// `(block, index)`. Anything that treats a slice as a key — catch-up's
+/// de-duplication, the archive's supersede rule — needs both halves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionedSlice {
+    /// Where the slice sits in the stream.
+    pub position: FlashblockPosition,
+    /// The payload job that produced it.
+    pub payload_id: PayloadId,
+    /// The serialized slice, shared with the archive.
+    pub text: Utf8Bytes,
+}
 
 /// Publishes slices to whoever is connected, and keeps the recent ones so a
 /// subscriber that reconnects can be caught up.
@@ -119,11 +133,15 @@ impl PublisherHandle {
             flashblock_index: payload.index,
         };
 
-        self.ring.write().push(position, text.clone());
+        self.ring.write().push(position, payload.payload_id, text.clone());
 
         // No subscribers is the normal case, not a failure: the slice is
         // archived either way.
-        let _ = self.pipe.send((position, text));
+        let _ = self.pipe.send(PositionedSlice {
+            position,
+            payload_id: payload.payload_id,
+            text,
+        });
 
         Ok(size)
     }

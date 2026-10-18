@@ -25,14 +25,23 @@
 //! argued from either.
 //!
 //! Which arm wins is asserted only where the submissions are ordered such that
-//! one answer is right. In the first two tests both arrive after the build
-//! opens and either outcome is acceptable; in the third both precede it, and
-//! the preconf arm owning the transaction is the point.
+//! one answer is right. The first two leave it open — in the first the
+//! ordinary transaction is in the build-start snapshot and the preconf arrives
+//! mid-build, in the second both arrive mid-build — and in the third both
+//! precede the build, where the preconf arm owning the transaction is the
+//! point.
+//!
+//! What every test does cross-check is that the answer agrees with the block:
+//! `assert_preconf_answer_matches_the_block` holds `Success` to "is in the
+//! block" and `Timeout` to its documented "tx NOT on chain", whichever arm
+//! won.
 //!
 //! A different hash on the same `(sender, nonce)` is a different question —
 //! that is replacement, and lives in `replacement.rs`.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf, wait_fifo_entry};
+use super::helpers::{
+    PreconfCfgBuilder, assert_preconf_answer_matches_the_block, send_preconf, wait_fifo_entry,
+};
 use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
@@ -136,12 +145,13 @@ async fn ordinary_then_preconf_is_no_longer_refused() {
         .expect("resolve_kind")
         .expect("payload build");
 
-    // Drained so the spawned task does not outlive the node. Its value is not
-    // asserted — see the doc comment.
-    let _ = rpc_task.await;
-
     let sealed: Vec<B256> =
         payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+
+    // Joined after `sealed` exists, so the answer can be checked against the
+    // block it describes.
+    assert_preconf_answer_matches_the_block(rpc_task.await, hash, &sealed);
+
     canonicalize_payload!(node, payload).await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -201,10 +211,13 @@ async fn preconf_then_ordinary_is_no_longer_refused() {
         .await
         .expect("resolve_kind")
         .expect("payload build");
-    let _ = rpc_task.await;
-
     let sealed: Vec<B256> =
         payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+
+    // Joined after `sealed` exists, so the answer can be checked against the
+    // block it describes.
+    assert_preconf_answer_matches_the_block(rpc_task.await, hash, &sealed);
+
     canonicalize_payload!(node, payload).await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 

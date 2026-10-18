@@ -387,14 +387,16 @@ mod tests {
 
     // ── start() lifecycle ────────────────────────────────────────
 
-    /// Stub pool used to exercise `PreconfServiceBuilder::start` without
-    /// standing up a real reth pool. `start`'s only interaction with the
-    /// pool is via [`RestoreSource::recover_envelope`], which
-    /// [`restore_preconf_state`] calls once per journal entry. Since
-    /// tests here use empty journals, the stub can panic if reached —
-    /// the empty-journal branch never invokes it.
+    /// Stub [`RestoreSource`] used to exercise `PreconfServiceBuilder::start`.
+    /// `start` reaches it only through [`restore_preconf_state`], once per
+    /// journal entry, so with the empty journals these tests use it is never
+    /// called — hence the panics.
+    ///
+    /// Not a pool stub: the production source
+    /// ([`RestoreDirect`](crate::RestoreDirect)) decodes the journal's bytes
+    /// and holds nothing, so `start` touches no pool at all.
     #[derive(Clone)]
-    struct UnreachablePool;
+    struct UnreachableSource;
 
     /// Same reasoning for the chain view: with an empty journal there is no entry
     /// whose landing could need checking, so the hash is never looked up.
@@ -414,7 +416,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RestoreSource for UnreachablePool {
+    impl RestoreSource for UnreachableSource {
         fn recover_slot(
             &self,
             _tx_rlp: &alloy_primitives::Bytes,
@@ -432,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_empty_journal_is_noop_on_fifo() {
         let (_dir, svc) = svc_with_temp_journal().await;
-        svc.start(&UnreachablePool, &UnreachableChain).await.unwrap();
+        svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
         // Empty journal ⇒ nothing was replayed into the fifo.
         assert_eq!(svc.fifo().snapshot().await.len(), 0);
     }
@@ -441,8 +443,8 @@ mod tests {
     async fn start_is_idempotent() {
         let (_dir, svc) = svc_with_temp_journal().await;
         // Calling twice must not panic; both calls succeed.
-        svc.start(&UnreachablePool, &UnreachableChain).await.unwrap();
-        svc.start(&UnreachablePool, &UnreachableChain).await.unwrap();
+        svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
+        svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
     }
 
     /// `start()` reads the journal from disk and pushes each
@@ -451,7 +453,7 @@ mod tests {
     /// `start_without_journal_...` cannot exercise.
     #[tokio::test]
     async fn start_with_populated_journal_restores_entries_to_fifo() {
-        use crate::journal::{JournalEntry, RestoredEnvelope};
+        use crate::{ClaimKind, journal::{JournalEntry, RestoredEnvelope}};
         use alloy_consensus::{Signed, TxLegacy};
         use alloy_primitives::{B256, Bytes, Signature, TxHash};
 
@@ -462,11 +464,11 @@ mod tests {
         // fifo-layer eviction callback (Arc'd shared state keeps the
         // clones observing the same call log).
         #[derive(Clone)]
-        struct RecordingPool {
+        struct RecordingSource {
             add_calls: Arc<std::sync::Mutex<Vec<Bytes>>>,
         }
         #[async_trait::async_trait]
-        impl RestoreSource for RecordingPool {
+        impl RestoreSource for RecordingSource {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(alloy_primitives::Address, u64)> {
                 // Same `(from, nonce)` `recover_envelope` fabricates below.
                 let seed = tx_rlp.first().copied().unwrap_or(0);
@@ -513,6 +515,7 @@ mod tests {
                 tx_rlp: Bytes::from(vec![0xA1; 4]),
                 block_height: 10,
                 committed_at_ms: now_ms,
+                kind: ClaimKind::Promised,
             })
             .await
             .unwrap();
@@ -522,11 +525,12 @@ mod tests {
                 tx_rlp: Bytes::from(vec![0xA2; 4]),
                 block_height: 11,
                 committed_at_ms: now_ms,
+                kind: ClaimKind::Promised,
             })
             .await
             .unwrap();
 
-        let pool = RecordingPool { add_calls: Arc::new(std::sync::Mutex::new(Vec::new())) };
+        let pool = RecordingSource { add_calls: Arc::new(std::sync::Mutex::new(Vec::new())) };
         // This pool admits everything, so the chain is never consulted either.
         svc.start(&pool, &UnreachableChain).await.unwrap();
 
@@ -543,14 +547,14 @@ mod tests {
     /// the file and the commitment records disagree.
     #[tokio::test]
     async fn start_prunes_an_entry_whose_commitment_cannot_be_honoured() {
-        use crate::journal::{JournalEntry, RestoreSkip, RestoredEnvelope};
+        use crate::{ClaimKind, journal::{JournalEntry, RestoreSkip, RestoredEnvelope}};
         use alloy_primitives::{Address, Bytes, TxHash};
 
         #[derive(Clone)]
-        struct RejectingPool;
+        struct RejectingSource;
 
         #[async_trait::async_trait]
-        impl RestoreSource for RejectingPool {
+        impl RestoreSource for RejectingSource {
             fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
                 Some((Address::from([0xB1; 20]), u64::from(tx_rlp[0])))
             }
@@ -573,13 +577,14 @@ mod tests {
                 tx_rlp: Bytes::from(vec![0xB1; 4]),
                 block_height: 5,
                 committed_at_ms: 1,
+                kind: ClaimKind::Promised,
             })
             .await
             .unwrap();
 
         // `RestoreSkip::Rejected` never consults the chain, so `UnreachableChain`
         // is still the right stub here.
-        svc.start(&RejectingPool, &UnreachableChain).await.unwrap();
+        svc.start(&RejectingSource, &UnreachableChain).await.unwrap();
 
         assert!(
             svc.fifo().snapshot().await.is_empty(),
