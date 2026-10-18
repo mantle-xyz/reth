@@ -413,9 +413,12 @@ enum Removal {
 /// already gone out, and present for one `reset_success_to_waiting` put back
 /// as `Replay` with its client still waiting.
 ///
-/// `entry` is `None` when the claim outlived its queue entry, which only
-/// happens inside the retention window after a receipt went out — a
-/// commitment either way.
+/// `entry` is `None` when the claim outlived its queue entry: a removal
+/// because the nonce moved on (`Removal::Landed`) keeps the record for either
+/// kind, so this is a commitment whose receipt went out *or* a pool
+/// transaction a build executed. Both are reported with the commitment
+/// wording; telling them apart would need the record's kind, and the pool
+/// case is rare enough that nothing reads it here yet.
 fn nonce_held_by(
     claims: &Commitments,
     incumbent: &TxHash,
@@ -540,6 +543,8 @@ pub struct BuildGuard {
     claims: Arc<Commitments>,
     /// `Option` so the mutex can be released inside `drop`, after the clear.
     lock: Option<OwnedMutexGuard<()>>,
+    /// This build's place in the order builds took the queue.
+    generation: u64,
 }
 
 impl BuildGuard {
@@ -551,6 +556,12 @@ impl BuildGuard {
     /// after writes a new one.
     pub fn parent_is_ours(&self, parent_hash: B256) -> bool {
         self.claims.parent_is_ours(parent_hash)
+    }
+
+    /// This build's generation, to hand to `Commitments::note_sealed` once
+    /// the build seals — which happens after this guard is gone.
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -631,10 +642,10 @@ impl PreconfTxSet {
     /// a build and touches nothing shared. The wait costs one in-flight
     /// dispatch instead: the loop takes its cancel arm first.
     pub async fn lock_for_build(&self) -> BuildGuard {
-        BuildGuard {
-            claims: self.claims.clone(),
-            lock: Some(self.build_lock.clone().lock_owned().await),
-        }
+        let lock = self.build_lock.clone().lock_owned().await;
+        // Under the mutex, so generations run in the order builds do.
+        let generation = self.claims.next_build_generation();
+        BuildGuard { claims: self.claims.clone(), lock: Some(lock), generation }
     }
 
     /// The claims this node has made. Read synchronously — the registry uses
@@ -2350,7 +2361,10 @@ mod tests {
     async fn handing_the_queue_on_forgets_the_last_sealed_block() {
         let set = Arc::new(PreconfTxSet::new(16));
         let previous = B256::repeat_byte(7);
-        set.claims().note_sealed(previous);
+        let before = set.lock_for_build().await;
+        let generation = before.generation();
+        drop(before);
+        set.claims().note_sealed(previous, generation);
 
         let guard = set.lock_for_build().await;
         assert!(guard.parent_is_ours(previous), "the holding build reads it in its own prologue",);
@@ -2481,8 +2495,10 @@ mod tests {
         let sealed_by_the_build_before = h(0xaa);
 
         // Build N: seals, so the shortcut is available to whoever is next.
-        drop(set.lock_for_build().await);
-        set.claims().note_sealed(sealed_by_the_build_before);
+        let build_n = set.lock_for_build().await;
+        let generation_n = build_n.generation();
+        drop(build_n);
+        set.claims().note_sealed(sealed_by_the_build_before, generation_n);
 
         // Build A: stages a transaction, then stops without sealing.
         let guard = set.lock_for_build().await;
@@ -2501,6 +2517,35 @@ mod tests {
             "a build that sealed nothing must not leave the previous build's hash standing",
         );
         assert!(set.contains(&h(1)).await, "and its staged entry survives to be replayed");
+    }
+
+    /// **A build that is slow to seal cannot overwrite its successor's seal.**
+    ///
+    /// The seal runs after the queue is handed on, so build A can still be
+    /// sealing while build B takes the queue, executes and seals. If A's seal
+    /// then landed, the build after B would read "parent is A" as "everything
+    /// in the queue is on chain" and drop what only B carried. The seal is
+    /// stamped with the sealing build's generation and an older one is
+    /// refused.
+    #[tokio::test]
+    async fn a_late_seal_from_an_earlier_build_does_not_replace_the_newer_one() {
+        let set = PreconfTxSet::new(16);
+        let (sealed_by_a, sealed_by_b) = (h(0xaa), h(0xbb));
+
+        let a = set.lock_for_build().await;
+        let generation_a = a.generation();
+        drop(a);
+        let b = set.lock_for_build().await;
+        let generation_b = b.generation();
+        drop(b);
+
+        // B seals first; A's seal arrives late.
+        set.claims().note_sealed(sealed_by_b, generation_b);
+        set.claims().note_sealed(sealed_by_a, generation_a);
+
+        let c = set.lock_for_build().await;
+        assert!(c.parent_is_ours(sealed_by_b), "B is the last build that sealed");
+        assert!(!c.parent_is_ours(sealed_by_a), "A's late seal must not stand");
     }
 
     /// `unindex` is the point every removal converges on, and it releases the

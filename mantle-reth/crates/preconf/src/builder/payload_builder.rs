@@ -1656,7 +1656,7 @@ impl SliceState {
                 // these transactions and the index chain stays unbroken: a
                 // subscriber sees *fewer* slices, not a gap. A block whose
                 // every tick fails therefore publishes nothing and still seals
-                // normally, with a WARN as the only trace.
+                // normally; the counter and the WARN are what says so.
                 metrics::counter!("flashblocks.slice_assembly_failed_total").increment(1);
                 warn!(
                     target: "mantle::preconf::flashblocks",
@@ -2388,7 +2388,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Explicit, because everything below is this build's own arithmetic
         // and the next one should not wait on it. Dropping also clears the
         // sealed-block hash, which the seal below re-establishes — see
-        // `BuildGuard`.
+        // `BuildGuard`. The generation is what lets that seal be refused if
+        // a later build has sealed in the meantime.
+        let build_generation = build_guard.generation();
         drop(build_guard);
 
         // ── Stage 4: SDM post-exec refund tx ───────────────────────────
@@ -2502,7 +2504,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // the next build one slow scan, which reads the chain and is the
         // safe direction by construction.
         if allow_preconf {
-            self.fifo.claims().note_sealed(sealed_block.hash());
+            self.fifo.claims().note_sealed(sealed_block.hash(), build_generation);
         }
         debug!(
             target: "mantle::preconf::payload_builder",

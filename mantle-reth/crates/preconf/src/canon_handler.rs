@@ -494,6 +494,29 @@ mod reorg_tests {
         );
     }
 
+    /// The same commitment, with the notification that would have stamped it
+    /// as committed lost on the way (`CanonUpdate::Gap`). The reverted block
+    /// is proof enough that it was on chain, and nothing else would put it
+    /// back: the fifo entry is gone, and the pool only ever held it if an
+    /// ordinary submission raced it.
+    #[tokio::test]
+    async fn a_promise_whose_commit_notification_was_lost_still_goes_back() {
+        let fifo = fifo();
+        let tx = op_tx(0, 1);
+        let hash = tx.tx_hash();
+        assert_eq!(fifo.claims().mark_promised(hash, &sender(), 0, REVERTED_AT), Ok(()));
+        // No `mark_committed`.
+
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+
+        assert_eq!(outcome, ReorgOutcome { drift: 1, reinjected: 1, conflicts: 0 });
+        assert_eq!(fifo.status_of(&hash).await, Some(PreconfStatus::Waiting));
+        assert_eq!(
+            fifo.find_by_hash(&hash).await.map(|entry| entry.source),
+            Some(PreconfSource::Replay),
+        );
+    }
+
     /// The build loop records every pool transaction it executes, so most of
     /// what a reverted block holds has a record here. Those go back too — the
     /// slice path pruned them from the pool — but they are not broken
