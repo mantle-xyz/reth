@@ -235,8 +235,13 @@ async fn authenticated_filter_websocket_handler(
             // to `/ws/{api_key}`, and refusing that would break nothing useful.
             if !state.filters_enabled && !matches!(filter, FilterType::None) {
                 Metrics::filter_subscriptions_refused().increment(1);
+                // The application, not the key. Reaching this closure means
+                // the key was *valid*, so logging it writes a live customer
+                // credential to disk — and `--enable-filters` is off by
+                // default, so an ordinary first attempt at this route is all
+                // it takes.
                 warn!(
-                    %api_key,
+                    application = %app,
                     "refused a filter subscription; --enable-filters is off"
                 );
                 return Response::builder()

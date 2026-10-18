@@ -16,6 +16,9 @@ PROFILE := env("PROFILE", "release")
 # Docker image name (override in CI)
 DOCKER_IMAGE_NAME := env("DOCKER_IMAGE_NAME", "ghcr.io/mantle-xyz/op-reth")
 
+# The proxy ships as its own image, not as a second binary inside the node's
+DOCKER_WS_PROXY_IMAGE_NAME := env("DOCKER_WS_PROXY_IMAGE_NAME", "ghcr.io/mantle-xyz/mantle-ws-proxy")
+
 # default recipe
 default:
   @just --list
@@ -28,6 +31,18 @@ build:
 
 # Alias: backward-compatible with old Makefile `make build-op`
 build-op: build
+
+# `mantle-ws-proxy` is not in `default-members`, so a bare `cargo build` never
+# produces it. Name the recipe rather than leaving the `-p` incantation as
+# folklore: the devnet's flashblocks tests expect the binary at
+# `target/release/mantle-ws-proxy`.
+
+# Build the flashblocks relay binary (release)
+build-ws-proxy:
+  cargo build -p mantle-reth-ws-proxy --bin mantle-ws-proxy --profile "{{PROFILE}}"
+
+# Build both binaries
+build-all: build build-ws-proxy
 
 # Build op-reth binary (debug, with Mantle state-export feature)
 build-debug:
@@ -178,6 +193,19 @@ docker-build-push-git-sha: (docker-build-push-tags GIT_SHA GIT_SHA)
 
 # Docker: tag with latest
 docker-build-push-latest: (docker-build-push-tags GIT_TAG "latest")
+
+# `mantle-ws-proxy` is delivered as its own image: a stateless relay that is
+# scaled and restarted independently of any node. It builds from source in the
+# image (`DockerfileWsProxy`), the same way the deployment pipeline builds
+# `DockerfileOp` — not from a pre-cross-compiled binary like the `.cross` path
+# above, which exists for multi-arch pushes the proxy does not yet need.
+
+# Build the standalone mantle-ws-proxy image (single arch, local)
+docker-build-ws-proxy tag=GIT_TAG:
+  docker build --file ./DockerfileWsProxy . \
+    --build-arg VERSION={{tag}} \
+    --build-arg GIT_COMMIT={{GIT_SHA}} \
+    --tag {{DOCKER_WS_PROXY_IMAGE_NAME}}:{{tag}}
 
 # ==================== Misc ====================
 

@@ -3,6 +3,11 @@
 *.pdb
 .env
 
-docs
-logs
+# Anchored: an unanchored `docs` would also match vendored directories such as
+# patches/reth-transaction-pool/docs/ and testing/ef-tests/ethereum-tests/docs/
+# (87 tracked files between them), silently dropping anything added there.
+/docs/
+/logs/
 .zcode
+
+_out/

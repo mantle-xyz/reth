@@ -490,15 +490,11 @@ mod tests {
 /// upstream populates those maps: an empty stream is indistinguishable from a
 /// quiet chain.
 ///
-/// The tests below pass because their fixtures populate `metadata.receipts` by
-/// hand. They lock the matching logic; they do not show that filtering is
-/// usable end to end, which needs the producer to start filling that map.
-///
-/// When a producer does start filling it, `an_empty_receipts_map_matches_nothing`
-/// will fail — that is the intended signal, not a regression; replace it with the
-/// populated-map assertion. The rest of this module is the contract to check
-/// against: its fixtures build a real `MantleFlashblockPayload`, serialise it, and
-/// assert the filter matches.
+/// The tests below populate `metadata.receipts` by hand, so they lock the
+/// matching logic without showing that filtering works end to end. If a
+/// producer ever starts filling that map,
+/// `an_empty_receipts_map_matches_nothing` is the test that should fail —
+/// that is the signal, not a regression.
 #[cfg(test)]
 mod mantle_shape {
     use alloy_consensus::Receipt;
