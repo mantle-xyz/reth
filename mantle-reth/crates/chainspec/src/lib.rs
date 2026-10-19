@@ -28,7 +28,7 @@ use alloy_hardforks::Hardfork;
 use alloy_op_hardforks::{
     MANTLE_MAINNET_ARSIA_TIMESTAMP, MANTLE_MAINNET_LIMB_TIMESTAMP, MANTLE_MAINNET_SKADI_TIMESTAMP,
     MANTLE_SEPOLIA_ARSIA_TIMESTAMP, MANTLE_SEPOLIA_LIMB_TIMESTAMP, MANTLE_SEPOLIA_SKADI_TIMESTAMP,
-    OpHardfork,
+    OpHardfork, mantle_hoodi_bvm_upgrade_time,
 };
 use alloy_primitives::U256;
 use reth_chainspec::ChainSpec;
@@ -177,6 +177,11 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
     let skadi_ts = mantle_genesis_info.mantle_skadi_time;
     let limb_ts = mantle_genesis_info.mantle_limb_time;
     let arsia_ts = mantle_genesis_info.mantle_arsia_time;
+    // Mantle Hoodi's bundled time, once scheduled, takes precedence over the genesis value.
+    let hoodi_bvm_upgrade_ts = mantle_hoodi_bvm_upgrade_time(
+        genesis.config.chain_id,
+        mantle_genesis_info.mantle_hoodi_bvm_upgrade_time,
+    );
 
     // Block-based hardforks (same as standard OP)
     let hardfork_opts = [
@@ -238,6 +243,11 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
         (OpHardfork::Holocene.boxed(), arsia_ts),
         (OpHardfork::Jovian.boxed(), arsia_ts),
         (MantleHardfork::Arsia.boxed(), arsia_ts),
+        // Mantle Hoodi only: Hoodi BVM upgrade (irregular state transition in alloy-op-evm). Not
+        // part of the mainnet/Sepolia schedule; appended after the template. The fork ID walks
+        // the forks in list order while op-geth sorts them by time, so the two agree only while
+        // this activation time is not earlier than any other fork time, as on Hoodi.
+        (MantleHardfork::HoodiBvmUpgrade.boxed(), hoodi_bvm_upgrade_ts),
     ];
 
     let mut time_hardforks = time_hardfork_opts

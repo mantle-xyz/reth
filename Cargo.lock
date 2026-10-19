@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-evm"
 version = "0.32.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -424,7 +424,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-hardforks"
 version = "0.5.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-chains",
  "alloy-hardforks",
@@ -5854,7 +5854,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "op-alloy"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "op-alloy-consensus",
  "op-alloy-network",
@@ -5866,7 +5866,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-consensus"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -5896,7 +5896,7 @@ checksum = "a79f352fc3893dcd670172e615afef993a41798a1d3fc0db88a3e60ef2e70ecc"
 [[package]]
 name = "op-alloy-network"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -5909,7 +5909,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-provider"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -5923,7 +5923,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-jsonrpsee"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-primitives",
  "jsonrpsee",
@@ -5932,7 +5932,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -5953,7 +5953,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types-engine"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?tag=mantle-v1.6.3#05e2f58d98c87ccaf8fd2eb6a0e6711bb7e8938b"
+source = "git+https://github.com/mantle-xyz/mantle-v2?branch=feat%2Fhoodi-bvm-predeploy-fork#75af38c6f24b327eca2b0d5dc61a3ede4a286d23"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -10442,7 +10442,7 @@ dependencies = [
 [[package]]
 name = "revm-inspectors"
 version = "0.39.0"
-source = "git+https://github.com/mantle-xyz/revm-inspectors?tag=v0.39.0-mantle-arsia.2#5a742573f4903faa3abf81ba86be38c4f27b90f0"
+source = "git+https://github.com/mantle-xyz/revm-inspectors?branch=fix%2Fjs-recursion-limit#9c569b3703af969ea6b9618847e3ed4eabf11a6e"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",

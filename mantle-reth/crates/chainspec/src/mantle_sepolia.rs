@@ -37,6 +37,7 @@ fn create_mantle_sepolia_genesis() -> alloy_genesis::Genesis {
             mantle_skadi_time: Some(MANTLE_SEPOLIA_SKADI_TIMESTAMP),
             mantle_limb_time: Some(MANTLE_SEPOLIA_LIMB_TIMESTAMP),
             mantle_arsia_time: Some(MANTLE_SEPOLIA_ARSIA_TIMESTAMP),
+            mantle_hoodi_bvm_upgrade_time: None,
         },
     );
     genesis
