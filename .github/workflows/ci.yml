@@ -16,14 +16,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # sccache caches individual rustc compilations across runs — including the cfg(test)
-  # builds and git-dependency crates that Swatinem's target/ cache misses. Today ~250
-  # upstream op-reth/revm/alloy crates recompile on every PR *despite* a Swatinem cache
-  # hit (they rebuild because cargo's per-run fingerprints differ); sccache replays their
-  # cached object output instead. Requires incremental compilation to be off.
+  # Incremental artifacts slow down a clean build and only enlarge the cached target/.
   CARGO_INCREMENTAL: "0"
-  RUSTC_WRAPPER: "sccache"
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   lint:
@@ -39,15 +33,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      # Install sccache before any cargo step so RUSTC_WRAPPER resolves.
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      # Only pushes to the branches above save the cache. PR and manual runs restore
+      # from their base or the default branch and save nothing: every saved cache is
+      # several GB, all of them share the repository's quota, and caches written by PR
+      # runs were evicting the base branch's, so those runs rebuilt from scratch.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
       - uses: extractions/setup-just@v2
       - run: just fmt
       - run: just clippy
-      - run: sccache --show-stats
 
   test:
     name: test
@@ -65,10 +61,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      # Same policy as the lint job: only pushes save the cache.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
       - uses: extractions/setup-just@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -100,4 +97,3 @@ jobs:
           name: nextest-junit
           path: target/nextest/default/junit.xml
           if-no-files-found: ignore
-      - run: sccache --show-stats
