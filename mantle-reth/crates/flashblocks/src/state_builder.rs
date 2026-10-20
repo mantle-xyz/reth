@@ -280,6 +280,21 @@ where
         let tx_hash = transaction.tx_hash();
         let is_deposit = transaction.is_deposit();
 
+        // Mantle's token ratio is not carried in L1 attributes. Read it before
+        // execution so an oracle update is charged using the old ratio and
+        // subsequent transactions (including later slices) use the new one.
+        if self.chain_spec.is_mantle() && !is_deposit {
+            self.l1_block_info.token_ratio = self
+                .evm
+                .db_mut()
+                .storage(
+                    op_revm::constants::GAS_ORACLE_CONTRACT,
+                    op_revm::constants::TOKEN_RATIO_SLOT,
+                )
+                .map_err(|err| ExecutionError::RpcReceiptBuild(err.to_string()))?;
+        }
+        self.l1_block_info.clear_tx_l1_cost();
+
         let da_footprint_used = if self
             .chain_spec
             .is_jovian_active_at_timestamp(self.evm.block().timestamp().saturating_to()) &&

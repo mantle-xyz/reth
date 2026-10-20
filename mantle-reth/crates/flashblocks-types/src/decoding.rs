@@ -2,10 +2,17 @@
 
 use std::io::Read;
 
+use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+
 use crate::{error::FlashblockDecodeError, payload::MantleFlashblockPayload};
 
-/// Largest flashblock accepted, before and after decompression.
-pub const MAX_DECOMPRESSED_FLASHBLOCK_BYTES: usize = 5 * 1024 * 1024;
+/// Largest flashblock accepted, before and after decompression (currently 17 MiB).
+///
+/// A slice can contain a whole block. Hex-encoded transaction bytes need twice
+/// the consensus RLP limit; another MiB covers JSON delimiters, block fields
+/// and Mantle's metadata (whose receipt and balance maps are empty).
+/// The proxy and consumer also use this ceiling for websocket frames/messages.
+pub const MAX_DECOMPRESSED_FLASHBLOCK_BYTES: usize = 2 * MAX_RLP_BLOCK_SIZE + 1024 * 1024;
 
 impl MantleFlashblockPayload {
     /// Decode a flashblock from bytes that may be plain JSON or
@@ -84,6 +91,18 @@ mod tests {
         let json = serde_json::to_vec(&sample()).unwrap();
 
         assert_eq!(MantleFlashblockPayload::try_decode_message(&json).unwrap(), sample());
+    }
+
+    /// One slice can carry almost the entire 8 MiB block, encoded as hex JSON.
+    #[test]
+    fn q01_near_block_limit_slice_decodes_plain_and_compressed() {
+        let mut payload = sample();
+        payload.diff.transactions = vec![vec![0xab; 8 * 1024 * 1024 - 4096].into()];
+        let json = serde_json::to_vec(&payload).unwrap();
+        assert!(json.len() > 5 * 1024 * 1024);
+        for bytes in [json.clone(), brotli_compress(&json)] {
+            assert_eq!(MantleFlashblockPayload::try_decode_message(&bytes).unwrap(), payload);
+        }
     }
 
     #[test]

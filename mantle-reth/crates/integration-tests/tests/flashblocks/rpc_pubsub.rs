@@ -110,6 +110,68 @@ async fn pending_logs_yields_matching_logs() {
     assert_eq!(log["transactionHash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
 }
 
+/// Invalid filter types must fail before a subscription ID is returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_logs_rejects_non_filter_parameters_before_accepting() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let (client, _handle) = pubsub_client!(node, harness);
+
+    for parameter in [
+        serde_json::json!(true),
+        serde_json::json!(false),
+        serde_json::json!({ "transactionHashes": [] }),
+        serde_json::json!({ "addresses": [format!("{LOGGER:#x}")] }),
+    ] {
+        let result = client
+            .subscribe::<serde_json::Value, _>(
+                "eth_subscribe",
+                rpc_params!["pendingLogs", parameter.clone()],
+                "eth_unsubscribe",
+            )
+            .await;
+        let error = result.expect_err("invalid filters must not receive a subscription ID");
+        let jsonrpsee::core::client::Error::Call(error) = error else {
+            panic!("expected a JSON-RPC parameter error for {parameter}, got {error}");
+        };
+        assert_eq!(error.code(), -32602, "invalid filter: {parameter}");
+    }
+}
+
+/// Explicitly empty filters and an omitted filter all subscribe to unfiltered logs.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_logs_accepts_omitted_null_and_empty_filters() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let (client, _handle) = pubsub_client!(node, harness);
+    let mut subscriptions = Vec::new();
+    subscriptions.push(
+        client
+            .subscribe::<serde_json::Value, _>(
+                "eth_subscribe",
+                rpc_params!["pendingLogs"],
+                "eth_unsubscribe",
+            )
+            .await
+            .expect("omitting the filter is valid"),
+    );
+    for parameter in [serde_json::Value::Null, serde_json::json!({})] {
+        subscriptions.push(
+            client
+                .subscribe(
+                    "eth_subscribe",
+                    rpc_params!["pendingLogs", parameter],
+                    "eth_unsubscribe",
+                )
+                .await
+                .expect("an empty filter is valid"),
+        );
+    }
+    let tx_hash = announce_slice!(harness);
+    for subscription in &mut subscriptions {
+        let log = next_item(subscription).await;
+        assert_eq!(log["transactionHash"], format!("{tx_hash:#x}"));
+    }
+}
+
 /// `newFlashblockTransactions` defaults to hashes only.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblock_transactions_defaults_to_hashes() {

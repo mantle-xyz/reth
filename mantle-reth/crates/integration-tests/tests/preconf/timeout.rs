@@ -11,7 +11,8 @@
 //! The race where the RPC deadline fires while dispatch is mid-apply (the `lock_for_apply` and
 //! `try_recv` fallback in `rpc.rs` harvesting the receipt) has no end-to-end test here:
 //! reproducing it needs a wall-clock guess that misses often enough to be noise. It is pinned
-//! without a clock by `builder::dispatch::tests::apply_lock_blocks_rpc_timeout_race_and_yields_success`.
+//! without a clock by
+//! `builder::dispatch::tests::apply_lock_blocks_rpc_timeout_race_and_yields_success`.
 //!
 //! Timeout entry releasing the `(sender, nonce)` slot for a differently-
 //! signed tx is a **replacement** semantic and lives in

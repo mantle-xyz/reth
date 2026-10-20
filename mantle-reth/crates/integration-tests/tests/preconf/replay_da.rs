@@ -25,8 +25,7 @@ use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
-use mantle_reth_preconf::ClaimKind;
-use mantle_reth_preconf::JournalEntry;
+use mantle_reth_preconf::{ClaimKind, JournalEntry};
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 use reth_optimism_payload_builder::config::OpDAConfig;
@@ -108,8 +107,13 @@ async fn replay_over_da_limit_rejected_and_not_on_chain() {
             .await;
     let tx_hash = keccak256(&raw_tx);
 
-    let entry =
-        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised };
+    let entry = JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    };
     let (journal_file, journal_dir) = write_journal(&[entry]);
 
     let cfg = PreconfCfgBuilder::new()
@@ -185,8 +189,20 @@ async fn replay_over_da_limit_does_not_block_other_replay() {
 
     // A first, so B landing proves the loop continued past A's rejection.
     let entries = [
-        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
-        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry {
+            hash: hash_a,
+            tx_rlp: tx_a.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
+        JournalEntry {
+            hash: hash_b,
+            tx_rlp: tx_b.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 

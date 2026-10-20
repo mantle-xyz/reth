@@ -26,6 +26,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// as unable to keep up.
 const REPLAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bounds a live write even when the peer never drains its socket buffer.
+const LIVE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// What catching a subscriber up achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayOutcome {
@@ -57,6 +60,9 @@ pub enum SubscriptionExit {
     ChannelClosed,
     /// Writing to the subscriber failed.
     SendFailed,
+    /// A write timed out. Carries the known unsent count: the current slice
+    /// plus the live queue, or the remainder of the current replay batch.
+    SendTimedOut(u64),
 }
 
 /// Read the slice a reconnecting subscriber last received from its handshake
@@ -96,8 +102,6 @@ pub(crate) async fn serve_subscriber(
     ring: Arc<RwLock<FlashblockRingBuffer>>,
     cancel: CancellationToken,
 ) {
-    let subscribers = Subscription::join();
-
     // The resume position lives in the upgrade request, which the handshake
     // consumes: once it returns, the stream no longer carries it. The callback
     // writes it out on the way past.
@@ -110,7 +114,7 @@ pub(crate) async fn serve_subscriber(
     let mut stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
-            warn!(target: "mantle::preconf::flashblocks", %error, "subscriber handshake failed");
+            debug!(target: "mantle::preconf::flashblocks", %error, "subscriber handshake failed");
             return;
         }
         Err(_) => {
@@ -119,6 +123,7 @@ pub(crate) async fn serve_subscriber(
         }
     };
 
+    let subscribers = Subscription::join();
     let mut receiver = pipe.subscribe();
 
     if let Some(cutoff) = resume_from {
@@ -151,6 +156,7 @@ pub(crate) async fn serve_subscriber(
                 );
             }
             Err(exit) => {
+                subscribers.leave(&exit);
                 debug!(target: "mantle::preconf::flashblocks", ?exit, "catch-up abandoned");
                 return;
             }
@@ -162,10 +168,10 @@ pub(crate) async fn serve_subscriber(
     debug!(target: "mantle::preconf::flashblocks", ?exit, "subscription ended");
 }
 
-/// Counts one live subscription for as long as it is held.
+/// Counts one successfully handshaken subscription for as long as it is held.
 ///
 /// A guard rather than a pair of calls: the subscription has several ways out —
-/// a failed handshake, a replay that could not be delivered, the client going
+/// a replay that could not be delivered, cancellation, the client going
 /// away — and a gauge that only comes down on some of them drifts upward until
 /// it says the endpoint is busier than it is.
 struct Subscription;
@@ -178,7 +184,7 @@ impl Subscription {
 
     /// Record how the subscription ended, before dropping the count.
     fn leave(self, exit: &SubscriptionExit) {
-        if let SubscriptionExit::Lagged(skipped) = exit {
+        if let SubscriptionExit::Lagged(skipped) | SubscriptionExit::SendTimedOut(skipped) = exit {
             // Recoverable on its own (see `SubscriptionExit::Lagged`), but a
             // rising rate says the channel is too small for the traffic, or
             // the subscriber too slow.
@@ -219,9 +225,10 @@ async fn replay(
         HashSet::with_capacity(snapshot.len().saturating_add(receiver.len()));
     let mut sent = 0usize;
 
-    for (position, payload_id, text) in snapshot {
+    let snapshot_len = snapshot.len();
+    for (index, (position, payload_id, text)) in snapshot.into_iter().enumerate() {
         delivered.insert((position, payload_id));
-        send_with_timeout(stream, text).await?;
+        send_with_timeout(stream, text, (snapshot_len - index) as u64).await?;
         sent += 1;
     }
 
@@ -245,8 +252,9 @@ async fn replay(
         }
     }
 
-    for text in pending {
-        send_with_timeout(stream, text).await?;
+    let pending_len = pending.len();
+    for (index, text) in pending.into_iter().enumerate() {
+        send_with_timeout(stream, text, (pending_len - index) as u64).await?;
         sent += 1;
     }
 
@@ -256,10 +264,12 @@ async fn replay(
 async fn send_with_timeout(
     stream: &mut WebSocketStream<TcpStream>,
     text: tokio_tungstenite::tungstenite::Utf8Bytes,
+    remaining: u64,
 ) -> Result<(), SubscriptionExit> {
     match tokio::time::timeout(REPLAY_SEND_TIMEOUT, stream.send(Message::Text(text))).await {
         Ok(Ok(())) => Ok(()),
-        _ => Err(SubscriptionExit::SendFailed),
+        Ok(Err(_)) => Err(SubscriptionExit::SendFailed),
+        Err(_) => Err(SubscriptionExit::SendTimedOut(remaining)),
     }
 }
 
@@ -275,8 +285,19 @@ pub(crate) async fn pump_live(
 
             published = receiver.recv() => match published {
                 Ok(slice) => {
-                    if stream.send(Message::Text(slice.text)).await.is_err() {
-                        return SubscriptionExit::SendFailed;
+                    let sent = tokio::select! {
+                        () = cancel.cancelled() => return SubscriptionExit::Cancelled,
+                        sent = tokio::time::timeout(
+                            LIVE_SEND_TIMEOUT,
+                            stream.send(Message::Text(slice.text)),
+                        ) => sent,
+                    };
+                    match sent {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return SubscriptionExit::SendFailed,
+                        Err(_) => return SubscriptionExit::SendTimedOut(
+                            (receiver.len() as u64).saturating_add(1),
+                        ),
                     }
                 }
                 // Ending the subscription here is deliberate; see
@@ -302,6 +323,7 @@ pub(crate) async fn pump_live(
 mod tests {
     use std::{net::Ipv4Addr, num::NonZeroUsize, sync::Arc, time::Duration};
 
+    use alloy_rpc_types_engine::PayloadId;
     use futures_util::StreamExt;
     use parking_lot::RwLock;
     use tokio::{
@@ -312,7 +334,6 @@ mod tests {
         MaybeTlsStream, WebSocketStream, accept_async, client_async,
         tungstenite::{Message, Utf8Bytes},
     };
-    use alloy_rpc_types_engine::PayloadId;
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -343,7 +364,11 @@ mod tests {
 
     /// The same position under a named build, with the build in the text so an
     /// assertion says which of the two a subscriber was handed.
-    fn slice_of(position: FlashblockPosition, payload_id: PayloadId, build: &str) -> PositionedSlice {
+    fn slice_of(
+        position: FlashblockPosition,
+        payload_id: PayloadId,
+        build: &str,
+    ) -> PositionedSlice {
         PositionedSlice {
             position,
             payload_id,
@@ -402,6 +427,98 @@ mod tests {
         ring
     }
 
+    #[test]
+    fn q02_only_completed_handshakes_count_as_subscribers() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                metrics::gauge!("flashblocks.subscribers").set(0.0);
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let connection = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+                let (server, _) = listener.accept().await.unwrap();
+                let (pipe, _) = broadcast::channel(8);
+                let cancel = CancellationToken::new();
+                let serving = super::serve_subscriber(server, &pipe, ring_with([]), cancel.clone());
+                tokio::pin!(serving);
+                assert!(futures_util::poll!(&mut serving).is_pending());
+                assert!(
+                    handle.render().contains("flashblocks_subscribers 0"),
+                    "an idle TCP connection is not a subscription"
+                );
+
+                let handshake = client_async("ws://localhost/", connection);
+                let (client, _) = tokio::select! {
+                    result = handshake => result.unwrap(),
+                    () = &mut serving => panic!("subscription ended during handshake"),
+                };
+                assert!(futures_util::poll!(&mut serving).is_pending());
+                assert!(handle.render().contains("flashblocks_subscribers 1"));
+                cancel.cancel();
+                serving.await;
+                assert!(handle.render().contains("flashblocks_subscribers 0"));
+                drop(client);
+            })
+        });
+    }
+
+    #[test]
+    fn q03_replay_timeout_counts_the_disconnect_and_known_unsent_slices() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let ring = ring_with([]);
+                ring.write().push(pos(10, 1), one_build(), "x".repeat(32 * 1024 * 1024).into());
+                ring.write().push(pos(10, 2), one_build(), "tail".into());
+                let (pipe, _) = broadcast::channel(8);
+                let server = tokio::spawn(async move {
+                    let (connection, _) = listener.accept().await.unwrap();
+                    super::serve_subscriber(connection, &pipe, ring, CancellationToken::new())
+                        .await;
+                });
+                let connection = TcpStream::connect(addr).await.unwrap();
+                let (_client, _) = client_async(
+                    format!("ws://{addr}/?block_number=10&flashblock_index=0"),
+                    connection,
+                )
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(7), server).await.unwrap().unwrap();
+                let scrape = handle.render();
+                assert!(scrape.contains("flashblocks_slow_subscriber_dropped_total 1"), "{scrape}");
+                assert!(
+                    scrape.contains("flashblocks_slices_missed_by_slow_subscribers_total 2"),
+                    "{scrape}"
+                );
+                assert!(scrape.contains("flashblocks_subscribers 0"), "{scrape}");
+            })
+        });
+    }
+
+    #[tokio::test]
+    async fn q03_pending_replay_timeout_reports_the_remaining_deduplicated_batch() {
+        let (mut server, _client) = socket_pair().await;
+        let ring = ring_with([]);
+        let (pipe, mut receiver) = broadcast::channel(8);
+        let mut large = slice(pos(10, 1));
+        large.text = "x".repeat(32 * 1024 * 1024).into();
+        pipe.send(large.clone()).unwrap();
+        pipe.send(large).unwrap();
+        pipe.send(slice(pos(10, 2))).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(7),
+            replay(&mut server, &mut receiver, &ring, pos(10, 0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(SubscriptionExit::SendTimedOut(2)));
+    }
+
     /// What the drain phase of [`replay`] exists for: a slice published while
     /// the archive is still being sent must still reach the subscriber.
     #[tokio::test]
@@ -455,9 +572,8 @@ mod tests {
             pipe.send(slice_of(pos(10, index), rebuild, "B")).expect("receiver is alive");
         }
 
-        let outcome = replay(&mut server, &mut receiver, &ring, pos(9, 9))
-            .await
-            .expect("catch-up completes");
+        let outcome =
+            replay(&mut server, &mut receiver, &ring, pos(9, 9)).await.expect("catch-up completes");
 
         assert_eq!(
             drain(&mut client, 6).await,
@@ -571,6 +687,41 @@ mod tests {
         let exit = pump_live(&mut server, &mut receiver, &CancellationToken::new()).await;
 
         assert!(matches!(exit, SubscriptionExit::Lagged(_)), "got {exit:?}");
+    }
+
+    /// A peer that stops reading can block send before recv reports lag.
+    #[tokio::test]
+    async fn a_subscriber_that_never_reads_is_disconnected() {
+        let (mut server, _client) = socket_pair().await;
+        let (pipe, mut receiver) = broadcast::channel(2);
+        let mut large = slice(pos(10, 0));
+        large.text = "x".repeat(32 * 1024 * 1024).into();
+        pipe.send(large).unwrap();
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(7),
+            pump_live(&mut server, &mut receiver, &CancellationToken::new()),
+        )
+        .await
+        .expect("a blocked live send must have a deadline");
+        assert_eq!(exit, SubscriptionExit::SendTimedOut(1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_blocked_live_send() {
+        let (mut server, _client) = socket_pair().await;
+        let (pipe, mut receiver) = broadcast::channel(2);
+        let mut large = slice(pos(10, 0));
+        large.text = "x".repeat(32 * 1024 * 1024).into();
+        pipe.send(large).unwrap();
+        let cancel = CancellationToken::new();
+        let mut pump = Box::pin(pump_live(&mut server, &mut receiver, &cancel));
+        assert!(futures_util::poll!(&mut pump).is_pending());
+        cancel.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("shutdown must interrupt the blocked socket write");
+        assert_eq!(exit, SubscriptionExit::Cancelled);
     }
 
     #[tokio::test]

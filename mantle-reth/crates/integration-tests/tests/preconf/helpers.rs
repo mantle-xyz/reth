@@ -1346,10 +1346,7 @@ macro_rules! launch_flashblocks_node {
 /// It also joins the task rather than dropping it: a panic inside the spawned
 /// RPC call used to pass silently.
 pub fn assert_preconf_answer_matches_the_block(
-    joined: Result<
-        Result<PreconfTxEvent, jsonrpsee::core::ClientError>,
-        tokio::task::JoinError,
-    >,
+    joined: Result<Result<PreconfTxEvent, jsonrpsee::core::ClientError>, tokio::task::JoinError>,
     hash: B256,
     sealed: &[B256],
 ) {

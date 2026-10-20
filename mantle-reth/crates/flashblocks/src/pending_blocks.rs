@@ -493,6 +493,17 @@ impl PendingBlocks {
         self.earliest_header.parent_hash
     }
 
+    /// Parent hashes available to EVM calls, matching the consumer replay database.
+    pub(crate) fn block_hash_overrides(&self) -> std::collections::BTreeMap<u64, B256> {
+        self.flashblocks
+            .iter()
+            .filter_map(|slice| {
+                let base = slice.base.as_ref()?;
+                Some((base.block_number.checked_sub(1)?, base.parent_hash))
+            })
+            .collect()
+    }
+
     /// Returns all flashblocks.
     pub fn get_flashblocks(&self) -> Vec<MantleFlashblockPayload> {
         self.flashblocks.iter().cloned().collect()

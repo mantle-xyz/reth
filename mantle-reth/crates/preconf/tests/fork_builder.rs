@@ -182,16 +182,15 @@ async fn step4_signed_tx_round_trips_through_fifo_with_recoverable_signer() {
 // Each of these needs a transaction actually applied, so each runs against a
 // launched node in `mantle-reth-integration-tests` (`tests/preconf/`):
 //
-// - receipt `gas_used` is the chain's figure, not the EVM's raw one:
-//   `full_receipt.rs` `preconf_receipt_matches_sealed_receipt`
-// - same sender, consecutive nonces, the second seeing the first's state:
-//   `happy_path.rs` `multi_nonce_same_sender_land_in_one_block`
-// - a revert is `status == 0` with the gas still charged:
-//   `full_receipt.rs` `revert_tx_receipt_matches_sealed_receipt`
-// - cancelling after one apply seals a block holding that transaction:
-//   `happy_path.rs` `success_returns_receipt_and_lands_on_chain`
-// - a preconf and a pool transaction share one block's state:
-//   `race_pool_arm.rs` `preconf_and_pool_txs_coexist_in_one_block`
-// - an entry past the dispatch deadline is skipped, answered `Timeout`, and
-//   kept out of the sealed block:
-//   `timeout.rs` `dispatch_safety_margin_marks_timeout_before_apply`
+// - receipt `gas_used` is the chain's figure, not the EVM's raw one: `full_receipt.rs`
+//   `preconf_receipt_matches_sealed_receipt`
+// - same sender, consecutive nonces, the second seeing the first's state: `happy_path.rs`
+//   `multi_nonce_same_sender_land_in_one_block`
+// - a revert is `status == 0` with the gas still charged: `full_receipt.rs`
+//   `revert_tx_receipt_matches_sealed_receipt`
+// - cancelling after one apply seals a block holding that transaction: `happy_path.rs`
+//   `success_returns_receipt_and_lands_on_chain`
+// - a preconf and a pool transaction share one block's state: `race_pool_arm.rs`
+//   `preconf_and_pool_txs_coexist_in_one_block`
+// - an entry past the dispatch deadline is skipped, answered `Timeout`, and kept out of the sealed
+//   block: `timeout.rs` `dispatch_safety_margin_marks_timeout_before_apply`

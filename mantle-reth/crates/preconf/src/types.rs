@@ -315,7 +315,9 @@ pub enum PreconfError {
     ///
     /// Keeps the `pool rejected:` prefix for the same reason the variant above
     /// does.
-    #[error("pool rejected: (sender, nonce) already used by a transaction in the block being built")]
+    #[error(
+        "pool rejected: (sender, nonce) already used by a transaction in the block being built"
+    )]
     NonceUsedByExecutedTx,
     /// The transaction's own `gas_limit` exceeds `preconf_max_gas_per_tx`, the
     /// operator's per-transaction ceiling for the preconf fast path.

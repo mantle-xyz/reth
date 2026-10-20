@@ -173,8 +173,7 @@ fn refuse_unusable_args(args: &Args) -> eyre::Result<Vec<String>> {
     // `--public-access-enabled` already means "serve unauthenticated clients"
     // when keys are set, so it is the opt-in here too, rather than a second
     // flag saying the same thing.
-    let api_keys: Vec<String> =
-        args.api_keys.iter().filter(|s| !s.is_empty()).cloned().collect();
+    let api_keys: Vec<String> = args.api_keys.iter().filter(|s| !s.is_empty()).cloned().collect();
     if api_keys.is_empty() && !args.public_access_enabled {
         eyre::bail!(
             "refusing to start an unauthenticated endpoint: pass --api-keys, or \

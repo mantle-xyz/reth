@@ -316,6 +316,13 @@ fn build_timeout_event(
 // the impl behind the `Arc<dyn DynPreconfHandler>` `MantleRpcExt` holds.
 #[async_trait]
 impl DynPreconfHandler for PreconfRpcHandler {
+    fn pending_nonce(
+        &self,
+        sender: &alloy_primitives::Address,
+    ) -> Option<mantle_reth_rpc_ext::PendingAccountNonce> {
+        self.fifo.pending_nonce(sender)
+    }
+
     async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
         // Preconf-handling latency, measured around `handle_inner` to cover
         // every early-return path (reject / timeout / success).

@@ -30,6 +30,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use alloy_consensus::Header;
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{
     Address, B256, Bytes, TxHash, U256,
@@ -37,7 +38,7 @@ use alloy_primitives::{
 };
 use alloy_rpc_types_eth::{
     BlockOverrides, Filter, Log,
-    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
+    state::{EvmOverrides, StateOverride},
 };
 use alloy_serde::JsonStorageKey;
 use jsonrpsee::{
@@ -46,8 +47,11 @@ use jsonrpsee::{
 };
 use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use op_alloy_network::Optimism;
+use reth_chainspec::ChainSpecProvider;
 use reth_execution_types::BlockReceipts;
-use reth_provider::CanonStateSubscriptions;
+use reth_optimism_forks::OpHardforks;
+use reth_primitives_traits::NodePrimitives;
+use reth_provider::{BlockIdReader, BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions};
 use reth_rpc::eth::EthFilter;
 use reth_rpc_eth_api::{
     EthApiTypes, EthFilterApiServer, FromEthApiError, RpcReceipt,
@@ -62,26 +66,22 @@ use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
 
-/// Supplies the pending overlay's state overrides to RPC methods owned elsewhere.
-///
-/// Implemented for the flashblocks state so `MantleEthApiExt::simulate_v1` can
-/// prepend pending state without depending on this crate's RPC layer.
-pub trait PendingStateOverrides: std::fmt::Debug + Send + Sync {
-    /// Canonical block the pending overlay is built on, or `pending` when absent;
-    /// see [`PendingBlocksAPI::get_canonical_block_number`].
-    fn pending_base_block(&self) -> BlockId;
+/// Bound the extra network dependency of a pending nonce query.
+const PENDING_NONCE_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// State overrides representing the pending overlay, if any.
-    fn pending_state_overrides(&self) -> Option<StateOverride>;
+/// Supplies one coherent pending execution snapshot to RPC methods owned elsewhere.
+pub trait PendingStateOverrides: std::fmt::Debug + Send + Sync {
+    /// Returns state and execution header from the same published snapshot.
+    fn pending_execution_context(&self) -> Option<super::PendingExecutionContext>;
 }
 
 impl<FB: FlashblocksAPI + std::fmt::Debug + Send + Sync> PendingStateOverrides for FB {
-    fn pending_base_block(&self) -> BlockId {
-        self.get_pending_blocks().get_canonical_block_number().into()
-    }
-
-    fn pending_state_overrides(&self) -> Option<StateOverride> {
-        self.get_pending_blocks().get_state_overrides()
+    fn pending_execution_context(&self) -> Option<super::PendingExecutionContext> {
+        let pending = self.get_pending_blocks();
+        pending
+            .as_ref()
+            .as_ref()
+            .map(|pending| super::PendingExecutionContext::from_pending(pending))
     }
 }
 
@@ -237,12 +237,22 @@ pub struct EthApiExt<Eth: EthApiTypes, FB> {
     eth_api: Eth,
     eth_filter: EthFilter<Eth>,
     flashblocks_state: Arc<FB>,
+    pending_nonce_client: Option<reth_optimism_rpc::SequencerClient>,
 }
 
 impl<Eth: EthApiTypes, FB> EthApiExt<Eth, FB> {
     /// Creates a new extended Eth API instance with flashblocks support.
     pub const fn new(eth_api: Eth, eth_filter: EthFilter<Eth>, flashblocks_state: Arc<FB>) -> Self {
-        Self { eth_api, eth_filter, flashblocks_state }
+        Self { eth_api, eth_filter, flashblocks_state, pending_nonce_client: None }
+    }
+
+    /// Uses the sequencer's pending nonce to include transactions not yet sliced.
+    pub fn with_pending_nonce_client(
+        mut self,
+        client: Option<reth_optimism_rpc::SequencerClient>,
+    ) -> Self {
+        self.pending_nonce_client = client;
+        self
     }
 }
 
@@ -267,8 +277,8 @@ impl<Eth, FB> EthApiOverrideServer for EthApiExt<Eth, FB>
 where
     Eth: FullEthApi<NetworkTypes = Optimism> + LoadPendingBlock + Clone + Send + Sync + 'static,
     Eth::Error: FromEthApiError,
-    <Eth as reth_rpc_eth_api::RpcNodeCore>::Provider:
-        reth_chainspec::ChainSpecProvider + reth_provider::BlockReaderIdExt,
+    Eth::Primitives: NodePrimitives<BlockHeader = Header>,
+    Eth::Provider: ChainSpecProvider<ChainSpec: OpHardforks> + BlockReaderIdExt,
     FB: FlashblocksAPI + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
 {
@@ -381,15 +391,43 @@ where
         if block_id.is_pending() {
             Metrics::rpc_get_transaction_count().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            let canon_block = pending_blocks.get_canonical_block_number();
+            let base = pending_blocks
+                .as_ref()
+                .as_ref()
+                .map(|pending| BlockId::from(pending.parent_hash()))
+                .unwrap_or(BlockId::latest());
             let fb_count = pending_blocks.get_transaction_count(address);
 
-            let canon_count =
-                EthState::transaction_count(&self.eth_api, address, Some(canon_block.into()))
-                    .await
-                    .map_err(Into::into)?;
+            let canon_count = EthState::transaction_count(&self.eth_api, address, Some(base))
+                .await
+                .map_err(Into::into)?;
 
-            return Ok(canon_count + fb_count);
+            let local = canon_count + fb_count;
+            if let Some(client) = &self.pending_nonce_client {
+                // Accepted sequencer transactions can precede their next slice.
+                // Never move behind transactions already executed by this preview.
+                let remote: U256 = time::timeout(
+                    PENDING_NONCE_TIMEOUT,
+                    client.request("eth_getTransactionCount", (address, BlockNumberOrTag::Pending)),
+                )
+                .await
+                .map_err(|_| {
+                    ErrorObjectOwned::owned(
+                        -32000,
+                        "sequencer pending nonce query timed out",
+                        None::<()>,
+                    )
+                })?
+                .map_err(|error| {
+                    ErrorObjectOwned::owned(
+                        -32000,
+                        format!("failed to query sequencer pending nonce: {error}"),
+                        None::<()>,
+                    )
+                })?;
+                return Ok(local.max(remote));
+            }
+            return Ok(local);
         }
 
         EthState::transaction_count(&self.eth_api, address, block_number).await.map_err(Into::into)
@@ -479,27 +517,31 @@ where
     ) -> RpcResult<Bytes> {
         debug!(message = "rpc::call", block_number = ?block_number);
 
-        let transaction = from_value(transaction)?;
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
+        let transaction: op_alloy_rpc_types::OpTransactionRequest = from_value(transaction)?;
+        let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
             Metrics::rpc_call().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
+            let context = {
+                let pending = self.flashblocks_state.get_pending_blocks();
+                pending
+                    .as_ref()
+                    .as_ref()
+                    .map(|pending| super::PendingExecutionContext::from_pending(pending))
+            };
+            if let Some(context) = context {
+                let overrides = context.overrides(state_overrides, block_overrides);
+                let at = context.base_block;
+                let api = super::PendingEthApi::new(self.eth_api.clone(), context);
+                return EthCall::call(&api, transaction, Some(at), overrides)
+                    .await
+                    .map_err(Into::into);
+            }
         }
-
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder =
-            state_overrides_builder.extend(state_overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
-
         EthCall::call(
             &self.eth_api,
             transaction,
-            Some(block_id),
-            EvmOverrides::new(Some(final_overrides), block_overrides),
+            block_number,
+            EvmOverrides::new(state_overrides, block_overrides),
         )
         .await
         .map_err(Into::into)
@@ -513,27 +555,34 @@ where
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<U256> {
         debug!(message = "rpc::estimate_gas", block_number = ?block_number);
-
-        let transaction = from_value(transaction)?;
-        let mut block_id = block_number.unwrap_or_default();
-        let mut pending_overrides = EvmOverrides::default();
+        let transaction: op_alloy_rpc_types::OpTransactionRequest = from_value(transaction)?;
+        let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
             Metrics::rpc_estimate_gas().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            block_id = pending_blocks.get_canonical_block_number().into();
-            pending_overrides.state = pending_blocks.get_state_overrides();
+            let context = {
+                let pending = self.flashblocks_state.get_pending_blocks();
+                pending
+                    .as_ref()
+                    .as_ref()
+                    .map(|pending| super::PendingExecutionContext::from_pending(pending))
+            };
+            if let Some(context) = context {
+                let overrides = context.overrides(overrides, block_overrides);
+                let at = context.base_block;
+                let api = super::PendingEthApi::new(self.eth_api.clone(), context);
+                let estimate =
+                    EthCall::estimate_gas_at(&api, transaction.clone(), at, overrides.clone())
+                        .await?;
+                api.check_estimate_funds(transaction.as_ref().clone(), estimate, overrides.state)
+                    .await?;
+                return Ok(estimate);
+            }
         }
-
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
-        state_overrides_builder = state_overrides_builder.extend(overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
-
         EthCall::estimate_gas_at(
             &self.eth_api,
             transaction,
             block_id,
-            EvmOverrides::new(Some(final_overrides), block_overrides),
+            EvmOverrides::new(overrides, block_overrides),
         )
         .await
         .map_err(Into::into)
@@ -557,18 +606,37 @@ where
         let mut all_logs = Vec::new();
 
         let pending_blocks = self.flashblocks_state.get_pending_blocks();
-        if pending_blocks.is_none() {
+        let Some(pending) = pending_blocks.as_ref() else {
             // Nothing to append, and the range handling below would skip the canonical
             // query that the standard implementation resolves `pending` to on its own.
             return self.eth_filter.logs(filter).await;
+        };
+
+        let end = pending.latest_block_number();
+        let canonical_tip =
+            self.eth_api.provider().best_block_number().map_err(EthApiError::from)?;
+        let start_tag = from_block.unwrap_or(BlockNumberOrTag::Latest);
+        let start = match start_tag {
+            BlockNumberOrTag::Pending => end,
+            BlockNumberOrTag::Latest => canonical_tip,
+            tag => self
+                .eth_api
+                .provider()
+                .convert_block_number(tag)
+                .map_err(EthApiError::from)?
+                .ok_or(EthApiError::HeaderNotFound(tag.into()))?,
+        };
+        if start > end {
+            return Ok(Vec::new());
         }
 
         let mut fetched_logs = HashSet::new();
-        if !matches!(from_block, Some(BlockNumberOrTag::Pending)) {
+        let historical_end = canonical_tip.min(end);
+        if !start_tag.is_pending() && start <= historical_end {
             let mut historical_filter = filter.clone();
             historical_filter.block_option = alloy_rpc_types_eth::FilterBlockOption::Range {
-                from_block,
-                to_block: Some(BlockNumberOrTag::Latest),
+                from_block: Some(start.into()),
+                to_block: Some(historical_end.into()),
             };
 
             let historical_logs = self.eth_filter.logs(historical_filter).await?;
@@ -582,6 +650,9 @@ where
         all_logs.extend(
             pending_logs
                 .into_iter()
+                .filter(|log| {
+                    log.block_number.is_some_and(|number| (start..=end).contains(&number))
+                })
                 .filter(|log| !fetched_logs.contains(&(log.block_number, log.log_index))),
         );
 

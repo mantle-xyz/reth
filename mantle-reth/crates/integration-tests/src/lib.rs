@@ -11,7 +11,18 @@
 /// own subsystem setup — see `launch_preconf_node!`.
 #[macro_export]
 macro_rules! launch_mantle_node {
-    ($chain_spec:expr, $node:expr, $payload_attributes:expr) => {{
+    ($chain_spec:expr, $node:expr, $payload_attributes:expr) => {
+        $crate::launch_mantle_node!(
+            $chain_spec,
+            $node,
+            $payload_attributes,
+            persist_each_block = false
+        )
+    };
+    (
+        $chain_spec:expr, $node:expr, $payload_attributes:expr,persist_each_block = $persist:expr
+        $(, rpc_pending_block = $pending_kind:expr)?
+    ) => {{
         async {
             use mantle_reth_cli::node::MantleNode;
             use reth_chainspec::EthChainSpec;
@@ -34,6 +45,7 @@ macro_rules! launch_mantle_node {
                         ..Default::default()
                     })
                     .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
+            $(config.rpc.rpc_pending_block = $pending_kind;)?
             config.network.discovery.discv5_port = Some(0);
             config.network.discovery.discv5_port_ipv6 = Some(0);
             // An isolated single node has no peers to discover, and building
@@ -60,11 +72,17 @@ macro_rules! launch_mantle_node {
                 .with_components(node_type.components())
                 .with_add_ons(node_type.add_ons())
                 .launch_with_fn(|builder| {
-                    let launcher = EngineNodeLauncher::new(
+                    let mut launcher = EngineNodeLauncher::new(
                         runtime.clone(),
                         builder.config.datadir(),
                         Default::default(),
                     );
+                    if $persist {
+                        launcher.engine_tree_config = launcher
+                            .engine_tree_config
+                            .with_persistence_threshold(0)
+                            .with_memory_block_buffer_target(0);
+                    }
                     builder.launch_with(launcher)
                 })
                 .await

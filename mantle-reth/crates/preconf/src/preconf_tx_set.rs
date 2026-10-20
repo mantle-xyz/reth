@@ -424,9 +424,9 @@ fn nonce_held_by(
     incumbent: &TxHash,
     entry: Option<&TxEntry>,
 ) -> PreconfError {
-    let staged_pool_tx = entry.is_some_and(|e| {
-        e.source == PreconfSource::Replay && e.responder.is_none()
-    }) && !claims.was_promised(incumbent);
+    let staged_pool_tx = entry
+        .is_some_and(|e| e.source == PreconfSource::Replay && e.responder.is_none()) &&
+        !claims.was_promised(incumbent);
 
     if staged_pool_tx {
         PreconfError::NonceUsedByExecutedTx
@@ -473,6 +473,8 @@ enum NonceBasis {
 /// admission never asks about.
 #[derive(Debug, Default)]
 struct AccountView {
+    /// Parent used for increments from transactions without a nonce field.
+    parent: Option<B256>,
     /// Only senders this build has touched. Absent ⇒ ask the chain.
     basis: HashMap<Address, NonceBasis>,
 }
@@ -481,6 +483,7 @@ impl AccountView {
     /// Start of a build: forget the previous one.
     fn reset(&mut self) {
         self.basis.clear();
+        self.parent = None;
     }
 
     /// A transaction carrying its own nonce has executed.
@@ -662,6 +665,29 @@ impl PreconfTxSet {
     /// Start of a build job — see [`AccountView::reset`].
     pub fn reset_accounts(&self) {
         self.accounts.write().reset();
+    }
+
+    /// Start a build with the parent used to interpret deposit nonce increments.
+    pub fn reset_accounts_at(&self, parent: B256) {
+        let mut accounts = self.accounts.write();
+        accounts.reset();
+        accounts.parent = Some(parent);
+    }
+
+    /// Capture the sender's executed nonce and its base under the same lock.
+    pub fn pending_nonce(
+        &self,
+        sender: &Address,
+    ) -> Option<mantle_reth_rpc_ext::PendingAccountNonce> {
+        use mantle_reth_rpc_ext::PendingAccountNonce;
+        let accounts = self.accounts.read();
+        match accounts.basis.get(sender)? {
+            NonceBasis::Absolute(nonce) => Some(PendingAccountNonce::Absolute(*nonce)),
+            NonceBasis::BumpsFromChain(increment) => Some(PendingAccountNonce::ParentIncrement {
+                parent: accounts.parent?,
+                increment: *increment,
+            }),
+        }
     }
 
     /// Note a transaction the build executed that carried its own nonce.

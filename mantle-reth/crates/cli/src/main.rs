@@ -61,7 +61,7 @@ fn main() {
                     fb.addr, fb.port, fb.block_time, fb.leeway_time,
                 );
                 if sweep_interval_given {
-                    info!(
+                    warn!(
                         target: "reth::cli",
                         "--preconf.sweep-interval-ms is superseded by --flashblocks.block-time while flashblocks are enabled",
                     );
@@ -191,7 +191,8 @@ async fn launch_node(
                 MdbxProofsStorage::new(&path)
                     .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
             );
-            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled).await
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled)
+                .await
         }
         ProofsStorageVersion::V2 => {
             info!(target: "reth::cli", "Using on-disk storage for proofs history (v2)");
@@ -199,7 +200,8 @@ async fn launch_node(
                 MdbxProofsStorageV2::new(&path)
                     .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorageV2: {e}"))?,
             );
-            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled).await
+            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled)
+                .await
         }
     }
 }

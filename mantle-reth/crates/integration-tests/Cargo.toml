@@ -37,6 +37,11 @@ name = "flashblocks"
 path = "tests/flashblocks/mod.rs"
 harness = true
 
+[[test]]
+name = "preconf_capacity_rejection"
+path = "tests/preconf_capacity_rejection.rs"
+harness = true
+
 [dependencies]
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }
@@ -116,3 +121,8 @@ eyre = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client", "server", "ws-client"] }
+
+[dev-dependencies]
+reth-node-metrics.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt"] }

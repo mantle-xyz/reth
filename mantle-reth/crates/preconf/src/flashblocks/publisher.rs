@@ -8,10 +8,10 @@ use std::{
     sync::Arc,
 };
 
+use alloy_rpc_types_engine::PayloadId;
 use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 use parking_lot::RwLock;
 use tokio::{net::TcpListener, sync::broadcast};
-use alloy_rpc_types_engine::PayloadId;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -137,11 +137,7 @@ impl PublisherHandle {
 
         // No subscribers is the normal case, not a failure: the slice is
         // archived either way.
-        let _ = self.pipe.send(PositionedSlice {
-            position,
-            payload_id: payload.payload_id,
-            text,
-        });
+        let _ = self.pipe.send(PositionedSlice { position, payload_id: payload.payload_id, text });
 
         Ok(size)
     }

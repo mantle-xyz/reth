@@ -166,6 +166,7 @@ metrics.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 
 [dev-dependencies]
+metrics-exporter-prometheus.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "test-util", "fs", "net"] }
 tempfile.workspace = true
 proptest.workspace = true

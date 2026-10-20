@@ -167,8 +167,8 @@ impl FlashblocksConsumerArgs {
     /// given; otherwise returns `None` (the consumer stays off).
     ///
     /// # Errors
-    /// Returns an error when upstream's `--flashblocks-url` is also set: both
-    /// consumers would subscribe and build pending state independently.
+    /// Returns an error when upstream's `--flashblocks-url` is also set, or a
+    /// consumer interval or depth is zero.
     pub fn into_config(
         self,
         upstream_flashblocks_url: Option<&Url>,
@@ -188,6 +188,15 @@ impl FlashblocksConsumerArgs {
             Some(secs) => Duration::from_secs(secs),
             None => DEFAULT_SUBSCRIBER_PING_INTERVAL,
         };
+        if self.max_leading_depth == Some(0) {
+            return Err(FlashblocksConsumerArgsError::ZeroLeadingDepth);
+        }
+        if self.max_trailing_depth == Some(0) {
+            return Err(FlashblocksConsumerArgsError::ZeroTrailingDepth);
+        }
+        if self.max_cache_ahead_blocks == Some(0) {
+            return Err(FlashblocksConsumerArgsError::ZeroCacheAheadBlocks);
+        }
 
         Ok(Some(FlashblocksConfig {
             websocket_url,
@@ -217,6 +226,15 @@ pub enum FlashblocksConsumerArgsError {
          that task rather than the startup"
     )]
     ZeroPingInterval,
+    /// The consumer would drop every slice ahead of canonical.
+    #[error("--flashblocks.max-leading-depth must be positive")]
+    ZeroLeadingDepth,
+    /// The consumer would rebuild on every canonical advance.
+    #[error("--flashblocks.max-trailing-depth must be positive")]
+    ZeroTrailingDepth,
+    /// Early-arriving slices could never be cached.
+    #[error("--flashblocks.max-cache-ahead-blocks must be positive")]
+    ZeroCacheAheadBlocks,
 }
 
 /// Flashblocks publisher CLI flags.
@@ -815,6 +833,45 @@ mod tests {
             args.flashblocks_consumer.into_config(args.rollup.flashblocks_url.as_ref()),
             Err(FlashblocksConsumerArgsError::ZeroPingInterval)
         ));
+    }
+
+    #[test]
+    fn zero_consumer_depths_are_refused_with_the_flag_name() {
+        for prefix in ["flashblocks", "subblocks"] {
+            for name in ["max-leading-depth", "max-trailing-depth", "max-cache-ahead-blocks"] {
+                let flag = format!("--{prefix}.{name}");
+                let args = parse_consumer(&[
+                    "--flashblocks.websocket-url",
+                    "ws://sequencer:1111",
+                    &flag,
+                    "0",
+                ]);
+                let err = args
+                    .flashblocks_consumer
+                    .into_config(args.rollup.flashblocks_url.as_ref())
+                    .expect_err("zero depth must refuse startup");
+                assert!(err.to_string().contains(&format!("--flashblocks.{name}")));
+            }
+        }
+    }
+
+    #[test]
+    fn minimum_positive_consumer_depths_are_accepted() {
+        let args = parse_consumer(&[
+            "--flashblocks.websocket-url",
+            "ws://sequencer:1111",
+            "--flashblocks.max-leading-depth",
+            "1",
+            "--flashblocks.max-trailing-depth",
+            "1",
+            "--flashblocks.max-cache-ahead-blocks",
+            "1",
+        ]);
+        let cfg = args.flashblocks_consumer.into_config(None).unwrap().unwrap();
+        assert_eq!(
+            (cfg.max_leading_depth, cfg.max_trailing_depth, cfg.max_cache_ahead_blocks),
+            (1, 1, 1)
+        );
     }
 
     #[test]

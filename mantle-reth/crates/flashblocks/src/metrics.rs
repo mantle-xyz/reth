@@ -79,6 +79,8 @@ macro_rules! flashblock_metrics {
 flashblock_metrics! {
     counter   upstream_errors                           => "flashblocks.consumer.upstream_errors_total",
         "Websocket errors on the upstream slice connection";
+    counter   upstream_decode_errors                    => "flashblocks.consumer.upstream_decode_errors_total",
+        "Upstream text or binary messages that could not be decoded as a slice";
     counter   upstream_messages                         => "flashblocks.consumer.upstream_messages_total",
         "Slices received from upstream";
     histogram block_processing_duration                 => "flashblocks.consumer.block_processing_duration",
@@ -177,6 +179,10 @@ mod tests {
         metrics::with_local_recorder(&recorder, Metrics::init);
 
         let after = handle.render();
+        assert!(
+            after.contains("flashblocks_consumer_upstream_decode_errors_total 0"),
+            "decode errors must be observable at zero on a healthy node:\n{after}",
+        );
         assert!(
             after.contains("flashblocks_consumer_foreign_build_slice_total 0"),
             "a healthy node must still publish this series at zero:\n{after}",

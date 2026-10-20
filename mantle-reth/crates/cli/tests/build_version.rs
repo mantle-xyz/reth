@@ -15,6 +15,9 @@ fn repository() -> TempDir {
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["config", "user.name", "Version Test"]);
     git(repo.path(), &["config", "user.email", "version@example.test"]);
+    // Fixture commits and lightweight tags must not depend on the developer's signing agent.
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    git(repo.path(), &["config", "tag.gpgsign", "false"]);
 
     fs::write(repo.path().join("source.txt"), "first").unwrap();
     git(repo.path(), &["add", "source.txt"]);
