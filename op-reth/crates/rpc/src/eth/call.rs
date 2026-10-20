@@ -226,8 +226,9 @@ where
     ///
     /// Everything else is a verbatim copy of
     /// `reth_rpc_eth_api::helpers::estimate::EstimateCall::estimate_gas_with` (reth rev
-    /// 88505c7). The `[MANTLE]` blocks below are the only deviations. See
-    /// `docs/op-reth-estimategas-fix-and-upstream.md` for the rationale.
+    /// aef8d3e). The `[MANTLE]` blocks below are the only deviations: re-check this function
+    /// against upstream's on every reth bump, because upstream fixes to the default
+    /// implementation never reach this override on their own.
     fn estimate_gas_with<S>(
         &self,
         mut evm_env: EvmEnvFor<Self::Evm>,
@@ -256,31 +257,14 @@ where
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.as_ref().gas_limit();
         let tx_request_gas_price = request.as_ref().gas_price();
-        // the gas limit of the corresponding block
-        let max_gas_limit = evm_env
-            .cfg_env
-            .tx_gas_limit_cap
-            // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
-            .filter(|_| !evm_env.cfg_env.is_amsterdam_eip8037_enabled())
-            .map_or_else(
-                || evm_env.block_env.gas_limit(),
-                |cap| cap.min(evm_env.block_env.gas_limit()),
-            );
-
-        // Determine the highest possible gas limit, considering both the request's specified
-        // limit and the block's limit. Like op-geth, a user-supplied gas limit below the intrinsic
-        // minimum is ignored (the block limit is used) rather than taken as the search ceiling.
-        let mut highest_gas_limit = tx_request_gas_limit
-            .filter(|&tx_gas_limit| tx_gas_limit >= MIN_TRANSACTION_GAS)
-            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
-            .unwrap_or(max_gas_limit);
 
         // Configure the evm env
         let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
 
-        // Apply block overrides first, so `gasLimit` / `baseFee` / `blobBaseFee` are visible to
-        // estimation. v2.4.2 added this upstream (mirroring go-ethereum#30695); this Mantle
-        // override predates it and would otherwise drop them silently.
+        // Apply any block overrides before deriving block-derived limits and the tx env so
+        // overrides for `gasLimit`, `baseFee` and `blobBaseFee` are visible to estimation.
+        // Mirrors geth's behavior, see:
+        // <https://github.com/ethereum/go-ethereum/pull/30695>
         if let Some(block_overrides) = overrides.block {
             apply_block_overrides(*block_overrides, &mut db, evm_env.block_env.inner_mut());
         }
@@ -289,6 +273,23 @@ where
         if let Some(state_override) = overrides.state {
             apply_state_overrides(state_override, &mut db).map_err(Self::Error::from_eth_err)?;
         }
+
+        // the gas limit of the corresponding block
+        let block_gas_limit = evm_env.block_env.gas_limit();
+        // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
+        let max_gas_limit = if evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
+            block_gas_limit
+        } else {
+            evm_env.cfg_env.tx_gas_limit_cap().min(block_gas_limit)
+        };
+
+        // Determine the highest possible gas limit, considering both the request's specified
+        // limit and the block's limit. Like op-geth, a user-supplied gas limit below the intrinsic
+        // minimum is ignored (the block limit is used) rather than taken as the search ceiling.
+        let mut highest_gas_limit = tx_request_gas_limit
+            .filter(|&tx_gas_limit| tx_gas_limit >= MIN_TRANSACTION_GAS)
+            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
+            .unwrap_or(max_gas_limit);
 
         let mut tx_env = self.create_txn_env(&evm_env, request, &mut db)?;
 
