@@ -135,9 +135,7 @@ async fn a_rebuilt_block_keeps_extending_after_its_base_slice() {
     // payload id: a continuation of build B that named build A's id is an input
     // no payload job can emit, and the consumer now refuses it as such.
     harness.send(base_slice_builder(1).prev(1, 1).payload_id(rebuild_id()).build()).await;
-    harness
-        .send(FlashblockBuilder::new(1, 1).prev(1, 0).payload_id(rebuild_id()).build())
-        .await;
+    harness.send(FlashblockBuilder::new(1, 1).prev(1, 0).payload_id(rebuild_id()).build()).await;
 
     let pending = harness.pending().expect("the rebuild must still be extendable");
     assert_eq!(pending.latest_block_number(), 1);

@@ -51,7 +51,13 @@ async fn signed_nonce0_transfer(
 }
 
 fn journal_entry(raw: &alloy_primitives::Bytes) -> JournalEntry {
-    JournalEntry { hash: keccak256(raw), tx_rlp: raw.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised }
+    JournalEntry {
+        hash: keccak256(raw),
+        tx_rlp: raw.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    }
 }
 
 /// Append three commitments (independent senders, each nonce 0), mark one

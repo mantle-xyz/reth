@@ -453,7 +453,10 @@ mod tests {
     /// `start_without_journal_...` cannot exercise.
     #[tokio::test]
     async fn start_with_populated_journal_restores_entries_to_fifo() {
-        use crate::{ClaimKind, journal::{JournalEntry, RestoredEnvelope}};
+        use crate::{
+            ClaimKind,
+            journal::{JournalEntry, RestoredEnvelope},
+        };
         use alloy_consensus::{Signed, TxLegacy};
         use alloy_primitives::{B256, Bytes, Signature, TxHash};
 
@@ -547,7 +550,10 @@ mod tests {
     /// the file and the commitment records disagree.
     #[tokio::test]
     async fn start_prunes_an_entry_whose_commitment_cannot_be_honoured() {
-        use crate::{ClaimKind, journal::{JournalEntry, RestoreSkip, RestoredEnvelope}};
+        use crate::{
+            ClaimKind,
+            journal::{JournalEntry, RestoreSkip, RestoredEnvelope},
+        };
         use alloy_primitives::{Address, Bytes, TxHash};
 
         #[derive(Clone)]

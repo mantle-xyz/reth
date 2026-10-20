@@ -32,8 +32,7 @@ use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
-use mantle_reth_preconf::ClaimKind;
-use mantle_reth_preconf::JournalEntry;
+use mantle_reth_preconf::{ClaimKind, JournalEntry};
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
@@ -157,8 +156,20 @@ async fn a_pool_tx_cannot_take_the_nonce_of_a_deferred_commitment() {
     let hash_b = keccak256(&tx_b);
 
     let entries = [
-        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
-        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised },
+        JournalEntry {
+            hash: hash_a,
+            tx_rlp: tx_a.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
+        JournalEntry {
+            hash: hash_b,
+            tx_rlp: tx_b.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 

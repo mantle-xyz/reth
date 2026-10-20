@@ -106,9 +106,7 @@ impl FlashblockSequenceValidator {
         // build by definition and belongs on top of the overlay, not in place
         // of it. Ahead of the link check below, which such a slice passes —
         // its predecessor is the position the overlay sits at.
-        if incoming_block_number == latest_block_number &&
-            incoming_build != IncomingBuild::Same
-        {
+        if incoming_block_number == latest_block_number && incoming_build != IncomingBuild::Same {
             return SequenceValidationResult::ForeignBuild;
         }
 
@@ -284,7 +282,15 @@ mod tests {
 
     #[rstest]
     #[case(100, 5, 100, 6, FlashblockId { block_number: 100, index: 5 }, IncomingBuild::Same, SequenceValidationResult::NextInSequence)]
-    #[case(100, 5, 100, 6, FlashblockId::NO_PREV, IncomingBuild::Same, SequenceValidationResult::NextInSequence)]
+    #[case(
+        100,
+        5,
+        100,
+        6,
+        FlashblockId::NO_PREV,
+        IncomingBuild::Same,
+        SequenceValidationResult::NextInSequence
+    )]
     #[case(100, 5, 101, 0, FlashblockId { block_number: 100, index: 5 }, IncomingBuild::Same, SequenceValidationResult::FirstOfNextBlock)]
     #[case(
         100,
@@ -295,7 +301,15 @@ mod tests {
         IncomingBuild::Same,
         SequenceValidationResult::FirstOfNextBlock
     )]
-    #[case(100, 5, 100, 5, FlashblockId::NO_PREV, IncomingBuild::Same, SequenceValidationResult::Duplicate)]
+    #[case(
+        100,
+        5,
+        100,
+        5,
+        FlashblockId::NO_PREV,
+        IncomingBuild::Same,
+        SequenceValidationResult::Duplicate
+    )]
     // The next block's base slice is a new build by definition; the rebuild
     // branch must not claim it, because it belongs on top of the overlay
     // rather than in place of it.

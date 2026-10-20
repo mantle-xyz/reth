@@ -18,8 +18,7 @@ use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use mantle_reth_preconf::ClaimKind;
-use mantle_reth_preconf::JournalEntry;
+use mantle_reth_preconf::{ClaimKind, JournalEntry};
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
@@ -74,8 +73,13 @@ async fn no_tx_pool_gates_replay_source_entry() {
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
 
-    let entry =
-        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0, kind: ClaimKind::Promised };
+    let entry = JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    };
     let mut line = serde_json::to_vec(&entry).expect("encode JournalEntry");
     line.push(b'\n');
     std::fs::write(&journal_file, &line).expect("write journal file");

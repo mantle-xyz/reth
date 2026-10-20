@@ -4,8 +4,7 @@
 //!
 //! - [`config::PreconfConfig`] — runtime configuration & whitelist checks
 //! - [`classifier::PreconfClassifier`] — the allowlists
-//! - [`commitments::Commitments`] — the record of every claim this node has made, owned by the
-//!   fifo
+//! - [`commitments::Commitments`] — the record of every claim this node has made, owned by the fifo
 //! - [`types`] — common enums and error types
 //! - [`preconf_tx_set::PreconfTxSet`] — the commitment truth source
 //! - [`apply`] — builder apply path interface
