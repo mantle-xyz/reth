@@ -19,33 +19,34 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use alloy_consensus::Header;
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, Bloom, Bytes, TxKind, U256};
 use alloy_rpc_types_eth::{
-    EIP1186AccountProofResponse, TransactionRequest,
-    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
+    EIP1186AccountProofResponse, TransactionRequest, simulate::SimulatePayload,
 };
 use alloy_serde::JsonStorageKey;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
-use mantle_reth_flashblocks::{Metrics, PendingStateOverrides};
+use mantle_reth_flashblocks::{Metrics, PendingEthApi, PendingStateOverrides};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_errors::RethError;
 use reth_optimism_evm::extract_l1_info;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_rpc::SequencerClient;
-use reth_primitives_traits::{AlloyBlockHeader, Block};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives};
 use reth_rpc_eth_api::{
     EthApiTypes, FromEthApiError, FullEthApiTypes,
     helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState},
 };
-use reth_rpc_eth_types::EthApiError;
+use reth_rpc_eth_types::{EthApiError, simulate};
 use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, StateProofProvider, StateProviderBox, StateProviderFactory,
     errors::ProviderResult,
 };
+use reth_transaction_pool::TransactionPool;
 use reth_trie_common::AccountProof;
 use std::sync::Arc;
 use tracing::debug;
@@ -302,8 +303,101 @@ pub struct PreconfLog {
 /// (forwarding to an upstream sequencer).
 #[async_trait]
 pub trait DynPreconfHandler: Send + Sync + std::fmt::Debug {
+    /// Captures the currently executing build's nonce for one sender.
+    fn pending_nonce(&self, sender: &Address) -> Option<PendingAccountNonce>;
+
     /// Process a raw transaction submission and return the preconf event.
     async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent>;
+}
+
+/// A nonce captured from the build's execution account view.
+#[derive(Debug, Clone, Copy)]
+pub enum PendingAccountNonce {
+    /// A signed transaction establishes the exact next nonce.
+    Absolute(u64),
+    /// Deposits advance nonce without carrying its value. Apply this increment
+    /// to the build's parent, never to a later canonical state that may already
+    /// contain those same deposits.
+    ParentIncrement {
+        /// Parent block of the captured build.
+        parent: B256,
+        /// Nonce increments executed since that parent.
+        increment: u64,
+    },
+}
+
+/// Pending nonce override for a local sequencer with preconfirmation enabled.
+///
+/// Slice execution can prune every transaction of a sender before a consumer
+/// receives the slice. Start the pool lookup at the build's executed nonce so
+/// both pruned transactions and newly accepted successors are accounted for.
+pub fn sequencer_nonce_rpc<Eth>(
+    eth: Arc<Eth>,
+    handler: Arc<dyn DynPreconfHandler>,
+) -> jsonrpsee::RpcModule<()>
+where
+    Eth: EthState + Send + Sync + 'static,
+    ErrorObject<'static>: From<Eth::Error>,
+{
+    SequencerNonceRpc { eth, handler }.into_rpc().remove_context()
+}
+
+#[rpc(server, namespace = "eth")]
+trait SequencerNonceApi {
+    /// Returns canonical nonce, plus executed and consecutively pooled transactions for pending.
+    #[method(name = "getTransactionCount")]
+    async fn get_transaction_count(
+        &self,
+        address: Address,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<U256>;
+}
+
+struct SequencerNonceRpc<Eth> {
+    eth: Arc<Eth>,
+    handler: Arc<dyn DynPreconfHandler>,
+}
+
+#[async_trait]
+impl<Eth> SequencerNonceApiServer for SequencerNonceRpc<Eth>
+where
+    Eth: EthState + Send + Sync + 'static,
+    ErrorObject<'static>: From<Eth::Error>,
+{
+    async fn get_transaction_count(
+        &self,
+        address: Address,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<U256> {
+        if block_number != Some(BlockId::pending()) {
+            return EthState::transaction_count(self.eth.as_ref(), address, block_number)
+                .await
+                .map_err(ErrorObject::from);
+        }
+        let canonical =
+            EthState::transaction_count(self.eth.as_ref(), address, Some(BlockId::latest()))
+                .await
+                .map_err(ErrorObject::from)?;
+        let executed = match self.handler.pending_nonce(&address) {
+            Some(PendingAccountNonce::Absolute(nonce)) => U256::from(nonce),
+            Some(PendingAccountNonce::ParentIncrement { parent, increment }) => {
+                let base =
+                    EthState::transaction_count(self.eth.as_ref(), address, Some(parent.into()))
+                        .await
+                        .map_err(ErrorObject::from)?;
+                base.saturating_add(U256::from(increment))
+            }
+            None => canonical,
+        }
+        .max(canonical)
+        .saturating_to();
+        let next = self
+            .eth
+            .pool()
+            .get_highest_consecutive_transaction_by_sender(address, executed)
+            .map_or(executed, |tx| tx.nonce().saturating_add(1).max(executed));
+        Ok(U256::from(next))
+    }
 }
 
 // ─── RPC trait ───────────────────────────────────────────────────────────────
@@ -336,6 +430,8 @@ pub trait MantleEthApiExt {
     /// Estimates the total fee for a transaction (L2 gas + L1 data + operator fee).
     ///
     /// Only supported on Mantle chains after the Arsia hardfork.
+    /// With `pending`, a consumer uses one captured Flashblocks preview for execution
+    /// and fee parameters; without a preview it resolves the block through the Eth API.
     #[method(name = "estimateTotalFee")]
     async fn estimate_total_fee(
         &self,
@@ -404,8 +500,7 @@ pub struct MantleRpcExt<Provider, EthApi> {
     /// stub.
     preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
     /// Pending flashblock overlay. `Some` only when the flashblock consumer is
-    /// enabled; supplies the state overrides `eth_simulateV1` prepends for the
-    /// `pending` tag.
+    /// enabled; supplies a request-scoped snapshot for pending simulation and total fees.
     pending_overrides: Option<Arc<dyn PendingStateOverrides>>,
 }
 
@@ -420,7 +515,7 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         Self { provider, eth_api, sequencer_client, preconf_handler, pending_overrides: None }
     }
 
-    /// Attaches the flashblock pending overlay used by `eth_simulateV1`.
+    /// Attaches the flashblock pending overlay used by simulation and total-fee estimation.
     #[must_use]
     pub fn with_pending_overrides(
         mut self,
@@ -433,59 +528,6 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
     #[inline]
     fn provider(&self) -> &Provider {
         &self.provider
-    }
-
-    /// Rewrites a `pending`-tagged `eth_simulateV1` request to run against the
-    /// flashblock overlay's base block with the overlay's state prepended.
-    ///
-    /// Returns the request unchanged when the tag is not `pending` or no overlay
-    /// is attached. User-supplied overrides win per address.
-    fn apply_pending_overrides(
-        &self,
-        payload: serde_json::Value,
-        block_number: Option<BlockId>,
-    ) -> RpcResult<(serde_json::Value, Option<BlockId>)> {
-        let block_id = block_number.unwrap_or_default();
-        if !block_id.is_pending() {
-            return Ok((payload, block_number));
-        }
-        let Some(overlay) = self.pending_overrides.as_ref() else {
-            return Ok((payload, block_number));
-        };
-        // Counted here rather than right after the `pending` check: unlike the
-        // `flashblocks.rpc.*` counters in the override module, this method is
-        // registered whether or not the consumer is enabled.
-        Metrics::rpc_simulate_v1().increment(1);
-        let Some(pending) = overlay.pending_state_overrides() else {
-            return Ok((payload, Some(overlay.pending_base_block())));
-        };
-
-        let mut payload = payload;
-        if let Some(calls) =
-            payload.get_mut("blockStateCalls").and_then(serde_json::Value::as_array_mut)
-        {
-            for call in calls.iter_mut() {
-                let user: StateOverride = match call.get("stateOverrides") {
-                    Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
-                        invalid_params_rpc_err(format!("invalid stateOverrides: {e}"))
-                    })?,
-                    None => StateOverride::default(),
-                };
-                let merged = StateOverridesBuilder::new(pending.clone()).extend(user).build();
-                let merged = serde_json::to_value(merged).map_err(|e| {
-                    ErrorObject::owned(
-                        -32000,
-                        format!("failed to serialise stateOverrides: {e}"),
-                        None::<()>,
-                    )
-                })?;
-                if let Some(obj) = call.as_object_mut() {
-                    obj.insert("stateOverrides".to_string(), merged);
-                }
-            }
-        }
-
-        Ok((payload, Some(overlay.pending_base_block())))
     }
 
     #[inline]
@@ -559,73 +601,6 @@ fn estimate_total_fee_gas_price(
     }
 }
 
-/// Default spacing between simulated blocks when a request does not override `time`.
-///
-/// Must track `OpNextBlockEnvAttributes::build_pending_env`, which derives a simulated block's
-/// timestamp as `parent.timestamp() + 12`. The value comes from `eth_simulateV1`'s original
-/// definition in go-ethereum (`timestampIncrement`, `internal/ethapi/simulate.go`) and is a plain
-/// constant on both clients today, so 12 is what op-geth and this reth actually produce — verified
-/// on devnet.
-///
-/// It is nonetheless *wrong for Mantle*, whose blocks are 2s apart, and upstream reth has already
-/// replaced the constant with a per-chain lookup (`Chain::average_blocktime_hint()`), keeping 12
-/// only as the fallback for unregistered chains. Mantle is **not** unregistered: `alloy-chains`
-/// records `average_blocktime_millis = 2000` for both chain 5000 and 5003
-/// (`CHAIN_DATA[95]`/`[96]` in `alloy-chains/src/generated/named.rs`).
-///
-/// So bumping to a rev that includes that change will switch the real increment from 12 to 2, and
-/// this constant will silently disagree with it — the crossing check would compute timestamps ~6x
-/// too far ahead and could reject a request that never crosses the fork. See
-/// [`simulated_block_timestamps`] for the fix to apply at bump time.
-const SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT: u64 = 12;
-
-/// Parses a JSON-RPC quantity into a `u64`, accepting both the canonical `"0x2a"` hex string and a
-/// bare JSON number.
-fn parse_quantity_u64(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::String(raw) => {
-            let raw = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))?;
-            u64::from_str_radix(raw, 16).ok()
-        }
-        serde_json::Value::Number(raw) => raw.as_u64(),
-        _ => None,
-    }
-}
-
-/// Returns the timestamp of each simulated block, in order, given the base block's timestamp and
-/// each entry's optional `blockOverrides.time`.
-///
-/// Mirrors how `eth_simulateV1` derives timestamps: default to `previous + 12`, but an explicit
-/// `time` override wins. Each block's parent is the *previous simulated block*, not the base block,
-/// so the timestamps must be walked forward rather than computed against the base.
-///
-/// This assumes one simulated block per `blockStateCalls` entry, and that consecutive blocks are
-/// [`SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT`] apart. Both hold today but both break on the same
-/// upstream bump:
-///
-/// - paradigmxyz/reth#24388 adds gap-filling, so a skipped `blockOverrides.number` inserts filler
-///   blocks that also consume timestamps — the entry's real timestamp then lands *later* than
-///   computed here, and a crossing could be missed.
-/// - the same tree replaces the fixed increment with `Chain::average_blocktime_hint()`, which
-///   returns 2s for Mantle (registered in `alloy-chains`), so timestamps computed at 12s would run
-///   ~6x too far ahead and a non-crossing request could be rejected.
-///
-/// The single fix for both: once on such a rev, derive the timestamps from `sanitize_chain`'s
-/// output — it materializes an explicit `time` for every block, fillers included, at the chain's
-/// real block time — instead of recomputing them here.
-fn simulated_block_timestamps(base_timestamp: u64, time_overrides: &[Option<u64>]) -> Vec<u64> {
-    let mut previous = base_timestamp;
-    time_overrides
-        .iter()
-        .map(|override_time| {
-            let timestamp = override_time
-                .unwrap_or_else(|| previous.saturating_add(SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT));
-            previous = timestamp;
-            timestamp
-        })
-        .collect()
-}
-
 /// Returns the 0-based index of the first simulated block that crosses the Arsia activation
 /// boundary, i.e. whose parent is pre-Arsia while the block itself is post-Arsia.
 ///
@@ -671,6 +646,8 @@ where
         + Send
         + Sync
         + 'static,
+    EthApi::Primitives: NodePrimitives<BlockHeader = Header>,
+    EthApi::Provider: ChainSpecProvider<ChainSpec: OpHardforks>,
     // Lets `eth_simulateV1` surface the standard implementation's error verbatim, preserving the
     // spec-defined codes (-38010..-38026) instead of collapsing them into a generic -32000.
     ErrorObject<'static>: From<EthApi::Error>,
@@ -840,13 +817,9 @@ where
                 sequencer.forward_raw_transaction_with_preconf(bytes.as_ref()).await;
             metrics::histogram!("preconf.forward.duration_ms")
                 .record(started.elapsed().as_millis() as f64);
-            let raw: serde_json::Value = forward_result.map_err(|err| {
-                ErrorObject::owned(
-                    -32000,
-                    format!("failed to forward tx to sequencer, please try again. Error: '{err}'"),
-                    None::<()>,
-                )
-            })?;
+            // Preserve the sequencer's RPC code, message and data. The shared
+            // conversion reports transport failures as internal errors instead.
+            let raw: serde_json::Value = forward_result?;
             serde_json::from_value::<PreconfTxEvent>(raw).map_err(|err| {
                 ErrorObject::owned(
                     -32000,
@@ -871,24 +844,68 @@ where
         validate_estimate_total_fee_blob_fields(&request)?;
 
         let block_id = block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
-
-        let block = self
-            .provider()
-            .block_by_id(block_id)
-            .map_err(|e| {
-                ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
-            })?
-            .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
-
-        // Pin symbolic block tags (safe, finalized, latest) to the resolved block number.
-        // This ensures estimate_gas_at uses the same block even if a new block arrives.
-        // Matches geth: `bNrOrHash = rpc.BlockNumberOrHashWithNumber(header.Number.Int64())`
-        let block_id = BlockId::Number(BlockNumberOrTag::Number(block.header().number()));
-
-        let header = block.header();
+        // Capture once: gas execution, base fee, L1 attributes and token ratio must
+        // all describe this same published preview, even if a new slice arrives.
+        let context = block_id
+            .is_pending()
+            .then(|| {
+                self.pending_overrides
+                    .as_ref()
+                    .and_then(|overlay| overlay.pending_execution_context())
+            })
+            .flatten();
+        let (block_id, timestamp, header_base_fee, l1_block_info) = if let Some(context) =
+            context.as_ref()
+        {
+            (
+                context.base_block,
+                context.header.timestamp(),
+                context.header.base_fee_per_gas(),
+                None,
+            )
+        } else if block_id.is_pending() {
+            // The provider may not have a pending block. Resolve through the Eth API,
+            // retaining actual pending state when available and otherwise pinning latest.
+            let pending = self.eth_api().pending_block_env_and_cfg().map_err(ErrorObject::from)?;
+            let at = pending.origin.state_block_id();
+            // Reuse the actual block captured during resolution. recovered_block(pending)
+            // is disabled by --rpc.pending-block=none even when the provider has it.
+            let block = if let Some(block) = pending.origin.into_actual_pending() {
+                block
+            } else {
+                self.eth_api()
+                    .recovered_block(at)
+                    .await
+                    .map_err(ErrorObject::from)?
+                    .ok_or_else(|| invalid_params_rpc_err("block not found"))?
+            };
+            let at = if at.is_pending() { at } else { block.hash().into() };
+            (
+                at,
+                block.header().timestamp(),
+                block.header().base_fee_per_gas(),
+                extract_l1_info(block.body()).ok(),
+            )
+        } else {
+            let block = self
+                .provider()
+                .block_by_id(block_id)
+                .map_err(|e| {
+                    ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
+                })?
+                .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
+            // Preserve non-pending block resolution and fee calculation.
+            let at = BlockId::Number(BlockNumberOrTag::Number(block.header().number()));
+            (
+                at,
+                block.header().timestamp(),
+                block.header().base_fee_per_gas(),
+                extract_l1_info(block.body()).ok(),
+            )
+        };
         let chain_spec = self.provider().chain_spec();
 
-        if !chain_spec.is_mantle_arsia_active_at_timestamp(header.timestamp()) {
+        if !chain_spec.is_mantle_arsia_active_at_timestamp(timestamp) {
             return Err(ErrorObject::owned(
                 -32000,
                 "eth_estimateTotalFee is not supported for pre-Arsia blocks",
@@ -905,22 +922,31 @@ where
             )
         })?;
 
-        // Estimate L2 gas via the standard gas estimator (matches op-geth DoEstimateGas)
-        let gas_estimate: U256 = EthCall::estimate_gas_at(
-            self.eth_api(),
-            serde_json::from_value(serde_json::to_value(&request).map_err(|e| {
-                ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
-            })?)
-            .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?,
-            block_id,
-            EvmOverrides::default(),
-        )
+        let transaction = serde_json::from_value(serde_json::to_value(&request).map_err(|e| {
+            ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
+        })?)
+        .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?;
+        let overrides =
+            context.as_ref().map(|context| context.overrides(None, None)).unwrap_or_default();
+        let pending_api =
+            context.map(|context| PendingEthApi::new(self.eth_api().clone(), context));
+        // Estimate L2 gas through the same execution path as eth_estimateGas(pending).
+        let gas_estimate: U256 = async {
+            if let Some(api) = pending_api.as_ref() {
+                let estimate =
+                    EthCall::estimate_gas_at(api, transaction, block_id, overrides.clone()).await?;
+                api.check_estimate_funds(request.clone(), estimate, overrides.state).await?;
+                Ok(estimate)
+            } else {
+                EthCall::estimate_gas_at(self.eth_api(), transaction, block_id, overrides).await
+            }
+        }
         .await
         .map_err(|e| {
             ErrorObject::owned(-32000, format!("failed to estimate gas: {e}"), None::<()>)
         })?;
 
-        let base_fee = U256::from(header.base_fee_per_gas().unwrap_or(0));
+        let base_fee = U256::from(header_base_fee.unwrap_or(0));
 
         // Get real suggested tip (matches op-geth SuggestGasTipCap)
         let suggested_tip =
@@ -935,16 +961,32 @@ where
         );
         let l2_fee = gas_estimate.saturating_mul(gas_price);
 
-        // Calculate L1 data fee + operator fee from L1BlockInfo
-        let (l1_data_fee, operator_fee) = match extract_l1_info(block.body()) {
-            Ok(mut l1_block_info) => {
-                // `token_ratio` (GasPriceOracle slot 0) is not in the L1-attributes calldata;
-                // read it from the target block's post-state (matches geth's
-                // `StateAndHeaderByNumberOrHash`). Propagate provider errors rather than
-                // silently keeping the default 0 — `token_ratio` is the multiplicative factor
-                // of the L1 data fee, so swallowing an error would drop the whole L1 component.
-                l1_block_info.token_ratio = read_token_ratio(self.provider(), block_id)?;
-
+        // Calculate L1 data fee + operator fee from the same state used for execution.
+        let l1_block_info = if let Some(api) = pending_api.as_ref() {
+            Some(api.l1_block_info().await.map_err(ErrorObject::from)?)
+        } else if let Some(mut info) = l1_block_info {
+            info.token_ratio = if block_id.is_pending() {
+                let state =
+                    self.eth_api().state_at_block_id(block_id).await.map_err(ErrorObject::from)?;
+                state
+                    .storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
+                    .map_err(|e| {
+                        ErrorObject::owned(
+                            -32000,
+                            format!("failed to read token_ratio: {e}"),
+                            None::<()>,
+                        )
+                    })?
+                    .unwrap_or_default()
+            } else {
+                read_token_ratio(self.provider(), block_id)?
+            };
+            Some(info)
+        } else {
+            None
+        };
+        let (l1_data_fee, operator_fee) = match l1_block_info {
+            Some(l1_block_info) => {
                 // Build a proxy envelope matching geth's CallDefaults + ToTransaction:
                 // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with RPCGasCap,
                 //   which defaults to DefaultMantleBlockGasLimit = 0x4000000000000)
@@ -953,16 +995,10 @@ where
                 //   authorizationList is present, otherwise EIP-1559. An explicit gasPrice or
                 //   absent baseFee uses legacy, matching geth's CallDefaults baseFee != nil.
                 let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
-                let tx_envelope = build_unsigned_tx_envelope(
-                    &request,
-                    envelope_gas,
-                    header.base_fee_per_gas(),
-                    chain_id,
-                )?;
-                let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(
-                    chain_spec.as_ref(),
-                    header.timestamp(),
-                );
+                let tx_envelope =
+                    build_unsigned_tx_envelope(&request, envelope_gas, header_base_fee, chain_id)?;
+                let spec_id =
+                    alloy_op_evm::spec_by_timestamp_after_bedrock(chain_spec.as_ref(), timestamp);
                 let l1_data_fee =
                     l1_block_info.calculate_tx_l1_cost_for_estimate(&tx_envelope, spec_id, 80);
 
@@ -982,7 +1018,7 @@ where
 
                 (l1_data_fee, operator_fee)
             }
-            Err(_) => (U256::ZERO, U256::ZERO),
+            None => (U256::ZERO, U256::ZERO),
         };
 
         Ok(l2_fee.saturating_add(l1_data_fee).saturating_add(operator_fee))
@@ -993,77 +1029,101 @@ where
         payload: serde_json::Value,
         block_number: Option<BlockId>,
     ) -> RpcResult<serde_json::Value> {
+        let mut payload: SimulatePayload<_> = serde_json::from_value(payload)
+            .map_err(|e| invalid_params_rpc_err(format!("invalid eth_simulateV1 payload: {e}")))?;
+        // Let the standard implementation report empty-call errors before any block lookup.
+        if payload.block_state_calls.is_empty() {
+            return EthCall::simulate_v1(self.eth_api(), payload, block_number)
+                .await
+                .map_err(ErrorObject::from)
+                .and_then(|blocks| {
+                    serde_json::to_value(blocks)
+                        .map_err(|e| ErrorObject::owned(-32000, e.to_string(), None::<()>))
+                });
+        }
+        let context = if block_number.is_some_and(|block| block.is_pending()) {
+            self.pending_overrides.as_ref().and_then(|overlay| {
+                Metrics::rpc_simulate_v1().increment(1);
+                overlay.pending_execution_context()
+            })
+        } else {
+            None
+        };
+        let (at, parent) = if let Some(context) = context.as_ref() {
+            (context.base_block, context.header.clone())
+        } else {
+            let mut at = block_number.unwrap_or_default();
+            // Consumer nodes do not populate the provider's pending block. Resolve via
+            // the Eth API, which falls back to latest when there is no pending state.
+            if at.is_pending() {
+                at = self.eth_api().evm_env_at(at).await.map_err(ErrorObject::from)?.1;
+            }
+            let block = self
+                .eth_api()
+                .recovered_block(at)
+                .await
+                .map_err(ErrorObject::from)?
+                .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
+            // An actual pending block's state is available under the pending tag,
+            // not as canonical history at its uncommitted hash.
+            let at = if at.is_pending() { at } else { block.hash().into() };
+            (at, block.sealed_header().clone())
+        };
         let chain_spec = self.provider().chain_spec();
-
-        // Only Mantle chains have an Arsia fork; leave every other chain on the standard path.
+        // Use the same normalization as execution: chain-specific spacing, explicit
+        // timestamps and filler blocks for number gaps all affect the Arsia boundary.
+        payload.block_state_calls = simulate::sanitize_chain(
+            payload.block_state_calls,
+            &parent,
+            chain_spec.chain_id(),
+            self.eth_api().max_simulate_blocks(),
+        )
+        .map_err(|error| ErrorObject::from(EthApi::Error::from_eth_err(error)))?;
         if chain_spec.is_mantle() {
-            let block_id = block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
-
-            // Read only the `time` overrides. Everything else is the standard implementation's
-            // concern, and deserializing the full typed payload here would drag the
-            // network-specific `RpcTxReq` generic through the trait boundary.
-            let time_overrides = payload
-                .get("blockStateCalls")
-                .and_then(serde_json::Value::as_array)
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .map(|call| {
-                            call.get("blockOverrides")
-                                .and_then(|overrides| overrides.get("time"))
-                                .and_then(parse_quantity_u64)
-                        })
-                        .collect::<Vec<_>>()
+            let timestamps: Vec<_> = payload
+                .block_state_calls
+                .iter()
+                .map(|block| {
+                    block
+                        .block_overrides
+                        .as_ref()
+                        .and_then(|block| block.time)
+                        .expect("sanitized timestamp")
                 })
-                .unwrap_or_default();
-
-            // An empty/absent `blockStateCalls` is the standard implementation's error to report,
-            // so skip the check and let it produce the canonical message.
-            if !time_overrides.is_empty() {
-                let base_timestamp = self
-                    .provider()
-                    .block_by_id(block_id)
-                    .map_err(|e| {
-                        ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
-                    })?
-                    .ok_or_else(|| invalid_params_rpc_err("block not found"))?
-                    .header()
-                    .timestamp();
-
-                let timestamps = simulated_block_timestamps(base_timestamp, &time_overrides);
-                if let Some(index) =
-                    first_arsia_boundary_crossing(base_timestamp, &timestamps, |timestamp| {
-                        chain_spec.is_mantle_arsia_active_at_timestamp(timestamp)
-                    })
-                {
-                    debug!(
-                        target: "rpc::eth",
-                        base_timestamp,
-                        crossing_block_index = index,
-                        crossing_block_timestamp = timestamps[index],
-                        "rejecting eth_simulateV1 crossing the Mantle Arsia activation boundary"
-                    );
-                    return Err(ErrorObject::owned(
-                        -32000,
-                        "eth_simulateV1 does not support crossing the Mantle Arsia activation \
-                         boundary",
-                        None::<()>,
-                    ));
-                }
+                .collect();
+            if let Some(index) =
+                first_arsia_boundary_crossing(parent.timestamp, &timestamps, |timestamp| {
+                    chain_spec.is_mantle_arsia_active_at_timestamp(timestamp)
+                })
+            {
+                debug!(target: "rpc::eth", base_timestamp = parent.timestamp,
+                    crossing_block_index = index, crossing_block_timestamp = timestamps[index],
+                    "rejecting eth_simulateV1 crossing the Mantle Arsia activation boundary");
+                return Err(ErrorObject::owned(
+                    -32000,
+                    "eth_simulateV1 does not support crossing the Mantle Arsia activation boundary",
+                    None::<()>,
+                ));
             }
         }
+        let blocks = if let Some(context) = context {
+            // Seed state once, including when sanitize_chain inserted a filler block.
+            // Reapplying it to later blocks would erase preceding simulated writes.
+            let first = &mut payload.block_state_calls[0];
+            let overrides = context.overrides(
+                first.state_overrides.take(),
+                first.block_overrides.take().map(Box::new),
+            );
+            first.state_overrides = overrides.state;
+            first.block_overrides = overrides.block.map(|block| *block);
+            let api = PendingEthApi::new(self.eth_api().clone(), context);
+            EthCall::simulate_v1(&api, payload, Some(at)).await.map_err(ErrorObject::from)?
+        } else {
+            EthCall::simulate_v1(self.eth_api(), payload, Some(at))
+                .await
+                .map_err(ErrorObject::from)?
+        };
 
-        // Flashblocks: for the `pending` tag, resolve to the overlay's base block and
-        // prepend its state overrides to every `blockStateCalls` entry.
-        let (payload, block_number) = self.apply_pending_overrides(payload, block_number)?;
-
-        // Not a boundary-crossing simulation: hand off to the standard implementation. Round-trip
-        // through JSON so the network-specific payload/result generics stay behind `EthApi`.
-        let typed_payload = serde_json::from_value(payload)
-            .map_err(|e| invalid_params_rpc_err(format!("invalid eth_simulateV1 payload: {e}")))?;
-        let blocks = EthCall::simulate_v1(self.eth_api(), typed_payload, block_number)
-            .await
-            .map_err(ErrorObject::from)?;
         serde_json::to_value(blocks).map_err(|e| {
             ErrorObject::owned(
                 -32000,
@@ -1213,7 +1273,6 @@ fn build_unsigned_tx_envelope(
 
 #[cfg(test)]
 mod tests {
-    use jsonrpsee::types::error::INVALID_PARAMS_CODE;
 
     use super::*;
     use alloy_consensus::TxEnvelope;
@@ -1269,196 +1328,6 @@ mod tests {
     ) -> Vec<u8> {
         build_unsigned_tx_envelope(request, gas_estimate, base_fee, chain_id)
             .expect("valid fee envelope request")
-    }
-
-    // ─── pending overlay injection into eth_simulateV1 ──────────────────
-
-    /// Stands in for the flashblock overlay. The real implementor is
-    /// `mantle-reth-flashblocks`'s state; this crate only consumes the trait.
-    #[derive(Debug)]
-    struct StubOverlay {
-        base_block: BlockId,
-        overrides: Option<StateOverride>,
-    }
-
-    impl PendingStateOverrides for StubOverlay {
-        fn pending_base_block(&self) -> BlockId {
-            self.base_block
-        }
-
-        fn pending_state_overrides(&self) -> Option<StateOverride> {
-            self.overrides.clone()
-        }
-    }
-
-    const OVERLAY_ONLY: Address = Address::repeat_byte(0xA1);
-    const CONTESTED: Address = Address::repeat_byte(0xB2);
-
-    fn state_override(address: Address, balance: &str) -> StateOverride {
-        serde_json::from_value(serde_json::json!({
-            format!("{address:#x}"): { "balance": balance }
-        }))
-        .expect("a valid state override")
-    }
-
-    /// `MantleRpcExt`'s inherent impl carries no bounds on either generic, so the
-    /// overlay path can be exercised without standing up a provider or eth API.
-    fn ext(overlay: Option<StubOverlay>) -> MantleRpcExt<(), ()> {
-        MantleRpcExt::new((), Arc::new(()), None, None)
-            .with_pending_overrides(overlay.map(|o| Arc::new(o) as Arc<dyn PendingStateOverrides>))
-    }
-
-    fn overlay_at_block_9() -> StubOverlay {
-        StubOverlay {
-            base_block: BlockId::from(9u64),
-            overrides: Some(state_override(OVERLAY_ONLY, "0x64")),
-        }
-    }
-
-    fn payload_with_user_override() -> serde_json::Value {
-        serde_json::json!({
-            "blockStateCalls": [
-                { "calls": [], "stateOverrides": state_override(CONTESTED, "0x2") },
-                { "calls": [] },
-            ]
-        })
-    }
-
-    fn overrides_of(payload: &serde_json::Value, call: usize) -> StateOverride {
-        serde_json::from_value(payload["blockStateCalls"][call]["stateOverrides"].clone())
-            .expect("a valid state override")
-    }
-
-    fn balance_of(overrides: &StateOverride, address: Address) -> Option<U256> {
-        overrides.get(&address).and_then(|account| account.balance)
-    }
-
-    /// A concrete tag names a settled block; the overlay must not be consulted.
-    #[test]
-    fn a_non_pending_tag_is_left_alone() {
-        let payload = payload_with_user_override();
-        let block = Some(BlockId::from(BlockNumberOrTag::Latest));
-
-        let (out, out_block) = ext(Some(overlay_at_block_9()))
-            .apply_pending_overrides(payload.clone(), block)
-            .expect("no rewrite");
-
-        assert_eq!(out, payload);
-        assert_eq!(out_block, block);
-    }
-
-    /// The default tag is `latest`, so an absent block number is also left alone.
-    #[test]
-    fn an_absent_block_number_is_left_alone() {
-        let payload = payload_with_user_override();
-
-        let (out, out_block) = ext(Some(overlay_at_block_9()))
-            .apply_pending_overrides(payload.clone(), None)
-            .expect("no rewrite");
-
-        assert_eq!(out, payload);
-        assert_eq!(out_block, None);
-    }
-
-    /// Without the flashblock consumer the `pending` tag stays untouched, so the
-    /// standard implementation keeps resolving it.
-    #[test]
-    fn pending_passes_through_when_no_overlay_is_attached() {
-        let payload = payload_with_user_override();
-        let block = Some(BlockId::pending());
-
-        let (out, out_block) =
-            ext(None).apply_pending_overrides(payload.clone(), block).expect("no rewrite");
-
-        assert_eq!(out, payload);
-        assert_eq!(out_block, block, "the tag must survive for the standard implementation");
-    }
-
-    /// An attached overlay that holds no state still pins the simulation to its
-    /// base block, so a later canonical commit cannot move the ground underneath.
-    #[test]
-    fn an_empty_overlay_still_pins_the_base_block() {
-        let payload = payload_with_user_override();
-        let overlay = StubOverlay { base_block: BlockId::from(9u64), overrides: None };
-
-        let (out, out_block) = ext(Some(overlay))
-            .apply_pending_overrides(payload.clone(), Some(BlockId::pending()))
-            .expect("rewrite");
-
-        assert_eq!(out, payload, "no overlay state means no override merging");
-        assert_eq!(out_block, Some(BlockId::from(9u64)));
-    }
-
-    /// R4: the overlay's state is prepended to every entry, and a user override
-    /// for the same address wins — the caller's intent is not silently replaced.
-    #[test]
-    fn the_overlay_is_prepended_to_every_call_and_user_overrides_win() {
-        let overlay = StubOverlay {
-            base_block: BlockId::from(9u64),
-            overrides: Some(
-                serde_json::from_value(serde_json::json!({
-                    format!("{OVERLAY_ONLY:#x}"): { "balance": "0x64" },
-                    format!("{CONTESTED:#x}"): { "balance": "0x1" },
-                }))
-                .expect("a valid state override"),
-            ),
-        };
-
-        let (out, out_block) = ext(Some(overlay))
-            .apply_pending_overrides(payload_with_user_override(), Some(BlockId::pending()))
-            .expect("rewrite");
-
-        assert_eq!(out_block, Some(BlockId::from(9u64)));
-
-        let first = overrides_of(&out, 0);
-        assert_eq!(
-            balance_of(&first, OVERLAY_ONLY),
-            Some(U256::from(0x64)),
-            "overlay-only address"
-        );
-        assert_eq!(
-            balance_of(&first, CONTESTED),
-            Some(U256::from(2)),
-            "the user's 0x2 must win over the overlay's 0x1"
-        );
-
-        let second = overrides_of(&out, 1);
-        assert_eq!(
-            balance_of(&second, OVERLAY_ONLY),
-            Some(U256::from(0x64)),
-            "an entry without user overrides still receives the overlay"
-        );
-        assert_eq!(balance_of(&second, CONTESTED), Some(U256::from(1)), "overlay value stands");
-    }
-
-    /// A malformed `stateOverrides` must be reported as a bad request rather than
-    /// dropped, which would run the simulation against unintended state.
-    #[test]
-    fn a_malformed_state_override_is_rejected() {
-        let payload = serde_json::json!({
-            "blockStateCalls": [{ "calls": [], "stateOverrides": "not an object" }]
-        });
-
-        let error = ext(Some(overlay_at_block_9()))
-            .apply_pending_overrides(payload, Some(BlockId::pending()))
-            .expect_err("must not be silently dropped");
-
-        assert_eq!(error.code(), INVALID_PARAMS_CODE);
-        assert!(error.message().contains("invalid stateOverrides"));
-    }
-
-    /// A payload without `blockStateCalls` is malformed for `eth_simulateV1`, but
-    /// this stage must not panic on it — rejection belongs to the typed decode.
-    #[test]
-    fn a_payload_without_block_state_calls_is_only_repointed() {
-        let payload = serde_json::json!({});
-
-        let (out, out_block) = ext(Some(overlay_at_block_9()))
-            .apply_pending_overrides(payload.clone(), Some(BlockId::pending()))
-            .expect("no panic");
-
-        assert_eq!(out, payload);
-        assert_eq!(out_block, Some(BlockId::from(9u64)));
     }
 
     // ─── gas price selection ────────────────────────────────────────────
@@ -2170,89 +2039,66 @@ mod tests {
         timestamp >= ARSIA_TIME
     }
 
-    #[test]
-    fn simulated_timestamps_default_to_parent_plus_increment() {
-        // Each block's parent is the previous simulated block, so the increments compound.
-        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![112, 124, 136]);
+    fn simulated_block_timestamps(base_timestamp: u64, times: &[Option<u64>]) -> Vec<u64> {
+        use alloy_rpc_types_eth::{BlockOverrides, simulate::SimBlock};
+        let parent = reth_primitives_traits::SealedHeader::seal_slow(Header {
+            timestamp: base_timestamp,
+            ..Default::default()
+        });
+        let blocks: Vec<SimBlock<TransactionRequest>> = times
+            .iter()
+            .map(|time| SimBlock {
+                block_overrides: Some(BlockOverrides { time: *time, ..Default::default() }),
+                ..Default::default()
+            })
+            .collect();
+        simulate::sanitize_chain(blocks, &parent, 5003, 256)
+            .unwrap()
+            .iter()
+            .map(|block| block.block_overrides.as_ref().unwrap().time.unwrap())
+            .collect()
     }
 
     #[test]
-    fn simulated_timestamps_honour_time_overrides() {
-        // An explicit override wins, and subsequent defaults build on it — not on the base block.
-        assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![112, 500, 512]);
+    fn mantle_simulated_timestamps_follow_execution_spacing() {
+        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![102, 104, 106]);
+        assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![102, 500, 502]);
     }
 
-    /// Path 1 from the cross-client report: the base block is the last pre-Arsia block, so the very
-    /// first simulated block (base + 12) already crosses the activation boundary.
     #[test]
-    fn detects_crossing_when_base_block_is_pre_arsia() {
+    fn detects_first_and_later_arsia_crossings() {
         let base = ARSIA_TIME - 2;
-        let timestamps = simulated_block_timestamps(base, &[None]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
-    }
-
-    /// Path 2 from the report: the first simulated block stays pre-Arsia and only the second one
-    /// crosses, via an explicit `blockOverrides.time`. The parent for that comparison is the
-    /// previous *simulated* block, which is why the walk cannot be done against the base block.
-    #[test]
-    fn detects_crossing_introduced_by_a_later_time_override() {
+        assert_eq!(
+            first_arsia_boundary_crossing(
+                base,
+                &simulated_block_timestamps(base, &[None]),
+                is_arsia
+            ),
+            Some(0)
+        );
         let base = ARSIA_TIME - 20;
-        let timestamps = simulated_block_timestamps(base, &[None, Some(ARSIA_TIME)]);
-        assert_eq!(timestamps, vec![ARSIA_TIME - 8, ARSIA_TIME]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(1));
+        assert_eq!(
+            first_arsia_boundary_crossing(
+                base,
+                &simulated_block_timestamps(base, &[None, Some(ARSIA_TIME)]),
+                is_arsia
+            ),
+            Some(1)
+        );
     }
 
     #[test]
-    fn allows_simulation_entirely_before_activation() {
-        let base = 0;
-        let timestamps = simulated_block_timestamps(base, &[None, None]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), None);
-    }
-
-    /// The boundary is crossed by the *first* simulated block when the base block is the last
-    /// pre-Arsia block, even though every later block is also post-activation: only the transition
-    /// counts, and it is reported once.
-    #[test]
-    fn reports_the_first_crossing_block_not_a_later_one() {
-        let base = ARSIA_TIME - 2;
-        let timestamps = simulated_block_timestamps(base, &[None, None, None]);
-        // base is pre-Arsia; all three simulated blocks land after activation.
-        assert!(timestamps.iter().all(|&ts| is_arsia(ts)));
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
-    }
-
-    /// Once activation is reached, a chain whose base is already post-activation has no transition
-    /// left to report.
-    #[test]
-    fn does_not_re_report_crossing_after_activation_is_reached() {
-        let base = ARSIA_TIME - 20;
-        // Block 0 jumps past activation, block 1 defaults to block 0 + 12 (also post-activation).
-        let timestamps = simulated_block_timestamps(base, &[Some(ARSIA_TIME), None]);
-        assert_eq!(timestamps, vec![ARSIA_TIME, ARSIA_TIME + 12]);
-        // The crossing is at index 0 only — index 1's parent is already post-activation.
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
-        // And with the crossing block removed, the remaining chain is entirely post-activation.
-        assert_eq!(first_arsia_boundary_crossing(ARSIA_TIME, &timestamps[1..], is_arsia), None);
-    }
-
-    /// The common case on a live chain: activation is already in the past, so nothing crosses.
-    #[test]
-    fn allows_simulation_entirely_after_activation() {
-        let base = ARSIA_TIME + 100;
-        let timestamps = simulated_block_timestamps(base, &[None, None]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), None);
-    }
-
-    #[test]
-    fn parses_quantity_from_hex_string_and_number() {
-        assert_eq!(parse_quantity_u64(&serde_json::json!("0x6a82e880")), Some(1_786_964_096));
-        assert_eq!(parse_quantity_u64(&serde_json::json!("0X2a")), Some(42));
-        assert_eq!(parse_quantity_u64(&serde_json::json!(42)), Some(42));
-        // Malformed values must not be silently read as 0 — that would fake a pre-Arsia timestamp
-        // and skip the boundary check.
-        assert_eq!(parse_quantity_u64(&serde_json::json!("2a")), None);
-        assert_eq!(parse_quantity_u64(&serde_json::json!("0xzz")), None);
-        assert_eq!(parse_quantity_u64(&serde_json::Value::Null), None);
+    fn allows_simulation_without_an_arsia_transition() {
+        for base in [ARSIA_TIME - 5, ARSIA_TIME] {
+            assert_eq!(
+                first_arsia_boundary_crossing(
+                    base,
+                    &simulated_block_timestamps(base, &[None, None]),
+                    is_arsia
+                ),
+                None
+            );
+        }
     }
 
     // ─── preconf event forwarding: byte-identity round-trip ─────────────

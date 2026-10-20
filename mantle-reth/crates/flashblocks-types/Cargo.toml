@@ -16,6 +16,7 @@ alloy-primitives = { workspace = true, features = ["std", "serde"] }
 alloy-rpc-types-engine = { workspace = true, features = ["std", "serde"] }
 op-alloy-consensus = { workspace = true, features = ["std", "serde"] }
 op-alloy-rpc-types-engine = { workspace = true, features = ["std", "serde"] }
+reth-consensus-common.workspace = true
 
 brotli = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }

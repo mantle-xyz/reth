@@ -390,7 +390,7 @@ impl PreconfJournal {
         if !retried.is_empty() {
             // The write that failed may have stopped mid-line. A newline closes
             // it so this attempt does not fuse onto its tail and cost both
-            // records; `load` skips the blank line it leaves behind.
+            // records; `load` counts the blank line as a corrupt entry.
             buf.push(b'\n');
         }
         for line in retried.iter().chain(lines.iter()) {
@@ -520,9 +520,6 @@ impl PreconfJournal {
         let mut line_no = 0usize;
         while let Some(line) = lines.next_line().await? {
             line_no += 1;
-            if line.is_empty() {
-                continue;
-            }
             match serde_json::from_str::<JournalEntry>(&line) {
                 Ok(entry) => out.push(entry),
                 Err(source) => {
@@ -1412,7 +1409,7 @@ mod tests {
             vec![entry(1, 10).hash, entry(2, 10).hash],
             "the held record goes first, keeping the file in execution order",
         );
-        assert_eq!(bad, 0);
+        assert_eq!(bad, 1, "the failed write leaves a counted recovery separator");
         assert_eq!(j.pending_len(), 0, "and the buffer is empty again");
     }
 
@@ -1660,7 +1657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_ignores_blank_lines() {
+    async fn load_counts_blank_lines_without_losing_valid_entries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let good = serde_json::to_string(&entry(3, 30)).unwrap();
@@ -1669,7 +1666,7 @@ mod tests {
         let j = PreconfJournal::open(&path, 0).await.unwrap();
         let (loaded, bad) = j.load().await.unwrap();
         assert_eq!(loaded, vec![entry(3, 30)]);
-        assert_eq!(bad, 0);
+        assert_eq!(bad, 3, "blank lines are evidence of an incomplete journal write");
     }
 
     /// Rotation keeps whatever `retain` says to keep. Production passes

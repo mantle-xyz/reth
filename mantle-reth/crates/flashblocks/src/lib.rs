@@ -80,8 +80,8 @@ pub use receipt_builder::{ReceiptBuildError, UnifiedReceiptBuilder};
 pub mod rpc;
 pub use rpc::{
     BlockNumberOrTagExt, EthApiExt, EthApiOverrideServer, EthPubSub, EthPubSubApiServer,
-    ExtendedSubscriptionKind, FlashblocksSubscriptionKind, PendingStateOverrides,
-    TransactionWithLogs,
+    ExtendedSubscriptionKind, FlashblocksSubscriptionKind, PendingEthApi, PendingExecutionContext,
+    PendingStateOverrides, TransactionWithLogs,
 };
 
 mod state;

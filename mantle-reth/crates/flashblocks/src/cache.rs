@@ -196,6 +196,34 @@ mod tests {
         assert_eq!(cache.drain(13).len(), 1);
     }
 
+    /// Inserting at the ahead limit evicts the whole block at the retention
+    /// boundary while preserving the next block. This is independent of
+    /// canonical progress: no `update_canonical` call drives the eviction.
+    #[test]
+    fn inserting_at_the_ahead_limit_evicts_only_blocks_at_or_below_the_retention_boundary() {
+        for (max_ahead_blocks, newest) in [(5, 106), (2, 103)] {
+            let mut cache = FlashblockCache::new(100, max_ahead_blocks);
+            assert!(cache.insert(make_flashblock(101, 0)));
+            assert!(cache.insert(make_flashblock(101, 1)));
+            assert!(cache.insert(make_flashblock(102, 0)));
+            assert_eq!(cache.total_flashblocks(), 3);
+
+            assert!(cache.insert(make_flashblock(newest, 0)));
+
+            assert!(cache.drain(101).is_empty(), "all slices at the boundary must be evicted");
+            assert_eq!(cache.len(), 2);
+            assert_eq!(cache.total_flashblocks(), 2);
+            let retained = cache.drain(102);
+            assert_eq!(retained.len(), 1, "the first block above the boundary must survive");
+            assert_eq!(retained[0].metadata.block_number, 102);
+            assert_eq!(retained[0].index, 0);
+            let inserted = cache.drain(newest);
+            assert_eq!(inserted.len(), 1);
+            assert_eq!(inserted[0].metadata.block_number, newest);
+            assert!(cache.is_empty());
+        }
+    }
+
     #[test]
     fn not_cacheable_without_canonical() {
         let mut cache = FlashblockCache {

@@ -144,11 +144,32 @@ impl FlashblockBuilder {
 /// The node context is returned so the caller keeps it alive for the test's
 /// duration; dropping it tears the provider down.
 macro_rules! launch_flashblocks_consumer {
-    ($max_trailing_depth:expr, $max_leading_depth:expr) => {{
+    ($max_trailing_depth:expr, $max_leading_depth:expr) => {
+        launch_flashblocks_consumer!(
+            $max_trailing_depth,
+            $max_leading_depth,
+            crate::consumer_helpers::flashblocks_test_chain_spec()
+        )
+    };
+    ($max_trailing_depth:expr, $max_leading_depth:expr, $chain_spec:expr) => {{
+        launch_flashblocks_consumer!(
+            $max_trailing_depth,
+            $max_leading_depth,
+            $chain_spec,
+            persist_each_block = false
+        )
+    }};
+    (
+        $max_trailing_depth:expr,
+        $max_leading_depth:expr,
+        $chain_spec:expr,persist_each_block =
+        $persist:expr
+    ) => {{
         let (node, _http, _wallet, _chain_id) = mantle_reth_integration_tests::launch_mantle_node!(
-            crate::consumer_helpers::flashblocks_test_chain_spec(),
+            $chain_spec,
             mantle_reth_cli::node::MantleNode::default(),
-            crate::consumer_helpers::flashblocks_payload_attributes
+            crate::consumer_helpers::flashblocks_payload_attributes,
+            persist_each_block = $persist
         )
         .await;
 
@@ -259,6 +280,25 @@ pub fn filler_deposit(seed: u64) -> Bytes {
     }
     .encoded_2718()
     .into()
+}
+
+/// A nearly block-sized deposit in a slice. The JSON includes legal trailing
+/// whitespace to exceed tungstenite's default 16 MiB frame limit as well.
+pub fn large_slice_message() -> (MantleFlashblockPayload, String) {
+    let tx = TxDeposit {
+        source_hash: B256::with_last_byte(42),
+        from: Address::ZERO,
+        to: TxKind::Call(Address::ZERO),
+        gas_limit: 200_000_000,
+        input: vec![0xab; 8 * 1024 * 1024 - 4096].into(),
+        ..Default::default()
+    }
+    .encoded_2718();
+    assert!(tx.len() < 8 * 1024 * 1024 - 2048);
+    let slice = FlashblockBuilder::new(1, 0).transactions(vec![tx.into()]).build();
+    let mut json = serde_json::to_string(&slice).expect("serialize large slice");
+    json.extend(std::iter::repeat_n(' ', (16 * 1024 * 1024 + 1024) - json.len()));
+    (slice, json)
 }
 
 /// Convenience accessors over a running [`FlashblocksState`].

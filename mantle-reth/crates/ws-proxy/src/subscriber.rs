@@ -8,6 +8,7 @@ use std::{
 use axum::http::Uri;
 use backoff::{ExponentialBackoff, backoff::Backoff};
 use futures::{SinkExt, StreamExt};
+use mantle_reth_flashblocks_types::MAX_DECOMPRESSED_FLASHBLOCK_BYTES as MAX_SLICE_BYTES;
 use tokio::{select, sync::oneshot};
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -206,7 +207,9 @@ where
         Metrics::upstream_connection_attempts().increment(1);
 
         // Refusing to buffer a frame we would refuse to read; see `MAX_SLICE_BYTES`.
-        let config = WebSocketConfig::default().max_message_size(Some(MAX_SLICE_BYTES));
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_SLICE_BYTES))
+            .max_frame_size(Some(MAX_SLICE_BYTES));
         let (ws_stream, _) =
             match connect_async_with_config(&connect_uri, Some(config), false).await {
                 Ok(connection) => {
@@ -391,25 +394,6 @@ fn parse_flashblock_position(data: &str) -> Option<(u64, u64)> {
     let extract: PositionExtract = serde_json::from_str(data).ok()?;
     Some((extract.metadata.block_number, extract.index))
 }
-
-/// Largest slice accepted from the upstream, matching the consumer's
-/// `MAX_DECOMPRESSED_FLASHBLOCK_BYTES`.
-///
-/// Applies to **both** frame types. A binary frame is checked before and after
-/// decompression, so a small but highly compressible payload cannot force a
-/// large allocation; a text frame is checked as it arrives. Text is the one
-/// Mantle's publisher actually sends, so guarding only binary would leave the
-/// production path unguarded.
-///
-/// Also the websocket connection's `max_message_size`, which is where a
-/// hostile upstream is stopped: the checks below run on a frame that has
-/// already been buffered whole, and refusing to buffer what we would refuse to
-/// read is the only version of this limit that bounds memory.
-///
-/// The two ceilings are declared independently — `mantle-reth-flashblocks-types`
-/// is only a dev-dependency here — and held equal by
-/// `the_ceiling_matches_the_consumer_s` rather than by convention.
-const MAX_SLICE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Recovers the slice JSON from a binary frame.
 ///
@@ -840,20 +824,6 @@ mod tests {
             bomb.len()
         );
         assert_eq!(decode_binary_slice(&bomb), None, "expands past the ceiling");
-    }
-
-    /// The proxy and the consumer have to refuse the same frames, or one of
-    /// them forwards a slice the other will not decode. The two constants are
-    /// declared independently — `mantle-reth-flashblocks-types` is a
-    /// dev-dependency here, so the ceiling cannot simply be imported — which
-    /// makes this the only thing holding them together.
-    #[test]
-    fn the_ceiling_matches_the_consumer_s() {
-        assert_eq!(
-            MAX_SLICE_BYTES,
-            mantle_reth_flashblocks_types::MAX_DECOMPRESSED_FLASHBLOCK_BYTES,
-            "a proxy that accepts a different size than the consumer forwards slices it cannot read",
-        );
     }
 
     /// The ceiling has to cover the frame type the producer actually sends.

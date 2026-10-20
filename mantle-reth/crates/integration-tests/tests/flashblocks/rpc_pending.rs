@@ -47,6 +47,1064 @@ macro_rules! overlay_with_user_call {
     }};
 }
 
+/// Installs a small EVM probe without changing the canonical test contracts.
+fn probe_override(code: &str) -> alloy_rpc_types_eth::state::StateOverride {
+    serde_json::from_value(serde_json::json!({
+        format!("{LOGGER:#x}"): { "code": code }
+    }))
+    .expect("valid probe bytecode")
+}
+
+/// TC-122: queries can see accepted sequencer transactions before a slice arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_includes_sequencer_transactions_before_the_next_slice() {
+    use jsonrpsee::core::client::ClientT;
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let (sequencer, _, _, _, fifo) = crate::launch_preconf_node_with_fifo!(
+        crate::helpers::PreconfCfgBuilder::default().build(),
+        crate::consumer_helpers::flashblocks_test_chain_spec()
+    )
+    .await;
+    let client = reth_optimism_rpc::SequencerClient::new(
+        sequencer.inner.rpc_server_handle().http_url().unwrap(),
+    )
+    .await
+    .unwrap();
+    let api = eth_api!(node, harness).with_pending_nonce_client(Some(client));
+    node.rpc.inject_tx(signed_call(0, LOGGER, U256::ZERO).await).await.unwrap();
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+            .await
+            .unwrap(),
+        U256::ZERO,
+        "the consumer's local pool does not represent sequencer acceptance"
+    );
+    // At a slice boundary the builder records execution and prunes the pool,
+    // before the consumer necessarily receives that slice. Even an empty pool
+    // must not make pending nonce fall back to canonical state.
+    let first = sequencer.rpc.inject_tx(signed_call(0, LOGGER, U256::ZERO).await).await.unwrap();
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+            .await
+            .unwrap(),
+        U256::from(1)
+    );
+    fifo.observe_executed(test_sender(), 0);
+    reth_transaction_pool::TransactionPool::prune_transactions(&sequencer.inner.pool, vec![first]);
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+            .await
+            .unwrap(),
+        U256::from(1),
+        "executed transactions still count after the sequencer pool is empty"
+    );
+    let successor =
+        sequencer.rpc.inject_tx(signed_call(1, LOGGER, U256::ZERO).await).await.unwrap();
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+            .await
+            .unwrap(),
+        U256::from(2),
+        "pool successors count even before the next pool nonce correction"
+    );
+    let latest: U256 = sequencer
+        .inner
+        .rpc_server_handle()
+        .http_client()
+        .unwrap()
+        .request("eth_getTransactionCount", jsonrpsee::rpc_params![test_sender()])
+        .await
+        .unwrap();
+    assert_eq!(latest, U256::ZERO, "an omitted block tag still means latest");
+    reth_transaction_pool::TransactionPool::prune_transactions(
+        &sequencer.inner.pool,
+        vec![successor],
+    );
+    // A discarded build must release that execution state, not retain a nonce
+    // high-water mark indefinitely.
+    fifo.reset_accounts();
+    for nonce in 0..3 {
+        assert_eq!(
+            api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+                .await
+                .unwrap(),
+            U256::from(nonce)
+        );
+        sequencer.rpc.inject_tx(signed_call(nonce, LOGGER, U256::ZERO).await).await.unwrap();
+    }
+    assert!(harness.pending().is_none(), "no slice has reached the consumer");
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+            .await
+            .unwrap(),
+        U256::from(3)
+    );
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Latest.into()))
+            .await
+            .unwrap(),
+        U256::ZERO,
+        "latest remains a local canonical-state query"
+    );
+
+    let mut txs = vec![l1_info_deposit(1)];
+    for nonce in 0..4 {
+        txs.push(signed_call(nonce, LOGGER, U256::ZERO).await);
+    }
+    harness.send(FlashblockBuilder::new(1, 0).transactions(txs).build()).await;
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+            .await
+            .unwrap(),
+        U256::from(4),
+        "a sequencer response cannot move behind executed preview state"
+    );
+}
+
+/// Deposits must be counted against the build parent even after canonicalization.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_does_not_double_count_committed_deposits() {
+    use jsonrpsee::core::client::ClientT;
+    let cfg = mantle_reth_preconf::PreconfConfig {
+        enabled: true,
+        all_preconfs: true,
+        journal_path: Some(reth_db::test_utils::tempdir_path().join("preconf.jsonl")),
+        ..Default::default()
+    };
+    let svc = mantle_reth_preconf::PreconfServiceBuilder::from_config(cfg).await.unwrap();
+    let (mut sequencer, client, _, _) = mantle_reth_integration_tests::launch_mantle_node!(
+        crate::consumer_helpers::flashblocks_test_chain_spec(),
+        mantle_reth_cli::node::MantleNode::default().with_preconf(svc),
+        crate::consumer_helpers::flashblocks_payload_attributes
+    )
+    .await;
+    crate::consumer_helpers::mine_canonical_block!(sequencer);
+    // Both this fixture's L1 attributes deposit and its post-execution
+    // transaction use Address::ZERO and advance its nonce.
+    let latest: U256 = client
+        .request("eth_getTransactionCount", jsonrpsee::rpc_params![Address::ZERO, "latest"])
+        .await
+        .unwrap();
+    let pending: U256 = client
+        .request("eth_getTransactionCount", jsonrpsee::rpc_params![Address::ZERO, "pending"])
+        .await
+        .unwrap();
+    assert!(latest > U256::ZERO, "the canonical block advanced this sender");
+    assert_eq!(pending, latest, "already committed deposits must not count twice");
+}
+
+/// A failed sequencer query must not silently return a stale successful nonce.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_reports_sequencer_errors_and_timeouts() {
+    use jsonrpsee::{RpcModule, server::Server, types::ErrorObjectOwned};
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    overlay_with_user_call!(harness);
+    for hangs in [false, true] {
+        let server = Server::builder().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let mut module = RpcModule::new(hangs);
+        module
+            .register_async_method("eth_getTransactionCount", |_, hangs, _| async move {
+                if *hangs {
+                    std::future::pending::<()>().await;
+                }
+                Err::<U256, _>(ErrorObjectOwned::owned(-32099, "sequencer unavailable", None::<()>))
+            })
+            .unwrap();
+        let server = server.start(module);
+        let client = reth_optimism_rpc::SequencerClient::new(url).await.unwrap();
+        let api = eth_api!(node, harness).with_pending_nonce_client(Some(client));
+        assert_eq!(
+            api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Latest.into()))
+                .await
+                .unwrap(),
+            U256::ZERO
+        );
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into())),
+        )
+        .await
+        .expect("nonce query has a deadline")
+        .unwrap_err();
+        assert_eq!(error.code(), -32000);
+        assert!(error.message().contains(if hangs {
+            "timed out"
+        } else {
+            "failed to query sequencer"
+        }));
+        server.stop().unwrap();
+    }
+}
+
+/// TC-117: receipt fees use the token ratio immediately before each transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_receipt_fees_follow_token_ratio_changes_across_slices() {
+    use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
+    use reth_chainspec::EthChainSpec;
+    let base = crate::consumer_helpers::flashblocks_test_chain_spec();
+    let mut genesis = base.genesis().clone();
+    genesis.alloc.insert(
+        GAS_ORACLE_CONTRACT,
+        alloy_genesis::GenesisAccount {
+            // Update the ratio and emit TokenRatioUpdated(uint256,uint256), as the
+            // canonical receipt converter uses its logs to track mid-block changes.
+            code: Some(
+                format!(
+                    "0x6102bc7f{TOKEN_RATIO_SLOT:064x}556102bc6101f47f{:x}60006000a300",
+                    keccak256("TokenRatioUpdated(uint256,uint256)"),
+                )
+                .parse()
+                .unwrap(),
+            ),
+            storage: Some([(B256::from(TOKEN_RATIO_SLOT), B256::from(U256::from(500)))].into()),
+            ..Default::default()
+        },
+    );
+    let spec = std::sync::Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis));
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3, spec);
+    let api = eth_api!(node, harness);
+    let first = signed_call(0, LOGGER, U256::ZERO).await;
+    let update = signed_call(1, GAS_ORACLE_CONTRACT, U256::ZERO).await;
+    let after = signed_call(2, LOGGER, U256::ZERO).await;
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), first.clone(), update.clone()])
+                .build(),
+        )
+        .await;
+    harness
+        .send(FlashblockBuilder::new(1, 1).prev(1, 0).transactions(vec![after.clone()]).build())
+        .await;
+    let mut fees = vec![];
+    let mut previews = vec![];
+    for (raw, ratio) in [(&first, 500), (&update, 500), (&after, 700)] {
+        let receipt = api.get_transaction_receipt(keccak256(raw)).await.unwrap().unwrap();
+        assert_eq!(receipt["tokenRatio"], format!("{ratio:#x}"));
+        let fee: U256 = serde_json::from_value(receipt["l1Fee"].clone()).unwrap();
+        assert!(fee > U256::ZERO, "a nonzero L1 fee must not disappear in preview receipts");
+        fees.push(fee);
+        previews.push(receipt);
+    }
+    assert!(fees[2] > fees[0], "the same call with a higher ratio costs more");
+    for raw in [&first, &update, &after] {
+        node.rpc.inject_tx(raw.clone()).await.unwrap();
+    }
+    crate::consumer_helpers::mine_canonical_block!(node);
+    for (raw, preview) in [&first, &update, &after].into_iter().zip(previews) {
+        let canonical = api.get_transaction_receipt(keccak256(raw)).await.unwrap().unwrap();
+        for field in [
+            "l1Fee",
+            "l1GasUsed",
+            "l1GasPrice",
+            "l1BaseFeeScalar",
+            "l1BlobBaseFeeScalar",
+            "tokenRatio",
+        ] {
+            assert_eq!(preview[field], canonical[field], "receipt field {field}");
+        }
+    }
+}
+
+/// D-03: state and EVM block fields must describe the same pending snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_execution_uses_the_overlay_block_environment() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    let mut slice = FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1)]).build();
+    let base = slice.base.as_mut().unwrap();
+    base.fee_recipient = Address::repeat_byte(0x11);
+    base.prev_randao = B256::repeat_byte(0x22);
+    base.base_fee_per_gas = U256::from(123);
+    harness.send(slice).await;
+    let header = harness.pending().expect("overlay").latest_header();
+    // NUMBER, TIMESTAMP, GASLIMIT, COINBASE, PREVRANDAO, BASEFEE, BLOCKHASH(number-1).
+    let state = probe_override(
+        "0x43600052426020524560405241606052446080524860a052600143034060c05260e06000f3",
+    );
+    let request = serde_json::json!({ "from": test_sender(), "to": LOGGER, "gasPrice": "0x1" });
+    let result = api
+        .call(request.clone(), Some(BlockNumberOrTag::Pending.into()), Some(state.clone()), None)
+        .await
+        .expect("probe call");
+    let words: Vec<_> = result.chunks_exact(32).map(U256::from_be_slice).collect();
+    assert_eq!(
+        words,
+        vec![
+            U256::from(header.number),
+            U256::from(header.timestamp),
+            U256::from(header.gas_limit),
+            U256::from_be_slice(header.beneficiary.as_slice()),
+            U256::from_be_slice(header.mix_hash.as_slice()),
+            U256::from(123),
+            U256::from_be_slice(header.parent_hash.as_slice()),
+        ]
+    );
+    let user = BlockOverrides {
+        number: Some(U256::from(99)),
+        time: Some(header.timestamp + 10),
+        ..Default::default()
+    };
+    let result = api
+        .call(request, Some(BlockNumberOrTag::Pending.into()), Some(state), Some(Box::new(user)))
+        .await
+        .expect("user block overrides");
+    assert_eq!(U256::from_be_slice(&result[..32]), U256::from(99));
+    assert_eq!(U256::from_be_slice(&result[32..64]), U256::from(header.timestamp + 10));
+}
+
+/// D-03: estimation must follow the pending contract's NUMBER-dependent branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_estimation_uses_the_overlay_block_number() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    overlay_with_user_call!(harness);
+    // Revert unless NUMBER == 1.
+    let state = probe_override("0x43600114600c5760006000fd5b00");
+    let request = serde_json::json!({ "to": LOGGER });
+    let gas = api
+        .estimate_gas(
+            request.clone(),
+            Some(BlockNumberOrTag::Pending.into()),
+            Some(state.clone()),
+            None,
+        )
+        .await
+        .expect("pending NUMBER is 1");
+    assert!(gas >= U256::from(21_000));
+    assert!(
+        api.estimate_gas(request, Some(BlockNumberOrTag::Latest.into()), Some(state), None)
+            .await
+            .is_err()
+    );
+}
+
+/// Q-04: pending total-fee estimates work with no consumer snapshot or pending provider block.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_total_fee_falls_back_without_a_preview() {
+    use jsonrpsee::core::client::ClientT;
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
+    use reth_chainspec::EthChainSpec;
+    let mut genesis = crate::consumer_helpers::flashblocks_test_chain_spec().genesis().clone();
+    genesis.alloc.insert(
+        GAS_ORACLE_CONTRACT,
+        alloy_genesis::GenesisAccount {
+            storage: Some([(B256::from(TOKEN_RATIO_SLOT), B256::from(U256::from(500)))].into()),
+            ..Default::default()
+        },
+    );
+    let spec = std::sync::Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis));
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3, spec);
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    let request = serde_json::json!({
+        "from": test_sender(), "to": Address::repeat_byte(0x77), "gasPrice": "0x1"
+    });
+    let latest = api
+        .estimate_total_fee(
+            serde_json::from_value(request.clone()).unwrap(),
+            Some(BlockNumberOrTag::Latest.into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest, U256::from(21_000));
+    assert_eq!(
+        api.estimate_total_fee(
+            serde_json::from_value(request.clone()).unwrap(),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("pending without a consumer snapshot"),
+        latest
+    );
+    // The node's registered Mantle RPC has no attached consumer overlay either.
+    let total: U256 = node
+        .inner
+        .rpc_server_handle()
+        .http_client()
+        .unwrap()
+        .request("eth_estimateTotalFee", jsonrpsee::rpc_params![request.clone(), "pending"])
+        .await
+        .expect("registered RPC without a consumer overlay");
+    assert_eq!(total, latest);
+    crate::consumer_helpers::mine_canonical_block!(node);
+    let latest = api
+        .estimate_total_fee(
+            serde_json::from_value(request.clone()).unwrap(),
+            Some(BlockNumberOrTag::Latest.into()),
+        )
+        .await
+        .unwrap();
+    assert!(latest > U256::from(21_000), "the canonical L1 fee must be nonzero");
+    assert_eq!(
+        api.estimate_total_fee(
+            serde_json::from_value(request).unwrap(),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("fallback with canonical L1 fee parameters"),
+        latest
+    );
+}
+
+/// Q-04: a provider pending block remains usable when local pending construction is disabled.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_total_fee_uses_actual_pending_when_local_pending_is_disabled() {
+    use jsonrpsee::core::client::ClientT;
+    use reth_provider::BlockReader;
+    let (mut node, client, _, _) = mantle_reth_integration_tests::launch_mantle_node!(
+        crate::consumer_helpers::flashblocks_test_chain_spec(),
+        mantle_reth_cli::node::MantleNode::default(),
+        crate::consumer_helpers::flashblocks_payload_attributes,
+        persist_each_block = false,
+        rpc_pending_block = "none".parse().unwrap()
+    )
+    .await;
+    let init = "600e600c600039600e6000f343600114600c5760006000fd5b00".parse().unwrap();
+    node.rpc.inject_tx(signed_deploy(0, init).await).await.unwrap();
+    node.build_and_submit_payload().await.expect("build and execute without canonicalizing");
+    assert_eq!(
+        node.inner
+            .provider
+            .pending_block()
+            .unwrap()
+            .expect("real provider pending")
+            .header()
+            .number,
+        1
+    );
+    let request = serde_json::json!({
+        "from": test_sender(), "to": test_sender().create(0), "gasPrice": "0x1"
+    });
+    let pending: U256 = client
+        .request("eth_estimateTotalFee", jsonrpsee::rpc_params![request.clone(), "pending"])
+        .await
+        .expect("estimate against the actual pending deployment and NUMBER");
+    assert!(pending > U256::from(21_000), "pending contract must execute");
+    let latest: U256 = client
+        .request("eth_estimateTotalFee", jsonrpsee::rpc_params![request, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(latest, U256::from(21_000), "deployment is not canonical");
+}
+
+/// Q-04: deployed preview code must execute using its own block's NUMBER.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_total_fee_uses_preview_code_and_block_environment() {
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    // Runtime reverts unless NUMBER == 1. This contract exists only in the preview.
+    let init = "600e600c600039600e6000f343600114600c5760006000fd5b00".parse().unwrap();
+    let mut slice = FlashblockBuilder::new(1, 0)
+        .transactions(vec![l1_info_deposit(1), signed_deploy(0, init).await])
+        .build();
+    slice.base.as_mut().unwrap().base_fee_per_gas = U256::from(123);
+    harness.send(slice).await;
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    let request = serde_json::json!({
+        "from": test_sender(), "to": test_sender().create(0), "gasPrice": "0x1"
+    });
+    let gas = eth_api!(node, harness)
+        .estimate_gas(request.clone(), Some(BlockNumberOrTag::Pending.into()), None, None)
+        .await
+        .expect("existing pending gas estimator");
+    assert!(gas > U256::from(21_000), "the deployed contract must actually run");
+    assert_eq!(
+        api.estimate_total_fee(
+            serde_json::from_value(request.clone()).unwrap(),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("total fee at preview state and NUMBER"),
+        gas
+    );
+    let dynamic_fee = serde_json::json!({
+        "from": test_sender(), "to": test_sender().create(0),
+        "maxFeePerGas": "0x3e8", "maxPriorityFeePerGas": "0x0"
+    });
+    assert_eq!(
+        api.estimate_total_fee(
+            serde_json::from_value(dynamic_fee).unwrap(),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("preview base fee"),
+        gas * U256::from(123)
+    );
+    assert_eq!(
+        api.estimate_total_fee(
+            serde_json::from_value(request).unwrap(),
+            Some(BlockNumberOrTag::Latest.into()),
+        )
+        .await
+        .unwrap(),
+        U256::from(21_000),
+        "latest still sees an undeployed address"
+    );
+}
+
+/// Q-04: L1 attributes come from the preview tip and tokenRatio from its post-state.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
+    use alloy_network::eip2718::{Decodable2718, Encodable2718};
+    use mantle_reth_flashblocks::{PendingExecutionContext, PendingStateOverrides};
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
+    use reth_chainspec::EthChainSpec;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct AdvancingPreview {
+        first: PendingExecutionContext,
+        next: PendingExecutionContext,
+        reads: AtomicUsize,
+    }
+    impl PendingStateOverrides for AdvancingPreview {
+        fn pending_execution_context(&self) -> Option<PendingExecutionContext> {
+            Some(if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first.clone()
+            } else {
+                self.next.clone()
+            })
+        }
+    }
+
+    fn fee_deposit(origin: u64, scalar: u32, constant: u64, l1_base_fee: u64) -> Bytes {
+        let raw = l1_info_deposit(origin);
+        let op_alloy_consensus::OpTxEnvelope::Deposit(tx) =
+            op_alloy_consensus::OpTxEnvelope::decode_2718(&mut raw.as_ref()).unwrap()
+        else {
+            panic!("L1 attributes must be a deposit")
+        };
+        let mut tx = tx.inner().clone();
+        let mut input = tx.input.to_vec();
+        input[36..68].copy_from_slice(&U256::from(l1_base_fee).to_be_bytes::<32>());
+        input[164..168].copy_from_slice(&scalar.to_be_bytes());
+        input[168..176].copy_from_slice(&constant.to_be_bytes());
+        tx.input = input.into();
+        tx.encoded_2718().into()
+    }
+
+    let mut genesis = crate::consumer_helpers::flashblocks_test_chain_spec().genesis().clone();
+    genesis.alloc.insert(
+        GAS_ORACLE_CONTRACT,
+        alloy_genesis::GenesisAccount {
+            code: Some("0x6102bc60005500".parse().unwrap()), // slot 0 = 700
+            storage: Some([(B256::from(TOKEN_RATIO_SLOT), B256::from(U256::from(500)))].into()),
+            ..Default::default()
+        },
+    );
+    let poor_sender = Address::repeat_byte(0x66);
+    genesis.alloc.insert(
+        poor_sender,
+        alloy_genesis::GenesisAccount { balance: U256::from(1_000_000), ..Default::default() },
+    );
+    let spec = std::sync::Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis));
+    let (harness, node) = launch_flashblocks_consumer!(3, 3, spec);
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    let request = serde_json::json!({ "from": test_sender(), "to": Address::repeat_byte(0x77), "gasPrice": "0x1" });
+    let estimate = || {
+        api.estimate_total_fee(
+            serde_json::from_value(request.clone()).unwrap(),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+    };
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![fee_deposit(1, 2, 7, 1_000_000_000)])
+                .build(),
+        )
+        .await;
+    let first = estimate().await.expect("first preview fee");
+    let captured = harness.state().pending_execution_context().unwrap();
+    // Transfer costs exactly 21,000 gas; operator fee = 21,000 * 2 * 100 + 7.
+    let fixed = U256::from(21_000 + 4_200_007);
+    assert!(first > fixed, "nonzero L1 fee must be included");
+    let error = api
+        .estimate_total_fee(
+            serde_json::from_value(serde_json::json!({
+                "from": poor_sender, "to": Address::repeat_byte(0x77), "gasPrice": "0x1"
+            }))
+            .unwrap(),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect_err("L2 gas alone is affordable, but operator fee is not");
+    assert!(error.message().contains("insufficient funds"), "{error}");
+    harness
+        .send(
+            FlashblockBuilder::new(1, 1)
+                .prev(1, 0)
+                .transactions(vec![signed_call(0, GAS_ORACLE_CONTRACT, U256::ZERO).await])
+                .build(),
+        )
+        .await;
+    let updated = estimate().await.expect("updated preview ratio");
+    assert_eq!(
+        (first - fixed) * U256::from(700),
+        (updated - fixed) * U256::from(500),
+        "L1 fee must follow the preview's updated tokenRatio"
+    );
+    assert!(updated > first);
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 1)
+                .transactions(vec![fee_deposit(2, 3, 11, 2_000_000_000)])
+                .build(),
+        )
+        .await;
+    let next = estimate().await.expect("next preview block's fee parameters");
+    assert_eq!(
+        next - U256::from(21_000 + 6_300_011),
+        (updated - fixed) * U256::from(2),
+        "latest preview L1 base fee and operator parameters must replace the preceding block's"
+    );
+    // The source offers a different real snapshot on the second read. A request
+    // must retain its first capture for both gas estimation and fee parameters.
+    let advancing = Arc::new(AdvancingPreview {
+        first: captured,
+        next: harness.state().pending_execution_context().unwrap(),
+        reads: AtomicUsize::new(0),
+    });
+    let captured_api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(advancing.clone()));
+    assert_eq!(
+        captured_api
+            .estimate_total_fee(
+                serde_json::from_value(request.clone()).unwrap(),
+                Some(BlockNumberOrTag::Pending.into()),
+            )
+            .await
+            .expect("captured snapshot after newer slices"),
+        first
+    );
+    assert_eq!(advancing.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.estimate_total_fee(
+            serde_json::from_value(request).unwrap(),
+            Some(BlockNumberOrTag::Latest.into()),
+        )
+        .await
+        .unwrap(),
+        U256::from(21_000),
+        "preview must not affect canonical estimates"
+    );
+}
+
+/// D-04: the provider has no pending block; the simulator must use the consumer snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_simulation_starts_after_the_overlay_tip() {
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    overlay_with_user_call!(harness);
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    // Return NUMBER, TIMESTAMP and the overlay-funded LOGGER balance.
+    let state = probe_override("0x43600052426020524760405260606000f3");
+    let result = api
+        .simulate_v1(
+            serde_json::json!({
+                "blockStateCalls": [{ "stateOverrides": state, "calls": [{ "to": LOGGER }] }]
+            }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("pending simulation");
+    assert_eq!(result[0]["number"], "0x2");
+    let output: Bytes =
+        serde_json::from_value(result[0]["calls"][0]["returnData"].clone()).expect("return data");
+    assert_eq!(U256::from_be_slice(&output[..32]), U256::from(2));
+    assert_eq!(
+        U256::from_be_slice(&output[32..64]),
+        U256::from(crate::consumer_helpers::l2_ts(1) + 2)
+    );
+    // The user's code override replaces LOGGER's overlay account override, so probe a separate
+    // call without it to verify that simulation also receives the pending state.
+    let balances = api
+        .simulate_v1(
+            serde_json::json!({
+                "blockStateCalls": [{ "calls": [{ "to": LOGGER }] }]
+            }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("pending balance simulation");
+    let output: Bytes =
+        serde_json::from_value(balances[0]["calls"][0]["returnData"].clone()).expect("balance");
+    assert_eq!(U256::from_be_slice(&output), VALUE);
+    let balances = api
+        .simulate_v1(
+            serde_json::json!({ "blockStateCalls": [{
+        "stateOverrides": { format!("{LOGGER:#x}"): { "balance": "0xff" } },
+        "calls": [{ "to": LOGGER }]
+    }] }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("user state overrides");
+    let output: Bytes =
+        serde_json::from_value(balances[0]["calls"][0]["returnData"].clone()).unwrap();
+    assert_eq!(U256::from_be_slice(&output), U256::from(255));
+    let canonical = api
+        .simulate_v1(
+            serde_json::json!({ "blockStateCalls": [{
+        "calls": [{ "to": LOGGER }]
+    }] }),
+            Some(BlockNumberOrTag::Latest.into()),
+        )
+        .await
+        .expect("canonical simulation");
+    assert_eq!(canonical[0]["number"], "0x1");
+    let output: Bytes =
+        serde_json::from_value(canonical[0]["calls"][0]["returnData"].clone()).unwrap();
+    assert_eq!(U256::from_be_slice(&output), U256::ZERO);
+}
+
+/// Pending simulation also works before the first slice and preserves simulated writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_simulation_falls_back_and_preserves_writes_between_blocks() {
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    let result = api
+        .simulate_v1(
+            serde_json::json!({
+                "blockStateCalls": [{ "calls": [{ "to": LOGGER }] }]
+            }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("fallback without a slice");
+    assert_eq!(result[0]["number"], "0x1");
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), signed_call(0, SETTER, U256::ZERO).await])
+                .build(),
+        )
+        .await;
+    // Write calldata to slot 1 when nonempty; otherwise just read the slot.
+    let code = "0x3615600b576000356001555b60015460005260206000f3";
+    let user = serde_json::json!({ format!("{SETTER:#x}"): { "code": code } });
+    let result = api.simulate_v1(serde_json::json!({ "blockStateCalls": [
+        { "stateOverrides": user, "calls": [{ "to": SETTER, "data": format!("{:#066x}", U256::from(9)) }] },
+        { "stateOverrides": user, "calls": [{ "to": SETTER }] }
+    ] }), Some(BlockNumberOrTag::Pending.into())).await.expect("sequential simulation");
+    for block in result.as_array().unwrap() {
+        assert_eq!(block["calls"][0]["status"], "0x1");
+        let output: Bytes =
+            serde_json::from_value(block["calls"][0]["returnData"].clone()).unwrap();
+        assert_eq!(
+            U256::from_be_slice(&output),
+            U256::from(9),
+            "the next block must retain simulated storage"
+        );
+    }
+}
+
+/// A two-block preview remains anchored to genesis while executing at its latest header.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_execution_and_simulation_follow_a_multi_block_overlay() {
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    overlay_with_user_call!(harness);
+    let published_parent = B256::repeat_byte(0x77);
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 0)
+                .parent_hash(published_parent)
+                .transactions(vec![l1_info_deposit(2)])
+                .build(),
+        )
+        .await;
+    let pending = harness.pending().expect("two-block overlay");
+    assert_eq!(pending.earliest_block_number(), 1);
+    assert_eq!(pending.latest_block_number(), 2);
+    let api = eth_api!(node, harness);
+    let result = api
+        .call(
+            serde_json::json!({ "to": LOGGER }),
+            Some(BlockNumberOrTag::Pending.into()),
+            Some(probe_override("0x4360005260014060205260406000f3")),
+            None,
+        )
+        .await
+        .expect("multi-block call");
+    assert_eq!(U256::from_be_slice(&result[..32]), U256::from(2));
+    assert_eq!(&result[32..], published_parent.as_slice());
+    let user_hash = B256::repeat_byte(0x88);
+    let result = api
+        .call(
+            serde_json::json!({ "to": LOGGER }),
+            Some(BlockNumberOrTag::Pending.into()),
+            Some(probe_override("0x60014060005260206000f3")),
+            Some(Box::new(BlockOverrides {
+                block_hash: Some([(1, user_hash)].into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("user block hash override");
+    assert_eq!(result.as_ref(), user_hash.as_slice());
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    let result = api
+        .simulate_v1(
+            serde_json::json!({ "blockStateCalls": [{
+        "calls": [{ "to": LOGGER }]
+    }] }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("multi-block simulation");
+    assert_eq!(
+        result.as_array().unwrap().len(),
+        1,
+        "preview blocks are not simulated again as fillers"
+    );
+    assert_eq!(result[0]["number"], "0x3");
+    let output: Bytes =
+        serde_json::from_value(result[0]["calls"][0]["returnData"].clone()).unwrap();
+    assert_eq!(U256::from_be_slice(&output), VALUE);
+}
+
+/// A request can retain its snapshot while canonicalization advances. BLOCKHASH
+/// must continue describing that captured preview, including its unsealed tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_simulation_keeps_captured_block_hashes_after_canonical_advances() {
+    use crate::consumer_helpers::mine_canonical_block;
+    use mantle_reth_flashblocks::{PendingExecutionContext, PendingStateOverrides};
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    use reth_provider::{BlockHashReader, StateProviderFactory};
+    #[derive(Debug)]
+    struct Captured(PendingExecutionContext);
+    impl PendingStateOverrides for Captured {
+        fn pending_execution_context(&self) -> Option<PendingExecutionContext> {
+            Some(self.0.clone())
+        }
+    }
+    let (harness, mut node) = launch_flashblocks_consumer!(
+        3,
+        3,
+        crate::consumer_helpers::flashblocks_test_chain_spec(),
+        persist_each_block = true
+    );
+    overlay_with_user_call!(harness);
+    let captured = harness.state().pending_execution_context().expect("captured preview");
+    assert_eq!(captured.header.hash(), B256::ZERO, "the preview tip is not sealed");
+    let canonical = mine_canonical_block!(node);
+    assert_ne!(canonical.hash(), B256::ZERO);
+    // Let the engine persist its own block. Writing static files here would
+    // race its shutdown flush and append the same header twice.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let persisted = node
+                .inner
+                .provider
+                .state_by_block_hash(captured.base_block.as_block_hash().unwrap())
+                .unwrap()
+                .block_hash(1)
+                .unwrap();
+            if persisted == Some(canonical.hash()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canonical header persisted by the engine");
+    assert_eq!(
+        node.inner
+            .provider
+            .state_by_block_hash(captured.base_block.as_block_hash().unwrap())
+            .unwrap()
+            .block_hash(1)
+            .unwrap(),
+        Some(canonical.hash()),
+        "the historical provider must expose the persisted canonical hash"
+    );
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(std::sync::Arc::new(Captured(captured))));
+    let result = api
+        .simulate_v1(
+            serde_json::json!({ "blockStateCalls": [{
+        "stateOverrides": probe_override("0x60014060005260206000f3"),
+        "calls": [{ "to": LOGGER }]
+    }] }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("captured simulation");
+    let output: Bytes =
+        serde_json::from_value(result[0]["calls"][0]["returnData"].clone()).unwrap();
+    assert_eq!(
+        output.as_ref(),
+        B256::ZERO.as_slice(),
+        "BLOCKHASH(1) must not change to the newly canonical hash"
+    );
+    let user_hash = B256::repeat_byte(0x55);
+    let result = api
+        .simulate_v1(
+            serde_json::json!({ "blockStateCalls": [{
+                "blockOverrides": { "blockHash": { "1": user_hash } },
+                "stateOverrides": probe_override("0x60014060005260206000f3"),
+                "calls": [{ "to": LOGGER }]
+            }] }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("user block hash override");
+    let output: Bytes =
+        serde_json::from_value(result[0]["calls"][0]["returnData"].clone()).unwrap();
+    assert_eq!(output.as_ref(), user_hash.as_slice());
+}
+
+/// The Arsia guard must inspect the preview parent and actual simulated timestamps,
+/// including empty blocks inserted for number gaps.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_simulation_checks_the_actual_arsia_boundary() {
+    use crate::consumer_helpers::{flashblocks_test_chain_spec, l2_ts};
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    let activation = l2_ts(6);
+    let mut spec = flashblocks_test_chain_spec().as_ref().clone();
+    spec.inner.hardforks.insert(
+        mantle_reth_chainspec::MantleHardfork::Arsia,
+        reth_chainspec::ForkCondition::Timestamp(activation),
+    );
+    let (harness, node) = launch_flashblocks_consumer!(3, 3, std::sync::Arc::new(spec));
+    harness.send(FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1)]).build()).await;
+    assert!(harness.pending().is_some(), "pre-Arsia preview");
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    let result = api
+        .simulate_v1(
+            serde_json::json!({ "blockStateCalls": [{ "calls": [] }] }),
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect("default time is preview + 2, before activation");
+    assert_eq!(result[0]["timestamp"], format!("{:#x}", l2_ts(3)));
+    for block in [
+        serde_json::json!({ "blockOverrides": { "time": format!("{activation:#x}") }, "calls": [] }),
+        // Preview 1, fillers 2/3 at +2/+4, requested block 4 at +6 crosses activation.
+        serde_json::json!({ "blockOverrides": { "number": "0x4" }, "calls": [] }),
+    ] {
+        let error = api
+            .simulate_v1(
+                serde_json::json!({ "blockStateCalls": [block] }),
+                Some(BlockNumberOrTag::Pending.into()),
+            )
+            .await
+            .expect_err("crossing Arsia is rejected");
+        assert!(error.message().contains("Arsia activation boundary"), "{error}");
+    }
+}
+
+/// Switching to a preview EVM must retain Mantle's additional operator-fee funds check.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_estimation_retains_the_arsia_funds_check() {
+    use alloy_network::eip2718::{Decodable2718, Encodable2718};
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let raw = l1_info_deposit(1);
+    let op_alloy_consensus::OpTxEnvelope::Deposit(deposit) =
+        op_alloy_consensus::OpTxEnvelope::decode_2718(&mut raw.as_ref()).unwrap()
+    else {
+        panic!("deposit")
+    };
+    let mut deposit = deposit.inner().clone();
+    let mut data = deposit.input.to_vec();
+    data[168..176].copy_from_slice(&1_000_000_000_000u64.to_be_bytes());
+    deposit.input = data.into();
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0).transactions(vec![deposit.encoded_2718().into()]).build(),
+        )
+        .await;
+    let api = eth_api!(node, harness);
+    let request =
+        serde_json::json!({ "from": test_sender(), "to": Address::ZERO, "gasPrice": "0x1" });
+    let balance = |value: &str| {
+        serde_json::from_value(serde_json::json!({
+            format!("{:#x}", test_sender()): { "balance": value }
+        }))
+        .unwrap()
+    };
+    let error = api
+        .estimate_gas(
+            request.clone(),
+            Some(BlockNumberOrTag::Pending.into()),
+            Some(balance("0xf4240")),
+            None,
+        )
+        .await
+        .expect_err("L2 gas is affordable, the operator fee is not");
+    assert!(error.message().contains("insufficient funds"), "{error}");
+    api.estimate_gas(
+        request,
+        Some(BlockNumberOrTag::Pending.into()),
+        Some(balance("0xde0b6b3a7640000")),
+        None,
+    )
+    .await
+    .expect("the user balance override funds all fees");
+}
+
 /// `eth_getBlockByNumber("pending")` serves the overlay, and passes `pending`
 /// through to the standard implementation when there is none.
 #[tokio::test(flavor = "multi_thread")]
@@ -181,6 +1239,104 @@ async fn get_logs_appends_the_overlay_when_the_range_ends_at_pending() {
     );
 }
 
+/// TC-126: a range starting beyond the preview must not return older logs.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_excludes_the_overlay_before_a_future_start_block() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    overlay_with_user_call!(harness);
+
+    for start in [2, 101] {
+        let filter =
+            Filter::new().address(LOGGER).from_block(start).to_block(BlockNumberOrTag::Pending);
+        assert!(api.get_logs(filter).await.expect("query").is_empty());
+    }
+    let filter = Filter::new().address(LOGGER).from_block(1).to_block(BlockNumberOrTag::Pending);
+    let logs = api.get_logs(filter).await.expect("inclusive preview boundary");
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].block_number, Some(1));
+}
+
+/// A multi-block overlay must respect numeric and `pending` start boundaries.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_filters_older_blocks_from_a_multi_block_overlay() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    overlay_with_user_call!(harness);
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 0)
+                .transactions(vec![l1_info_deposit(2), signed_call(1, LOGGER, VALUE).await])
+                .build(),
+        )
+        .await;
+    assert_eq!(harness.pending().expect("overlay").latest_block_number(), 2);
+
+    for start in [BlockNumberOrTag::Number(2), BlockNumberOrTag::Pending] {
+        let filter =
+            Filter::new().address(LOGGER).from_block(start).to_block(BlockNumberOrTag::Pending);
+        let logs = api.get_logs(filter).await.expect("query");
+        assert_eq!(logs.len(), 1, "only block 2 belongs to this range");
+        assert_eq!(logs[0].block_number, Some(2));
+    }
+    let filter = Filter::new()
+        .address(LOGGER)
+        .from_block(BlockNumberOrTag::Earliest)
+        .to_block(BlockNumberOrTag::Pending);
+    let logs = api.get_logs(filter).await.expect("full range");
+    assert_eq!(logs.iter().map(|log| log.block_number).collect::<Vec<_>>(), vec![Some(1), Some(2)]);
+}
+
+/// Resolved start tags apply to retained preview history as well as canonical logs.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_resolves_latest_and_deduplicates_canonical_preview_overlap() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    for number in 1..=3 {
+        let raw = signed_call(number - 1, LOGGER, VALUE).await;
+        harness
+            .send(
+                FlashblockBuilder::new(number, 0)
+                    .prev(number - 1, 0)
+                    .transactions(vec![l1_info_deposit(number), raw.clone()])
+                    .build(),
+            )
+            .await;
+        if number < 3 {
+            node.rpc.inject_tx(raw).await.expect("canonical call");
+            let block = mine_canonical_block!(node);
+            assert_eq!(block.number, number);
+        }
+    }
+    let pending = harness.pending().expect("three-block overlay");
+    assert_eq!((pending.earliest_block_number(), pending.latest_block_number()), (1, 3));
+
+    for start in [None, Some(BlockNumberOrTag::Latest), Some(BlockNumberOrTag::Number(2))] {
+        let mut filter = Filter::new().address(LOGGER).to_block(BlockNumberOrTag::Pending);
+        if let Some(start) = start {
+            filter = filter.from_block(start);
+        }
+        let logs = api.get_logs(filter).await.expect("mixed range");
+        assert_eq!(
+            logs.iter().map(|log| log.block_number).collect::<Vec<_>>(),
+            vec![Some(2), Some(3)],
+            "block 1 is below the start and canonical block 2 must appear only once"
+        );
+    }
+    let filter = Filter::new()
+        .address(LOGGER)
+        .from_block(BlockNumberOrTag::Earliest)
+        .to_block(BlockNumberOrTag::Pending);
+    let logs = api.get_logs(filter).await.expect("complete mixed range");
+    assert_eq!(
+        logs.iter().map(|log| log.block_number).collect::<Vec<_>>(),
+        vec![Some(1), Some(2), Some(3)]
+    );
+}
+
 /// A code-less account touched by the overlay must not gain code in the overrides.
 ///
 /// REVM pads bytecode for jump-destination analysis, so the execution-time form of
@@ -279,9 +1435,7 @@ async fn estimate_gas_at_pending_sees_the_overlay_balance() {
     assert!(gas >= U256::from(21_000), "a plain transfer costs at least the intrinsic gas");
 
     assert!(
-        api.estimate_gas(request, Some(BlockNumberOrTag::Latest.into()), None, None)
-            .await
-            .is_err(),
+        api.estimate_gas(request, Some(BlockNumberOrTag::Latest.into()), None, None).await.is_err(),
         "canonically the sender cannot cover the transfer"
     );
 }

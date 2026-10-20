@@ -451,6 +451,20 @@ where
         }
 
         if self.exceeds_leading_depth(&flashblock, tip) {
+            // Leading depth bounds published previews, not the early-arrival
+            // cache. Preserve restartable slices within its independent window.
+            let block_number = flashblock.metadata.block_number;
+            let index = flashblock.index;
+            let mut cache = self.cache.lock().await;
+            let resumable = index == 0 || cache.has_flashblock(block_number, index - 1);
+            if resumable && cache.is_cacheable(block_number) {
+                cache.insert(flashblock);
+                debug!(
+                    message = "cached flashblock beyond the overlay leading depth",
+                    block_number, index,
+                );
+                return;
+            }
             Metrics::leading_depth_exceeded().increment(1);
             warn!(
                 message = "flashblock leads canonical beyond the configured depth, dropping",
@@ -473,8 +487,8 @@ where
         let previous = prev_pending_blocks.clone();
         match self.process_flashblock(prev_pending_blocks, &flashblock) {
             Ok(new_pending_blocks) => {
-                if let Some(ref pb) = new_pending_blocks
-                    && !previous.as_ref().is_some_and(|old| Arc::ptr_eq(old, pb))
+                if let Some(ref pb) = new_pending_blocks &&
+                    !previous.as_ref().is_some_and(|old| Arc::ptr_eq(old, pb))
                 {
                     _ = self.sender.send(Arc::clone(pb));
                 }

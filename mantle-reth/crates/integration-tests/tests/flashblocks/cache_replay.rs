@@ -9,6 +9,25 @@ use crate::consumer_helpers::{
     launch_flashblocks_consumer, mine_canonical_block as mine, submit_uncommitted_block,
 };
 
+/// D-01: the cache window remains usable beyond the overlay's leading limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_beyond_leading_depth_replays_when_its_parent_lands() {
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 1);
+    let block_1 = mine!(node);
+    harness.send_canonical(block_1).await;
+    let block_2_hash = submit_uncommitted_block!(node);
+
+    harness.send(base_slice_builder(3).parent_hash(block_2_hash).build()).await;
+    harness.send(FlashblockBuilder::new(3, 1).prev(3, 0).build()).await;
+    assert!(harness.pending().is_none(), "cached slices must not extend the overlay yet");
+
+    let block_2 = commit_submitted_block!(node, block_2_hash);
+    harness.send_canonical(block_2).await;
+    let pending = harness.pending().expect("slices beyond the leading limit must be cached");
+    assert_eq!(pending.latest_block_number(), 3);
+    assert_eq!(pending.latest_flashblock_index(), 1, "the cached continuation is replayed too");
+}
+
 /// A slice whose canonical parent has not been imported yet is parked, then
 /// replayed when that parent arrives.
 #[tokio::test(flavor = "multi_thread")]

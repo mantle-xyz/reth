@@ -19,10 +19,12 @@
 //! ## What `recover_envelope` refuses
 //!
 //! `RestoreSkip::Rejected` for bytes that will not decode, and for the
-//! `Deposit` / `PostExec` variants — which should never reach the journal, since only
-//! preconf-RPC submissions are persisted, but are filtered anyway to match
-//! admission's own gate. [`crate::restore_preconf_state`] logs and skips those
-//! entries; everything else is handed back for `push_if_absent`.
+//! `Deposit` / `PostExec` variants. With the current OP pooled envelope type,
+//! these system transactions fail decoding before the eligibility check:
+//! the pooled type supports only user transaction variants. The later check
+//! remains as a safeguard for other pooled types used with this generic
+//! decoder, matching admission's gate. [`crate::restore_preconf_state`] logs
+//! and skips rejected entries; everything else is handed back for `push_if_absent`.
 
 use std::marker::PhantomData;
 
@@ -97,10 +99,11 @@ where
             .map_err(|e| RestoreSkip::Rejected(format!("decode/recover failed: {e}")))?;
         let sender = recovered.signer();
 
-        // Extract the alloy `TxEnvelope` for fifo push. Deposit /
-        // PostExec variants should never appear in the journal (only
-        // preconf-RPC-submitted txs are persisted), but drop them
-        // defensively — matches admission's own filter.
+        // Extract the alloy `TxEnvelope` for fifo push. The current
+        // `op_alloy_consensus::OpPooledTransaction` cannot decode Deposit /
+        // PostExec, so those fail above (and in `recover_slot`) before this
+        // filter. Keep the filter for other `Tx::Pooled` implementations:
+        // decoding a system transaction must not make it preconf-eligible.
         let consensus = <Tx as PoolTransaction>::pooled_into_consensus(recovered.inner().clone());
         let op_env: OpTxEnvelope = consensus.into();
         let envelope = op_envelope_to_alloy(op_env).ok_or_else(|| {

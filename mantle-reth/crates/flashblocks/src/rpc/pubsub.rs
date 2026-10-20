@@ -11,6 +11,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     server::SubscriptionMessage,
 };
+use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use op_alloy_network::Optimism;
 use reth_rpc::eth::EthPubSub as RethEthPubSub;
 use reth_rpc_eth_api::{
@@ -207,6 +208,19 @@ where
         let ExtendedSubscriptionKind::Flashblocks(flashblocks_kind) = kind else {
             unreachable!("standard subscription types are delegated to inner");
         };
+
+        if flashblocks_kind == FlashblocksSubscriptionKind::PendingLogs &&
+            !matches!(params.as_ref(), None | Some(Params::None | Params::Logs(_)))
+        {
+            pending
+                .reject(ErrorObjectOwned::owned(
+                    INVALID_PARAMS_CODE,
+                    "Invalid params for pendingLogs: expected a log filter object or null",
+                    None::<()>,
+                ))
+                .await;
+            return Ok(());
+        }
 
         let sink = pending.accept().await?;
 

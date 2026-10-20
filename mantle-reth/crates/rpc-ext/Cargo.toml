@@ -12,6 +12,7 @@ description = "Mantle-specific RPC extensions (eth_getBlockRange, eth_sendRawTra
 workspace = true
 
 [dependencies]
+reth-transaction-pool.workspace = true
 # op-reth
 reth-optimism-rpc.workspace = true
 # `OpTransactionReceiptFields` — the 11 L1 fee fields, flattened onto the

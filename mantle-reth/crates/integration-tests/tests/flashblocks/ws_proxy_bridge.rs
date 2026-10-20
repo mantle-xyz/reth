@@ -291,6 +291,31 @@ async fn plaintext_slices_reach_the_consumer_through_the_proxy() {
     assert_eq!(recv_next(&mut slices).await.metadata.block_number, 2);
 }
 
+/// Large publisher messages survive the proxy's frame, message and decode limits,
+/// including uncompressed binary upstream frames and compressed downstream frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn q01_large_slice_reaches_the_consumer_through_the_proxy() {
+    let (expected, json) = crate::consumer_helpers::large_slice_message();
+    for compressed in [false, true] {
+        let (upstream, sequencer, mut uris) = stub_sequencer().await;
+        let proxy = spawn_proxy(upstream, compressed).await;
+        let mut slices = subscribe(proxy.url.clone(), NO_PINGS);
+        proxy.await_client().await;
+        assert_eq!(recv_next(&mut uris).await, "/ws");
+        let frame = if compressed {
+            WsMessage::binary(json.clone().into_bytes())
+        } else {
+            WsMessage::text(json.clone())
+        };
+        sequencer.send(Upstream::Frame(frame)).unwrap();
+        assert_eq!(recv_next(&mut slices).await, expected);
+        sequencer.send(slice_frame(1, 1)).unwrap();
+        assert_eq!(recv_next(&mut slices).await.index, 1);
+        assert!(uris.try_recv().is_err(), "the upstream must not reconnect");
+        assert_eq!(proxy.admitted.load(Ordering::SeqCst), 1);
+    }
+}
+
 /// With `--enable-compression` the proxy sends brotli `Binary` frames. The
 /// consumer sniffs the encoding rather than being told it, so this is the pair
 /// of implementations agreeing without a negotiation step — and the one hop

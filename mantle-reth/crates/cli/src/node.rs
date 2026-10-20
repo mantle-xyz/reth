@@ -645,7 +645,8 @@ where
                         ctx.registry.eth_api().clone(),
                         ctx.registry.eth_handlers().filter.clone(),
                         Arc::clone(&state),
-                    );
+                    )
+                    .with_pending_nonce_client(sequencer_client.clone());
                     ctx.modules.replace_configured(eth_api_ext.into_rpc())?;
 
                     let pubsub = FlashblocksEthPubSub::new(
@@ -659,6 +660,15 @@ where
                     Ok(state)
                 })
                 .transpose()?;
+
+            // A consumer owns its pending reads. Only the local sequencer uses
+            // the build account view plus its transaction pool for nonce reads.
+            if flashblocks_state.is_none() && let Some(handler) = preconf_handler.as_ref() {
+                ctx.modules.replace_configured(mantle_reth_rpc_ext::sequencer_nonce_rpc(
+                    Arc::new(ctx.registry.eth_api().clone()),
+                    Arc::clone(handler),
+                ))?;
+            }
 
             let mantle_ext = MantleRpcExt::new(
                 ctx.node().provider().clone(),

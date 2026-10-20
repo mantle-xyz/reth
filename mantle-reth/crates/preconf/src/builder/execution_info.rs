@@ -2,12 +2,12 @@
 //! accounted for.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
 };
 
 use alloy_consensus::transaction::Recovered;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, TxHash};
 use reth_optimism_payload_builder::{
     block_size::BlockSizeBudget as OpBlockSizeBudget, builder::ExecutionInfo as OpExecutionInfo,
 };
@@ -80,6 +80,8 @@ pub struct ExecutionInfo<T> {
     journalable: Vec<usize>,
     /// How far into `journalable` the journal has been handed records.
     journaled_upto: usize,
+    /// Distinct pool hashes skipped for RLP headroom in this build, across snapshots.
+    block_rlp_full_skipped: HashSet<TxHash>,
 }
 
 impl<T> Default for ExecutionInfo<T> {
@@ -92,6 +94,7 @@ impl<T> Default for ExecutionInfo<T> {
             pruned_upto: 0,
             journalable: Vec::new(),
             journaled_upto: 0,
+            block_rlp_full_skipped: HashSet::new(),
         }
     }
 }
@@ -104,6 +107,33 @@ impl<T> ExecutionInfo<T> {
     /// else. Callers on the build path must go through here.
     pub fn with_block_size(block_size: OpBlockSizeBudget) -> Self {
         Self { inner: OpExecutionInfo { block_size, ..OpExecutionInfo::new() }, ..Self::default() }
+    }
+}
+
+impl<T> ExecutionInfo<T> {
+    /// Check the pool candidate against this block's RLP budget and record skips.
+    ///
+    /// A too-large transaction cannot fit any block. A full block can clear
+    /// next slot; count each skipped hash once here even when slice snapshots
+    /// repeatedly offer it. The admission verdict itself is never cached.
+    pub(crate) fn pool_rlp_admission(
+        &mut self,
+        hash: TxHash,
+        tx_rlp_length: usize,
+        sdm_refund_possible: bool,
+    ) -> reth_optimism_payload_builder::block_size::RawSizeAdmission {
+        use reth_optimism_payload_builder::block_size::RawSizeAdmission;
+        let admission = self.block_size.admission(tx_rlp_length, sdm_refund_possible);
+        match admission {
+            RawSizeAdmission::TooLarge => {
+                metrics::counter!("preconf.build.tx_exceeds_block_rlp_total").increment(1);
+            }
+            RawSizeAdmission::BlockFull if self.block_rlp_full_skipped.insert(hash) => {
+                metrics::counter!("preconf.build.block_rlp_full_skipped_total").increment(1);
+            }
+            RawSizeAdmission::BlockFull | RawSizeAdmission::Fits => {}
+        }
+        admission
     }
 }
 
@@ -222,6 +252,45 @@ mod tests {
     use super::{ExecutionInfo, OpBlockSizeBudget, OpExecutionInfo};
 
     type Info = ExecutionInfo<OpTxEnvelope>;
+    #[test]
+    fn rlp_full_skips_count_each_hash_once_per_build() {
+        use alloy_primitives::B256;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use reth_optimism_payload_builder::block_size::{
+            BLOCK_SIZE_PACKING_TARGET, RawSizeAdmission,
+        };
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut info = Info::with_block_size(OpBlockSizeBudget::new(true, true, 42, false));
+            let a = B256::repeat_byte(1);
+            let b = B256::repeat_byte(2);
+            assert_eq!(info.pool_rlp_admission(a, 100, false), RawSizeAdmission::Fits);
+            info.block_size.record_transaction(BLOCK_SIZE_PACKING_TARGET, false);
+            for _slice in 0..4 {
+                assert_eq!(info.pool_rlp_admission(a, 100, false), RawSizeAdmission::BlockFull);
+                assert_eq!(info.pool_rlp_admission(b, 100, false), RawSizeAdmission::BlockFull);
+            }
+            assert!(
+                metrics
+                    .render()
+                    .lines()
+                    .any(|l| l == "preconf_build_block_rlp_full_skipped_total 2"),
+                "repeated snapshots must count two distinct hashes"
+            );
+            let mut next = Info::with_block_size(OpBlockSizeBudget::new(true, true, 43, false));
+            assert_eq!(next.pool_rlp_admission(a, 100, false), RawSizeAdmission::Fits);
+            next.block_size.record_transaction(BLOCK_SIZE_PACKING_TARGET, false);
+            assert_eq!(next.pool_rlp_admission(a, 100, false), RawSizeAdmission::BlockFull);
+            assert!(
+                metrics
+                    .render()
+                    .lines()
+                    .any(|l| l == "preconf_build_block_rlp_full_skipped_total 3"),
+                "a new build must count the hash again"
+            );
+        });
+    }
 
     fn sender(byte: u8) -> Address {
         Address::repeat_byte(byte)

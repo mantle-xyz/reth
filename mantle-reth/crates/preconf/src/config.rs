@@ -250,6 +250,16 @@ pub enum PreconfConfigError {
     /// every submission would be refused.
     #[error("preconf_queue_gas_blocks must be > 0")]
     InvalidPreconfQueueGasBlocks,
+    /// The derived queued gas ceiling cannot be represented as `u64`.
+    #[error(
+        "--preconf.max-gas-per-block ({block}) * --preconf.queue-gas-blocks ({blocks}) overflows u64"
+    )]
+    QueueGasOverflow {
+        /// Configured per-block gas budget.
+        block: u64,
+        /// Configured number of queued blocks.
+        blocks: u64,
+    },
     /// `preconf_max_gas_per_block < preconf_max_gas_per_tx` — a single tx
     /// could never fit the block budget.
     #[error("preconf_max_gas_per_block ({block}) must be >= preconf_max_gas_per_tx ({per_tx})")]
@@ -304,6 +314,12 @@ impl PreconfConfig {
         }
         if self.preconf_queue_gas_blocks == 0 {
             return Err(PreconfConfigError::InvalidPreconfQueueGasBlocks);
+        }
+        if self.preconf_max_gas_per_block.checked_mul(self.preconf_queue_gas_blocks).is_none() {
+            return Err(PreconfConfigError::QueueGasOverflow {
+                block: self.preconf_max_gas_per_block,
+                blocks: self.preconf_queue_gas_blocks,
+            });
         }
         if self.preconf_max_gas_per_block < self.preconf_max_gas_per_tx {
             return Err(PreconfConfigError::BlockBudgetSmallerThanPerTx {
@@ -415,6 +431,34 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidPreconfQueueGasBlocks)));
+    }
+
+    #[test]
+    fn overflowing_queue_gas_is_refused_with_the_flag_names() {
+        let cfg = PreconfConfig {
+            preconf_max_gas_per_block: 6_000_000,
+            preconf_queue_gas_blocks: 1_000_000_000_000_000_000,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("queue gas multiplication must not saturate");
+        let message = err.to_string();
+        assert!(message.contains("--preconf.queue-gas-blocks"));
+        assert!(message.contains("--preconf.max-gas-per-block"));
+    }
+
+    #[test]
+    fn queue_gas_validation_accepts_the_largest_non_overflowing_product() {
+        let cfg = PreconfConfig {
+            preconf_max_gas_per_block: 6_000_000,
+            preconf_queue_gas_blocks: u64::MAX / 6_000_000,
+            ..Default::default()
+        };
+        assert!(cfg.clone().validate().is_ok());
+        assert!(
+            PreconfConfig { preconf_queue_gas_blocks: cfg.preconf_queue_gas_blocks + 1, ..cfg }
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

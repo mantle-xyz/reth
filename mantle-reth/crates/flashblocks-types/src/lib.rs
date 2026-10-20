@@ -5,7 +5,7 @@
 //! before the block is sealed. This crate defines the types that travel on
 //! that wire and nothing else — it is shared by the sequencer-side producer
 //! and the RPC-side consumer, so it deliberately depends only on `op-alloy`
-//! and `serde`.
+//! and `serde`, with the consensus block-size constant used for wire limits.
 //!
 //! The payload is byte-compatible with `op-alloy`'s `OpFlashblockPayload`:
 //! the same JSON decodes as either type. Only `metadata` differs, and it

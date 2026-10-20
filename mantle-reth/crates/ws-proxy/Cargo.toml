@@ -25,6 +25,7 @@ futures = { workspace = true }
 ipnet = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
+mantle-reth-flashblocks-types = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true, features = ["std"] }
@@ -37,6 +38,5 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 [dev-dependencies]
 alloy-consensus = { workspace = true, features = ["std", "serde"] }
 alloy-primitives = { workspace = true, features = ["std"] }
-mantle-reth-flashblocks-types = { workspace = true }
 op-alloy-consensus = { workspace = true, features = ["std", "serde"] }
 tokio-tungstenite = { workspace = true }

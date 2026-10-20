@@ -509,6 +509,27 @@ enum Admission {
     /// (RPC does not defer). A server pre-apply rejection — the tx never
     /// reaches the builder, and the commitment ends here.
     Reject(PreconfError),
+    /// RLP packing capacity rejected the tx; the RPC error is unchanged.
+    RejectRlp(PreconfError),
+}
+
+impl Admission {
+    /// Record the capacity rejection selected by admission, once before dispatch.
+    fn record_rejection_metrics(&self) {
+        match self {
+            Self::Reject(PreconfError::DaLimitExceeded { .. }) => {
+                metrics::counter!("preconf.fifo.da_rejected_total").increment(1);
+            }
+            // The non-DA rejections in preconf_admission are actual block gas limits.
+            Self::Reject(_) => {
+                metrics::counter!("preconf.fifo.block_gas_rejected_total").increment(1);
+            }
+            Self::RejectRlp(_) => {
+                metrics::counter!("preconf.fifo.block_rlp_rejected_total").increment(1);
+            }
+            Self::Admit | Self::Defer => {}
+        }
+    }
 }
 
 /// Block-capacity admission for a preconf tx — the unified DA + real-block-gas
@@ -603,16 +624,18 @@ fn combined_preconf_admission(
     source: PreconfSource,
 ) -> Admission {
     // An existing DA/gas rejection must survive a transient RLP capacity shortage.
-    if matches!(&da_gas_admission, Admission::Reject(_)) {
+    if matches!(&da_gas_admission, Admission::Reject(_) | Admission::RejectRlp(_)) {
         return da_gas_admission;
     }
     match raw_size_admission {
         RawSizeAdmission::Fits => da_gas_admission,
         RawSizeAdmission::BlockFull if source == PreconfSource::Replay => Admission::Defer,
-        RawSizeAdmission::BlockFull => Admission::Reject(PreconfError::BuilderRejected(format!(
-            "block RLP size headroom exhausted: need {tx_rlp_length} bytes, packing limit {BLOCK_SIZE_PACKING_TARGET}"
-        ))),
-        RawSizeAdmission::TooLarge => Admission::Reject(PreconfError::BuilderRejected(format!(
+        RawSizeAdmission::BlockFull => {
+            Admission::RejectRlp(PreconfError::BuilderRejected(format!(
+                "block RLP size headroom exhausted: need {tx_rlp_length} bytes, packing limit {BLOCK_SIZE_PACKING_TARGET}"
+            )))
+        }
+        RawSizeAdmission::TooLarge => Admission::RejectRlp(PreconfError::BuilderRejected(format!(
             "transaction RLP size {tx_rlp_length} exceeds block packing limit {BLOCK_SIZE_PACKING_TARGET}"
         ))),
     }
@@ -863,6 +886,7 @@ where
         tx_rlp_length,
         source,
     );
+    admission.record_rejection_metrics();
     match admission {
         Admission::Admit => {
             let mut apply_fn = |tx, h, height| {
@@ -893,9 +917,28 @@ where
                 "replay tx deferred (transient block capacity); keeping Waiting for next slot"
             );
         }
-        Admission::Reject(e) => {
+        Admission::Reject(e) | Admission::RejectRlp(e) => {
             loop_state.block_sender(sender, nonce, dispatch::BlockKind::Reject);
-            metrics::counter!("preconf.fifo.da_rejected_total").increment(1);
+            // Replay carries an earlier public claim. Inspect it before
+            // complete_failure releases the claim and its nonce slot.
+            if source == PreconfSource::Replay {
+                if fifo.claims().was_promised(&hash) {
+                    error!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?sender, nonce, reason = ?e,
+                        "COMMITMENT BROKEN: block capacity permanently rejects a replayed \
+                         transaction whose receipt was returned to the client"
+                    );
+                    metrics::counter!("preconf.tx.commitment_broken_total").increment(1);
+                } else {
+                    warn!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?sender, nonce, reason = ?e,
+                        "block capacity permanently rejects an announced transaction during replay"
+                    );
+                    metrics::counter!("preconf.tx.announced_dropped_total").increment(1);
+                }
+            }
             // Server pre-apply capacity rejection (DA / real block gas) — the
             // tx never reaches the builder, and the commitment ends here.
             let _ = fifo.complete_failure(&hash, e).await;
@@ -949,9 +992,9 @@ where
 ///
 /// The two statuses it can see:
 ///
-/// - **`Waiting`** — anything not yet applied: journal-restored, carried over from a discarded
-///   job, or freshly pushed. Returned with the original `source` intact so genuinely stale `Rpc`
-///   entries get timed out by the deadline gate.
+/// - **`Waiting`** — anything not yet applied: journal-restored, carried over from a discarded job,
+///   or freshly pushed. Returned with the original `source` intact so genuinely stale `Rpc` entries
+///   get timed out by the deadline gate.
 /// - **`Success`** — stale in-flight from a discarded prior job. A canon'd entry would have been
 ///   removed by the immediately-preceding [`sync_fifo_forward_to_head`], so any Success reaching
 ///   here is an un-canon'd in-flight (client already got a receipt; must land).
@@ -1120,6 +1163,7 @@ where
 
     let interop = tx.interop_deadline();
     let tx_da_size = tx.estimated_da_size();
+    let tx_hash = *tx.hash();
     let tx = tx.into_consensus();
     let tx_uncompressed_size = tx.encode_2718_len() as u64;
 
@@ -1129,20 +1173,8 @@ where
     // `carries_its_senders_nonce` doubles as the SDM refund gate.
     let sdm_refund_possible = carries_its_senders_nonce(tx.inner());
     let tx_rlp_length = tx.length();
-    let rlp_admission = info.block_size.admission(tx_rlp_length, sdm_refund_possible);
+    let rlp_admission = info.pool_rlp_admission(tx_hash, tx_rlp_length, sdm_refund_possible);
     if rlp_admission != RawSizeAdmission::Fits {
-        // Both verdicts take the transaction out of this block, and the pool
-        // decides what to do with it next; here the only choice is to stop
-        // offering it. They are counted apart because an operator responds to
-        // them differently: `TooLarge` is permanent — the transaction is
-        // bigger than a whole block's RLP budget, so no block will ever hold
-        // it — while `BlockFull` only says this block ran out of room, which
-        // is a sign of how full blocks are running.
-        if rlp_admission == RawSizeAdmission::TooLarge {
-            metrics::counter!("preconf.build.tx_exceeds_block_rlp_total").increment(1);
-        } else {
-            metrics::counter!("preconf.build.block_rlp_full_skipped_total").increment(1);
-        }
         best_txs.mark_invalid(tx.signer(), tx.nonce());
         return Ok(BestTxStep::Continue);
     }
@@ -1908,7 +1940,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // the same reason `sync_fifo_forward_to_head` is: it reads nothing
         // into the block, and those builds execute the batched user
         // transactions the admission path most needs to know about.
-        self.fifo.reset_accounts();
+        self.fifo.reset_accounts_at(ctx.parent().hash());
 
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
         //
@@ -2031,8 +2063,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Measured once and handed to both schedules unreduced; each subtracts
         // the leeway it holds back itself. Reducing it here and adding it back
         // for the other caller is a round trip that does not survive saturation.
-        let time_to_deadline =
-            slot_deadline.duration_since(std::time::SystemTime::now()).unwrap_or(tick_interval);
+        let remaining = slot_deadline.duration_since(std::time::SystemTime::now());
+        let deadline_already_passed = remaining.is_err();
+        let time_to_deadline = remaining.unwrap_or(tick_interval);
 
         // Divides the block across the slices still expected to fit. Also owns
         // the tick grid when slicing is on: the ticker and the budget have to
@@ -2047,6 +2080,21 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 SliceLimits { block_gas_limit, block_da_limit, da_footprint_gas_scalar },
             )
         });
+
+        if let Some(schedule) = slice_schedule.as_ref() &&
+            (deadline_already_passed || schedule.drift.as_millis() == 0)
+        {
+            // Preserve the fallback schedule, but do not let it conceal an
+            // expired deadline. Count once even when leeway also exhausts it.
+            metrics::counter!("flashblocks.deadline_already_passed_total").increment(1);
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                deadline_timestamp = attrs_timestamp,
+                deadline_already_passed,
+                ?time_to_deadline,
+                "flashblock build deadline already passed or leeway exhausted; using single-tick budget"
+            );
+        }
 
         let schedule = derive_pool_quota_schedule(
             time_to_deadline,
@@ -3048,7 +3096,7 @@ mod tests {
                     BLOCK_SIZE_PACKING_TARGET,
                     PreconfSource::Replay
                 ),
-                Admission::Reject(_)
+                Admission::RejectRlp(_)
             ),
             "permanent raw-size rejection must not become a transient DA defer"
         );
@@ -3072,8 +3120,61 @@ mod tests {
                 BLOCK_SIZE_PACKING_TARGET,
                 PreconfSource::Replay
             ),
-            Admission::Reject(_)
+            Admission::RejectRlp(_)
         ));
+    }
+
+    #[test]
+    fn capacity_rejection_metrics_distinguish_rlp_da_and_gas() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for (raw, source) in [
+                (RawSizeAdmission::BlockFull, PreconfSource::Rpc),
+                (RawSizeAdmission::TooLarge, PreconfSource::Replay),
+            ] {
+                combined_preconf_admission(Admission::Admit, raw, 100, source)
+                    .record_rejection_metrics();
+            }
+            preconf_admission(
+                1_001,
+                21_000,
+                0,
+                0,
+                da_limits(Some(1_000), None, None),
+                PreconfSource::Rpc,
+            )
+            .record_rejection_metrics();
+            preconf_admission(
+                100,
+                BLOCK_GAS + 1,
+                0,
+                0,
+                da_limits(None, None, None),
+                PreconfSource::Rpc,
+            )
+            .record_rejection_metrics();
+            combined_preconf_admission(
+                Admission::Admit,
+                RawSizeAdmission::BlockFull,
+                100,
+                PreconfSource::Replay,
+            )
+            .record_rejection_metrics();
+            Admission::Admit.record_rejection_metrics();
+            let rendered = metrics.render();
+            for (name, count) in [
+                ("preconf_fifo_block_rlp_rejected_total", 2),
+                ("preconf_fifo_da_rejected_total", 1),
+                ("preconf_fifo_block_gas_rejected_total", 1),
+            ] {
+                assert!(
+                    rendered.lines().any(|l| l == format!("{name} {count}")),
+                    "expected {name} = {count}; got:\n{rendered}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -3094,7 +3195,7 @@ mod tests {
                 100,
                 PreconfSource::Rpc
             ),
-            Admission::Reject(_)
+            Admission::RejectRlp(_)
         ));
     }
 

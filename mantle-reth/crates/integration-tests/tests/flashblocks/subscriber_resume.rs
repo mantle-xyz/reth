@@ -169,6 +169,25 @@ async fn slices_are_forwarded_in_order() {
     assert_eq!(position_of(&next(&mut slices).await), (2, 0));
 }
 
+/// Both the decoder and the websocket frame limit must accommodate a block-sized slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn q01_large_slice_reaches_the_consumer_directly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+    let (expected, json) = crate::consumer_helpers::large_slice_message();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        websocket.send(Message::text(json)).await.unwrap();
+        websocket.send(slice_message((1, 1))).await.unwrap();
+        while websocket.next().await.is_some() {}
+    });
+    let mut slices = subscribe(url);
+    assert_eq!(next(&mut slices).await, expected);
+    assert_eq!(position_of(&next(&mut slices).await), (1, 1));
+    server.abort();
+}
+
 /// The first connection has no position to resume from.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_connection_carries_no_resume_parameters() {
