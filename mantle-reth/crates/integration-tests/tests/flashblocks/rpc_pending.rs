@@ -55,7 +55,7 @@ fn probe_override(code: &str) -> alloy_rpc_types_eth::state::StateOverride {
     .expect("valid probe bytecode")
 }
 
-/// TC-122: queries can see accepted sequencer transactions before a slice arrives.
+/// Pending nonce queries include accepted sequencer transactions before a slice arrives.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_nonce_includes_sequencer_transactions_before_the_next_slice() {
     use jsonrpsee::core::client::ClientT;
@@ -237,7 +237,7 @@ async fn pending_nonce_reports_sequencer_errors_and_timeouts() {
     }
 }
 
-/// TC-117: receipt fees use the token ratio immediately before each transaction.
+/// Receipt fees use the token ratio immediately before each transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_receipt_fees_follow_token_ratio_changes_across_slices() {
     use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
@@ -307,7 +307,7 @@ async fn pending_receipt_fees_follow_token_ratio_changes_across_slices() {
     }
 }
 
-/// D-03: state and EVM block fields must describe the same pending snapshot.
+/// State and EVM block fields must describe the same pending snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_execution_uses_the_overlay_block_environment() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);
@@ -354,7 +354,7 @@ async fn pending_execution_uses_the_overlay_block_environment() {
     assert_eq!(U256::from_be_slice(&result[32..64]), U256::from(header.timestamp + 10));
 }
 
-/// D-03: estimation must follow the pending contract's NUMBER-dependent branch.
+/// Gas estimation must follow the pending contract's NUMBER-dependent branch.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_estimation_uses_the_overlay_block_number() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);
@@ -380,7 +380,7 @@ async fn pending_estimation_uses_the_overlay_block_number() {
     );
 }
 
-/// Q-04: pending total-fee estimates work with no consumer snapshot or pending provider block.
+/// Pending total-fee estimates work with no consumer snapshot or pending provider block.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_total_fee_falls_back_without_a_preview() {
     use jsonrpsee::core::client::ClientT;
@@ -454,7 +454,7 @@ async fn pending_total_fee_falls_back_without_a_preview() {
     );
 }
 
-/// Q-04: a provider pending block remains usable when local pending construction is disabled.
+/// A provider pending block remains usable when local pending construction is disabled.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_total_fee_uses_actual_pending_when_local_pending_is_disabled() {
     use jsonrpsee::core::client::ClientT;
@@ -495,7 +495,7 @@ async fn pending_total_fee_uses_actual_pending_when_local_pending_is_disabled() 
     assert_eq!(latest, U256::from(21_000), "deployment is not canonical");
 }
 
-/// Q-04: deployed preview code must execute using its own block's NUMBER.
+/// Deployed preview code must execute using its own block's NUMBER.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_total_fee_uses_preview_code_and_block_environment() {
     use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
@@ -556,7 +556,7 @@ async fn pending_total_fee_uses_preview_code_and_block_environment() {
     );
 }
 
-/// Q-04: L1 attributes come from the preview tip and tokenRatio from its post-state.
+/// L1 attributes come from the preview tip and tokenRatio from its post-state.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
     use alloy_network::eip2718::{Decodable2718, Encodable2718};
@@ -720,7 +720,7 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
     );
 }
 
-/// D-04: the provider has no pending block; the simulator must use the consumer snapshot.
+/// Without a provider pending block, the simulator must use the consumer snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_simulation_starts_after_the_overlay_tip() {
     use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
@@ -1239,7 +1239,7 @@ async fn get_logs_appends_the_overlay_when_the_range_ends_at_pending() {
     );
 }
 
-/// TC-126: a range starting beyond the preview must not return older logs.
+/// A log range starting beyond the preview must not return older logs.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_logs_excludes_the_overlay_before_a_future_start_block() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);

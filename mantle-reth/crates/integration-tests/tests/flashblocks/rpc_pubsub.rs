@@ -110,7 +110,7 @@ async fn pending_logs_yields_matching_logs() {
     assert_eq!(log["transactionHash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
 }
 
-/// TC-149: invalid filter types must fail before a subscription ID is returned.
+/// Invalid filter types must fail before a subscription ID is returned.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_logs_rejects_non_filter_parameters_before_accepting() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);

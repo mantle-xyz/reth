@@ -689,7 +689,7 @@ mod tests {
         assert!(matches!(exit, SubscriptionExit::Lagged(_)), "got {exit:?}");
     }
 
-    /// D-02: a peer that stops reading can block send before recv reports lag.
+    /// A peer that stops reading can block send before recv reports lag.
     #[tokio::test]
     async fn a_subscriber_that_never_reads_is_disconnected() {
         let (mut server, _client) = socket_pair().await;

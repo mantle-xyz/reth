@@ -9,7 +9,7 @@ use crate::consumer_helpers::{
     launch_flashblocks_consumer, mine_canonical_block as mine, submit_uncommitted_block,
 };
 
-/// D-01: the cache window remains usable beyond the overlay's leading limit.
+/// The cache window remains usable beyond the overlay's leading limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slice_beyond_leading_depth_replays_when_its_parent_lands() {
     let (harness, mut node) = launch_flashblocks_consumer!(3, 1);
