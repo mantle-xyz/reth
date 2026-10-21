@@ -35,6 +35,13 @@ pub trait EthPubSubApi {
     ///
     /// Standard kinds are delegated to reth; `newFlashblocks`, `pendingLogs` and
     /// `newFlashblockTransactions` are served from flashblock state.
+    ///
+    /// `newFlashblocks` publishes the latest full preview block as a snapshot,
+    /// not a slice delta. Its zero block hash is provisional; notifications do
+    /// not provide reliable delivery or slice-gap detection. After reconnecting,
+    /// query a fresh preview and reconcile finalized history with the canonical
+    /// chain. Consumers needing slice indices and predecessor links must use
+    /// the producer's raw flashblock stream.
     #[subscription(
         name = "subscribe" => "subscription",
         unsubscribe = "unsubscribe",

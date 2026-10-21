@@ -752,8 +752,12 @@ async fn pending_simulation_starts_after_the_overlay_tip() {
         U256::from_be_slice(&output[32..64]),
         U256::from(crate::consumer_helpers::l2_ts(1) + 2)
     );
-    // The user's code override replaces LOGGER's overlay account override, so probe a separate
-    // call without it to verify that simulation also receives the pending state.
+    assert_eq!(
+        U256::from_be_slice(&output[64..96]),
+        VALUE,
+        "overriding code must preserve the preview balance"
+    );
+    // A request without overrides sees the same preview balance.
     let balances = api
         .simulate_v1(
             serde_json::json!({
@@ -1527,6 +1531,40 @@ macro_rules! overlay_with_storage_write {
             .await;
         assert!($harness.pending().is_some(), "the slice should open an overlay");
     }};
+}
+
+/// A user code override must retain preview storage for calls and gas estimation.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_partial_account_overrides_preserve_preview_storage() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    overlay_with_storage_write!(harness);
+    // Read slot 1, revert unless it is 7, then return the value.
+    let user: alloy_rpc_types_eth::state::StateOverride =
+        serde_json::from_value(serde_json::json!({
+            format!("{SETTER:#x}"): { "code": "0x60015480600714600d575f5ffd5b5f5260205ff3" }
+        }))
+        .unwrap();
+    let request = serde_json::json!({ "to": SETTER });
+    let result = api
+        .call(request.clone(), Some(BlockNumberOrTag::Pending.into()), Some(user.clone()), None)
+        .await
+        .expect("code overrides must retain the preview storage write");
+    assert_eq!(U256::from_be_slice(&result), U256::from(7));
+    let gas = api
+        .estimate_gas(
+            request.clone(),
+            Some(BlockNumberOrTag::Pending.into()),
+            Some(user.clone()),
+            None,
+        )
+        .await
+        .expect("estimation must retain the preview storage write");
+    assert!(gas > U256::from(21_000));
+    assert!(
+        api.call(request, Some(BlockNumberOrTag::Latest.into()), Some(user), None,).await.is_err(),
+        "the canonical slot is still zero"
+    );
 }
 
 /// `eth_getStorageAt` sees the overlay's write under `pending` only.

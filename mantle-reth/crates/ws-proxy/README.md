@@ -22,7 +22,8 @@ sequencer (mantle-reth)  ──→  mantle-ws-proxy  ──→  N subscribers
 
 Mantle builds slices inside the sequencer rather than in a sidecar: the
 publisher is `MantleFlashblocksPublisher` in `mantle-reth-preconf`, enabled with
-`--flashblocks.enable` and listening on `--flashblocks.port` (1111 by default).
+`--flashblocks.enable` and listening on `127.0.0.1:1111` by default. Use
+`--flashblocks.addr` and `--flashblocks.port` to change the bind address and port.
 Base's lineage — this crate is a port of Base's `websocket-proxy` — puts a
 separate builder and a rollup-boost hop ahead of the proxy. This document
 describes the topology this crate is configured for: the sequencer itself as
@@ -50,6 +51,15 @@ mantle-ws-proxy \
   --metrics-addr 0.0.0.0:9000 \
   --api-keys 'indexer:<key>'
 ```
+
+The upstream URL above assumes the sequencer listens on an address reachable
+from the proxy. For separate hosts or containers with separate network
+namespaces, add `--flashblocks.addr <sequencer-private-ip>` to the sequencer's
+node command, and make sure `mantle-sequencer` resolves to that address. In a
+container, `--flashblocks.addr 0.0.0.0` can bind all container interfaces; restrict
+access to the publisher port to the intended private network. If both processes
+share a network namespace, keep the default bind address and use
+`--upstream-ws ws://127.0.0.1:1111` instead.
 
 `--api-keys` is not optional furniture: **the proxy refuses to start without
 it**, unless `--public-access-enabled` is passed to say the network in front
@@ -124,8 +134,12 @@ Text frames are forwarded as-is. Binary frames are sniffed — already-JSON, or
 brotli to be decompressed — before being placed on the broadcast channel, so a
 compressing upstream works; `decode_binary_slice` in `subscriber.rs` carries the
 sniff rule and the reason dropping binary frames (as Base's proxy does) would
-starve every subscriber here. Slices larger than `MAX_BINARY_SLICE_BYTES`
-(5 MiB) are refused.
+starve every subscriber here. The shared `MAX_DECOMPRESSED_FLASHBLOCK_BYTES`
+limit is 17 MiB. Upstream WebSocket messages and individual frames are bounded
+by that limit, as is decoded binary content. An oversized raw text message
+fails at the transport layer and causes the upstream connection to reconnect.
+A compressed message that fits the transport limit but decompresses beyond
+17 MiB is dropped without reconnecting. Neither path forwards oversized content.
 
 Downstream compression is separate and opt-in via `--enable-compression`.
 
@@ -158,6 +172,24 @@ counts subscribers who tried.
 
 Which input feeds which filter, and why each spelling of an address behaves the
 way it does, is the module doc on `filter::mantle_shape`.
+
+## Reconnecting after the sequencer archive has advanced
+
+The proxy remembers its last decoded upstream slice and reconnects to the
+sequencer with `block_number` and `flashblock_index` query parameters. The
+sequencer's archive retains a bounded number of slices. If the requested
+position precedes the oldest retained slice, the sequencer sends the retained
+slices and then continues live delivery. It increments
+`flashblocks.resume_before_archive_total` (`flashblocks_resume_before_archive_total`
+in Prometheus) on the sequencer, once per replay attempt detected in that state,
+including attempts that later fail to send. This counts attempts, not missing slices.
+Successful catch-up with a position before the archive also produces a warning.
+
+The stream carries no explicit archive-gap message or close reason. Downstream
+consumers must check slice indices and predecessor links, recover missing history
+from the canonical chain, and wait for a usable base before rebuilding a preview
+when the retained slices cannot extend their state. Reconnecting with the same
+old position cannot retrieve slices already evicted from the archive.
 
 ## Metrics
 

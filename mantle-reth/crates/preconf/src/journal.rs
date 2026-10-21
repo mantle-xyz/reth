@@ -28,11 +28,12 @@
 //! **A line survives rotation only if the registry holds a record for its hash.**
 //! [`PreconfJournal::append_promised`] takes one commitment from the apply;
 //! [`PreconfJournal::append_batch`] takes a whole slice, ordinary transactions
-//! included. The registry record that `retain` reads is established
-//! elsewhere, when a client is handed its event — so a line whose hash never
-//! gets one is slot-scoped: good for a restart inside the slot, gone at the
-//! next rotation. For the slice's ordinary transactions that is the intent;
-//! see `Commitments::mark_promised` for the case where it is not.
+//! included. Both preconf and ordinary pool execution establish an Announced
+//! registry record before publishing; a preconf receipt upgrades its record
+//! to Promised. Ordinary transactions remain tracked for replay even without
+//! a client receipt, so their journal lines survive rotation while the
+//! registry retains them. Rotation removes a line only after its hash is no
+//! longer tracked; see `Commitments::is_tracked`.
 //!
 //! **The second writer only exists when slicing does.** With flashblocks off,
 //! what reaches this file is commitments and nothing else, so a restart replays

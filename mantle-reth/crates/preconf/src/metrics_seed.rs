@@ -67,6 +67,7 @@ const COUNTERS: &[&str] = &[
     "flashblocks.unlanded_nonce_unreadable_total",
     "flashblocks.slices_missed_by_slow_subscribers_total",
     "flashblocks.slow_subscriber_dropped_total",
+    "flashblocks.resume_before_archive_total",
     "flashblocks.superseded_slices_total",
     "preconf.api.timeout_total",
     // The completion protocol was broken: an entry finished without a result
@@ -172,6 +173,10 @@ const HISTOGRAMS: &[&str] = &[
 /// don't expose phantom series. Requires the metrics recorder to be
 /// installed already (true by the `on_node_started` hook). Idempotent.
 pub fn seed_preconf_metrics() {
+    metrics::describe_counter!(
+        "flashblocks.resume_before_archive_total",
+        "Replay attempts whose requested position precedes the oldest retained slice, including attempts that later fail; not a count of missing slices"
+    );
     for &name in COUNTERS {
         metrics::counter!(name).increment(0);
     }
