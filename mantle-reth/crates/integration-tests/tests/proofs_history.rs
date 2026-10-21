@@ -86,3 +86,83 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
     )
     .await;
 }
+
+/// Regression: enabling `--proofs-history` must not drop the Mantle RPC extensions.
+///
+/// reth keeps a single `extend_rpc_modules` hook slot. The proofs-history wiring installs its own
+/// hook, which used to overwrite the one `MantleNode::add_ons` installed, so on every
+/// proofs-history node `eth_getBlockRange` / `eth_estimateTotalFee` /
+/// `eth_sendRawTransactionWithPreconf` silently answered `-32601 Method not found` — with no
+/// startup warning. The wiring now composes both, so these methods stay registered.
+///
+/// The assertion is only about registration: each method may still reject these dummy arguments,
+/// but a registered method never returns `-32601`.
+#[tokio::test]
+async fn proofs_history_keeps_mantle_rpc_extensions() {
+    use jsonrpsee::core::ClientError;
+
+    const METHOD_NOT_FOUND: i32 = -32601;
+
+    let sidecar = tempfile::tempdir().expect("tempdir");
+    let sidecar_path = sidecar.path().join("proofs");
+
+    let args = RollupArgs {
+        proofs_history: true,
+        history: ProofsHistoryStorageArgs {
+            storage_path: Some(sidecar_path.clone()),
+            storage_version: ProofsStorageVersion::V2,
+        },
+        ..Default::default()
+    };
+
+    with_configured_mantle_node_opts(
+        MantleNode::default(),
+        mantle_test_chain_spec(),
+        mantle_payload_attributes,
+        TreeConfig::default(),
+        Some((args, sidecar_path)),
+        async |_node, client| {
+            // `eth_getBlockRange(start, end, full)` — a Mantle-only method; with the hook dropped
+            // this was `-32601`.
+            let range: Result<Value, ClientError> =
+                client.request("eth_getBlockRange", rpc_params!["0x0", "0x0", false]).await;
+            assert_registered("eth_getBlockRange", &range, METHOD_NOT_FOUND);
+
+            // `eth_estimateTotalFee(tx, block)` — Mantle-only.
+            let fee: Result<Value, ClientError> = client
+                .request(
+                    "eth_estimateTotalFee",
+                    rpc_params![serde_json::json!({
+                        "from": Address::ZERO,
+                        "to": Address::ZERO,
+                        "value": "0x0",
+                    })],
+                )
+                .await;
+            assert_registered("eth_estimateTotalFee", &fee, METHOD_NOT_FOUND);
+
+            // `eth_sendRawTransactionWithPreconf(raw)` — Mantle-only. With preconf disabled and no
+            // sequencer configured it rejects with a different error, but it is registered.
+            let preconf: Result<Value, ClientError> =
+                client.request("eth_sendRawTransactionWithPreconf", rpc_params!["0x"]).await;
+            assert_registered("eth_sendRawTransactionWithPreconf", &preconf, METHOD_NOT_FOUND);
+        },
+    )
+    .await;
+}
+
+/// Asserts a JSON-RPC call reached a registered method: it either succeeded or failed with
+/// something other than `-32601 Method not found`.
+fn assert_registered(
+    method: &str,
+    out: &Result<Value, jsonrpsee::core::ClientError>,
+    not_found: i32,
+) {
+    if let Err(jsonrpsee::core::ClientError::Call(err)) = out {
+        assert_ne!(
+            err.code(),
+            not_found,
+            "{method} must stay registered with --proofs-history, got -32601: {err}"
+        );
+    }
+}

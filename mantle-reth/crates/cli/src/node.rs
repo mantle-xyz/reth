@@ -512,87 +512,114 @@ where
         let preconf = self.preconf.clone();
         let flashblocks_cfg = self.flashblocks.clone();
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
-        add_ons = add_ons.extend_rpc_modules(move |ctx| {
-            // Build SequencerClient if a sequencer URL is configured.
-            // SequencerClient::new is async; use block_in_place since we're inside tokio.
-            let sequencer_client = sequencer_url
-                .map(|url| {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(reth_optimism_rpc::SequencerClient::new(url))
-                    })
-                })
-                .transpose()
-                .map_err(|e| eyre::eyre!("failed to create SequencerClient: {e}"))?;
+        add_ons = add_ons.extend_rpc_modules(move |mut ctx| {
+            install_mantle_rpc_extensions(&mut ctx, sequencer_url, preconf, flashblocks_cfg)
+        });
+        add_ons
+    }
+}
 
-            // If preconf is enabled, spin up the canonical-state handler and
-            // build the RPC handler.
-            let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
-                preconf.as_ref().map(|svc| {
-                    let canon =
-                        svc.canon_handler(ctx.node().provider().clone());
-                    ctx.node()
-                        .task_executor()
-                        .spawn_critical_task("mantle-preconf-canon-handler", canon.run());
-                    info!(target: "reth::cli", "Mantle preconf canonical-state handler spawned");
+/// Installs the Mantle `eth_` / preconf / flashblocks RPC extensions onto `ctx`.
+///
+/// Factored out of [`MantleNode::add_ons`] so the proofs-history wiring can run it too.
+/// reth keeps a single `extend_rpc_modules` hook slot, so installing the proofs-history
+/// overrides as a second hook silently overwrites this one. The proofs-history path calls
+/// this first and then adds its own overrides on top, keeping both.
+pub(crate) fn install_mantle_rpc_extensions<Node, EthApi>(
+    ctx: &mut reth_node_builder::rpc::RpcContext<'_, Node, EthApi>,
+    sequencer_url: Option<String>,
+    preconf: Option<Arc<PreconfServiceBuilder>>,
+    flashblocks_cfg: Option<FlashblocksConfig>,
+) -> eyre::Result<()>
+where
+    Node: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives, ChainSpec: OpHardforks>>,
+    EthApi: reth_rpc_eth_api::helpers::FullEthApi<NetworkTypes = op_alloy_network::Optimism>
+        + reth_rpc_eth_api::helpers::LoadPendingBlock,
+    EthApi::Error: reth_rpc_eth_api::FromEthApiError,
+    EthApi::Primitives:
+        reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header>,
+    EthApi::Provider:
+        reth_chainspec::ChainSpecProvider<ChainSpec: OpHardforks> + reth_provider::BlockReaderIdExt,
+    jsonrpsee_types::error::ErrorObject<'static>: From<EthApi::Error>,
+{
+    // Build SequencerClient if a sequencer URL is configured.
+    // SequencerClient::new is async; use block_in_place since we're inside tokio.
+    let sequencer_client = sequencer_url
+        .map(|url| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(reth_optimism_rpc::SequencerClient::new(url))
+            })
+        })
+        .transpose()
+        .map_err(|e| eyre::eyre!("failed to create SequencerClient: {e}"))?;
 
-                    // If persistence is on, drive the periodic rotation
-                    // loop under the reth `TaskManager`'s graceful-
-                    // shutdown protocol. Holding the `GracefulShutdownGuard`
-                    // across `run_rejournal_loop`'s final rotate makes the
-                    // `TaskManager` wait for the last on-disk write to
-                    // finish before returning from process shutdown, so
-                    // sealed hashes reported by the canon handler on the
-                    // way down are dropped from the journal file before
-                    // the node exits.
-                    // Journal is mandatory, so no `Option` dance here.
-                    let journal = svc.journal().clone();
-                    // Rotation asks the classifier which commitments are still
-                    // tracked — it owns that answer.
-                    let rotate_claims = svc.fifo().claims().clone();
-                    let interval = svc.cfg().rejournal_interval;
-                    ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(
-                        "mantle-preconf-rejournal-loop",
-                        move |signal| async move {
-                            // `signal` (`GracefulShutdown`) resolves to
-                            // a `GracefulShutdownGuard` when the reth
-                            // `TaskManager` begins shutdown. Passing it
-                            // as the shutdown future to
-                            // `run_rejournal_loop` — whose `T` type
-                            // parameter carries the guard through the
-                            // final-rotate step — keeps the guard alive
-                            // until the last on-disk write finishes,
-                            // so the process only exits after the
-                            // journal file has been closed cleanly.
-                            let guard = mantle_reth_preconf::run_rejournal_loop(
-                                journal,
-                                rotate_claims,
-                                interval,
-                                signal,
-                            )
-                            .await;
-                            // Explicit drop for clarity; the guard is
-                            // released here, letting `TaskManager`'s
-                            // outstanding-tasks counter reach zero.
-                            drop(guard);
-                        },
-                    );
-                    info!(target: "reth::cli", "Mantle preconf journal rotation loop spawned");
+    // If preconf is enabled, spin up the canonical-state handler and
+    // build the RPC handler.
+    let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
+        preconf.as_ref().map(|svc| {
+            let canon = svc.canon_handler(ctx.node().provider().clone());
+            ctx.node()
+                .task_executor()
+                .spawn_critical_task("mantle-preconf-canon-handler", canon.run());
+            info!(target: "reth::cli", "Mantle preconf canonical-state handler spawned");
 
-                    // Handed over while the pool was being built; see
-                    // `PreconfServiceBuilder::set_admission`.
-                    let admission = svc
-                        .admission()
-                        .expect("preconf admission is wired in build_pool before this runs");
-                    let handler = svc.rpc_handler(admission);
-                    Arc::new(handler) as Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>
-                });
+            // If persistence is on, drive the periodic rotation
+            // loop under the reth `TaskManager`'s graceful-
+            // shutdown protocol. Holding the `GracefulShutdownGuard`
+            // across `run_rejournal_loop`'s final rotate makes the
+            // `TaskManager` wait for the last on-disk write to
+            // finish before returning from process shutdown, so
+            // sealed hashes reported by the canon handler on the
+            // way down are dropped from the journal file before
+            // the node exits.
+            // Journal is mandatory, so no `Option` dance here.
+            let journal = svc.journal().clone();
+            // Rotation asks the classifier which commitments are still
+            // tracked — it owns that answer.
+            let rotate_claims = svc.fifo().claims().clone();
+            let interval = svc.cfg().rejournal_interval;
+            ctx.node().task_executor().spawn_critical_with_graceful_shutdown_signal(
+                "mantle-preconf-rejournal-loop",
+                move |signal| async move {
+                    // `signal` (`GracefulShutdown`) resolves to
+                    // a `GracefulShutdownGuard` when the reth
+                    // `TaskManager` begins shutdown. Passing it
+                    // as the shutdown future to
+                    // `run_rejournal_loop` — whose `T` type
+                    // parameter carries the guard through the
+                    // final-rotate step — keeps the guard alive
+                    // until the last on-disk write finishes,
+                    // so the process only exits after the
+                    // journal file has been closed cleanly.
+                    let guard = mantle_reth_preconf::run_rejournal_loop(
+                        journal,
+                        rotate_claims,
+                        interval,
+                        signal,
+                    )
+                    .await;
+                    // Explicit drop for clarity; the guard is
+                    // released here, letting `TaskManager`'s
+                    // outstanding-tasks counter reach zero.
+                    drop(guard);
+                },
+            );
+            info!(target: "reth::cli", "Mantle preconf journal rotation loop spawned");
 
-            // Flashblock consumer: start the state processor, the websocket
-            // subscription and the canonical feed, then override the `pending`
-            // reads. Registered before `MantleRpcExt` so the latter can borrow
-            // the overlay for `eth_simulateV1`.
-            let flashblocks_state = flashblocks_cfg
+            // Handed over while the pool was being built; see
+            // `PreconfServiceBuilder::set_admission`.
+            let admission =
+                svc.admission().expect("preconf admission is wired in build_pool before this runs");
+            let handler = svc.rpc_handler(admission);
+            Arc::new(handler) as Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>
+        });
+
+    // Flashblock consumer: start the state processor, the websocket
+    // subscription and the canonical feed, then override the `pending`
+    // reads. Registered before `MantleRpcExt` so the latter can borrow
+    // the overlay for `eth_simulateV1`.
+    let flashblocks_state = flashblocks_cfg
                 .map(|cfg| -> eyre::Result<Arc<FlashblocksState>> {
                     let state = Arc::new(FlashblocksState::new(
                         cfg.max_trailing_depth,
@@ -660,26 +687,24 @@ where
                 })
                 .transpose()?;
 
-            let mantle_ext = MantleRpcExt::new(
-                ctx.node().provider().clone(),
-                Arc::new(ctx.registry.eth_api().clone()),
-                sequencer_client,
-                preconf_handler,
-            )
-            .with_pending_overrides(flashblocks_state.map(|state| {
-                state as Arc<dyn mantle_reth_flashblocks::PendingStateOverrides>
-            }));
-            // `replace_configured`, not `merge_configured`: this module now also serves
-            // `eth_simulateV1`, which the standard `eth_` namespace already registers. Merging a
-            // duplicate method name fails, so remove-then-add to override it. The other methods in
-            // this module are new names and are unaffected by the choice.
-            ctx.modules.replace_configured(mantle_ext.into_rpc())?;
-            info!(target: "reth::cli", "Mantle RPC extensions registered");
+    let mantle_ext = MantleRpcExt::new(
+        ctx.node().provider().clone(),
+        Arc::new(ctx.registry.eth_api().clone()),
+        sequencer_client,
+        preconf_handler,
+    )
+    .with_pending_overrides(
+        flashblocks_state
+            .map(|state| state as Arc<dyn mantle_reth_flashblocks::PendingStateOverrides>),
+    );
+    // `replace_configured`, not `merge_configured`: this module now also serves
+    // `eth_simulateV1`, which the standard `eth_` namespace already registers. Merging a
+    // duplicate method name fails, so remove-then-add to override it. The other methods in
+    // this module are new names and are unaffected by the choice.
+    ctx.modules.replace_configured(mantle_ext.into_rpc())?;
+    info!(target: "reth::cli", "Mantle RPC extensions registered");
 
-            Ok(())
-        });
-        add_ons
-    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -165,7 +165,14 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
             // it), so mirror what `op-reth op-proofs init` does before launch. At this point the
             // chain is still at genesis, so the seed is the genesis state.
             seed_proofs_sidecar(&db_for_seed, mdbx.clone());
-            with_proofs_history(builder, args, mdbx)
+            with_proofs_history(
+                builder,
+                args,
+                mdbx,
+                node.op_node.args.sequencer.clone(),
+                node.preconf.clone(),
+                node.flashblocks.clone(),
+            )
         }
         None => builder,
     };
