@@ -310,3 +310,41 @@ async fn estimate_gas_out_of_gas_at_the_ceiling_reads_as_op_geth_via_rpc() {
     })
     .await;
 }
+
+/// A raised `blockOverrides.gasLimit` does not lift the search ceiling past the RPC gas cap,
+/// which Mantle defaults to its block gas limit. The target reverts with the gas it was handed,
+/// so the test reads the ceiling off the first execution instead of running it out.
+#[tokio::test]
+async fn estimate_gas_ceiling_stays_within_the_rpc_gas_cap_via_rpc() {
+    use mantle_reth_cli::rpc_defaults::MANTLE_RPC_GAS_CAP;
+
+    with_mantle_rpc_client(|client| async move {
+        // GAS PUSH1 0 MSTORE PUSH1 32 PUSH1 0 REVERT
+        let probe = serde_json::json!({ UNFUNDED: { "code": "0x5a60005260206000fd" } });
+        let res: Result<U256, _> = client
+            .request(
+                "eth_estimateGas",
+                vec![
+                    serde_json::json!({ "from": FUNDED, "to": UNFUNDED, "data": "0x01" }),
+                    serde_json::json!("latest"),
+                    probe,
+                    serde_json::json!({ "gasLimit": "0x10000000000" }),
+                ],
+            )
+            .await;
+
+        let Err(jsonrpsee::core::client::Error::Call(error)) = res else {
+            panic!("expected the probe's revert, got {res:?}");
+        };
+        let data: alloy_primitives::Bytes =
+            serde_json::from_str(error.data().expect("revert data").get()).expect("hex data");
+        let gas_left = U256::from_be_slice(&data);
+        // What is left once the transaction's intrinsic gas is paid.
+        assert!(
+            gas_left < U256::from(MANTLE_RPC_GAS_CAP) &&
+                gas_left > U256::from(MANTLE_RPC_GAS_CAP - 50_000),
+            "the first execution must run at the {MANTLE_RPC_GAS_CAP} cap, it had {gas_left}"
+        );
+    })
+    .await;
+}

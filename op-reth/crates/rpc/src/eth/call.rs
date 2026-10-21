@@ -222,8 +222,8 @@ where
     /// gas price (`geth_style_gas_allowance`, rejecting on `value >= balance` / blob-exposure like
     /// op-geth), ignore a
     /// request gas limit below the intrinsic minimum, only take the basic-transfer
-    /// short-circuit when the allowance permits it, and report running out of gas at the ceiling
-    /// as `gas required exceeds allowance`.
+    /// short-circuit when the allowance permits it, report running out of gas at the ceiling
+    /// as `gas required exceeds allowance`, and bound the ceiling by the RPC gas cap.
     ///
     /// Everything else is a verbatim copy of
     /// `reth_rpc_eth_api::helpers::estimate::EstimateCall::estimate_gas_with` (reth rev
@@ -282,6 +282,14 @@ where
             block_gas_limit
         } else {
             evm_env.cfg_env.tx_gas_limit_cap().min(block_gas_limit)
+        };
+        // [MANTLE] The RPC gas cap bounds the ceiling too, as it does in op-geth
+        // (`gasestimator.go`: `if gasCap != 0 && hi > gasCap`). Block overrides apply first, and
+        // Arsia lifts the per-transaction cap, so without it a raised `gasLimit` would have the
+        // estimate execute however much gas the request names.
+        let max_gas_limit = match self.call_gas_limit() {
+            0 => max_gas_limit,
+            gas_cap => max_gas_limit.min(gas_cap),
         };
 
         // Determine the highest possible gas limit, considering both the request's specified
