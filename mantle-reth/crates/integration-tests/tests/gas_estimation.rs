@@ -277,3 +277,36 @@ async fn estimate_gas_fails_when_the_block_override_cannot_fit_the_call_via_rpc(
     })
     .await;
 }
+
+/// A call that never finishes runs out of gas at the ceiling, and the estimate reports it as
+/// op-geth does: `gas required exceeds allowance (<ceiling>)`, -32000. reth's own error for it
+/// is `out of gas: gas required exceeds: <ceiling>`, -32003.
+#[tokio::test]
+async fn estimate_gas_out_of_gas_at_the_ceiling_reads_as_op_geth_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        // JUMPDEST PUSH1 0 JUMP: loops until the gas runs out.
+        let looping = serde_json::json!({ UNFUNDED: { "code": "0x5b600056" } });
+        let res: Result<U256, _> = client
+            .request(
+                "eth_estimateGas",
+                vec![
+                    serde_json::json!({ "from": FUNDED, "to": UNFUNDED, "data": "0x01" }),
+                    serde_json::json!("latest"),
+                    looping,
+                    serde_json::json!({ "gasLimit": "0x186a0" }),
+                ],
+            )
+            .await;
+
+        match res {
+            Err(jsonrpsee::core::client::Error::Call(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (-32000, "gas required exceeds allowance (100000)")
+                );
+            }
+            other => panic!("expected an RPC error, got {other:?}"),
+        }
+    })
+    .await;
+}

@@ -25,7 +25,7 @@ use reth_rpc_eth_api::{
     },
 };
 use reth_rpc_eth_types::{
-    RpcInvalidTransactionError,
+    EthApiError, RpcInvalidTransactionError,
     error::api::{FromEvmHalt, FromRevert},
 };
 use reth_rpc_server_types::constants::gas_oracle::{CALL_STIPEND_GAS, ESTIMATE_GAS_ERROR_RATIO};
@@ -221,8 +221,9 @@ where
     /// gate the caller balance allowance by the fee cap (`maxFeePerGas`) instead of the effective
     /// gas price (`geth_style_gas_allowance`, rejecting on `value >= balance` / blob-exposure like
     /// op-geth), ignore a
-    /// request gas limit below the intrinsic minimum, and only take the basic-transfer
-    /// short-circuit when the allowance permits it.
+    /// request gas limit below the intrinsic minimum, only take the basic-transfer
+    /// short-circuit when the allowance permits it, and report running out of gas at the ceiling
+    /// as `gas required exceeds allowance`.
     ///
     /// Everything else is a verbatim copy of
     /// `reth_rpc_eth_api::helpers::estimate::EstimateCall::estimate_gas_with` (reth rev
@@ -400,7 +401,24 @@ where
         let gas_refund = match res.result {
             ExecutionResult::Success { gas, .. } => gas.final_refunded(),
             ExecutionResult::Halt { reason, .. } => {
-                return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()));
+                let error = Self::Error::from_evm_halt(reason, tx_env.gas_limit());
+                // [MANTLE] A call that runs out of gas at the ceiling is reported the way op-geth
+                // reports it (`gasestimator.go`, after the first execution at `hi`), not as reth's
+                // out-of-gas error with its -32003.
+                if matches!(
+                    error.as_err(),
+                    Some(EthApiError::InvalidTransaction(
+                        RpcInvalidTransactionError::BasicOutOfGas(_) |
+                            RpcInvalidTransactionError::MemoryOutOfGas(_) |
+                            RpcInvalidTransactionError::PrecompileOutOfGas(_)
+                    ))
+                ) {
+                    return Err(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
+                        gas_limit: tx_env.gas_limit(),
+                    }
+                    .into_eth_err());
+                }
+                return Err(error);
             }
             ExecutionResult::Revert { output, .. } => {
                 return if tx_request_gas_limit.is_some() || tx_request_gas_price.is_some() {
