@@ -66,9 +66,6 @@ use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
 
-/// Bound the extra network dependency of a pending nonce query.
-const PENDING_NONCE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Supplies one coherent pending execution snapshot to RPC methods owned elsewhere.
 pub trait PendingStateOverrides: std::fmt::Debug + Send + Sync {
     /// Returns state and execution header from the same published snapshot.
@@ -237,22 +234,12 @@ pub struct EthApiExt<Eth: EthApiTypes, FB> {
     eth_api: Eth,
     eth_filter: EthFilter<Eth>,
     flashblocks_state: Arc<FB>,
-    pending_nonce_client: Option<reth_optimism_rpc::SequencerClient>,
 }
 
 impl<Eth: EthApiTypes, FB> EthApiExt<Eth, FB> {
     /// Creates a new extended Eth API instance with flashblocks support.
     pub const fn new(eth_api: Eth, eth_filter: EthFilter<Eth>, flashblocks_state: Arc<FB>) -> Self {
-        Self { eth_api, eth_filter, flashblocks_state, pending_nonce_client: None }
-    }
-
-    /// Uses the sequencer's pending nonce to include transactions not yet sliced.
-    pub fn with_pending_nonce_client(
-        mut self,
-        client: Option<reth_optimism_rpc::SequencerClient>,
-    ) -> Self {
-        self.pending_nonce_client = client;
-        self
+        Self { eth_api, eth_filter, flashblocks_state }
     }
 }
 
@@ -402,32 +389,7 @@ where
                 .await
                 .map_err(Into::into)?;
 
-            let local = canon_count + fb_count;
-            if let Some(client) = &self.pending_nonce_client {
-                // Accepted sequencer transactions can precede their next slice.
-                // Never move behind transactions already executed by this preview.
-                let remote: U256 = time::timeout(
-                    PENDING_NONCE_TIMEOUT,
-                    client.request("eth_getTransactionCount", (address, BlockNumberOrTag::Pending)),
-                )
-                .await
-                .map_err(|_| {
-                    ErrorObjectOwned::owned(
-                        -32000,
-                        "sequencer pending nonce query timed out",
-                        None::<()>,
-                    )
-                })?
-                .map_err(|error| {
-                    ErrorObjectOwned::owned(
-                        -32000,
-                        format!("failed to query sequencer pending nonce: {error}"),
-                        None::<()>,
-                    )
-                })?;
-                return Ok(local.max(remote));
-            }
-            return Ok(local);
+            return Ok(canon_count + fb_count);
         }
 
         EthState::transaction_count(&self.eth_api, address, block_number).await.map_err(Into::into)

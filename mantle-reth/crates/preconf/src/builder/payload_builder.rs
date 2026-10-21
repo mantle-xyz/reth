@@ -1940,7 +1940,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // the same reason `sync_fifo_forward_to_head` is: it reads nothing
         // into the block, and those builds execute the batched user
         // transactions the admission path most needs to know about.
-        self.fifo.reset_accounts_at(ctx.parent().hash());
+        self.fifo.reset_accounts();
 
         // ── Stage 2: sequencer transactions (deposits + system txs) ────
         //

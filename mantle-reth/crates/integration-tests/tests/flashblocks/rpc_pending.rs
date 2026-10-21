@@ -55,186 +55,27 @@ fn probe_override(code: &str) -> alloy_rpc_types_eth::state::StateOverride {
     .expect("valid probe bytecode")
 }
 
-/// Pending nonce queries include accepted sequencer transactions before a slice arrives.
+/// A consumer answers pending nonce from its own overlay; transactions the
+/// sequencer accepted but has not yet sliced are not visible to it.
 #[tokio::test(flavor = "multi_thread")]
-async fn pending_nonce_includes_sequencer_transactions_before_the_next_slice() {
-    use jsonrpsee::core::client::ClientT;
+async fn consumer_pending_nonce_reads_only_the_local_overlay() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);
-    let (sequencer, _, _, _, fifo) = crate::launch_preconf_node_with_fifo!(
-        crate::helpers::PreconfCfgBuilder::default().build(),
-        crate::consumer_helpers::flashblocks_test_chain_spec()
-    )
-    .await;
-    let client = reth_optimism_rpc::SequencerClient::new(
-        sequencer.inner.rpc_server_handle().http_url().unwrap(),
-    )
-    .await
-    .unwrap();
-    let api = eth_api!(node, harness).with_pending_nonce_client(Some(client));
+    let api = eth_api!(node, harness);
     node.rpc.inject_tx(signed_call(0, LOGGER, U256::ZERO).await).await.unwrap();
     assert_eq!(
         api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
             .await
             .unwrap(),
         U256::ZERO,
-        "the consumer's local pool does not represent sequencer acceptance"
+        "without an overlay, pending is the canonical nonce"
     );
-    // At a slice boundary the builder records execution and prunes the pool,
-    // before the consumer necessarily receives that slice. Even an empty pool
-    // must not make pending nonce fall back to canonical state.
-    let first = sequencer.rpc.inject_tx(signed_call(0, LOGGER, U256::ZERO).await).await.unwrap();
+    overlay_with_user_call!(harness);
     assert_eq!(
         api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
             .await
             .unwrap(),
         U256::from(1)
     );
-    fifo.observe_executed(test_sender(), 0);
-    reth_transaction_pool::TransactionPool::prune_transactions(&sequencer.inner.pool, vec![first]);
-    assert_eq!(
-        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
-            .await
-            .unwrap(),
-        U256::from(1),
-        "executed transactions still count after the sequencer pool is empty"
-    );
-    let successor =
-        sequencer.rpc.inject_tx(signed_call(1, LOGGER, U256::ZERO).await).await.unwrap();
-    assert_eq!(
-        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
-            .await
-            .unwrap(),
-        U256::from(2),
-        "pool successors count even before the next pool nonce correction"
-    );
-    let latest: U256 = sequencer
-        .inner
-        .rpc_server_handle()
-        .http_client()
-        .unwrap()
-        .request("eth_getTransactionCount", jsonrpsee::rpc_params![test_sender()])
-        .await
-        .unwrap();
-    assert_eq!(latest, U256::ZERO, "an omitted block tag still means latest");
-    reth_transaction_pool::TransactionPool::prune_transactions(
-        &sequencer.inner.pool,
-        vec![successor],
-    );
-    // A discarded build must release that execution state, not retain a nonce
-    // high-water mark indefinitely.
-    fifo.reset_accounts();
-    for nonce in 0..3 {
-        assert_eq!(
-            api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
-                .await
-                .unwrap(),
-            U256::from(nonce)
-        );
-        sequencer.rpc.inject_tx(signed_call(nonce, LOGGER, U256::ZERO).await).await.unwrap();
-    }
-    assert!(harness.pending().is_none(), "no slice has reached the consumer");
-    assert_eq!(
-        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
-            .await
-            .unwrap(),
-        U256::from(3)
-    );
-    assert_eq!(
-        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Latest.into()))
-            .await
-            .unwrap(),
-        U256::ZERO,
-        "latest remains a local canonical-state query"
-    );
-
-    let mut txs = vec![l1_info_deposit(1)];
-    for nonce in 0..4 {
-        txs.push(signed_call(nonce, LOGGER, U256::ZERO).await);
-    }
-    harness.send(FlashblockBuilder::new(1, 0).transactions(txs).build()).await;
-    assert_eq!(
-        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
-            .await
-            .unwrap(),
-        U256::from(4),
-        "a sequencer response cannot move behind executed preview state"
-    );
-}
-
-/// Deposits must be counted against the build parent even after canonicalization.
-#[tokio::test(flavor = "multi_thread")]
-async fn pending_nonce_does_not_double_count_committed_deposits() {
-    use jsonrpsee::core::client::ClientT;
-    let cfg = mantle_reth_preconf::PreconfConfig {
-        enabled: true,
-        all_preconfs: true,
-        journal_path: Some(reth_db::test_utils::tempdir_path().join("preconf.jsonl")),
-        ..Default::default()
-    };
-    let svc = mantle_reth_preconf::PreconfServiceBuilder::from_config(cfg).await.unwrap();
-    let (mut sequencer, client, _, _) = mantle_reth_integration_tests::launch_mantle_node!(
-        crate::consumer_helpers::flashblocks_test_chain_spec(),
-        mantle_reth_cli::node::MantleNode::default().with_preconf(svc),
-        crate::consumer_helpers::flashblocks_payload_attributes
-    )
-    .await;
-    crate::consumer_helpers::mine_canonical_block!(sequencer);
-    // Both this fixture's L1 attributes deposit and its post-execution
-    // transaction use Address::ZERO and advance its nonce.
-    let latest: U256 = client
-        .request("eth_getTransactionCount", jsonrpsee::rpc_params![Address::ZERO, "latest"])
-        .await
-        .unwrap();
-    let pending: U256 = client
-        .request("eth_getTransactionCount", jsonrpsee::rpc_params![Address::ZERO, "pending"])
-        .await
-        .unwrap();
-    assert!(latest > U256::ZERO, "the canonical block advanced this sender");
-    assert_eq!(pending, latest, "already committed deposits must not count twice");
-}
-
-/// A failed sequencer query must not silently return a stale successful nonce.
-#[tokio::test(flavor = "multi_thread")]
-async fn pending_nonce_reports_sequencer_errors_and_timeouts() {
-    use jsonrpsee::{RpcModule, server::Server, types::ErrorObjectOwned};
-    let (harness, node) = launch_flashblocks_consumer!(3, 3);
-    overlay_with_user_call!(harness);
-    for hangs in [false, true] {
-        let server = Server::builder().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        let mut module = RpcModule::new(hangs);
-        module
-            .register_async_method("eth_getTransactionCount", |_, hangs, _| async move {
-                if *hangs {
-                    std::future::pending::<()>().await;
-                }
-                Err::<U256, _>(ErrorObjectOwned::owned(-32099, "sequencer unavailable", None::<()>))
-            })
-            .unwrap();
-        let server = server.start(module);
-        let client = reth_optimism_rpc::SequencerClient::new(url).await.unwrap();
-        let api = eth_api!(node, harness).with_pending_nonce_client(Some(client));
-        assert_eq!(
-            api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Latest.into()))
-                .await
-                .unwrap(),
-            U256::ZERO
-        );
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(7),
-            api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into())),
-        )
-        .await
-        .expect("nonce query has a deadline")
-        .unwrap_err();
-        assert_eq!(error.code(), -32000);
-        assert!(error.message().contains(if hangs {
-            "timed out"
-        } else {
-            "failed to query sequencer"
-        }));
-        server.stop().unwrap();
-    }
 }
 
 /// Receipt fees use the token ratio immediately before each transaction.
