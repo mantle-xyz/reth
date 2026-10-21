@@ -6,10 +6,12 @@
 //! behind [`SEAL_DEPTH`], and the journal's eviction question
 //! ([`Commitments::is_tracked`]).
 //!
-//! **The journal is written elsewhere**, from the apply and from each slice, so
-//! "has a journal line" is the wider set. A line with no record here is
-//! slot-scoped: it survives a restart inside the slot and goes at the next
-//! rotation.
+//! **The journal is written elsewhere**, from the preconf apply and from each
+//! slice. Both preconf and ordinary pool execution create an `Announced`
+//! record; returning a preconf receipt upgrades it to `Promised`. Both kinds
+//! remain tracked for replay and retention. Journal rotation retains a line
+//! only while its hash has a record here; receiving no client receipt does
+//! not by itself make an ordinary transaction eligible for removal.
 //!
 //! Owned by `PreconfTxSet`, which is what lets a removal release a record
 //! straight from `drop_hash`.
@@ -378,9 +380,9 @@ impl Commitments {
     ///
     /// **Not in lockstep with the journal.** A record is what keeps a journal
     /// line alive (rotation's only rule is [`Self::is_tracked`]), but the
-    /// journal is written from the apply and from each slice. A line whose hash
-    /// never reaches here is slot-scoped: it survives a restart inside the slot
-    /// and goes at the next rotation.
+    /// journal is written from the apply and from each slice. An ordinary
+    /// transaction stays `Announced` and is retained while tracked, even
+    /// though it never reaches this receipt-driven upgrade.
     ///
     /// **Do not move this to canonical time.** A canonical notification carries
     /// bare hashes; picking out our own needs a record that already exists, and

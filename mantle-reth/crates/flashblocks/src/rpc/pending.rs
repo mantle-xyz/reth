@@ -11,7 +11,7 @@ use alloy_eips::BlockId;
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types_eth::{
     BlockOverrides,
-    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
+    state::{AccountOverride, EvmOverrides, StateOverride},
 };
 use reth_evm::EvmEnvFor;
 use reth_primitives_traits::{Block, BlockTy, NodePrimitives, RecoveredBlock, SealedHeader};
@@ -62,15 +62,16 @@ impl PendingExecutionContext {
         }
     }
 
-    /// Applies user overrides after the snapshot; user block hashes win per height.
+    /// Applies user overrides to specified account fields and storage slots after the snapshot.
     pub fn overrides(
         &self,
         state: Option<StateOverride>,
         block: Option<Box<BlockOverrides>>,
     ) -> EvmOverrides {
-        let state = StateOverridesBuilder::new(self.state.clone())
-            .extend(state.unwrap_or_default())
-            .build();
+        let mut merged_state = self.state.clone();
+        for (address, account) in state.unwrap_or_default() {
+            merge_account_override(merged_state.entry(address).or_default(), account);
+        }
         let mut block = block.unwrap_or_default();
         let mut hashes = self.block_hashes.clone();
         // The first simulated block can query the preview tip. Pin its published
@@ -78,7 +79,41 @@ impl PendingExecutionContext {
         hashes.insert(self.header.number, self.header.hash());
         hashes.extend(block.block_hash.take().unwrap_or_default());
         block.block_hash = Some(hashes);
-        EvmOverrides::new(Some(state), Some(block))
+        EvmOverrides::new(Some(merged_state), Some(block))
+    }
+}
+
+/// User fields win even when zero or empty; unspecified fields retain preview values.
+fn merge_account_override(preview: &mut AccountOverride, user: AccountOverride) {
+    let AccountOverride { balance, nonce, code, state, state_diff, move_precompile_to } = user;
+    if balance.is_some() {
+        preview.balance = balance;
+    }
+    if nonce.is_some() {
+        preview.nonce = nonce;
+    }
+    if code.is_some() {
+        preview.code = code;
+    }
+    if move_precompile_to.is_some() {
+        preview.move_precompile_to = move_precompile_to;
+    }
+    match (state, state_diff) {
+        (Some(state), diff) => {
+            // A full replacement discards preview storage. Keep an invalid request's diff
+            // alongside it so the standard executor still rejects state + stateDiff.
+            preview.state = Some(state);
+            preview.state_diff = diff;
+        }
+        (None, Some(diff)) => {
+            // Retain a full replacement's zero defaults when patching its slots.
+            if let Some(state) = preview.state.as_mut() {
+                state.extend(diff);
+            } else {
+                preview.state_diff.get_or_insert_with(Default::default).extend(diff);
+            }
+        }
+        (None, None) => {}
     }
 }
 
@@ -347,4 +382,146 @@ where
 impl<Eth: EthCall> EthCall for PendingEthApi<Eth> where
     Eth::Primitives: NodePrimitives<BlockHeader = Header>
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::Address;
+
+    use super::*;
+
+    fn context(account: AccountOverride) -> PendingExecutionContext {
+        PendingExecutionContext {
+            base_block: B256::ZERO.into(),
+            header: SealedHeader::seal_slow(Header::default()),
+            state: StateOverride::from_iter([(Address::ZERO, account)]),
+            l1_block_info: Default::default(),
+            block_hashes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn partial_account_overrides_preserve_unspecified_preview_fields() {
+        let preview = AccountOverride {
+            balance: Some(U256::from(100)),
+            nonce: Some(7),
+            code: Some(vec![0x00].into()),
+            state_diff: Some([(B256::ZERO, B256::with_last_byte(9))].into_iter().collect()),
+            ..Default::default()
+        };
+        let context = context(preview.clone());
+        for user in [
+            AccountOverride::default(),
+            AccountOverride { balance: Some(U256::ZERO), ..Default::default() },
+            AccountOverride { nonce: Some(0), ..Default::default() },
+            AccountOverride { code: Some(Default::default()), ..Default::default() },
+            AccountOverride {
+                move_precompile_to: Some(Address::repeat_byte(1)),
+                ..Default::default()
+            },
+        ] {
+            let overrides = context
+                .overrides(Some(StateOverride::from_iter([(Address::ZERO, user.clone())])), None)
+                .state
+                .unwrap();
+            let account = &overrides[&Address::ZERO];
+            assert_eq!(account.balance, user.balance.or(Some(U256::from(100))));
+            assert_eq!(account.nonce, user.nonce.or(Some(7)));
+            assert_eq!(account.code, user.code.or(Some(vec![0x00].into())));
+            assert_eq!(account.state_diff, preview.state_diff);
+            assert_eq!(account.move_precompile_to, user.move_precompile_to);
+        }
+        assert_eq!(context.state[&Address::ZERO], preview, "requests must not mutate the snapshot");
+    }
+
+    #[test]
+    fn storage_overrides_replace_or_patch_preview_storage() {
+        use alloy_evm::overrides::apply_state_overrides;
+        use revm::{Database, database::EmptyDB};
+
+        let context = context(AccountOverride {
+            state_diff: Some(
+                [
+                    (B256::ZERO, B256::with_last_byte(7)),
+                    (B256::with_last_byte(1), B256::with_last_byte(8)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        });
+        let slots = [(B256::ZERO, B256::ZERO), (B256::with_last_byte(2), B256::with_last_byte(9))];
+        for (user, expected) in [
+            (AccountOverride::default().with_state_diff(slots), [0u64, 8, 9, 42]),
+            (AccountOverride::default().with_state(slots), [0, 0, 9, 0]),
+            (AccountOverride::default().with_state([]), [0, 0, 0, 0]),
+            (AccountOverride::default().with_state_diff([]), [7, 8, 0, 42]),
+        ] {
+            let mut db = revm::database::State::builder().with_database(EmptyDB::default()).build();
+            apply_state_overrides(
+                StateOverride::from_iter([(
+                    Address::ZERO,
+                    AccountOverride::default()
+                        .with_nonce(1)
+                        .with_state_diff([(B256::with_last_byte(3), B256::with_last_byte(42))]),
+                )]),
+                &mut db,
+            )
+            .unwrap();
+            let overrides = context
+                .overrides(Some(StateOverride::from_iter([(Address::ZERO, user)])), None)
+                .state
+                .unwrap();
+            apply_state_overrides(overrides, &mut db).unwrap();
+            for (slot, value) in expected.into_iter().enumerate() {
+                assert_eq!(db.storage(Address::ZERO, U256::from(slot)).unwrap(), U256::from(value));
+            }
+        }
+    }
+
+    #[test]
+    fn storage_diff_preserves_a_full_preview_storage_replacement() {
+        let context = context(AccountOverride::default().with_state([
+            (B256::ZERO, B256::with_last_byte(7)),
+            (B256::with_last_byte(1), B256::with_last_byte(8)),
+        ]));
+        let overrides = context
+            .overrides(
+                Some(StateOverride::from_iter([(
+                    Address::ZERO,
+                    AccountOverride::default().with_state_diff([(B256::ZERO, B256::ZERO)]),
+                )])),
+                None,
+            )
+            .state
+            .unwrap();
+        let account = &overrides[&Address::ZERO];
+        assert_eq!(
+            account.state,
+            Some(
+                [(B256::ZERO, B256::ZERO), (B256::with_last_byte(1), B256::with_last_byte(8)),]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert!(account.state_diff.is_none());
+    }
+
+    #[test]
+    fn conflicting_user_storage_overrides_still_fail_validation() {
+        use alloy_evm::overrides::{StateOverrideError, apply_state_overrides};
+        use revm::database::EmptyDB;
+
+        let context = context(AccountOverride::default());
+        let user = AccountOverride::default().with_state([]).with_state_diff([]);
+        let overrides = context
+            .overrides(Some(StateOverride::from_iter([(Address::ZERO, user)])), None)
+            .state
+            .unwrap();
+        let mut db = revm::database::State::builder().with_database(EmptyDB::default()).build();
+        assert!(matches!(
+            apply_state_overrides(overrides, &mut db),
+            Err(StateOverrideError::BothStateAndStateDiff(Address::ZERO))
+        ));
+    }
 }

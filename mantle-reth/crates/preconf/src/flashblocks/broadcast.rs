@@ -217,6 +217,10 @@ async fn replay(
         let ring = ring.read();
         (ring.entries_after(&cutoff), ring.precedes_window(&cutoff), ring.exceeds_window(&cutoff))
     };
+    if preceded_by_gap {
+        // Count the attempt when detected, even if a later send fails.
+        metrics::counter!("flashblocks.resume_before_archive_total").increment(1);
+    }
 
     // Keyed by build as well as position: a rebuild reuses positions, so
     // position alone would read its slices as repeats of the ones they replace
@@ -491,6 +495,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(7), server).await.unwrap().unwrap();
                 let scrape = handle.render();
                 assert!(scrape.contains("flashblocks_slow_subscriber_dropped_total 1"), "{scrape}");
+                assert!(scrape.contains("flashblocks_resume_before_archive_total 1\n"), "{scrape}");
                 assert!(
                     scrape.contains("flashblocks_slices_missed_by_slow_subscribers_total 2"),
                     "{scrape}"
@@ -594,6 +599,46 @@ mod tests {
             .expect("catch-up completes");
 
         assert!(!outcome.preceded_by_gap);
+    }
+
+    #[test]
+    fn resume_before_archive_counts_attempts_without_changing_replay() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::seed_preconf_metrics();
+                assert!(handle.render().contains("flashblocks_resume_before_archive_total 0\n"));
+                for (cutoff, empty, expected_count, expected_messages) in [
+                    (pos(10, 5), false, 0, vec!["10-6"]),
+                    (pos(10, 6), false, 0, vec![]),
+                    (pos(11, 0), false, 0, vec![]),
+                    (pos(10, 1), false, 1, vec!["10-5", "10-6"]),
+                    (pos(10, 0), false, 2, vec!["10-5", "10-6"]),
+                    (pos(10, 5), false, 2, vec!["10-6"]),
+                    (pos(10, 0), true, 2, vec![]),
+                ] {
+                    let (mut server, mut client) = socket_pair().await;
+                    let positions = if empty { vec![] } else { vec![pos(10, 5), pos(10, 6)] };
+                    let ring = ring_with(positions);
+                    let (_pipe, mut receiver) = broadcast::channel(8);
+                    let outcome = replay(&mut server, &mut receiver, &ring, cutoff).await.unwrap();
+                    assert_eq!(outcome.sent, expected_messages.len());
+                    assert_eq!(
+                        drain(&mut client, expected_messages.len() + 1).await,
+                        expected_messages
+                    );
+                    let scrape = handle.render();
+                    assert!(
+                        scrape.contains(&format!(
+                            "flashblocks_resume_before_archive_total {expected_count}\n"
+                        )),
+                        "resume {cutoff:?}, empty archive {empty}: {scrape}"
+                    );
+                }
+            })
+        });
     }
 
     /// The subscriber asked to resume from before anything still held. It is

@@ -615,6 +615,80 @@ mod tests {
         Harness { handler, fifo, sender }
     }
 
+    #[derive(Debug)]
+    struct ReceiptAdmission {
+        receipt: PreconfReceipt,
+    }
+
+    #[async_trait]
+    impl DynAdmission for ReceiptAdmission {
+        async fn admit(
+            &self,
+            _bytes: Bytes,
+            _origin_instant: std::time::Instant,
+            responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
+        ) -> Result<AdmittedTx, PreconfError> {
+            responder.send(Ok(self.receipt.clone())).expect("receipt receiver is alive");
+            Ok(AdmittedTx { hash: self.receipt.tx_hash, sender: self.receipt.from, nonce: 0 })
+        }
+    }
+
+    /// This admission deliberately bypasses the real queue's conflict checks.
+    /// It characterizes receipt handling after an injected registry conflict;
+    /// it does not demonstrate that normal admission can reach that state.
+    #[test]
+    fn injected_slot_conflicts_do_not_change_the_returned_receipt() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::seed_preconf_metrics();
+                for success in [true, false] {
+                    for incumbent_promised in [false, true] {
+                        let h = harness();
+                        let receipt = sample_receipt(success);
+                        let hash = receipt.tx_hash;
+                        let incumbent = B256::from([0xbb; 32]);
+                        assert_eq!(
+                            h.fifo.claims().record_announced(incumbent, &h.sender, 0, 41),
+                            Ok(())
+                        );
+                        if incumbent_promised {
+                            assert_eq!(
+                                h.fifo.claims().mark_promised(incumbent, &h.sender, 0, 41),
+                                Ok(())
+                            );
+                        }
+                        let handler = PreconfRpcHandler::new(
+                            Arc::new(ReceiptAdmission { receipt }),
+                            h.fifo.clone(),
+                            h.handler.cfg.clone(),
+                        );
+
+                        let event = handler.handle_inner(Bytes::new()).await.expect("receipt");
+
+                        assert_eq!(event.tx_hash, hash);
+                        assert_eq!(event.block_height, 42);
+                        assert_eq!(
+                            event.status,
+                            if success { WireStatus::Success } else { WireStatus::Failed }
+                        );
+                        assert_eq!(event.receipt.status, Some(u64::from(success)));
+                        assert_eq!(h.fifo.claims().slot_owner(&h.sender, 0), Some(incumbent));
+                        assert!(h.fifo.claims().was_promised(&hash));
+                        assert_eq!(h.fifo.claims().was_promised(&incumbent), incumbent_promised);
+                    }
+                }
+                let rendered = metrics.render();
+                assert!(
+                    rendered.lines().any(|line| line == "preconf_tx_commitment_broken_total 0"),
+                    "receipt-time conflicts do not increment the broken counter: {rendered}"
+                );
+            });
+        });
+    }
+
     /// An EVM revert that produced a receipt is a commitment like any other —
     /// see `claim_commitment_slot` for why the gate is not on `Success`.
     ///

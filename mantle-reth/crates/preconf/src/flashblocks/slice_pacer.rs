@@ -14,8 +14,9 @@ pub struct SliceLimits {
     pub block_gas_limit: u64,
     /// Data-availability bytes for the whole block, when configured.
     pub block_da_limit: Option<u64>,
-    /// Post-Jovian footprint scalar. Footprint is charged in gas — DA bytes
-    /// times this scalar — and shares the block gas ceiling.
+    /// Post-Jovian footprint scalar. DA bytes times this scalar are charged
+    /// against a separate allowance with the same numeric block gas limit.
+    /// Execution gas and footprint gas are not added together.
     pub da_footprint_gas_scalar: Option<u16>,
 }
 
@@ -194,7 +195,8 @@ impl SlicePacer {
                 .da_per_batch
                 .zip(limits.block_da_limit)
                 .map(|(per_batch, block_limit)| Budget::new(per_batch, block_limit)),
-            // Footprint is charged in gas and shares the block gas ceiling.
+            // Footprint and execution gas have independent allowances, each
+            // bounded by the same numeric block gas limit.
             footprint: schedule
                 .da_footprint_gas_per_batch
                 .map(|per_batch| Budget::new(per_batch, limits.block_gas_limit)),
