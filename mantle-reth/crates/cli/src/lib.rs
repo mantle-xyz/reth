@@ -20,6 +20,8 @@ pub use node::{MantleNode, MantleNodeComponentBuilder, MantlePoolBuilder, Mantle
 
 pub mod version;
 
+pub mod rpc_defaults;
+
 pub mod metrics_seed;
 pub use metrics_seed::seed_blockchain_tree_metrics;
 
