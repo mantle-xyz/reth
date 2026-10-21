@@ -46,7 +46,6 @@ use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, StateProofProvider, StateProviderBox, StateProviderFactory,
     errors::ProviderResult,
 };
-use reth_transaction_pool::TransactionPool;
 use reth_trie_common::AccountProof;
 use std::sync::Arc;
 use tracing::debug;
@@ -303,101 +302,8 @@ pub struct PreconfLog {
 /// (forwarding to an upstream sequencer).
 #[async_trait]
 pub trait DynPreconfHandler: Send + Sync + std::fmt::Debug {
-    /// Captures the currently executing build's nonce for one sender.
-    fn pending_nonce(&self, sender: &Address) -> Option<PendingAccountNonce>;
-
     /// Process a raw transaction submission and return the preconf event.
     async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent>;
-}
-
-/// A nonce captured from the build's execution account view.
-#[derive(Debug, Clone, Copy)]
-pub enum PendingAccountNonce {
-    /// A signed transaction establishes the exact next nonce.
-    Absolute(u64),
-    /// Deposits advance nonce without carrying its value. Apply this increment
-    /// to the build's parent, never to a later canonical state that may already
-    /// contain those same deposits.
-    ParentIncrement {
-        /// Parent block of the captured build.
-        parent: B256,
-        /// Nonce increments executed since that parent.
-        increment: u64,
-    },
-}
-
-/// Pending nonce override for a local sequencer with preconfirmation enabled.
-///
-/// Slice execution can prune every transaction of a sender before a consumer
-/// receives the slice. Start the pool lookup at the build's executed nonce so
-/// both pruned transactions and newly accepted successors are accounted for.
-pub fn sequencer_nonce_rpc<Eth>(
-    eth: Arc<Eth>,
-    handler: Arc<dyn DynPreconfHandler>,
-) -> jsonrpsee::RpcModule<()>
-where
-    Eth: EthState + Send + Sync + 'static,
-    ErrorObject<'static>: From<Eth::Error>,
-{
-    SequencerNonceRpc { eth, handler }.into_rpc().remove_context()
-}
-
-#[rpc(server, namespace = "eth")]
-trait SequencerNonceApi {
-    /// Returns canonical nonce, plus executed and consecutively pooled transactions for pending.
-    #[method(name = "getTransactionCount")]
-    async fn get_transaction_count(
-        &self,
-        address: Address,
-        block_number: Option<BlockId>,
-    ) -> RpcResult<U256>;
-}
-
-struct SequencerNonceRpc<Eth> {
-    eth: Arc<Eth>,
-    handler: Arc<dyn DynPreconfHandler>,
-}
-
-#[async_trait]
-impl<Eth> SequencerNonceApiServer for SequencerNonceRpc<Eth>
-where
-    Eth: EthState + Send + Sync + 'static,
-    ErrorObject<'static>: From<Eth::Error>,
-{
-    async fn get_transaction_count(
-        &self,
-        address: Address,
-        block_number: Option<BlockId>,
-    ) -> RpcResult<U256> {
-        if block_number != Some(BlockId::pending()) {
-            return EthState::transaction_count(self.eth.as_ref(), address, block_number)
-                .await
-                .map_err(ErrorObject::from);
-        }
-        let canonical =
-            EthState::transaction_count(self.eth.as_ref(), address, Some(BlockId::latest()))
-                .await
-                .map_err(ErrorObject::from)?;
-        let executed = match self.handler.pending_nonce(&address) {
-            Some(PendingAccountNonce::Absolute(nonce)) => U256::from(nonce),
-            Some(PendingAccountNonce::ParentIncrement { parent, increment }) => {
-                let base =
-                    EthState::transaction_count(self.eth.as_ref(), address, Some(parent.into()))
-                        .await
-                        .map_err(ErrorObject::from)?;
-                base.saturating_add(U256::from(increment))
-            }
-            None => canonical,
-        }
-        .max(canonical)
-        .saturating_to();
-        let next = self
-            .eth
-            .pool()
-            .get_highest_consecutive_transaction_by_sender(address, executed)
-            .map_or(executed, |tx| tx.nonce().saturating_add(1).max(executed));
-        Ok(U256::from(next))
-    }
 }
 
 // ─── RPC trait ───────────────────────────────────────────────────────────────
