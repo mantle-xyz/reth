@@ -35,3 +35,7 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just test
       - run: just test-doc
+      # Quarantined with `#[ignore]` because they fail under the parallel suite's
+      # load, not on their own: serially they pass. Nothing else runs ignored
+      # tests, so this is the one place they still gate anything.
+      - run: just test-quarantined

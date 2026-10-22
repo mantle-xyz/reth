@@ -128,6 +128,8 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
     Fut: std::future::Future<Output = ()>,
 {
     reth_tracing::init_test_tracing();
+    // The same RPC flag defaults the shipped binary installs before parsing its CLI.
+    mantle_reth_cli::rpc_defaults::init_rpc_defaults();
 
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
         .with_unused_ports()
@@ -138,6 +140,9 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
     config.network.discovery.discv5_port = Some(0);
     config.network.discovery.discv5_port_ipv6 = Some(0);
+    // Off for the reason `launch_mantle_node!` spells out: building the DNS
+    // resolver can fail on the host's nameserver list and sink the launch.
+    config.network.discovery.disable_dns_discovery = true;
 
     let db = create_test_rw_db_with_path(
         config

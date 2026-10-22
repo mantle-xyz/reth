@@ -1,10 +1,10 @@
 //! Tx-pool *cumulative* balance reservation: the pool must reserve each pending tx's
 //! L1 data fee + operator fee (`extra_balance_cost`) in its cumulative affordability
-//! accounting, not just the intrinsic `cost()`. (PR #86; builds on the single-tx gate, #84.)
+//! accounting, not just the intrinsic `cost()`.
 //!
 //! A sender may cover the intrinsic cost of two pending txs yet not afford both once the
-//! per-tx operator fee is reserved. Pre-#86 the pool gated only on intrinsic `cost()` and
-//! admitted both; #86 reserves the overlay so the unaffordable second tx stays parked.
+//! per-tx operator fee is reserved. Gating on intrinsic `cost()` alone admits both;
+//! reserving the overlay keeps the unaffordable second tx parked.
 //!
 //! Isolation: both txs are identical and both pass the single-tx admission gate; the *only*
 //! variable across the two tests is the sender balance, moved by exactly one tx's operator-fee
@@ -62,7 +62,7 @@ fn l1_attributes_deposit_bytes() -> Bytes {
         gas_limit: 1_000_000,
         is_system_transaction: true,
         input: arsia_l1_attributes_calldata(),
-        eth_value: 0,
+        eth_value: U256::ZERO,
         eth_tx_value: None,
     }
     .encoded_2718()

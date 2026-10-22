@@ -80,5 +80,26 @@ this rule instead.
 | `just check` | `cargo check --workspace` (fast type-check) |
 | `just test` | Exhaustive local suite (examples + benches + all features) |
 | `just build` | Build the shipped `op-reth` binary (`-p mantle-reth-cli`) |
+| `just build-ws-proxy` | Build `mantle-ws-proxy`, the flashblocks relay. Not in `default-members`, so a bare `cargo build` never produces it. |
+| `just build-all` | Both of the above |
+| `just docker-build-ws-proxy` | Build the standalone `mantle-ws-proxy` image from `DockerfileWsProxy`. |
 
 Run `just --list` to see all available recipes.
+
+## How each binary is delivered
+
+| Binary | Delivery |
+|--------|----------|
+| `op-reth` | Release tarballs (`release.yml`) **and** a container image built from the root `DockerfileOp` |
+| `mantle-ws-proxy` | **Its own container image only** (`DockerfileWsProxy`) — deliberately not in the release tarballs |
+
+The proxy ships separately because it is deployed separately: a stateless relay
+between one flashblocks producer and many subscribers, scaled and restarted
+independently of any node. Bundling it into the node's image or tarball would
+imply a lifecycle the two do not share.
+
+Both images build from source inside the image. `DockerfileWsProxy` mirrors
+`DockerfileOp`, including the two conventions the deployment pipeline depends
+on — keep the literal build-command string out of comments, and keep the
+compile step on a single physical line. See the comments at the top of either
+file before editing them.
