@@ -2,8 +2,8 @@
 //!
 //! Two pieces, both for [`crate::restore_preconf_state`]:
 //!
-//! - [`RestoreDirect`] decodes a persisted commitment's wire bytes into the envelope + sender the
-//!   fifo needs.
+//! - [`RestoreDirect`] decodes a journal record's wire bytes into the envelope + sender the fifo
+//!   needs.
 //! - [`ProviderChainView`] lets a node provider answer what restore asks of the chain: where a
 //!   sender's nonce stands, and whether a commitment already landed.
 //!

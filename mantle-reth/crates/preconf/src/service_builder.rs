@@ -191,7 +191,8 @@ impl PreconfServiceBuilder {
     ///
     /// Call once from the pool builder after the pool is up, **before** the
     /// canon handler is spawned, so the fifo state is populated when it starts
-    /// consuming events.
+    /// consuming events. Returns `Err` if the journal cannot be read; the
+    /// caller must not start the node.
     pub async fn start<P, C>(&self, pool: &P, chain: &C) -> Result<(), PreconfStartError>
     where
         P: RestoreSource + Clone + 'static,
@@ -388,25 +389,20 @@ mod tests {
 
     // ── start() lifecycle ────────────────────────────────────────
 
-    /// Stub [`RestoreSource`] used to exercise `PreconfServiceBuilder::start`.
-    /// `start` reaches it only through [`restore_preconf_state`], once per
-    /// journal entry, so with the empty journals these tests use it is never
-    /// called — hence the panics.
-    ///
-    /// Not a pool stub: the production source
-    /// ([`RestoreDirect`](crate::RestoreDirect)) decodes the journal's bytes
-    /// and holds nothing, so `start` touches no pool at all.
+    /// Stub [`RestoreSource`] for `start` tests with an empty journal, where
+    /// restore never calls it; hence the panics. (The production source,
+    /// [`RestoreDirect`](crate::RestoreDirect), only decodes bytes; `start`
+    /// touches no pool.)
     #[derive(Clone)]
     struct UnreachableSource;
 
-    /// Same reasoning for the chain view: with an empty journal there is no entry
-    /// whose landing could need checking, so the hash is never looked up.
+    /// Chain view for the same tests. `commitment_on_chain` is never reached
+    /// with an empty journal.
     struct UnreachableChain;
 
     impl crate::journal::CommitmentChainView for UnreachableChain {
-        // Not unreachable: restore asks this for every decoded entry now.
-        // `None` reads as "nonce still free", which is the still-owed path —
-        // exactly what this test wants for its journaled commitment.
+        // Reachable: restore asks this for every decoded entry. `None` means
+        // the nonce counts as still free, so the entry is still owed.
         fn account_nonce(&self, _sender: &alloy_primitives::Address) -> Option<u64> {
             None
         }
@@ -467,10 +463,7 @@ mod tests {
         assert!(matches!(err, PreconfStartError::Journal(_)), "got {err:?}");
     }
 
-    /// `start()` reads the journal from disk and pushes each
-    /// promised entry into the fifo via the adapter. Covers the
-    /// journal-enabled end-to-end wiring that
-    /// `start_without_journal_...` cannot exercise.
+    /// `start` reads a populated journal and pushes each entry into the fifo.
     #[tokio::test]
     async fn start_with_populated_journal_restores_entries_to_fifo() {
         use crate::{

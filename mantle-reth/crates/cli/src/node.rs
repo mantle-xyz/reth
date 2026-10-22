@@ -236,12 +236,10 @@ where
         // Load the on-chain allowlists BEFORE anything can classify a
         // transaction, and start tracking updates.
         //
-        // Ordering is load-bearing twice over. This cannot live in the binary's
-        // `on_node_started` hook, which runs only once the RPC server, payload
-        // builder and consensus engine are up: the record is written at
-        // admission, so anything admitted against empty allowlists would be
-        // refused and never get a second chance. It must also precede journal restore,
-        // which pushes promised envelopes through the validator.
+        // This cannot live in the binary's `on_node_started` hook, which runs
+        // only once the RPC server, payload builder and consensus engine are up:
+        // the record is written at admission, so anything admitted against
+        // empty allowlists would be refused and never get a second chance.
         //
         // Fatal on a code-less address — `build_pool` returns `eyre::Result`, so
         // the launch aborts. An *empty* allowlist is not an error; it is a
@@ -265,12 +263,15 @@ where
             );
         }
 
-        // Run journal restore before any background pool task starts consuming
-        // events. Two ordering constraints:
-        // - Must run before `spawn_maintenance_tasks` (which spawns reth's local-tx backup loader)
-        //   so the loader and the restore path don't race on the pool mutex.
-        // - Must run before admission is reachable so the restore helper's fifo pushes are
-        //   attributed to the restart path, not to a fresh RPC submission.
+        // Restore the journal before anything else can submit transactions:
+        // - before `spawn_maintenance_tasks` (reth's local-tx backup loader), so every restored
+        //   record has claimed its `(sender, nonce)` before a same-nonce transaction can arrive;
+        // - before admission is reachable, so the restored fifo entries are not mistaken for fresh
+        //   RPC submissions.
+        //
+        // Restore decodes the journal straight into the fifo; it does not go
+        // through the pool or its validator. A journal that cannot be read
+        // aborts the launch (see `PreconfServiceBuilder::start`).
         if let Some(svc) = preconf_svc.as_ref() {
             svc.set_admission(Arc::new(PreconfAdmission::new(
                 admission_validator,
@@ -282,10 +283,8 @@ where
 
             use mantle_reth_preconf::{ProviderChainView, RestoreDirect};
             let adapter = RestoreDirect::<T, TxTy<N::Types>>::new();
-            // The provider answers both of restore's chain questions: whether
-            // a commitment's nonce is still its sender's next one, and — only
-            // when it is not — whether the transaction that took it was this
-            // one.
+            // Answers restore's two chain questions: whether an entry's nonce
+            // is still unused, and if not, whether this transaction used it.
             let chain_view = ProviderChainView::new(ctx.provider().clone());
             svc.start(&adapter, &chain_view)
                 .await
