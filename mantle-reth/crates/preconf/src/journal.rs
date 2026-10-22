@@ -52,7 +52,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{ClaimKind, Commitments, PreconfTxSet};
+use crate::{ClaimKind, Commitments, PreconfTxSet, types::PushResult};
 
 /// One persisted record: a preconf commitment, or an ordinary pool transaction
 /// a slice carried. Holds what a restart needs to put the transaction back in
@@ -443,9 +443,10 @@ impl PreconfJournal {
     /// only flushed; see [`Self::append_batch`].)
     ///
     /// The read-filter-rewrite pass holds no lock, so appends continue
-    /// meanwhile. Only the tail takes the writer lock: splice the records
-    /// appended during the pass, fsync, rename. Its cost scales with those
-    /// appends, not with the file — which matters because a slice is journaled
+    /// meanwhile. The writer lock is taken only briefly at the start, to read
+    /// the file length, and for the tail: splice the records appended during
+    /// the pass, fsync, rename. The tail costs those appends plus one fsync,
+    /// not a pass over the file — which matters because a slice is journaled
     /// before it is broadcast, so a waiting append delays the broadcast.
     pub async fn rotate(
         &self,
@@ -586,9 +587,9 @@ impl Drop for RotateTimer {
     }
 }
 
-/// Records `preconf.journal.rotate_locked_ms` on drop: the part of a rotation
-/// that holds the writer lock, the only part an append can wait for.
-/// Fractional milliseconds, since the span is expected to be under one.
+/// Records `preconf.journal.rotate_locked_ms` on drop: the tail of a rotation
+/// that holds the writer lock, the part an append can wait for. In fractional
+/// milliseconds, to keep sub-millisecond resolution.
 struct LockedTimer(std::time::Instant);
 
 impl Drop for LockedTimer {
@@ -771,9 +772,10 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                     }
                 };
                 if let Err(owner) = claimed {
-                    // Another entry owns the nonce, so this one will lose it; not
-                    // seized (see `mark_promised`). `recover_envelope` below
-                    // decides the outcome and logs it.
+                    // An earlier entry in the file owns the nonce, so this one
+                    // loses it; not seized (see `mark_promised`). If it reaches
+                    // the push below, the push is refused and counted as a
+                    // conflict.
                     warn!(
                         target: "mantle::preconf::journal",
                         hash = ?entry.hash,
@@ -799,6 +801,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     }
 
     let mut restored = 0usize;
+    let mut conflicts = 0usize;
     let mut honored = 0usize;
     let mut nonce_taken = 0usize;
     let mut promise_nonce_taken = 0usize;
@@ -883,17 +886,21 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
             }
         };
 
-        // `ConflictActive` if a newer transaction already holds the
-        // `(sender, nonce)`; the newer one is kept.
-        let _ = fifo
+        // The earlier entry in the file keeps a contested `(sender, nonce)`: it
+        // was pushed first, so a later one is refused with `ConflictActive`.
+        // `AlreadyExists` is a duplicate line of an entry already restored.
+        match fifo
             .push_if_absent(
                 Arc::new(recovered.envelope),
                 recovered.from,
                 crate::types::PreconfSource::Replay,
             )
-            .await;
-
-        restored += 1;
+            .await
+        {
+            PushResult::Inserted => restored += 1,
+            PushResult::AlreadyExists => {}
+            PushResult::ConflictActive(_) => conflicts += 1,
+        }
     }
 
     // Entries whose nonce another transaction took. `restore_nonce_taken`
@@ -908,6 +915,7 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     info!(
         target: "mantle::preconf::journal",
         restored,
+        conflicts,
         honored,
         nonce_taken,
         promise_nonce_taken,
@@ -1525,8 +1533,8 @@ mod tests {
     }
 
     /// `locked_for` covers only the locked tail, not the compaction pass. The
-    /// pass is held open for 300ms; the locked tail takes microseconds, so the
-    /// margin is wide.
+    /// pass is held open for 300ms; the tail (a small splice and one fsync)
+    /// takes far less.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_locked_span_excludes_the_compaction_pass() {
         let dir = TempDir::new().unwrap();

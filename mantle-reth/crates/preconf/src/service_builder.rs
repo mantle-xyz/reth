@@ -193,12 +193,12 @@ impl PreconfServiceBuilder {
     /// canon handler is spawned, so the fifo state is populated when it starts
     /// consuming events. Returns `Err` if the journal cannot be read; the
     /// caller must not start the node.
-    pub async fn start<P, C>(&self, pool: &P, chain: &C) -> Result<(), PreconfStartError>
+    pub async fn start<P, C>(&self, source: &P, chain: &C) -> Result<(), PreconfStartError>
     where
         P: RestoreSource + Clone + 'static,
         C: crate::journal::CommitmentChainView,
     {
-        restore_preconf_state(&self.journal, pool, chain, &self.fifo, self.fifo.claims()).await?;
+        restore_preconf_state(&self.journal, source, chain, &self.fifo, self.fifo.claims()).await?;
 
         Ok(())
     }
@@ -418,13 +418,13 @@ mod tests {
             &self,
             _tx_rlp: &alloy_primitives::Bytes,
         ) -> Option<(alloy_primitives::Address, u64)> {
-            unreachable!("empty journal → restore_preconf_state must not call the pool")
+            unreachable!("empty journal → restore_preconf_state must not call the source")
         }
         async fn recover_envelope(
             &self,
             _tx_rlp: &alloy_primitives::Bytes,
         ) -> Result<crate::journal::RestoredEnvelope, crate::journal::RestoreSkip> {
-            unreachable!("empty journal → restore_preconf_state must not call the pool")
+            unreachable!("empty journal → restore_preconf_state must not call the source")
         }
     }
 
@@ -473,12 +473,8 @@ mod tests {
         use alloy_consensus::{Signed, TxLegacy};
         use alloy_primitives::{B256, Bytes, Signature, TxHash};
 
-        // Recording pool — every recover_envelope call fabricates a
-        // synthetic envelope so restore_preconf_state has something to
-        // push into the fifo, and asserts what got called. `Clone`
-        // required because `start()` clones the pool into the
-        // fifo-layer eviction callback (Arc'd shared state keeps the
-        // clones observing the same call log).
+        // Records every `recover_envelope` call and fabricates an envelope
+        // from the first byte, so each entry gets a distinct hash.
         #[derive(Clone)]
         struct RecordingSource {
             add_calls: Arc<std::sync::Mutex<Vec<Bytes>>>,
@@ -495,9 +491,6 @@ mod tests {
                 tx_rlp: &Bytes,
             ) -> Result<RestoredEnvelope, crate::journal::RestoreSkip> {
                 self.add_calls.lock().unwrap().push(tx_rlp.clone());
-                // Fabricate a deterministic legacy envelope keyed off
-                // the first byte of the RLP so every restored entry
-                // has a distinct hash.
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 let inner = TxLegacy { nonce: seed as u64, ..Default::default() };
                 let signed = Signed::new_unchecked(
@@ -546,12 +539,12 @@ mod tests {
             .await
             .unwrap();
 
-        let pool = RecordingSource { add_calls: Arc::new(std::sync::Mutex::new(Vec::new())) };
-        // This pool admits everything, so the chain is never consulted either.
-        svc.start(&pool, &UnreachableChain).await.unwrap();
+        let source = RecordingSource { add_calls: Arc::new(std::sync::Mutex::new(Vec::new())) };
+        // Every nonce reads as free, so `commitment_on_chain` is never asked.
+        svc.start(&source, &UnreachableChain).await.unwrap();
 
-        // The adapter was invoked for each journal entry.
-        assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "one add per entry");
+        // The source was called once per journal entry.
+        assert_eq!(source.add_calls.lock().unwrap().len(), 2, "one add per entry");
         // Fifo contains both restored envelopes.
         let snapshot = svc.fifo().snapshot().await;
         assert_eq!(snapshot.len(), 2);
@@ -607,7 +600,7 @@ mod tests {
 
         assert!(
             svc.fifo().snapshot().await.is_empty(),
-            "a commitment the pool refuses reaches no fifo entry",
+            "a commitment the source rejects reaches no fifo entry",
         );
         let (remaining, _) = svc.journal().load().await.unwrap();
         assert!(remaining.is_empty(), "and its journal line is pruned along with its record");
