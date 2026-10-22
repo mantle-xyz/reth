@@ -66,7 +66,7 @@ macro_rules! install_proofs_history {
                 // reth keeps a single `extend_rpc_modules` slot, so this hook replaces the one
                 // `MantleNode::add_ons` installed. Run the Mantle extensions here first, then the
                 // proofs-history overrides on top — otherwise the Mantle methods
-                // (eth_getBlockRange / eth_estimateTotalFee / eth_sendRawTransactionWithPreconf)
+                // (eth_estimateTotalFee / eth_sendRawTransactionWithPreconf)
                 // and, with --preconf/--flashblocks, their handlers would be silently dropped.
                 crate::node::install_mantle_rpc_extensions(
                     &mut ctx,

@@ -91,8 +91,8 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
 ///
 /// reth keeps a single `extend_rpc_modules` hook slot. The proofs-history wiring installs its own
 /// hook, which used to overwrite the one `MantleNode::add_ons` installed, so on every
-/// proofs-history node `eth_getBlockRange` / `eth_estimateTotalFee` /
-/// `eth_sendRawTransactionWithPreconf` silently answered `-32601 Method not found` — with no
+/// proofs-history node the Mantle-only methods (`eth_estimateTotalFee`,
+/// `eth_sendRawTransactionWithPreconf`) silently answered `-32601 Method not found` — with no
 /// startup warning. The wiring now composes both, so these methods stay registered.
 ///
 /// The assertion is only about registration: each method may still reject these dummy arguments,
@@ -122,13 +122,8 @@ async fn proofs_history_keeps_mantle_rpc_extensions() {
         TreeConfig::default(),
         Some((args, sidecar_path)),
         async |_node, client| {
-            // `eth_getBlockRange(start, end, full)` — a Mantle-only method; with the hook dropped
-            // this was `-32601`.
-            let range: Result<Value, ClientError> =
-                client.request("eth_getBlockRange", rpc_params!["0x0", "0x0", false]).await;
-            assert_registered("eth_getBlockRange", &range, METHOD_NOT_FOUND);
-
-            // `eth_estimateTotalFee(tx, block)` — Mantle-only.
+            // `eth_estimateTotalFee(tx, block)` — Mantle-only; with the hook dropped this was
+            // `-32601`.
             let fee: Result<Value, ClientError> = client
                 .request(
                     "eth_estimateTotalFee",
