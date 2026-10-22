@@ -511,6 +511,11 @@ where
         let sequencer_url = self.op_node.args.sequencer.clone();
         let preconf = self.preconf.clone();
         let flashblocks_cfg = self.flashblocks.clone();
+        // Historical log and feeHistory ranges are forwarded whole. The history endpoint must
+        // cover the full range; latest/safe/finalized tags are interpreted by that endpoint.
+        // For a frozen backend, use explicit end blocks within its retained history. Unlisted
+        // extensions remain local and may lack pre-snapshot data. Unknown hashes fall back to
+        // local RPC on history failures; an absent old hash can therefore return null.
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |mut ctx| {
             install_mantle_rpc_extensions(&mut ctx, sequencer_url, preconf, flashblocks_cfg)

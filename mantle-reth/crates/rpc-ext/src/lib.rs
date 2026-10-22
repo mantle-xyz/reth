@@ -2,7 +2,6 @@
 //!
 //! This crate provides Mantle-specific RPC methods that extend the standard Ethereum RPC API:
 //!
-//! - `eth_getBlockRange` — returns a list of blocks in a specified number range
 //! - `eth_sendRawTransactionWithPreconf` — submits a raw transaction and returns a preconfirmation
 //!   event from the sequencer
 //!
@@ -38,7 +37,7 @@ use reth_optimism_rpc::SequencerClient;
 use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives};
 use reth_rpc_eth_api::{
     EthApiTypes, FromEthApiError, FullEthApiTypes,
-    helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState},
+    helpers::{EthApiSpec, EthCall, EthFees, EthState},
 };
 use reth_rpc_eth_types::{EthApiError, simulate};
 use reth_rpc_server_types::result::invalid_params_rpc_err;
@@ -312,19 +311,7 @@ pub trait DynPreconfHandler: Send + Sync + std::fmt::Debug {
 #[cfg_attr(not(test), rpc(server, namespace = "eth"))]
 #[cfg_attr(test, rpc(server, client, namespace = "eth"))]
 pub trait MantleEthApiExt {
-    /// Returns a list of blocks in the given range `[start, end]` (both inclusive).
-    ///
-    /// # Errors
-    /// - `start > end`
-    /// - range exceeds 1 000 blocks
-    /// - `end` does not exist
-    #[method(name = "getBlockRange")]
-    async fn get_block_range(
-        &self,
-        start: BlockNumberOrTag,
-        end: BlockNumberOrTag,
-        full_transactions: bool,
-    ) -> RpcResult<Vec<serde_json::Value>>;
+    // eth_getBlockRange is retired and is not exposed over RPC.
 
     /// Sends a raw transaction with preconfirmation support.
     ///
@@ -356,8 +343,7 @@ pub trait MantleEthApiExt {
     /// `processBlock` (`internal/ethapi/simulate.go`).
     ///
     /// Payload and result cross the RPC boundary as `serde_json::Value` to avoid carrying the
-    /// network-specific `RpcTxReq`/`RpcBlock` generics through the trait, matching
-    /// `eth_getBlockRange` above.
+    /// network-specific `RpcTxReq`/`RpcBlock` generics through the trait.
     #[method(name = "simulateV1")]
     async fn simulate_v1(
         &self,
@@ -393,8 +379,7 @@ pub trait MantleEthApiExt {
 ///
 /// Generic over:
 /// - `Provider` — used to resolve `BlockNumberOrTag` to concrete block numbers
-/// - `EthApi` — used to fetch fully-formatted RPC blocks (handles the network-specific type
-///   conversion so we don't need to carry all the generic parameters here)
+/// - `EthApi` — used for call simulation, fee estimation and the `eth_getProof` override
 #[derive(Debug, Clone)]
 pub struct MantleRpcExt<Provider, EthApi> {
     provider: Provider,
@@ -441,9 +426,6 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         &self.eth_api
     }
 }
-
-/// Maximum number of blocks that may be requested in a single `eth_getBlockRange` call.
-const MAX_BLOCK_RANGE: u64 = 1000;
 
 /// geth `DefaultMantleBlockGasLimit` — used as `RPCGasCap` default in op-geth.
 /// `estimateTotalFee` uses this to build a proxy tx envelope matching geth's `CallDefaults`,
@@ -552,127 +534,13 @@ where
         + Send
         + Sync
         + 'static,
-    EthApi: EthBlocks
-        + EthCall
-        + EthFees
-        + EthApiSpec
-        + EthState
-        + FullEthApiTypes
-        + Send
-        + Sync
-        + 'static,
+    EthApi: EthCall + EthFees + EthApiSpec + EthState + FullEthApiTypes + Send + Sync + 'static,
     EthApi::Primitives: NodePrimitives<BlockHeader = Header>,
     EthApi::Provider: ChainSpecProvider<ChainSpec: OpHardforks>,
     // Lets `eth_simulateV1` surface the standard implementation's error verbatim, preserving the
     // spec-defined codes (-38010..-38026) instead of collapsing them into a generic -32000.
     ErrorObject<'static>: From<EthApi::Error>,
 {
-    async fn get_block_range(
-        &self,
-        start: BlockNumberOrTag,
-        end: BlockNumberOrTag,
-        full_transactions: bool,
-    ) -> RpcResult<Vec<serde_json::Value>> {
-        // Resolve symbolic tags (latest, earliest, …) to concrete block numbers.
-        let start_num = self
-            .provider()
-            .convert_block_number(start)
-            .map_err(|e| {
-                ErrorObject::owned(
-                    -32000,
-                    format!("failed to convert start block number: {e}"),
-                    None::<()>,
-                )
-            })?
-            .ok_or_else(|| invalid_params_rpc_err("start block number not found"))?;
-
-        let end_num = self
-            .provider()
-            .convert_block_number(end)
-            .map_err(|e| {
-                ErrorObject::owned(
-                    -32000,
-                    format!("failed to convert end block number: {e}"),
-                    None::<()>,
-                )
-            })?
-            .ok_or_else(|| invalid_params_rpc_err("end block number not found"))?;
-
-        // Validate ordering.
-        if end_num < start_num {
-            return Err(invalid_params_rpc_err(format!(
-                "start of block range ({start_num}) is greater than end of block range ({end_num})"
-            )));
-        }
-
-        // Validate range size.
-        let range_size = end_num.saturating_sub(start_num).saturating_add(1);
-        if range_size > MAX_BLOCK_RANGE {
-            return Err(invalid_params_rpc_err(format!(
-                "requested block range is too large (max is {MAX_BLOCK_RANGE}, requested {range_size})"
-            )));
-        }
-
-        // Verify that the end block actually exists by fetching it first.
-        let end_block = EthBlocks::rpc_block(
-            self.eth_api(),
-            BlockNumberOrTag::Number(end_num).into(),
-            full_transactions,
-        )
-        .await
-        .map_err(|e| {
-            ErrorObject::owned(-32000, format!("failed to fetch end block: {e}"), None::<()>)
-        })?;
-
-        if end_block.is_none() {
-            return Err(invalid_params_rpc_err(format!(
-                "end of requested block range ({end_num}) does not exist"
-            )));
-        }
-
-        // Collect all blocks — serialise to `serde_json::Value` so that we avoid
-        // carrying the network-specific `RpcBlock<EthApi::NetworkTypes>` generic
-        // through the RPC trait boundary.
-        let mut blocks = Vec::with_capacity(range_size as usize);
-
-        for block_num in start_num..end_num {
-            // All blocks in [start, end) — we already confirmed the end block exists.
-            let block = EthBlocks::rpc_block(
-                self.eth_api(),
-                BlockNumberOrTag::Number(block_num).into(),
-                full_transactions,
-            )
-            .await
-            .map_err(|e| {
-                ErrorObject::owned(
-                    -32000,
-                    format!("failed to fetch block {block_num}: {e}"),
-                    None::<()>,
-                )
-            })?
-            .ok_or_else(|| {
-                ErrorObject::owned(
-                    -32000,
-                    format!("block {block_num} not indexed; this should never happen"),
-                    None::<()>,
-                )
-            })?;
-
-            let value = serde_json::to_value(block).map_err(|e| {
-                ErrorObject::owned(-32000, format!("failed to serialise block: {e}"), None::<()>)
-            })?;
-            blocks.push(value);
-        }
-
-        // Append the end block (already fetched).
-        let end_value = serde_json::to_value(end_block.unwrap()).map_err(|e| {
-            ErrorObject::owned(-32000, format!("failed to serialise end block: {e}"), None::<()>)
-        })?;
-        blocks.push(end_value);
-
-        Ok(blocks)
-    }
-
     async fn get_proof(
         &self,
         address: Address,
