@@ -61,13 +61,14 @@ pub enum PreconfServiceError {
     MissingJournalPath,
 }
 
-/// Errors surfaced by [`PreconfServiceBuilder::start`] — the restore
-/// phase only ever propagates journal-load failures (which are already
-/// converted to warn-and-empty inside `restore_preconf_state`), so this
-/// enum is currently a placeholder for future variants (e.g. explicit
-/// timeout / cancellation).
+/// Errors surfaced by [`PreconfServiceBuilder::start`].
 #[derive(Debug, Error)]
-pub enum PreconfStartError {}
+pub enum PreconfStartError {
+    /// The journal could not be read. Fatal on purpose: starting without its
+    /// commitments would let the first rotation delete them.
+    #[error("preconf journal restore: {0}")]
+    Journal(#[from] JournalError),
+}
 
 /// Owns and hands out the shared preconf handles for a single node
 /// instance. Construct once at startup; wrap in `Arc` at the CLI layer
@@ -196,7 +197,7 @@ impl PreconfServiceBuilder {
         P: RestoreSource + Clone + 'static,
         C: crate::journal::CommitmentChainView,
     {
-        restore_preconf_state(&self.journal, pool, chain, &self.fifo, self.fifo.claims()).await;
+        restore_preconf_state(&self.journal, pool, chain, &self.fifo, self.fifo.claims()).await?;
 
         Ok(())
     }
@@ -445,6 +446,25 @@ mod tests {
         // Calling twice must not panic; both calls succeed.
         svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
         svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
+    }
+
+    /// A journal that opens but cannot be read must stop the node. Starting
+    /// would leave every commitment in it untracked, and the first rotation
+    /// would then delete them all.
+    ///
+    /// A directory at the journal's path is what makes the read fail: it opens,
+    /// and reading it is `EISDIR`. Unlike a permission change, it also fails
+    /// for a root caller.
+    #[tokio::test]
+    async fn start_refuses_a_journal_it_cannot_read() {
+        let (dir, svc) = svc_with_temp_journal().await;
+        let path = dir.path().join("preconf.jsonl");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let err = svc.start(&UnreachableSource, &UnreachableChain).await.unwrap_err();
+
+        assert!(matches!(err, PreconfStartError::Journal(_)), "got {err:?}");
     }
 
     /// `start()` reads the journal from disk and pushes each

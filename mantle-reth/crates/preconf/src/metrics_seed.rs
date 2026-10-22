@@ -104,6 +104,7 @@ const COUNTERS: &[&str] = &[
     "preconf.tx.replay_round_total",
     "preconf.journal.dropped_entries_total",
     "preconf.journal.restore_nonce_taken",
+    "preconf.journal.restore_promise_nonce_taken",
     "preconf.journal.restore_undecodable",
     "preconf.journal.restore_unknown",
     "preconf.whitelist.zero_entry_skipped",
