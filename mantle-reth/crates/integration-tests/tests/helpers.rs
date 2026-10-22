@@ -127,6 +127,31 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
     F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    with_configured_mantle_node_rpc_opts(
+        node,
+        chain_spec,
+        attributes_generator,
+        tree_config,
+        proofs_history,
+        RpcServerArgs::default().with_unused_ports().with_http(),
+        test,
+    )
+    .await;
+}
+
+/// Launches a real Mantle node with custom HTTP/WS RPC configuration.
+pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
+    node: MantleNode,
+    chain_spec: Arc<OpChainSpec>,
+    attributes_generator: fn(u64) -> OpPayloadAttrs,
+    tree_config: TreeConfig,
+    proofs_history: Option<(RollupArgs, PathBuf)>,
+    rpc: RpcServerArgs,
+    test: F,
+) where
+    F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     reth_tracing::init_test_tracing();
     // The same RPC flag defaults the shipped binary installs before parsing its CLI.
     mantle_reth_cli::rpc_defaults::init_rpc_defaults();
@@ -137,7 +162,7 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
             datadir: reth_db::test_utils::tempdir_path().into(),
             ..Default::default()
         })
-        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
+        .with_rpc(rpc);
     config.network.discovery.discv5_port = Some(0);
     config.network.discovery.discv5_port_ipv6 = Some(0);
     // Off for the reason `launch_mantle_node!` spells out: building the DNS
