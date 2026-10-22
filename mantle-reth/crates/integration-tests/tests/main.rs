@@ -14,5 +14,6 @@ mod get_proof;
 mod payload_block_size;
 mod preconf_forwarding;
 mod proofs_history;
+mod simulate;
 mod txpool;
 mod txpool_admission;

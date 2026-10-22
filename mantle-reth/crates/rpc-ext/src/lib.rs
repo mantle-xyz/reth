@@ -507,6 +507,15 @@ fn estimate_total_fee_gas_price(
     }
 }
 
+/// A chain id with no block time registered in `alloy-chains`, for which `sanitize_chain` steps
+/// simulated blocks 12s apart: op-geth's `timestampIncrement`, which op-geth applies whatever the
+/// chain.
+///
+/// `sanitize_chain` steps them by the chain's block time otherwise (reth #24388: 2s on Mantle),
+/// where op-geth, and this node before the bump, add 12s. Normalizing against this id gives
+/// op-geth's blocks, fillers for number gaps included, without copying the function.
+const OP_GETH_SIMULATE_CHAIN_ID: u64 = 0;
+
 /// Returns the 0-based index of the first simulated block that crosses the Arsia activation
 /// boundary, i.e. whose parent is pre-Arsia while the block itself is post-Arsia.
 ///
@@ -978,10 +987,17 @@ where
         let chain_spec = self.provider().chain_spec();
         // Use the same normalization as execution: chain-specific spacing, explicit
         // timestamps and filler blocks for number gaps all affect the Arsia boundary.
+        // On Mantle the spacing is op-geth's, so that a request answers as it does on
+        // op-geth; a flashblocks preview has no op-geth counterpart and keeps the chain's.
+        let spacing_chain_id = if chain_spec.is_mantle() && context.is_none() {
+            OP_GETH_SIMULATE_CHAIN_ID
+        } else {
+            chain_spec.chain_id()
+        };
         payload.block_state_calls = simulate::sanitize_chain(
             payload.block_state_calls,
             &parent,
-            chain_spec.chain_id(),
+            spacing_chain_id,
             self.eth_api().max_simulate_blocks(),
         )
         .map_err(|error| ErrorObject::from(EthApi::Error::from_eth_err(error)))?;
@@ -1945,6 +1961,7 @@ mod tests {
         timestamp >= ARSIA_TIME
     }
 
+    /// Timestamps of the blocks a Mantle simulation without a flashblocks preview runs.
     fn simulated_block_timestamps(base_timestamp: u64, times: &[Option<u64>]) -> Vec<u64> {
         use alloy_rpc_types_eth::{BlockOverrides, simulate::SimBlock};
         let parent = reth_primitives_traits::SealedHeader::seal_slow(Header {
@@ -1958,17 +1975,19 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        simulate::sanitize_chain(blocks, &parent, 5003, 256)
+        simulate::sanitize_chain(blocks, &parent, OP_GETH_SIMULATE_CHAIN_ID, 256)
             .unwrap()
             .iter()
             .map(|block| block.block_overrides.as_ref().unwrap().time.unwrap())
             .collect()
     }
 
+    /// op-geth steps every simulated block 12s past the one before, whatever the chain's block
+    /// time, and so did this node before reth #24388 tied the step to the chain's.
     #[test]
-    fn mantle_simulated_timestamps_follow_execution_spacing() {
-        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![102, 104, 106]);
-        assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![102, 500, 502]);
+    fn mantle_simulated_timestamps_step_twelve_seconds_like_op_geth() {
+        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![112, 124, 136]);
+        assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![112, 500, 512]);
     }
 
     #[test]
@@ -1995,7 +2014,7 @@ mod tests {
 
     #[test]
     fn allows_simulation_without_an_arsia_transition() {
-        for base in [ARSIA_TIME - 5, ARSIA_TIME] {
+        for base in [ARSIA_TIME - 30, ARSIA_TIME] {
             assert_eq!(
                 first_arsia_boundary_crossing(
                     base,

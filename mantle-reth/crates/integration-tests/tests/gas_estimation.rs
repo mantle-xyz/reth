@@ -8,7 +8,7 @@
 
 use crate::helpers::with_mantle_rpc_client;
 use alloy_primitives::U256;
-use jsonrpsee::core::client::ClientT;
+use jsonrpsee::{core::client::ClientT, http_client::HttpClient};
 
 /// Pre-funded Hardhat account from `assets/genesis.json` (holds ~1M ETH).
 const FUNDED: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
@@ -16,6 +16,33 @@ const FUNDED: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const FUNDED_2: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 /// An address with no genesis allocation — balance is zero.
 const UNFUNDED: &str = "0x000000000000000000000000000000000000dEaD";
+/// The identity precompile: a call with calldata that needs no deployed code.
+const IDENTITY: &str = "0x0000000000000000000000000000000000000004";
+
+/// A call to the identity precompile. Carries calldata so the estimate goes through
+/// the binary search rather than the 21000 basic-transfer short-circuit, which
+/// executes at `MIN_TRANSACTION_GAS` and never reaches the search ceiling.
+fn identity_call() -> serde_json::Value {
+    serde_json::json!({ "from": FUNDED, "to": IDENTITY, "data": "0x00" })
+}
+
+/// `eth_estimateGas` with params `[request, "latest", null, blockOverrides]`.
+async fn estimate_with_block_overrides(
+    client: &HttpClient,
+    block_overrides: serde_json::Value,
+) -> Result<U256, jsonrpsee::core::client::Error> {
+    client
+        .request(
+            "eth_estimateGas",
+            vec![
+                identity_call(),
+                serde_json::json!("latest"),
+                serde_json::Value::Null,
+                block_overrides,
+            ],
+        )
+        .await
+}
 
 /// `eth_estimateGas` for a simple transfer returns >= 21000 via RPC.
 ///
@@ -196,6 +223,127 @@ async fn estimate_gas_low_balance_high_maxfee_transfer_exceeds_allowance_via_rpc
         assert!(
             msg.contains("gas required exceeds allowance"),
             "expected 'gas required exceeds allowance', got: {msg}"
+        );
+    })
+    .await;
+}
+
+/// A `blockOverrides.gasLimit` below the block's own limit, but still enough for the
+/// call, must leave the estimate unchanged.
+///
+/// The search ceiling is derived from the block gas limit, so the override has to be
+/// applied before that derivation, as upstream reth does (#23990, mirroring
+/// go-ethereum#30695). Applied after it, the search starts from the genesis 30M
+/// against a 100k block, and the first execution is refused as exceeding the block gas
+/// limit — the estimate errors although the call needs a fraction of the override.
+#[tokio::test]
+async fn estimate_gas_honours_a_lowered_block_gas_limit_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        let unconstrained: U256 = client
+            .request("eth_estimateGas", vec![identity_call()])
+            .await
+            .expect("premise: the call estimates without overrides");
+
+        let lowered = estimate_with_block_overrides(
+            &client,
+            serde_json::json!({ "gasLimit": "0x186a0" }), // 100_000
+        )
+        .await
+        .expect("a block gas limit that still covers the call must not fail the estimate");
+
+        assert_eq!(lowered, unconstrained, "a sufficient block gas limit changes nothing");
+    })
+    .await;
+}
+
+/// A `blockOverrides.gasLimit` the call cannot fit in must fail the estimate.
+///
+/// The other direction of the test above: this one fails if the override is dropped
+/// on the way in (the estimate then runs against the unmodified block and succeeds),
+/// which is what the copy of `estimate_gas_with` did before it took `EvmOverrides`.
+#[tokio::test]
+async fn estimate_gas_fails_when_the_block_override_cannot_fit_the_call_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        let starved = estimate_with_block_overrides(
+            &client,
+            serde_json::json!({ "gasLimit": "0x4e20" }), // 20_000, below the 21000 intrinsic cost
+        )
+        .await;
+
+        assert!(
+            starved.is_err(),
+            "a block gas limit below the intrinsic cost must fail the estimate, got {starved:?}"
+        );
+    })
+    .await;
+}
+
+/// A call that never finishes runs out of gas at the ceiling, and the estimate reports it as
+/// op-geth does: `gas required exceeds allowance (<ceiling>)`, -32000. reth's own error for it
+/// is `out of gas: gas required exceeds: <ceiling>`, -32003.
+#[tokio::test]
+async fn estimate_gas_out_of_gas_at_the_ceiling_reads_as_op_geth_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        // JUMPDEST PUSH1 0 JUMP: loops until the gas runs out.
+        let looping = serde_json::json!({ UNFUNDED: { "code": "0x5b600056" } });
+        let res: Result<U256, _> = client
+            .request(
+                "eth_estimateGas",
+                vec![
+                    serde_json::json!({ "from": FUNDED, "to": UNFUNDED, "data": "0x01" }),
+                    serde_json::json!("latest"),
+                    looping,
+                    serde_json::json!({ "gasLimit": "0x186a0" }),
+                ],
+            )
+            .await;
+
+        match res {
+            Err(jsonrpsee::core::client::Error::Call(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (-32000, "gas required exceeds allowance (100000)")
+                );
+            }
+            other => panic!("expected an RPC error, got {other:?}"),
+        }
+    })
+    .await;
+}
+
+/// A raised `blockOverrides.gasLimit` does not lift the search ceiling past the RPC gas cap,
+/// which Mantle defaults to its block gas limit. The target reverts with the gas it was handed,
+/// so the test reads the ceiling off the first execution instead of running it out.
+#[tokio::test]
+async fn estimate_gas_ceiling_stays_within_the_rpc_gas_cap_via_rpc() {
+    use mantle_reth_cli::rpc_defaults::MANTLE_RPC_GAS_CAP;
+
+    with_mantle_rpc_client(|client| async move {
+        // GAS PUSH1 0 MSTORE PUSH1 32 PUSH1 0 REVERT
+        let probe = serde_json::json!({ UNFUNDED: { "code": "0x5a60005260206000fd" } });
+        let res: Result<U256, _> = client
+            .request(
+                "eth_estimateGas",
+                vec![
+                    serde_json::json!({ "from": FUNDED, "to": UNFUNDED, "data": "0x01" }),
+                    serde_json::json!("latest"),
+                    probe,
+                    serde_json::json!({ "gasLimit": "0x10000000000" }),
+                ],
+            )
+            .await;
+
+        let Err(jsonrpsee::core::client::Error::Call(error)) = res else {
+            panic!("expected the probe's revert, got {res:?}");
+        };
+        let data: alloy_primitives::Bytes =
+            serde_json::from_str(error.data().expect("revert data").get()).expect("hex data");
+        let gas_left = U256::from_be_slice(&data);
+        // What is left once the transaction's intrinsic gas is paid.
+        assert!(
+            gas_left < U256::from(MANTLE_RPC_GAS_CAP) &&
+                gas_left > U256::from(MANTLE_RPC_GAS_CAP - 50_000),
+            "the first execution must run at the {MANTLE_RPC_GAS_CAP} cap, it had {gas_left}"
         );
     })
     .await;

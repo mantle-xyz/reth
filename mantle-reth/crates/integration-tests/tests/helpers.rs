@@ -128,6 +128,8 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
     Fut: std::future::Future<Output = ()>,
 {
     reth_tracing::init_test_tracing();
+    // The same RPC flag defaults the shipped binary installs before parsing its CLI.
+    mantle_reth_cli::rpc_defaults::init_rpc_defaults();
 
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
         .with_unused_ports()
