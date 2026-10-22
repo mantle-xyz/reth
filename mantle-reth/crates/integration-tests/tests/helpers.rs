@@ -133,20 +133,24 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
         attributes_generator,
         tree_config,
         proofs_history,
-        RpcServerArgs::default().with_unused_ports().with_http(),
+        |rpc| rpc.with_http(),
         test,
     )
     .await;
 }
 
 /// Launches a real Mantle node with custom HTTP/WS RPC configuration.
+///
+/// `rpc` adjusts the RPC server args, which start from Mantle's flag defaults with unused ports.
+/// The args are built here, after those defaults are installed: `RpcServerArgs::default()` reads
+/// them, so args built by the caller beforehand would miss them (e.g. the 60M RPC gas cap).
 pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
     node: MantleNode,
     chain_spec: Arc<OpChainSpec>,
     attributes_generator: fn(u64) -> OpPayloadAttrs,
     tree_config: TreeConfig,
     proofs_history: Option<(RollupArgs, PathBuf)>,
-    rpc: RpcServerArgs,
+    rpc: fn(RpcServerArgs) -> RpcServerArgs,
     test: F,
 ) where
     F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
@@ -155,6 +159,7 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
     reth_tracing::init_test_tracing();
     // The same RPC flag defaults the shipped binary installs before parsing its CLI.
     mantle_reth_cli::rpc_defaults::init_rpc_defaults();
+    let rpc = rpc(RpcServerArgs::default().with_unused_ports());
 
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
         .with_unused_ports()

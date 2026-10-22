@@ -126,7 +126,7 @@ async fn historical_rpc_cutoff_http_and_ws() {
         mantle_payload_attributes,
         TreeConfig::default(),
         None,
-        RpcServerArgs::default().with_unused_ports().with_http().with_ws(),
+        |rpc: RpcServerArgs| rpc.with_http().with_ws(),
         move |node, http| async move {
             check_routes(&http, &requests).await;
             let ws = node.inner.rpc_server_handle().ws_client().await.unwrap();
