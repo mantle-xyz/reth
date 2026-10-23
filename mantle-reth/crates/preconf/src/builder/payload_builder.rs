@@ -498,7 +498,8 @@ fn estimated_tx_da_size(tx: &TxEnvelope) -> u64 {
 /// the execution result (did it succeed once admitted?).
 #[derive(Debug)]
 enum Admission {
-    /// The tx fits the current in-flight block's remaining RLP, DA and gas → dispatch.
+    /// The tx fits the current in-flight block's remaining RLP, DA, gas and uncompressed size
+    /// → dispatch.
     Admit,
     /// The tx fits an *empty* block but not the current one (transient
     /// capacity). Only returned for [`PreconfSource::Replay`]: the entry is
@@ -511,6 +512,9 @@ enum Admission {
     Reject(PreconfError),
     /// RLP packing capacity rejected the tx; the RPC error is unchanged.
     RejectRlp(PreconfError),
+    /// The block's uncompressed-size cap rejected the tx; see
+    /// [`with_uncompressed_cap`].
+    RejectUncompressed(PreconfError),
 }
 
 impl Admission {
@@ -526,6 +530,9 @@ impl Admission {
             }
             Self::RejectRlp(_) => {
                 metrics::counter!("preconf.fifo.block_rlp_rejected_total").increment(1);
+            }
+            Self::RejectUncompressed(_) => {
+                metrics::counter!("preconf.fifo.block_uncompressed_rejected_total").increment(1);
             }
             Self::Admit | Self::Defer => {}
         }
@@ -641,6 +648,45 @@ fn combined_preconf_admission(
     }
 }
 
+/// Apply the block's uncompressed-size cap (`max_uncompressed_block_size`) on
+/// top of an admission verdict. The pool arm already checks it
+/// (`is_tx_over_limits`); without the same check here, preconf transactions
+/// could push the block past the cap and leave the pool arm refusing everything
+/// after them.
+///
+/// Same classification as the other capacity checks: a transaction over the
+/// cap on its own is rejected; one that only overflows the current block is
+/// deferred if `Replay`, rejected if `Rpc`. An earlier rejection stands.
+fn with_uncompressed_cap(
+    admission: Admission,
+    tx_size: u64,
+    used: u64,
+    limit: Option<u64>,
+    source: PreconfSource,
+) -> Admission {
+    let Some(limit) = limit else { return admission };
+    if !matches!(admission, Admission::Admit | Admission::Defer) {
+        return admission;
+    }
+    if tx_size > limit {
+        return Admission::RejectUncompressed(PreconfError::BuilderRejected(format!(
+            "transaction uncompressed size {tx_size} exceeds block limit {limit}"
+        )));
+    }
+    if used.saturating_add(tx_size) > limit {
+        return match source {
+            PreconfSource::Replay => Admission::Defer,
+            PreconfSource::Rpc => {
+                Admission::RejectUncompressed(PreconfError::BuilderRejected(format!(
+                    "block uncompressed size headroom exhausted: used {used}, need {tx_size}, \
+                     block limit {limit}"
+                )))
+            }
+        };
+    }
+    admission
+}
+
 /// Apply a preconf tx and fold its gas, DA footprint, uncompressed size **and
 /// priority fee** into `info` so the pool best-tx arm (which reads
 /// `info.cumulative_evm_gas_used` / `info.cumulative_da_bytes_used` /
@@ -649,10 +695,10 @@ fn combined_preconf_admission(
 /// budget — and the sealed payload's block value (`total_fees`) includes preconf
 /// revenue, same as pool txs.
 ///
-/// No DA gate here: [`preconf_admission`] already enforces the per-tx / per-block
-/// DA + footprint bounds against the same `info.cumulative_da_bytes_used`
-/// (unchanged in the single-task window between admission and apply), and only
-/// dispatches on `Admit`. A gate here would be dead code.
+/// No capacity gate here: [`preconf_admission`] and [`with_uncompressed_cap`]
+/// already enforce the DA, footprint and uncompressed-size bounds against the
+/// same `info` totals (unchanged in the single-task window between admission
+/// and apply), and only `Admit` dispatches. A gate here would be dead code.
 #[allow(clippy::too_many_arguments)]
 fn apply_preconf_with_da<N, B, ChainSpec>(
     builder: &mut B,
@@ -710,8 +756,9 @@ where
     // advanced the canonical total would be invisible to every later admission
     // check on this block.
     info.accumulate_gas(receipt.gas_used, evm_gas_used);
-    // Likewise for the EIP-7934 uncompressed-size check, which reads
-    // `cumulative_uncompressed_bytes` and would otherwise miss every preconf tx.
+    // Likewise for the uncompressed-size checks — the pool arm's and
+    // `with_uncompressed_cap` — which read `cumulative_uncompressed_bytes` and
+    // would otherwise miss every preconf tx.
     info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
     // The block's RLP budget, measured in block-body item lengths rather than
     // the 2718 payload the line above counts. `tx_rlp_length` is the same value
@@ -777,7 +824,8 @@ fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: Prec
 /// "execute an admitted tx + record result".
 ///
 /// Three gates in order — [`barred_by_allowlist`], the same-sender cascade
-/// (Replay only), then [`preconf_admission`]. Each is documented on its own
+/// (Replay only), then block capacity: [`preconf_admission`] (DA and gas), the
+/// RLP budget, and [`with_uncompressed_cap`]. Each is documented on its own
 /// branch in the body.
 ///
 /// The `info` cumulative reads happen *before* the `&mut info` apply closure
@@ -809,6 +857,8 @@ where
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     let tx_rlp_length = entry.tx.as_ref().length();
+    // The size `apply_preconf_with_da` adds to `cumulative_uncompressed_bytes`.
+    let tx_uncompressed = entry.tx.encode_2718_len() as u64;
     drop(entry);
 
     if !needs_admission(loop_state, &hash, status) {
@@ -886,6 +936,13 @@ where
         tx_rlp_length,
         source,
     );
+    let admission = with_uncompressed_cap(
+        admission,
+        tx_uncompressed,
+        info.cumulative_uncompressed_bytes,
+        limits.max_uncompressed_block_size,
+        source,
+    );
     admission.record_rejection_metrics();
     match admission {
         Admission::Admit => {
@@ -917,7 +974,7 @@ where
                 "replay tx deferred (transient block capacity); keeping Waiting for next slot"
             );
         }
-        Admission::Reject(e) | Admission::RejectRlp(e) => {
+        Admission::Reject(e) | Admission::RejectRlp(e) | Admission::RejectUncompressed(e) => {
             loop_state.block_sender(sender, nonce, dispatch::BlockKind::Reject);
             // Replay carries an earlier public claim. Inspect it before
             // complete_failure releases the claim and its nonce slot.
@@ -3076,6 +3133,57 @@ mod tests {
             preconf_admission(100, tx_gas, 0, gas_used, limits, PreconfSource::Rpc),
             Admission::Reject(_)
         ));
+    }
+
+    /// No uncompressed-size cap configured: the verdict passes through.
+    #[test]
+    fn without_an_uncompressed_cap_the_verdict_stands() {
+        let out = with_uncompressed_cap(Admission::Admit, 10_000, 10_000, None, PreconfSource::Rpc);
+        assert!(matches!(out, Admission::Admit));
+    }
+
+    /// A transaction over the cap on its own fits no block: rejected whatever
+    /// its source, even if the other checks only deferred it.
+    #[test]
+    fn a_transaction_over_the_uncompressed_cap_alone_is_rejected() {
+        for (verdict, source) in
+            [(Admission::Admit, PreconfSource::Rpc), (Admission::Defer, PreconfSource::Replay)]
+        {
+            let out = with_uncompressed_cap(verdict, 1_001, 0, Some(1_000), source);
+            assert!(matches!(out, Admission::RejectUncompressed(_)), "{source:?}: {out:?}");
+        }
+    }
+
+    /// Fits an empty block but not this one: `Replay` defers, `Rpc` is refused.
+    /// Exactly at the cap still fits, as in the pool arm's check.
+    #[test]
+    fn overflowing_the_uncompressed_cap_defers_replay_and_rejects_rpc() {
+        let cap = Some(1_000);
+        assert!(matches!(
+            with_uncompressed_cap(Admission::Admit, 200, 900, cap, PreconfSource::Replay),
+            Admission::Defer
+        ));
+        assert!(matches!(
+            with_uncompressed_cap(Admission::Admit, 200, 900, cap, PreconfSource::Rpc),
+            Admission::RejectUncompressed(_)
+        ));
+        assert!(matches!(
+            with_uncompressed_cap(Admission::Admit, 100, 900, cap, PreconfSource::Rpc),
+            Admission::Admit
+        ));
+    }
+
+    /// An earlier rejection is not replaced.
+    #[test]
+    fn an_earlier_rejection_survives_the_uncompressed_cap() {
+        let out = with_uncompressed_cap(
+            Admission::RejectRlp(PreconfError::BuilderRejected("rlp".into())),
+            1_001,
+            0,
+            Some(1_000),
+            PreconfSource::Rpc,
+        );
+        assert!(matches!(out, Admission::RejectRlp(_)), "{out:?}");
     }
 
     /// Boundary: cumulative exactly at the block limit still `Admit`s (gate

@@ -431,6 +431,9 @@ impl MantleNode {
         // [MANTLE] Clone the node's handle rather than seeding a new one, so the builder and
         // the executor observe the same `admin_setOperatorSdmOptIn` toggle.
         builder_config.operator_sdm_opt_in = self.op_node.operator_sdm_opt_in.clone();
+        // `OpBuilderConfig::new` leaves this unset; without it
+        // `--rollup.max-uncompressed-block-size` never reaches the builder.
+        builder_config.max_uncompressed_block_size = self.op_node.args.max_uncompressed_block_size;
 
         // Slice publishing rides on the preconf handle: `--flashblocks.enable`
         // requires `--preconf.enable`, so there is no path where flashblocks

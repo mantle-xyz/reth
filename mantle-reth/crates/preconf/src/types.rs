@@ -378,7 +378,7 @@ pub enum PreconfError {
         in_use: u64,
         /// Configured ceiling in `unit`.
         capacity: u64,
-        /// Which ceiling fired — `"entries"` or `"bytes"`.
+        /// Which ceiling fired — `"entries"`, `"bytes"` or `"gas"`.
         unit: &'static str,
     },
     /// The sender already holds its maximum number of in-flight preconf
@@ -390,7 +390,7 @@ pub enum PreconfError {
     /// well; matching it keeps the two channels indistinguishable to a client.
     #[error("txpool is full")]
     AccountSlotsFull {
-        /// Entries this sender currently holds.
+        /// `Waiting` entries this sender currently holds.
         in_use: u64,
         /// Configured per-sender ceiling.
         max: u64,
@@ -428,7 +428,7 @@ pub enum PreconfError {
     /// — down to the wording it refuses with.
     #[error("in-flight transaction limit reached for delegated accounts")]
     DelegatedInflightLimit {
-        /// Entries this sender currently holds.
+        /// `Waiting` entries this sender currently holds.
         in_use: u64,
         /// Configured ceiling for delegated accounts.
         max: u64,

@@ -51,6 +51,7 @@ mod restart_replay;
 mod single_payload;
 mod timeout;
 mod tx_type_whitelist;
+mod uncompressed_cap;
 mod validation_reject;
 mod validator_error_mapping;
 mod whitelist_onchain;
