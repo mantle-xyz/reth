@@ -1,49 +1,29 @@
 //! Append-only journal of preconf commitments for restart-safe operation.
 //!
-//! When the RPC handler returns a successful preconf event to a client,
-//! the sequencer has made a promise — "this transaction will be in a
-//! sealed block." If the node crashes before the tx is sealed, we owe
-//! the client honest replay on restart: the commitment must go back in
-//! the queue, and the canonical-state handler must be ready to
-//! forward-clean it once it does land.
+//! A successful preconf receipt promises the client that the transaction will
+//! land. If the node dies before it does, the restart must put the transaction
+//! back in the queue; [`PreconfJournal`] is what it reads to do so.
 //!
-//! [`PreconfJournal`] is the on-disk substrate for that promise. The
-//! file format is **JSON Lines**: one [`JournalEntry`] per line, append
-//! only, line endings as record separators. Choosing a self-describing
-//! text format over a binary one trades a few bytes per record for
-//! trivial human-readability during incident triage — at 100 TPS the
-//! file grows by ~50 KB/s, comfortably within disk budget for a
-//! short-lived journal that gets rotated periodically.
+//! The file is **JSON Lines**: one [`JournalEntry`] per line, append only.
+//! Human-readable for incident triage, at the cost of a few bytes per record.
 //!
-//! **No in-memory view of which commitments are still owed lives here.**
-//! [`Commitments`] is the single owner of "this commitment is over",
-//! because the only notion this layer could form — *canonical once* — is one a
-//! reorg can undo. Rotation receives that decision as the `retain` predicate
-//! [`PreconfJournal::rotate`] takes, and restore asks
-//! `Commitments::is_tracked` directly. So this type owns no eviction policy of
-//! its own and reads no chain state: a second, journal-local rule could drop a
-//! record the registry still holds, which is exactly the divergence the two
-//! halves of commitment tracking must not have.
+//! **This layer decides nothing about which records are still owed.**
+//! [`Commitments`] owns that. Rotation takes it as the `retain` predicate of
+//! [`PreconfJournal::rotate`], and restore asks `Commitments::is_tracked`. A
+//! second, journal-local rule could drop a record the registry still holds.
 //!
-//! **A line survives rotation only if the registry holds a record for its hash.**
-//! [`PreconfJournal::append_promised`] takes one commitment from the apply;
-//! [`PreconfJournal::append_batch`] takes a whole slice, ordinary transactions
-//! included. Both preconf and ordinary pool execution establish an Announced
-//! registry record before publishing; a preconf receipt upgrades its record
-//! to Promised. Ordinary transactions remain tracked for replay even without
-//! a client receipt, so their journal lines survive rotation while the
-//! registry retains them. Rotation removes a line only after its hash is no
-//! longer tracked; see `Commitments::is_tracked`.
+//! **Two writers.** [`PreconfJournal::append_promised`] records a commitment
+//! from the apply; [`PreconfJournal::append_batch`] records a whole slice,
+//! ordinary pool transactions included (as [`ClaimKind::Announced`]). A line
+//! survives rotation while the registry tracks its hash.
 //!
-//! **The second writer only exists when slicing does.** With flashblocks off,
-//! what reaches this file is commitments and nothing else, so a restart replays
-//! them without the ordinary transactions they executed after — a commitment
-//! that needed an approve ahead of it fails on replay. See
-//! `builder::payload_builder`'s pool arm for why that is left as it is.
+//! With flashblocks off only commitments are written, so a restart replays
+//! them without the ordinary transactions they executed after; a commitment
+//! that depended on one of those fails on replay. See
+//! `builder::payload_builder`'s pool arm.
 //!
-//! The journal exposes `append_promised` / `append_batch` / `load` / `rotate`
-//! for the durability path, plus the startup helper [`restore_preconf_state`]
-//! and the background rotation loop [`spawn_rejournal_loop`].
+//! Besides the write and rotation API, the module provides the startup helper
+//! [`restore_preconf_state`] and the background loop [`spawn_rejournal_loop`].
 
 use std::{
     future::Future,
@@ -72,40 +52,30 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{ClaimKind, Commitments, PreconfTxSet};
+use crate::{ClaimKind, Commitments, PreconfTxSet, types::PushResult};
 
-/// One persisted preconf commitment. Carries everything needed to
-/// put the transaction back in the queue on restart and to recognise
-/// it later when it appears on chain.
+/// One persisted record: a preconf commitment, or an ordinary pool transaction
+/// a slice carried. Holds what a restart needs to put the transaction back in
+/// the queue and to recognise it on chain.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JournalEntry {
     /// Transaction hash — primary key.
     pub hash: TxHash,
-    /// RLP-encoded transaction bytes. Used to re-inject the tx into
-    /// the queue on startup.
+    /// EIP-2718 encoded transaction, re-injected into the queue on restart.
     pub tx_rlp: Bytes,
-    /// Predicted L2 block height the commitment was promised for.
-    /// Informational on restart; the canonical chain is authoritative.
+    /// L2 block height the transaction was executed into. Restore passes it to
+    /// `Commitments` as the promised height, which `Commitments::sweep`
+    /// measures the record's retention from.
     pub block_height: u64,
-    /// Wall-clock ms at which the commitment was made. Used by
-    /// operators to correlate journal entries against logs / metrics.
+    /// Wall-clock ms when the record was made, for correlating with logs.
     pub committed_at_ms: u64,
-    /// Which claim this node made about the transaction.
+    /// Which claim this node made: a commitment from the apply, or an
+    /// announcement of a pool transaction from a slice. Restore re-establishes
+    /// each record as its kind; it cannot infer the kind itself, because the
+    /// registry is empty until restore fills it.
     ///
-    /// The two writers put different things here — the apply writes a
-    /// commitment, a slice writes the ordinary pool transactions it carried —
-    /// and restore cannot work it out on its own: the registry is empty at
-    /// that point, because the restore pass is what fills it. Without this
-    /// field every replayed record is read as a commitment, and a sender
-    /// replacing their own pending transaction lands in the branch that
-    /// reports a receipt nobody can honour.
-    ///
-    /// Absent from files written before this field existed. Those files hold
-    /// both kinds — the slice path journaled pool transactions before it said
-    /// which were which — and nothing in a record tells them apart, so every
-    /// one is read as a commitment: the kind that is never dropped. The cost
-    /// is on the first restart after an upgrade only, and is what the apply
-    /// path has always done with such a record.
+    /// Absent from files written before the field existed; those records read
+    /// back as commitments, including the pool transactions among them.
     #[serde(default = "promised_by_default")]
     pub kind: ClaimKind,
 }
@@ -116,10 +86,9 @@ const fn promised_by_default() -> ClaimKind {
     ClaimKind::Promised
 }
 
-/// Current wall-clock milliseconds since the Unix epoch, for stamping
-/// [`JournalEntry::committed_at_ms`]. Falls back to `0` if the system clock is
-/// set before 1970, which is better read as "unset" than worth a panic on a
-/// path that is only telemetry.
+/// Current wall-clock milliseconds since the Unix epoch, for
+/// [`JournalEntry::committed_at_ms`]. `0` if the clock reads before 1970: the
+/// field is telemetry only, not worth a panic.
 pub(crate) fn now_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -127,11 +96,7 @@ pub(crate) fn now_unix_ms() -> u64 {
 
 impl JournalEntry {
     /// The record for a transaction just executed into the block being built.
-    ///
-    /// One shape for both writers, with `kind` as the one thing that differs:
-    /// preconf commitments are recorded from the apply, pool transactions from
-    /// the slice that carries them, and a restart has no other way to tell the
-    /// two apart — see [`JournalEntry::kind`].
+    /// Both writers use it; only `kind` differs.
     pub(crate) fn for_executed(
         hash: TxHash,
         tx: &impl Encodable2718,
@@ -148,36 +113,25 @@ impl JournalEntry {
     }
 }
 
-/// How many un-written records the retry buffer holds before the oldest start
-/// falling out — thirty blocks' worth.
+/// How many unwritten records the retry buffer holds before the oldest are
+/// dropped: thirty blocks of 1,500 simple transfers (30M gas each).
 ///
-/// Thirty blocks is one rotation interval (the 60s default over 2s blocks),
-/// which is as far back as a record can still matter: past it rotation has
-/// already dropped the ones no longer owed. Fifteen hundred a block is what
-/// 30M of gas holds when it is all simple transfers.
+/// Thirty blocks is one rotation interval (60s default, 2s blocks). A record
+/// older than that is no longer needed: its block has most likely sealed.
 const PENDING_CAPACITY: usize = 30 * 1_500;
 
-/// Backstop on what the retry buffer may hold, in bytes.
+/// Byte limit on the retry buffer, as a fuse against memory blow-up.
 ///
-/// [`PENDING_CAPACITY`] is the limit to reason with — it is expressed in the
-/// units the rest of the subsystem uses. It does not bound memory, though: a
-/// record carries its transaction's encoding, and at the pool's 128 KiB ceiling
-/// per transaction a full buffer would be gigabytes rather than the tens of
-/// megabytes ordinary traffic produces.
-///
-/// This is the fuse for that, not a second budget. Reaching it takes hours of
-/// uninterrupted maximum-size transactions with the disk refusing writes
-/// throughout; ordinary traffic never comes close, so which limit bites stays
-/// predictable.
+/// [`PENDING_CAPACITY`] is the limit that normally applies. It does not bound
+/// memory: at the pool's 128 KiB per-transaction ceiling a full buffer would be
+/// gigabytes. Ordinary traffic stays far below this fuse.
 const PENDING_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
-/// Drop the oldest held records until one of `incoming` bytes fits, returning
-/// how many went. `bytes` is the running size of `pending` and is adjusted to
-/// match.
+/// Drop the oldest held records until `incoming` bytes fit, returning how many
+/// were dropped. `bytes` is the running size of `pending`, kept in step.
 ///
-/// Split out from [`PreconfJournal::buffer`] so the rule can be exercised at a
-/// budget a test can afford: [`PENDING_MAX_BYTES`] is a gigabyte, and reaching
-/// it for real would mean allocating one.
+/// Separate from [`PreconfJournal::buffer`] so tests can use a small budget
+/// instead of allocating [`PENDING_MAX_BYTES`].
 fn evict_to_fit(
     pending: &mut VecDeque<Vec<u8>>,
     bytes: &mut usize,
@@ -186,9 +140,8 @@ fn evict_to_fit(
     max_bytes: usize,
 ) -> u64 {
     let mut dropped = 0;
-    // `while` for the byte fuse, because one arriving record can be worth many
-    // of the ones it displaces. Never evicts down to empty: a record bigger
-    // than the whole budget is still worth more held than dropped.
+    // A loop because one large record can displace many small ones. Never
+    // empties the buffer: a record bigger than the whole budget is still kept.
     while pending.len() >= max_count || (*bytes + incoming > max_bytes && !pending.is_empty()) {
         let evicted = pending.pop_front().expect("non-empty");
         *bytes -= evicted.len();
@@ -197,101 +150,67 @@ fn evict_to_fit(
     dropped
 }
 
-/// Errors surfaced by the journal IO surface.
+/// Errors from journal IO.
 #[derive(Debug, Error)]
 pub enum JournalError {
     /// Underlying filesystem / IO error.
     #[error("journal IO: {0}")]
     Io(#[from] io::Error),
-    /// A JSON record failed to deserialise. Wraps the source error and
-    /// the offending line number so operators can pinpoint corruption.
-    #[error("journal deserialisation at line {line}: {source}")]
-    Decode {
-        /// 1-based line number in the journal file.
-        line: usize,
-        /// Underlying serde error.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// A JSON record serialised but contained a payload `serde_json`
-    /// can not encode. Practically only happens on `Bytes` of unusual
-    /// content; left distinct from `Io` for telemetry parity with the
-    /// decode path.
+    /// A record `serde_json` could not encode; retrying cannot fix it. Decode
+    /// failures have no variant: a bad line is skipped and counted.
     #[error("journal serialisation: {0}")]
     Encode(#[source] serde_json::Error),
 }
 
-/// On-disk append-only journal of preconf commitments.
+/// On-disk append-only journal (see the module docs).
 ///
-/// The journal is `Sync`: a single instance can be held by an `Arc` and
-/// shared between the RPC handler (writer) and the rejournal loop
-/// (rotation). All writes serialise through an async `Mutex` around the file
-/// handle.
-///
-/// What it does **not** hold — a view of which commitments are still owed, and
-/// any eviction rule of its own — is the module docs' first point.
+/// Shared behind an `Arc` by its writers and the rotation loop; all writes go
+/// through one async `Mutex` around the file handle. Holds no view of which
+/// records are still owed.
 #[derive(Debug)]
 pub struct PreconfJournal {
-    /// Path to the journal file. Stored for rotation, which writes a
-    /// sibling tmp file and atomically renames into place.
+    /// Path to the journal file. Rotation writes a sibling tmp file and renames
+    /// it over this path.
     path: PathBuf,
-    /// Append handle protected by a `Mutex` because the trait
-    /// `tokio::io::AsyncWriteExt::write_all` takes `&mut self`.
+    /// Append handle. A `Mutex` because `write_all` takes `&mut self`.
     writer: Mutex<File>,
-    /// On-disk size cap in bytes that arms size-triggered rotation.
-    /// Config validation guarantees a positive value whenever the journal
-    /// is enabled (see [`crate::PreconfConfig`]).
+    /// File size in bytes at which a size-triggered rotation is requested.
+    /// Positive whenever the journal is enabled (see [`crate::PreconfConfig`]).
     max_size: u64,
-    /// Running on-disk byte count. Maintained by `write_lines`
-    /// (`+= buf.len()`, the whole write at once, under the writer lock) and
-    /// reset by `rotate` to the kept-bytes total. Avoids a `stat` syscall on
-    /// the hot path.
+    /// Running on-disk byte count, used to arm size-triggered rotation without a
+    /// `stat` on the hot path. Advanced by `write_lines` on success, re-read from
+    /// the file after a failed write (which may have placed part of its bytes),
+    /// and reset by `rotate`. Rotation's own cut point does not come from here.
     size_bytes: AtomicU64,
-    /// Pinged by `write_lines` when `size_bytes` crosses `max_size`,
-    /// waking [`run_rejournal_loop`] to force a rotation off the hot
-    /// path. `notify_one` coalesces a burst of appends into a single
-    /// pending permit.
+    /// Signalled by `write_lines` once `size_bytes` reaches `max_size`, waking
+    /// [`run_rejournal_loop`]. `notify_one` coalesces a burst into one wake.
     rotate_notify: Notify,
-    /// Records a write could not place on disk, waiting for the next one.
+    /// Records a failed write could not place, carried by the next write.
     ///
-    /// Bounded by [`PENDING_CAPACITY`], and by [`PENDING_MAX_BYTES`] as a fuse;
-    /// over either the oldest are dropped, because they are the ones whose block
-    /// has most likely sealed already — a record only matters until its block is
-    /// canonical.
-    ///
-    /// Distinct from the eviction [`Self::rotate`] performs: that one is about
-    /// *durable* records and is the caller's rule. This one is about records
-    /// that never reached the disk at all, and is the price of not blocking the
-    /// build loop on a failing disk.
+    /// Bounded by [`PENDING_CAPACITY`], with [`PENDING_MAX_BYTES`] as a fuse;
+    /// past either the oldest are dropped, as their blocks are the likeliest to
+    /// have sealed. This is how a failing disk avoids blocking the build loop.
     pending: SyncMutex<VecDeque<Vec<u8>>>,
-    /// Running size of `pending`, so the byte fuse costs no walk.
+    /// Running size of `pending` in bytes.
     pending_bytes: AtomicUsize,
 }
 
 impl PreconfJournal {
-    /// Open (or create) the journal file at `path` in append mode.
+    /// Open (or create) the journal file at `path` in append mode, leaving any
+    /// existing contents in place for [`Self::load`].
     ///
-    /// If the file already exists, its contents are left untouched —
-    /// recovery callers should invoke [`Self::load`] before starting
-    /// to append.
-    ///
-    /// `max_size` is the on-disk size cap that arms size-triggered
-    /// rotation: once the file grows to `max_size` bytes, `write_lines`
-    /// wakes [`run_rejournal_loop`] to rotate off the hot path. The byte
-    /// counter is seeded from the existing file so the cap is enforced
-    /// across restarts against pre-existing survivors. Config validation
-    /// guarantees a positive cap whenever the journal is enabled.
+    /// `size_bytes` starts at the existing file's size, so `max_size` also
+    /// counts records that survived from before a restart.
     pub async fn open(path: impl AsRef<Path>, max_size: u64) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            // Best-effort dir creation; operator may have pre-created.
+            // The operator may have created it already.
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
         let file = OpenOptions::new().create(true).append(true).open(&path).await?;
         let init_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-        // Seed the gauge from the on-disk size (carried across restarts).
         metrics::gauge!("preconf.journal.size_bytes").set(init_size as f64);
         let journal = Self {
             path,
@@ -302,61 +221,36 @@ impl PreconfJournal {
             pending: SyncMutex::new(VecDeque::new()),
             pending_bytes: AtomicUsize::new(0),
         };
-        // Nothing in memory to seed from the file: recognising a post-restart
-        // commitment as ours is `restore_preconf_state`'s job.
+        // Nothing to seed in memory: rebuilding state from the file is
+        // `restore_preconf_state`'s job.
         Ok(journal)
     }
 
-    /// Path the journal is bound to. Stable for the lifetime of the
-    /// instance.
-    ///
-    /// Test-only: rotation reads the field directly, and nothing in production
-    /// asks a journal where it lives.
+    /// Path the journal is bound to. Test-only; production reads the field.
     #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Append one commitment to the journal. Performs an explicit
-    /// `flush` (not `sync_all`) so the bytes leave the runtime's
-    /// buffer before this call returns; durability against power loss
-    /// would require an additional `sync_all`, traded off against
-    /// per-tx latency.
-    ///
-    /// A batch of one — the size accounting, the rotation threshold and the
-    /// lock discipline have to be identical for both, and writing them twice
-    /// is how they stop being.
+    /// Append one commitment: [`Self::append_batch`] with a batch of one.
     pub async fn append_promised(&self, entry: &JournalEntry) -> Result<(), JournalError> {
         self.append_batch(std::slice::from_ref(entry)).await
     }
 
-    /// Append many records under one lock, with a single write and a single
-    /// flush.
+    /// Append many records with one lock, one write and one flush. Batching
+    /// keeps a slice of a thousand transactions from holding the lock a
+    /// thousand times. An empty batch does no IO.
     ///
-    /// `flush`, not `sync_all`: the bytes leave the runtime's buffer before this
-    /// returns, but power-loss durability would cost a per-call fsync.
+    /// `flush`, not fsync: the bytes reach the OS before this returns, but are
+    /// not guaranteed to survive a power loss.
     ///
-    /// The batching is what keeps a slice affordable: it can carry a thousand
-    /// transactions, and taking the writer lock once per transaction would hold
-    /// up the preconf path that appends through the same lock. An empty batch
-    /// does no IO.
-    ///
-    /// This is the one place the write mechanics live — [`Self::append_promised`]
-    /// is a batch of one.
-    ///
-    /// All-or-nothing on encode: every record is serialised before anything is
-    /// written, so a record `serde_json` cannot encode leaves the file
-    /// untouched rather than half a batch on disk.
-    ///
-    /// An **IO** failure is different: the records are kept for the next write
-    /// and `Err` is returned for the caller to log, not to act on. Callers must
-    /// not resend them: the next write carries them, and a resend would put the
-    /// same record on disk twice once one succeeds.
+    /// Every record is encoded before anything is written, so an encode error
+    /// writes nothing. On an IO error the records are kept for the next write
+    /// and `Err` is returned for logging only. Callers must not resend: the
+    /// next write already carries them.
     pub async fn append_batch(&self, entries: &[JournalEntry]) -> Result<(), JournalError> {
-        // Encoded up front, and separately from the write: a record `serde_json`
-        // cannot encode will not encode on the next attempt either, so it fails
-        // outright instead of joining the retry buffer and being carried
-        // forever. Nothing is written if any of them fails.
+        // A record that fails to encode will fail again, so it is not buffered
+        // for retry.
         let mut lines = Vec::with_capacity(entries.len());
         for entry in entries {
             let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
@@ -366,20 +260,18 @@ impl PreconfJournal {
         self.write_lines(lines).await
     }
 
-    /// Write `lines`, preceded by anything an earlier attempt could not place.
+    /// Write `lines`, preceded by anything an earlier write could not place.
     ///
     /// On IO failure everything goes to the retry buffer and the error is
-    /// returned for the caller to log. The caller is expected to carry on
-    /// regardless: journaling is a side path, and the transactions it describes
-    /// are in the block either way — the record only matters if the process
-    /// dies before that block is canonical.
+    /// returned. Callers carry on regardless: the transactions are in the block
+    /// either way, and the record only matters if the process dies before that
+    /// block is canonical.
     async fn write_lines(&self, mut lines: Vec<Vec<u8>>) -> Result<(), JournalError> {
         if lines.is_empty() && self.pending.lock().is_empty() {
             return Ok(());
         }
-        // The writer lock is taken first so a concurrent append cannot slip
-        // between draining the buffer and writing it, which would put the older
-        // records after the newer ones in the file.
+        // Lock first, so no append slips in between draining the buffer and
+        // writing it and lands ahead of the older records.
         let mut writer = self.writer.lock().await;
         let mut retried: Vec<Vec<u8>> = {
             let mut pending = self.pending.lock();
@@ -389,9 +281,9 @@ impl PreconfJournal {
 
         let mut buf = Vec::new();
         if !retried.is_empty() {
-            // The write that failed may have stopped mid-line. A newline closes
-            // it so this attempt does not fuse onto its tail and cost both
-            // records; `load` counts the blank line as a corrupt entry.
+            // The failed write may have stopped mid-line. A newline closes that
+            // line so this write does not fuse onto it; `load` counts it as one
+            // corrupt entry.
             buf.push(b'\n');
         }
         for line in retried.iter().chain(lines.iter()) {
@@ -400,10 +292,15 @@ impl PreconfJournal {
         let len = buf.len() as u64;
 
         if let Err(e) = writer.write_all(&buf).await.and(writer.flush().await) {
-            // Refill under the guard, or a concurrent append writes ahead of
-            // these older records — the reorder the lock above exists to prevent.
+            // Buffered while still holding the lock, to keep the order.
             retried.append(&mut lines);
             self.buffer(retried);
+            // The write may have placed part of `buf` before failing, so the
+            // counter no longer matches the file. Re-read the true length;
+            // if even that fails, rotation does not depend on the counter.
+            if let Ok(meta) = writer.metadata().await {
+                self.size_bytes.store(meta.len(), Ordering::Relaxed);
+            }
             return Err(JournalError::Io(e));
         }
         let new_size = self.size_bytes.fetch_add(len, Ordering::Relaxed) + len;
@@ -440,43 +337,31 @@ impl PreconfJournal {
         metrics::gauge!("preconf.journal.pending_entries").set(pending.len() as f64);
     }
 
-    /// How many records are waiting for a write to succeed.
-    ///
-    /// Test-only — the production view of this is the
-    /// `preconf.journal.pending_entries` gauge. Kept because the
-    /// `PENDING_CAPACITY` / `PENDING_MAX_BYTES` fuses have no other observation
-    /// point.
+    /// How many records are waiting for a write to succeed. Test-only; in
+    /// production this is the `preconf.journal.pending_entries` gauge.
     #[cfg(test)]
     pub fn pending_len(&self) -> usize {
         self.pending.lock().len()
     }
 
-    /// Read the journal file from disk and return every entry that
-    /// parsed successfully. Lines that fail to parse are logged as
-    /// `warn` and skipped — the journal is best-effort recovery
-    /// substrate, not a database transaction log, so a single bad
-    /// line should not block startup.
-    ///
-    /// Returns the count of skipped corrupt lines as the second
-    /// tuple field for telemetry / metric reporting.
+    /// Read every entry that parses, skipping and counting the lines that do
+    /// not. A missing file reads as empty. Returns the entries and the count of
+    /// skipped lines.
     pub async fn load(&self) -> Result<(Vec<JournalEntry>, usize), JournalError> {
         let file = match tokio::fs::File::open(&self.path).await {
             Ok(f) => f,
-            // A missing journal is the normal first-boot path. Surface
-            // an empty result instead of forcing every caller to match
-            // on `ErrorKind::NotFound`.
+            // The normal first start.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
             Err(e) => return Err(JournalError::Io(e)),
         };
         Self::parse_entries(BufReader::new(file)).await
     }
 
-    /// Entries from the first `limit` bytes of the file.
-    ///
-    /// Rotation compacts the file as it stood when the pass began, not as it
-    /// stands when the pass ends, so it reads to a byte offset rather than to
-    /// end of file. `limit` comes from the size counter, which only ever
-    /// advances by whole writes, so the cut cannot land mid-record.
+    /// Entries from the first `limit` bytes of the file: the part a rotation
+    /// compacts. `limit` is the file length taken under the writer lock, so no
+    /// append is in progress at the cut. The cut can still follow the partial
+    /// line of a failed write; that line is skipped as corrupt, and its records
+    /// are rewritten whole from the retry buffer.
     async fn load_upto(&self, limit: u64) -> Result<(Vec<JournalEntry>, usize), JournalError> {
         let file = match tokio::fs::File::open(&self.path).await {
             Ok(f) => f,
@@ -486,17 +371,10 @@ impl PreconfJournal {
         Self::parse_entries(BufReader::new(file.take(limit))).await
     }
 
-    /// The raw bytes the file has grown by past `from`.
-    ///
-    /// Copied verbatim rather than parsed and re-encoded: these records arrived
-    /// after the compaction pass took its snapshot, so they belong to the
-    /// generation being started rather than the one being compacted. Verbatim
-    /// also keeps `retain` — a caller-supplied predicate of unknown cost — off
-    /// the one stretch of rotation that holds the writer lock.
-    ///
-    /// A write that failed part-way leaves a partial line, which is carried
-    /// across like anything else; the next append closes it with a newline and
-    /// [`Self::load`] skips it.
+    /// The raw bytes appended past `from`: records that arrived while a
+    /// rotation was compacting. Copied verbatim rather than parsed, so `retain`
+    /// is not evaluated while the writer lock is held; a partial line among
+    /// them is carried too, and skipped by the next [`Self::load`].
     async fn bytes_after(&self, from: u64) -> Result<Vec<u8>, JournalError> {
         let mut file = match tokio::fs::File::open(&self.path).await {
             Ok(f) => f,
@@ -509,19 +387,31 @@ impl PreconfJournal {
         Ok(out)
     }
 
-    /// Parse newline-delimited entries out of `reader`, skipping the ones that
-    /// will not decode and returning how many those were.
-    async fn parse_entries<R>(reader: R) -> Result<(Vec<JournalEntry>, usize), JournalError>
+    /// Parse newline-delimited entries, skipping and counting the ones that do
+    /// not decode. Lines are read as bytes, so a non-UTF-8 line is one bad
+    /// record rather than a failed read; only a real IO error fails.
+    async fn parse_entries<R>(mut reader: R) -> Result<(Vec<JournalEntry>, usize), JournalError>
     where
         R: tokio::io::AsyncBufRead + Unpin,
     {
-        let mut lines = reader.lines();
         let mut out = Vec::new();
         let mut bad = 0usize;
         let mut line_no = 0usize;
-        while let Some(line) = lines.next_line().await? {
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf).await? == 0 {
+                break;
+            }
             line_no += 1;
-            match serde_json::from_str::<JournalEntry>(&line) {
+            let mut line = buf.as_slice();
+            if let Some(rest) = line.strip_suffix(b"\n") {
+                line = rest;
+            }
+            if let Some(rest) = line.strip_suffix(b"\r") {
+                line = rest;
+            }
+            match serde_json::from_slice::<JournalEntry>(line) {
                 Ok(entry) => out.push(entry),
                 Err(source) => {
                     warn!(
@@ -543,48 +433,40 @@ impl PreconfJournal {
         Ok((out, bad))
     }
 
-    /// Rewrite the journal file keeping only the entries `retain` accepts,
-    /// then atomically swap it for the live file.
+    /// Rewrite the file keeping only the entries `retain` accepts, then rename
+    /// the rewrite over the live file. Called by the rotation loop, never on the
+    /// hot path.
     ///
-    /// Implementation: read all entries, filter, write to a sibling
-    /// `<path>.tmp`, then `rename` over the live file. The rename is atomic
-    /// against a process crash — never a half-written hybrid. It is not a
-    /// durability guarantee: the tmp file is only `flush`ed and nothing here
-    /// fsyncs it or the directory, so a power loss can leave the rename
-    /// applied and the new file's tail missing. Same trade as `append`.
+    /// The rename is atomic against a process crash. Against power loss, the
+    /// rewrite is fsynced before the rename and the directory after it, so the
+    /// new file is never seen without its contents. (Appends themselves are
+    /// only flushed; see [`Self::append_batch`].)
     ///
-    /// The caller is expected to be the rotation loop, not the hot RPC path.
-    ///
-    /// The read-filter-rewrite pass runs with **no lock held**, so appends
-    /// continue into the live file throughout it. Only the tail end takes the
-    /// writer lock, and what it does there is bounded by one pass's worth of
-    /// appends rather than by the size of the file: splice, rename, re-open.
-    /// This matters because a slice is journalled before it is broadcast, so an
-    /// append that waits for a multi-megabyte rewrite is a broadcast that
-    /// waits for it too.
+    /// The read-filter-rewrite pass holds no lock, so appends continue
+    /// meanwhile. The writer lock is taken only briefly at the start, to read
+    /// the file length, and for the tail: splice the records appended during
+    /// the pass, fsync, rename. The tail costs those appends plus one fsync,
+    /// not a pass over the file — which matters because a slice is journaled
+    /// before it is broadcast, so a waiting append delays the broadcast.
     pub async fn rotate(
         &self,
         retain: impl Fn(&TxHash) -> bool,
     ) -> Result<RotateStats, JournalError> {
-        // Records `preconf.journal.rotate_duration_ms` on every exit path
-        // (including the `?` early returns below).
+        // Records `preconf.journal.rotate_duration_ms` on every exit path.
         let _timer = RotateTimer(std::time::Instant::now());
 
-        // How much of the file this pass is answerable for. Read under the
-        // writer lock so it cannot be sampled part-way through an append, and
-        // taken from the size counter rather than from a `stat` because the
-        // counter only advances by whole writes — which is what makes it safe
-        // to cut the file here.
+        // The part of the file this pass compacts: its length, read under the
+        // writer lock so no append is half-done. Not `size_bytes`, which a
+        // failed write can leave short of the true end.
         let compacting_upto = {
-            let _writer = self.writer.lock().await;
-            self.size_bytes.load(Ordering::Relaxed)
+            let writer = self.writer.lock().await;
+            writer.metadata().await?.len()
         };
 
         let (entries, bad_before) = self.load_upto(compacting_upto).await?;
 
-        // `retain` is the caller's rule and the only one here (module docs).
-        // Evaluated once per record, so a concurrent update lands in the *next*
-        // rotation rather than half of this one.
+        // Evaluated once per record; a registry change mid-pass takes effect in
+        // the next rotation.
         let mut kept = 0usize;
         let mut dropped = 0usize;
         let mut kept_bytes = 0u64;
@@ -603,74 +485,88 @@ impl PreconfJournal {
             kept_bytes += line.len() as u64;
             kept += 1;
         }
+        // Most of the fsync cost, paid before taking the lock.
+        tmp.flush().await?;
+        tmp.sync_data().await?;
 
-        // From here to the end of the function the writer lock is held, and
-        // appends wait. Everything expensive is already done.
+        // Appends wait from here until the guard is released.
         let mut writer = self.writer.lock().await;
-        // Declared after the guard so it is dropped before it: what this
-        // records is the span an append could have been waiting on, measured
-        // from acquiring the lock to just short of releasing it.
+        // Declared after the guard so it drops first: it measures how long an
+        // append could have waited.
         let locked = LockedTimer(std::time::Instant::now());
 
-        // Splice on whatever landed while the pass was running. Without this the
-        // swap below would discard those records, and the size counter would
-        // describe a file that never existed.
+        // Splice on the records appended during the pass, which the swap would
+        // otherwise lose.
         let carried = self.bytes_after(compacting_upto).await?;
         tmp.write_all(&carried).await?;
         tmp.flush().await?;
+        // Durable before the rename: on some filesystems a rename can survive a
+        // power loss that its file's contents do not, leaving an empty journal.
+        // `sync_data` still syncs the file size, which is all a reader needs.
+        tmp.sync_data().await?;
         drop(tmp);
 
-        // Atomic swap: rename into place, then re-open the writer against the
-        // new inode.
+        // Opened before the rename, so nothing that can fail comes after it: a
+        // handle that fails to open after the swap would leave appends going
+        // to the replaced file, which no longer has a name.
+        let new_writer = OpenOptions::new().append(true).open(&tmp_path).await?;
         tokio::fs::rename(&tmp_path, &self.path).await?;
-        *writer = OpenOptions::new().create(true).append(true).open(&self.path).await?;
-        // Reset the byte counter to the new file's true size while still holding
-        // the writer lock, so it stays consistent with any append that
-        // serialises before or after this swap.
+        *writer = new_writer;
+        // Reset under the lock, so no append sees the old count.
         let new_size = kept_bytes + carried.len() as u64;
         self.size_bytes.store(new_size, Ordering::Relaxed);
         metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
+        let locked_for = locked.0.elapsed();
+        drop(locked);
+        drop(writer);
+
+        // Makes the rename itself durable. Outside the lock, and only logged on
+        // failure: the swap has happened and appends are already going to the
+        // new file, so there is nothing to undo.
+        if let Err(e) = sync_parent_dir(&self.path).await {
+            warn!(
+                target: "mantle::preconf::journal",
+                ?e,
+                "journal directory fsync after rotation failed"
+            );
+        }
 
         Ok(RotateStats {
             kept,
             dropped,
-            locked_for: locked.0.elapsed(),
+            locked_for,
             carried_bytes: carried.len() as u64,
             bad_lines_skipped: bad_before,
         })
     }
 }
 
-/// Telemetry-friendly summary of a single [`PreconfJournal::rotate`]
-/// invocation.
+/// fsync the directory holding `path`, so a rename inside it survives a power
+/// loss.
+async fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(parent).await?.sync_all().await
+}
+
+/// Summary of one [`PreconfJournal::rotate`], for logs and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateStats {
-    /// Entries the compaction pass carried over — every one of them accepted by
-    /// `retain`. Not the whole of the rotated file: see
+    /// Entries the compaction pass kept, i.e. accepted by `retain`. Excludes
     /// [`carried_bytes`](Self::carried_bytes).
     pub kept: usize,
-    /// Entries left out of the new file — every one of them refused by `retain`.
+    /// Entries the compaction pass dropped, i.e. refused by `retain`.
     pub dropped: usize,
-    /// How long the writer lock was held, and so how long an append could have
-    /// been waiting on this rotation.
-    ///
-    /// Reported rather than only measured into
-    /// `preconf.journal.rotate_locked_ms` because the metric is emitted from a
-    /// drop guard, and nothing that reads the source can tell whether the guard
-    /// is still being constructed. As a returned value it is assertable.
+    /// How long the writer lock was held, i.e. how long an append could have
+    /// waited. Also recorded as `preconf.journal.rotate_locked_ms`; returned
+    /// so tests can assert on it.
     pub locked_for: Duration,
-    /// Bytes appended while the pass was running and spliced onto the end of
-    /// the rotated file.
-    ///
-    /// These arrived after the pass took its snapshot, so `retain` was never
-    /// asked about them and they are counted in neither `kept` nor `dropped`.
-    /// They face the next rotation instead. Reported so `kept` and the rotated
-    /// file's line count can be reconciled.
+    /// Bytes appended during the pass and spliced on unfiltered. Not counted in
+    /// `kept` or `dropped`; the next rotation filters them.
     pub carried_bytes: u64,
-    /// Corrupt lines observed during the read pass. Rotate silently
-    /// removes them from the rewritten file (they're not carried over
-    /// into the new generation) — this count is reported for
-    /// operator-facing metrics only, not for retry / repair logic.
+    /// Corrupt lines the pass skipped, and so left out of the new file.
     pub bad_lines_skipped: usize,
 }
 
@@ -691,14 +587,9 @@ impl Drop for RotateTimer {
     }
 }
 
-/// Records `preconf.journal.rotate_locked_ms` on drop: the part of a rotation
-/// that holds the writer lock, and so the only part of it an append can wait
-/// for. [`RotateTimer`] covers the whole pass, most of which runs unlocked, so
-/// it cannot answer that question on its own.
-///
-/// Fractional milliseconds, unlike the whole-pass timer: this span is expected
-/// to be under a millisecond, and at integer resolution "fast" and "did not
-/// happen" would both read as zero.
+/// Records `preconf.journal.rotate_locked_ms` on drop: the tail of a rotation
+/// that holds the writer lock, the part an append can wait for. In fractional
+/// milliseconds, to keep sub-millisecond resolution.
 struct LockedTimer(std::time::Instant);
 
 impl Drop for LockedTimer {
@@ -712,38 +603,24 @@ impl Drop for LockedTimer {
 
 /// Turns journal bytes back into something the queue can hold.
 ///
-/// Production uses [`RestoreDirect`](crate::RestoreDirect); tests inject a
-/// stub so a decode failure can be scripted.
-///
-/// A trait, and kept here beside the journal, so the restore helper needs no
-/// dependency on `reth-transaction-pool` — the pooled envelope type it
-/// decodes into is supplied at the call site.
+/// Production uses [`RestoreDirect`](crate::RestoreDirect); tests use a stub.
+/// A trait so this crate needs no dependency on `reth-transaction-pool`.
 #[async_trait::async_trait]
 pub trait RestoreSource: Send + Sync {
-    /// Decode and recover `tx_rlp`, and convert it into the form the queue
-    /// holds.
+    /// Decode and sender-recover `tx_rlp` into the form the queue holds.
     ///
-    /// Only what the bytes themselves can be wrong about surfaces as
-    /// `Err(reason)`: they do not decode, or they decode to a type the
-    /// preconf path does not carry. Whether the commitment is still owed is
-    /// not this call's question — that is the chain's, and
-    /// [`restore_preconf_state`] asks it. The restore
-    /// helper logs and skips those entries.
+    /// `Err` only for what the bytes themselves get wrong: they do not decode,
+    /// or decode to a type the preconf path does not carry. Whether the
+    /// commitment is still owed is decided by [`restore_preconf_state`].
     async fn recover_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, RestoreSkip>;
 
-    /// Recover just the `(sender, nonce)` of `tx_rlp`.
+    /// Recover just the `(sender, nonce)` of `tx_rlp`, so restore can claim
+    /// every slot before admitting any entry (see
+    /// [`Commitments::mark_promised`](crate::Commitments::mark_promised)).
     ///
-    /// Exists so [`restore_preconf_state`]'s pre-pass can claim each
-    /// commitment's slot before *any* entry is admitted; see
-    /// [`Commitments::mark_promised`](crate::Commitments::mark_promised)
-    /// for why that has to happen before `recover_envelope`.
-    ///
-    /// `None` for anything that does not decode or whose signature does not
-    /// recover — the entry will fail `recover_envelope` for the same reason a moment
-    /// later, which is where it gets logged.
-    ///
-    /// Decodes the same bytes `recover_envelope` decodes again: one extra ec-recover
-    /// per journal entry, once per process start.
+    /// `None` if the bytes do not decode or the signature does not recover;
+    /// `recover_envelope` then fails on the same entry. Costs one extra
+    /// signature recovery per entry, once per process start.
     fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)>;
 }
 
@@ -751,65 +628,49 @@ pub trait RestoreSource: Send + Sync {
 /// tell.
 ///
 /// Three-valued on purpose: [`Self::Unknown`] is a **fact about our knowledge**,
-/// not a failure to be folded into either answer. Collapsing it into `No` turns
-/// every honoured commitment on an index-pruned node into a false "commitment
-/// lost" alarm; collapsing it into `Yes` reinstates the very
-/// silently-wrong-report this type exists to prevent.
+/// not a failure to be folded into either answer. As `No` it would raise a
+/// false "commitment lost" alarm for every honoured commitment on a node with
+/// a pruned index; as `Yes` it would report a commitment kept without evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnChain {
-    /// Found on the canonical chain, in the block at `height`.
-    ///
-    /// The height is carried because restore starts the commitment's retention
-    /// clock with it — see the `OnChain::Yes` arm of [`restore_preconf_state`].
+    /// Found on the canonical chain, in the block at `height`. Restore measures
+    /// the record's retention from that height.
     Yes {
         /// Canonical block number the transaction was found in.
         height: u64,
     },
-    /// Not on the canonical chain, and the index that would have found it is
-    /// intact — so the miss is trustworthy.
+    /// Not on the canonical chain, and the lookup index is intact, so the miss
+    /// can be trusted.
     No,
     /// Cannot be determined: the transaction-lookup index has been pruned, or
     /// the query itself failed.
     Unknown,
 }
 
-/// The chain-side lookup [`restore_preconf_state`] needs to tell "this
-/// commitment landed" apart from "some other transaction consumed its nonce".
-///
-/// Separate from [`RestoreSource`], which only decodes bytes: answering this
-/// needs the chain's account nonce, which the bytes cannot supply.
+/// The chain lookups [`restore_preconf_state`] needs to tell "this commitment
+/// landed" from "another transaction took its nonce".
 pub trait CommitmentChainView: Send + Sync {
     /// Is `hash` on the canonical chain?
     fn commitment_on_chain(&self, hash: &TxHash) -> OnChain;
 
     /// `sender`'s account nonce on the canonical chain, or `None` if it
-    /// cannot be read.
-    ///
-    /// Restore asks this first, and for most entries it is the only question:
-    /// a commitment whose nonce is still free is simply still owed, and goes
-    /// straight back in the queue. Only when the nonce is *gone* is there
-    /// anything to investigate, and only then is the more expensive
-    /// [`Self::commitment_on_chain`] worth paying for.
+    /// cannot be read. Restore asks this first; only when the nonce has moved
+    /// past the entry does it pay for [`Self::commitment_on_chain`].
     fn account_nonce(&self, sender: &Address) -> Option<u64>;
 }
 
-/// Why a journal entry could not be turned back into a transaction.
-///
-/// Deliberately says only what the **bytes** can be wrong about. Whether a
-/// commitment is still owed — and, when its nonce is gone, which of honoured,
-/// stolen or unknowable that means — is resolved by
-/// [`restore_preconf_state`] with a [`CommitmentChainView`].
+/// Why a journal entry could not be turned back into a transaction. Covers
+/// only what the bytes get wrong; whether a commitment is still owed is
+/// decided by [`restore_preconf_state`] with a [`CommitmentChainView`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreSkip {
-    /// Corrupt bytes, or a variant that cannot be preconfirmed. A real
-    /// failure — the commitment is lost.
+    /// Corrupt bytes, or a type that cannot be preconfirmed. The commitment is
+    /// lost.
     Rejected(String),
 }
 
-/// Output of a successful [`RestoreSource::recover_envelope`] — the decoded
-/// envelope plus the recovered sender. The journal needs both: the
-/// envelope to push into the fifo, the sender as the `from` field
-/// keyed by `(sender, nonce)` for the replacement guard.
+/// Output of a successful [`RestoreSource::recover_envelope`]: the envelope to
+/// push into the fifo, and its sender.
 #[derive(Debug)]
 pub struct RestoredEnvelope {
     /// Decoded, sender-recovered transaction envelope.
@@ -819,12 +680,11 @@ pub struct RestoredEnvelope {
 }
 
 // ─── Startup restore ────────────────────────────────────────────────────────
-/// Is the commitment's nonce still the sender's next one?
+/// Is the commitment's nonce still unused on chain?
 ///
-/// `true` also when the chain cannot be read: an unreadable account is not
-/// evidence that the nonce was taken, and treating it as such would abandon a
-/// commitment on a transient storage error. Queueing it instead is recoverable
-/// — the build's own forward sweep drops it if it turns out to be stale.
+/// `true` also when the account cannot be read: a transient storage error is
+/// no evidence the nonce was taken. If the entry turns out to be stale, the
+/// build's forward sweep drops it.
 fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -> bool {
     match chain.account_nonce(&rec.from) {
         Some(on_chain) => alloy_consensus::Transaction::nonce(&rec.envelope) >= on_chain,
@@ -832,62 +692,53 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
     }
 }
 
-/// Walk the journal at startup and re-establish the in-memory state
-/// the running system expects.
+/// Rebuild the in-memory preconf state from the journal at startup.
 ///
-/// Order matters:
+/// 1. Re-establish a registry record for **every** entry first, as the kind it was written with
+///    (`mark_promised` for a commitment, `record_announced` for a pool transaction). This claims
+///    each entry's `(sender, nonce)` before any entry is admitted.
+/// 2. Decode each entry via [`RestoreSource::recover_envelope`], then ask the chain whether it is
+///    still owed: the sender's nonce first, and only if that has moved on, whether this transaction
+///    is the one that took it.
+/// 3. Push each still-owed entry into the fifo as
+///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay), which the dispatch layer's
+///    deadline and gas-budget gates let through.
 ///
-/// 1. Mark **every** loaded hash promised up front, before admitting any of them. This is what
-///    carries "a receipt for this tx already went out to a client" across the restart, and it has
-///    to happen first: it is what claims the `(sender, nonce)` each commitment was issued against,
-///    before anything else can take it.
-/// 2. Decode via [`RestoreSource::recover_envelope`], then ask the chain whether the commitment is
-///    still owed — the sender's nonce first, and only if that is gone, whether this transaction is
-///    the one that took it.
-/// 3. Push the recovered envelope into the fifo with
-///    [`PreconfSource::Replay`](crate::types::PreconfSource::Replay) so the dispatch layer's
-///    deadline / gas-budget gates bypass the tx (SLA: "receipt returned → tx must land").
+/// No eligibility check: nothing here reads `PreconfConfig`, so a commitment
+/// already acknowledged comes back whatever the current policy says.
 ///
-/// Restore does not re-derive eligibility: nothing on this path reads
-/// `PreconfConfig`, so a commitment already acknowledged to a client comes back
-/// regardless of what current policy says. Why step 1 cannot be folded into
-/// step 2 is argued at the pre-pass loop below.
-///
-/// Non-recoverable failures (corrupt bytes, a type the preconf path does not
-/// carry) are logged and skipped — best-effort restore, never block startup.
+/// A bad record (corrupt bytes, a type the preconf path does not carry) is
+/// logged and skipped. Failing to read the file at all is returned as `Err`,
+/// and the caller must not start: nothing restored would be tracked, so the
+/// first rotation would delete every commitment still in the file.
 pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     journal: &PreconfJournal,
     source: &P,
     chain: &C,
     fifo: &Arc<PreconfTxSet>,
     claims: &Commitments,
-) {
-    // No prune before the replay pass: the only eviction rule is "the registry
-    // no longer tracks this", and the registry is empty until the loop below
-    // populates it — pruning here would discard every commitment we owe on the
-    // very restart meant to honour them. The prune happens once at the end
-    // instead, against the records this pass just established.
+) -> Result<(), JournalError> {
+    // No rotation before this pass: the registry is empty until the pass fills
+    // it, so every record would read as untracked and be deleted. The rotation
+    // runs at the end instead.
     let (entries, bad_lines) = match journal.load().await {
         Ok(v) => v,
         Err(e) => {
-            // Every commitment whose receipt already went out is abandoned
-            // here: it enters neither the fifo nor `Commitments`, so it will
-            // not land and its nonce reads as free. The file not existing is
-            // *not* this path (that is `Ok((vec![], 0))`, the ordinary first
-            // start) and neither is a corrupt line — only a real IO failure
-            // reaches here, which is why it is `error!` rather than `warn!`.
-            // A single unparseable line was already the louder of the two.
+            // Starting anyway would lose every commitment in the file: none of
+            // them would enter `Commitments`, so the first rotation would delete
+            // them all. A missing file (`Ok`, the first start) and a corrupt
+            // line (skipped) do not reach here; only a real IO failure does.
             metrics::counter!("preconf.journal.restore_load_failed_total").increment(1);
             error!(
                 target: "mantle::preconf::journal",
                 ?e,
-                "journal load failed; every in-flight commitment is abandoned"
+                "journal load failed; refusing to start rather than lose its commitments"
             );
-            return;
+            return Err(e);
         }
     };
-    // Counted, not merely logged: a file that is quietly shedding lines looks
-    // identical to a quiet chain from the outside.
+    // Counted as well as logged: a file quietly shedding lines is otherwise
+    // invisible.
     metrics::counter!("preconf.journal.restore_bad_lines_total").increment(bad_lines as u64);
     info!(
         target: "mantle::preconf::journal",
@@ -896,30 +747,22 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
         "preconf journal load"
     );
 
-    // Step 1 — a pre-pass: every hash becomes a live commitment owning its nonce before any is
-    // admitted. Two reasons it is not folded into the loop below.
+    // Step 1, as its own pass so every `(sender, nonce)` is claimed before any
+    // entry is admitted:
     //
-    // **The record.** Two journal entries sharing a `(sender, nonce)` are enough to matter:
-    // admitting the first would put the *second* through the replacement guard instead of
-    // treating it as the commitment it is.
-    //
-    // **The slot.** Both record functions claim the `(sender, nonce)` from what
-    // `recover_slot` hands them. Back-filling the claim at validator time would
-    // leave the nonce reading free in between, so a same-nonce transaction
-    // admitted there would take a nonce the client was already told it had.
-    // Startup ordering closes that window today (`cli::node` runs restore before
-    // the pool loader, the RPC server and the network); claiming here makes it
-    // structural instead.
-    //
-    // **The kind.** Each record is re-established as what it was written as, not
-    // as a commitment: a slice's ordinary pool transactions are `Announced`, and
-    // reading them back as `Promised` would route a sender's own replacement
-    // into the branch that reports a receipt nobody can honour. Both kinds claim
-    // the slot and both keep the same reorg reach — the kind decides who is told
-    // when the claim fails, not how long it is kept.
+    // - Two entries can share a `(sender, nonce)`. Admitting the first before the second is
+    //   recorded would send the second through the replacement guard instead of treating it as the
+    //   commitment it is.
+    // - Claiming later, at validation, would leave the nonce free in between for a same-nonce
+    //   transaction to take. Startup order (`cli::node` restores before the pool loader, RPC and
+    //   network start) closes that window today; claiming here does not depend on it.
     for entry in &entries {
         match source.recover_slot(&entry.tx_rlp) {
             Some((from, nonce)) => {
+                // Re-established as the kind it was written with. Reading a pool
+                // transaction back as `Promised` would report a sender's own
+                // replacement as a broken commitment. Both kinds claim the slot
+                // and are kept for the same depth.
                 let claimed = match entry.kind {
                     ClaimKind::Promised => {
                         claims.mark_promised(entry.hash, &from, nonce, entry.block_height)
@@ -929,10 +772,10 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                     }
                 };
                 if let Err(owner) = claimed {
-                    // Someone already owns the nonce, so this commitment is the
-                    // one that will lose it. Deliberately not seized — see
-                    // `mark_promised`. `recover_envelope` below decides the outcome
-                    // (typically `ReplacementUnderpriced`) and logs it.
+                    // An earlier entry in the file owns the nonce, so this one
+                    // loses it; not seized (see `mark_promised`). If it reaches
+                    // the push below, the push is refused and counted as a
+                    // conflict.
                     warn!(
                         target: "mantle::preconf::journal",
                         hash = ?entry.hash,
@@ -941,18 +784,10 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                     );
                 }
             }
-            // Undecodable envelope. **No record is written**, deliberately:
-            // `recover_slot` shares its first step with `recover_envelope`, so this
-            // entry is about to be rejected there too and will never reach the
-            // queue — and a `Promised` record would break the rule that a
-            // promise names the `(sender, nonce)` it was issued against. A
-            // record that cannot say which nonce it defends would go on to
-            // occupy one anyway.
-            //
-            // Reaching this means the file was corrupted in a way that survived
-            // JSON parsing, or this binary no longer supports that transaction
-            // type. Either way it is a broken commitment we cannot even name, so
-            // it is an `error!`, not a `debug!`.
+            // Undecodable, so no record is made: a record must name the
+            // `(sender, nonce)` it claims. `recover_envelope` rejects the same
+            // entry below. Reaching this means corruption that survived JSON
+            // parsing, or a transaction type this binary no longer supports.
             None => {
                 error!(
                     target: "mantle::preconf::journal",
@@ -966,21 +801,16 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     }
 
     let mut restored = 0usize;
+    let mut conflicts = 0usize;
     let mut honored = 0usize;
     let mut nonce_taken = 0usize;
+    let mut promise_nonce_taken = 0usize;
     let mut unknown = 0usize;
     let mut rejected = 0usize;
 
     for entry in entries {
         let recovered = match source.recover_envelope(&entry.tx_rlp).await {
-            // Decoded. Whether it is still owed is the chain's to say, and the
-            // cheap half of that question comes first: if the sender's nonce
-            // has not moved past this transaction, nothing has taken its place
-            // and the commitment simply has not been kept yet.
-            //
-            // Only when the nonce *is* gone is there anything to investigate,
-            // and only then is the transaction-lookup query below worth
-            // paying for.
+            // Nonce not yet used: still owed, back into the queue.
             Ok(rec) if nonce_still_free(chain, &rec) => rec,
             Ok(rec) => {
                 let reason = format!(
@@ -988,22 +818,12 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                     rec.from,
                     alloy_consensus::Transaction::nonce(&rec.envelope),
                 );
-                // The nonce is gone, but knowing that does not say to whom.
-                // Ask the chain: the three answers mean entirely different
-                // things, and only the first is the commitment having been
-                // kept.
+                // The nonce is used; ask whether by this transaction.
                 match chain.commitment_on_chain(&entry.hash) {
                     OnChain::Yes { height } => {
-                        // The promise was kept before the restart. Start its
-                        // retention clock at the block it actually landed in:
-                        // rotation keeps a record only while the registry is
-                        // still tracking it, so without this the entry would be
-                        // immortal — nothing else will ever report this block,
-                        // it is already in the past, and every future restart
-                        // would replay (and complain about) the same entry.
-                        //
-                        // This does not release the tracking outright; see
-                        // `Commitments::mark_committed`.
+                        // Kept before the restart. Measure retention from the
+                        // block it landed in, which a reorg could still undo
+                        // (see `Commitments::mark_committed`).
                         claims.mark_committed(&entry.hash, height);
                         debug!(
                             target: "mantle::preconf::journal",
@@ -1015,17 +835,14 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                         honored += 1;
                     }
                     OnChain::No => {
-                        // A different transaction took this nonce. The commitment
-                        // is broken and cannot be recovered while that stays true
-                        // — the hash is bound to its nonce by its own signature.
+                        // Another transaction took the nonce, so this one can
+                        // never land: its hash is bound to that nonce.
                         //
-                        // Deliberately still retained: if the transaction that
-                        // took the nonce is itself reverted, this commitment
-                        // becomes applicable again, so there is nothing to
-                        // forget yet. The cost is that the entry survives
-                        // rotation until then, and every restart repeats this
-                        // warning — which is the right noise for a promise we
-                        // could not keep.
+                        // The step-1 record stays, with no fifo entry, until
+                        // `Commitments::sweep` releases it at `SEAL_DEPTH`
+                        // persisted blocks past its promised height; rotation
+                        // then drops the line. Nothing re-injects it if the
+                        // other transaction is reverted.
                         warn!(
                             target: "mantle::preconf::journal",
                             hash = ?entry.hash,
@@ -1034,12 +851,14 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                              transaction; whatever was announced about it will not happen"
                         );
                         nonce_taken += 1;
+                        if entry.kind == ClaimKind::Promised {
+                            promise_nonce_taken += 1;
+                        }
                     }
                     OnChain::Unknown => {
-                        // Retained too: an entry we cannot judge must be
-                        // kept. Actionable for operators, since it means the
-                        // transaction-lookup index this check needs has been
-                        // pruned away.
+                        // Cannot judge, so the record is kept like the `No`
+                        // arm's. Usually means the transaction-lookup index was
+                        // pruned.
                         warn!(
                             target: "mantle::preconf::journal",
                             hash = ?entry.hash,
@@ -1053,12 +872,8 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
                 continue;
             }
             Err(RestoreSkip::Rejected(reason)) => {
-                // Give the record up here rather than leaving it to expire.
-                // Nothing else will ever revisit this hash — it has no fifo
-                // entry and will never be observed on chain — so keeping the
-                // promise record would pin the nonce and hold the journal line
-                // for a commitment this process has already abandoned. The two
-                // halves go together or the journal outlives what tracks it.
+                // Released now rather than left for `sweep`: nothing can land
+                // it, and the record would hold the sender's nonce until then.
                 claims.release_unless_committed(&entry.hash);
                 warn!(
                     target: "mantle::preconf::journal",
@@ -1071,58 +886,47 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
             }
         };
 
-        // Push to fifo. `ConflictActive` happens if a fresher tx
-        // already occupies the (sender, nonce) slot — accept the
-        // newer entry, don't shove a stale journaled one over it.
-        let _ = fifo
+        // The earlier entry in the file keeps a contested `(sender, nonce)`: it
+        // was pushed first, so a later one is refused with `ConflictActive`.
+        // `AlreadyExists` is a duplicate line of an entry already restored.
+        match fifo
             .push_if_absent(
                 Arc::new(recovered.envelope),
                 recovered.from,
                 crate::types::PreconfSource::Replay,
             )
-            .await;
-
-        restored += 1;
+            .await
+        {
+            PushResult::Inserted => restored += 1,
+            PushResult::AlreadyExists => {}
+            PushResult::ConflictActive(_) => conflicts += 1,
+        }
     }
 
-    // `nonce_taken` is the one worth watching: a transaction this node told the
-    // outside about, whose nonce something else has since taken. Published as a
-    // counter as well, because a log line that only appears at startup is easy
-    // to miss.
-    //
-    // It counts two things that do not weigh the same, and cannot tell them
-    // apart. A preconf commitment reaching here means a client holds a
-    // synchronous receipt for a transaction that can never land. An ordinary
-    // pool transaction reaching here means someone replaced their own pending
-    // transaction after a slice had shown it — routine, and the sort of thing
-    // that will bury the first case if an alert is hung on this number as it
-    // stands.
-    //
-    // Telling them apart needs the entry to say which it is, and nothing here
-    // can work it out: the registry is empty at this point — this very pass
-    // is what fills it — and the record carries no marker. A field would do it,
-    // and old files would need no guess, since every record written before pool
-    // transactions were journaled is a commitment. Left for the pass that
-    // settles the metrics, which is where the alert thresholds get decided and
-    // where it will be clear whether this wants a second counter or a label.
+    // Entries whose nonce another transaction took. `restore_nonce_taken`
+    // counts both kinds; `restore_promise_nonce_taken` counts commitments only
+    // — a client holds a receipt for a transaction that can never land — and is
+    // the one to alert on. For a pool transaction this is usually the sender
+    // replacing their own, which is routine.
     metrics::counter!("preconf.journal.restore_nonce_taken").increment(nonce_taken as u64);
+    metrics::counter!("preconf.journal.restore_promise_nonce_taken")
+        .increment(promise_nonce_taken as u64);
     metrics::counter!("preconf.journal.restore_unknown").increment(unknown as u64);
     info!(
         target: "mantle::preconf::journal",
         restored,
+        conflicts,
         honored,
         nonce_taken,
+        promise_nonce_taken,
         unknown,
         rejected,
         "preconf restore complete"
     );
 
-    // Prune now, against the records this pass just established: entries whose
-    // commitment was kept and buried, and the ones given up above, are gone from
-    // the registry and so leave the file here. Doing it after the replay rather
-    // than before is what lets the eviction rule be the registry's alone —
-    // before it, every record would read as untracked. Best-effort; the next
-    // rotation retries.
+    // Rotate against the records this pass established, dropping the ones it
+    // released or found buried. Failure is only logged; the next rotation
+    // retries.
     if let Err(e) = journal.rotate(|hash| claims.is_tracked(hash)).await {
         warn!(
             target: "mantle::preconf::journal",
@@ -1130,32 +934,21 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
             "post-restore rotate failed; the file keeps entries the registry has dropped"
         );
     }
+    Ok(())
 }
 
 // ─── Background rotation loop ───────────────────────────────────────────────
 
-/// Runs the journal rotation loop until `shutdown` resolves, then performs
-/// one final rotation and returns.
+/// Rotate the journal every `interval`, and when a write signals the size cap,
+/// until `shutdown` resolves; then rotate once more and return.
 ///
-/// The loop wakes every `interval`, calls [`PreconfJournal::rotate`],
-/// and logs the [`RotateStats`]. Rotation failures are logged but do
-/// not terminate the loop — the next tick retries.
+/// A failed rotation is logged and retried on the next tick. Shutdown is only
+/// observed between rotations, never in the middle of one. The first tick is
+/// skipped, so a node does not rotate a near-empty file right after boot.
 ///
-/// `shutdown` is any future that resolves to `()` when the caller wants
-/// the loop to stop. `select!` is not preemptive across awaits *within*
-/// a rotate call, so a shutdown signal fired mid-rotate is observed
-/// only when the current rotate resolves — this guarantees the file
-/// is never left in a half-written state.
-///
-/// After the shutdown signal is observed, one **final** rotation is
-/// attempted so entries that `retain` stopped accepting since the last
-/// tick leave the on-disk file before the process exits. Callers that
-/// hold a reth `GracefulShutdownGuard` must keep it alive across this
-/// call so the `TaskManager` waits for the final rotate.
-///
-/// The first rotation is skipped (the interval's immediate-first tick
-/// is consumed at start) so a long-running node does not rotate a
-/// nearly-empty journal in the first few seconds after boot.
+/// The final rotation removes records the registry dropped since the last
+/// tick. Callers passing a reth `GracefulShutdownGuard` as the shutdown output
+/// keep it alive until that rotation completes.
 pub async fn run_rejournal_loop<F, T>(
     journal: Arc<PreconfJournal>,
     claims: Arc<Commitments>,
@@ -1165,18 +958,14 @@ pub async fn run_rejournal_loop<F, T>(
 where
     F: Future<Output = T>,
 {
-    // The one eviction rule: a record may go once `claims` has stopped tracking
-    // its commitment. When that happens is `Commitments::is_tracked`.
+    // The one eviction rule: drop a record once the registry stops tracking it.
     let retain = |hash: &TxHash| claims.is_tracked(hash);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Consume the immediate-first tick so we don't rotate at t=0.
+    // Consume the immediate first tick.
     ticker.tick().await;
-    // Rate-limit size-triggered rotations so a burst of appends over the
-    // cap (e.g. survivors alone exceed `max_size`) can't spin the
-    // expensive full-file `rotate()` on every append. Capped at the
-    // periodic interval so it never rotates more often than the timer
-    // would anyway. `None` ⇒ never rotated yet ⇒ first trigger is honoured.
+    // Size-triggered rotations at most once per `min_gap`, so a file whose
+    // survivors alone exceed the cap does not rotate on every append.
     let min_gap = interval.min(SIZE_ROTATE_MIN_GAP);
     let mut last_rotate: Option<Instant> = None;
     debug!(
@@ -1188,18 +977,14 @@ where
     tokio::pin!(shutdown);
     let signal_output = loop {
         tokio::select! {
-            // `biased` — drain shutdown first so a torn-down
-            // service does not perform one more rotation after
-            // the shutdown signal.
+            // Shutdown first, so no extra rotation runs after the signal.
             biased;
             output = &mut shutdown => {
                 debug!(target: "mantle::preconf::journal", "rotation loop shutting down");
                 break output;
             }
-            // Size-triggered rotation. Honour only if `min_gap` has
-            // elapsed since the last rotate; otherwise drop this wake —
-            // a later append re-notifies (the file is still over the cap)
-            // and the periodic ticker is the safety net.
+            // Ignored within `min_gap` of the last rotation; the next append
+            // signals again, and the ticker is the backstop.
             _ = journal.rotate_notify.notified() => {
                 let now = Instant::now();
                 if last_rotate.is_none_or(|t| now.duration_since(t) >= min_gap) {
@@ -1214,25 +999,20 @@ where
         }
     };
 
-    // Final rotate on shutdown — flush records `retain` has stopped accepting
-    // since the last tick. `signal_output` is held alive across this await so
-    // callers passing a graceful-shutdown guard as `T` keep their runtime's
-    // shutdown latch open until the final on-disk write completes. Failures are
-    // logged; we do not surface them because the process is going away anyway.
+    // Final rotation. `signal_output` is held across it, so a shutdown guard
+    // passed as `T` stays alive until the write completes. Failure is only
+    // logged: the process is exiting.
     log_rotate(journal.rotate(&retain).await, "shutdown");
 
     signal_output
 }
 
-/// Minimum wall-clock gap between two size-triggered rotations, before
-/// being capped at the periodic interval (see [`run_rejournal_loop`]).
-/// Set to the default L2 slot (2s): a burst of size triggers within one
-/// slot collapses to a single rotate, so the expensive full-file rewrite
-/// runs at most once per slot off the hot path.
+/// Minimum gap between two size-triggered rotations, capped at the periodic
+/// interval: one L2 slot (2s), so a burst of triggers rotates at most once a
+/// slot.
 const SIZE_ROTATE_MIN_GAP: Duration = Duration::from_secs(2);
 
-/// Log a rotation outcome uniformly across the tick / size / shutdown
-/// trigger sites.
+/// Log a rotation outcome, for all three triggers (tick, size, shutdown).
 fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
     match result {
         Ok(stats) => {
@@ -1256,14 +1036,10 @@ fn log_rotate(result: Result<RotateStats, JournalError>, reason: &'static str) {
     }
 }
 
-/// Spawns [`run_rejournal_loop`] on the ambient tokio runtime, driven
-/// by a `oneshot::Receiver<()>` shutdown channel.
-///
-/// This is a convenience wrapper primarily used by tests and any caller
-/// that owns its own runtime. Production wiring in `mantle-reth-cli`
-/// uses [`run_rejournal_loop`] directly under
-/// `TaskExecutor::spawn_critical_with_graceful_shutdown_signal` so
-/// the reth `TaskManager` participates in the graceful shutdown handoff.
+/// Spawn [`run_rejournal_loop`] on the ambient runtime, stopped by
+/// `shutdown_rx`. For tests and callers with their own runtime; production
+/// runs [`run_rejournal_loop`] under
+/// `TaskExecutor::spawn_critical_with_graceful_shutdown_signal`.
 pub fn spawn_rejournal_loop(
     journal: Arc<PreconfJournal>,
     claims: Arc<Commitments>,
@@ -1271,9 +1047,7 @@ pub fn spawn_rejournal_loop(
     shutdown_rx: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // `oneshot::Receiver` resolves `Err` when the sender is dropped;
-        // treat both `Ok(())` and drop as shutdown signals so callers
-        // don't have to send explicitly.
+        // A dropped sender also counts as shutdown.
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
@@ -1303,11 +1077,8 @@ mod tests {
         JournalEntry { kind: ClaimKind::Announced, ..entry(byte, height) }
     }
 
-    /// A journal written before `kind` existed holds nothing but commitments:
-    /// pool transactions were not journaled yet. Such a record has to read back
-    /// as one — without the default it would not parse at all, and with the
-    /// wrong default every pre-upgrade commitment would stop being reported as
-    /// broken when it cannot be kept.
+    /// A record written before `kind` existed still parses, and reads back as a
+    /// commitment, so a broken one is still reported as broken.
     #[test]
     fn a_record_written_before_the_kind_field_reads_back_as_a_commitment() {
         let legacy = serde_json::json!({
@@ -1330,8 +1101,7 @@ mod tests {
         (dir, j)
     }
 
-    /// A slice's transactions are written together: one write and one flush
-    /// rather than one per transaction — see [`PreconfJournal::append_batch`].
+    /// A batch is written in order, as one write.
     #[tokio::test]
     async fn append_batch_writes_every_entry_in_order() {
         let (_dir, j) = fresh_journal().await;
@@ -1344,14 +1114,11 @@ mod tests {
         assert_eq!(bad, 0);
     }
 
-    // Deliberately untested: that `append_batch` flushes before returning.
-    // Removing the `flush` does not turn any test here red — tokio's `File`
-    // hands the write to a blocking thread, which has normally finished by the
-    // time a second handle reads the path, so such a test passes on timing
-    // rather than on the guarantee. `append_promised` has the same gap.
+    // Not tested: that `append_batch` flushes before returning. tokio's `File`
+    // writes on a blocking thread that has normally finished before a second
+    // handle reads the path, so such a test would pass even without the flush.
 
-    /// A slice that executed nothing is the common case once the pool is
-    /// drained; it must not cost a write.
+    /// An empty batch, common once the pool is drained, does no IO.
     #[tokio::test]
     async fn append_batch_of_nothing_writes_nothing() {
         let (_dir, j) = fresh_journal().await;
@@ -1362,24 +1129,19 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
-    /// A journal whose file handle cannot be written to, for exercising the
-    /// failure path with a real IO error rather than a stand-in.
+    /// A journal whose writes fail with a real IO error.
     async fn read_only_journal() -> (TempDir, PreconfJournal) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
-        // Create the file, then hold it open read-only: `write_all` on it fails
-        // with EBADF, which is as close to a disk refusing a write as a test
-        // gets without a filesystem fixture.
+        // A read-only handle: `write_all` fails with EBADF.
         let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
         let ro = OpenOptions::new().read(true).open(&path).await.unwrap();
         *j.writer.lock().await = ro;
         (dir, j)
     }
 
-    /// A write that fails keeps its records for the next attempt.
-    ///
-    /// Losing them outright is what the journal exists to prevent, and the
-    /// caller has moved on — its cursor advanced the moment it handed them over.
+    /// A failed write keeps its records for the next attempt; the caller has
+    /// already moved on and will not resend them.
     #[tokio::test]
     async fn a_failed_write_keeps_its_records_for_the_next_attempt() {
         let (_dir, j) = read_only_journal().await;
@@ -1414,12 +1176,8 @@ mod tests {
         assert_eq!(j.pending_len(), 0, "and the buffer is empty again");
     }
 
-    /// A write that stopped mid-line does not cost the record that follows it.
-    ///
-    /// `write_all` can fail partway, leaving a line without its newline. The
-    /// retry appends behind it, and without something to close the line the two
-    /// fuse into one unparseable record — losing the held one as well as the
-    /// truncated one.
+    /// A retry after a write that stopped mid-line does not fuse onto that line;
+    /// only the truncated line is lost.
     #[tokio::test]
     async fn a_retry_does_not_fuse_onto_a_half_written_line() {
         let dir = TempDir::new().unwrap();
@@ -1450,12 +1208,8 @@ mod tests {
         assert_eq!(bad, 1, "and it is still counted as the corrupt line it is");
     }
 
-    /// The buffer stops at its capacity, and the records it drops are the ones
-    /// offered first — theirs are the blocks most likely sealed by now.
-    ///
-    /// Offered as one batch rather than one call each: eviction is what is under
-    /// test, and forty-five thousand failed writes would be a slow way to reach
-    /// it.
+    /// A full buffer drops the records offered first. Offered as one batch, so
+    /// the test does not need tens of thousands of failed writes.
     #[tokio::test]
     async fn a_full_buffer_drops_its_oldest_records() {
         let (_dir, j) = read_only_journal().await;
@@ -1478,8 +1232,8 @@ mod tests {
         );
     }
 
-    /// Fill a buffer through the real eviction rule at a budget a test can
-    /// afford, and report what survived.
+    /// Run the real eviction rule at a small budget; return what survived and
+    /// how many were dropped.
     fn fill(sizes: &[usize], max_count: usize, max_bytes: usize) -> (VecDeque<Vec<u8>>, u64) {
         let mut pending = VecDeque::new();
         let mut bytes = 0usize;
@@ -1493,10 +1247,7 @@ mod tests {
         (pending, dropped)
     }
 
-    /// The byte fuse bites when the record count never would.
-    ///
-    /// The count is the limit to reason with, but it says nothing about memory:
-    /// at the pool's 128 KiB per transaction a full buffer is gigabytes.
+    /// The byte fuse evicts where the count limit would not.
     #[test]
     fn the_byte_fuse_evicts_where_the_count_limit_would_not() {
         let (pending, dropped) = fill(&[100, 100, 100, 100], 1_000, 300);
@@ -1506,8 +1257,7 @@ mod tests {
         assert_eq!(pending.front().expect("non-empty")[0], 1, "and the oldest is what went");
     }
 
-    /// The count still bites first at the sizes ordinary traffic produces —
-    /// which is what makes it the limit worth reasoning about.
+    /// At ordinary record sizes the count limit applies first.
     #[test]
     fn the_count_limit_bites_first_at_ordinary_sizes() {
         let (pending, dropped) = fill(&[100; 6], 4, 1_000_000);
@@ -1516,8 +1266,7 @@ mod tests {
         assert_eq!(dropped, 2);
     }
 
-    /// A record larger than the whole budget is still held: evicting to empty
-    /// and dropping it too would keep nothing at all.
+    /// A record larger than the whole budget is still held.
     #[test]
     fn a_record_larger_than_the_budget_is_still_held() {
         let (pending, _) = fill(&[5_000], 1_000, 300);
@@ -1525,8 +1274,8 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
-    /// A batch counts toward the size cap exactly as the same entries appended
-    /// one at a time would — otherwise a slicing node would never rotate.
+    /// A batch counts toward the size cap like single appends, so a slicing
+    /// node still rotates.
     #[tokio::test]
     async fn append_batch_arms_size_triggered_rotation() {
         let dir = TempDir::new().unwrap();
@@ -1563,9 +1312,8 @@ mod tests {
         }
     }
 
-    /// Age is not an eviction rule here. An entry stamped at the epoch is kept
-    /// as long as `Commitments` still tracks its commitment — the journal has
-    /// no clock of its own to overrule that with.
+    /// Age is not an eviction rule: an entry stamped at the epoch is kept while
+    /// `Commitments` tracks it.
     #[tokio::test]
     async fn rotate_keeps_an_ancient_entry_commitments_still_tracks() {
         let (_dir, j) = fresh_journal().await;
@@ -1581,10 +1329,8 @@ mod tests {
         assert_eq!(survivors, vec![ancient], "still tracked ⇒ still owed ⇒ kept");
     }
 
-    /// The entry leaves the file exactly when `Commitments` stops tracking its
-    /// commitment — nothing else. When that happens (buried `SEAL_DEPTH` deep, a
-    /// promise out of reach, a build giving up) is `Commitments`' question, and
-    /// is pinned by its own `sweep` tests.
+    /// An entry leaves the file when `Commitments` stops tracking it, and not
+    /// before. When that happens is covered by the `sweep` tests.
     #[tokio::test]
     async fn rotate_drops_an_entry_commitments_gave_up() {
         let (_dir, j) = fresh_journal().await;
@@ -1646,7 +1392,7 @@ mod tests {
     async fn load_skips_corrupt_lines_and_reports_count() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
-        // Hand-craft a file with one good line, one corrupt line, one good line.
+        // Two good lines around one corrupt line.
         let good = serde_json::to_string(&entry(7, 70)).unwrap();
         let bad = "{this is not json}";
         let last = serde_json::to_string(&entry(8, 80)).unwrap();
@@ -1662,7 +1408,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let good = serde_json::to_string(&entry(3, 30)).unwrap();
-        // Triple blank lines around the good one.
+        // Two blank lines before the good one and one after.
         tokio::fs::write(&path, format!("\n\n{good}\n\n")).await.unwrap();
         let j = PreconfJournal::open(&path, 0).await.unwrap();
         let (loaded, bad) = j.load().await.unwrap();
@@ -1670,8 +1416,7 @@ mod tests {
         assert_eq!(bad, 3, "blank lines are evidence of an incomplete journal write");
     }
 
-    /// Rotation keeps whatever `retain` says to keep. Production passes
-    /// "`Commitments` is still tracking this".
+    /// Rotation keeps exactly what `retain` accepts.
     #[tokio::test]
     async fn rotate_keeps_exactly_what_retain_accepts() {
         let (_dir, j) = fresh_journal().await;
@@ -1692,8 +1437,7 @@ mod tests {
         assert_eq!(after, vec![e_a, e_c]);
     }
 
-    /// The safe direction: a predicate that keeps everything drops nothing, so a
-    /// rotation tick cannot lose a commitment `Commitments` is still tracking.
+    /// A predicate that keeps everything drops nothing.
     #[tokio::test]
     async fn rotate_keeps_everything_when_retain_always_true() {
         let (_dir, j) = fresh_journal().await;
@@ -1708,17 +1452,11 @@ mod tests {
         assert_eq!(after, vec![e_a, e_b]);
     }
 
-    /// An append racing a rotate must not be lost. `retain` accepts everything
-    /// here, so any absence is the race, not the retention rule.
+    /// Appends racing a rotation are neither lost nor left out of `size_bytes`.
+    /// `retain` keeps everything, so any loss is the race.
     ///
-    /// Two failure modes: an entry landing in rotate's snapshot → rename window
-    /// can be dropped outright, and even when it survives on disk, a counter
-    /// reset to the compaction pass's byte total alone would leave it short of
-    /// the real file and silently mistune the size-rotation trigger.
-    ///
-    /// The appends here race the rotation rather than being placed inside it, so
-    /// which of them land in that window varies between runs; the deterministic
-    /// placement is
+    /// Which appends land inside the rotation varies between runs; the
+    /// deterministic version is
     /// [`an_entry_appended_during_the_compaction_pass_survives_the_swap`].
     #[tokio::test]
     async fn rotate_does_not_lose_concurrent_appends() {
@@ -1727,8 +1465,7 @@ mod tests {
         let path = dir.path().join("preconf.jsonl");
         let j = Arc::new(PreconfJournal::open(&path, 0).await.unwrap());
 
-        // Survivors widen rotate's tmp-write window, so the race has something
-        // to land in.
+        // Existing records lengthen the rotation, giving the race room.
         for i in 0..5u8 {
             j.append_promised(&entry(i, u64::from(i))).await.unwrap();
         }
@@ -1767,12 +1504,9 @@ mod tests {
         );
     }
 
-    /// Hold a rotation open inside its compaction pass.
-    ///
-    /// `retain` is called once per record being compacted, which makes it the
-    /// one place a test can stand in the middle of a rotation and ask what else
-    /// can still happen. Returns the journal, a receiver that fires when the
-    /// pass has begun, the handle to release it, and the rotation's own handle.
+    /// Hold a rotation open inside its compaction pass, by blocking in the
+    /// first `retain` call. Returns a receiver that fires once the pass has
+    /// begun, the sender that releases it, and the rotation's handle.
     fn rotation_held_open(
         j: Arc<PreconfJournal>,
     ) -> (
@@ -1787,8 +1521,7 @@ mod tests {
             j.rotate(move |_| {
                 if first.swap(false, Ordering::Relaxed) {
                     compacting_tx.send(()).expect("test is listening");
-                    // Blocks the pass until the test has its answer. A blocking
-                    // recv because `retain` is synchronous.
+                    // Blocking recv: `retain` is synchronous.
                     release_rx.recv().expect("test releases the pass");
                 }
                 true
@@ -1799,14 +1532,9 @@ mod tests {
         (compacting_rx, release_tx, rotate)
     }
 
-    /// What the locked span reports must be the swap, not the whole rotation —
-    /// otherwise `rotate_locked_ms` says appends waited for the rewrite, which
-    /// is the number the split was made to bring down.
-    ///
-    /// The pass is held open for a known stretch and the span is required to be
-    /// shorter than that stretch. A timer covering the whole pass would report
-    /// at least the hold; the true value is microseconds, so the margin is
-    /// three orders of magnitude rather than a threshold to tune.
+    /// `locked_for` covers only the locked tail, not the compaction pass. The
+    /// pass is held open for 300ms; the tail (a small splice and one fsync)
+    /// takes far less.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_locked_span_excludes_the_compaction_pass() {
         let dir = TempDir::new().unwrap();
@@ -1830,14 +1558,9 @@ mod tests {
         );
     }
 
-    /// The compaction pass reads to the offset it snapshotted, not to end of
-    /// file. Reading further would put records into the rewritten file that the
-    /// splice then appends a second time.
-    ///
-    /// Pinned on `load_upto` directly rather than by racing a rotation: the
-    /// window between taking the snapshot and finishing the read has no hook a
-    /// test could stand in, so a concurrent append can only land inside it by
-    /// luck.
+    /// `load_upto` reads only to its limit, or the splice would append records
+    /// a second time. Tested directly because a race cannot reliably land an
+    /// append inside that window.
     #[tokio::test]
     async fn the_compaction_pass_reads_only_as_far_as_its_snapshot() {
         let (_dir, j) = fresh_journal().await;
@@ -1854,8 +1577,7 @@ mod tests {
         assert_eq!(seen, vec![compacted], "read past the snapshot into {latecomer:?}");
     }
 
-    /// An append must not queue behind the compaction pass — see
-    /// [`PreconfJournal::rotate`] for why the pass runs unlocked.
+    /// An append does not wait for the compaction pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_append_does_not_wait_for_the_compaction_pass() {
         let dir = TempDir::new().unwrap();
@@ -1867,8 +1589,7 @@ mod tests {
         let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
         compacting.recv().await.expect("compaction pass began");
 
-        // Generous: the question is whether the append is blocked at all, not
-        // how quickly it finishes.
+        // Generous: this checks the append is not blocked, not its speed.
         let appended =
             tokio::time::timeout(Duration::from_secs(5), j.append_promised(&entry(9, 9))).await;
 
@@ -1877,10 +1598,8 @@ mod tests {
         appended.expect("append waited for the compaction pass to finish").unwrap();
     }
 
-    /// The compaction pass owns the file only as far as it had grown when the
-    /// pass began. Whatever lands past that point has to be carried into the
-    /// rotated file, and counted, or the swap discards it and leaves the size
-    /// counter describing a file that no longer exists.
+    /// A record appended during the compaction pass is carried into the rotated
+    /// file and counted in `size_bytes`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_entry_appended_during_the_compaction_pass_survives_the_swap() {
         let dir = TempDir::new().unwrap();
@@ -1893,9 +1612,8 @@ mod tests {
         let (mut compacting, release, rotate) = rotation_held_open(Arc::clone(&j));
         compacting.recv().await.expect("compaction pass began");
 
-        // Timed, not a bare await: an implementation that blocks appends for the
-        // duration of the pass would otherwise deadlock the test here rather
-        // than fail it.
+        // Timed, so an implementation that blocks appends fails instead of
+        // deadlocking.
         let late = entry(9, 9);
         let appended = tokio::time::timeout(Duration::from_secs(5), j.append_promised(&late)).await;
 
@@ -1903,9 +1621,8 @@ mod tests {
         rotate.await.unwrap();
         appended.expect("append waited for the compaction pass to finish").unwrap();
 
-        // Exact, not `contains`: the survivors in their original order followed
-        // by the one that arrived late. Equality is what rules out the entry
-        // being dropped, duplicated, or reordered against the compacted ones.
+        // Exact equality: rules out the late entry being dropped, duplicated or
+        // reordered.
         let mut expected: Vec<JournalEntry> = (0..5u8).map(|i| entry(i, u64::from(i))).collect();
         expected.push(late);
 
@@ -1919,10 +1636,9 @@ mod tests {
         );
     }
 
+    /// After a rotation, appends land in the rotated file.
     #[tokio::test]
     async fn rotate_then_append_writes_to_new_file_handle() {
-        // Verify the writer is re-opened against the new inode after
-        // rotation — a subsequent append must land in the rotated file.
         let (_dir, j) = fresh_journal().await;
         let e_a = entry(1, 10);
         j.append_promised(&e_a).await.unwrap();
@@ -1936,18 +1652,114 @@ mod tests {
         assert_eq!(after, vec![e_b]);
     }
 
+    /// A non-UTF-8 byte costs one corrupt line, not the whole read: a failed
+    /// read would stop the node starting, and make every rotation fail.
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_costs_only_itself() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let mut file = serde_json::to_vec(&entry(7, 70)).unwrap();
+        file.extend_from_slice(b"\n\xff\xfe{}\n");
+        file.extend_from_slice(&serde_json::to_vec(&entry(8, 80)).unwrap());
+        file.push(b'\n');
+        tokio::fs::write(&path, file).await.unwrap();
+        let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
+
+        let (loaded, bad) = j.load().await.expect("a bad byte does not fail the read");
+        assert_eq!(loaded, vec![entry(7, 70), entry(8, 80)]);
+        assert_eq!(bad, 1);
+
+        let stats = j.rotate(|_| true).await.expect("nor does it fail rotation");
+        assert_eq!(stats.bad_lines_skipped, 1);
+        let (after, bad_after) = j.load().await.unwrap();
+        assert_eq!(after, vec![entry(7, 70), entry(8, 80)]);
+        assert_eq!(bad_after, 0, "rotation leaves the bad line behind");
+    }
+
+    /// A write that fails part-way leaves bytes `size_bytes` never counted.
+    /// Rotation must still cut at the real end of the file, or it splits and
+    /// loses the record written after the failure.
+    ///
+    /// The partial write is staged by hand (a fragment appended directly, its
+    /// record put in the retry buffer); no portable way stops a real write
+    /// half-way.
+    #[tokio::test]
+    async fn rotation_after_a_partial_write_keeps_every_record() {
+        let (_dir, j) = fresh_journal().await;
+        let before = entry(1, 10);
+        j.append_promised(&before).await.unwrap();
+
+        let failed = entry(2, 10);
+        let failed_line = serde_json::to_vec(&failed).unwrap();
+        {
+            use std::io::Write;
+            let mut raw = std::fs::OpenOptions::new().append(true).open(&j.path).unwrap();
+            raw.write_all(&failed_line[..failed_line.len() / 2]).unwrap();
+        }
+        let mut held = failed_line;
+        held.push(b'\n');
+        j.buffer(vec![held]);
+
+        let after = entry(3, 10);
+        j.append_promised(&after).await.expect("the disk is back");
+        j.rotate(|_| true).await.unwrap();
+
+        let (loaded, _) = j.load().await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.hash).collect::<Vec<_>>(),
+            vec![before.hash, failed.hash, after.hash],
+        );
+        assert_eq!(
+            j.size_bytes.load(Ordering::Relaxed),
+            std::fs::metadata(&j.path).unwrap().len(),
+            "and the counter matches the rotated file",
+        );
+    }
+
+    /// After a rotation the writer and the path name the same file, so later
+    /// appends land where a restart reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rotation_leaves_the_writer_on_the_file_at_the_path() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_dir, j) = fresh_journal().await;
+        j.append_promised(&entry(1, 10)).await.unwrap();
+        j.rotate(|_| true).await.unwrap();
+
+        let writer_ino = j.writer.lock().await.metadata().await.unwrap().ino();
+        let path_ino = std::fs::metadata(&j.path).unwrap().ino();
+        assert_eq!(writer_ino, path_ino);
+        assert!(!tmp_path_for(&j.path).exists(), "the tmp file was renamed into place");
+    }
+
+    /// An unreadable journal makes restore return the error, not an empty
+    /// "successful" restore.
+    #[tokio::test]
+    async fn restore_returns_the_error_when_the_journal_cannot_be_read() {
+        let (dir, j) = fresh_journal().await;
+        let path = dir.path().join("preconf.jsonl");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let fifo = Arc::new(PreconfTxSet::new(16));
+
+        let result =
+            restore_preconf_state(&j, &StubSource::new(), &landed(), &fifo, &empty_commitments())
+                .await;
+
+        assert!(matches!(result, Err(JournalError::Io(_))), "got {result:?}");
+    }
+
     // ── restore_preconf_state ──────────────────────────────────────
 
-    /// Stub [`RestoreSource`] that records every `recover_envelope` call. We
-    /// don't go through real reth pool machinery — that's wired in by
-    /// the cli crate at a later phase. The stub fabricates plausible
-    /// envelopes for every `recover_envelope` call.
+    /// Stub [`RestoreSource`]: records every `recover_envelope` call and
+    /// fabricates an envelope from the first byte of the bytes it is given.
     struct StubSource {
-        // Counts for assertions.
+        /// Bytes passed to `recover_envelope`, in order.
         add_calls: std::sync::Mutex<Vec<Bytes>>,
-        // Whether recover_envelope should return Err.
+        /// `recover_envelope` returns `Err`.
         reject_add: bool,
-        // Whether recover_slot should fail, i.e. the bytes do not decode.
+        /// The bytes do not decode: `recover_slot` returns `None` too.
         undecodable: bool,
     }
 
@@ -1963,9 +1775,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RestoreSource for StubSource {
-        /// Must agree with the `(from, nonce)` `recover_envelope` fabricates below —
-        /// restore claims the slot from this and pushes the fifo entry from that,
-        /// so a mismatch would silently test nothing.
+        /// Must return the `(from, nonce)` `recover_envelope` fabricates, or
+        /// restore would claim one slot and push another.
         fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
             if self.undecodable {
                 return None;
@@ -1978,22 +1789,18 @@ mod tests {
             if self.reject_add {
                 return Err(RestoreSkip::Rejected("rejected by stub".into()));
             }
-            // Undecodable bytes fail here too: the real adapter decodes the same
-            // RLP in both methods, so a stub that let one succeed while the other
-            // failed would exercise a state production cannot reach.
+            // Fails here as in `recover_slot`, as the real adapter would.
             if self.undecodable {
                 return Err(RestoreSkip::Rejected("does not decode".into()));
             }
-            // Fabricate an envelope. We use a deterministic dummy
-            // legacy tx — the journal restore code only needs `envelope`
-            // and `from` to be present; nothing reads their content
-            // beyond push_if_absent's bookkeeping.
+            // A dummy legacy transaction; restore only uses `envelope` and
+            // `from` for the fifo push.
             use alloy_consensus::{Signed, TxLegacy};
             use alloy_primitives::Signature;
             let nonce = u64::from(tx_rlp.first().copied().unwrap_or(0));
             let inner = TxLegacy { nonce, ..Default::default() };
             let sig = Signature::test_signature();
-            // Derive a non-deterministic but stable hash from the rlp byte.
+            // Hash and sender derived from the first byte.
             let hash_byte = tx_rlp.first().copied().unwrap_or(0);
             let hash = TxHash::from([hash_byte; 32]);
             let envelope = TxEnvelope::Legacy(Signed::new_unchecked(inner, sig, hash));
@@ -2002,13 +1809,9 @@ mod tests {
         }
     }
 
-    /// Scripted chain view: answers every hash the same way.
-    ///
-    /// [`OnChain::Yes`] is what tests that predate the three-way split want —
-    /// back then a consumed nonce *was* "the commitment landed", so passing `Yes`
-    /// keeps their subject unchanged.
-    /// `nonce` is what the chain says the sender is at; `None` leaves every
-    /// commitment's nonce free, which is the "still owed" path.
+    /// Scripted chain view: the same `OnChain` answer for every hash, and
+    /// `.1` as every sender's nonce (`None`: unreadable, so every entry's nonce
+    /// counts as still free).
     struct StubChain(OnChain, Option<u64>);
 
     impl CommitmentChainView for StubChain {
@@ -2021,32 +1824,27 @@ mod tests {
         }
     }
 
-    /// The chain view for tests that are not about this distinction.
+    /// The chain view for tests that do not care whether an entry landed.
     fn landed() -> StubChain {
         StubChain(OnChain::Yes { height: LANDED_AT }, None)
     }
 
-    /// Height `landed()` reports. Arbitrary; the tests only care about it
-    /// relative to the persisted watermark they publish.
+    /// Height `landed()` reports; only its distance to the persisted watermark
+    /// matters.
     const LANDED_AT: u64 = 10;
 
-    /// The production rotation predicate: a record stays while `Commitments` is
-    /// still tracking its commitment. Tests use it so they exercise the same
-    /// decision production does, rather than a hand-written stand-in.
+    /// The production rotation predicate.
     fn retain_tracked(c: &Commitments) -> impl Fn(&TxHash) -> bool + '_ {
         move |h| c.is_tracked(h)
     }
 
-    /// `Commitments` for restore tests, with **empty allowlists on purpose**: cold
-    /// start may legitimately have loaded two empty lists (governance allows
-    /// nobody) and restore must still bring commitments back. `restart_replay.rs`
-    /// structurally cannot reproduce that, since it seeds the lists before the
-    /// node starts.
+    /// An **enabled** `Commitments` with **empty allowlists**.
     ///
-    /// Built **enabled**, because `PreconfConfig::default()` has
-    /// `enabled: false`, which short-circuits every write on this type — restore
-    /// would appear to run and record nothing. Any `Commitments` a test hands to
-    /// `restore_preconf_state` must be enabled for the same reason.
+    /// Enabled, because a disabled one (the `PreconfConfig` default) records
+    /// nothing and restore would appear to do nothing. Empty allowlists,
+    /// because restore must bring commitments back even when governance
+    /// currently allows nobody; `restart_replay.rs` cannot cover that, as it
+    /// seeds the lists before the node starts.
     fn empty_commitments() -> Commitments {
         Commitments::from_config(&crate::PreconfConfig {
             enabled: true,
@@ -2054,10 +1852,8 @@ mod tests {
         })
     }
 
-    /// A `Commitments` that has finished tracking `hashes`: each was promised,
-    /// observed on chain, and has since been buried `SEAL_DEPTH` persisted
-    /// blocks deep. Rotation may drop a record in that state, which is what the
-    /// rejournal-loop tests need to set up.
+    /// A `Commitments` that has finished tracking `hashes`: promised, landed,
+    /// buried `SEAL_DEPTH` deep and released, so rotation may drop them.
     fn commitments_done_with(hashes: &[TxHash]) -> Arc<Commitments> {
         let c = empty_commitments();
         for (i, h) in hashes.iter().enumerate() {
@@ -2067,40 +1863,32 @@ mod tests {
         }
         c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         for h in hashes {
-            // Rotation keys on the record, so take the step that removes it — the
-            // same one `forward` takes when the fifo drops a landed entry. Its
-            // `true` doubles as the fixture's sanity check: it refuses while the
-            // commitment is still inside its retention period.
+            // Stands in for `Commitments::sweep` releasing a buried record.
+            // Returns false while still within retention, which the assert
+            // catches.
             assert!(c.release_unless_committed(h), "fixture must be done with the commitment");
         }
         Arc::new(c)
     }
 
-    /// A `Commitments` with the watermark already high enough that anything
-    /// [`finish_tracking`] marks becomes immediately releasable. For tests that
-    /// need to finish a commitment *after* the rotation loop has started.
+    /// A `Commitments` whose watermark already makes anything
+    /// [`finish_tracking`] marks releasable, for finishing a commitment after
+    /// the rotation loop has started.
     fn commitments_with_high_watermark() -> Arc<Commitments> {
         let c = empty_commitments();
         c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         Arc::new(c)
     }
 
-    /// Mark `hash` as a commitment this process still owes: promised, never
-    /// landed, and promised for a block the chain cannot have buried. Rotation
-    /// must keep it — an entry with no record at all would be dropped as an
-    /// orphan, so a fixture's survivor has to say so explicitly.
+    /// Mark `hash` as still owed: promised for a block that cannot be buried
+    /// yet, so rotation keeps it. (An entry with no record would be dropped.)
     fn still_owed(c: &Commitments, hash: TxHash) {
         let _ = c.mark_promised(hash, &Address::from([0xEE; 20]), u64::from(hash.0[0]), u64::MAX);
         assert!(c.is_tracked(&hash));
     }
 
-    /// Take `hash` through promise → committed → released, so `Commitments` is
-    /// done with it — i.e. finish tracking a commitment mid-flight.
-    ///
-    /// The release is the point: rotation keys on the record, and retention
-    /// expiring is not the record disappearing. This takes the same step
-    /// production takes when `forward` drops the fifo entry of a landed
-    /// commitment, so the journal predicate sees what it would see there.
+    /// Take `hash` through promised → landed → released, so `Commitments` is
+    /// done with it. The release stands in for `Commitments::sweep`.
     fn finish_tracking(c: &Commitments, hash: TxHash) {
         // The nonce is derived from the hash so repeated calls do not collide.
         let _ = c.mark_promised(hash, &Address::from([0xEE; 20]), u64::from(hash.0[0]), 0);
@@ -2109,17 +1897,12 @@ mod tests {
         assert!(!c.is_tracked(&hash));
     }
 
-    /// What a restart costs, at the volume slicing produces.
+    /// Restore stays linear in the entry count. With slicing, a restart can
+    /// face tens of thousands of entries.
     ///
-    /// Journaling pool transactions takes the file from a handful of entries per
-    /// block to roughly a block's worth, and rotation only clears it once a
-    /// minute — so a restart can face tens of thousands of entries, each one
-    /// decoded, claimed and offered to the pool before the node serves anything.
-    ///
-    /// Not an assertion about wall-clock time, which would be a flaky test on
-    /// shared CI. It prints, so the number can be read off a run and recorded;
-    /// what it *guards* is that restore stays linear — the two volumes differ by
-    /// 10x, and anything quadratic in the entry count would show up as 100x.
+    /// Asserts on the ratio between 1k and 10k entries, not on wall-clock
+    /// time, which would be flaky on shared CI: linear is ~10x, quadratic ~100x.
+    /// The timings are printed for reference.
     #[tokio::test]
     async fn restore_cost_grows_with_the_entry_count_not_faster() {
         async fn restore_n(n: usize) -> std::time::Duration {
@@ -2140,7 +1923,7 @@ mod tests {
             let claims = empty_commitments();
 
             let started = std::time::Instant::now();
-            restore_preconf_state(&journal, &pool, &chain, &fifo, &claims).await;
+            restore_preconf_state(&journal, &pool, &chain, &fifo, &claims).await.expect("restore");
             started.elapsed()
         }
 
@@ -2148,8 +1931,8 @@ mod tests {
         let large = restore_n(10_000).await;
         println!("restore: 1k entries {small:?}, 10k entries {large:?}");
 
-        // 10x the entries, generously under 40x the time. A quadratic restore
-        // would be near 100x and trip this; ordinary scheduling noise will not.
+        // Under 40x: quadratic would be near 100x; scheduling noise stays well
+        // below 40x.
         let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::EPSILON);
         assert!(
             ratio < 40.0,
@@ -2163,17 +1946,16 @@ mod tests {
         let (_dir, j) = fresh_journal().await;
         let pool = StubSource::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments())
+            .await
+            .expect("restore");
         assert!(pool.add_calls.lock().unwrap().is_empty());
         assert!(fifo.snapshot().await.is_empty());
     }
 
-    /// A slice writes the ordinary pool transactions it carried, and those are
-    /// not commitments: nobody holds a receipt for them, and a consumer that
-    /// sees one reconciles on its own. Restoring them as `Promised` makes a
-    /// sender replacing their own pending transaction indistinguishable from a
-    /// receipt this node cannot honour — which is what
-    /// `preconf.tx.commitment_broken_total` exists to count.
+    /// Restore re-establishes each record as the kind it was written with. A
+    /// pool transaction read back as `Promised` would make a sender's own
+    /// replacement look like a broken commitment.
     #[tokio::test]
     async fn restore_keeps_the_kind_each_record_was_written_with() {
         let (_dir, j) = fresh_journal().await;
@@ -2182,7 +1964,9 @@ mod tests {
 
         let claims = Arc::new(empty_commitments());
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &StubSource::new(), &landed(), &fifo, &claims).await;
+        restore_preconf_state(&j, &StubSource::new(), &landed(), &fifo, &claims)
+            .await
+            .expect("restore");
 
         assert!(
             claims.was_promised(&TxHash::from([1; 32])),
@@ -2202,7 +1986,9 @@ mod tests {
 
         let pool = StubSource::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments())
+            .await
+            .expect("restore");
 
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "both txs admitted");
         let snapshot = fifo.snapshot().await;
@@ -2217,20 +2003,20 @@ mod tests {
 
         let pool = StubSource::new();
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments()).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &empty_commitments())
+            .await
+            .expect("restore");
 
         assert_eq!(pool.add_calls.lock().unwrap().len(), 1);
         assert_eq!(fifo.snapshot().await.len(), 1);
     }
 
-    /// Every entry must already carry promised **before the first one reaches
-    /// `recover_envelope`**, not merely before its own. Asserted from inside
-    /// `recover_envelope`. See the pre-pass in `restore_preconf_state` for why
-    /// the stronger form is the one that matters.
+    /// Every entry has a record **before the first one reaches
+    /// `recover_envelope`**, not merely before its own.
     #[tokio::test]
     async fn restore_marks_every_entry_promised_before_admitting_any() {
-        /// Pool that, on each tx it is handed, snapshots the promise flag of **all**
-        /// journal hashes — including the ones not offered yet.
+        /// On each call, snapshots whether every journal hash is tracked,
+        /// including those not decoded yet.
         struct RecordSpySource {
             claims: Arc<Commitments>,
             hashes: Vec<TxHash>,
@@ -2265,9 +2051,7 @@ mod tests {
         }
 
         let (_dir, j) = fresh_journal().await;
-        // `entry(byte, height)` keys both the journal hash and the stub's
-        // fabricated envelope off the same byte, so the spy can look the record
-        // up by hash.
+        // `entry(byte, ..)` and the spy derive the hash from the same byte.
         j.append_promised(&entry(1, 10)).await.unwrap();
         j.append_promised(&entry(2, 11)).await.unwrap();
         j.append_promised(&entry(3, 12)).await.unwrap();
@@ -2279,14 +2063,12 @@ mod tests {
             seen: std::sync::Mutex::new(vec![]),
         };
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &claims).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &claims).await.expect("restore");
 
         let seen = pool.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 3, "every entry must be offered to the pool");
-        // The discriminating assertion is on the **first** admission: entries 2
-        // and 3 have not been offered yet and must already be `Promised`. Marking
-        // each entry just before its own admission satisfies "this one is
-        // Promised" but leaves those two `None` — that arrangement fails here.
+        // At the first call, entries 2 and 3 must already be tracked. Recording
+        // each entry just before its own decode would leave them `false`.
         assert!(
             seen[0].iter().all(|promised| *promised),
             "all entries must be Promised before the first admission, including \
@@ -2295,26 +2077,14 @@ mod tests {
         );
     }
 
-    /// The same ordering invariant for the **slot**: every commitment must own
-    /// its `(sender, nonce)` before the first entry is offered to the pool.
-    ///
-    /// Without the pre-pass claiming it, the nonce would read as *free* from
-    /// restore until `recover_envelope` drives that entry through the validator. A
-    /// same-nonce transaction admitted in that interval takes the slot, and the
-    /// commitment loses a nonce its client was already told it had. Nothing can
-    /// admit in that interval as the node is wired today (`cli::node` runs
-    /// restore before reth's local-tx backup loader, the RPC server and the
-    /// network), so this pins the property that the *index* enforces it rather
-    /// than startup order.
-    ///
-    /// NB the `Commitments` here has to be **enabled**: `mark_promised` returns
-    /// early on a disabled one and records nothing at all, which would make this
-    /// test vacuous. `empty_commitments()` would serve equally well — it builds
-    /// the same thing.
+    /// Every entry's `(sender, nonce)` is claimed before the first entry reaches
+    /// `recover_envelope`, so no same-nonce transaction can take it in between.
+    /// Startup order prevents that today; this checks restore does not depend
+    /// on it.
     #[tokio::test]
     async fn restore_claims_every_slot_before_admitting_any() {
-        /// Pool that, on each tx it is handed, snapshots the owner of **all** the
-        /// journal entries' slots — including those not offered yet.
+        /// On each call, snapshots the owner of every entry's slot, including
+        /// those not decoded yet.
         struct SlotSpySource {
             claims: Arc<Commitments>,
             slots: Vec<(Address, u64)>,
@@ -2357,6 +2127,8 @@ mod tests {
         j.append_promised(&entry(2, 11)).await.unwrap();
         j.append_promised(&entry(3, 12)).await.unwrap();
 
+        // Must be enabled, or `mark_promised` records nothing and the test
+        // proves nothing.
         let claims =
             Arc::new(Commitments::enabled(crate::commitments::DEFAULT_COMMITMENT_CACHE_CAP));
         let pool = SlotSpySource {
@@ -2365,13 +2137,12 @@ mod tests {
             seen: std::sync::Mutex::new(vec![]),
         };
         let fifo = Arc::new(PreconfTxSet::new(16));
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &claims).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &claims).await.expect("restore");
 
         let seen = pool.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 3, "every entry must be offered to the pool");
-        // Discriminating on the **first** admission: entries 2 and 3 have not been
-        // offered yet. Claiming inside the loop, or leaving the claim to the
-        // validator, leaves those two `None` here.
+        // At the first call, entries 2 and 3 must already be claimed.
+        // Claiming inside the decode loop would leave them `None`.
         assert_eq!(
             seen[0],
             (1u8..=3).map(|b| Some(TxHash::from([b; 32]))).collect::<Vec<_>>(),
@@ -2379,15 +2150,9 @@ mod tests {
         );
     }
 
-    /// An entry whose transaction is **already on chain** is the commitment
-    /// having been kept, not a failure. What landing does and does not do to
-    /// the record is [`crate::commitments::Commitments::mark_committed`]; what
-    /// this pins is the consequence for the file — kept while the block is
-    /// shallow, droppable once retention expires, which is what stops every
-    /// future restart replaying and complaining about the same entry forever.
-    ///
-    /// That such an entry never reaches the fifo is covered separately, by
-    /// `a_consumed_nonce_never_reaches_the_fifo`.
+    /// An entry already on chain is a kept commitment: its line stays while the
+    /// landing block is shallow and can go once it is buried. (That it never
+    /// reaches the fifo is `a_consumed_nonce_never_reaches_the_fifo`.)
     #[tokio::test]
     async fn restore_starts_the_retention_clock_for_an_already_landed_entry() {
         let (_dir, j) = fresh_journal().await;
@@ -2395,9 +2160,8 @@ mod tests {
         j.append_promised(&e).await.unwrap();
 
         let c = empty_commitments();
-        // Coherent rather than `landed()`: a transaction that is on chain has
-        // necessarily taken its nonce, and it is the *nonce* that sends
-        // restore looking for the hash in the first place.
+        // Nonce gone as well as `Yes`: an on-chain transaction has used its
+        // nonce, and the used nonce is what makes restore look up the hash.
         restore_preconf_state(
             &j,
             &OnChainSource,
@@ -2405,16 +2169,16 @@ mod tests {
             &Arc::new(PreconfTxSet::new(16)),
             &c,
         )
-        .await;
+        .await
+        .expect("restore");
 
-        // Shallow, so the record is still held and the line with it.
+        // Shallow: the record, and so the line, is kept.
         assert!(!c.release_unless_committed(&e.hash), "shallow: the record is held");
         let stats = j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();
         assert_eq!(remaining, vec![e.clone()], "kept while shallow; stats = {stats:?}");
 
-        // Buried deep enough, the record may go — so the next restart will not
-        // see it again.
+        // Buried: the record may go, and rotation drops the line.
         c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         assert!(c.release_unless_committed(&e.hash), "buried: the record is released");
         let stats = j.rotate(retain_tracked(&c)).await.unwrap();
@@ -2422,25 +2186,17 @@ mod tests {
         assert!(remaining.is_empty(), "rotation must drop it; stats = {stats:?}");
     }
 
-    /// **The invariant the guard's occupancy check rests on**: nothing ever gets
-    /// a fifo entry for a `(sender, nonce)` it does not own.
+    /// Restore never leaves a fifo entry for a `(sender, nonce)` it does not own.
     ///
-    /// Restore is the one place that pushes entries without going through
-    /// admission, and the one place that mints a promise — the
-    /// record the guard waves past its occupancy check. So it is the only
-    /// candidate for producing the violating state, and it needs two journal
-    /// records on one `(sender, nonce)` to try.
-    ///
-    /// Two records like that should not exist (a commitment holds its nonce from
-    /// the receipt until it is buried `SEAL_DEPTH` deep, so a same-nonce
-    /// replacement can never earn its own receipt). This test does not rely on
-    /// that: it hands restore exactly that input and shows the loser still comes
-    /// away with no entry, because `push_if_absent` refuses a different hash on
-    /// an occupied `(sender, nonce)`.
+    /// Restore pushes entries without going through admission, so it is the
+    /// one place that could break this. Two journal records on one
+    /// `(sender, nonce)` should not occur, but given them, only the slot's
+    /// owner gets an entry: `push_if_absent` refuses a different hash on an
+    /// occupied slot.
     #[tokio::test]
     async fn restore_never_leaves_a_fifo_entry_without_its_slot() {
-        /// Every entry decodes to the *same* `(sender, nonce)` but a hash taken
-        /// from its first rlp byte — the collision the invariant forbids.
+        /// Every entry decodes to the same `(sender, nonce)`, with a hash from
+        /// its first byte.
         struct SameSlotSource;
 
         const SHARED_SENDER: Address = Address::new([0xAB; 20]);
@@ -2476,13 +2232,12 @@ mod tests {
 
         let fifo = Arc::new(PreconfTxSet::new(16));
         let c = empty_commitments();
-        restore_preconf_state(&j, &SameSlotSource, &landed(), &fifo, &c).await;
+        restore_preconf_state(&j, &SameSlotSource, &landed(), &fifo, &c).await.expect("restore");
 
-        // The pre-pass gives the slot to whoever asks first; the other loses it.
+        // The first entry claims the slot; the other loses it.
         let owner = c.slot_owner(&SHARED_SENDER, SHARED_NONCE).expect("someone owns the nonce");
         let other = if owner == winner.hash { loser.hash } else { winner.hash };
 
-        // The invariant: every fifo entry owns its `(sender, nonce)`.
         assert!(fifo.contains(&owner).await, "the owner is the one that gets an entry");
         assert!(
             !fifo.contains(&other).await,
@@ -2490,13 +2245,11 @@ mod tests {
         );
     }
 
-    /// The sender's nonce, as the tests below arrange for the chain to report
-    /// it: past every commitment they journal, so each takes the "nonce is
-    /// gone" path and differs only in what the chain then says about the hash.
+    /// A sender nonce past every journaled entry, so the tests below all take
+    /// the "nonce used" path and differ only in the `OnChain` answer.
     const NONCE_IS_GONE: Option<u64> = Some(u64::MAX);
 
-    /// A decoder that always succeeds. What the entry's fate is depends on
-    /// the chain now, not on this.
+    /// A decoder that always succeeds; the outcome is up to the chain view.
     struct OnChainSource;
 
     #[async_trait::async_trait]
@@ -2521,16 +2274,10 @@ mod tests {
         }
     }
 
-    /// **The bug this three-way split exists for.** The sender's nonce is gone,
-    /// but a *different* transaction consumed it — so the commitment is broken,
-    /// not kept.
-    ///
-    /// There is nothing to forget: the transaction that took the nonce may itself
-    /// be reverted, and then this commitment applies again. So restore must not
-    /// record it as landed, and `retain_tracked` must therefore keep it. A
-    /// nonce-only test cannot tell this case from "kept": `tx.nonce <
-    /// account.nonce` holds either way and never looks at the hash, so the
-    /// entry would be dropped at the next rotation and counted as honoured.
+    /// Nonce used by a *different* transaction: the commitment is broken, not
+    /// kept. Restore must not record it as landed, and its line survives
+    /// rotation until `Commitments::sweep` releases the record. A nonce-only
+    /// check would read this as kept and drop the line at once.
     #[tokio::test]
     async fn a_stolen_nonce_keeps_its_entry_through_rotation() {
         let (_dir, j) = fresh_journal().await;
@@ -2545,11 +2292,11 @@ mod tests {
             &Arc::new(PreconfTxSet::new(16)),
             &c,
         )
-        .await;
+        .await
+        .expect("restore");
 
-        // `retain_tracked`, not `|_| true`: the entry survives because
-        // `Commitments` still has its record. A predicate that read the
-        // consumed nonce as "kept" would drop the line here instead.
+        // `retain_tracked`, not `|_| true`: the line survives because the
+        // record does.
         j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();
         assert_eq!(
@@ -2558,15 +2305,12 @@ mod tests {
             "must survive rotation, so a later reorg can still free its nonce"
         );
 
-        // And the record is un-landed, not landed-and-shallow: only an un-landed
-        // one can be released outright. A commitment observed on chain would be
-        // held by its retention depth instead. How long an un-landed promise is
-        // kept is `sweep`'s question, pinned in `Commitments`' own tests.
+        // Not landed: a landed record could not be released while shallow.
         assert!(c.release_unless_committed(&e.hash), "restore must not record it as landed");
     }
 
-    /// Cannot tell ⇒ keep. Folding `Unknown` into "on chain" would reinstate the
-    /// silent misreport on a node whose transaction-lookup index is pruned.
+    /// `Unknown` keeps the entry; read as "on chain" it would hide a broken
+    /// commitment on a node with a pruned lookup index.
     #[tokio::test]
     async fn an_undeterminable_entry_is_retained() {
         let (_dir, j) = fresh_journal().await;
@@ -2581,7 +2325,8 @@ mod tests {
             &Arc::new(PreconfTxSet::new(16)),
             &c,
         )
-        .await;
+        .await
+        .expect("restore");
 
         j.rotate(retain_tracked(&c)).await.unwrap();
         let (remaining, _) = j.load().await.unwrap();
@@ -2589,9 +2334,8 @@ mod tests {
         assert!(c.release_unless_committed(&e.hash), "an unjudgeable entry is not recorded landed");
     }
 
-    /// The counterpart: the chain confirms the hash, so the promise *was* kept
-    /// and the record may go — once it is buried deep enough. This is the common
-    /// outcome on any restart.
+    /// The common case: the chain confirms the hash, so the commitment was kept
+    /// and the line can go once the landing block is buried.
     #[tokio::test]
     async fn a_confirmed_commitment_is_dropped_once_it_is_deep_enough() {
         let (_dir, j) = fresh_journal().await;
@@ -2606,7 +2350,8 @@ mod tests {
             &Arc::new(PreconfTxSet::new(16)),
             &c,
         )
-        .await;
+        .await
+        .expect("restore");
 
         c.observe_persisted(LANDED_AT + crate::commitments::SEAL_DEPTH);
         assert!(c.release_unless_committed(&e.hash), "buried ⇒ the record may go");
@@ -2615,8 +2360,7 @@ mod tests {
         assert!(remaining.is_empty());
     }
 
-    /// None of the three pushes into the fifo: the nonce is consumed, so there is
-    /// nothing left for the preconf arm to apply either way.
+    /// With the nonce used, no `OnChain` answer puts the entry in the fifo.
     #[tokio::test]
     async fn a_consumed_nonce_never_reaches_the_fifo() {
         for answer in [OnChain::Yes { height: LANDED_AT }, OnChain::No, OnChain::Unknown] {
@@ -2631,15 +2375,15 @@ mod tests {
                 &fifo,
                 &empty_commitments(),
             )
-            .await;
+            .await
+            .expect("restore");
 
             assert!(fifo.snapshot().await.is_empty(), "{answer:?}");
         }
     }
 
-    /// A pool refusal is a commitment that cannot be honoured. Restore walks
-    /// every entry regardless, and gives each refused one up — record released,
-    /// so the prune at the end of restore takes its line with it.
+    /// Restore walks every entry even when `recover_envelope` rejects them all,
+    /// releases each rejected record, and the closing rotation drops its line.
     #[tokio::test]
     async fn restore_gives_up_every_entry_the_pool_refuses() {
         let (_dir, j) = fresh_journal().await;
@@ -2650,10 +2394,9 @@ mod tests {
         pool.reject_add = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
         let c = empty_commitments();
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await.expect("restore");
 
-        // Both entries' recover_envelope calls return Err — the function
-        // does not panic and walks all entries.
+        // Both calls return `Err`; restore still visits every entry.
         assert_eq!(pool.add_calls.lock().unwrap().len(), 2);
         assert!(fifo.snapshot().await.is_empty());
         assert!(!c.is_tracked(&entry(4, 40).hash), "a refused commitment is not kept in memory");
@@ -2661,10 +2404,9 @@ mod tests {
         assert!(remaining.is_empty(), "nor on disk — the two halves go together");
     }
 
-    /// An entry whose bytes do not decode cannot even be named: the pre-pass gets
-    /// no `(sender, nonce)` out of it, so it never becomes a promise record, and
-    /// nothing in this process will revisit it. The prune at the end of restore is
-    /// what stops it being replayed on every future restart.
+    /// An undecodable entry gets no record (there is no `(sender, nonce)` to
+    /// claim), so the closing rotation drops its line instead of every restart
+    /// replaying it.
     #[tokio::test]
     async fn restore_drops_an_entry_it_cannot_decode() {
         let (_dir, j) = fresh_journal().await;
@@ -2675,7 +2417,7 @@ mod tests {
         pool.undecodable = true;
         let fifo = Arc::new(PreconfTxSet::new(16));
         let c = empty_commitments();
-        restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await;
+        restore_preconf_state(&j, &pool, &landed(), &fifo, &c).await.expect("restore");
 
         assert!(!c.is_tracked(&e.hash), "an entry that cannot be named holds no record");
         assert!(fifo.snapshot().await.is_empty());
@@ -2694,21 +2436,17 @@ mod tests {
 
         let j = Arc::new(j);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        // 30ms interval — first tick consumed at start, so the next
-        // rotate happens at t ≈ 30ms.
+        // The first tick is skipped, so the first rotation is at ~30ms.
         let handle = spawn_rejournal_loop(j.clone(), c, Duration::from_millis(30), shutdown_rx);
 
-        // Wait long enough for at least one rotate to fire.
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // The no-longer-tracked entry should have been dropped from the file.
         let (after, _) = j.load().await.unwrap();
         assert!(
             after.is_empty(),
             "rotation must have dropped the untracked entry; instead got {after:?}"
         );
 
-        // Graceful shutdown.
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_millis(200), handle)
             .await
@@ -2716,12 +2454,10 @@ mod tests {
             .expect("loop panicked");
     }
 
+    /// With a 1-byte cap every append signals a rotation; the hour-long
+    /// interval rules out the ticker, so the rotation seen is size-triggered.
     #[tokio::test]
     async fn size_trigger_rotates_dropping_untracked_without_periodic_tick() {
-        // Tiny `max_size` (1 byte) → every append crosses the cap and
-        // pings the rotate notify. A huge interval guarantees the
-        // periodic ticker cannot rotate within the test window, so any
-        // rotation observed is purely size-triggered.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
@@ -2737,7 +2473,6 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = spawn_rejournal_loop(j.clone(), c, Duration::from_secs(3600), shutdown_rx);
 
-        // Let the loop consume the pending size-notify and rotate.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let (after, _) = j.load().await.unwrap();
@@ -2754,11 +2489,10 @@ mod tests {
             .expect("loop panicked");
     }
 
+    /// `open` counts an existing file toward the cap, so the first append after
+    /// a restart can already trigger a rotation.
     #[tokio::test]
     async fn open_with_max_size_seeds_counter_from_existing_file() {
-        // A pre-existing entry already exceeding the cap must
-        // be counted at open, so the very first post-restart append trips
-        // the size trigger even though on its own it is tiny.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         {
@@ -2767,11 +2501,9 @@ mod tests {
         }
         let existing = tokio::fs::metadata(&path).await.unwrap().len();
         assert!(existing > 0);
-        // Reopen with a cap just at the existing size; counter seeded so a
-        // notify is armed on the next append.
+        // Cap at the existing size: one more append crosses it.
         let j = PreconfJournal::open(&path, existing).await.unwrap();
         j.append_promised(&entry(2, 11)).await.unwrap();
-        // A permit should be pending (size now > cap) — consume it without blocking.
         tokio::time::timeout(Duration::from_millis(50), j.rotate_notify.notified())
             .await
             .expect("size trigger must be armed after reopen seeding");
@@ -2782,10 +2514,8 @@ mod tests {
         let (_dir, j) = fresh_journal().await;
         let j = Arc::new(j);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        // Interval larger than the test waits — only the first
-        // (immediately-consumed) tick happens; no interval rotation calls.
-        // (A single final rotate on shutdown still runs by design; see
-        // `graceful_shutdown_performs_final_rotate` for that behavior.)
+        // No interval rotation within the test; the final rotation on shutdown
+        // still runs (see `graceful_shutdown_performs_final_rotate`).
         let handle = spawn_rejournal_loop(
             j.clone(),
             empty_commitments().into(),
@@ -2793,7 +2523,6 @@ mod tests {
             shutdown_rx,
         );
 
-        // Hand the shutdown signal immediately.
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_millis(200), handle)
             .await
@@ -2801,28 +2530,24 @@ mod tests {
             .expect("loop panicked");
     }
 
+    /// The final rotation on shutdown drops entries released since the last
+    /// tick.
     #[tokio::test]
     async fn graceful_shutdown_performs_final_rotate() {
-        // Regression guard for the graceful-shutdown contract:
-        // `run_rejournal_loop` MUST perform one final rotate after the
-        // shutdown signal fires, so entries that stopped being tracked
-        // between the last periodic tick and the shutdown are still
-        // dropped from the on-disk file.
         let (_dir, j) = fresh_journal().await;
         j.append_promised(&entry(1, 100)).await.unwrap();
         let j = Arc::new(j);
 
         let c = commitments_with_high_watermark();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        // Interval large — no periodic tick will fire during the test.
+        // No periodic tick fires during the test.
         let handle =
             spawn_rejournal_loop(j.clone(), c.clone(), Duration::from_secs(60), shutdown_rx);
 
-        // Finish tracking AFTER the loop starts but BEFORE shutdown — nothing
-        // touches the file until a rotate runs.
+        // Released after the loop starts, so only the final rotation can drop
+        // it.
         finish_tracking(&c, TxHash::from([1; 32]));
 
-        // Trigger shutdown; the loop's final rotate must drop the untracked entry.
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_millis(500), handle)
             .await
@@ -2836,18 +2561,14 @@ mod tests {
         );
     }
 
+    /// `run_rejournal_loop` returns the shutdown future's output, so a caller's
+    /// shutdown guard lives until the final rotation is done.
     #[tokio::test]
     async fn run_rejournal_loop_returns_shutdown_output_after_final_rotate() {
-        // Anchors the generic-output contract of `run_rejournal_loop`:
-        // callers passing a graceful-shutdown guard as `T` need it kept
-        // alive across the final-rotate await, then returned so their
-        // outer task can drop it explicitly.
         let (_dir, j) = fresh_journal().await;
         let j = Arc::new(j);
 
-        // Sentinel type in place of a `GracefulShutdownGuard`; if the
-        // loop forgot to return the signal output, the assertion below
-        // wouldn't compile.
+        // Stands in for a `GracefulShutdownGuard`.
         #[derive(Debug, PartialEq)]
         struct Sentinel(u32);
 
@@ -2864,13 +2585,9 @@ mod tests {
 
     // ── size-trigger rate limit / byte-counter invariants ──────────
 
+    /// Two size triggers within `SIZE_ROTATE_MIN_GAP` (2s) rotate once.
     #[tokio::test]
     async fn size_trigger_second_rotation_rate_limited_within_min_gap() {
-        // Two size triggers fired within `SIZE_ROTATE_MIN_GAP` (2s) must
-        // collapse to a single rotation: the first is honoured, the second
-        // dropped. A huge interval keeps the periodic ticker from firing
-        // inside the sub-second window, so any rotation is purely
-        // size-triggered; `max_size = 1` makes every append trip the cap.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
@@ -2889,15 +2606,14 @@ mod tests {
         let handle =
             spawn_rejournal_loop(j.clone(), c.clone(), Duration::from_secs(3600), shutdown_rx);
 
-        // First (coalesced) size trigger is honoured → released e1 dropped.
+        // The first size trigger rotates, dropping released e1.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (after_first, _) = j.load().await.unwrap();
         assert_eq!(after_first, vec![e2.clone(), e3], "first size trigger drops released e1");
 
-        // Release e2 and fire a *second* trigger well within `min_gap`
-        // (~150ms elapsed ≪ 2s). It must be rate-limited — e2 stays on disk.
+        // A second trigger ~150ms later is ignored, so released e2 stays.
         finish_tracking(&c, e2.hash);
-        j.append_promised(&entry(4, 13)).await.unwrap(); // re-notifies (over cap)
+        j.append_promised(&entry(4, 13)).await.unwrap(); // signals again
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (after_second, _) = j.load().await.unwrap();
         assert!(
@@ -2905,7 +2621,6 @@ mod tests {
             "second trigger within min_gap must be dropped; e2 must survive, got {after_second:?}"
         );
 
-        // (The final rotate on shutdown WILL drop e2 — expected, not asserted.)
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_millis(200), handle)
             .await
@@ -2913,18 +2628,13 @@ mod tests {
             .expect("loop panicked");
     }
 
+    /// A rotation whose survivors still exceed the cap does not trigger
+    /// another: only appends signal, never `rotate` itself.
     #[tokio::test]
     async fn rotate_does_not_self_retrigger_when_survivors_exceed_cap() {
-        // A size-triggered `rotate()` whose survivors still exceed
-        // `max_size` must NOT keep the loop rotating on its own: the size
-        // trigger fires only from `write_lines` — the append path, whether
-        // `append_promised` or `append_batch` — never from `rotate`.
-        // Guards against a future change that re-notifies inside `rotate`
-        // (which would spin the full-file rewrite on every wake while the
-        // file stays over the cap).
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
-        // `max_size = 1` ⇒ even the lone survivor exceeds the cap.
+        // 1-byte cap: even one survivor exceeds it.
         let j = Arc::new(PreconfJournal::open(&path, 1).await.unwrap());
         let e1 = entry(1, 10);
         let e2 = entry(2, 11);
@@ -2938,14 +2648,12 @@ mod tests {
         let handle =
             spawn_rejournal_loop(j.clone(), c.clone(), Duration::from_secs(3600), shutdown_rx);
 
-        // First append-driven trigger drops e1; survivor e2 alone still
-        // exceeds `max_size = 1`.
+        // The first trigger drops e1; e2 alone still exceeds the cap.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (after_first, _) = j.load().await.unwrap();
         assert_eq!(after_first, vec![e2.clone()], "first rotate drops released e1, keeps e2");
 
-        // Release e2 but issue NO further append. Wait past `min_gap` (2s) so a
-        // self-retrigger, if it existed, would be free to fire.
+        // Release e2 without appending, and wait past `min_gap` (2s).
         finish_tracking(&c, e2.hash);
         tokio::time::sleep(Duration::from_millis(2200)).await;
 
@@ -2963,17 +2671,13 @@ mod tests {
             .expect("loop panicked");
     }
 
+    /// `size_bytes` equals the file length after appends and after a rotation;
+    /// if it drifts, the size trigger fires late or never.
     #[tokio::test]
     async fn rotate_resets_size_counter_to_true_on_disk_size() {
-        // `size_bytes` tracks the real on-disk size without a stat syscall on
-        // the hot path. It must stay equal to the
-        // file's true length across both `write_lines` (+= the bytes just
-        // written) and `rotate` (reset to kept-bytes). Drift here silently
-        // breaks the size trigger (it would fire late, or never).
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
-        // `max_size` is irrelevant to the counter mechanics; 0 keeps the
-        // trigger out of the way.
+        // A 0 cap keeps the trigger out of the way.
         let j = PreconfJournal::open(&path, 0).await.unwrap();
 
         let e1 = entry(1, 10);
@@ -2983,7 +2687,6 @@ mod tests {
         j.append_promised(&e2).await.unwrap();
         j.append_promised(&e3).await.unwrap();
 
-        // After appends: counter == on-disk size.
         let on_disk = tokio::fs::metadata(&path).await.unwrap().len();
         assert_eq!(
             j.size_bytes.load(Ordering::Relaxed),
@@ -2991,8 +2694,6 @@ mod tests {
             "counter must equal file size after appends"
         );
 
-        // Drop two released entries; the counter must reset to the kept-bytes
-        // total, which equals the rewritten file's true size.
         let dropped = [e1.hash, e3.hash];
         let stats = j.rotate(|h| !dropped.contains(h)).await.unwrap();
         assert_eq!((stats.kept, stats.dropped), (1, 2));
@@ -3008,11 +2709,10 @@ mod tests {
         assert_eq!(after, vec![e2]);
     }
 
+    /// Rotation leaves corrupt lines out of the new file and reports them in
+    /// `bad_lines_skipped`.
     #[tokio::test]
     async fn rotate_drops_corrupt_lines_and_reports_count() {
-        // `rotate()` rewrites the file via `load_upto()`, which skips corrupt
-        // lines. The corrupt line must NOT be carried into the new
-        // generation, and its count must surface as `bad_lines_skipped`.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let good_a = serde_json::to_string(&entry(7, 70)).unwrap();
@@ -3026,18 +2726,15 @@ mod tests {
         assert_eq!(stats.dropped, 0, "retain kept everything → nothing dropped");
         assert_eq!(stats.bad_lines_skipped, 1, "one corrupt line reported");
 
-        // The corrupt line is gone from the rewritten file: a second load
-        // sees the two good entries and zero bad lines.
         let (after, bad_after) = j.load().await.unwrap();
         assert_eq!(after, vec![entry(7, 70), entry(8, 80)]);
         assert_eq!(bad_after, 0, "corrupt line must not be carried into the new file");
     }
 
+    /// The size trigger is inclusive (`new_size >= max_size`): a file exactly at
+    /// the cap signals, one byte under does not.
     #[tokio::test]
     async fn size_trigger_fires_at_exact_boundary_not_below() {
-        // The trigger condition is `new_size >= max_size` (inclusive). Pin
-        // the boundary: an append landing the file *exactly* at `max_size`
-        // arms the notify; one byte short does not.
         let line_len = {
             let mut v = serde_json::to_vec(&entry(1, 10)).unwrap();
             v.push(b'\n');
@@ -3055,7 +2752,7 @@ mod tests {
                 .expect("append landing exactly at max_size must arm the size trigger");
         }
 
-        // One byte above the cap ⇒ NOT armed (a single line stays under).
+        // Cap one byte above the line: the file stays one byte under it.
         {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("preconf.jsonl");
@@ -3069,17 +2766,10 @@ mod tests {
     }
 }
 
-/// Stateful property model for [`PreconfJournal`].
-///
-/// Replays random `append` / `rotate` sequences against the real journal and an
-/// independent reference model, checking after every step that the on-disk file
-/// and the `size_bytes` counter agree with it. Guards the retention accounting
-/// against changes that leak entries or drift the counter.
-///
-/// Which records may be dropped is the caller's rule, not the journal's (module
-/// docs), so `Op::Untrack` mutates a tracking set the *test* owns. The model
-/// therefore poses the question the interface actually asks: does rotate drop
-/// exactly what it was told to, and does the file stay in lock-step.
+/// Property test: random append / untrack / rotate sequences against the real
+/// journal and a reference model. After every step the file's contents and
+/// `size_bytes` must match the model. The tracking set (`Op::Untrack`) is
+/// owned by the test, as `retain` is the caller's rule.
 #[cfg(test)]
 mod proptest_journal_model {
     use super::*;
@@ -3094,8 +2784,8 @@ mod proptest_journal_model {
         TxHash::from([byte; 32])
     }
 
-    /// Fixed 1:1 identity per byte — a signed tx's hash derives from its
-    /// content, so a given hash always carries the same entry bytes.
+    /// One fixed entry per byte, as a real hash always carries the same
+    /// transaction.
     fn entry_for(byte: u8) -> JournalEntry {
         JournalEntry {
             hash: hash(byte),
@@ -3140,10 +2830,8 @@ mod proptest_journal_model {
             match op {
                 Op::Append(b) => self.file.push(*b),
                 Op::Untrack(bytes) => self.untracked.extend(bytes.iter().copied()),
-                // No TTL is configured, so `retain` is the only drop rule.
-                // Unlike the old model, an untracked hash *stays* untracked:
-                // the set lives outside the journal, so re-appending the same
-                // hash and rotating again drops it again.
+                // `retain` is the only drop rule. An untracked hash stays
+                // untracked, so re-appending it and rotating drops it again.
                 Op::Rotate => {
                     let untracked = self.untracked.clone();
                     self.file.retain(|b| !untracked.contains(b));
@@ -3155,7 +2843,7 @@ mod proptest_journal_model {
     async fn fresh() -> (TempDir, PreconfJournal) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
-        // Large cap so appends never auto-arm the size trigger during replay.
+        // Huge cap, so appends never signal a rotation during replay.
         let j = PreconfJournal::open(&path, u64::MAX).await.unwrap();
         (dir, j)
     }
@@ -3207,10 +2895,9 @@ mod proptest_journal_model {
     proptest! {
         #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
-        /// Any sequence of append / untrack / rotate keeps the on-disk file and
-        /// the `size_bytes` counter in lock-step with the reference model — in
-        /// particular rotate drops exactly the entries `retain` rejects, and no
-        /// more.
+        /// Any append / untrack / rotate sequence keeps the file and
+        /// `size_bytes` in step with the model; rotate drops exactly what
+        /// `retain` rejects.
         #[test]
         fn journal_matches_reference_model(ops in prop::collection::vec(op(), 1..24)) {
             tokio::runtime::Builder::new_current_thread()

@@ -47,9 +47,8 @@ const COUNTERS: &[&str] = &[
     "preconf.admit.rejected_tx_type_total",
     "preconf.admit.rejected_not_eligible_total",
     "preconf.admit.rejected_tx_gas_total",
-    // Restore-path losses. `restore_load_failed_total` is whole-file; the
-    // per-line counters beside it already existed, which is the asymmetry
-    // that made a total loss quieter than a single bad line.
+    // Restore-path losses: the whole file failing to load (startup then
+    // aborts), and single lines skipped.
     "preconf.journal.restore_load_failed_total",
     "preconf.journal.restore_bad_lines_total",
     "flashblocks.deadline_already_passed_total",
@@ -104,6 +103,7 @@ const COUNTERS: &[&str] = &[
     "preconf.tx.replay_round_total",
     "preconf.journal.dropped_entries_total",
     "preconf.journal.restore_nonce_taken",
+    "preconf.journal.restore_promise_nonce_taken",
     "preconf.journal.restore_undecodable",
     "preconf.journal.restore_unknown",
     "preconf.whitelist.zero_entry_skipped",
