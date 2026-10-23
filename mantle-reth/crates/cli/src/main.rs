@@ -221,6 +221,14 @@ where
 {
     let metrics_mdbx = mdbx.clone();
 
+    // Captured before `node` is moved into the builder: reth keeps a single
+    // `extend_rpc_modules` slot, so the proofs-history hook has to re-install the Mantle
+    // extensions itself (see `install_mantle_rpc_extensions`) rather than letting
+    // `MantleNode::add_ons` own that slot.
+    let sequencer_url = node.op_node.args.sequencer.clone();
+    let preconf = node.preconf.clone();
+    let flashblocks_cfg = node.flashblocks.clone();
+
     let builder = builder.node(node).on_node_started(move |full_node| {
         seed_blockchain_tree_metrics(&full_node.provider);
         // Pre-register preconf metric series (0 baseline). Preconf-only.
@@ -239,7 +247,16 @@ where
         Ok(())
     });
 
-    let handle = with_proofs_history_launch_ctx(builder, &args, mdbx).launch().await?;
+    let handle = with_proofs_history_launch_ctx(
+        builder,
+        &args,
+        mdbx,
+        sequencer_url,
+        preconf,
+        flashblocks_cfg,
+    )
+    .launch()
+    .await?;
 
     handle.node_exit_future.await
 }

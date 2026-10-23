@@ -24,6 +24,17 @@ where
     ErrorObject<'static>: From<Eth::Error>,
     P: OpProofsStore + Clone + 'a,
 {
+    /// Acquires a permit from the eth API's tracing-task semaphore (`--rpc.proof-permits`).
+    ///
+    /// `eth_getProof` on the sidecar is otherwise unbounded: the stock reth path and the Mantle
+    /// `rpc-ext` override both take this permit before walking the trie, so hold it here too to
+    /// cap how many historical-proof walks run at once.
+    pub async fn acquire_tracing_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.eth_api.acquire_owned_tracing().await
+    }
+
     /// Creates a state provider for the given block id.
     pub async fn state_provider(
         &'a self,
