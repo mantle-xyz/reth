@@ -5,9 +5,10 @@
 //! (2~3 block) reorg path: build N commitment blocks in a row, then FCU the
 //! head all the way back to a common ancestor, reverting every commitment
 //! block in one shot. All commitments must re-land on the new branch, none
-//! dropped, none duplicated. Re-land is via the journal-replay path (each
-//! committed block's entry is persisted, then re-injected as `Replay` when the
-//! reorg's canonical-state notification reports its block reverted).
+//! dropped, none duplicated. Re-land is via the canon handler: when the reorg's
+//! canonical-state notification reports the blocks reverted, it requeues each
+//! commitment from the reverted chain as `Replay`, and the next build executes
+//! it through the carryover.
 
 use super::helpers::{
     PreconfCfgBuilder, fresh_journal, l1_info_deposit, mantle_test_chain_spec, send_preconf,
@@ -89,9 +90,9 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
     // ── Reorg all commitment blocks out in one shot: rebuild at the FIRST
     //    commitment's height (n=1 → same timestamp) against a NEW L1 origin
     //    (200). This reverts the whole commitment chain. Every commitment must
-    //    re-land (via journal replay); the SLA promises eventual re-land, not
-    //    same-block, so the re-injected commitments may drain across the rebuild
-    //    block and a few following blocks — accumulate and count.
+    //    re-land; the SLA promises eventual re-land, not same-block, so the
+    //    requeued commitments may drain across the rebuild block and a few
+    //    following blocks — accumulate and count.
     use std::collections::HashMap;
     let mut counts: HashMap<B256, usize> = HashMap::new();
     let (mut head, sealed0) = reorg_to!(node, base, n = 1, l1 = 200);
@@ -107,8 +108,9 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
     for h in &sealed0 {
         *counts.entry(*h).or_default() += 1;
     }
-    let mut fn_n = 2u64;
-    for _ in 0..(NUM_COMMITMENTS + 1) {
+    // Slot numbers start at 2 (slot 1 is the reorg rebuild above); walk at most
+    // NUM_COMMITMENTS + 1 further slots waiting for every commitment to reland.
+    for fn_n in 2u64..=(2 + NUM_COMMITMENTS as u64) {
         if hashes.iter().all(|h| counts.contains_key(h)) {
             break;
         }
@@ -117,7 +119,6 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
             *counts.entry(*x).or_default() += 1;
         }
         head = h;
-        fn_n += 1;
     }
 
     // Primary invariant — must-land: every commitment must come back after the

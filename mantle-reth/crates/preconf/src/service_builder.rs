@@ -2,11 +2,11 @@
 //!
 //! [`PreconfServiceBuilder`] is the **application-level owner** of the
 //! preconf subsystem's cross-component shared state — a validated
-//! [`Arc<PreconfConfig>`], a single [`Arc<PreconfTxSet>`], and a
-//! mandatory [`Arc<PreconfJournal>`] — and exposes typed factories for
-//! the per-task handlers that consume them:
+//! [`Arc<PreconfConfig>`], a single [`Arc<PreconfClassifier>`], a single
+//! [`Arc<PreconfTxSet>`], and a mandatory [`Arc<PreconfJournal>`] — and
+//! exposes typed factories for the per-task handlers that consume them:
 //!
-//! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical- state notifications and
+//! - [`PreconfServiceBuilder::canon_handler`] — to subscribe canonical-state notifications and
 //!   forward the fifo past sealed block nonces.
 //! - [`PreconfServiceBuilder::rpc_handler`] — to back the local `eth_sendRawTransactionWithPreconf`
 //!   entry on the sequencer node.
@@ -24,22 +24,23 @@
 //! keeps the service builder free of reth `TaskExecutor` and lifecycle
 //! plumbing.
 //!
-//! Pool integration lives on [`MantlePoolBuilder::with_preconf`](crate)
-//! and is driven directly from the cli crate's component-builder code —
-//! it consumes the same `cfg` and `fifo` handles via
+//! Pool integration lives on `MantlePoolBuilder::with_preconf` (in the
+//! `mantle-reth-cli` crate) and is driven directly from the cli crate's
+//! component-builder code — it consumes the same `cfg` and `fifo` handles via
 //! [`PreconfServiceBuilder::cfg`] / [`PreconfServiceBuilder::fifo`].
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::NodePrimitives;
-use reth_storage_api::StateProviderFactory;
-use reth_transaction_pool::TransactionPool;
 
 use crate::{
-    PreconfCanonHandler, PreconfConfig, PreconfJournal, PreconfRpcHandler, PreconfTxSet,
+    PreconfCanonHandler, PreconfClassifier, PreconfConfig, PreconfJournal, PreconfRpcHandler,
+    PreconfTxSet,
+    admission::DynAdmission,
     config::PreconfConfigError,
-    journal::{JournalError, RestorePool, UNSEALED_ABANDON_ROTATIONS, restore_preconf_state},
+    flashblocks::{FlashblockProducerConfig, FlashblocksProducerHandles},
+    journal::{JournalError, RestoreSource, restore_preconf_state},
 };
 use thiserror::Error;
 
@@ -60,13 +61,14 @@ pub enum PreconfServiceError {
     MissingJournalPath,
 }
 
-/// Errors surfaced by [`PreconfServiceBuilder::start`] — the restore
-/// phase only ever propagates journal-load failures (which are already
-/// converted to warn-and-empty inside `restore_preconf_state`), so this
-/// enum is currently a placeholder for future variants (e.g. explicit
-/// timeout / cancellation).
+/// Errors surfaced by [`PreconfServiceBuilder::start`].
 #[derive(Debug, Error)]
-pub enum PreconfStartError {}
+pub enum PreconfStartError {
+    /// The journal could not be read. Fatal on purpose: starting without its
+    /// commitments would let the first rotation delete them.
+    #[error("preconf journal restore: {0}")]
+    Journal(#[from] JournalError),
+}
 
 /// Owns and hands out the shared preconf handles for a single node
 /// instance. Construct once at startup; wrap in `Arc` at the CLI layer
@@ -78,11 +80,34 @@ pub enum PreconfStartError {}
 #[derive(Debug)]
 pub struct PreconfServiceBuilder {
     cfg: Arc<PreconfConfig>,
+    /// Owns the preconf allowlists — the per-tx commitment records live in
+    /// [`Commitments`](crate::commitments::Commitments), owned by the fifo and
+    /// reached through `fifo.claims()`. Built here so every consumer — the
+    /// whitelist watcher, admission, the payload builder — shares one
+    /// instance; two classifiers would mean two answers.
+    classifier: Arc<PreconfClassifier>,
     fifo: Arc<PreconfTxSet>,
     /// Commitment journal — always present. Opened at construction from
     /// `cfg.journal_path` (which the CLI layer resolves to the
     /// datadir-relative default when unset).
     journal: Arc<PreconfJournal>,
+    /// Slice publishing, when the operator asked for it. `None` leaves the
+    /// payload builder on its pre-flashblock path and binds no port.
+    ///
+    /// Behind an `Arc` so the payload service layer can hold the endpoint open
+    /// for as long as it serves it, without holding this whole builder.
+    flashblocks: Option<Arc<FlashblocksProducerHandles>>,
+    /// Handed over by the pool-building phase, picked up by the RPC phase.
+    ///
+    /// Admission needs the validator chain, which only exists once the pool
+    /// is being built; the RPC handler is assembled later, from a different
+    /// context. This is the one thing both phases can reach, so it is what
+    /// carries the handle between them.
+    ///
+    /// A trait object because the concrete type is parameterised by that
+    /// validator chain and by the state provider, neither of which this
+    /// builder can name.
+    admission: OnceLock<Arc<dyn DynAdmission>>,
 }
 
 impl PreconfServiceBuilder {
@@ -103,20 +128,53 @@ impl PreconfServiceBuilder {
         let broadcast_cap = cfg.broadcast_cap;
         let journal_path =
             cfg.journal_path.clone().ok_or(PreconfServiceError::MissingJournalPath)?;
-        // Abandon an unsealed commitment after `UNSEALED_ABANDON_ROTATIONS`
-        // rotation cadences without sealing (bounds the journal vs zombies).
-        let abandon_after = cfg.rejournal_interval * UNSEALED_ABANDON_ROTATIONS;
-        let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size)
-            .await?
-            .with_abandon_after(abandon_after);
+        let journal = PreconfJournal::open(&journal_path, cfg.journal_max_size).await?;
+        // Built from the validated config, before it is shared: the classifier
+        // reads `all_preconfs` off it.
+        let classifier = Arc::new(PreconfClassifier::from_config(&cfg));
         let cfg = Arc::new(cfg);
         let fifo = Arc::new(PreconfTxSet::new(broadcast_cap));
-        Ok(Self { cfg, fifo, journal: Arc::new(journal) })
+        Ok(Self {
+            cfg,
+            classifier,
+            fifo,
+            journal: Arc::new(journal),
+            flashblocks: None,
+            admission: OnceLock::new(),
+        })
+    }
+
+    /// Bind the flashblocks endpoint and take ownership of it.
+    ///
+    /// A separate step from [`Self::from_config`] because the two are
+    /// configured independently: flashblocks is its own CLI group, and its
+    /// config is `None` whenever the operator did not ask for it.
+    ///
+    /// See [`FlashblocksProducerHandles::bind`] for what binding involves and
+    /// why it happens up front; this layer only holds the result.
+    pub fn bind_flashblocks(&mut self, cfg: FlashblockProducerConfig) -> std::io::Result<()> {
+        self.flashblocks = Some(Arc::new(FlashblocksProducerHandles::bind(cfg)?));
+        Ok(())
+    }
+
+    /// The flashblocks endpoint, when one was bound.
+    ///
+    /// Handed out as the `Arc` rather than a plain reference: whoever spawns
+    /// the accept loop has to keep the endpoint alive for as long as it runs,
+    /// and dropping the last handle closes it.
+    pub const fn flashblocks(&self) -> Option<&Arc<FlashblocksProducerHandles>> {
+        self.flashblocks.as_ref()
     }
 
     /// Shared config handle. Cheap to clone — internally an `Arc`.
     pub fn cfg(&self) -> &Arc<PreconfConfig> {
         &self.cfg
+    }
+
+    /// Shared classifier handle — the single owner of the allowlists.
+    /// Cheap to clone — internally an `Arc`.
+    pub fn classifier(&self) -> &Arc<PreconfClassifier> {
+        &self.classifier
     }
 
     /// Shared fifo handle. Cheap to clone — internally an `Arc`.
@@ -129,66 +187,66 @@ impl PreconfServiceBuilder {
         &self.journal
     }
 
-    /// Startup hook: replay the journal into the fifo and register the
-    /// fifo → pool eviction callback.
+    /// Startup hook: replay the journal into the fifo.
     ///
-    /// Call once from the pool builder after the pool is up, **before**
-    /// the pool listener + canon handler are spawned so the fifo state
-    /// is populated when they start consuming events.
-    pub async fn start<P>(&self, pool: &P) -> Result<(), PreconfStartError>
+    /// Call once from the pool builder after the pool is up, **before** the
+    /// canon handler is spawned, so the fifo state is populated when it starts
+    /// consuming events. Returns `Err` if the journal cannot be read; the
+    /// caller must not start the node.
+    pub async fn start<P, C>(&self, source: &P, chain: &C) -> Result<(), PreconfStartError>
     where
-        P: RestorePool + Clone + 'static,
+        P: RestoreSource + Clone + 'static,
+        C: crate::journal::CommitmentChainView,
     {
-        restore_preconf_state(&self.journal, pool, &self.fifo).await;
-
-        // Every non-on-chain terminal transition (mark_timeout /
-        // mark_canceled / mark_failed) synchronously removes the tx
-        // from the pool, closing the window where a client-observed
-        // failure could be contradicted by a later on-chain landing
-        // via the pool iterator.
-        let pool_for_evict = pool.clone();
-        self.fifo.set_pool_eviction_callback(Arc::new(move |hash| {
-            pool_for_evict.remove_transactions(vec![hash]);
-        }));
+        restore_preconf_state(&self.journal, source, chain, &self.fifo, self.fifo.claims()).await?;
 
         Ok(())
     }
 
-    /// Construct a canonical-state handler bound to `provider` + `pool`.
-    /// The caller is responsible for spawning the returned handler's
+    /// Construct a canonical-state handler bound to `provider`. The caller is
+    /// responsible for spawning the returned handler's
     /// [`run`](PreconfCanonHandler::run) future on its task executor.
     ///
     /// The generic `N` matches `Pr::Primitives` — for OP-stack nodes
     /// this is `OpPrimitives`; the bound `N::SignedTx: Transaction +
-    /// TxHashRef` is satisfied automatically. `P` is the transaction
-    /// pool; the handler uses it to `remove_transactions` on hashes
-    /// evicted by `PreconfTxSet::clean_reclaimable`, so a Timeout / Canceled preconf
-    /// tx cannot land on chain after the client already saw `Timeout`.
-    pub fn canon_handler<Pr, P, N>(&self, provider: Pr, pool: P) -> PreconfCanonHandler<Pr, P, N>
+    /// TxHashRef` is satisfied automatically.
+    ///
+    /// `Pr` must also be a `BlockNumReader`: the handler publishes
+    /// `last_block_number()` (the **persisted** tip) to `Commitments` via
+    /// `fifo.claims().observe_persisted` each notification, which is the ruler
+    /// the retention period is measured against — see
+    /// `commitments::SEAL_DEPTH`.
+    pub fn canon_handler<Pr, N>(&self, provider: Pr) -> PreconfCanonHandler<Pr, N>
     where
-        Pr: CanonStateSubscriptions<Primitives = N> + 'static,
-        P: TransactionPool + 'static,
+        Pr: CanonStateSubscriptions<Primitives = N> + reth_storage_api::BlockNumReader + 'static,
         N: NodePrimitives,
         N::SignedTx: alloy_consensus::Transaction + alloy_consensus::transaction::TxHashRef,
+        // The reverted branch puts commitments back in the queue, which holds
+        // alloy envelopes — see `PreconfCanonHandler`.
+        op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
     {
-        PreconfCanonHandler::new(provider, pool, self.fifo.clone(), self.journal().clone())
+        PreconfCanonHandler::new(provider, self.fifo.clone())
+    }
+
+    /// Hand admission over from the pool-building phase.
+    ///
+    /// First call wins; a second is dropped. Both the enabled and disabled
+    /// wiring paths run through the same code, and only one of them has a
+    /// validator chain to build admission from.
+    pub fn set_admission(&self, admission: Arc<dyn DynAdmission>) {
+        let _ = self.admission.set(admission);
+    }
+
+    /// Admission, if the pool-building phase got far enough to hand it over.
+    pub fn admission(&self) -> Option<Arc<dyn DynAdmission>> {
+        self.admission.get().cloned()
     }
 
     /// Construct the local-sequencer RPC handler. Returned by value so
     /// the caller can decide whether to wrap in `Arc` (the path through
     /// `MantleRpcExt::new` expects `Arc<dyn DynPreconfHandler>`).
-    pub fn rpc_handler<P, Pr>(&self, pool: P, provider: Pr) -> PreconfRpcHandler<P, Pr>
-    where
-        P: TransactionPool + 'static,
-        Pr: StateProviderFactory + 'static,
-    {
-        PreconfRpcHandler::new(
-            pool,
-            provider,
-            self.fifo.clone(),
-            self.cfg.clone(),
-            self.journal().clone(),
-        )
+    pub fn rpc_handler(&self, admission: Arc<dyn DynAdmission>) -> PreconfRpcHandler {
+        PreconfRpcHandler::new(admission, self.fifo.clone(), self.cfg.clone())
     }
 }
 
@@ -208,14 +266,62 @@ mod tests {
         (dir, svc)
     }
 
+    /// A publisher bound on an OS-assigned port, so tests never collide.
+    fn flashblocks_cfg() -> crate::flashblocks::FlashblockProducerConfig {
+        crate::flashblocks::FlashblockProducerConfig {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            ..Default::default()
+        }
+    }
+
+    fn slice(
+        block_number: u64,
+        index: u64,
+    ) -> mantle_reth_flashblocks_types::MantleFlashblockPayload {
+        let mut payload =
+            mantle_reth_flashblocks_types::MantleFlashblockPayload { index, ..Default::default() };
+        payload.metadata.block_number = block_number;
+        payload
+    }
+
+    /// The payload builder publishes through the very endpoint this builder
+    /// bound — not through a second one that no subscriber is connected to.
+    /// Proven by publishing through the handle the builder is handed and
+    /// reading it back through a handle taken from the owning publisher.
+    #[tokio::test]
+    async fn the_payload_builder_publishes_through_the_bound_endpoint() {
+        let (_dir, mut svc) = svc_with_temp_journal().await;
+        svc.bind_flashblocks(flashblocks_cfg()).expect("binds");
+        let flashblocks = svc.flashblocks().expect("bound above");
+
+        flashblocks.producer().publisher.publish(&slice(10, 3)).expect("publishes");
+
+        assert_eq!(
+            flashblocks.publisher().handle().latest_position(),
+            Some(crate::flashblocks::FlashblockPosition { block_number: 10, flashblock_index: 3 }),
+            "a handle taken from the owning publisher sees what the builder published",
+        );
+    }
+
+    /// Leaving flashblocks off must not bind anything: a verifier running
+    /// without the flag has no endpoint to clash on.
+    #[tokio::test]
+    async fn without_flashblocks_nothing_is_bound() {
+        let (_dir, svc) = svc_with_temp_journal().await;
+
+        assert!(svc.flashblocks().is_none());
+    }
+
     #[tokio::test]
     async fn from_config_arc_shares_handles() {
         let (_dir, svc) = svc_with_temp_journal().await;
         let svc = Arc::new(svc);
         let svc2 = Arc::clone(&svc);
-        // Arc-shared instance: both refs see the same fifo / cfg.
+        // Arc-shared instance: both refs see the same fifo / cfg / classifier.
         assert!(Arc::ptr_eq(svc.cfg(), svc2.cfg()));
         assert!(Arc::ptr_eq(svc.fifo(), svc2.fifo()));
+        assert!(Arc::ptr_eq(svc.classifier(), svc2.classifier()));
     }
 
     #[tokio::test]
@@ -283,36 +389,49 @@ mod tests {
 
     // ── start() lifecycle ────────────────────────────────────────
 
-    /// Stub pool used to exercise `PreconfServiceBuilder::start` without
-    /// standing up a real reth pool. `start`'s only interaction with the
-    /// pool is via [`RestorePool::add_envelope`], which
-    /// [`restore_preconf_state`] calls once per journal entry. Since
-    /// tests here use empty journals, the stub can panic if reached —
-    /// the empty-journal branch never invokes it.
+    /// Stub [`RestoreSource`] for `start` tests with an empty journal, where
+    /// restore never calls it; hence the panics. (The production source,
+    /// [`RestoreDirect`](crate::RestoreDirect), only decodes bytes; `start`
+    /// touches no pool.)
     #[derive(Clone)]
-    struct UnreachablePool;
+    struct UnreachableSource;
+
+    /// Chain view for the same tests. `commitment_on_chain` is never reached
+    /// with an empty journal.
+    struct UnreachableChain;
+
+    impl crate::journal::CommitmentChainView for UnreachableChain {
+        // Reachable: restore asks this for every decoded entry. `None` means
+        // the nonce counts as still free, so the entry is still owed.
+        fn account_nonce(&self, _sender: &alloy_primitives::Address) -> Option<u64> {
+            None
+        }
+
+        fn commitment_on_chain(&self, _hash: &alloy_primitives::TxHash) -> crate::journal::OnChain {
+            unreachable!("empty journal → restore_preconf_state must not consult the chain")
+        }
+    }
 
     #[async_trait::async_trait]
-    impl RestorePool for UnreachablePool {
-        async fn contains(&self, _hash: &alloy_primitives::TxHash) -> bool {
-            unreachable!("empty journal → restore_preconf_state must not call the pool")
-        }
-        async fn add_envelope(
+    impl RestoreSource for UnreachableSource {
+        fn recover_slot(
             &self,
             _tx_rlp: &alloy_primitives::Bytes,
-        ) -> Result<crate::journal::RestoredEnvelope, String> {
-            unreachable!("empty journal → restore_preconf_state must not call the pool")
+        ) -> Option<(alloy_primitives::Address, u64)> {
+            unreachable!("empty journal → restore_preconf_state must not call the source")
         }
-        fn remove_transactions(&self, _hashes: Vec<alloy_primitives::TxHash>) {
-            // No mark_* fires in these tests; the setup asserts only
-            // on fifo state.
+        async fn recover_envelope(
+            &self,
+            _tx_rlp: &alloy_primitives::Bytes,
+        ) -> Result<crate::journal::RestoredEnvelope, crate::journal::RestoreSkip> {
+            unreachable!("empty journal → restore_preconf_state must not call the source")
         }
     }
 
     #[tokio::test]
     async fn start_with_empty_journal_is_noop_on_fifo() {
         let (_dir, svc) = svc_with_temp_journal().await;
-        svc.start(&UnreachablePool).await.unwrap();
+        svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
         // Empty journal ⇒ nothing was replayed into the fifo.
         assert_eq!(svc.fifo().snapshot().await.len(), 0);
     }
@@ -321,40 +440,57 @@ mod tests {
     async fn start_is_idempotent() {
         let (_dir, svc) = svc_with_temp_journal().await;
         // Calling twice must not panic; both calls succeed.
-        svc.start(&UnreachablePool).await.unwrap();
-        svc.start(&UnreachablePool).await.unwrap();
+        svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
+        svc.start(&UnreachableSource, &UnreachableChain).await.unwrap();
     }
 
-    /// `start()` reads the journal from disk and pushes each
-    /// promised entry into the fifo via the adapter. Covers the
-    /// journal-enabled end-to-end wiring that
-    /// `start_without_journal_...` cannot exercise.
+    /// A journal that opens but cannot be read must stop the node. Starting
+    /// would leave every commitment in it untracked, and the first rotation
+    /// would then delete them all.
+    ///
+    /// A directory at the journal's path is what makes the read fail: it opens,
+    /// and reading it is `EISDIR`. Unlike a permission change, it also fails
+    /// for a root caller.
+    #[tokio::test]
+    async fn start_refuses_a_journal_it_cannot_read() {
+        let (dir, svc) = svc_with_temp_journal().await;
+        let path = dir.path().join("preconf.jsonl");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let err = svc.start(&UnreachableSource, &UnreachableChain).await.unwrap_err();
+
+        assert!(matches!(err, PreconfStartError::Journal(_)), "got {err:?}");
+    }
+
+    /// `start` reads a populated journal and pushes each entry into the fifo.
     #[tokio::test]
     async fn start_with_populated_journal_restores_entries_to_fifo() {
-        use crate::journal::{JournalEntry, RestoredEnvelope};
+        use crate::{
+            ClaimKind,
+            journal::{JournalEntry, RestoredEnvelope},
+        };
         use alloy_consensus::{Signed, TxLegacy};
         use alloy_primitives::{B256, Bytes, Signature, TxHash};
 
-        // Recording pool — every add_envelope call fabricates a
-        // synthetic envelope so restore_preconf_state has something to
-        // push into the fifo, and asserts what got called. `Clone`
-        // required because `start()` clones the pool into the
-        // fifo-layer eviction callback (Arc'd shared state keeps the
-        // clones observing the same call log).
+        // Records every `recover_envelope` call and fabricates an envelope
+        // from the first byte, so each entry gets a distinct hash.
         #[derive(Clone)]
-        struct RecordingPool {
+        struct RecordingSource {
             add_calls: Arc<std::sync::Mutex<Vec<Bytes>>>,
         }
         #[async_trait::async_trait]
-        impl RestorePool for RecordingPool {
-            async fn contains(&self, _hash: &TxHash) -> bool {
-                false
+        impl RestoreSource for RecordingSource {
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(alloy_primitives::Address, u64)> {
+                // Same `(from, nonce)` `recover_envelope` fabricates below.
+                let seed = tx_rlp.first().copied().unwrap_or(0);
+                Some((alloy_primitives::Address::from([seed; 20]), u64::from(seed)))
             }
-            async fn add_envelope(&self, tx_rlp: &Bytes) -> Result<RestoredEnvelope, String> {
+            async fn recover_envelope(
+                &self,
+                tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, crate::journal::RestoreSkip> {
                 self.add_calls.lock().unwrap().push(tx_rlp.clone());
-                // Fabricate a deterministic legacy envelope keyed off
-                // the first byte of the RLP so every restored entry
-                // has a distinct hash.
                 let seed = tx_rlp.first().copied().unwrap_or(0);
                 let inner = TxLegacy { nonce: seed as u64, ..Default::default() };
                 let signed = Signed::new_unchecked(
@@ -367,10 +503,6 @@ mod tests {
                     from: alloy_primitives::Address::from([seed; 20]),
                 })
             }
-            fn remove_transactions(&self, _hashes: Vec<TxHash>) {
-                // No mark_* fires in this restore-only test; keep
-                // no-op to satisfy the trait.
-            }
         }
 
         // Set up a service builder with a journal already containing
@@ -380,9 +512,8 @@ mod tests {
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
-        // Fresh commit timestamps so `start`'s pre-restore rotate does not
-        // age-abandon them before they can be replayed (see
-        // `journal::UNSEALED_ABANDON_ROTATIONS`).
+        // Fresh commit timestamps, so the entries are ordinary in-flight
+        // commitments rather than anything a rotation would drop.
         let now_ms =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
                 as u64;
@@ -393,6 +524,7 @@ mod tests {
                 tx_rlp: Bytes::from(vec![0xA1; 4]),
                 block_height: 10,
                 committed_at_ms: now_ms,
+                kind: ClaimKind::Promised,
             })
             .await
             .unwrap();
@@ -402,49 +534,75 @@ mod tests {
                 tx_rlp: Bytes::from(vec![0xA2; 4]),
                 block_height: 11,
                 committed_at_ms: now_ms,
+                kind: ClaimKind::Promised,
             })
             .await
             .unwrap();
 
-        let pool = RecordingPool { add_calls: Arc::new(std::sync::Mutex::new(Vec::new())) };
-        svc.start(&pool).await.unwrap();
+        let source = RecordingSource { add_calls: Arc::new(std::sync::Mutex::new(Vec::new())) };
+        // Every nonce reads as free, so `commitment_on_chain` is never asked.
+        svc.start(&source, &UnreachableChain).await.unwrap();
 
-        // The adapter was invoked for each journal entry.
-        assert_eq!(pool.add_calls.lock().unwrap().len(), 2, "one add per entry");
+        // The source was called once per journal entry.
+        assert_eq!(source.add_calls.lock().unwrap().len(), 2, "one add per entry");
         // Fifo contains both restored envelopes.
         let snapshot = svc.fifo().snapshot().await;
         assert_eq!(snapshot.len(), 2);
     }
 
-    /// An age-abandoned journal entry is pruned by `start`'s pre-restore rotate,
-    /// so it is never replayed into the pool/fifo. `UnreachablePool` panics if
-    /// `add_envelope` is reached, so a passing run proves the entry was dropped
-    /// before restore rather than re-injected.
+    /// A restore that cannot re-admit an entry gives the commitment up, and the
+    /// journal line goes with it — `start`'s prune runs *after* the replay pass,
+    /// keyed on the records that pass established, so there is no window in which
+    /// the file and the commitment records disagree.
     #[tokio::test]
-    async fn start_prunes_age_abandoned_entry_before_restore() {
-        use crate::journal::JournalEntry;
-        use alloy_primitives::{Bytes, TxHash};
+    async fn start_prunes_an_entry_whose_commitment_cannot_be_honoured() {
+        use crate::{
+            ClaimKind,
+            journal::{JournalEntry, RestoreSkip, RestoredEnvelope},
+        };
+        use alloy_primitives::{Address, Bytes, TxHash};
+
+        #[derive(Clone)]
+        struct RejectingSource;
+
+        #[async_trait::async_trait]
+        impl RestoreSource for RejectingSource {
+            fn recover_slot(&self, tx_rlp: &Bytes) -> Option<(Address, u64)> {
+                Some((Address::from([0xB1; 20]), u64::from(tx_rlp[0])))
+            }
+            async fn recover_envelope(
+                &self,
+                _tx_rlp: &Bytes,
+            ) -> Result<RestoredEnvelope, RestoreSkip> {
+                Err(RestoreSkip::Rejected("stub refuses to admit".into()))
+            }
+        }
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("preconf.jsonl");
         let cfg = PreconfConfig { journal_path: Some(path.clone()), ..PreconfConfig::default() };
         let svc = PreconfServiceBuilder::from_config(cfg).await.unwrap();
 
-        // Ancient commit timestamp ⇒ far older than the abandon window.
         svc.journal()
             .append_promised(&JournalEntry {
                 hash: TxHash::from([0xB1; 32]),
                 tx_rlp: Bytes::from(vec![0xB1; 4]),
                 block_height: 5,
                 committed_at_ms: 1,
+                kind: ClaimKind::Promised,
             })
             .await
             .unwrap();
 
-        svc.start(&UnreachablePool).await.unwrap();
+        // `RestoreSkip::Rejected` never consults the chain, so `UnreachableChain`
+        // is still the right stub here.
+        svc.start(&RejectingSource, &UnreachableChain).await.unwrap();
+
         assert!(
             svc.fifo().snapshot().await.is_empty(),
-            "age-abandoned entry must be pruned, not restored",
+            "a commitment the source rejects reaches no fifo entry",
         );
+        let (remaining, _) = svc.journal().load().await.unwrap();
+        assert!(remaining.is_empty(), "and its journal line is pruned along with its record");
     }
 }

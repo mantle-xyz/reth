@@ -4,31 +4,33 @@
 //!
 //! ## Lifecycle (per slot)
 //!
-//! 1. CL hits `engine_forkchoiceUpdatedVx`. The payload service calls [`Self::new_payload_job`]
-//!    with the new [`BuildNewPayload<Attrs>`].
-//! 2. The generator looks up the parent header via [`BlockReaderIdExt::sealed_header_by_hash`] and
+//! 1. CL hits `engine_forkchoiceUpdatedVx`. The payload service calls
+//!    [`PayloadJobGenerator::new_payload_job`] with the new [`BuildNewPayload<Attrs>`].
+//! 2. The generator looks up the parent header via [`HeaderProvider::sealed_header_by_hash`] and
 //!    assembles a [`BuildArguments`] in the upstream shape (so we can reuse the fork's
 //!    `build_payload` signature verbatim).
 //! 3. A fresh [`JobCancel`] and a `watch::channel(None)` are created. A tokio task is spawned that
 //!    drives [`PreconfPayloadBuilder::build_payload`] to completion, then sends the final
 //!    `Option<OpBuiltPayload<N>>` into the watch sender. On error the sender is dropped (without
-//!    sending). A panic inside the build is caught (`catch_unwind`), logged at `error!`, counted
-//!    via `preconf.build.panic_total`, and then degrades the same way (sender dropped →
-//!    `MissingPayload`) rather than being silently swallowed by the never-awaited join handle.
+//!    sending); a job abandoned while it waited for the build lock ends this way too, but is logged
+//!    at `debug!` and not counted as a failed build. A panic inside the build is caught
+//!    (`catch_unwind`), logged at `error!`, counted via `preconf.build.panic_total`, and then
+//!    degrades the same way (sender dropped → `MissingPayload`) rather than being silently
+//!    swallowed by the never-awaited join handle.
 //! 4. The [`PreconfPayloadJob`] returned to the payload service holds the watch receiver + cancel
 //!    handle + join handle. Subsequent `best_payload()` / `resolve_kind()` calls read through
 //!    those.
 //!
 //! ## `ensure_only_one_payload`
 //!
-//! [`Self::new_payload_job`] signal-cancels the previously spawned build, keeping **at most one
-//! live**. Otherwise a build that is never resolved (`getPayload`) nor evicted (reorg `Drop`) would
-//! linger forever — still subscribed to the shared [`PreconfTxSet`] broadcast — and could apply
-//! preconf txs into a block that never commits, stealing them from the job that will. It is a no-op
-//! in steady state (the previous job was already cancelled by its own `resolve_kind`); it only
-//! matters for abandoned / superseded jobs. Upstream [`BasicPayloadJobGenerator`] instead bounds
-//! job lifetime with a per-job deadline, which we avoid — it would cut a slow build short and break
-//! the preconf must-land SLA.
+//! [`PayloadJobGenerator::new_payload_job`] signal-cancels the previously spawned build, keeping
+//! **at most one live**. Otherwise a build that is never resolved (`getPayload`) nor evicted (reorg
+//! `Drop`) would linger forever — still subscribed to the shared [`PreconfTxSet`] broadcast — and
+//! could apply preconf txs into a block that never commits, stealing them from the job that will.
+//! It is a no-op in steady state (the previous job was already cancelled by its own
+//! `resolve_kind`); it only matters for abandoned / superseded jobs. Upstream
+//! [`BasicPayloadJobGenerator`] instead bounds job lifetime with a per-job deadline, which we avoid
+//! — it would cut a slow build short and break the preconf must-land SLA.
 //!
 //! ## What this generator does NOT do (yet)
 //!
@@ -40,14 +42,15 @@
 //!
 //! [`PayloadJobGenerator`]: reth_payload_builder::PayloadJobGenerator
 //! [`PreconfPayloadBuilder::build_payload`]: crate::builder::payload_builder::PreconfPayloadBuilder::build_payload
-//! [`BlockReaderIdExt::sealed_header_by_hash`]: reth_storage_api::BlockReaderIdExt::sealed_header_by_hash
+//! [`HeaderProvider::sealed_header_by_hash`]: reth_storage_api::HeaderProvider::sealed_header_by_hash
 
 use std::{
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use alloy_consensus::TxEnvelope;
+use alloy_primitives::B256;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth_optimism_evm::ConfigurePostExecEvm;
 use reth_optimism_node::OpBuiltPayload;
@@ -64,8 +67,16 @@ use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::builder::{
-    cancel::JobCancel, payload_builder::PreconfPayloadBuilder, payload_job::PreconfPayloadJob,
+    cancel::{AbandonedBeforeStart, CancelReason, JobCancel},
+    payload_builder::PreconfPayloadBuilder,
+    payload_job::PreconfPayloadJob,
 };
+
+/// The live build's cancel handle paired with the block it produced.
+///
+/// The block is filled in once, by the build itself, and read by the job that
+/// comes after it.
+type LiveBuild = (JobCancel, Arc<OnceLock<B256>>);
 
 /// `PayloadJobGenerator` impl that spawns the mantle preconf-aware
 /// build loop on each new payload request.
@@ -75,7 +86,7 @@ use crate::builder::{
 /// attributes and [`OpPayloadBuilderAttributes<N::SignedTx>`] (builder
 /// variant) for internal block building. This mirrors upstream's
 /// `OpPayloadBuilder::try_build` / `convert_build_args` split — see
-/// `op-reth/crates/payload/src/builder.rs:344`. A generic `Attrs`
+/// `op-reth/crates/payload/src/builder.rs`. A generic `Attrs`
 /// parameter cannot express the wrapper-unwrap step
 /// (`OpPayloadAttrs.0 → OpPayloadAttributes → from_rpc_attrs`)
 /// through the trait system cleanly; going OP-specific is the path
@@ -89,10 +100,17 @@ pub struct PreconfPayloadJobGenerator<Pool, Client, Evm, N> {
     /// `Arc<PreconfConfig>` / `Arc<PreconfTxSet>` and the OP builder
     /// config (DA / gas / SDM-enable).
     builder: PreconfPayloadBuilder<Pool, Client, Evm>,
-    /// `ensure_only_one_payload`: cancel handle of the most-recently
-    /// spawned build. Signalled when the next job is created so at most
-    /// one build task is ever live — see [`Self::new_payload_job`].
-    last_cancel: Arc<Mutex<Option<JobCancel>>>,
+    /// `ensure_only_one_payload`: cancel handle of the most-recently spawned
+    /// build, signalled when the next job is created so at most one build task
+    /// is ever live — see [`Self::new_payload_job`] — paired with the block that
+    /// build produced.
+    ///
+    /// That block is what tells one the consensus layer built on from one it
+    /// took and discarded: the next job's parent is the former and not the
+    /// latter. A bare `OnceLock` rather than the payload channel because
+    /// `OpBuiltPayload<N>` would force `N: NodePrimitives` onto this struct,
+    /// which it deliberately does not constrain.
+    last_cancel: Arc<Mutex<Option<LiveBuild>>>,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
     /// constraining `N` itself.
     _pd: PhantomData<fn() -> N>,
@@ -130,7 +148,7 @@ where
     // Pool / Client / Evm constraints needed by build_payload's where
     // clause. Repeated here because the trait impl is a fresh
     // generics scope.
-    Pool: reth_transaction_pool::TransactionPool<
+    Pool: reth_transaction_pool::TransactionPoolExt<
             Transaction: reth_optimism_txpool::OpPooledTx<Consensus = N::SignedTx>,
         > + Clone
         + Send
@@ -156,6 +174,7 @@ where
     N: OpPayloadPrimitives,
     N::SignedTx:
         From<alloy_primitives::Sealed<op_alloy_consensus::TxPostExec>> + TryFrom<TxEnvelope>,
+    op_alloy_consensus::OpTxEnvelope: From<N::SignedTx>,
 {
     type Job = PreconfPayloadJob<OpPayloadAttrs, OpBuiltPayload<N>>;
 
@@ -164,7 +183,8 @@ where
         input: BuildNewPayload<<Self::Job as reth_payload_builder::PayloadJob>::PayloadAttributes>,
         id: PayloadId,
     ) -> Result<Self::Job, PayloadBuilderError> {
-        let BuildNewPayload { attributes: rpc_attrs, parent_hash, cache, trie_handle } = input;
+        let BuildNewPayload { attributes: rpc_attrs, parent_hash, cache, state_root_handle } =
+            input;
 
         // Look up parent header — mirrors Base's pattern. Genesis edge
         // case (parent_hash zero) intentionally surfaces as
@@ -183,7 +203,7 @@ where
         // (`OpPayloadBuilderAttributes<N::SignedTx>`), so we unwrap
         // `rpc_attrs.0 → OpPayloadAttributes` and feed it through
         // `from_rpc_attrs` — same shape as upstream's private
-        // `convert_build_args` (op-reth payload/src/builder.rs:344).
+        // `convert_build_args` (op-reth `payload/src/builder.rs`).
         let attributes_for_job = rpc_attrs.clone();
         let builder_attrs =
             OpPayloadBuilderAttributes::<TxTy<N>>::from_rpc_attrs(parent_hash, id, rpc_attrs.0)
@@ -197,7 +217,7 @@ where
                 // significant.
                 Default::default(),
                 cache,
-                trie_handle,
+                state_root_handle,
                 config,
                 // The CancelOnDrop in BuildArguments is consumed by the
                 // upstream OpPayloadBuilderCtx. Our async cancel signal is
@@ -214,17 +234,35 @@ where
         // `ensure_only_one_payload`: cancel the previously spawned build so at
         // most one is ever live (rationale in the module docs). Idempotent in
         // steady state — the previous job was already cancelled by `resolve_kind`.
-        if let Some(prev) = self
+        // Filled by the spawned build below, read by the *next* job.
+        let built_block: Arc<OnceLock<B256>> = Arc::new(OnceLock::new());
+
+        if let Some((prev, prev_built)) = self
             .last_cancel
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace(cancel.clone())
+            .replace((cancel.clone(), Arc::clone(&built_block)))
         {
-            prev.signal();
+            // Only this job's parent can say whether the last payload was used:
+            // if the consensus layer built on what it was given, that parent is
+            // the block we produced. A second attempt at the same height and a
+            // switch to another chain both fail that test, and both mean a
+            // block's worth of transactions went nowhere with nothing else to
+            // report it.
+            if resolved_payload_went_nowhere(prev.reason(), prev_built.get().copied(), parent_hash)
+            {
+                metrics::counter!("preconf.build.resolved_payload_superseded_total").increment(1);
+            }
+            // The previous job's work is being thrown away — a later job for
+            // the same height supersedes it. Idempotent in steady state: if the
+            // consensus layer already asked for that payload, its reason is
+            // recorded and this changes nothing.
+            prev.abandon();
         }
 
         let cancel_for_build = cancel.clone();
         let (payload_tx, payload_rx) = watch::channel::<Option<OpBuiltPayload<N>>>(None);
+        let built_block_for_build = Arc::clone(&built_block);
 
         let builder_clone = self.builder.clone();
 
@@ -261,6 +299,9 @@ where
 
             match build_result {
                 Ok(Ok(payload)) => {
+                    // Recorded before the send, so the next job cannot read an
+                    // empty cell for a build that did deliver.
+                    let _ = built_block_for_build.set(payload.block().hash());
                     // `send` only fails when the receiver has been dropped,
                     // which means the job was torn down before we finished.
                     // Nothing we can do — log and exit.
@@ -271,7 +312,24 @@ where
                         );
                     }
                 }
+                // Abandoned while waiting for the build lock: nothing was
+                // built, and nobody will ask for the payload. Not a failure.
+                Ok(Err(PayloadBuilderError::Other(err)))
+                    if err.downcast_ref::<AbandonedBeforeStart>().is_some() =>
+                {
+                    tracing::debug!(
+                        target: "mantle::preconf::payload_job_generator",
+                        %id,
+                        "preconf payload job abandoned before it started building"
+                    );
+                    drop(payload_tx);
+                }
                 Ok(Err(err)) => {
+                    // The panic arm below has always been counted; this one was
+                    // not, which made "the build failed" invisible to anything
+                    // reading metrics — and a build that returns an error is the
+                    // more likely of the two.
+                    metrics::counter!("preconf.build.failed_total").increment(1);
                     warn!(
                         target: "mantle::preconf::payload_job_generator",
                         ?err,
@@ -338,10 +396,89 @@ const STALL_WATCHDOG_SLOTS: u32 = 3;
 /// common case returns `false` at once.
 async fn run_stall_watchdog(cancel: JobCancel, window: std::time::Duration) -> bool {
     if tokio::time::timeout(window, cancel.wait()).await.is_err() {
-        cancel.signal();
+        cancel.abandon();
         true
     } else {
         false
+    }
+}
+
+/// Whether the payload the consensus layer asked for went nowhere.
+///
+/// A build the consensus layer never asked for hands its transactions back at
+/// the end of its own build; one that *was* asked for does not, because the
+/// block it produced is expected to land. When it does not land, those
+/// transactions are in no block and no pool, and this is the only sign of it.
+///
+/// The test is the next job's parent: if the consensus layer built on what it
+/// was given, that parent is our block. Anything else — the same height again,
+/// or a different chain entirely — means what we handed over was not used.
+fn resolved_payload_went_nowhere(
+    reason: Option<CancelReason>,
+    resolved_block: Option<B256>,
+    next_parent: B256,
+) -> bool {
+    reason == Some(CancelReason::Resolved) && resolved_block != Some(next_parent)
+}
+
+#[cfg(test)]
+mod went_nowhere_tests {
+    use alloy_primitives::B256;
+
+    use super::{CancelReason, resolved_payload_went_nowhere};
+
+    fn hash(byte: u8) -> B256 {
+        B256::from([byte; 32])
+    }
+
+    /// The healthy case: the consensus layer built on what it was given, so the
+    /// next job's parent *is* that payload's block.
+    #[test]
+    fn a_payload_the_next_block_builds_on_is_not_counted() {
+        assert!(!resolved_payload_went_nowhere(
+            Some(CancelReason::Resolved),
+            Some(hash(1)),
+            hash(1),
+        ));
+    }
+
+    /// A second attempt at the same height: the next job's parent is the parent
+    /// the abandoned payload was built on, not the payload itself.
+    #[test]
+    fn a_second_attempt_at_the_same_height_is_counted() {
+        let parent = hash(9);
+        assert!(resolved_payload_went_nowhere(
+            Some(CancelReason::Resolved),
+            Some(hash(1)), // the block we handed over, a child of `parent`
+            parent,
+        ));
+    }
+
+    /// The case the parent-equality rule could not see: the consensus layer took
+    /// the payload and then moved to a different chain, so the next job's parent
+    /// is neither our block nor the height we were building on.
+    #[test]
+    fn a_payload_left_behind_by_a_chain_switch_is_counted() {
+        assert!(resolved_payload_went_nowhere(
+            Some(CancelReason::Resolved),
+            Some(hash(1)),
+            hash(42),
+        ));
+    }
+
+    /// A job nobody asked for hands its transactions back at the end of its own
+    /// build, so counting it here would double-report.
+    #[test]
+    fn a_job_nobody_asked_for_is_not_counted() {
+        assert!(!resolved_payload_went_nowhere(Some(CancelReason::Abandoned), None, hash(1)));
+        assert!(!resolved_payload_went_nowhere(None, None, hash(1)));
+    }
+
+    /// Asked for and never produced. Its slices still pruned their transactions,
+    /// so they went nowhere just the same.
+    #[test]
+    fn a_resolved_job_that_produced_no_payload_is_counted() {
+        assert!(resolved_payload_went_nowhere(Some(CancelReason::Resolved), None, hash(1)));
     }
 }
 
@@ -375,13 +512,13 @@ mod tests {
         let cancel = JobCancel::new();
         let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
         assert!(fired, "window elapsed with no cancel ⇒ watchdog fires");
-        assert!(cancel.is_cancelled(), "watchdog must signal cancel on fire");
+        assert!(cancel.reason().is_some(), "watchdog must signal cancel on fire");
     }
 
     #[tokio::test(start_paused = true)]
     async fn stall_watchdog_does_not_fire_when_cancelled_early() {
         let cancel = JobCancel::new();
-        cancel.signal(); // normal terminator (getPayload / Drop / next FCU)
+        cancel.abandon(); // normal terminator (getPayload / Drop / next FCU)
         let fired = run_stall_watchdog(cancel.clone(), Duration::from_secs(6)).await;
         assert!(!fired, "cancel before the window ⇒ watchdog is a no-op");
     }

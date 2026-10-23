@@ -1,10 +1,13 @@
 name: ci
 
 on:
+  # `branches` filters on the base branch, and this repo has no fallback workflow:
+  # a branch missing here gets no CI at all.
   pull_request:
-    branches: [mantle-stage2, main, dev/mantle-v1.6.2]
+    branches: [mantle-stage2, main, "dev/**", "release/**"]
   push:
-    branches: [mantle-stage2, main, dev/mantle-v1.6.2]
+    branches: [mantle-stage2, main, "dev/**", "release/**"]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -13,14 +16,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # sccache caches individual rustc compilations across runs — including the cfg(test)
-  # builds and git-dependency crates that Swatinem's target/ cache misses. Today ~250
-  # upstream op-reth/revm/alloy crates recompile on every PR *despite* a Swatinem cache
-  # hit (they rebuild because cargo's per-run fingerprints differ); sccache replays their
-  # cached object output instead. Requires incremental compilation to be off.
+  # Incremental artifacts slow down a clean build and only enlarge the cached target/.
   CARGO_INCREMENTAL: "0"
-  RUSTC_WRAPPER: "sccache"
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   lint:
@@ -31,25 +28,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           components: clippy
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      # Install sccache before any cargo step so RUSTC_WRAPPER resolves.
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      # Only pushes to the branches above save the cache. PR and manual runs restore
+      # from their base or the default branch and save nothing: every saved cache is
+      # several GB, all of them share the repository's quota, and caches written by PR
+      # runs were evicting the base branch's, so those runs rebuilt from scratch.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
       - uses: extractions/setup-just@v2
       - run: just fmt
       - run: just clippy
-      - run: sccache --show-stats
 
   test:
     name: test
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Measured 50–59 min on a Swatinem cache miss (eight runs, 2026-10-15/16),
+    # almost all of it compilation; see the `test-ci` recipe in `justfile`.
+    # The old 60 left single-digit minutes of headroom.
+    timeout-minutes: 90
     # Tests compile a lot of code; do not fail the build on warnings here
     # (warnings are already gated by the clippy job above).
     env:
@@ -58,14 +60,40 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
-      - uses: mozilla-actions/sccache-action@v0.0.10
+          toolchain: "1.95"
+      # Same policy as the lint job: only pushes save the cache.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
       - uses: extractions/setup-just@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
       - run: just test-ci
-      - run: sccache --show-stats
+      # A test that passed only on a retry is a `FLAKY` line somewhere in the
+      # thousands above. This puts it on the run's summary page as a warning;
+      # it does not fail the job.
+      - name: Annotate retried passes
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          report = pathlib.Path("target/nextest/default/junit.xml")
+          if not report.exists():
+              raise SystemExit
+          for case in ET.parse(report).getroot().iter("testcase"):
+              if case.find("flakyFailure") is not None or case.find("flakyError") is not None:
+                  print(
+                      f"::warning title=flaky test::{case.get('classname')} "
+                      f"{case.get('name')} passed only after a retry"
+                  )
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nextest-junit
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore

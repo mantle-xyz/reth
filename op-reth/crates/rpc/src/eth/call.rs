@@ -3,9 +3,13 @@ use alloy_consensus::{BlockHeader, SignableTransaction, TxEip1559};
 use alloy_eips::{BlockId, eip2718::Encodable2718};
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Signature, TxKind, U256};
-use alloy_rpc_types_eth::{TransactionRequest, state::StateOverride};
+use alloy_rpc_types_eth::{TransactionRequest, state::EvmOverrides};
 use reth_chainspec::{ChainSpecProvider, MIN_TRANSACTION_GAS};
-use reth_evm::{ConfigureEvm, Evm, EvmEnvFor, TransactionEnvMut, overrides::apply_state_overrides};
+use reth_evm::{
+    ConfigureEvm, Evm, EvmEnvFor, TransactionEnvMut,
+    env::BlockEnvironment,
+    overrides::{apply_block_overrides, apply_state_overrides},
+};
 use reth_optimism_evm::extract_l1_info;
 use reth_optimism_forks::OpHardforks;
 use reth_primitives_traits::Block;
@@ -21,7 +25,7 @@ use reth_rpc_eth_api::{
     },
 };
 use reth_rpc_eth_types::{
-    RpcInvalidTransactionError,
+    EthApiError, RpcInvalidTransactionError,
     error::api::{FromEvmHalt, FromRevert},
 };
 use reth_rpc_server_types::constants::gas_oracle::{CALL_STIPEND_GAS, ESTIMATE_GAS_ERROR_RATIO};
@@ -49,7 +53,7 @@ where
         &self,
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         at: BlockId,
-        state_override: Option<StateOverride>,
+        overrides: EvmOverrides,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
         async move {
             // [MANTLE] Apply the request's `stateOverride` balance for `from` to the Mantle
@@ -57,9 +61,9 @@ where
             // state before reading balances, but these checks read the raw provider
             // state (`state_by_block_id`), which ignored `stateOverride` and spuriously
             // rejected overridden-balance estimates. Extracted once here because
-            // `state_override` is moved into the inner call below.
+            // `overrides` is moved into the inner call below.
             let from_override_balance = request.as_ref().from.and_then(|from| {
-                state_override.as_ref().and_then(|ov| ov.get(&from)).and_then(|acc| acc.balance)
+                overrides.state.as_ref().and_then(|ov| ov.get(&from)).and_then(|acc| acc.balance)
             });
 
             // [MANTLE] Pre-check: value transfer (op-geth `gasestimator.go` clause 6,
@@ -97,7 +101,7 @@ where
             }
 
             let estimate =
-                EstimateCall::estimate_gas_at(self, request.clone(), at, state_override).await?;
+                EstimateCall::estimate_gas_at(self, request.clone(), at, overrides).await?;
 
             // [MANTLE] Post-estimation Arsia balance check (op-geth v1.5.5 mantleArsiaCheckFunds)
             // geth uses target block state (opts.State from StateAndHeaderByNumberOrHash).
@@ -217,19 +221,21 @@ where
     /// gate the caller balance allowance by the fee cap (`maxFeePerGas`) instead of the effective
     /// gas price (`geth_style_gas_allowance`, rejecting on `value >= balance` / blob-exposure like
     /// op-geth), ignore a
-    /// request gas limit below the intrinsic minimum, and only take the basic-transfer
-    /// short-circuit when the allowance permits it.
+    /// request gas limit below the intrinsic minimum, only take the basic-transfer
+    /// short-circuit when the allowance permits it, report running out of gas at the ceiling
+    /// as `gas required exceeds allowance`, and bound the ceiling by the RPC gas cap.
     ///
     /// Everything else is a verbatim copy of
     /// `reth_rpc_eth_api::helpers::estimate::EstimateCall::estimate_gas_with` (reth rev
-    /// 88505c7). The `[MANTLE]` blocks below are the only deviations. See
-    /// `docs/op-reth-estimategas-fix-and-upstream.md` for the rationale.
+    /// aef8d3e). The `[MANTLE]` blocks below are the only deviations: re-check this function
+    /// against upstream's on every reth bump, because upstream fixes to the default
+    /// implementation never reach this override on their own.
     fn estimate_gas_with<S>(
         &self,
         mut evm_env: EvmEnvFor<Self::Evm>,
         mut request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         state: S,
-        state_override: Option<StateOverride>,
+        overrides: EvmOverrides,
     ) -> Result<U256, Self::Error>
     where
         S: EvmStateProvider,
@@ -252,16 +258,39 @@ where
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.as_ref().gas_limit();
         let tx_request_gas_price = request.as_ref().gas_price();
+
+        // Configure the evm env
+        let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+
+        // Apply any block overrides before deriving block-derived limits and the tx env so
+        // overrides for `gasLimit`, `baseFee` and `blobBaseFee` are visible to estimation.
+        // Mirrors geth's behavior, see:
+        // <https://github.com/ethereum/go-ethereum/pull/30695>
+        if let Some(block_overrides) = overrides.block {
+            apply_block_overrides(*block_overrides, &mut db, evm_env.block_env.inner_mut());
+        }
+
+        // Apply any state overrides if specified.
+        if let Some(state_override) = overrides.state {
+            apply_state_overrides(state_override, &mut db).map_err(Self::Error::from_eth_err)?;
+        }
+
         // the gas limit of the corresponding block
-        let max_gas_limit = evm_env
-            .cfg_env
-            .tx_gas_limit_cap
-            // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
-            .filter(|_| !evm_env.cfg_env.is_amsterdam_eip8037_enabled())
-            .map_or_else(
-                || evm_env.block_env.gas_limit(),
-                |cap| cap.min(evm_env.block_env.gas_limit()),
-            );
+        let block_gas_limit = evm_env.block_env.gas_limit();
+        // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
+        let max_gas_limit = if evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
+            block_gas_limit
+        } else {
+            evm_env.cfg_env.tx_gas_limit_cap().min(block_gas_limit)
+        };
+        // [MANTLE] The RPC gas cap bounds the ceiling too, as it does in op-geth
+        // (`gasestimator.go`: `if gasCap != 0 && hi > gasCap`). Block overrides apply first, and
+        // Arsia lifts the per-transaction cap, so without it a raised `gasLimit` would have the
+        // estimate execute however much gas the request names.
+        let max_gas_limit = match self.call_gas_limit() {
+            0 => max_gas_limit,
+            gas_cap => max_gas_limit.min(gas_cap),
+        };
 
         // Determine the highest possible gas limit, considering both the request's specified
         // limit and the block's limit. Like op-geth, a user-supplied gas limit below the intrinsic
@@ -270,14 +299,6 @@ where
             .filter(|&tx_gas_limit| tx_gas_limit >= MIN_TRANSACTION_GAS)
             .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
             .unwrap_or(max_gas_limit);
-
-        // Configure the evm env
-        let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
-
-        // Apply any state overrides if specified.
-        if let Some(state_override) = state_override {
-            apply_state_overrides(state_override, &mut db).map_err(Self::Error::from_eth_err)?;
-        }
 
         let mut tx_env = self.create_txn_env(&evm_env, request, &mut db)?;
 
@@ -388,7 +409,24 @@ where
         let gas_refund = match res.result {
             ExecutionResult::Success { gas, .. } => gas.final_refunded(),
             ExecutionResult::Halt { reason, .. } => {
-                return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()));
+                let error = Self::Error::from_evm_halt(reason, tx_env.gas_limit());
+                // [MANTLE] A call that runs out of gas at the ceiling is reported the way op-geth
+                // reports it (`gasestimator.go`, after the first execution at `hi`), not as reth's
+                // out-of-gas error with its -32003.
+                if matches!(
+                    error.as_err(),
+                    Some(EthApiError::InvalidTransaction(
+                        RpcInvalidTransactionError::BasicOutOfGas(_) |
+                            RpcInvalidTransactionError::MemoryOutOfGas(_) |
+                            RpcInvalidTransactionError::PrecompileOutOfGas(_)
+                    ))
+                ) {
+                    return Err(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
+                        gas_limit: tx_env.gas_limit(),
+                    }
+                    .into_eth_err());
+                }
+                return Err(error);
             }
             ExecutionResult::Revert { output, .. } => {
                 return if tx_request_gas_limit.is_some() || tx_request_gas_price.is_some() {
@@ -489,6 +527,11 @@ where
     #[inline]
     fn max_simulate_blocks(&self) -> u64 {
         self.inner.eth_api.max_simulate_blocks()
+    }
+
+    #[inline]
+    fn compute_state_root_for_eth_simulate(&self) -> bool {
+        self.inner.eth_api.compute_state_root_for_eth_simulate()
     }
 
     #[inline]

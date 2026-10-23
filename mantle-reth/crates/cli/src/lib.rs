@@ -7,7 +7,10 @@ mod chainspec;
 pub use chainspec::MantleChainSpecParser;
 
 pub mod args;
-pub use args::{MantleArgs, PreconfArgs};
+pub use args::{
+    FlashblocksArgs, FlashblocksConsumerArgs, MantleArgs, MantleArgsError, MantleConfigs,
+    PreconfArgs,
+};
 
 pub mod txpool;
 pub use txpool::{MantleTransactionValidator, MetaTxDisabled, UnprotectedTxDisabled};
@@ -16,6 +19,8 @@ pub mod node;
 pub use node::{MantleNode, MantleNodeComponentBuilder, MantlePoolBuilder, MantleTransactionPool};
 
 pub mod version;
+
+pub mod rpc_defaults;
 
 pub mod metrics_seed;
 pub use metrics_seed::seed_blockchain_tree_metrics;

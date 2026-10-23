@@ -19,39 +19,95 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use alloy_consensus::Header;
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{B256, Bytes, TxKind, U256};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_primitives::{Address, B256, Bloom, Bytes, TxKind, U256};
+use alloy_rpc_types_eth::{
+    EIP1186AccountProofResponse, TransactionRequest, simulate::SimulatePayload,
+};
+use alloy_serde::JsonStorageKey;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
+use mantle_reth_flashblocks::{Metrics, PendingEthApi, PendingStateOverrides};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
+use reth_errors::RethError;
 use reth_optimism_evm::extract_l1_info;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_rpc::SequencerClient;
-use reth_primitives_traits::{AlloyBlockHeader, Block};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives};
 use reth_rpc_eth_api::{
-    FullEthApiTypes,
-    helpers::{EthBlocks, EthCall, EthFees},
+    EthApiTypes, FromEthApiError, FullEthApiTypes,
+    helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState},
 };
+use reth_rpc_eth_types::{EthApiError, simulate};
 use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{
-    BlockIdReader, BlockReaderIdExt, StateProviderBox, StateProviderFactory, errors::ProviderResult,
+    BlockIdReader, BlockReaderIdExt, StateProofProvider, StateProviderBox, StateProviderFactory,
+    errors::ProviderResult,
 };
+use reth_trie_common::AccountProof;
 use std::sync::Arc;
 use tracing::debug;
 
 /// Preconfirmation transaction event returned by `eth_sendRawTransactionWithPreconf`.
+///
+/// # What a preconfirmation does and does not promise
+///
+/// This event is produced the moment the sequencer applies the transaction to the
+/// block it is **currently building** — before that block is sealed, and long
+/// before it is canonical. So it is a prediction, not a record:
+///
+/// - **`tx_hash` is binding.** The sequencer has committed to landing *this* transaction, and holds
+///   the `(sender, nonce)` it occupies against any other transaction for as long as the commitment
+///   stands. The one exception is a breach: if the transaction later proves un-appliable (its nonce
+///   was consumed elsewhere, its balance spent), the sequencer releases the nonce so the sender is
+///   not wedged, and logs `COMMITMENT BROKEN` / `preconf.tx.commitment_broken_total`. A client that
+///   re-submits the same hash then gets `CommitmentBroken` — the only channel through which the
+///   breach is reported.
+/// - **A preconfirmation does not preempt an ordinary transaction.** Whichever of the two the
+///   builder executes first takes the `(sender, nonce)`. The hold above begins when this event is
+///   produced; before that, queueing is only queueing and reserves no nonce.
+/// - **Everything else is a prediction of one particular build.** If that in-flight block is
+///   discarded (a competing block takes the height, the payload job is superseded, the process
+///   restarts), the sequencer re-applies the transaction to a *later* block — honouring the
+///   promise, but against different state. `block_height`, `status` and `receipt.logs` are all
+///   recomputed then, and the client is **not** sent a corrected event: the response to this call
+///   has already been delivered.
+/// - The fields added to `receipt` are all **positions and figures from one particular build**.
+///   `transactionIndex`, `cumulativeGasUsed` and each log's `logIndex` say where this transaction
+///   sat in the block that was being built; a replay puts it somewhere else, and no corrected event
+///   is sent. `gasUsed`, `logsBloom`, `status`, `effectiveGasPrice` and the L1 fee fields are all
+///   recomputed on replay too.
+/// - `blockHash` is absent and always will be: the block is not sealed when this event is produced,
+///   so its header does not exist yet.
+/// - Fields being absent altogether means the sequencer did not send them — an op-geth sequencer
+///   sends only `logs`.
+///
+/// Consequently, **do not reconcile on the fields of this event**. Treat it as
+/// "accepted, will land", and read the authoritative outcome from
+/// `eth_getTransactionReceipt` once the transaction is on chain. In particular a
+/// `Success` here can be followed by a failed on-chain receipt if the
+/// transaction reverts when replayed against later state.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreconfTxEvent {
-    /// Transaction hash
+    /// Transaction hash. The one field that is binding — see the type docs.
     pub tx_hash: B256,
-    /// Preconfirmation status
+    /// Preconfirmation status, as evaluated against the in-flight block.
+    ///
+    /// **May differ from the eventual on-chain receipt.** A cross-block replay
+    /// re-executes against different state, so a `Success` here can end up as a
+    /// reverted on-chain receipt (and vice versa). Not a reconciliation source.
     pub status: PreconfStatus,
     /// Optional failure message
     pub reason: String,
-    /// Predicted L2 block number (hex-encoded quantity)
+    /// **Predicted** L2 block number (hex-encoded quantity).
+    ///
+    /// Computed as `parent_number + 1` for the block being built when this
+    /// preconfirmation was issued. If that block is discarded the transaction
+    /// lands at a **later** height and this value is never corrected. Use
+    /// `eth_getTransactionReceipt` for the authoritative height.
     #[serde(with = "alloy_serde::quantity")]
     pub block_height: u64,
     /// Preconfirmation transaction receipt
@@ -61,26 +117,51 @@ pub struct PreconfTxEvent {
 /// Preconfirmation status.
 ///
 /// Matches op-geth's 4-variant `PreconfStatus` for cross-client SDK
-/// compatibility. Server pre-apply rejection (e.g. block gas budget) is
-/// collapsed into `Failed` at this wire boundary — the fine-grained
-/// reason travels in [`PreconfTxEvent::reason`]. The internal fifo state
-/// machine still distinguishes `Canceled` from `Failed` for replacement
-/// / clean-up semantics.
+/// compatibility.
+///
+/// **Two different things wear this name, and only one of them is this enum.**
+/// The queue's own entry status is `Waiting` or `Success` and nothing else —
+/// a commitment that ends is removed rather than parked in a terminal state.
+/// The wire status here is derived separately, from the EVM execution outcome:
+/// `impl From<PreconfReceipt> for PreconfTxEvent` in `mantle_reth_preconf::rpc`
+/// maps `receipt.status` to `Success` / `Failed`, and the handler's deadline
+/// arm builds `Timeout`. So `Failed` has no queue counterpart to map from, but
+/// it is still a status clients see.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PreconfStatus {
-    /// EVM apply succeeded; tx on chain.
+    /// EVM apply succeeded in the build that issued this event. Like every
+    /// field but `tx_hash`, a prediction of that one build rather than
+    /// canonical inclusion — see the notes on this type.
     #[serde(rename = "success")]
     Success,
-    /// Either (a) EVM apply revert/halt (tx on chain) OR (b) builder
-    /// pre-apply reject / server-side cancel (tx NOT on chain). The
-    /// [`PreconfTxEvent::reason`] field disambiguates.
+    /// EVM apply reverted or halted in the build that issued this event: the
+    /// transaction executed and produced a receipt, so this is an outcome
+    /// rather than a refusal. Carries the same build-scoped caveat as
+    /// `Success`.
+    ///
+    /// **Narrower than op-geth's `failed`, deliberately.** The two agree
+    /// everywhere else: an admission refusal (base fee, funds, tx type) is a
+    /// JSON-RPC error on both, a revert is `Failed` on both, an expired
+    /// deadline is `Timeout` on both. They differ once the builder has the
+    /// transaction and cannot fit it: op-geth reports that as `failed` with
+    /// `ErrPreconfBlockFull` in the reason, while this node answers the
+    /// JSON-RPC call with an error — `PreconfError::BlockGasBudgetExceeded` and
+    /// its DA counterparts leave through the handler's `Some(Ok(Err(err)))`
+    /// arm, which sends no event at all.
+    ///
+    /// So `Failed` from this node always means the transaction executed and is
+    /// on chain. From op-geth it may also mean it never ran.
     #[serde(rename = "failed")]
     Failed,
     /// Client-side deadline elapsed (`preconf_timeout`); tx NOT on chain.
     #[serde(rename = "timeout")]
     Timeout,
-    /// Preconfirmation is waiting (intermediate state; typically not
-    /// broadcast to subscribers).
+    /// Preconfirmation is still waiting on the builder.
+    ///
+    /// **Never sent by this node.** `eth_sendRawTransactionWithPreconf` only
+    /// answers once the commitment has ended, so the client sees one of the
+    /// three above. Carried for op-geth wire compatibility, and so a client
+    /// deserialising another implementation's event does not fail on it.
     #[serde(rename = "waiting")]
     Waiting,
 }
@@ -88,11 +169,23 @@ pub enum PreconfStatus {
 /// Preconfirmation transaction receipt.
 ///
 /// `logs` is `Option` rather than a plain `Vec` so absence semantics
-/// can be expressed on the wire: `null` when no EVM apply happened
-/// (Timeout / server pre-apply reject), `[]` when apply happened but
-/// emitted no logs. SDKs treat both as "no logs" but the wire shape
-/// preserves the distinction.
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+/// can be expressed on the wire: `null` when no EVM apply happened,
+/// `[]` when apply happened but emitted no logs. SDKs treat both as
+/// "no logs" but the wire shape preserves the distinction.
+///
+/// This node sends `null` only on `Timeout`; it answers a builder refusal with
+/// a JSON-RPC error rather than an event (see [`PreconfStatus::Failed`]). An
+/// event deserialised from an op-geth sequencer can carry `null` on `failed`
+/// as well.
+///
+/// Apart from `logs`, every scalar field is `Option` and omitted when absent;
+/// `l1_fields` is a flattened struct whose own fields are each `Option` and
+/// each omitted individually. An absent field means the sequencer did not send
+/// one — an op-geth sequencer sends only `logs` — so a forwarding reth node
+/// reproduces its response byte for byte. A zero would be a number this node
+/// invented; absence is the honest answer.
+#[derive(Debug, Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreconfTxReceipt {
     /// Event logs, echoed verbatim from the sequencer.
     ///
@@ -102,24 +195,96 @@ pub struct PreconfTxReceipt {
     /// wire (`invalid type: null, expected a sequence`) *and* would re-serialize an empty result
     /// as `[]`, diverging from geth. `Option<Vec<_>>` deserializes null→None and re-serializes
     /// None→null, so a forwarding reth node returns byte-identical shape to the geth sequencer.
+    /// The `null` / `[]` distinction is the one described on the type above.
     ///
-    /// (Internally the preconf handler also uses this: `None` ⇒ no EVM apply happened —
-    /// Timeout / server pre-apply reject — while `Some(vec![])` ⇒ apply happened but emitted
-    /// no logs.)
+    /// Like every other field of [`PreconfTxEvent`] except `tx_hash`, these are
+    /// the logs of one particular in-flight execution. A cross-block replay
+    /// re-executes against different state and can emit different logs, with no
+    /// corrected event sent. Read `eth_getTransactionReceipt` to reconcile.
     #[serde(default)]
     pub logs: Option<Vec<PreconfLog>>,
+
+    /// EVM status — `0x1` on success, `0x0` on revert or halt.
+    ///
+    /// Not to be confused with [`PreconfTxEvent::status`], which is the
+    /// preconfirmation's own four-state outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub status: Option<u64>,
+    /// Gas this transaction alone used, after the post-exec refund — the same
+    /// figure `eth_getTransactionReceipt` reports.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub gas_used: Option<u64>,
+    /// Block gas used through this transaction, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub cumulative_gas_used: Option<u64>,
+    /// This transaction's index in the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub transaction_index: Option<u64>,
+    /// Bloom over this transaction's logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_bloom: Option<Bloom>,
+    /// EIP-2718 transaction type byte.
+    #[serde(
+        default,
+        rename = "type",
+        skip_serializing_if = "Option::is_none",
+        with = "alloy_serde::quantity::opt"
+    )]
+    pub tx_type: Option<u64>,
+    /// Sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Address>,
+    /// Recipient — absent for a creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Address>,
+    /// Address a creation deployed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<Address>,
+    /// What this transaction paid per unit of gas.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub effective_gas_price: Option<u128>,
+    /// The eleven L1 fee fields, flattened so their shape matches
+    /// `eth_getTransactionReceipt` exactly. Every field inside is `Option` and
+    /// omitted when the fork that introduced it is not active, so an op-geth
+    /// sequencer's response is unaffected.
+    ///
+    /// The type also carries `opGasRefund`, `depositNonce` and
+    /// `depositReceiptVersion`. None of the three is ever set here — a preconf
+    /// transaction can never be a deposit, and `opGasRefund` is left unset for
+    /// the reason given at its `OpReceiptFieldsBuilder` call site in
+    /// `apply_preconf_with_da` — so all three stay absent from the wire.
+    #[serde(flatten)]
+    pub l1_fields: op_alloy_rpc_types::OpTransactionReceiptFields,
 }
 
 /// Preconfirmation log entry
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreconfLog {
     /// Log address
-    pub address: alloy_primitives::Address,
+    pub address: Address,
     /// Log topics
     pub topics: Vec<B256>,
     /// Log data
     pub data: Bytes,
+    /// Number of the block being built when this log was emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub block_number: Option<u64>,
+    /// Timestamp of the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub block_timestamp: Option<u64>,
+    /// Hash of the transaction that emitted this log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_hash: Option<B256>,
+    /// Index of that transaction in the block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub transaction_index: Option<u64>,
+    /// This log's index across the whole block being built.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub log_index: Option<u64>,
+    /// Geth compatibility field — always `false` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<bool>,
 }
 
 // ─── Preconf handler indirection ─────────────────────────────────────────────
@@ -171,6 +336,8 @@ pub trait MantleEthApiExt {
     /// Estimates the total fee for a transaction (L2 gas + L1 data + operator fee).
     ///
     /// Only supported on Mantle chains after the Arsia hardfork.
+    /// With `pending`, a consumer uses one captured Flashblocks preview for execution
+    /// and fee parameters; without a preview it resolves the block through the Eth API.
     #[method(name = "estimateTotalFee")]
     async fn estimate_total_fee(
         &self,
@@ -197,6 +364,27 @@ pub trait MantleEthApiExt {
         payload: serde_json::Value,
         block_number: Option<BlockId>,
     ) -> RpcResult<serde_json::Value>;
+
+    /// Overrides `eth_getProof` to keep geth parity for accounts that do not exist.
+    ///
+    /// geth — including op-geth, Mantle's reference client — reports zero
+    /// `codeHash`/`storageHash` for nonexistent accounts
+    /// ([go-ethereum#28357](https://github.com/ethereum/go-ethereum/pull/28357)); reth's
+    /// standard conversion reports `KECCAK_EMPTY`/`EMPTY_ROOT_HASH`. The exclusion-proof
+    /// shape op-geth clients already parse must stay geth's, so this override routes the
+    /// proof through [`AccountProof::into_eip1186_response_with`] with
+    /// `zero_empty_account = true` (the knob upstream added for exactly this case), same as
+    /// the proofs-history node's `EthApiExt` override. Everything else — proof-window
+    /// enforcement, block-id resolution (pending included), off-thread trie walking —
+    /// delegates to the same helpers the standard implementation uses, so responses for
+    /// existing accounts are identical.
+    #[method(name = "getProof")]
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse>;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -217,6 +405,9 @@ pub struct MantleRpcExt<Provider, EthApi> {
     /// `None` ⇒ fall back to `sequencer_client` forward / "not implemented"
     /// stub.
     preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
+    /// Pending flashblock overlay. `Some` only when the flashblock consumer is
+    /// enabled; supplies a request-scoped snapshot for pending simulation and total fees.
+    pending_overrides: Option<Arc<dyn PendingStateOverrides>>,
 }
 
 impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
@@ -227,7 +418,17 @@ impl<Provider, EthApi> MantleRpcExt<Provider, EthApi> {
         sequencer_client: Option<SequencerClient>,
         preconf_handler: Option<Arc<dyn DynPreconfHandler>>,
     ) -> Self {
-        Self { provider, eth_api, sequencer_client, preconf_handler }
+        Self { provider, eth_api, sequencer_client, preconf_handler, pending_overrides: None }
+    }
+
+    /// Attaches the flashblock pending overlay used by simulation and total-fee estimation.
+    #[must_use]
+    pub fn with_pending_overrides(
+        mut self,
+        pending_overrides: Option<Arc<dyn PendingStateOverrides>>,
+    ) -> Self {
+        self.pending_overrides = pending_overrides;
+        self
     }
 
     #[inline]
@@ -306,72 +507,14 @@ fn estimate_total_fee_gas_price(
     }
 }
 
-/// Default spacing between simulated blocks when a request does not override `time`.
+/// A chain id with no block time registered in `alloy-chains`, for which `sanitize_chain` steps
+/// simulated blocks 12s apart: op-geth's `timestampIncrement`, which op-geth applies whatever the
+/// chain.
 ///
-/// Must track `OpNextBlockEnvAttributes::build_pending_env`, which derives a simulated block's
-/// timestamp as `parent.timestamp() + 12`. The value comes from `eth_simulateV1`'s original
-/// definition in go-ethereum (`timestampIncrement`, `internal/ethapi/simulate.go`) and is a plain
-/// constant on both clients today, so 12 is what op-geth and this reth actually produce — verified
-/// on devnet.
-///
-/// It is nonetheless *wrong for Mantle*, whose blocks are 2s apart, and upstream reth has already
-/// replaced the constant with a per-chain lookup (`Chain::average_blocktime_hint()`), keeping 12
-/// only as the fallback for unregistered chains. Mantle is **not** unregistered: `alloy-chains`
-/// records `average_blocktime_millis = 2000` for both chain 5000 and 5003
-/// (`CHAIN_DATA[95]`/`[96]` in `alloy-chains/src/generated/named.rs`).
-///
-/// So bumping to a rev that includes that change will switch the real increment from 12 to 2, and
-/// this constant will silently disagree with it — the crossing check would compute timestamps ~6x
-/// too far ahead and could reject a request that never crosses the fork. See
-/// [`simulated_block_timestamps`] for the fix to apply at bump time.
-const SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT: u64 = 12;
-
-/// Parses a JSON-RPC quantity into a `u64`, accepting both the canonical `"0x2a"` hex string and a
-/// bare JSON number.
-fn parse_quantity_u64(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::String(raw) => {
-            let raw = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))?;
-            u64::from_str_radix(raw, 16).ok()
-        }
-        serde_json::Value::Number(raw) => raw.as_u64(),
-        _ => None,
-    }
-}
-
-/// Returns the timestamp of each simulated block, in order, given the base block's timestamp and
-/// each entry's optional `blockOverrides.time`.
-///
-/// Mirrors how `eth_simulateV1` derives timestamps: default to `previous + 12`, but an explicit
-/// `time` override wins. Each block's parent is the *previous simulated block*, not the base block,
-/// so the timestamps must be walked forward rather than computed against the base.
-///
-/// This assumes one simulated block per `blockStateCalls` entry, and that consecutive blocks are
-/// [`SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT`] apart. Both hold today but both break on the same
-/// upstream bump:
-///
-/// - paradigmxyz/reth#24388 adds gap-filling, so a skipped `blockOverrides.number` inserts filler
-///   blocks that also consume timestamps — the entry's real timestamp then lands *later* than
-///   computed here, and a crossing could be missed.
-/// - the same tree replaces the fixed increment with `Chain::average_blocktime_hint()`, which
-///   returns 2s for Mantle (registered in `alloy-chains`), so timestamps computed at 12s would run
-///   ~6x too far ahead and a non-crossing request could be rejected.
-///
-/// The single fix for both: once on such a rev, derive the timestamps from `sanitize_chain`'s
-/// output — it materializes an explicit `time` for every block, fillers included, at the chain's
-/// real block time — instead of recomputing them here.
-fn simulated_block_timestamps(base_timestamp: u64, time_overrides: &[Option<u64>]) -> Vec<u64> {
-    let mut previous = base_timestamp;
-    time_overrides
-        .iter()
-        .map(|override_time| {
-            let timestamp = override_time
-                .unwrap_or_else(|| previous.saturating_add(SIMULATE_DEFAULT_BLOCK_TIME_INCREMENT));
-            previous = timestamp;
-            timestamp
-        })
-        .collect()
-}
+/// `sanitize_chain` steps them by the chain's block time otherwise (reth #24388: 2s on Mantle),
+/// where op-geth, and this node before the bump, add 12s. Normalizing against this id gives
+/// op-geth's blocks, fillers for number gaps included, without copying the function.
+const OP_GETH_SIMULATE_CHAIN_ID: u64 = 0;
 
 /// Returns the 0-based index of the first simulated block that crosses the Arsia activation
 /// boundary, i.e. whose parent is pre-Arsia while the block itself is post-Arsia.
@@ -409,7 +552,17 @@ where
         + Send
         + Sync
         + 'static,
-    EthApi: EthBlocks + EthCall + EthFees + FullEthApiTypes + Send + Sync + 'static,
+    EthApi: EthBlocks
+        + EthCall
+        + EthFees
+        + EthApiSpec
+        + EthState
+        + FullEthApiTypes
+        + Send
+        + Sync
+        + 'static,
+    EthApi::Primitives: NodePrimitives<BlockHeader = Header>,
+    EthApi::Provider: ChainSpecProvider<ChainSpec: OpHardforks>,
     // Lets `eth_simulateV1` surface the standard implementation's error verbatim, preserving the
     // spec-defined codes (-38010..-38026) instead of collapsing them into a generic -32000.
     ErrorObject<'static>: From<EthApi::Error>,
@@ -520,6 +673,50 @@ where
         Ok(blocks)
     }
 
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse> {
+        // [MANTLE] mirror of upstream `EthState::get_proof`
+        // (rpc-eth-api/src/helpers/state.rs) — re-sync on upstream bump. Sole divergence:
+        // the geth-parity conversion below.
+        //
+        // `let _permit` (not `let _`): the tracing permit (`--rpc.max-tracing-requests`) is
+        // the only concurrency bound on proof generation, held for the whole operation.
+        let _permit = self
+            .eth_api()
+            .acquire_owned_tracing()
+            .await
+            .map_err(RethError::other)
+            .map_err(EthApiError::Internal)
+            .map_err(<EthApi as EthApiTypes>::Error::from_eth_err)
+            .map_err(ErrorObject::from)?;
+
+        // Omitted block param means latest, per the EIP-1898 geth convention
+        // (`BlockId::default()` is `Latest`, not a zero-ish hash/number).
+        let block_id = block_number.unwrap_or_default();
+        EthState::ensure_within_proof_window(self.eth_api(), block_id)
+            .map_err(ErrorObject::from)?;
+
+        self.eth_api()
+            .spawn_blocking_io_fut(async move |eth_api| {
+                let state = eth_api.state_at_block_id(block_id).await?;
+                let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
+                let proof: AccountProof = state
+                    .proof(Default::default(), address, &storage_keys)
+                    .map_err(<EthApi as EthApiTypes>::Error::from_eth_err)?;
+                // [MANTLE] geth parity (go-ethereum#28357): an account that does not exist
+                // reports zero `codeHash`/`storageHash` instead of `KECCAK_EMPTY`/
+                // `EMPTY_ROOT_HASH`, and a lone empty-trie sentinel node collapses to an empty
+                // proof array. Existing accounts are identical to the standard conversion.
+                Ok(proof.into_eip1186_response_with(keys, true))
+            })
+            .await
+            .map_err(ErrorObject::from)
+    }
+
     async fn send_raw_transaction_with_preconf(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
         // Path 1: local sequencer + preconf enabled → handle in-process.
         if let Some(handler) = self.preconf_handler.as_ref() {
@@ -535,13 +732,9 @@ where
                 sequencer.forward_raw_transaction_with_preconf(bytes.as_ref()).await;
             metrics::histogram!("preconf.forward.duration_ms")
                 .record(started.elapsed().as_millis() as f64);
-            let raw: serde_json::Value = forward_result.map_err(|err| {
-                ErrorObject::owned(
-                    -32000,
-                    format!("failed to forward tx to sequencer, please try again. Error: '{err}'"),
-                    None::<()>,
-                )
-            })?;
+            // Preserve the sequencer's RPC code, message and data. The shared
+            // conversion reports transport failures as internal errors instead.
+            let raw: serde_json::Value = forward_result?;
             serde_json::from_value::<PreconfTxEvent>(raw).map_err(|err| {
                 ErrorObject::owned(
                     -32000,
@@ -566,24 +759,68 @@ where
         validate_estimate_total_fee_blob_fields(&request)?;
 
         let block_id = block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
-
-        let block = self
-            .provider()
-            .block_by_id(block_id)
-            .map_err(|e| {
-                ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
-            })?
-            .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
-
-        // Pin symbolic block tags (safe, finalized, latest) to the resolved block number.
-        // This ensures estimate_gas_at uses the same block even if a new block arrives.
-        // Matches geth: `bNrOrHash = rpc.BlockNumberOrHashWithNumber(header.Number.Int64())`
-        let block_id = BlockId::Number(BlockNumberOrTag::Number(block.header().number()));
-
-        let header = block.header();
+        // Capture once: gas execution, base fee, L1 attributes and token ratio must
+        // all describe this same published preview, even if a new slice arrives.
+        let context = block_id
+            .is_pending()
+            .then(|| {
+                self.pending_overrides
+                    .as_ref()
+                    .and_then(|overlay| overlay.pending_execution_context())
+            })
+            .flatten();
+        let (block_id, timestamp, header_base_fee, l1_block_info) = if let Some(context) =
+            context.as_ref()
+        {
+            (
+                context.base_block,
+                context.header.timestamp(),
+                context.header.base_fee_per_gas(),
+                None,
+            )
+        } else if block_id.is_pending() {
+            // The provider may not have a pending block. Resolve through the Eth API,
+            // retaining actual pending state when available and otherwise pinning latest.
+            let pending = self.eth_api().pending_block_env_and_cfg().map_err(ErrorObject::from)?;
+            let at = pending.origin.state_block_id();
+            // Reuse the actual block captured during resolution. recovered_block(pending)
+            // is disabled by --rpc.pending-block=none even when the provider has it.
+            let block = if let Some(block) = pending.origin.into_actual_pending() {
+                block
+            } else {
+                self.eth_api()
+                    .recovered_block(at)
+                    .await
+                    .map_err(ErrorObject::from)?
+                    .ok_or_else(|| invalid_params_rpc_err("block not found"))?
+            };
+            let at = if at.is_pending() { at } else { block.hash().into() };
+            (
+                at,
+                block.header().timestamp(),
+                block.header().base_fee_per_gas(),
+                extract_l1_info(block.body()).ok(),
+            )
+        } else {
+            let block = self
+                .provider()
+                .block_by_id(block_id)
+                .map_err(|e| {
+                    ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
+                })?
+                .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
+            // Preserve non-pending block resolution and fee calculation.
+            let at = BlockId::Number(BlockNumberOrTag::Number(block.header().number()));
+            (
+                at,
+                block.header().timestamp(),
+                block.header().base_fee_per_gas(),
+                extract_l1_info(block.body()).ok(),
+            )
+        };
         let chain_spec = self.provider().chain_spec();
 
-        if !chain_spec.is_mantle_arsia_active_at_timestamp(header.timestamp()) {
+        if !chain_spec.is_mantle_arsia_active_at_timestamp(timestamp) {
             return Err(ErrorObject::owned(
                 -32000,
                 "eth_estimateTotalFee is not supported for pre-Arsia blocks",
@@ -600,22 +837,31 @@ where
             )
         })?;
 
-        // Estimate L2 gas via the standard gas estimator (matches op-geth DoEstimateGas)
-        let gas_estimate: U256 = EthCall::estimate_gas_at(
-            self.eth_api(),
-            serde_json::from_value(serde_json::to_value(&request).map_err(|e| {
-                ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
-            })?)
-            .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?,
-            block_id,
-            None,
-        )
+        let transaction = serde_json::from_value(serde_json::to_value(&request).map_err(|e| {
+            ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
+        })?)
+        .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?;
+        let overrides =
+            context.as_ref().map(|context| context.overrides(None, None)).unwrap_or_default();
+        let pending_api =
+            context.map(|context| PendingEthApi::new(self.eth_api().clone(), context));
+        // Estimate L2 gas through the same execution path as eth_estimateGas(pending).
+        let gas_estimate: U256 = async {
+            if let Some(api) = pending_api.as_ref() {
+                let estimate =
+                    EthCall::estimate_gas_at(api, transaction, block_id, overrides.clone()).await?;
+                api.check_estimate_funds(request.clone(), estimate, overrides.state).await?;
+                Ok(estimate)
+            } else {
+                EthCall::estimate_gas_at(self.eth_api(), transaction, block_id, overrides).await
+            }
+        }
         .await
         .map_err(|e| {
             ErrorObject::owned(-32000, format!("failed to estimate gas: {e}"), None::<()>)
         })?;
 
-        let base_fee = U256::from(header.base_fee_per_gas().unwrap_or(0));
+        let base_fee = U256::from(header_base_fee.unwrap_or(0));
 
         // Get real suggested tip (matches op-geth SuggestGasTipCap)
         let suggested_tip =
@@ -630,16 +876,32 @@ where
         );
         let l2_fee = gas_estimate.saturating_mul(gas_price);
 
-        // Calculate L1 data fee + operator fee from L1BlockInfo
-        let (l1_data_fee, operator_fee) = match extract_l1_info(block.body()) {
-            Ok(mut l1_block_info) => {
-                // `token_ratio` (GasPriceOracle slot 0) is not in the L1-attributes calldata;
-                // read it from the target block's post-state (matches geth's
-                // `StateAndHeaderByNumberOrHash`). Propagate provider errors rather than
-                // silently keeping the default 0 — `token_ratio` is the multiplicative factor
-                // of the L1 data fee, so swallowing an error would drop the whole L1 component.
-                l1_block_info.token_ratio = read_token_ratio(self.provider(), block_id)?;
-
+        // Calculate L1 data fee + operator fee from the same state used for execution.
+        let l1_block_info = if let Some(api) = pending_api.as_ref() {
+            Some(api.l1_block_info().await.map_err(ErrorObject::from)?)
+        } else if let Some(mut info) = l1_block_info {
+            info.token_ratio = if block_id.is_pending() {
+                let state =
+                    self.eth_api().state_at_block_id(block_id).await.map_err(ErrorObject::from)?;
+                state
+                    .storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
+                    .map_err(|e| {
+                        ErrorObject::owned(
+                            -32000,
+                            format!("failed to read token_ratio: {e}"),
+                            None::<()>,
+                        )
+                    })?
+                    .unwrap_or_default()
+            } else {
+                read_token_ratio(self.provider(), block_id)?
+            };
+            Some(info)
+        } else {
+            None
+        };
+        let (l1_data_fee, operator_fee) = match l1_block_info {
+            Some(l1_block_info) => {
                 // Build a proxy envelope matching geth's CallDefaults + ToTransaction:
                 // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with RPCGasCap,
                 //   which defaults to DefaultMantleBlockGasLimit = 0x4000000000000)
@@ -648,16 +910,10 @@ where
                 //   authorizationList is present, otherwise EIP-1559. An explicit gasPrice or
                 //   absent baseFee uses legacy, matching geth's CallDefaults baseFee != nil.
                 let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
-                let tx_envelope = build_unsigned_tx_envelope(
-                    &request,
-                    envelope_gas,
-                    header.base_fee_per_gas(),
-                    chain_id,
-                )?;
-                let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(
-                    chain_spec.as_ref(),
-                    header.timestamp(),
-                );
+                let tx_envelope =
+                    build_unsigned_tx_envelope(&request, envelope_gas, header_base_fee, chain_id)?;
+                let spec_id =
+                    alloy_op_evm::spec_by_timestamp_after_bedrock(chain_spec.as_ref(), timestamp);
                 let l1_data_fee =
                     l1_block_info.calculate_tx_l1_cost_for_estimate(&tx_envelope, spec_id, 80);
 
@@ -677,7 +933,7 @@ where
 
                 (l1_data_fee, operator_fee)
             }
-            Err(_) => (U256::ZERO, U256::ZERO),
+            None => (U256::ZERO, U256::ZERO),
         };
 
         Ok(l2_fee.saturating_add(l1_data_fee).saturating_add(operator_fee))
@@ -688,73 +944,108 @@ where
         payload: serde_json::Value,
         block_number: Option<BlockId>,
     ) -> RpcResult<serde_json::Value> {
+        let mut payload: SimulatePayload<_> = serde_json::from_value(payload)
+            .map_err(|e| invalid_params_rpc_err(format!("invalid eth_simulateV1 payload: {e}")))?;
+        // Let the standard implementation report empty-call errors before any block lookup.
+        if payload.block_state_calls.is_empty() {
+            return EthCall::simulate_v1(self.eth_api(), payload, block_number)
+                .await
+                .map_err(ErrorObject::from)
+                .and_then(|blocks| {
+                    serde_json::to_value(blocks)
+                        .map_err(|e| ErrorObject::owned(-32000, e.to_string(), None::<()>))
+                });
+        }
+        let context = if block_number.is_some_and(|block| block.is_pending()) {
+            self.pending_overrides.as_ref().and_then(|overlay| {
+                Metrics::rpc_simulate_v1().increment(1);
+                overlay.pending_execution_context()
+            })
+        } else {
+            None
+        };
+        let (at, parent) = if let Some(context) = context.as_ref() {
+            (context.base_block, context.header.clone())
+        } else {
+            let mut at = block_number.unwrap_or_default();
+            // Consumer nodes do not populate the provider's pending block. Resolve via
+            // the Eth API, which falls back to latest when there is no pending state.
+            if at.is_pending() {
+                at = self.eth_api().evm_env_at(at).await.map_err(ErrorObject::from)?.1;
+            }
+            let block = self
+                .eth_api()
+                .recovered_block(at)
+                .await
+                .map_err(ErrorObject::from)?
+                .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
+            // An actual pending block's state is available under the pending tag,
+            // not as canonical history at its uncommitted hash.
+            let at = if at.is_pending() { at } else { block.hash().into() };
+            (at, block.sealed_header().clone())
+        };
         let chain_spec = self.provider().chain_spec();
-
-        // Only Mantle chains have an Arsia fork; leave every other chain on the standard path.
+        // Use the same normalization as execution: chain-specific spacing, explicit
+        // timestamps and filler blocks for number gaps all affect the Arsia boundary.
+        // On Mantle the spacing is op-geth's, so that a request answers as it does on
+        // op-geth; a flashblocks preview has no op-geth counterpart and keeps the chain's.
+        let spacing_chain_id = if chain_spec.is_mantle() && context.is_none() {
+            OP_GETH_SIMULATE_CHAIN_ID
+        } else {
+            chain_spec.chain_id()
+        };
+        payload.block_state_calls = simulate::sanitize_chain(
+            payload.block_state_calls,
+            &parent,
+            spacing_chain_id,
+            self.eth_api().max_simulate_blocks(),
+        )
+        .map_err(|error| ErrorObject::from(EthApi::Error::from_eth_err(error)))?;
         if chain_spec.is_mantle() {
-            let block_id = block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
-
-            // Read only the `time` overrides. Everything else is the standard implementation's
-            // concern, and deserializing the full typed payload here would drag the
-            // network-specific `RpcTxReq` generic through the trait boundary.
-            let time_overrides = payload
-                .get("blockStateCalls")
-                .and_then(serde_json::Value::as_array)
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .map(|call| {
-                            call.get("blockOverrides")
-                                .and_then(|overrides| overrides.get("time"))
-                                .and_then(parse_quantity_u64)
-                        })
-                        .collect::<Vec<_>>()
+            let timestamps: Vec<_> = payload
+                .block_state_calls
+                .iter()
+                .map(|block| {
+                    block
+                        .block_overrides
+                        .as_ref()
+                        .and_then(|block| block.time)
+                        .expect("sanitized timestamp")
                 })
-                .unwrap_or_default();
-
-            // An empty/absent `blockStateCalls` is the standard implementation's error to report,
-            // so skip the check and let it produce the canonical message.
-            if !time_overrides.is_empty() {
-                let base_timestamp = self
-                    .provider()
-                    .block_by_id(block_id)
-                    .map_err(|e| {
-                        ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
-                    })?
-                    .ok_or_else(|| invalid_params_rpc_err("block not found"))?
-                    .header()
-                    .timestamp();
-
-                let timestamps = simulated_block_timestamps(base_timestamp, &time_overrides);
-                if let Some(index) =
-                    first_arsia_boundary_crossing(base_timestamp, &timestamps, |timestamp| {
-                        chain_spec.is_mantle_arsia_active_at_timestamp(timestamp)
-                    })
-                {
-                    debug!(
-                        target: "rpc::eth",
-                        base_timestamp,
-                        crossing_block_index = index,
-                        crossing_block_timestamp = timestamps[index],
-                        "rejecting eth_simulateV1 crossing the Mantle Arsia activation boundary"
-                    );
-                    return Err(ErrorObject::owned(
-                        -32000,
-                        "eth_simulateV1 does not support crossing the Mantle Arsia activation \
-                         boundary",
-                        None::<()>,
-                    ));
-                }
+                .collect();
+            if let Some(index) =
+                first_arsia_boundary_crossing(parent.timestamp, &timestamps, |timestamp| {
+                    chain_spec.is_mantle_arsia_active_at_timestamp(timestamp)
+                })
+            {
+                debug!(target: "rpc::eth", base_timestamp = parent.timestamp,
+                    crossing_block_index = index, crossing_block_timestamp = timestamps[index],
+                    "rejecting eth_simulateV1 crossing the Mantle Arsia activation boundary");
+                return Err(ErrorObject::owned(
+                    -32000,
+                    "eth_simulateV1 does not support crossing the Mantle Arsia activation boundary",
+                    None::<()>,
+                ));
             }
         }
+        let blocks = if let Some(context) = context {
+            // Seed state once, including when sanitize_chain inserted a filler block.
+            // Reapplying it to later blocks would erase preceding simulated writes.
+            let first = &mut payload.block_state_calls[0];
+            let overrides = context.overrides(
+                first.state_overrides.take(),
+                first.block_overrides.take().map(Box::new),
+            );
+            first.state_overrides = overrides.state;
+            first.block_overrides = overrides.block.map(|block| *block);
+            let api = PendingEthApi::new(self.eth_api().clone(), context);
+            EthCall::simulate_v1(&api, payload, Some(at)).await.map_err(ErrorObject::from)?
+        } else {
+            EthCall::simulate_v1(self.eth_api(), payload, Some(at))
+                .await
+                .map_err(ErrorObject::from)?
+        };
 
-        // Not a boundary-crossing simulation: hand off to the standard implementation. Round-trip
-        // through JSON so the network-specific payload/result generics stay behind `EthApi`.
-        let typed_payload = serde_json::from_value(payload)
-            .map_err(|e| invalid_params_rpc_err(format!("invalid eth_simulateV1 payload: {e}")))?;
-        let blocks = EthCall::simulate_v1(self.eth_api(), typed_payload, block_number)
-            .await
-            .map_err(ErrorObject::from)?;
         serde_json::to_value(blocks).map_err(|e| {
             ErrorObject::owned(
                 -32000,
@@ -904,6 +1195,7 @@ fn build_unsigned_tx_envelope(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use alloy_consensus::TxEnvelope;
     use alloy_eips::{
@@ -1459,22 +1751,21 @@ mod tests {
 
     // ─── PreconfTxReceipt.logs three-state serde ────────────────────
     //
-    // R6/T7 — `logs` distinguishes "no EVM apply happened" (`null`)
-    // from "apply happened but no logs" (`[]`) on the wire. This is a
-    // deliberate contract that R5/D1 wire refactor introduced (changed
-    // from `Vec<PreconfLog>` to `Option<Vec<PreconfLog>>`). SDKs rely
-    // on the distinction to build UX around Timeout vs revert.
+    // `logs` distinguishes "no EVM apply happened" (`null`) from "apply
+    // happened but no logs" (`[]`) on the wire — which is why the field is
+    // `Option<Vec<PreconfLog>>` rather than a plain `Vec`. SDKs rely on the
+    // distinction to tell a timeout from a revert.
 
     #[test]
     fn preconf_tx_receipt_logs_none_serializes_as_null() {
-        let r = PreconfTxReceipt { logs: None };
+        let r = PreconfTxReceipt { logs: None, ..Default::default() };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(json, r#"{"logs":null}"#);
     }
 
     #[test]
     fn preconf_tx_receipt_logs_empty_vec_serializes_as_empty_array() {
-        let r = PreconfTxReceipt { logs: Some(vec![]) };
+        let r = PreconfTxReceipt { logs: Some(vec![]), ..Default::default() };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(json, r#"{"logs":[]}"#);
     }
@@ -1487,7 +1778,9 @@ mod tests {
                 address: addr,
                 topics: vec![B256::from([0xCD; 32])],
                 data: Bytes::from(vec![0xEF, 0xEF]),
+                ..Default::default()
             }]),
+            ..Default::default()
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: PreconfTxReceipt = serde_json::from_str(&json).unwrap();
@@ -1505,8 +1798,8 @@ mod tests {
 
     #[test]
     fn preconf_status_wire_serde_has_four_variants() {
-        // R5/D1 decision 8B — wire enum matches op-geth's 4 variants.
-        // Regression guard against silently re-introducing `Canceled`.
+        // The wire enum matches op-geth's four variants. Regression guard
+        // against silently re-introducing `Canceled`.
         for (variant, expected) in [
             (PreconfStatus::Success, r#""success""#),
             (PreconfStatus::Failed, r#""failed""#),
@@ -1517,12 +1810,12 @@ mod tests {
             let back: PreconfStatus = serde_json::from_str(expected).unwrap();
             assert_eq!(back, variant);
         }
-        // `"canceled"` must NOT deserialize (variant was deleted).
+        // `"canceled"` must NOT deserialize.
         assert!(serde_json::from_str::<PreconfStatus>(r#""canceled""#).is_err());
     }
 
     /// Regression for the cross-client `eth_estimateTotalFee` divergence at Sepolia-QA4
-    /// block 597707 (PR #73). `token_ratio` (`GasPriceOracle` slot 0) changed `3231` ->
+    /// block 597707. `token_ratio` (`GasPriceOracle` slot 0) changed `3231` ->
     /// `3224` *inside* that block, so reading it from the parent block (`3231`) instead of
     /// the target block's post-state (`3224`) inflated the L1 data fee. `token_ratio` is
     /// the last (multiplicative) factor in the Arsia L1 cost, so the per-client delta is
@@ -1668,88 +1961,89 @@ mod tests {
         timestamp >= ARSIA_TIME
     }
 
-    #[test]
-    fn simulated_timestamps_default_to_parent_plus_increment() {
-        // Each block's parent is the previous simulated block, so the increments compound.
-        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![112, 124, 136]);
+    /// Timestamps of the blocks a Mantle simulation without a flashblocks preview runs.
+    fn simulated_block_timestamps(base_timestamp: u64, times: &[Option<u64>]) -> Vec<u64> {
+        use alloy_rpc_types_eth::{BlockOverrides, simulate::SimBlock};
+        let parent = reth_primitives_traits::SealedHeader::seal_slow(Header {
+            timestamp: base_timestamp,
+            ..Default::default()
+        });
+        let blocks: Vec<SimBlock<TransactionRequest>> = times
+            .iter()
+            .map(|time| SimBlock {
+                block_overrides: Some(BlockOverrides { time: *time, ..Default::default() }),
+                ..Default::default()
+            })
+            .collect();
+        simulate::sanitize_chain(blocks, &parent, OP_GETH_SIMULATE_CHAIN_ID, 256)
+            .unwrap()
+            .iter()
+            .map(|block| block.block_overrides.as_ref().unwrap().time.unwrap())
+            .collect()
     }
 
+    /// op-geth steps every simulated block 12s past the one before, whatever the chain's block
+    /// time, and so did this node before reth #24388 tied the step to the chain's.
     #[test]
-    fn simulated_timestamps_honour_time_overrides() {
-        // An explicit override wins, and subsequent defaults build on it — not on the base block.
+    fn mantle_simulated_timestamps_step_twelve_seconds_like_op_geth() {
+        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![112, 124, 136]);
         assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![112, 500, 512]);
     }
 
-    /// Path 1 from the cross-client report: the base block is the last pre-Arsia block, so the very
-    /// first simulated block (base + 12) already crosses the activation boundary.
     #[test]
-    fn detects_crossing_when_base_block_is_pre_arsia() {
+    fn detects_first_and_later_arsia_crossings() {
         let base = ARSIA_TIME - 2;
-        let timestamps = simulated_block_timestamps(base, &[None]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
-    }
-
-    /// Path 2 from the report: the first simulated block stays pre-Arsia and only the second one
-    /// crosses, via an explicit `blockOverrides.time`. The parent for that comparison is the
-    /// previous *simulated* block, which is why the walk cannot be done against the base block.
-    #[test]
-    fn detects_crossing_introduced_by_a_later_time_override() {
+        assert_eq!(
+            first_arsia_boundary_crossing(
+                base,
+                &simulated_block_timestamps(base, &[None]),
+                is_arsia
+            ),
+            Some(0)
+        );
         let base = ARSIA_TIME - 20;
-        let timestamps = simulated_block_timestamps(base, &[None, Some(ARSIA_TIME)]);
-        assert_eq!(timestamps, vec![ARSIA_TIME - 8, ARSIA_TIME]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(1));
+        assert_eq!(
+            first_arsia_boundary_crossing(
+                base,
+                &simulated_block_timestamps(base, &[None, Some(ARSIA_TIME)]),
+                is_arsia
+            ),
+            Some(1)
+        );
     }
 
     #[test]
-    fn allows_simulation_entirely_before_activation() {
-        let base = 0;
-        let timestamps = simulated_block_timestamps(base, &[None, None]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), None);
+    fn allows_simulation_without_an_arsia_transition() {
+        for base in [ARSIA_TIME - 30, ARSIA_TIME] {
+            assert_eq!(
+                first_arsia_boundary_crossing(
+                    base,
+                    &simulated_block_timestamps(base, &[None, None]),
+                    is_arsia
+                ),
+                None
+            );
+        }
     }
 
-    /// The boundary is crossed by the *first* simulated block when the base block is the last
-    /// pre-Arsia block, even though every later block is also post-activation: only the transition
-    /// counts, and it is reported once.
+    // ─── preconf event forwarding: byte-identity round-trip ─────────────
+
+    /// A reth follower forwarding an op-geth sequencer's response deserializes
+    /// it into `PreconfTxEvent` and re-serializes. op-geth does not send any of
+    /// the fields added here, so every one of them must vanish on the way out —
+    /// a zero would be a number this node invented.
     #[test]
-    fn reports_the_first_crossing_block_not_a_later_one() {
-        let base = ARSIA_TIME - 2;
-        let timestamps = simulated_block_timestamps(base, &[None, None, None]);
-        // base is pre-Arsia; all three simulated blocks land after activation.
-        assert!(timestamps.iter().all(|&ts| is_arsia(ts)));
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
+    fn geth_shaped_event_round_trips_byte_for_byte() {
+        let geth = r#"{"txHash":"0x0101010101010101010101010101010101010101010101010101010101010101","status":"failed","reason":"execution reverted","blockHeight":"0x1","receipt":{"logs":null}}"#;
+        let decoded: PreconfTxEvent = serde_json::from_str(geth).expect("decode geth shape");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-encode"), geth);
     }
 
-    /// Once activation is reached, a chain whose base is already post-activation has no transition
-    /// left to report.
+    /// Same, for op-geth's log shape: three fields and nothing else.
     #[test]
-    fn does_not_re_report_crossing_after_activation_is_reached() {
-        let base = ARSIA_TIME - 20;
-        // Block 0 jumps past activation, block 1 defaults to block 0 + 12 (also post-activation).
-        let timestamps = simulated_block_timestamps(base, &[Some(ARSIA_TIME), None]);
-        assert_eq!(timestamps, vec![ARSIA_TIME, ARSIA_TIME + 12]);
-        // The crossing is at index 0 only — index 1's parent is already post-activation.
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), Some(0));
-        // And with the crossing block removed, the remaining chain is entirely post-activation.
-        assert_eq!(first_arsia_boundary_crossing(ARSIA_TIME, &timestamps[1..], is_arsia), None);
-    }
-
-    /// The common case on a live chain: activation is already in the past, so nothing crosses.
-    #[test]
-    fn allows_simulation_entirely_after_activation() {
-        let base = ARSIA_TIME + 100;
-        let timestamps = simulated_block_timestamps(base, &[None, None]);
-        assert_eq!(first_arsia_boundary_crossing(base, &timestamps, is_arsia), None);
-    }
-
-    #[test]
-    fn parses_quantity_from_hex_string_and_number() {
-        assert_eq!(parse_quantity_u64(&serde_json::json!("0x6a82e880")), Some(1_786_964_096));
-        assert_eq!(parse_quantity_u64(&serde_json::json!("0X2a")), Some(42));
-        assert_eq!(parse_quantity_u64(&serde_json::json!(42)), Some(42));
-        // Malformed values must not be silently read as 0 — that would fake a pre-Arsia timestamp
-        // and skip the boundary check.
-        assert_eq!(parse_quantity_u64(&serde_json::json!("2a")), None);
-        assert_eq!(parse_quantity_u64(&serde_json::json!("0xzz")), None);
-        assert_eq!(parse_quantity_u64(&serde_json::Value::Null), None);
+    fn geth_shaped_logs_round_trip_byte_for_byte() {
+        let geth = r#"{"txHash":"0x0202020202020202020202020202020202020202020202020202020202020202","status":"success","reason":"","blockHeight":"0x2","receipt":{"logs":[{"address":"0x0000000000000000000000000000000000000001","topics":["0x0303030303030303030303030303030303030303030303030303030303030303"],"data":"0x"}]}}"#;
+        let decoded: PreconfTxEvent = serde_json::from_str(geth).expect("decode geth shape");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-encode"), geth);
     }
 }

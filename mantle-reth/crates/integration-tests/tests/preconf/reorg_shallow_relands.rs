@@ -52,7 +52,9 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        .journal_path(fresh_journal("shallow")) // journal ON — so the reverted commitment can be replayed
+        // The journal is mandatory; re-landing does not read it (the canon
+        // handler requeues the commitment from the reverted block itself).
+        .journal_path(fresh_journal("shallow"))
         .build();
 
     let (node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
