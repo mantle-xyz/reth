@@ -919,24 +919,17 @@ impl PreconfTxSet {
         self.push_with_status(tx, from, source, PreconfStatus::Waiting, true).await
     }
 
-    /// Put a transaction a reorg reverted back in the queue, as a `Waiting`
-    /// `Replay` entry, **without** the broadcast [`Self::push_if_absent`] sends.
+    /// Put a transaction a reorg reverted back in the queue as a `Waiting`
+    /// `Replay` entry, without the broadcast [`Self::push_if_absent`] sends.
     ///
-    /// Quiet so that a build already running does not pick it up. That build
-    /// may stand on the reverted block, where this transaction's nonce is spent:
-    /// executing it there fails as nonce-too-low and ends the commitment as
-    /// broken. The next build reaches it through `replay_fifo_carryover`, after
-    /// `sync_fifo_forward_to_head` has checked its nonce against that build's
-    /// own parent.
+    /// A running build may stand on the reverted block, where the nonce is spent;
+    /// executing it there would end the commitment as broken. Only the next build
+    /// reaches it, through the carryover, after `sync_fifo_forward_to_head` has
+    /// checked the nonce against that build's parent.
     ///
-    /// One way a running build can still see it: the build loop's `Lagged`
-    /// branch re-scans the whole queue. That needs its receiver to fall
-    /// `broadcast_cap` (65,536) messages behind. With the default queue gas cap
-    /// (48M, about 2,300 minimum-gas entries) and 1s client timeout, the loop
-    /// would have to stop consuming for about 30 seconds; a lower
-    /// `--preconf.timeout-ms` shortens that proportionally.
-    ///
-    /// Same results as `push_if_absent`.
+    /// Exception: a running build's `Lagged` re-scan does see it. That takes a
+    /// `broadcast_cap` backlog, about 30s of a stalled loop at default settings
+    /// (less with a lower `--preconf.timeout-ms`).
     pub async fn requeue_reverted(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
         self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Waiting, false).await
     }
