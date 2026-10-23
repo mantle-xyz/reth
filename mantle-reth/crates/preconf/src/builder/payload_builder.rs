@@ -73,7 +73,7 @@ use crate::{
     builder::{
         ExecutionInfo,
         best_tx_lead::BestTxLead,
-        cancel::{CancelReason, JobCancel},
+        cancel::{AbandonedBeforeStart, CancelReason, JobCancel},
         dispatch,
         execution_info::{carries_its_senders_nonce, record_executed},
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
@@ -965,20 +965,45 @@ where
 /// the senders alone avoids cloning a view of every entry, and one sweep avoids
 /// re-reading every entry once per sender — quadratic at the volumes
 /// [`PreconfTxSet::forward_all`] describes.
+///
+/// This is also the nonce check a reorg re-injection relies on: the canon
+/// handler requeues reverted transactions without a broadcast
+/// ([`PreconfTxSet::requeue_reverted`]), so they are first seen here, judged
+/// against this build's parent, before the carryover can execute them.
+///
+/// A sender whose nonce cannot be read is left out, so its entries stay until
+/// a later build can read it.
 async fn sync_fifo_forward_to_head<S>(fifo: &PreconfTxSet, state_provider: &S)
 where
     S: reth_storage_api::StateProvider + ?Sized,
 {
-    let heads: HashMap<Address, u64> = fifo
-        .senders()
-        .await
-        .into_iter()
-        .map(|sender| {
-            let nonce = state_provider.account_nonce(&sender).ok().flatten().unwrap_or(0);
-            (sender, nonce)
-        })
-        .collect();
+    let heads =
+        readable_nonces(fifo.senders().await, |sender| state_provider.account_nonce(sender));
     fifo.forward_all(&heads).await;
+}
+
+/// Each sender's nonce as `nonce_of` reads it, leaving out any sender whose
+/// read fails rather than treating the failure as nonce 0.
+fn readable_nonces(
+    senders: impl IntoIterator<Item = Address>,
+    nonce_of: impl Fn(&Address) -> reth_storage_api::errors::provider::ProviderResult<Option<u64>>,
+) -> HashMap<Address, u64> {
+    senders
+        .into_iter()
+        .filter_map(|sender| match nonce_of(&sender) {
+            // No account state reads as nonce 0.
+            Ok(nonce) => Some((sender, nonce.unwrap_or(0))),
+            Err(err) => {
+                metrics::counter!("preconf.build.forward_nonce_unreadable_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::payload_builder",
+                    %sender, ?err,
+                    "chain nonce unreadable; keeping this sender's queue entries for the next build",
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Preamble that walks the fifo snapshot in insertion order and returns the
@@ -1928,6 +1953,17 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         metrics::histogram!("preconf.build.lock_wait_ms")
             .record(wait_started.elapsed().as_secs_f64() * 1000.0);
 
+        // A job abandoned while it waited for the queue stops here, before it
+        // touches anything the next build relies on. Its parent may be a block a
+        // reorg has just taken back: running on, `drop_landed_claims` would drop
+        // entries as landed in that block, and the forward sweep would judge
+        // nonces against it. Its payload is never asked for.
+        if cancel.is_abandoned() {
+            drop(build_guard);
+            metrics::counter!("preconf.build.abandoned_before_start_total").increment(1);
+            return Err(PayloadBuilderError::other(AbandonedBeforeStart));
+        }
+
         // The previous build's account view ends here. Cleared rather than
         // re-seeded: a build that is cancelled or never sealed must not leave
         // a sender pinned at a nonce the chain will never reach, and a sender
@@ -2852,6 +2888,30 @@ mod tests {
     async fn replay_fifo_carryover_on_empty_fifo_is_noop() {
         let fifo = PreconfTxSet::new(16);
         assert!(replay_fifo_carryover(&fifo).await.is_empty());
+    }
+
+    /// A sender whose nonce cannot be read is left out of the forward sweep,
+    /// instead of being swept as if its nonce were 0; a missing account is
+    /// still nonce 0.
+    #[test]
+    fn an_unreadable_nonce_leaves_its_sender_out_of_the_sweep() {
+        let readable = Address::from([1; 20]);
+        let missing = Address::from([2; 20]);
+        let unreadable = Address::from([3; 20]);
+
+        let heads = readable_nonces([readable, missing, unreadable], |sender| {
+            if *sender == readable {
+                Ok(Some(7))
+            } else if *sender == missing {
+                Ok(None)
+            } else {
+                Err(reth_storage_api::errors::provider::ProviderError::BestBlockNotFound)
+            }
+        });
+
+        assert_eq!(heads.get(&readable), Some(&7));
+        assert_eq!(heads.get(&missing), Some(&0));
+        assert!(!heads.contains_key(&unreadable), "no reading, so no nonce: {heads:?}");
     }
 
     // ============ try_include_post_exec_tx ============

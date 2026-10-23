@@ -896,11 +896,11 @@ impl PreconfTxSet {
 
     // ============ Push path ============
 
-    /// Idempotent push.
+    /// Idempotent push, followed by a broadcast for the running build.
     ///
-    /// `from` must be the recovered sender; the callers (journal restore and
-    /// reorg re-injection) have it pre-validated. Hash + nonce are read from
-    /// `tx`.
+    /// `from` must be the recovered sender; the caller (journal restore) has
+    /// it pre-validated. Hash + nonce are read from `tx`. A reorg re-injection
+    /// uses [`Self::requeue_reverted`] instead, which does not broadcast.
     ///
     /// Returns:
     /// - [`PushResult::Inserted`] — new entry created and broadcast notified.
@@ -913,7 +913,29 @@ impl PreconfTxSet {
         from: Address,
         source: PreconfSource,
     ) -> PushResult {
-        self.push_with_status(tx, from, source, PreconfStatus::Waiting).await
+        self.push_with_status(tx, from, source, PreconfStatus::Waiting, true).await
+    }
+
+    /// Put a transaction a reorg reverted back in the queue, as a `Waiting`
+    /// `Replay` entry, **without** the broadcast [`Self::push_if_absent`] sends.
+    ///
+    /// Quiet so that a build already running does not pick it up. That build
+    /// may stand on the reverted block, where this transaction's nonce is spent:
+    /// executing it there fails as nonce-too-low and ends the commitment as
+    /// broken. The next build reaches it through `replay_fifo_carryover`, after
+    /// `sync_fifo_forward_to_head` has checked its nonce against that build's
+    /// own parent.
+    ///
+    /// One way a running build can still see it: the build loop's `Lagged`
+    /// branch re-scans the whole queue. That needs its receiver to fall
+    /// `broadcast_cap` (65,536) messages behind. With the default queue gas cap
+    /// (48M, about 2,300 minimum-gas entries) and 1s client timeout, the loop
+    /// would have to stop consuming for about 30 seconds; a lower
+    /// `--preconf.timeout-ms` shortens that proportionally.
+    ///
+    /// Same results as `push_if_absent`.
+    pub async fn requeue_reverted(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
+        self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Waiting, false).await
     }
 
     /// Stage a transaction this build has **already executed**, so the next one
@@ -937,20 +959,24 @@ impl PreconfTxSet {
     /// as nonce-too-low — the client told its transaction failed while it is
     /// in the block.
     pub async fn stage_executed(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
-        let out =
-            self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await;
+        let out = self
+            .push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success, false)
+            .await;
         if matches!(out, PushResult::Inserted) {
             self.trim_staged().await;
         }
         out
     }
 
+    /// `notify`: send the broadcast for a new `Waiting` entry. A `Success`
+    /// entry never notifies, as it has run already.
     async fn push_with_status(
         &self,
         tx: Arc<TxEnvelope>,
         from: Address,
         source: PreconfSource,
         status: PreconfStatus,
+        notify: bool,
     ) -> PushResult {
         let hash = *tx.tx_hash();
         let nonce = tx.nonce();
@@ -1018,7 +1044,7 @@ impl PreconfTxSet {
         inner.order.push_back(hash);
         drop(inner);
 
-        if status == PreconfStatus::Waiting {
+        if notify && status == PreconfStatus::Waiting {
             let _ = self.notifier.send(hash);
         }
 

@@ -56,11 +56,11 @@ pub enum PreconfStatus {
 ///   Covers two triggers:
 ///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
 ///       crash.
-///     - **Reorg reinject** — the canonical-state handler pushes back every commitment the reverted
-///       chain carried. Whether a hash is one is asked of the claim registry
-///       (`Commitments::is_tracked`, i.e. "a `Success` receipt for this hash already went out")
-///       rather than of the journal: the journal's notion of a finished commitment is "canonical
-///       once", which is exactly what a reorg undoes.
+///     - **Reorg reinject** — the canonical-state handler puts back every commitment the reverted
+///       chain carried, without a broadcast, so only the next build executes it. Whether a hash is
+///       one is asked of the claim registry (`Commitments::is_tracked`, i.e. "a `Success` receipt
+///       for this hash already went out") rather than of the journal: the journal's notion of a
+///       finished commitment is "canonical once", which is exactly what a reorg undoes.
 ///
 ///   In both cases the Mantle preconf SLA (*"once a receipt has been returned to the client, the
 ///   tx must land on chain"*) requires these entries to **bypass** the deadline and per-block gas
@@ -135,13 +135,15 @@ pub struct PreconfReceipt {
     pub l1_fields: OpTransactionReceiptFields,
 }
 
-/// Result of [`crate::preconf_tx_set::PreconfTxSet::push_if_absent`].
+/// Result of [`crate::preconf_tx_set::PreconfTxSet::push_if_absent`] and
+/// [`crate::preconf_tx_set::PreconfTxSet::requeue_reverted`].
 ///
-/// `push_if_absent` is the single source of truth for fifo membership
+/// These pushes are the single source of truth for fifo membership
 /// invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushResult {
-    /// New entry created and broadcast notified.
+    /// New entry created. `push_if_absent` also sends the broadcast;
+    /// `requeue_reverted` does not.
     Inserted,
     /// Same hash already present — idempotent no-op. Every entry in the queue
     /// is live, so there is never one to reopen.

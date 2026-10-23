@@ -17,9 +17,12 @@
 //!   stale `Success` entry and replay it via `reset_success_to_waiting`.
 //! - **Reverted chain**: `fifo.claims().uncommit` is called for every reverted transaction — see
 //!   [`Commitments::uncommit`](crate::commitments::Commitments::uncommit) for what that one call
-//!   does and why its return value is the `reorg_drift` signal. Re-injection happens here: each
-//!   commitment the reverted chain carried is pushed back with `PreconfSource::Replay`. The
-//!   client-observed `block_height` may drift for reorged commitments; op-geth has the same
+//!   does and why its return value is the `reorg_drift` signal. Each commitment the reverted chain
+//!   carried is put back as `PreconfSource::Replay` through [`PreconfTxSet::requeue_reverted`],
+//!   which sends no broadcast: a build already running may stand on the reverted block, so only the
+//!   next build, which checks the nonce against its own parent first, may execute it. A transaction
+//!   the new chain also carries is skipped; the committed-chain pass records it at its new height.
+//!   The client-observed `block_height` may drift for reorged commitments; op-geth has the same
 //!   behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
@@ -30,6 +33,7 @@
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 
 use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
+use alloy_primitives::{TxHash, map::HashSet};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_chain_state::{CanonStateNotification, CanonStateSubscriptions};
 use reth_execution_types::Chain;
@@ -39,10 +43,8 @@ use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing::{debug, error, warn};
 
 use crate::{
-    admission::op_envelope_to_alloy,
-    commitments::ClaimKind,
-    preconf_tx_set::PreconfTxSet,
-    types::{PreconfSource, PushResult},
+    admission::op_envelope_to_alloy, commitments::ClaimKind, preconf_tx_set::PreconfTxSet,
+    types::PushResult,
 };
 
 /// What one read of the canonical-state subscription produced.
@@ -154,7 +156,9 @@ where
             // Reverted chain — withdraw the "seen on chain" observation and
             // emit the drift signal; see `observe_reorg`.
             if let Some(old) = notif.reverted() {
-                let outcome = reinject_reverted(&self.fifo, &old).await;
+                let new_chain: HashSet<TxHash> =
+                    notif.committed().transaction_hashes().copied().collect();
+                let outcome = reinject_reverted(&self.fifo, &old, &new_chain).await;
                 // Counted from what the pass actually found, so the series and
                 // the tests are reading the same numbers.
                 if outcome.drift > 0 {
@@ -261,6 +265,8 @@ struct ReorgOutcome {
     drift: u64,
     /// Transactions put back in the queue.
     reinjected: u64,
+    /// Transactions the new chain also carries, so left alone.
+    on_new_chain: u64,
     /// Transactions whose `(sender, nonce)` is held by a different live entry,
     /// so they cannot go back.
     conflicts: u64,
@@ -269,9 +275,17 @@ struct ReorgOutcome {
 /// Withdraws the on-chain observation for every transaction a reorg took back,
 /// and puts the ones this node owes back in the queue.
 ///
+/// A transaction `new_chain` also carries is skipped: it is still on chain, and
+/// the committed-chain pass in [`PreconfCanonHandler::run`] records it at its
+/// new height. Withdrawing it would count a false `reorg_drift`.
+///
 /// Free rather than a method: it needs the queue and nothing else, and a
 /// handler cannot be built without a provider.
-async fn reinject_reverted<N>(fifo: &PreconfTxSet, old: &Chain<N>) -> ReorgOutcome
+async fn reinject_reverted<N>(
+    fifo: &PreconfTxSet,
+    old: &Chain<N>,
+    new_chain: &HashSet<TxHash>,
+) -> ReorgOutcome
 where
     N: NodePrimitives,
     N::SignedTx: Transaction + TxHashRef,
@@ -289,6 +303,10 @@ where
     let block_number = old.tip().number();
     for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
         let hash = *recovered.inner().tx_hash();
+        if new_chain.contains(&hash) {
+            outcome.on_new_chain += 1;
+            continue;
+        }
         // One call, two answers: whether there is an observation to withdraw,
         // and how strong the claim behind it was — see `Commitments::uncommit`.
         let Some(kind) = fifo.claims().uncommit(&hash) else { continue };
@@ -309,25 +327,26 @@ where
             );
         }
 
-        // And put it back, because nothing else will. The queue entry
-        // is gone by now — it was removed when the commitment landed —
-        // so `uncommit` alone would leave a promise nobody is going to
-        // keep.
+        // Put it back, because nothing else in the preconf path will: its
+        // queue entry was removed when it landed. The reverted chain carries
+        // the transaction whole, so the journal is not needed.
         //
-        // The transaction comes from the reverted chain itself, which
-        // carries it whole; there is no need to ask the journal, and
-        // no window in which the chain has dropped it but the journal
-        // has not caught up.
+        // `Replay`, not `Rpc`: the receipt went out before the reorg, so the
+        // dispatch gates that protect a waiting client must not apply to it.
         //
-        // `Replay`, not `Rpc`: the receipt went out before the reorg,
-        // so this is a commitment being honoured rather than a fresh
-        // request, and the dispatch gates that protect a waiting
-        // client must not apply to it.
+        // Quiet (no broadcast): see `PreconfTxSet::requeue_reverted`.
+        //
+        // Not the only way back. reth's pool maintenance re-adds the same
+        // transaction to the ordinary pool on this notification. While the
+        // queue holds it, the pool arm skips it (`apply_one_best_tx` checks
+        // `status_of`); if the queue loses it, the pool arm executes it as an
+        // ordinary transaction, since the slot gate there lets the slot's own
+        // transaction through. Do not filter it out of the pool.
         let signer = recovered.signer();
         let (signed, _) = recovered.into_parts();
         match op_envelope_to_alloy(OpTxEnvelope::from(signed)) {
             Some(envelope) => {
-                match fifo.push_if_absent(Arc::new(envelope), signer, PreconfSource::Replay).await {
+                match fifo.requeue_reverted(Arc::new(envelope), signer).await {
                     PushResult::Inserted => outcome.reinjected += 1,
                     // The queue still holds it, so it is already owed and
                     // this call had nothing to add.
@@ -427,9 +446,10 @@ mod reorg_tests {
     use reth_execution_types::{Chain, ExecutionOutcome};
     use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
     use reth_primitives_traits::RecoveredBlock;
+    use tokio::sync::broadcast;
 
     use super::*;
-    use crate::types::PreconfStatus;
+    use crate::types::{PreconfSource, PreconfStatus};
 
     /// Height of the reverted block; nothing here depends on the value.
     const REVERTED_AT: u64 = 7;
@@ -477,9 +497,12 @@ mod reorg_tests {
         assert_eq!(fifo.claims().mark_promised(hash, &sender(), 0, REVERTED_AT), Ok(()));
         assert!(fifo.claims().mark_committed(&hash, REVERTED_AT));
 
-        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx), &HashSet::default()).await;
 
-        assert_eq!(outcome, ReorgOutcome { drift: 1, reinjected: 1, conflicts: 0 });
+        assert_eq!(
+            outcome,
+            ReorgOutcome { drift: 1, reinjected: 1, on_new_chain: 0, conflicts: 0 }
+        );
         assert_eq!(fifo.status_of(&hash).await, Some(PreconfStatus::Waiting));
         assert_eq!(
             fifo.claims().slot_owner(&sender(), 0),
@@ -494,11 +517,14 @@ mod reorg_tests {
         );
     }
 
-    /// The same commitment, with the notification that would have stamped it
-    /// as committed lost on the way (`CanonUpdate::Gap`). The reverted block
-    /// is proof enough that it was on chain, and nothing else would put it
-    /// back: the fifo entry is gone, and the pool only ever held it if an
-    /// ordinary submission raced it.
+    /// The same commitment, but `mark_committed` never ran for it, as when its
+    /// notification is dropped. It still goes back: the reverted block shows it
+    /// was on chain. That holds only while its record lasts; past `SEAL_DEPTH`
+    /// from the promise, `sweep` has released it and there is nothing to put
+    /// back.
+    ///
+    /// Calls `reinject_reverted` directly, so the handler's `CanonUpdate::Gap`
+    /// branch is not exercised here.
     #[tokio::test]
     async fn a_promise_whose_commit_notification_was_lost_still_goes_back() {
         let fifo = fifo();
@@ -507,13 +533,58 @@ mod reorg_tests {
         assert_eq!(fifo.claims().mark_promised(hash, &sender(), 0, REVERTED_AT), Ok(()));
         // No `mark_committed`.
 
-        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx), &HashSet::default()).await;
 
-        assert_eq!(outcome, ReorgOutcome { drift: 1, reinjected: 1, conflicts: 0 });
+        assert_eq!(
+            outcome,
+            ReorgOutcome { drift: 1, reinjected: 1, on_new_chain: 0, conflicts: 0 }
+        );
         assert_eq!(fifo.status_of(&hash).await, Some(PreconfStatus::Waiting));
         assert_eq!(
             fifo.find_by_hash(&hash).await.map(|entry| entry.source),
             Some(PreconfSource::Replay),
+        );
+    }
+
+    /// A transaction the new chain also carries is still on chain: it is not
+    /// withdrawn, counted as drift, or put back. The committed-chain pass
+    /// records it at its new height.
+    #[tokio::test]
+    async fn a_transaction_the_new_chain_also_carries_is_left_alone() {
+        let fifo = fifo();
+        let tx = op_tx(0, 1);
+        let hash = tx.tx_hash();
+        assert_eq!(fifo.claims().mark_promised(hash, &sender(), 0, REVERTED_AT), Ok(()));
+        assert!(fifo.claims().mark_committed(&hash, REVERTED_AT));
+        let new_chain: HashSet<TxHash> = [hash].into_iter().collect();
+
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx), &new_chain).await;
+
+        assert_eq!(outcome, ReorgOutcome { on_new_chain: 1, ..Default::default() });
+        assert_eq!(fifo.status_of(&hash).await, None, "not put back in the queue");
+        assert!(
+            !fifo.claims().release_unless_committed(&hash),
+            "still recorded as committed, so a shallow record cannot be released",
+        );
+    }
+
+    /// The re-injected entry sends no broadcast, so a build already running,
+    /// possibly on the reverted block, does not pick it up.
+    #[tokio::test]
+    async fn a_requeued_commitment_wakes_no_running_build() {
+        let fifo = fifo();
+        let mut running_build = fifo.subscribe();
+        let tx = op_tx(0, 1);
+        let hash = tx.tx_hash();
+        assert_eq!(fifo.claims().mark_promised(hash, &sender(), 0, REVERTED_AT), Ok(()));
+        assert!(fifo.claims().mark_committed(&hash, REVERTED_AT));
+
+        reinject_reverted(&fifo, &reverted_chain(tx), &HashSet::default()).await;
+
+        assert_eq!(fifo.status_of(&hash).await, Some(PreconfStatus::Waiting), "it is queued");
+        assert!(
+            matches!(running_build.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "but no broadcast went out",
         );
     }
 
@@ -529,9 +600,12 @@ mod reorg_tests {
         assert_eq!(fifo.claims().record_announced(hash, &sender(), 0, REVERTED_AT), Ok(()));
         assert!(fifo.claims().mark_committed(&hash, REVERTED_AT));
 
-        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx), &HashSet::default()).await;
 
-        assert_eq!(outcome, ReorgOutcome { drift: 0, reinjected: 1, conflicts: 0 });
+        assert_eq!(
+            outcome,
+            ReorgOutcome { drift: 0, reinjected: 1, on_new_chain: 0, conflicts: 0 }
+        );
     }
 
     /// A transaction this node never claimed is somebody else's business.
@@ -541,7 +615,7 @@ mod reorg_tests {
         let tx = op_tx(0, 1);
         let hash = tx.tx_hash();
 
-        let outcome = reinject_reverted(&fifo, &reverted_chain(tx)).await;
+        let outcome = reinject_reverted(&fifo, &reverted_chain(tx), &HashSet::default()).await;
 
         assert_eq!(outcome, ReorgOutcome::default());
         assert_eq!(fifo.status_of(&hash).await, None);
@@ -570,11 +644,12 @@ mod reorg_tests {
         assert_eq!(fifo.claims().mark_promised(reverted_hash, &sender(), 0, REVERTED_AT), Ok(()));
         assert!(fifo.claims().mark_committed(&reverted_hash, REVERTED_AT));
 
-        let outcome = reinject_reverted(&fifo, &reverted_chain(reverted)).await;
+        let outcome =
+            reinject_reverted(&fifo, &reverted_chain(reverted), &HashSet::default()).await;
 
         assert_eq!(
             outcome,
-            ReorgOutcome { drift: 1, reinjected: 0, conflicts: 1 },
+            ReorgOutcome { drift: 1, reinjected: 0, on_new_chain: 0, conflicts: 1 },
             "drift is still reported — the promise was broken either way",
         );
         assert_eq!(fifo.status_of(&reverted_hash).await, None, "it could not go back");

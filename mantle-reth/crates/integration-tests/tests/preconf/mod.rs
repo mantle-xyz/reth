@@ -15,6 +15,7 @@
 
 pub mod helpers;
 
+mod abandoned_build;
 mod account_view;
 mod basefee_threshold;
 mod canon_cleanup;
