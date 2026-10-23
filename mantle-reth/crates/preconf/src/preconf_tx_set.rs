@@ -2046,20 +2046,20 @@ mod admit_tests {
         assert!(set.claims().slot_owner(&alice, 0).is_none(), "the slot comes back with it");
     }
 
-    /// A reorg reinject or a journal restore looks like the staged pool
-    /// transaction above in two of three respects — `Replay`, no responder —
-    /// and is a real commitment. The `Promised` claim is the only thing
-    /// telling them apart, which is why the carve-out checks all three.
+    /// A reorg reinject looks like the staged pool transaction above in two of
+    /// three respects — `Replay`, no responder — and is a real commitment. The
+    /// `Promised` claim is the only thing telling them apart, which is why the
+    /// carve-out checks all three. (A journal restore leaves the same shape;
+    /// see `a_replayed_commitment_refuses_to_take_on_a_client`.)
     #[tokio::test]
     async fn a_reinjected_commitment_is_not_mistaken_for_a_pool_tx() {
         let set = PreconfTxSet::new(8);
         let alice = addr(1);
-        let restored = tx(0, 1, 0);
-        let hash = *restored.tx_hash();
+        let reverted = tx(0, 1, 0);
+        let hash = *reverted.tx_hash();
 
-        // `Replay`, no client parked — the shape `restore_preconf_state` and
-        // the canon handler push.
-        set.push_if_absent(restored, alice, PreconfSource::Replay).await;
+        // Requeued the way the canon handler does after a reorg.
+        set.requeue_reverted(reverted, alice).await;
         set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
 
         let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;
