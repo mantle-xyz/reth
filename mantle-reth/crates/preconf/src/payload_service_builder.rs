@@ -59,7 +59,8 @@ use crate::{
 ///
 /// Holds the shared preconf state (config + fifo) that the cli
 /// constructed once at startup, plus the OP builder settings
-/// ([`OpBuilderConfig`]: DA / gas-limit / sdm-enable). On
+/// ([`OpBuilderConfig`]: DA / gas-limit / sdm-enable / uncompressed block
+/// size). On
 /// [`Self::spawn_payload_builder_service`] it assembles a
 /// [`PreconfPayloadBuilder`] from the runtime-provided pool / provider
 /// / evm-config, wraps it in a [`PreconfPayloadJobGenerator`], and
@@ -81,7 +82,8 @@ pub struct MantlePreconfServiceBuilder<N> {
     /// hands the handle to the builder and spawns the accept loop that serves
     /// it, so it is also what keeps the endpoint open.
     flashblocks: Option<Arc<FlashblocksProducerHandles>>,
-    /// OP builder settings (DA limits, max gas per tx, sdm-enable, ...).
+    /// OP builder settings (DA limits, max gas per tx, sdm-enable, uncompressed
+    /// block size, ...).
     builder_config: OpBuilderConfig,
     /// `fn() -> N` marker so the struct is `Send + Sync` without
     /// constraining `N` itself.
@@ -189,7 +191,8 @@ where
             let upstream = OpPayloadBuilder::new(false)
                 .with_da_config(builder_config.da_config.clone())
                 .with_gas_limit_config(builder_config.gas_limit_config.clone())
-                .with_operator_sdm_opt_in(builder_config.operator_sdm_opt_in.clone());
+                .with_operator_sdm_opt_in(builder_config.operator_sdm_opt_in.clone())
+                .with_max_uncompressed_block_size(builder_config.max_uncompressed_block_size);
             return BasicPayloadServiceBuilder::new(upstream)
                 .spawn_payload_builder_service(ctx, pool, evm_config)
                 .await;

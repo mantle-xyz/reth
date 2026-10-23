@@ -186,15 +186,16 @@ pub struct TxEntryView {
 /// known, and the alternative is a setter nobody can see was never called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
-    /// Total entries.
+    /// `Waiting` entries. Every ceiling here counts only those: an executed
+    /// entry is not backlog.
     pub max_txs: usize,
-    /// Total encoded bytes.
+    /// Encoded bytes of the `Waiting` entries.
     pub max_size: usize,
-    /// Entries one sender may hold.
+    /// `Waiting` entries one sender may hold.
     pub max_account_slots: usize,
-    /// Entries a sender with an EIP-7702 delegation may hold.
+    /// `Waiting` entries a sender with an EIP-7702 delegation may hold.
     pub max_inflight_delegated: usize,
-    /// Summed `gas_limit` over every entry.
+    /// Summed `gas_limit` over the `Waiting` entries.
     ///
     /// What this ceiling catches that the other three cannot, and why it is a
     /// multiple of the per-block budget:
@@ -266,6 +267,36 @@ struct PreconfTxSetInner {
 }
 
 impl PreconfTxSetInner {
+    /// Entry count, bytes and gas of the `Waiting` entries: what `admit`'s
+    /// queue-wide ceilings measure. A `Success` entry has executed already and
+    /// stays only until the next build confirms it landed, so it is not part of
+    /// the backlog; counting it let one large executed pool transaction fill
+    /// the gas ceiling for the rest of the block.
+    fn waiting_usage(&self) -> (usize, usize, u64) {
+        self.entries.values().filter(|e| e.status == PreconfStatus::Waiting).fold(
+            (0, 0, 0),
+            |(count, bytes, gas), e| {
+                (
+                    count + 1,
+                    bytes + e.size,
+                    gas.saturating_add(Transaction::gas_limit(e.tx.as_ref())),
+                )
+            },
+        )
+    }
+
+    /// How many of `sender`'s entries are `Waiting`, for the per-sender
+    /// ceilings. Same reason as [`Self::waiting_usage`].
+    fn waiting_slots_of(&self, sender: &Address) -> usize {
+        self.by_sender.get(sender).map_or(0, |nonces| {
+            nonces
+                .values()
+                .filter(|&hash| {
+                    self.entries.get(hash).is_some_and(|e| e.status == PreconfStatus::Waiting)
+                })
+                .count()
+        })
+    }
     fn new(claims: Arc<Commitments>) -> Self {
         Self { order: VecDeque::new(), entries: HashMap::new(), by_sender: HashMap::new(), claims }
     }
@@ -694,16 +725,17 @@ impl PreconfTxSet {
     /// The three queue-wide ceilings `admit` enforces (`max_txs`, `max_size`,
     /// `max_queued_gas`) are reported, because a ceiling without a utilisation
     /// reading fails silently: requests start being refused and nothing says
-    /// which limit did it. The two per-sender ceilings — `max_account_slots`
-    /// and `max_inflight_delegated` — have no queue-wide figure to publish, so
+    /// which limit did it. Like the ceilings, they count `Waiting` entries
+    /// only: `pending` against `max_txs`, `bytes_used` and `gas_used` against
+    /// the other two. `entries` is every entry, executed ones included. The
+    /// two per-sender ceilings — `max_account_slots` and
+    /// `max_inflight_delegated` — have no queue-wide figure to publish, so
     /// they show up only once they refuse something, in
     /// `preconf.admit.rejected_account_slots_total` and
     /// `preconf.admit.rejected_delegated_total`.
     pub async fn publish_pending_gauge(&self) {
         let inner = self.inner.lock().await;
-        let pending = inner.entries.values().filter(|e| e.status == PreconfStatus::Waiting).count();
-        let bytes: usize = inner.entries.values().map(|e| e.size).sum();
-        let gas: u64 = inner.entries.values().map(|e| Transaction::gas_limit(e.tx.as_ref())).sum();
+        let (pending, bytes, gas) = inner.waiting_usage();
         let entries = inner.entries.len();
         drop(inner);
 
@@ -755,16 +787,17 @@ impl PreconfTxSet {
 
         // ── Capacity ───────────────────────────────────────────────────
         // Refusing rather than evicting: every entry here is a promise
-        // already made, so there is no one to displace.
-        if inner.entries.len() >= capacity.max_txs {
+        // already made, so there is no one to displace. Only `Waiting` entries
+        // count — see `PreconfTxSetInner::waiting_usage`.
+        let (waiting, used_bytes, used_gas) = inner.waiting_usage();
+        if waiting >= capacity.max_txs {
             metrics::counter!("preconf.admit.rejected_entries_total").increment(1);
             return Err(PreconfError::QueueFull {
-                in_use: inner.entries.len() as u64,
+                in_use: waiting as u64,
                 capacity: capacity.max_txs as u64,
                 unit: "entries",
             });
         }
-        let used_bytes: usize = inner.entries.values().map(|e| e.size).sum();
         if used_bytes.saturating_add(size) > capacity.max_size {
             metrics::counter!("preconf.admit.rejected_bytes_total").increment(1);
             return Err(PreconfError::QueueFull {
@@ -773,11 +806,9 @@ impl PreconfTxSet {
                 unit: "bytes",
             });
         }
-        // Counting replayed entries too: a commitment already promised consumes
-        // the same drain rate as anything else, so it really does push what
-        // comes after it out of reach.
-        let used_gas: u64 =
-            inner.entries.values().map(|e| Transaction::gas_limit(e.tx.as_ref())).sum();
+        // Replayed entries count too while they wait: a commitment already
+        // promised consumes the same drain rate as anything else, so it really
+        // does push what comes after it out of reach.
         if used_gas.saturating_add(gas_limit) > capacity.max_queued_gas {
             metrics::counter!("preconf.admit.rejected_gas_total").increment(1);
             return Err(PreconfError::QueueFull {
@@ -789,12 +820,13 @@ impl PreconfTxSet {
 
         let held = inner.by_sender.get(&from);
         let holds_this_nonce = held.is_some_and(|nonces| nonces.contains_key(&nonce));
+        let sender_waiting = inner.waiting_slots_of(&from);
         // A replacement takes a slot rather than adding one, so it is not
         // counted against the ceiling.
-        if !holds_this_nonce && held.is_some_and(|n| n.len() >= capacity.max_account_slots) {
+        if !holds_this_nonce && sender_waiting >= capacity.max_account_slots {
             metrics::counter!("preconf.admit.rejected_account_slots_total").increment(1);
             return Err(PreconfError::AccountSlotsFull {
-                in_use: held.map_or(0, BTreeMap::len) as u64,
+                in_use: sender_waiting as u64,
                 max: capacity.max_account_slots as u64,
             });
         }
@@ -855,9 +887,10 @@ impl PreconfTxSet {
         // ── Delegated senders ──────────────────────────────────────────
         // A sender with code can change what its queued transactions mean
         // with a single new delegation, so the ordinary pool caps how many it
-        // may have in flight. Same cap here, from the same config.
+        // may have in flight. Same cap here, from the same config. In flight
+        // means not yet executed, so `Waiting` only.
         if bytecode_hash.is_some_and(|code| code != KECCAK256_EMPTY) {
-            let inflight = inner.by_sender.get(&from).map_or(0, BTreeMap::len);
+            let inflight = inner.waiting_slots_of(&from);
             if inflight >= capacity.max_inflight_delegated {
                 metrics::counter!("preconf.admit.rejected_delegated_total").increment(1);
                 return Err(PreconfError::DelegatedInflightLimit {
@@ -1760,6 +1793,61 @@ mod admit_tests {
             set.inner.lock().await.entries[&hash].responder.is_none(),
             "and the refused request must not have left its channel behind",
         );
+    }
+
+    // ── Executed entries do not count ──────────────────────────────────
+    //
+    // The pool arm stages what it executes as `Success` entries that stay until
+    // the next build. They are not backlog, so no ceiling counts them.
+
+    /// One executed pool transaction, however large, does not fill the queue.
+    #[tokio::test]
+    async fn an_executed_entry_does_not_count_against_the_queue_ceilings() {
+        let set = PreconfTxSet::new(8);
+        let incoming = tx_gas(0, 2, 21_000);
+        let tight = Capacity {
+            max_txs: 1,
+            max_size: incoming.encoded_2718().len(),
+            max_queued_gas: 21_000,
+            ..cap()
+        };
+        set.stage_executed(tx_gas(0, 1, 1_000_000_000), addr(1)).await;
+
+        let out = admit(&set, Req::new(incoming, addr(2)), tight).await;
+
+        assert_eq!(out, Ok(()), "count, bytes and gas all have room for one waiting entry");
+    }
+
+    /// A sender's own executed transactions do not use up its slots, nor its
+    /// in-flight allowance when it has code.
+    #[tokio::test]
+    async fn a_senders_executed_entries_do_not_use_its_slots() {
+        let set = PreconfTxSet::new(8);
+        let one_slot = Capacity { max_account_slots: 1, max_inflight_delegated: 1, ..cap() };
+        set.stage_executed(tx(0, 1, 0), addr(1)).await;
+
+        let out =
+            admit(&set, Req::new(tx(1, 2, 0), addr(1)).chain_nonce(1).delegated(), one_slot).await;
+
+        assert_eq!(out, Ok(()));
+    }
+
+    /// Put back to `Waiting` (an abandoned build's carryover), it counts again.
+    #[tokio::test]
+    async fn an_entry_put_back_to_waiting_counts_again() {
+        let set = PreconfTxSet::new(8);
+        let staged = tx_gas(0, 1, 1_000_000_000);
+        set.stage_executed(staged.clone(), addr(1)).await;
+        set.reset_success_to_waiting(staged.tx_hash()).await.unwrap();
+
+        let out = admit(
+            &set,
+            Req::new(tx_gas(0, 2, 21_000), addr(2)),
+            Capacity { max_queued_gas: 1_000_000_000, ..cap() },
+        )
+        .await;
+
+        assert!(matches!(out, Err(PreconfError::QueueFull { unit: "gas", .. })), "{out:?}");
     }
 
     // ── Base fee ───────────────────────────────────────────────────────

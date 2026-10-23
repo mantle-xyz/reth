@@ -85,6 +85,7 @@ const COUNTERS: &[&str] = &[
     "preconf.fifo.da_rejected_total",
     "preconf.fifo.block_gas_rejected_total",
     "preconf.fifo.block_rlp_rejected_total",
+    "preconf.fifo.block_uncompressed_rejected_total",
     "preconf.fifo.staged_evicted_total",
     // An entry left the queue with a client still waiting on it — the
     // completion protocol was bypassed. Should stay flat at zero.
