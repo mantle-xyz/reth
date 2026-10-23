@@ -513,9 +513,12 @@ where
         let flashblocks_cfg = self.flashblocks.clone();
         // Historical log and feeHistory ranges are forwarded whole. The history endpoint must
         // cover the full range; latest/safe/finalized tags are interpreted by that endpoint.
-        // For a frozen backend, use explicit end blocks within its retained history. Unlisted
-        // extensions remain local and may lack pre-snapshot data. Unknown hashes fall back to
-        // local RPC on history failures; an absent old hash can therefore return null.
+        // For a frozen backend, use explicit end blocks within its retained history. A log
+        // filter whose range starts before the cutoff is installed on the history endpoint and
+        // polled there, so it reports new logs only while that endpoint follows the chain.
+        // Unlisted extensions remain local and may lack pre-snapshot data. Unknown hashes fall
+        // back to local RPC on history failures; an absent old hash can therefore return null.
+        // A hash the history endpoint reported missing is looked up locally for a minute.
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |mut ctx| {
             install_mantle_rpc_extensions(&mut ctx, sequencer_url, preconf, flashblocks_cfg)
