@@ -17,16 +17,20 @@
 //! commitment is back on the new canonical chain"), canonicalise, and then
 //! build again — the stale Replay entry now points at a consumed nonce.
 //!
-//! Two layers must make that a graceful skip rather than a crash or a
-//! double-inclusion (both in `payload_builder.rs`):
+//! What keeps a stale Replay entry from reaching apply:
 //!   - `sync_fifo_forward_to_head` runs at build start, before `replay_fifo_carryover`, and drops
-//!     fifo entries whose nonce is below the sender's on-chain nonce — the primary skip;
-//!   - the apply loop additionally tolerates `is_nonce_too_low()` without `mark_invalid`, as a
-//!     second-line defense if a stale entry still reaches apply.
+//!     fifo entries whose nonce is below the sender's nonce at the build's parent. This is the
+//!     layer these tests exercise.
+//!   - A reorg re-injection is requeued without a broadcast (`PreconfTxSet::requeue_reverted`), so
+//!     a build already running on the reverted block never sees it; the next build reaches it only
+//!     through the check above.
 //!
-//! These tests assert the
-//! observable contract — hash on chain exactly once, node healthy — rather
-//! than which layer did the skipping.
+//! Unlike the pool arm, the preconf arm does not tolerate nonce-too-low: a
+//! Replay entry that still reaches apply with a spent nonce is reported as a
+//! broken commitment.
+//!
+//! These tests assert the observable contract — hash on chain exactly once,
+//! node healthy.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec, send_preconf};
 use crate::{canonize_built, launch_preconf_node};

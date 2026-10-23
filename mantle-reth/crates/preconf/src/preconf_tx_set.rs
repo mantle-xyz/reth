@@ -26,7 +26,9 @@
 //! - At most one responder per hash, and it lives inside the entry. It is installed with the entry,
 //!   under the same lock, so the builder cannot reach an entry that has nobody to answer.
 //! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and reconcile via
-//!   `snapshot()`.
+//!   `snapshot()`. Not every `Waiting` entry is announced: a reorg requeues without a broadcast
+//!   (see [`PreconfTxSet::requeue_reverted`]), so only that re-scan or the next build's carryover
+//!   reaches it.
 //!
 //! ## Lock order
 //!
@@ -636,7 +638,8 @@ impl PreconfTxSet {
     ///
     /// Two builds overlap routinely: a superseded job is signalled
     /// asynchronously and keeps running on a thread of its own until its next
-    /// await point.
+    /// await point. One still waiting here when it is abandoned returns as
+    /// soon as it gets the lock, without touching the queue.
     ///
     /// Not held across the seal — the state root is the most expensive step in
     /// a build and touches nothing shared. The wait costs one in-flight
@@ -896,11 +899,11 @@ impl PreconfTxSet {
 
     // ============ Push path ============
 
-    /// Idempotent push.
+    /// Idempotent push, followed by a broadcast for the running build.
     ///
-    /// `from` must be the recovered sender; the callers (journal restore and
-    /// reorg re-injection) have it pre-validated. Hash + nonce are read from
-    /// `tx`.
+    /// `from` must be the recovered sender; the caller (journal restore) has
+    /// it pre-validated. Hash + nonce are read from `tx`. A reorg re-injection
+    /// uses [`Self::requeue_reverted`] instead, which does not broadcast.
     ///
     /// Returns:
     /// - [`PushResult::Inserted`] — new entry created and broadcast notified.
@@ -913,7 +916,22 @@ impl PreconfTxSet {
         from: Address,
         source: PreconfSource,
     ) -> PushResult {
-        self.push_with_status(tx, from, source, PreconfStatus::Waiting).await
+        self.push_with_status(tx, from, source, PreconfStatus::Waiting, true).await
+    }
+
+    /// Put a transaction a reorg reverted back in the queue as a `Waiting`
+    /// `Replay` entry, without the broadcast [`Self::push_if_absent`] sends.
+    ///
+    /// A running build may stand on the reverted block, where the nonce is spent;
+    /// executing it there would end the commitment as broken. Only the next build
+    /// reaches it, through the carryover, after `sync_fifo_forward_to_head` has
+    /// checked the nonce against that build's parent.
+    ///
+    /// Exception: a running build's `Lagged` re-scan does see it. That takes a
+    /// `broadcast_cap` backlog, about 30s of a stalled loop at default settings
+    /// (less with a lower `--preconf.timeout-ms`).
+    pub async fn requeue_reverted(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
+        self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Waiting, false).await
     }
 
     /// Stage a transaction this build has **already executed**, so the next one
@@ -923,8 +941,8 @@ impl PreconfTxSet {
     /// `senders_with_landed_claims` and `drop_landed_claims` select on.
     /// Getting it wrong skips both silently.
     ///
-    /// Sends no broadcast — the notifier means "there is work to dispatch",
-    /// and this has run already.
+    /// Sends no broadcast — the notifier means "there is work for the running
+    /// build", and this has run already.
     ///
     /// **A `Waiting` entry under the same hash is not upgraded** —
     /// `push_with_status` returns `AlreadyExists` and leaves it alone. What
@@ -937,20 +955,24 @@ impl PreconfTxSet {
     /// as nonce-too-low — the client told its transaction failed while it is
     /// in the block.
     pub async fn stage_executed(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
-        let out =
-            self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await;
+        let out = self
+            .push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success, false)
+            .await;
         if matches!(out, PushResult::Inserted) {
             self.trim_staged().await;
         }
         out
     }
 
+    /// `notify`: send the broadcast for a new `Waiting` entry. A `Success`
+    /// entry never notifies, as it has run already.
     async fn push_with_status(
         &self,
         tx: Arc<TxEnvelope>,
         from: Address,
         source: PreconfSource,
         status: PreconfStatus,
+        notify: bool,
     ) -> PushResult {
         let hash = *tx.tx_hash();
         let nonce = tx.nonce();
@@ -1018,7 +1040,7 @@ impl PreconfTxSet {
         inner.order.push_back(hash);
         drop(inner);
 
-        if status == PreconfStatus::Waiting {
+        if notify && status == PreconfStatus::Waiting {
             let _ = self.notifier.send(hash);
         }
 
@@ -2024,20 +2046,20 @@ mod admit_tests {
         assert!(set.claims().slot_owner(&alice, 0).is_none(), "the slot comes back with it");
     }
 
-    /// A reorg reinject or a journal restore looks like the staged pool
-    /// transaction above in two of three respects — `Replay`, no responder —
-    /// and is a real commitment. The `Promised` claim is the only thing
-    /// telling them apart, which is why the carve-out checks all three.
+    /// A reorg reinject looks like the staged pool transaction above in two of
+    /// three respects — `Replay`, no responder — and is a real commitment. The
+    /// `Promised` claim is the only thing telling them apart, which is why the
+    /// carve-out checks all three. (A journal restore leaves the same shape;
+    /// see `a_replayed_commitment_refuses_to_take_on_a_client`.)
     #[tokio::test]
     async fn a_reinjected_commitment_is_not_mistaken_for_a_pool_tx() {
         let set = PreconfTxSet::new(8);
         let alice = addr(1);
-        let restored = tx(0, 1, 0);
-        let hash = *restored.tx_hash();
+        let reverted = tx(0, 1, 0);
+        let hash = *reverted.tx_hash();
 
-        // `Replay`, no client parked — the shape `restore_preconf_state` and
-        // the canon handler push.
-        set.push_if_absent(restored, alice, PreconfSource::Replay).await;
+        // Requeued the way the canon handler does after a reorg.
+        set.requeue_reverted(reverted, alice).await;
         set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
 
         let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;

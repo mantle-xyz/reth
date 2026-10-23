@@ -23,6 +23,13 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
+/// Returned by `build_payload` for a job abandoned while it waited for the
+/// build lock. Not a failure: the job generator logs it at debug level and
+/// does not count it in `preconf.build.failed_total`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("payload job abandoned before it started building")]
+pub struct AbandonedBeforeStart;
+
 /// Why a build stopped.
 ///
 /// The build loop reacts to both the same way — wrap up — but what becomes of

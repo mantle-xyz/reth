@@ -64,6 +64,8 @@ const COUNTERS: &[&str] = &[
     "flashblocks.slices_outliving_their_block_total",
     "flashblocks.unlanded_sweep_slow_total",
     "flashblocks.unlanded_nonce_unreadable_total",
+    // Same failure on the queue's forward sweep at build start.
+    "preconf.build.forward_nonce_unreadable_total",
     "flashblocks.slices_missed_by_slow_subscribers_total",
     "flashblocks.slow_subscriber_dropped_total",
     "flashblocks.resume_before_archive_total",
@@ -76,6 +78,9 @@ const COUNTERS: &[&str] = &[
     "preconf.tx.failure_total",
     "preconf.tx.fatal_total",
     "preconf.build.panic_total",
+    // A job abandoned while it waited for the build lock, so it built nothing.
+    // Routine when jobs are superseded; not counted as a failure.
+    "preconf.build.abandoned_before_start_total",
     "preconf.build.watchdog_cancel_total",
     "preconf.fifo.da_rejected_total",
     "preconf.fifo.block_gas_rejected_total",

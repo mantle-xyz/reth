@@ -5,9 +5,10 @@
 //! (2~3 block) reorg path: build N commitment blocks in a row, then FCU the
 //! head all the way back to a common ancestor, reverting every commitment
 //! block in one shot. All commitments must re-land on the new branch, none
-//! dropped, none duplicated. Re-land is via the journal-replay path (each
-//! committed block's entry is persisted, then re-injected as `Replay` when the
-//! reorg's canonical-state notification reports its block reverted).
+//! dropped, none duplicated. Re-land is via the canon handler: when the reorg's
+//! canonical-state notification reports the blocks reverted, it requeues each
+//! commitment from the reverted chain as `Replay`, and the next build executes
+//! it through the carryover.
 
 use super::helpers::{
     PreconfCfgBuilder, fresh_journal, l1_info_deposit, mantle_test_chain_spec, send_preconf,
@@ -89,9 +90,9 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
     // ── Reorg all commitment blocks out in one shot: rebuild at the FIRST
     //    commitment's height (n=1 → same timestamp) against a NEW L1 origin
     //    (200). This reverts the whole commitment chain. Every commitment must
-    //    re-land (via journal replay); the SLA promises eventual re-land, not
-    //    same-block, so the re-injected commitments may drain across the rebuild
-    //    block and a few following blocks — accumulate and count.
+    //    re-land; the SLA promises eventual re-land, not same-block, so the
+    //    requeued commitments may drain across the rebuild block and a few
+    //    following blocks — accumulate and count.
     use std::collections::HashMap;
     let mut counts: HashMap<B256, usize> = HashMap::new();
     let (mut head, sealed0) = reorg_to!(node, base, n = 1, l1 = 200);
