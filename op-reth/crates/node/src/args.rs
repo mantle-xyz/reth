@@ -225,6 +225,16 @@ pub struct RollupArgs {
     )]
     pub historical_rpc: Option<String>,
 
+    // [MANTLE] Nodes initialised from a state snapshot have no usable blocks up to the anchor.
+    /// First block served from the local database when `--rollup.historicalrpc` is set.
+    /// Requests for earlier blocks go to the historical endpoint.
+    ///
+    /// For a database initialised from a state snapshot, this is the block after the snapshot
+    /// anchor. Defaults to 87,370,343 on Mantle mainnet (anchor 87,370,342) and to the Bedrock
+    /// block on other chains. 0 turns forwarding off.
+    #[arg(long = "rollup.historicalrpc.cutoff", value_name = "BLOCK", requires = "historical_rpc")]
+    pub historical_rpc_cutoff: Option<u64>,
+
     /// Minimum suggested priority fee (tip) in wei, default `1_000_000`
     #[arg(long, default_value_t = 1_000_000)]
     pub min_suggested_priority_fee: u64,
@@ -306,6 +316,7 @@ impl Default for RollupArgs {
             interop_safety_level: SafetyLevel::CrossUnsafe,
             sequencer_headers: Vec::new(),
             historical_rpc: None,
+            historical_rpc_cutoff: None,
             min_suggested_priority_fee: 1_000_000,
             max_uncompressed_block_size: None,
             flashblocks_url: None,
@@ -417,6 +428,32 @@ mod tests {
         ])
         .args;
         assert_eq!(args, expected_args);
+    }
+
+    /// [MANTLE] The cutoff overrides the chain default and needs a historical endpoint.
+    #[test]
+    fn test_parse_historical_rpc_cutoff() {
+        let expected_args = RollupArgs {
+            historical_rpc: Some("http://history:8545".into()),
+            historical_rpc_cutoff: Some(90_000_001),
+            ..Default::default()
+        };
+        let args = CommandParser::<RollupArgs>::parse_from([
+            "reth",
+            "--rollup.historicalrpc",
+            "http://history:8545",
+            "--rollup.historicalrpc.cutoff",
+            "90000001",
+        ])
+        .args;
+        assert_eq!(args, expected_args);
+
+        let missing_endpoint = CommandParser::<RollupArgs>::try_parse_from([
+            "reth",
+            "--rollup.historicalrpc.cutoff",
+            "90000001",
+        ]);
+        assert!(missing_endpoint.is_err());
     }
 
     #[test]

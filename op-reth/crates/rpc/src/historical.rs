@@ -13,10 +13,30 @@ use jsonrpsee_core::{
     server::MethodResponse,
 };
 use jsonrpsee_types::{Params, Request};
+use parking_lot::Mutex;
 use reth_storage_api::{BlockReaderIdExt, TransactionsProvider};
+use schnellru::{ByLength, LruMap};
 use serde_json::value::RawValue;
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tracing::{debug, warn};
+
+/// [MANTLE] Maximum number of filters installed on the historical endpoint that are tracked.
+/// When full, the least recently used filter is forgotten; polling it then fails locally as an
+/// unknown filter, and the client has to install it again.
+const MAX_HISTORICAL_FILTERS: u32 = 10_000;
+
+/// [MANTLE] Maximum number of transaction hashes remembered as missing from the historical
+/// endpoint.
+const MAX_MISSING_TRANSACTIONS: u32 = 16_384;
+
+/// [MANTLE] How long a transaction hash reported missing by the historical endpoint is looked up
+/// locally only. History before the cutoff does not change, so a miss stays valid; the limit
+/// only bounds how long a history backend that is still filling in would be skipped.
+const MISSING_TRANSACTION_TTL: Duration = Duration::from_secs(60);
 
 /// A client that can be used to forward RPC requests for historical data to an endpoint.
 ///
@@ -95,7 +115,7 @@ impl<P> HistoricalRpc<P> {
     /// Constructs a new historical RPC layer with the given provider, client and bedrock block
     /// number.
     pub fn new(provider: P, client: HistoricalRpcClient, bedrock_block: BlockNumber) -> Self {
-        let inner = Arc::new(HistoricalRpcInner { provider, client, bedrock_block });
+        let inner = Arc::new(HistoricalRpcInner::new(provider, client, bedrock_block));
 
         Self { inner }
     }
@@ -243,6 +263,25 @@ struct HistoricalRpcInner<P> {
     client: HistoricalRpcClient,
     /// Bedrock transition block number
     bedrock_block: BlockNumber,
+    /// [MANTLE] Ids of filters that forwarded `eth_newFilter` calls installed on the historical
+    /// endpoint. Polling or removing such a filter has to reach the same endpoint.
+    historical_filters: Mutex<LruMap<String, (), ByLength>>,
+    /// [MANTLE] Transaction hashes the historical endpoint recently reported missing, with the
+    /// time of the report. Clients poll a pending transaction until it is included, and each
+    /// poll would otherwise query the historical endpoint before the local pool.
+    missing_transactions: Mutex<LruMap<B256, Instant, ByLength>>,
+}
+
+impl<P> HistoricalRpcInner<P> {
+    fn new(provider: P, client: HistoricalRpcClient, bedrock_block: BlockNumber) -> Self {
+        Self {
+            provider,
+            client,
+            bedrock_block,
+            historical_filters: Mutex::new(LruMap::new(ByLength::new(MAX_HISTORICAL_FILTERS))),
+            missing_transactions: Mutex::new(LruMap::new(ByLength::new(MAX_MISSING_TRANSACTIONS))),
+        }
+    }
 }
 
 impl<P> HistoricalRpcInner<P>
@@ -261,8 +300,16 @@ where
             "eth_getTransactionByHash" |
             "eth_getTransactionReceipt" |
             "eth_getRawTransactionByHash" => self.transaction_forward_reason(req),
+            // [MANTLE] Raw transaction reads by hash follow the same rule.
+            "debug_getRawTransaction" => self.transaction_forward_reason(req),
+            // [MANTLE] Fee history is routed by the earliest block of its range.
             "eth_feeHistory" => {
                 self.should_forward_fee_history(req).then_some(ForwardReason::PreBedrock)
+            }
+            // [MANTLE] A filter installed on the historical endpoint is only known there, so its
+            // answers, errors included, come from there.
+            "eth_getFilterChanges" | "eth_getFilterLogs" | "eth_uninstallFilter" => {
+                self.is_historical_filter(req).then_some(ForwardReason::PreBedrock)
             }
             method => self.block_forward_reason(method, req),
         }
@@ -302,6 +349,11 @@ where
                         is_pre_bedrock.then_some(ForwardReason::PreBedrock)
                     }
                     _ => {
+                        // [MANTLE] The endpoint recently reported this hash missing; only the
+                        // local handler can still find it, e.g. as a pending transaction.
+                        if self.recently_missing(tx_hash) {
+                            return None;
+                        }
                         // Transaction not found locally, optimistically forward to historical endpoint
                         debug!(
                             target: "rpc::historical",
@@ -314,6 +366,26 @@ where
             })
     }
 
+    /// [MANTLE] Returns true if the historical endpoint reported the transaction missing within
+    /// [`MISSING_TRANSACTION_TTL`].
+    fn recently_missing(&self, tx_hash: B256) -> bool {
+        let mut missing = self.missing_transactions.lock();
+        let Some(reported) = missing.peek(&tx_hash) else { return false };
+        if reported.elapsed() < MISSING_TRANSACTION_TTL {
+            return true;
+        }
+        missing.remove(&tx_hash);
+        false
+    }
+
+    /// [MANTLE] Returns true if the filter id in the first parameter belongs to a filter
+    /// installed on the historical endpoint.
+    fn is_historical_filter(&self, req: &Request<'_>) -> bool {
+        req.params()
+            .one::<String>()
+            .is_ok_and(|id| self.historical_filters.lock().get(&id).is_some())
+    }
+
     /// Determines if a block-based request should be forwarded
     fn block_forward_reason(&self, method: &str, req: &Request<'_>) -> Option<ForwardReason> {
         let maybe_block_id = extract_block_id_for_method(method, &req.params());
@@ -321,7 +393,7 @@ where
         maybe_block_id.and_then(|block_id| self.block_id_forward_reason(block_id))
     }
 
-    /// Routes the entire fee history range using its earliest requested block.
+    /// [MANTLE] Routes the entire fee history range using its earliest requested block.
     fn should_forward_fee_history(&self, req: &Request<'_>) -> bool {
         let params = req.params();
         let mut params = params.sequence();
@@ -382,7 +454,17 @@ where
         let params = req.params();
         let params_str = params.as_str().unwrap_or("[]");
 
+        // [MANTLE] Parameters and results pass through as raw JSON, so values such as
+        // floating-point fee ratios reach the caller exactly as the endpoint wrote them.
         let params = serde_json::from_str::<Box<RawValue>>(params_str).ok()?;
+
+        // [MANTLE] Forget the filter even if the endpoint fails to remove it: it expires there
+        // on its own, and a retry is then answered locally as an unknown filter.
+        if req.method_name() == "eth_uninstallFilter" &&
+            let Ok(id) = req.params().one::<String>()
+        {
+            self.historical_filters.lock().remove(&id);
+        }
 
         let raw = match self.client.request::<_, Box<RawValue>>(req.method_name(), params).await {
             Ok(raw) => raw,
@@ -426,12 +508,25 @@ where
         // A history miss may still be a local pending or preconfirmed transaction.
         // Some historical clients encode a missing raw transaction as empty bytes.
         let missing = match req.method_name() {
-            "eth_getRawTransactionByHash" => matches!(raw.get(), "null" | r#""0x""#),
+            "eth_getRawTransactionByHash" | "debug_getRawTransaction" => {
+                matches!(raw.get(), "null" | r#""0x""#)
+            }
             "eth_getTransactionByHash" | "eth_getTransactionReceipt" => raw.get() == "null",
             _ => false,
         };
         if missing {
+            // [MANTLE] Look the hash up locally only for a while, see `recently_missing`.
+            if let Ok(tx_hash) = parse_transaction_hash_from_params(&req.params()) {
+                self.missing_transactions.lock().insert(tx_hash, Instant::now());
+            }
             return None;
+        }
+
+        // [MANTLE] Route later calls for this filter to the endpoint that installed it.
+        if req.method_name() == "eth_newFilter" &&
+            let Ok(id) = serde_json::from_str::<String>(raw.get())
+        {
+            self.historical_filters.lock().insert(id, ());
         }
 
         let payload = jsonrpsee_types::ResponsePayload::success(raw).into();
@@ -557,6 +652,10 @@ fn extract_block_id_for_method(method: &str, params: &Params<'_>) -> Option<Bloc
         "eth_getRawTransactionByBlockHashAndIndex" |
         "debug_traceBlockByNumber" |
         "debug_traceBlockByHash" => parse_block_id_from_params(params, 0),
+        // [MANTLE] Raw block data, which the Mantle proxyd sidecar also routes by height.
+        "debug_getRawHeader" | "debug_getRawBlock" | "debug_getRawReceipts" => {
+            parse_block_id_from_params(params, 0)
+        }
         "eth_getBalance" |
         "eth_getCode" |
         "eth_getTransactionCount" |
@@ -564,8 +663,11 @@ fn extract_block_id_for_method(method: &str, params: &Params<'_>) -> Option<Bloc
         "eth_estimateGas" |
         "eth_createAccessList" |
         "debug_traceCall" => parse_block_id_from_params(params, 1),
+        // [MANTLE] Simulation runs on top of the given block's state, like `eth_call`.
+        "eth_simulateV1" => parse_block_id_from_params(params, 1),
         "eth_getStorageAt" | "eth_getProof" => parse_block_id_from_params(params, 2),
-        "eth_getLogs" => {
+        // [MANTLE] Log queries and log filters are routed by the first block of their range.
+        "eth_getLogs" | "eth_newFilter" => {
             let filter: Filter = params.one().ok()?;
             filter
                 .block_option
@@ -613,6 +715,35 @@ mod tests {
     };
     use tower::layer::util::Identity;
 
+    /// A history miss must allow the local transaction handler to inspect pending sources.
+    #[tokio::test]
+    async fn transaction_lookup_falls_through_only_on_miss() {
+        let hash = B256::from([0x11; 32]);
+        let params = json!([hash]).to_string();
+        for (method, result, fall_through) in [
+            ("eth_getTransactionByHash", serde_json::Value::Null, true),
+            ("eth_getTransactionByHash", json!({"hash": hash}), false),
+            ("eth_getRawTransactionByHash", serde_json::Value::Null, true),
+            ("eth_getRawTransactionByHash", json!("0x"), true),
+            ("eth_getRawTransactionByHash", json!("0xbeef"), false),
+            ("eth_getTransactionReceipt", serde_json::Value::Null, true),
+            ("eth_getTransactionReceipt", json!({"transactionHash": hash}), false),
+        ] {
+            let asserter = Asserter::new();
+            asserter.push_success(&result);
+            let historical = mocked_historical(asserter);
+            let response = historical.maybe_forward_request(&owned_request(method, &params)).await;
+            if fall_through {
+                assert!(
+                    response.is_none(),
+                    "history miss must not hide a local pending transaction"
+                );
+            } else {
+                assert_eq!(result_of(&response.unwrap()), result);
+            }
+        }
+    }
+
     fn method_not_found_payload() -> ErrorPayload {
         ErrorPayload {
             code: jsonrpsee_types::error::METHOD_NOT_FOUND_CODE as i64,
@@ -622,11 +753,11 @@ mod tests {
     }
 
     fn mocked_historical(asserter: Asserter) -> HistoricalRpcInner<NoopProvider> {
-        HistoricalRpcInner {
-            provider: NoopProvider::default(),
-            client: HistoricalRpcClient::with_client(RpcClient::mocked(asserter)),
-            bedrock_block: 105235063,
-        }
+        HistoricalRpcInner::new(
+            NoopProvider::default(),
+            HistoricalRpcClient::with_client(RpcClient::mocked(asserter)),
+            105235063,
+        )
     }
 
     /// Shared log of outbound `(method, params)` pairs captured by [`RecordingTransport`].
@@ -668,11 +799,11 @@ mod tests {
         let requests = RequestLog::default();
         let transport =
             RecordingTransport { inner: MockTransport::new(asserter), requests: requests.clone() };
-        let historical = HistoricalRpcInner {
-            provider: NoopProvider::default(),
-            client: HistoricalRpcClient::with_client(RpcClient::new(transport, true)),
-            bedrock_block: 105235063,
-        };
+        let historical = HistoricalRpcInner::new(
+            NoopProvider::default(),
+            HistoricalRpcClient::with_client(RpcClient::new(transport, true)),
+            105235063,
+        );
         (historical, requests)
     }
 
@@ -1114,16 +1245,126 @@ mod tests {
     #[test]
     fn forward_failure_returns_error_and_warns_once() {
         let warns = warns_during(async {
-            let historical = HistoricalRpcInner {
-                provider: NoopProvider::default(),
-                client: HistoricalRpcClient::new("http://127.0.0.1:0").unwrap(),
-                bedrock_block: 105235063,
-            };
+            let historical = HistoricalRpcInner::new(
+                NoopProvider::default(),
+                HistoricalRpcClient::new("http://127.0.0.1:0").unwrap(),
+                105235063,
+            );
             let req = owned_request("eth_getHeaderByNumber", r#"["0x64"]"#);
             let response = historical.forward_to_historical(&req).await.unwrap();
             assert_eq!(response.as_error_code(), Some(jsonrpsee_types::error::INTERNAL_ERROR_CODE));
             assert_eq!(error_message_of(&response), "historical RPC request failed");
         });
         assert_eq!(warns, 1, "expected exactly one warning for a forwarding failure");
+    }
+
+    /// [MANTLE] Raw block reads, simulation and log filters are routed by their block.
+    #[test]
+    fn extracts_block_id_for_mantle_routed_methods() {
+        for (method, params_str) in [
+            ("debug_getRawHeader", r#"["0x64"]"#),
+            ("debug_getRawBlock", r#"["0x64"]"#),
+            ("debug_getRawReceipts", r#"["0x64"]"#),
+            ("eth_simulateV1", r#"[{"blockStateCalls": []}, "0x64"]"#),
+            ("eth_newFilter", r#"[{"fromBlock": "0x64", "toBlock": "latest"}]"#),
+        ] {
+            let params = Params::new(Some(params_str));
+            assert_eq!(
+                extract_block_id_for_method(method, &params).unwrap(),
+                BlockId::Number(BlockNumberOrTag::Number(100)),
+                "{method}"
+            );
+        }
+    }
+
+    /// [MANTLE] A filter installed on the historical endpoint is polled and removed there, with
+    /// the endpoint's errors returned as they are, and forgotten once removed.
+    #[tokio::test]
+    async fn historical_filters_stay_on_the_endpoint() {
+        let asserter = Asserter::new();
+        let (historical, requests) = recorded_historical(asserter.clone());
+        let poll = |method| owned_request(method, r#"["0xfeed"]"#);
+
+        asserter.push_success(&"0xfeed");
+        let install =
+            owned_request("eth_newFilter", r#"[{"fromBlock": "0x64", "toBlock": "0x65"}]"#);
+        let installed = historical.maybe_forward_request(&install).await.unwrap();
+        assert_eq!(result_of(&installed), json!("0xfeed"));
+
+        // A filter starting at the cutoff is local, and so is polling an unknown id.
+        let local = owned_request("eth_newFilter", r#"[{"fromBlock": "0x645c277"}]"#);
+        assert!(historical.forward_reason(&local).is_none());
+        let unknown = owned_request("eth_getFilterChanges", r#"["0xbeef"]"#);
+        assert!(historical.forward_reason(&unknown).is_none());
+
+        let logs = json!([{"blockNumber": "0x64"}]);
+        for method in ["eth_getFilterLogs", "eth_getFilterChanges"] {
+            asserter.push_success(&logs);
+            let response = historical.maybe_forward_request(&poll(method)).await.unwrap();
+            assert_eq!(result_of(&response), logs, "{method}");
+        }
+
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: "filter not found".into(),
+            data: None,
+        });
+        let response =
+            historical.maybe_forward_request(&poll("eth_getFilterChanges")).await.unwrap();
+        assert_eq!(response.as_error_code(), Some(-32000));
+
+        asserter.push_success(&true);
+        let removed = historical.maybe_forward_request(&poll("eth_uninstallFilter")).await.unwrap();
+        assert_eq!(result_of(&removed), json!(true));
+        assert!(historical.forward_reason(&poll("eth_getFilterChanges")).is_none());
+
+        let methods: Vec<_> =
+            recorded_requests(&requests).into_iter().map(|(method, _)| method).collect();
+        assert_eq!(
+            methods,
+            [
+                "eth_newFilter",
+                "eth_getFilterLogs",
+                "eth_getFilterChanges",
+                "eth_getFilterChanges",
+                "eth_uninstallFilter",
+            ]
+        );
+    }
+
+    /// [MANTLE] A hash the endpoint reported missing is looked up locally until the report
+    /// expires. Hits are not remembered.
+    #[tokio::test]
+    async fn missing_transactions_are_not_forwarded_again() {
+        let asserter = Asserter::new();
+        let (historical, requests) = recorded_historical(asserter.clone());
+        let hash = B256::from([0x22; 32]);
+        let params = json!([hash]).to_string();
+
+        asserter.push_success(&"0x");
+        let raw = owned_request("debug_getRawTransaction", &params);
+        assert!(historical.maybe_forward_request(&raw).await.is_none());
+        for method in [
+            "debug_getRawTransaction",
+            "debug_traceTransaction",
+            "eth_getRawTransactionByHash",
+            "eth_getTransactionByHash",
+            "eth_getTransactionReceipt",
+        ] {
+            let req = owned_request(method, &params);
+            assert!(historical.forward_reason(&req).is_none(), "{method}");
+        }
+        assert_eq!(recorded_requests(&requests).len(), 1);
+
+        let receipt = owned_request("eth_getTransactionReceipt", &params);
+        let expired = Instant::now().checked_sub(MISSING_TRANSACTION_TTL).unwrap();
+        historical.missing_transactions.lock().insert(hash, expired);
+        assert!(matches!(historical.forward_reason(&receipt), Some(ForwardReason::UnknownHash)));
+
+        let found = json!({"transactionHash": hash});
+        asserter.push_success(&found);
+        let response = historical.maybe_forward_request(&receipt).await.unwrap();
+        assert_eq!(result_of(&response), found);
+        assert!(historical.forward_reason(&receipt).is_some());
     }
 }
