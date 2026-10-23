@@ -9,9 +9,7 @@
 use crate::helpers::{mantle_payload_attributes, with_mantle_node};
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_network::eip2718::Encodable2718;
-use alloy_op_hardforks::{
-    MANTLE_HOODI_BLOCK_TIME, MANTLE_HOODI_CHAIN_ID, mantle_hoodi_bvm_upgrade_time,
-};
+use alloy_op_hardforks::{MANTLE_HOODI_BLOCK_TIME, MANTLE_HOODI_CHAIN_ID};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, hex, keccak256};
 use jsonrpsee::{core::client::ClientT, http_client::HttpClient, rpc_params};
 use mantle_reth_cli::node::MantleNode;
@@ -31,14 +29,8 @@ const BVM_ETH_CODEHASH: B256 =
     alloy_primitives::b256!("0xe84a8d4d3ed629a670b03e88dab806078de4b86beac8ca06addcff8dd4996290");
 const BVM_MNT_CODEHASH: B256 =
     alloy_primitives::b256!("0xf165e4b851dc8d4e18dcf1d2bc59817d0129a39365c191e76bfd596b60513b45");
-/// Activation time written to the test genesis; used only while no bundled time is scheduled.
-const CONFIGURED_UPGRADE_TIME: u64 = 1_000;
-/// The effective activation time: the bundled one once scheduled, otherwise the genesis value.
-const UPGRADE_TIME: u64 =
-    match mantle_hoodi_bvm_upgrade_time(MANTLE_HOODI_CHAIN_ID, Some(CONFIGURED_UPGRADE_TIME)) {
-        Some(time) => time,
-        None => unreachable!(),
-    };
+/// Activation time written to the test genesis.
+const UPGRADE_TIME: u64 = 1_000;
 /// Pre-existing `BVM_ETH` storage that the code write must preserve.
 const SUPPLY_SLOT: B256 = B256::with_last_byte(2);
 const SUPPLY: u64 = 15_349;
@@ -119,10 +111,7 @@ async fn hoodi_bvm_upgrade_writes_code_at_activation() {
     genesis.base_fee_per_gas = Some(1_000_000_000);
     genesis.extra_data = encode_jovian_extra_data(Default::default(), BaseFeeParams::new(8, 2), 0)
         .expect("post-Arsia genesis extra data");
-    genesis
-        .config
-        .extra_fields
-        .insert("mantleHoodiBvmUpgradeTime".to_owned(), json!(CONFIGURED_UPGRADE_TIME));
+    genesis.config.extra_fields.insert("mantleHoodiBvmUpgradeTime".to_owned(), json!(UPGRADE_TIME));
     // Hoodi-like pre-fork state: BVM_ETH has placeholder code and a total supply, BVM_MNT absent.
     genesis.alloc.insert(
         BVM_ETH,

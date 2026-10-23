@@ -1,7 +1,8 @@
 //! Mantle chain specifications.
 //!
-//! Provides `MANTLE_MAINNET`, `MANTLE_SEPOLIA` statics and the `from_mantle_genesis` function
-//! for converting a [`Genesis`] JSON into a Mantle-configured [`OpChainSpec`].
+//! Provides `MANTLE_MAINNET`, `MANTLE_SEPOLIA`, `MANTLE_HOODI` statics and the
+//! `from_mantle_genesis` function for converting a [`Genesis`] JSON into a Mantle-configured
+//! [`OpChainSpec`].
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -15,10 +16,12 @@
 extern crate alloc;
 
 mod mantle;
+mod mantle_hoodi;
 mod mantle_mainnet;
 mod mantle_sepolia;
 
 pub use alloy_op_hardforks::MantleHardfork;
+pub use mantle_hoodi::MANTLE_HOODI;
 pub use mantle_mainnet::MANTLE_MAINNET;
 pub use mantle_sepolia::MANTLE_SEPOLIA;
 
@@ -28,7 +31,7 @@ use alloy_hardforks::Hardfork;
 use alloy_op_hardforks::{
     MANTLE_MAINNET_ARSIA_TIMESTAMP, MANTLE_MAINNET_LIMB_TIMESTAMP, MANTLE_MAINNET_SKADI_TIMESTAMP,
     MANTLE_SEPOLIA_ARSIA_TIMESTAMP, MANTLE_SEPOLIA_LIMB_TIMESTAMP, MANTLE_SEPOLIA_SKADI_TIMESTAMP,
-    OpHardfork, mantle_hoodi_bvm_upgrade_time,
+    OpHardfork,
 };
 use alloy_primitives::U256;
 use reth_chainspec::ChainSpec;
@@ -158,8 +161,8 @@ static MANTLE_SEPOLIA_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
 /// - Arsia activates Canyon + Fjord + Granite + Holocene + Jovian simultaneously.
 ///
 /// For Mantle mainnet/Sepolia the genesis JSON is pre-configured by
-/// `configure_mantle_genesis`. For unknown Mantle-compatible chains, hardfork
-/// timestamps are read from the genesis `extra_fields`.
+/// `configure_mantle_genesis`, and Mantle Hoodi's by `MANTLE_HOODI`. For unknown Mantle-compatible
+/// chains, hardfork timestamps are read from the genesis `extra_fields`.
 pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
     use mantle::MantleChainInfo;
 
@@ -177,11 +180,7 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
     let skadi_ts = mantle_genesis_info.mantle_skadi_time;
     let limb_ts = mantle_genesis_info.mantle_limb_time;
     let arsia_ts = mantle_genesis_info.mantle_arsia_time;
-    // Mantle Hoodi's bundled time, once scheduled, takes precedence over the genesis value.
-    let hoodi_bvm_upgrade_ts = mantle_hoodi_bvm_upgrade_time(
-        genesis.config.chain_id,
-        mantle_genesis_info.mantle_hoodi_bvm_upgrade_time,
-    );
+    let hoodi_bvm_upgrade_ts = mantle_genesis_info.mantle_hoodi_bvm_upgrade_time;
 
     // Block-based hardforks (same as standard OP)
     let hardfork_opts = [
