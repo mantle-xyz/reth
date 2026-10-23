@@ -26,7 +26,9 @@
 //! - At most one responder per hash, and it lives inside the entry. It is installed with the entry,
 //!   under the same lock, so the builder cannot reach an entry that has nobody to answer.
 //! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and reconcile via
-//!   `snapshot()`.
+//!   `snapshot()`. Not every `Waiting` entry is announced: a reorg requeues without a broadcast
+//!   (see [`PreconfTxSet::requeue_reverted`]), so only that re-scan or the next build's carryover
+//!   reaches it.
 //!
 //! ## Lock order
 //!
@@ -636,7 +638,8 @@ impl PreconfTxSet {
     ///
     /// Two builds overlap routinely: a superseded job is signalled
     /// asynchronously and keeps running on a thread of its own until its next
-    /// await point.
+    /// await point. One still waiting here when it is abandoned returns as
+    /// soon as it gets the lock, without touching the queue.
     ///
     /// Not held across the seal — the state root is the most expensive step in
     /// a build and touches nothing shared. The wait costs one in-flight
@@ -945,8 +948,8 @@ impl PreconfTxSet {
     /// `senders_with_landed_claims` and `drop_landed_claims` select on.
     /// Getting it wrong skips both silently.
     ///
-    /// Sends no broadcast — the notifier means "there is work to dispatch",
-    /// and this has run already.
+    /// Sends no broadcast — the notifier means "there is work for the running
+    /// build", and this has run already.
     ///
     /// **A `Waiting` entry under the same hash is not upgraded** —
     /// `push_with_status` returns `AlreadyExists` and leaves it alone. What

@@ -12,9 +12,11 @@
 //! 3. A fresh [`JobCancel`] and a `watch::channel(None)` are created. A tokio task is spawned that
 //!    drives [`PreconfPayloadBuilder::build_payload`] to completion, then sends the final
 //!    `Option<OpBuiltPayload<N>>` into the watch sender. On error the sender is dropped (without
-//!    sending). A panic inside the build is caught (`catch_unwind`), logged at `error!`, counted
-//!    via `preconf.build.panic_total`, and then degrades the same way (sender dropped →
-//!    `MissingPayload`) rather than being silently swallowed by the never-awaited join handle.
+//!    sending); a job abandoned while it waited for the build lock ends this way too, but is logged
+//!    at `debug!` and not counted as a failed build. A panic inside the build is caught
+//!    (`catch_unwind`), logged at `error!`, counted via `preconf.build.panic_total`, and then
+//!    degrades the same way (sender dropped → `MissingPayload`) rather than being silently
+//!    swallowed by the never-awaited join handle.
 //! 4. The [`PreconfPayloadJob`] returned to the payload service holds the watch receiver + cancel
 //!    handle + join handle. Subsequent `best_payload()` / `resolve_kind()` calls read through
 //!    those.

@@ -1811,7 +1811,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///
     /// 1. **Prelude** — upstream [`OpPayloadBuilderCtx`], parent-block state provider fetched twice
     ///    (owned, to keep the async future `Send`), L1 block contract preloaded into the DB cache.
-    /// 2. **Stage 1** — `apply_pre_execution_changes`.
+    /// 2. **Stage 1** — `apply_pre_execution_changes`, then the build lock
+    ///    ([`PreconfTxSet::lock_for_build`]). A job abandoned while it waited for the lock returns
+    ///    [`AbandonedBeforeStart`] there, having touched nothing shared.
     /// 3. **Stage 2** — `execute_sequencer_transactions_watching_whitelist` (deposits + L1 info +
     ///    system txs, snapshotting any `WhitelistUpdated` delta they emit).
     /// 4. **Stage 3** — unified `select!` loop with four `biased` branches, **in this order**:
@@ -1830,10 +1832,10 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///    Before the loop, in order: a sweep of what the last build announced and the chain has
     ///    not taken (which also puts those senders' pool nonces back where the chain has them);
     ///    the **index 0 slice** (deposits and system txs only); then the **carryover preamble** —
-    ///    stale in-flight / journal-restored commitments and the unlanded pool transactions the
-    ///    sweep handed to the fifo, all dispatched through [`admit_and_dispatch`]. They bypass the
-    ///    broadcast queue and the pool arm, so they land ahead of concurrently-queued RPC pushes
-    ///    and fresh pool traffic.
+    ///    stale in-flight / journal-restored commitments, commitments a reorg requeued, and the
+    ///    unlanded pool transactions the sweep handed to the fifo, all dispatched through
+    ///    [`admit_and_dispatch`]. They bypass the broadcast queue and the pool arm, so they land
+    ///    ahead of concurrently-queued RPC pushes and fresh pool traffic.
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).
     /// 6. **Stage 5** — `builder.finish` → seal + wrap into `OpBuiltPayload`.
     ///
