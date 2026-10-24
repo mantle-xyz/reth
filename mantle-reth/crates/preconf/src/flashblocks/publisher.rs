@@ -6,12 +6,16 @@ use std::{
     net::{SocketAddr, TcpListener as StdTcpListener},
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 
 use alloy_rpc_types_engine::PayloadId;
 use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 use parking_lot::RwLock;
-use tokio::{net::TcpListener, sync::broadcast};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::broadcast,
+};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -163,21 +167,70 @@ impl PublisherHandle {
     }
 }
 
+/// Where the accept loop takes connections from. A trait so tests can make
+/// accepting fail.
+trait Accept: Send + 'static {
+    fn accept(&self) -> impl Future<Output = io::Result<TcpStream>> + Send;
+}
+
+impl Accept for TcpListener {
+    async fn accept(&self) -> io::Result<TcpStream> {
+        Ok(Self::accept(self).await?.0)
+    }
+}
+
+/// Delay after the first failed accept; each further failure doubles it.
+const ACCEPT_BACKOFF_FIRST: Duration = Duration::from_millis(10);
+/// Longest delay between accepts while they keep failing.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// How long to wait before accepting again after a failure.
+///
+/// Without a wait, a failure that does not consume the pending connection —
+/// `EMFILE` is the usual one — leaves the listener readable, and the loop
+/// retries at full speed: one core busy and a warning per attempt.
+#[derive(Debug, Default)]
+struct AcceptBackoff {
+    next: Option<Duration>,
+}
+
+impl AcceptBackoff {
+    /// Record a failure and return how long to wait before the next accept.
+    fn failed(&mut self) -> Duration {
+        let delay = self.next.unwrap_or(ACCEPT_BACKOFF_FIRST);
+        self.next = Some(delay.saturating_mul(2).min(ACCEPT_BACKOFF_MAX));
+        delay
+    }
+
+    /// Record a success: the next failure waits the shortest delay again.
+    const fn succeeded(&mut self) {
+        self.next = None;
+    }
+}
+
 /// Accept subscribers until cancelled, serving each on its own task.
-async fn accept_loop(
-    listener: TcpListener,
+async fn accept_loop<L: Accept>(
+    listener: L,
     pipe: broadcast::Sender<PositionedSlice>,
     ring: Arc<RwLock<FlashblockRingBuffer>>,
     cancel: CancellationToken,
 ) {
+    let mut backoff = AcceptBackoff::default();
     loop {
         let connection = tokio::select! {
             () = cancel.cancelled() => return,
             accepted = listener.accept() => match accepted {
-                Ok((connection, _)) => connection,
+                Ok(connection) => {
+                    backoff.succeeded();
+                    connection
+                }
                 Err(error) => {
-                    warn!(target: "mantle::preconf::flashblocks", %error, "failed to accept subscriber");
-                    continue;
+                    let delay = backoff.failed();
+                    warn!(target: "mantle::preconf::flashblocks", %error, ?delay, "failed to accept subscriber");
+                    tokio::select! {
+                        () = cancel.cancelled() => return,
+                        () = tokio::time::sleep(delay) => continue,
+                    }
                 }
             },
         };
@@ -357,5 +410,82 @@ mod tests {
         let closed = tokio::time::timeout(Duration::from_secs(5), subscriber.next()).await;
         assert!(closed.is_ok(), "the subscription ends rather than hanging");
         assert!(tokio::net::TcpListener::bind(addr).await.is_ok(), "the port is free again",);
+    }
+
+    /// An accept that always fails, counting attempts. After `limit` attempts it
+    /// never returns, so a loop with no backoff stops instead of hanging the
+    /// paused-clock test.
+    struct FailingAccept {
+        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        limit: usize,
+    }
+
+    impl super::Accept for FailingAccept {
+        async fn accept(&self) -> std::io::Result<tokio::net::TcpStream> {
+            let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.limit {
+                std::future::pending::<()>().await;
+            }
+            Err(std::io::Error::other("too many open files"))
+        }
+    }
+
+    fn failing_loop(
+        limit: usize,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let attempts = std::sync::Arc::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pipe, _) = tokio::sync::broadcast::channel(1);
+        let ring = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::flashblocks::FlashblockRingBuffer::new(std::num::NonZeroUsize::MIN),
+        ));
+        let handle = tokio::spawn(super::accept_loop(
+            FailingAccept { attempts: std::sync::Arc::clone(&attempts), limit },
+            pipe,
+            ring,
+            cancel.clone(),
+        ));
+        (attempts, cancel, handle)
+    }
+
+    #[test]
+    fn accept_backoff_doubles_up_to_the_cap_and_resets_on_success() {
+        let mut backoff = super::AcceptBackoff::default();
+        let delays: Vec<u64> = (0..9).map(|_| backoff.failed().as_millis() as u64).collect();
+        assert_eq!(delays, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+
+        backoff.succeeded();
+        assert_eq!(backoff.failed(), super::ACCEPT_BACKOFF_FIRST);
+    }
+
+    /// Failed accepts are retried after the backoff delays, not straight away.
+    /// The delays sum to 1270ms by the eighth attempt, so one second fits seven.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_accept_is_retried_with_backoff() {
+        let (attempts, cancel, handle) = failing_loop(100);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 7);
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+
+    /// Shutdown does not wait out the delay.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_during_the_backoff_stops_the_loop_at_once() {
+        let (_attempts, cancel, handle) = failing_loop(100);
+        // Into the capped delays.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let cancelled_at = tokio::time::Instant::now();
+        cancel.cancel();
+        handle.await.unwrap();
+
+        assert_eq!(tokio::time::Instant::now(), cancelled_at);
     }
 }
