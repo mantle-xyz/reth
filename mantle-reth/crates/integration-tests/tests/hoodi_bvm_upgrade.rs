@@ -9,7 +9,7 @@
 use crate::helpers::{mantle_payload_attributes, with_mantle_node};
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_network::eip2718::Encodable2718;
-use alloy_op_hardforks::{MANTLE_HOODI_BLOCK_TIME, MANTLE_HOODI_CHAIN_ID};
+use alloy_op_hardforks::{MANTLE_BLOCK_TIME, MANTLE_HOODI_CHAIN_ID};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, hex, keccak256};
 use jsonrpsee::{core::client::ClientT, http_client::HttpClient, rpc_params};
 use mantle_reth_cli::node::MantleNode;
@@ -38,7 +38,7 @@ const SUPPLY: u64 = 15_349;
 /// Block `n` (counted from 1 by the payload helper) is one Hoodi block interval apart from its
 /// parent: block 1 precedes the activation block, block 2 is it, block 3 follows it.
 fn block_time(n: u64) -> u64 {
-    UPGRADE_TIME - MANTLE_HOODI_BLOCK_TIME + (n - 1) * MANTLE_HOODI_BLOCK_TIME
+    UPGRADE_TIME - MANTLE_BLOCK_TIME + (n - 1) * MANTLE_BLOCK_TIME
 }
 
 fn attributes(n: u64) -> OpPayloadAttrs {
@@ -136,20 +136,14 @@ async fn hoodi_bvm_upgrade_writes_code_at_activation() {
                 move |verifier, ver_rpc| async move {
                     sequencer.payload.timestamp = 0;
                     let pre = build_and_import(&mut sequencer, &verifier).await;
-                    assert_eq!(
-                        pre.block().header().timestamp,
-                        UPGRADE_TIME - MANTLE_HOODI_BLOCK_TIME
-                    );
+                    assert_eq!(pre.block().header().timestamp, UPGRADE_TIME - MANTLE_BLOCK_TIME);
                     let fork = build_and_import(&mut sequencer, &verifier).await;
                     assert_eq!(fork.block().header().timestamp, UPGRADE_TIME);
                     // The block after the activation block is outside the write window; that it
                     // does not write is covered by alloy-op-evm's unit tests, since rewriting the
                     // same code would not change the state.
                     let post = build_and_import(&mut sequencer, &verifier).await;
-                    assert_eq!(
-                        post.block().header().timestamp,
-                        UPGRADE_TIME + MANTLE_HOODI_BLOCK_TIME
-                    );
+                    assert_eq!(post.block().header().timestamp, UPGRADE_TIME + MANTLE_BLOCK_TIME);
 
                     for client in [&seq_rpc, &ver_rpc] {
                         assert_eq!(
