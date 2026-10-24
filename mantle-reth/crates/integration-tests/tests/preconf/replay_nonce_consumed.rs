@@ -21,9 +21,9 @@
 //!   - `sync_fifo_forward_to_head` runs at build start, before `replay_fifo_carryover`, and drops
 //!     fifo entries whose nonce is below the sender's nonce at the build's parent. This is the
 //!     layer these tests exercise.
-//!   - A reorg re-injection is requeued without a broadcast (`PreconfTxSet::requeue_reverted`), so
-//!     a build already running on the reverted block never sees it; the next build reaches it only
-//!     through the check above.
+//!   - A build whose parent is no longer on the canonical chain abandons itself instead of
+//!     executing a Replay entry (`ReplayParentCheck`), so a reorg re-injection announced to a build
+//!     still on the reverted block does not run there. `stale_parent_replay.rs` covers that layer.
 //!
 //! Unlike the pool arm, the preconf arm does not tolerate nonce-too-low: a
 //! Replay entry that still reaches apply with a spent nonce is reported as a

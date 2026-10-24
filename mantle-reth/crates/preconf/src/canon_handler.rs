@@ -18,12 +18,12 @@
 //! - **Reverted chain**: `fifo.claims().uncommit` is called for every reverted transaction — see
 //!   [`Commitments::uncommit`](crate::commitments::Commitments::uncommit) for what that one call
 //!   does and why its return value is the `reorg_drift` signal. Each commitment the reverted chain
-//!   carried is put back as `PreconfSource::Replay` through [`PreconfTxSet::requeue_reverted`],
-//!   which sends no broadcast: a build already running may stand on the reverted block, so only the
-//!   next build, which checks the nonce against its own parent first, may execute it. A transaction
-//!   the new chain also carries is skipped; the committed-chain pass records it at its new height.
-//!   The client-observed `block_height` may drift for reorged commitments; op-geth has the same
-//!   behavior.
+//!   carried is put back as `PreconfSource::Replay` through [`PreconfTxSet::push_if_absent`]. A
+//!   build already running may stand on the reverted block; it does not execute the entry, because
+//!   a replayed commitment runs only on the canonical chain (`ReplayParentCheck` in
+//!   `builder::payload_builder`). A transaction the new chain also carries is skipped; the
+//!   committed-chain pass records it at its new height. The client-observed `block_height` may
+//!   drift for reorged commitments; op-geth has the same behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
 //! then spawned as a `spawn_critical_task` on the reth task executor.
@@ -43,8 +43,10 @@ use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing::{debug, error, warn};
 
 use crate::{
-    admission::op_envelope_to_alloy, commitments::ClaimKind, preconf_tx_set::PreconfTxSet,
-    types::PushResult,
+    admission::op_envelope_to_alloy,
+    commitments::ClaimKind,
+    preconf_tx_set::PreconfTxSet,
+    types::{PreconfSource, PushResult},
 };
 
 /// What one read of the canonical-state subscription produced.
@@ -334,7 +336,9 @@ where
         // `Replay`, not `Rpc`: the receipt went out before the reorg, so the
         // dispatch gates that protect a waiting client must not apply to it.
         //
-        // Quiet (no broadcast): see `PreconfTxSet::requeue_reverted`.
+        // Announced like any other push. A build still standing on the
+        // reverted block reads it and abandons itself instead of executing it
+        // — see `ReplayParentCheck` in `builder::payload_builder`.
         //
         // Not the only way back. reth's pool maintenance re-adds the same
         // transaction to the ordinary pool on this notification. While the
@@ -346,7 +350,7 @@ where
         let (signed, _) = recovered.into_parts();
         match op_envelope_to_alloy(OpTxEnvelope::from(signed)) {
             Some(envelope) => {
-                match fifo.requeue_reverted(Arc::new(envelope), signer).await {
+                match fifo.push_if_absent(Arc::new(envelope), signer, PreconfSource::Replay).await {
                     PushResult::Inserted => outcome.reinjected += 1,
                     // The queue still holds it, so it is already owed and
                     // this call had nothing to add.
@@ -446,10 +450,9 @@ mod reorg_tests {
     use reth_execution_types::{Chain, ExecutionOutcome};
     use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
     use reth_primitives_traits::RecoveredBlock;
-    use tokio::sync::broadcast;
 
     use super::*;
-    use crate::types::{PreconfSource, PreconfStatus};
+    use crate::types::PreconfStatus;
 
     /// Height of the reverted block; nothing here depends on the value.
     const REVERTED_AT: u64 = 7;
@@ -568,10 +571,10 @@ mod reorg_tests {
         );
     }
 
-    /// The re-injected entry sends no broadcast, so a build already running,
-    /// possibly on the reverted block, does not pick it up.
+    /// The re-injected entry is announced, so a build on the new head picks it
+    /// up in the block it is building rather than the next one.
     #[tokio::test]
-    async fn a_requeued_commitment_wakes_no_running_build() {
+    async fn a_requeued_commitment_is_announced_to_running_builds() {
         let fifo = fifo();
         let mut running_build = fifo.subscribe();
         let tx = op_tx(0, 1);
@@ -582,10 +585,7 @@ mod reorg_tests {
         reinject_reverted(&fifo, &reverted_chain(tx), &HashSet::default()).await;
 
         assert_eq!(fifo.status_of(&hash).await, Some(PreconfStatus::Waiting), "it is queued");
-        assert!(
-            matches!(running_build.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
-            "but no broadcast went out",
-        );
+        assert_eq!(running_build.try_recv().ok(), Some(hash), "and announced");
     }
 
     /// The build loop records every pool transaction it executes, so most of

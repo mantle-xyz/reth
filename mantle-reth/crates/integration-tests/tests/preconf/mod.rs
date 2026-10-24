@@ -49,6 +49,7 @@ mod replay_nonce_consumed;
 mod replay_transient_defer;
 mod restart_replay;
 mod single_payload;
+mod stale_parent_replay;
 mod timeout;
 mod tx_type_whitelist;
 mod uncompressed_cap;
