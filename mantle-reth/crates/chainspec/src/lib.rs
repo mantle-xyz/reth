@@ -1,7 +1,8 @@
 //! Mantle chain specifications.
 //!
-//! Provides `MANTLE_MAINNET`, `MANTLE_SEPOLIA` statics and the `from_mantle_genesis` function
-//! for converting a [`Genesis`] JSON into a Mantle-configured [`OpChainSpec`].
+//! Provides `MANTLE_MAINNET`, `MANTLE_SEPOLIA`, `MANTLE_HOODI` statics and the
+//! `from_mantle_genesis` function for converting a [`Genesis`] JSON into a Mantle-configured
+//! [`OpChainSpec`].
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -15,10 +16,12 @@
 extern crate alloc;
 
 mod mantle;
+mod mantle_hoodi;
 mod mantle_mainnet;
 mod mantle_sepolia;
 
 pub use alloy_op_hardforks::MantleHardfork;
+pub use mantle_hoodi::MANTLE_HOODI;
 pub use mantle_mainnet::MANTLE_MAINNET;
 pub use mantle_sepolia::MANTLE_SEPOLIA;
 
@@ -158,8 +161,8 @@ static MANTLE_SEPOLIA_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
 /// - Arsia activates Canyon + Fjord + Granite + Holocene + Jovian simultaneously.
 ///
 /// For Mantle mainnet/Sepolia the genesis JSON is pre-configured by
-/// `configure_mantle_genesis`. For unknown Mantle-compatible chains, hardfork
-/// timestamps are read from the genesis `extra_fields`.
+/// `configure_mantle_genesis`, and Mantle Hoodi's by `MANTLE_HOODI`. For unknown Mantle-compatible
+/// chains, hardfork timestamps are read from the genesis `extra_fields`.
 pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
     use mantle::MantleChainInfo;
 
@@ -177,6 +180,7 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
     let skadi_ts = mantle_genesis_info.mantle_skadi_time;
     let limb_ts = mantle_genesis_info.mantle_limb_time;
     let arsia_ts = mantle_genesis_info.mantle_arsia_time;
+    let hoodi_bvm_upgrade_ts = mantle_genesis_info.mantle_hoodi_bvm_upgrade_time;
 
     // Block-based hardforks (same as standard OP)
     let hardfork_opts = [
@@ -238,6 +242,11 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
         (OpHardfork::Holocene.boxed(), arsia_ts),
         (OpHardfork::Jovian.boxed(), arsia_ts),
         (MantleHardfork::Arsia.boxed(), arsia_ts),
+        // Mantle Hoodi only: Hoodi BVM upgrade (irregular state transition in alloy-op-evm). Not
+        // part of the mainnet/Sepolia schedule; appended after the template. The fork ID walks
+        // the forks in list order while op-geth sorts them by time, so the two agree only while
+        // this activation time is not earlier than any other fork time, as on Hoodi.
+        (MantleHardfork::HoodiBvmUpgrade.boxed(), hoodi_bvm_upgrade_ts),
     ];
 
     let mut time_hardforks = time_hardfork_opts
