@@ -160,6 +160,7 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
     // The same RPC flag defaults the shipped binary installs before parsing its CLI.
     mantle_reth_cli::rpc_defaults::init_rpc_defaults();
     let rpc = rpc(RpcServerArgs::default().with_unused_ports());
+    let genesis = (chain_spec.genesis_header().number, chain_spec.genesis_hash());
 
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
         .with_unused_ports()
@@ -196,7 +197,7 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
             // The ExEx refuses to start against an unseeded sidecar (and takes the node down with
             // it), so mirror what `op-reth op-proofs init` does before launch. At this point the
             // chain is still at genesis, so the seed is the genesis state.
-            seed_proofs_sidecar(&db_for_seed, mdbx.clone());
+            seed_proofs_sidecar(&db_for_seed, mdbx.clone(), genesis);
             with_proofs_history(
                 builder,
                 args,
@@ -255,13 +256,15 @@ where
 fn seed_proofs_sidecar(
     db: &Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>,
     storage: Arc<MdbxProofsStorageV2>,
+    (genesis_number, genesis_hash): (u64, B256),
 ) {
     use reth_db::Database;
     use reth_optimism_trie::{InitializationJob, RethTrieStorageLayout};
 
     let tx = db.tx().expect("open main-db read tx");
-    // Genesis: block 0, and the sidecar only needs a consistent anchor to start from.
+    // The anchor must be the real genesis block: the ExEx checks the next block's parent hash
+    // against it, and a wrong hash stops it at the first mined block.
     InitializationJob::new(storage, tx, RethTrieStorageLayout::Legacy)
-        .run(0, Default::default())
+        .run(genesis_number, genesis_hash)
         .expect("seed proofs sidecar");
 }

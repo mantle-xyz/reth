@@ -268,54 +268,73 @@ where
                     .await?
                     .ok_or(EthApiError::HeaderNotFound(block_id.into()))?;
 
+                // [MANTLE] Re-executing the block and building its witness is blocking work. Run
+                // it on a blocking task, as `execute_payload` does, instead of an async runtime
+                // worker.
+                let (tx, rx) = oneshot::channel();
                 let this = self.inner.clone();
-                let block_number = block.header().number();
+                self.inner.task_spawner.spawn_blocking_task(async move {
+                    let result = async {
+                        let block_number = block.header().number();
 
-                let state_provider = this
-                    .state_provider_factory
-                    .state_provider(Some(BlockId::Number(block.parent_num_hash().number.into())))
-                    .await
-                    .map_err(EthApiError::from)?;
-                let db = StateProviderDatabase::new(&state_provider);
-                let block_executor = this.eth_api.evm_config().executor(db);
+                        let state_provider = this
+                            .state_provider_factory
+                            .state_provider(Some(BlockId::Number(
+                                block.parent_num_hash().number.into(),
+                            )))
+                            .await?;
+                        let db = StateProviderDatabase::new(&state_provider);
+                        let block_executor = this.eth_api.evm_config().executor(db);
 
-                let mut witness_record = ExecutionWitnessRecord::default();
+                        let mut witness_record = ExecutionWitnessRecord::default();
 
-                let _ = block_executor
-                    .execute_with_state_closure(&block, |statedb: &State<_>| {
-                        witness_record.record_executed_state(statedb, Default::default());
-                    })
-                    .map_err(EthApiError::from)?;
+                        let _ = block_executor.execute_with_state_closure(
+                            &block,
+                            |statedb: &State<_>| {
+                                witness_record.record_executed_state(statedb, Default::default());
+                            },
+                        )?;
 
-                let ExecutionWitnessRecord { hashed_state, codes, keys, lowest_block_number } =
-                    witness_record;
+                        let ExecutionWitnessRecord {
+                            hashed_state,
+                            codes,
+                            keys,
+                            lowest_block_number,
+                        } = witness_record;
 
-                let state = state_provider
-                    .witness(Default::default(), hashed_state, Default::default())
-                    .map_err(EthApiError::from)?;
-                let mut exec_witness =
-                    ExecutionWitness { state, codes, keys, ..Default::default() };
+                        let state = state_provider.witness(
+                            Default::default(),
+                            hashed_state,
+                            Default::default(),
+                        )?;
+                        let mut exec_witness =
+                            ExecutionWitness { state, codes, keys, ..Default::default() };
 
-                // If there were no calls to the BLOCKHASH opcode, return only the
-                // parent header.
-                let smallest =
-                    lowest_block_number.unwrap_or_else(|| block_number.saturating_sub(1));
+                        // If there were no calls to the BLOCKHASH opcode, return only the
+                        // parent header.
+                        let smallest =
+                            lowest_block_number.unwrap_or_else(|| block_number.saturating_sub(1));
 
-                let range = smallest..block_number;
-                exec_witness.headers = self
-                    .inner
-                    .provider
-                    .headers_range(range)
-                    .map_err(EthApiError::from)?
-                    .into_iter()
-                    .map(|header| {
-                        let mut serialized_header = Vec::new();
-                        header.encode(&mut serialized_header);
-                        serialized_header.into()
-                    })
-                    .collect();
+                        let range = smallest..block_number;
+                        exec_witness.headers = this
+                            .provider
+                            .headers_range(range)?
+                            .into_iter()
+                            .map(|header| {
+                                let mut serialized_header = Vec::new();
+                                header.encode(&mut serialized_header);
+                                serialized_header.into()
+                            })
+                            .collect();
 
-                Ok(exec_witness)
+                        Ok::<_, EthApiError>(exec_witness)
+                    };
+
+                    let _ = tx.send(result.await);
+                });
+
+                let witness = rx.await.map_err(|err| internal_rpc_err(err.to_string()))??;
+                Ok(witness)
             })
             .await
     }
