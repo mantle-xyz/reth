@@ -77,22 +77,34 @@ where
             })?;
 
         let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
+        let factory = self.state_provider_factory.clone();
 
-        let result = async {
-            let proof = self
-                .state_provider_factory
-                .state_provider(block_number)
-                .await
-                .map_err(Into::into)?
-                .proof(Default::default(), address, &storage_keys)
-                .map_err(Into::into)?;
+        // [MANTLE] Walk the trie on a blocking IO task, as the stock reth and Mantle `rpc-ext`
+        // `eth_getProof` do, so proof walks don't hold the async runtime's worker threads.
+        let result: RpcResult<EIP1186AccountProofResponse> = self
+            .state_provider_factory
+            .eth_api()
+            .spawn_blocking_io_fut(async move |_| {
+                let proof: RpcResult<EIP1186AccountProofResponse> = async {
+                    let proof = factory
+                        .state_provider(block_number)
+                        .await
+                        .map_err(Into::into)?
+                        .proof(Default::default(), address, &storage_keys)
+                        .map_err(Into::into)?;
 
-            // [MANTLE] geth returns B256::ZERO for codeHash and storageHash on an account that
-            // does not exist, where reth returns KECCAK_EMPTY / EMPTY_ROOT_HASH. Mantle follows
-            // geth, so the exclusion-proof shape stays the one op-geth clients already parse.
-            Ok(proof.into_eip1186_response_with(keys, true))
-        }
-        .await;
+                    // [MANTLE] geth returns B256::ZERO for codeHash and storageHash on an account
+                    // that does not exist, where reth returns KECCAK_EMPTY / EMPTY_ROOT_HASH.
+                    // Mantle follows geth, so the exclusion-proof shape stays the one op-geth
+                    // clients already parse.
+                    Ok(proof.into_eip1186_response_with(keys, true))
+                }
+                .await;
+                Ok(proof)
+            })
+            .await
+            .map_err(ErrorObject::from)
+            .and_then(|proof| proof);
 
         match &result {
             Ok(_) => {

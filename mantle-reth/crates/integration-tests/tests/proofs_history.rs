@@ -17,23 +17,31 @@ use mantle_reth_cli::node::MantleNode;
 use reth_node_api::TreeConfig;
 use reth_optimism_node::args::{ProofsHistoryStorageArgs, ProofsStorageVersion, RollupArgs};
 use serde_json::Value;
+use std::path::Path;
+
+/// Rollup args that enable proofs-history with a v2 sidecar at `sidecar_path`.
+fn proofs_history_args(sidecar_path: &Path) -> RollupArgs {
+    RollupArgs {
+        proofs_history: true,
+        history: ProofsHistoryStorageArgs {
+            storage_path: Some(sidecar_path.to_path_buf()),
+            storage_version: ProofsStorageVersion::V2,
+        },
+        ..Default::default()
+    }
+}
 
 /// `debug_proofsSyncStatus` only exists when the debug override is installed, and the sidecar only
 /// reports a window once the ExEx has actually written to it. Both halves of the wiring have to be
 /// live for this to pass — which is precisely what regressed when the flags were a silent no-op.
+///
+/// The sidecar's `eth_getProof` also has to be the one serving, not the Mantle or stock one. The
+/// last step asks for a block only the sidecar can answer.
 #[tokio::test]
 async fn proofs_history_wiring_serves_sidecar_rpc() {
     let sidecar = tempfile::tempdir().expect("tempdir");
     let sidecar_path = sidecar.path().join("proofs");
-
-    let args = RollupArgs {
-        proofs_history: true,
-        history: ProofsHistoryStorageArgs {
-            storage_path: Some(sidecar_path.clone()),
-            storage_version: ProofsStorageVersion::V2,
-        },
-        ..Default::default()
-    };
+    let args = proofs_history_args(&sidecar_path);
 
     with_configured_mantle_node_opts(
         MantleNode::default(),
@@ -41,7 +49,7 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
         mantle_payload_attributes,
         TreeConfig::default(),
         Some((args, sidecar_path)),
-        async |_node, client| {
+        async |mut node, client| {
             // 1. The debug override is installed. Without the wiring this is `Method not found` —
             //    which is exactly how the silent no-op presented in production.
             let status: Value = client
@@ -66,22 +74,74 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
                 .expect("in-window eth_getProof should be served");
             assert!(proof["accountProof"].is_array(), "expected an account proof back");
 
-            // 3. Below the window the sidecar refuses rather than silently falling back to the
-            //    revert-based path. This is the assertion that proves the override is actually in
-            //    the request path: the native implementation would happily answer here.
-            if earliest > 0 {
-                let below = format!("0x{:x}", earliest - 1);
-                let out: Result<Value, _> = client
+            // 3. Once block 1 exists, block 0 is no longer the tip. Under the default
+            //    `--rpc.eth-proof-window` (0) the Mantle and stock `eth_getProof` refuse it with
+            //    `-32602`, while it is inside the sidecar window. So an answer proves the sidecar
+            //    override is the one in the request path.
+            let head = node.advance_block().await.expect("mine block 1");
+            node.sync_to(head.block().hash()).await.expect("settle block 1");
+            let proof: Result<Value, _> = client
+                .request("eth_getProof", rpc_params![Address::ZERO, Vec::<String>::new(), "0x0"])
+                .await;
+            assert!(
+                proof.is_ok(),
+                "block 0 is in the sidecar window and only the sidecar serves it: {proof:?}"
+            );
+        },
+    )
+    .await;
+}
+
+/// The proofs engine writes to the sidecar in batches (every few blocks, or after an idle
+/// interval), so a block just mined is not in its window yet. Such a block must still be answered,
+/// from reth's own state, instead of failing with `no state found`. A block past the head still
+/// fails.
+#[tokio::test]
+async fn proofs_history_answers_blocks_not_yet_in_the_sidecar() {
+    let sidecar = tempfile::tempdir().expect("tempdir");
+    let sidecar_path = sidecar.path().join("proofs");
+    let args = proofs_history_args(&sidecar_path);
+
+    with_configured_mantle_node_opts(
+        MantleNode::default(),
+        mantle_test_chain_spec(),
+        mantle_payload_attributes,
+        TreeConfig::default(),
+        Some((args, sidecar_path)),
+        async |mut node, client| {
+            let head = node.advance_block().await.expect("mine block 1");
+            node.sync_to(head.block().hash()).await.expect("settle block 1");
+
+            let status: Value = client
+                .request("debug_proofsSyncStatus", rpc_params![])
+                .await
+                .expect("debug_proofsSyncStatus");
+            assert_eq!(status["latest"], 0, "block 1 should still be buffered: {status}");
+
+            for block in ["latest", "0x1"] {
+                let proof: Value = client
                     .request(
                         "eth_getProof",
-                        rpc_params![Address::ZERO, Vec::<String>::new(), below],
+                        rpc_params![Address::ZERO, Vec::<String>::new(), block],
                     )
-                    .await;
-                assert!(
-                    out.is_err(),
-                    "below-window eth_getProof must fail, not fall back to the native path"
-                );
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("eth_getProof at {block} should be served: {err}")
+                    });
+                assert!(proof["accountProof"].is_array(), "{block}: {proof}");
             }
+
+            // Re-executes block 1 on its parent's sidecar state.
+            let witness: Value = client
+                .request("debug_executionWitness", rpc_params!["0x1"])
+                .await
+                .expect("debug_executionWitness for block 1 should be served");
+            assert!(witness["state"].is_array(), "{witness}");
+
+            let future: Result<Value, _> = client
+                .request("eth_getProof", rpc_params![Address::ZERO, Vec::<String>::new(), "0x2"])
+                .await;
+            assert!(future.is_err(), "a block past the head has no state: {future:?}");
         },
     )
     .await;
@@ -105,15 +165,7 @@ async fn proofs_history_keeps_mantle_rpc_extensions() {
 
     let sidecar = tempfile::tempdir().expect("tempdir");
     let sidecar_path = sidecar.path().join("proofs");
-
-    let args = RollupArgs {
-        proofs_history: true,
-        history: ProofsHistoryStorageArgs {
-            storage_path: Some(sidecar_path.clone()),
-            storage_version: ProofsStorageVersion::V2,
-        },
-        ..Default::default()
-    };
+    let args = proofs_history_args(&sidecar_path);
 
     with_configured_mantle_node_opts(
         MantleNode::default(),
