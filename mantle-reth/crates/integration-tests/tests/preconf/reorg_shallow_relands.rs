@@ -88,7 +88,8 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     // ── Reorg: rebuild at the SAME height (n=1 → SAME timestamp) but a DIFFERENT
     //    L1 origin (200). This reverts the commitment block and re-derives it
     //    against a new L1 origin — exactly what an L1 reorg does. The commitment
-    //    must re-land via the preconf carryover / journal-replay path.
+    //    must re-land: the canon handler re-injects it from the reverted block,
+    //    and the rebuild executes it as a Replay entry.
     let (relanded_head, sealed_relanded) = reorg_to!(node, base, n = 1, l1 = 200);
     assert!(
         sealed_relanded.contains(&hash),

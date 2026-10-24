@@ -181,8 +181,7 @@ pub struct PreconfConfig {
 
     // ===== Internal channel capacity =====
     /// Capacity of the fifo notifier broadcast channel. Consumers that fall
-    /// behind see `Lagged(n)` and fall back to a snapshot reconcile, which also
-    /// sees entries a reorg requeued without a broadcast.
+    /// behind see `Lagged(n)` and fall back to a snapshot reconcile.
     /// Default 65536 (see [`DEFAULT_BROADCAST_CAP`]).
     pub broadcast_cap: usize,
 }

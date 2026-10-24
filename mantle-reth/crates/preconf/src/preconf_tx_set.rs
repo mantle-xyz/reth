@@ -26,9 +26,7 @@
 //! - At most one responder per hash, and it lives inside the entry. It is installed with the entry,
 //!   under the same lock, so the builder cannot reach an entry that has nobody to answer.
 //! - `notifier.send` is best-effort — slow consumers receive `Lagged(n)` and reconcile via
-//!   `snapshot()`. Not every `Waiting` entry is announced: a reorg requeues without a broadcast
-//!   (see [`PreconfTxSet::requeue_reverted`]), so only that re-scan or the next build's carryover
-//!   reaches it.
+//!   `snapshot()`.
 //!
 //! ## Lock order
 //!
@@ -934,9 +932,12 @@ impl PreconfTxSet {
 
     /// Idempotent push, followed by a broadcast for the running build.
     ///
-    /// `from` must be the recovered sender; the caller (journal restore) has
-    /// it pre-validated. Hash + nonce are read from `tx`. A reorg re-injection
-    /// uses [`Self::requeue_reverted`] instead, which does not broadcast.
+    /// `from` must be the recovered sender; the callers (journal restore, reorg
+    /// re-injection) have it pre-validated. Hash + nonce are read from `tx`.
+    ///
+    /// A re-injected commitment is announced to a build that may stand on the
+    /// block the reorg reverted. That build does not execute it: see
+    /// `ReplayParentCheck` in `builder::payload_builder`.
     ///
     /// Returns:
     /// - [`PushResult::Inserted`] — new entry created and broadcast notified.
@@ -950,21 +951,6 @@ impl PreconfTxSet {
         source: PreconfSource,
     ) -> PushResult {
         self.push_with_status(tx, from, source, PreconfStatus::Waiting, true).await
-    }
-
-    /// Put a transaction a reorg reverted back in the queue as a `Waiting`
-    /// `Replay` entry, without the broadcast [`Self::push_if_absent`] sends.
-    ///
-    /// A running build may stand on the reverted block, where the nonce is spent;
-    /// executing it there would end the commitment as broken. Only the next build
-    /// reaches it, through the carryover, after `sync_fifo_forward_to_head` has
-    /// checked the nonce against that build's parent.
-    ///
-    /// Exception: a running build's `Lagged` re-scan does see it. That takes a
-    /// `broadcast_cap` backlog, about 30s of a stalled loop at default settings
-    /// (less with a lower `--preconf.timeout-ms`).
-    pub async fn requeue_reverted(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
-        self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Waiting, false).await
     }
 
     /// Stage a transaction this build has **already executed**, so the next one
@@ -2147,7 +2133,7 @@ mod admit_tests {
         let hash = *reverted.tx_hash();
 
         // Requeued the way the canon handler does after a reorg.
-        set.requeue_reverted(reverted, alice).await;
+        set.push_if_absent(reverted, alice, PreconfSource::Replay).await;
         set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
 
         let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;

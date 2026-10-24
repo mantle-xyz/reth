@@ -7,8 +7,9 @@
 //! block in one shot. All commitments must re-land on the new branch, none
 //! dropped, none duplicated. Re-land is via the canon handler: when the reorg's
 //! canonical-state notification reports the blocks reverted, it requeues each
-//! commitment from the reverted chain as `Replay`, and the next build executes
-//! it through the carryover.
+//! commitment from the reverted chain as `Replay`, and a build on the new head
+//! executes it: from the broadcast if one is already running, otherwise
+//! through the next build's carryover.
 
 use super::helpers::{
     PreconfCfgBuilder, fresh_journal, l1_info_deposit, mantle_test_chain_spec, send_preconf,
