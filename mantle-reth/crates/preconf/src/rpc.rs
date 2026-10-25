@@ -22,12 +22,11 @@
 //! * **Record the commitment.** Every receipt is recorded, reverts included — a revert is an
 //!   outcome, not a failure to keep the promise.
 //!
-//! Two doors hold a replaying commitment open against a resubmitting client,
-//! both keyed on the entry's source rather than its status — a replaying
-//! commitment sits in the same `Waiting` state a fresh one does.
-//! `PreconfTxSet::admit` refuses the resubmit outright; `time_out_unfinished`
-//! ends only that client's wait and leaves the entry queued. Its receipt went
-//! to an earlier process, so removing the entry would mean it never lands.
+//! No client ever waits on a replaying commitment. `PreconfTxSet::admit`
+//! refuses a resubmit of its hash, and the entry a client waits on is the
+//! `Rpc` entry it was admitted with: that entry only becomes `Replay` through
+//! `reset_success_to_waiting`, after `begin_success` has already taken its
+//! responder. So the deadline only ever ends an `Rpc` entry.
 
 use std::sync::Arc;
 
@@ -43,7 +42,7 @@ use tracing::{debug, warn};
 use crate::{
     PreconfConfig, PreconfTxSet,
     admission::{AdmittedTx, DynAdmission},
-    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
+    types::{PreconfError, PreconfReceipt, PreconfStatus},
 };
 
 /// Generic preconf RPC handler. Constructed by the preconf `ServiceBuilder`
@@ -277,20 +276,10 @@ impl PreconfRpcHandler {
 
         let timed_out = PreconfError::Timeout { timeout_ms: preconf_timeout.as_millis() as u64 };
 
-        // A replaying commitment keeps its place: its receipt went out in an
-        // earlier process and it still has to land, so only this client's wait
-        // is over. Removing the entry would mean it never lands.
-        let replaying = entry.as_ref().is_some_and(|e| e.source == PreconfSource::Replay);
-
-        if replaying {
-            // The commitment outlives this client, so only the wait ends.
-            self.fifo.cancel_responder(hash, timed_out).await;
-        } else {
-            // `Err` means something ended it between the read above and now,
-            // and whatever did answered this client on the way out. Nothing
-            // left to do either way.
-            let _ = self.fifo.complete_failure(hash, timed_out).await;
-        }
+        // `Err` means something ended it between the read above and now, and
+        // whatever did answered this client on the way out. Nothing left to do
+        // either way.
+        let _ = self.fifo.complete_failure(hash, timed_out).await;
         Ok(build_timeout_event(*hash, preconf_timeout))
     }
 }

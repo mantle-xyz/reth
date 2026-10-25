@@ -151,14 +151,20 @@ impl<T> DerefMut for ExecutionInfo<T> {
     }
 }
 
-impl<T: SignedTransaction> ExecutionInfo<T> {
+impl<T: SignedTransaction + OpTransaction> ExecutionInfo<T> {
     /// Record a transaction the block executor has committed.
+    ///
+    /// A transaction whose nonce field is not its sender's nonce (see
+    /// [`carries_its_senders_nonce`]) is executed but leaves no entry in
+    /// [`Self::executed_sender_nonces`].
     pub fn record(&mut self, tx: Recovered<T>) {
-        let nonce = tx.nonce();
-        self.executed_sender_nonces
-            .entry(tx.signer())
-            .and_modify(|highest| *highest = (*highest).max(nonce))
-            .or_insert(nonce);
+        if carries_its_senders_nonce(tx.inner()) {
+            let nonce = tx.nonce();
+            self.executed_sender_nonces
+                .entry(tx.signer())
+                .and_modify(|highest| *highest = (*highest).max(nonce))
+                .or_insert(nonce);
+        }
         self.executed.push(tx);
     }
 
@@ -173,7 +179,9 @@ impl<T: SignedTransaction> ExecutionInfo<T> {
         self.journalable.push(self.executed.len());
         self.record(tx);
     }
+}
 
+impl<T: SignedTransaction> ExecutionInfo<T> {
     /// Everything executed this block, in execution order.
     pub fn executed(&self) -> &[Recovered<T>] {
         &self.executed
@@ -583,6 +591,43 @@ mod tests {
 
         assert_eq!(deposit.nonce(), 0, "the premise: it reports zero, not the real value");
         assert!(!super::carries_its_senders_nonce(&deposit));
+    }
+
+    /// The slice-boundary pool update reads this map, so a deposit's `0`
+    /// landing in it is what sets its depositor to next-at-1 in the pool. The
+    /// post-execution transaction would do the same to `Address::ZERO`.
+    /// Both still count as executed.
+    #[test]
+    fn transactions_without_their_senders_nonce_leave_no_executed_nonce() {
+        use op_alloy_consensus::{SDMGasEntry, build_post_exec_tx};
+
+        let depositor = sender(0xaa);
+        let deposit = OpTxEnvelope::Deposit(
+            TxDeposit {
+                source_hash: B256::repeat_byte(0x11),
+                from: depositor,
+                to: TxKind::Call(Address::ZERO),
+                mint: 0,
+                value: U256::ZERO,
+                gas_limit: 21_000,
+                is_system_transaction: false,
+                input: Default::default(),
+                eth_value: U256::ZERO,
+                eth_tx_value: None,
+            }
+            .seal_slow(),
+        );
+        let post_exec: OpTxEnvelope =
+            build_post_exec_tx(42, vec![SDMGasEntry { index: 1, gas_refund: 1 }])
+                .seal_slow()
+                .into();
+        let mut info = Info::default();
+
+        info.record(Recovered::new_unchecked(deposit, depositor));
+        info.record(Recovered::new_unchecked(post_exec, Address::ZERO));
+
+        assert!(info.executed_sender_nonces().is_empty(), "{:?}", info.executed_sender_nonces());
+        assert_eq!(info.executed().len(), 2, "both still executed");
     }
 
     /// The upstream counters stay the one place block totals live, reachable

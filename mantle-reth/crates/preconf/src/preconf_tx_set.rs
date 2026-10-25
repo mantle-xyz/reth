@@ -442,9 +442,10 @@ enum Removal {
 ///
 /// The three conditions are each needed. `Replay` alone also covers journal
 /// restore and reorg reinject — real commitments, which hold a `Promised`
-/// claim. A responder alone is absent for a preconfirmation whose receipt has
-/// already gone out, and present for one `reset_success_to_waiting` put back
-/// as `Replay` with its client still waiting.
+/// claim; the claim check is what tells them apart. A missing responder alone
+/// also matches an `Rpc` preconfirmation whose receipt has already gone out.
+/// No production `Replay` entry holds a responder, so that condition only keeps
+/// an entry a client is still waiting on from ever being reported this way.
 ///
 /// `entry` is `None` when the claim outlived its queue entry: a removal
 /// because the nonce moved on (`Removal::Landed`) keeps the record for either
@@ -1530,23 +1531,6 @@ impl PreconfTxSet {
                 true
             }
             None => false,
-        }
-    }
-
-    /// Answer `hash`'s client with an error and leave the entry where it is.
-    /// No-op if no responder is attached. The send is fire-and-forget — the
-    /// receiver may already have dropped (client gave up).
-    ///
-    /// **Not a completion.** One caller: a replaying commitment whose client
-    /// timed out. The commitment outlives that client and still has to land, so
-    /// the entry stays. Every other failure uses [`Self::complete_failure`].
-    pub async fn cancel_responder(&self, hash: &TxHash, err: PreconfError) {
-        let mut inner = self.inner.lock().await;
-        let responder = inner.entries.get_mut(hash).and_then(|e| e.responder.take());
-        // Under `inner` for the same reason completions are: detaching a
-        // responder and resolving it must not be two observable events.
-        if let Some(r) = responder {
-            let _ = r.send(Err(err));
         }
     }
 
@@ -3125,28 +3109,6 @@ mod tests {
 
     // ============ responder lifecycle ============
 
-    #[tokio::test]
-    async fn cancel_responder_sends_error_to_receiver() {
-        let set = PreconfTxSet::new(16);
-        let tx = make_tx(0, 1);
-        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
-        let (s, r) = oneshot::channel();
-        assert!(set.set_responder(*tx.tx_hash(), Instant::now(), s).await);
-
-        set.cancel_responder(tx.tx_hash(), PreconfError::NotPreconfEligible).await;
-        let received = r.await.unwrap();
-        assert_eq!(received, Err(PreconfError::NotPreconfEligible));
-    }
-
-    #[tokio::test]
-    async fn cancel_responder_silently_drops_when_none_attached() {
-        let set = PreconfTxSet::new(16);
-        let tx = make_tx(0, 1);
-        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
-        // No attach — cancel is a no-op.
-        set.cancel_responder(tx.tx_hash(), PreconfError::NotPreconfEligible).await;
-    }
-
     /// Forward one sender. Production forwards them all at once — see
     /// [`PreconfTxSet::forward_all`] for why there is no such method.
     pub(super) async fn forward_one(set: &PreconfTxSet, addr: &Address, new_nonce: u64) {
@@ -3664,7 +3626,6 @@ mod proptest_responder_model {
         CompleteFailure(u8),
         MarkSucceeded(u8),
         Take(u8),
-        Cancel(u8),
         Forward(u8),
     }
 
@@ -3678,7 +3639,6 @@ mod proptest_responder_model {
             hb().prop_map(Op::CompleteFailure),
             hb().prop_map(Op::MarkSucceeded),
             hb().prop_map(Op::Take),
-            hb().prop_map(Op::Cancel),
             (0..=HASHES).prop_map(Op::Forward),
         ]
     }
@@ -3759,14 +3719,6 @@ mod proptest_responder_model {
                         assert_value(rx, &format!("step {i}: taken responder delivered"));
                     } else {
                         assert!(r.is_none(), "step {i}: take with no responder must be None");
-                    }
-                }
-                Op::Cancel(b) => {
-                    let b = *b;
-                    set.cancel_responder(&h(b), some_err()).await;
-                    let st = &mut model[b as usize];
-                    if let Some(rx) = st.held.take() {
-                        assert_value(rx, &format!("step {i}: canceled responder got error"));
                     }
                 }
                 Op::Forward(new_nonce) => {

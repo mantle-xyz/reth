@@ -797,8 +797,7 @@ where
 ///
 /// [`PreconfSource::Replay`] is exempt — its receipt has already gone out, and a
 /// commitment already acknowledged to a client is owed whatever governance later
-/// decides. Same predicate `rpc.rs`'s deadline branch uses to refuse to time
-/// such an entry out.
+/// decides.
 fn barred_by_allowlist(
     cfg: &PreconfConfig,
     whitelist: &Whitelist,
