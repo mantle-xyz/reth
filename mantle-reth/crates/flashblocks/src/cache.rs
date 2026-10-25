@@ -13,6 +13,10 @@ use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 /// [`FlashblockCache::is_cacheable`] for the window that spells out.
 pub const DEFAULT_MAX_CACHE_AHEAD_BLOCKS: u64 = 5;
 
+/// Largest `max_cache_ahead_blocks` the CLI accepts. Already far wider than
+/// anything the overlay can use.
+pub const MAX_CACHE_AHEAD_BLOCKS: u64 = 256;
+
 /// Buffers flashblocks that cannot be applied to the overlay yet. Two paths in
 /// `StateProcessor::apply_flashblock` feed it: slices whose canonical block has
 /// not landed ([`ProviderError::MissingCanonicalHeader`]), and slices that
@@ -54,7 +58,10 @@ impl FlashblockCache {
     /// produced, plus `max_ahead_blocks` beyond it.
     pub const fn is_cacheable(&self, block_number: BlockNumber) -> bool {
         match self.latest_canonical {
-            Some(canonical) => block_number <= canonical + self.max_ahead_blocks + 1,
+            // Saturating: a configured `u64::MAX` would overflow.
+            Some(canonical) => {
+                block_number <= canonical.saturating_add(self.max_ahead_blocks).saturating_add(1)
+            }
             None => false,
         }
     }
@@ -222,6 +229,16 @@ mod tests {
             assert_eq!(inserted[0].metadata.block_number, newest);
             assert!(cache.is_empty());
         }
+    }
+
+    #[test]
+    fn an_unbounded_window_does_not_overflow() {
+        let cache = FlashblockCache {
+            entries: HashMap::new(),
+            latest_canonical: Some(10),
+            max_ahead_blocks: u64::MAX,
+        };
+        assert!(cache.is_cacheable(u64::MAX));
     }
 
     #[test]

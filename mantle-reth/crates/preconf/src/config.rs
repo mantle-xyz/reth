@@ -96,6 +96,18 @@ pub const DEFAULT_JOURNAL_MAX_SIZE: u64 = 1_073_741_824;
 /// path stays a rarity.
 pub const DEFAULT_BROADCAST_CAP: usize = 65536;
 
+/// Largest `broadcast_cap` accepted — 16x the default. The channel
+/// preallocates every slot, so far above this is a typo that aborts.
+pub const MAX_BROADCAST_CAP: usize = 1 << 20;
+
+/// Longest `slot_duration` accepted. Far beyond any chain's block time, and
+/// keeps deadlines derived from it from overflowing `Instant`.
+pub const MAX_SLOT_DURATION: Duration = Duration::from_secs(60);
+
+/// Longest `rejournal_interval` accepted — one day. An extreme value overflows
+/// `Instant` in the rotation task, a critical task.
+pub const MAX_REJOURNAL_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Runtime preconf configuration; distributed as `Arc<PreconfConfig>` after
 /// construction.
 ///
@@ -122,6 +134,7 @@ pub struct PreconfConfig {
     pub all_preconfs: bool,
 
     /// Client-side oneshot wait — default 1s (see [`DEFAULT_PRECONF_TIMEOUT`]).
+    /// Must exceed [`safety_margin`](Self::safety_margin).
     pub preconf_timeout: Duration,
 
     /// Dispatch-time preemption margin — see [`DEFAULT_SAFETY_MARGIN`].
@@ -145,7 +158,8 @@ pub struct PreconfConfig {
     /// evenly across the ticks that fit in it. The tick is the flashblock
     /// slice interval when the publisher is enabled and
     /// [`sweep_interval`](Self::sweep_interval) otherwise — see
-    /// `flashblocks::tick_interval`. Default 2s (OP-stack block time).
+    /// `flashblocks::tick_interval`. Default 2s (OP-stack block time), at most
+    /// [`MAX_SLOT_DURATION`].
     pub slot_duration: Duration,
 
     // ===== Operator hardening =====
@@ -173,7 +187,8 @@ pub struct PreconfConfig {
     /// preconf is enabled — there is no "disabled" mode.
     pub journal_path: Option<PathBuf>,
 
-    /// Journal rotation cadence — default 60s. Must be > 0.
+    /// Journal rotation cadence — default 60s. Must be > 0 and at most
+    /// [`MAX_REJOURNAL_INTERVAL`].
     pub rejournal_interval: Duration,
 
     /// Journal file size ceiling — default 1 GiB. Must be > 0.
@@ -182,7 +197,8 @@ pub struct PreconfConfig {
     // ===== Internal channel capacity =====
     /// Capacity of the fifo notifier broadcast channel. Consumers that fall
     /// behind see `Lagged(n)` and fall back to a snapshot reconcile.
-    /// Default 65536 (see [`DEFAULT_BROADCAST_CAP`]).
+    /// Default 65536 (see [`DEFAULT_BROADCAST_CAP`]), at most
+    /// [`MAX_BROADCAST_CAP`].
     pub broadcast_cap: usize,
 }
 
@@ -222,9 +238,44 @@ pub enum PreconfConfigError {
     /// `broadcast_cap == 0` — tokio broadcast requires capacity > 0.
     #[error("broadcast_cap must be > 0")]
     InvalidBroadcastCap,
+    /// `broadcast_cap` above [`MAX_BROADCAST_CAP`].
+    #[error("--preconf.broadcast-cap ({cap}) must be <= {max}")]
+    BroadcastCapTooLarge {
+        /// Configured capacity.
+        cap: usize,
+        /// Largest accepted capacity.
+        max: usize,
+    },
     /// `preconf_timeout == 0`.
     #[error("preconf_timeout must be > 0")]
     InvalidPreconfTimeout,
+    /// `preconf_timeout <= safety_margin`: dispatch would skip every RPC
+    /// preconf.
+    #[error(
+        "--preconf.timeout-ms ({timeout:?}) must be greater than the dispatch safety margin ({margin:?})"
+    )]
+    TimeoutWithinSafetyMargin {
+        /// Configured timeout.
+        timeout: Duration,
+        /// Dispatch safety margin.
+        margin: Duration,
+    },
+    /// `slot_duration` above [`MAX_SLOT_DURATION`].
+    #[error("--preconf.slot-duration-ms ({slot:?}) must be <= {max:?}")]
+    SlotDurationTooLong {
+        /// Configured slot duration.
+        slot: Duration,
+        /// Longest accepted slot duration.
+        max: Duration,
+    },
+    /// `rejournal_interval` above [`MAX_REJOURNAL_INTERVAL`].
+    #[error("--preconf.rejournal-interval-secs ({interval:?}) must be <= {max:?}")]
+    RejournalIntervalTooLong {
+        /// Configured interval.
+        interval: Duration,
+        /// Longest accepted interval.
+        max: Duration,
+    },
     /// `sweep_interval == 0`.
     #[error("sweep_interval must be > 0")]
     InvalidSweepInterval,
@@ -291,14 +342,32 @@ impl PreconfConfig {
         if self.broadcast_cap == 0 {
             return Err(PreconfConfigError::InvalidBroadcastCap);
         }
+        if self.broadcast_cap > MAX_BROADCAST_CAP {
+            return Err(PreconfConfigError::BroadcastCapTooLarge {
+                cap: self.broadcast_cap,
+                max: MAX_BROADCAST_CAP,
+            });
+        }
         if self.preconf_timeout.is_zero() {
             return Err(PreconfConfigError::InvalidPreconfTimeout);
+        }
+        if self.preconf_timeout <= self.safety_margin {
+            return Err(PreconfConfigError::TimeoutWithinSafetyMargin {
+                timeout: self.preconf_timeout,
+                margin: self.safety_margin,
+            });
         }
         if self.sweep_interval.is_zero() {
             return Err(PreconfConfigError::InvalidSweepInterval);
         }
         if self.slot_duration.is_zero() {
             return Err(PreconfConfigError::InvalidSlotDuration);
+        }
+        if self.slot_duration > MAX_SLOT_DURATION {
+            return Err(PreconfConfigError::SlotDurationTooLong {
+                slot: self.slot_duration,
+                max: MAX_SLOT_DURATION,
+            });
         }
         if self.sweep_interval > self.slot_duration {
             return Err(PreconfConfigError::SweepIntervalExceedsSlot {
@@ -332,6 +401,12 @@ impl PreconfConfig {
         // "use the datadir default", not "skip validation".
         if self.rejournal_interval.is_zero() {
             return Err(PreconfConfigError::InvalidRejournalInterval);
+        }
+        if self.rejournal_interval > MAX_REJOURNAL_INTERVAL {
+            return Err(PreconfConfigError::RejournalIntervalTooLong {
+                interval: self.rejournal_interval,
+                max: MAX_REJOURNAL_INTERVAL,
+            });
         }
         if self.journal_max_size == 0 {
             return Err(PreconfConfigError::InvalidJournalMaxSize);
@@ -382,6 +457,47 @@ mod tests {
         let mut cfg = PreconfConfig::default();
         cfg.broadcast_cap = 0;
         assert!(matches!(cfg.validate(), Err(PreconfConfigError::InvalidBroadcastCap)));
+    }
+
+    #[test]
+    fn validate_rejects_a_broadcast_cap_above_the_maximum() {
+        let mut cfg = PreconfConfig::default();
+        cfg.broadcast_cap = MAX_BROADCAST_CAP;
+        assert!(cfg.clone().validate().is_ok(), "the maximum itself is accepted");
+        cfg.broadcast_cap = MAX_BROADCAST_CAP + 1;
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::BroadcastCapTooLarge { .. })));
+    }
+
+    /// Dispatch skips an entry once `elapsed + safety_margin >= timeout`; with
+    /// the timeout at or under the margin that is every entry, on arrival.
+    #[test]
+    fn validate_rejects_a_timeout_within_the_safety_margin() {
+        let mut cfg = PreconfConfig::default();
+        cfg.preconf_timeout = cfg.safety_margin;
+        assert!(matches!(
+            cfg.clone().validate(),
+            Err(PreconfConfigError::TimeoutWithinSafetyMargin { .. })
+        ));
+        cfg.preconf_timeout = cfg.safety_margin + Duration::from_millis(1);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_slot_duration_above_the_maximum() {
+        let mut cfg = PreconfConfig::default();
+        cfg.slot_duration = MAX_SLOT_DURATION;
+        assert!(cfg.clone().validate().is_ok(), "the maximum itself is accepted");
+        cfg.slot_duration = MAX_SLOT_DURATION + Duration::from_millis(1);
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::SlotDurationTooLong { .. })));
+    }
+
+    #[test]
+    fn validate_rejects_a_rejournal_interval_above_the_maximum() {
+        let mut cfg = PreconfConfig::default();
+        cfg.rejournal_interval = MAX_REJOURNAL_INTERVAL;
+        assert!(cfg.clone().validate().is_ok(), "the maximum itself is accepted");
+        cfg.rejournal_interval = MAX_REJOURNAL_INTERVAL + Duration::from_secs(1);
+        assert!(matches!(cfg.validate(), Err(PreconfConfigError::RejournalIntervalTooLong { .. })));
     }
 
     #[test]

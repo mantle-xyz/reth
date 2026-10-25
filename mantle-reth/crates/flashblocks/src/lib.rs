@@ -52,12 +52,12 @@ mod canonical;
 pub use canonical::{await_canonical_match, forward_canonical_state};
 
 mod cache;
-pub use cache::{DEFAULT_MAX_CACHE_AHEAD_BLOCKS, FlashblockCache};
+pub use cache::{DEFAULT_MAX_CACHE_AHEAD_BLOCKS, FlashblockCache, MAX_CACHE_AHEAD_BLOCKS};
 
 mod config;
 pub use config::{
     DEFAULT_MAX_LEADING_DEPTH, DEFAULT_MAX_TRAILING_DEPTH, DEFAULT_SUBSCRIBER_PING_INTERVAL,
-    FlashblocksConfig,
+    FlashblocksConfig, MAX_SUBSCRIBER_PING_INTERVAL,
 };
 
 mod error;

@@ -23,6 +23,9 @@ use crate::DEFAULT_MAX_CACHE_AHEAD_BLOCKS;
 /// when it is wrong.
 pub const DEFAULT_SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Longest ping interval the CLI accepts — five minutes.
+pub const MAX_SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Default number of canonical blocks the pending overlay may trail behind
 /// before it is rebuilt from canonical state.
 pub const DEFAULT_MAX_TRAILING_DEPTH: u64 = 3;
@@ -40,9 +43,11 @@ pub struct FlashblocksConfig {
     pub max_trailing_depth: u64,
     /// See [`DEFAULT_MAX_LEADING_DEPTH`].
     pub max_leading_depth: u64,
-    /// See [`DEFAULT_MAX_CACHE_AHEAD_BLOCKS`].
+    /// See [`DEFAULT_MAX_CACHE_AHEAD_BLOCKS`]. The CLI caps it at
+    /// [`MAX_CACHE_AHEAD_BLOCKS`](crate::MAX_CACHE_AHEAD_BLOCKS).
     pub max_cache_ahead_blocks: u64,
-    /// See [`DEFAULT_SUBSCRIBER_PING_INTERVAL`].
+    /// See [`DEFAULT_SUBSCRIBER_PING_INTERVAL`]. Capped at
+    /// [`MAX_SUBSCRIBER_PING_INTERVAL`].
     pub subscriber_ping_interval: Duration,
 }
 

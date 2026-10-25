@@ -15,7 +15,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, trace, warn};
 use url::Url;
 
-use crate::{FlashblocksReceiver, metrics::Metrics};
+use crate::{FlashblocksReceiver, MAX_SUBSCRIBER_PING_INTERVAL, metrics::Metrics};
 
 /// Position of the last delivered flashblock, used to resume after a reconnect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,7 @@ where
         info!(message = "starting flashblocks subscription", url = %self.ws_url);
 
         let ws_url = self.ws_url.clone();
-        let ping_period = self.ping_interval;
+        let ping_period = effective_ping_period(self.ping_interval);
 
         let (sender, mut mailbox) = mpsc::channel(100);
 
@@ -209,8 +209,37 @@ fn next_backoff(current: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), MAX_BACKOFF)
 }
 
+/// The configured ping period, capped at [`MAX_SUBSCRIBER_PING_INTERVAL`].
+///
+/// For configs built in code (the CLI refuses longer): an extreme period
+/// overflows `Instant` and silently kills the subscription task.
+fn effective_ping_period(configured: Duration) -> Duration {
+    if configured > MAX_SUBSCRIBER_PING_INTERVAL {
+        warn!(
+            ?configured,
+            max = ?MAX_SUBSCRIBER_PING_INTERVAL,
+            "flashblocks ping interval capped at the maximum"
+        );
+        return MAX_SUBSCRIBER_PING_INTERVAL;
+    }
+    configured
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_extreme_ping_interval_is_capped_before_it_reaches_the_clock() {
+        let period = super::effective_ping_period(std::time::Duration::MAX);
+
+        assert_eq!(period, crate::MAX_SUBSCRIBER_PING_INTERVAL);
+        // What the subscription task does with it.
+        let _ = tokio::time::Instant::now() + period;
+        assert_eq!(
+            super::effective_ping_period(std::time::Duration::from_secs(2)),
+            std::time::Duration::from_secs(2),
+        );
+    }
+
     use super::*;
 
     #[test]

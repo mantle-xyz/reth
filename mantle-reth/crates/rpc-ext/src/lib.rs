@@ -719,6 +719,9 @@ where
 
     async fn send_raw_transaction_with_preconf(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
         // Path 1: local sequencer + preconf enabled → handle in-process.
+        //
+        // Never both: the CLI refuses `--preconf.enable` with
+        // `--rollup.sequencer`.
         if let Some(handler) = self.preconf_handler.as_ref() {
             return handler.handle(bytes).await;
         }

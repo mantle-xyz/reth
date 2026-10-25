@@ -17,6 +17,10 @@ use crate::PreconfConfig;
 /// Default interval between slices — 200ms.
 pub const DEFAULT_FLASHBLOCK_BLOCK_TIME: Duration = Duration::from_millis(200);
 
+/// Shortest interval between slices accepted — 100ms. Below it the builder
+/// spends the slot publishing slices rather than executing.
+pub const MIN_FLASHBLOCK_BLOCK_TIME: Duration = Duration::from_millis(100);
+
 /// Default margin by which the budgeted slice grid finishes ahead of the
 /// slot deadline — none.
 ///
@@ -71,7 +75,7 @@ pub const DEFAULT_BEST_TX_LEAD_SLICES: u64 = 1;
 /// Runtime configuration for publishing flashblocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashblockProducerConfig {
-    /// Interval between slices.
+    /// Interval between slices. At least [`MIN_FLASHBLOCK_BLOCK_TIME`].
     pub block_time: Duration,
     /// How far ahead of the slot deadline the budgeted slice grid finishes.
     /// Shifts the tick grid; does not end the build, which runs until
@@ -79,7 +83,8 @@ pub struct FlashblockProducerConfig {
     pub leeway_time: Duration,
     /// Address the publisher binds.
     pub addr: IpAddr,
-    /// Port the publisher binds.
+    /// Port the publisher binds. `0` lets the OS pick (tests use it); the CLI
+    /// refuses it.
     pub port: u16,
     /// Published slices kept for subscribers that reconnect.
     pub ring_capacity: usize,
@@ -106,9 +111,14 @@ impl Default for FlashblockProducerConfig {
 /// Errors surfaced by [`FlashblockProducerConfig::validate`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FlashblockProducerConfigError {
-    /// `block_time == 0`.
-    #[error("flashblocks block_time must be > 0")]
-    InvalidBlockTime,
+    /// `block_time` below [`MIN_FLASHBLOCK_BLOCK_TIME`].
+    #[error("--flashblocks.block-time ({block_time:?}) must be >= {min:?}")]
+    BlockTimeTooShort {
+        /// Configured slice interval.
+        block_time: Duration,
+        /// Shortest accepted interval.
+        min: Duration,
+    },
     /// `broadcast_capacity == 0` — tokio broadcast requires capacity > 0.
     #[error("flashblocks broadcast_capacity must be > 0")]
     InvalidBroadcastCapacity,
@@ -200,8 +210,11 @@ impl FlashblockProducerConfig {
         if sdm_enabled {
             return Err(FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks);
         }
-        if self.block_time.is_zero() {
-            return Err(FlashblockProducerConfigError::InvalidBlockTime);
+        if self.block_time < MIN_FLASHBLOCK_BLOCK_TIME {
+            return Err(FlashblockProducerConfigError::BlockTimeTooShort {
+                block_time: self.block_time,
+                min: MIN_FLASHBLOCK_BLOCK_TIME,
+            });
         }
         if self.broadcast_capacity == 0 {
             return Err(FlashblockProducerConfigError::InvalidBroadcastCapacity);
@@ -261,7 +274,10 @@ mod tests {
         time::Duration,
     };
 
-    use super::{FlashblockProducerConfig, FlashblockProducerConfigError, tick_interval};
+    use super::{
+        FlashblockProducerConfig, FlashblockProducerConfigError, MIN_FLASHBLOCK_BLOCK_TIME,
+        tick_interval,
+    };
     use crate::PreconfConfig;
 
     fn preconf_with_slot(slot: Duration) -> PreconfConfig {
@@ -296,13 +312,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_block_time() {
-        let cfg = FlashblockProducerConfig { block_time: Duration::ZERO, ..cfg() };
-
-        assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
-            Err(FlashblockProducerConfigError::InvalidBlockTime)
-        ));
+    fn validate_rejects_a_block_time_below_the_minimum() {
+        let preconf = preconf_with_slot(Duration::from_secs(2));
+        for block_time in [Duration::ZERO, MIN_FLASHBLOCK_BLOCK_TIME - Duration::from_millis(1)] {
+            let cfg = FlashblockProducerConfig { block_time, ..cfg() };
+            assert!(
+                matches!(
+                    cfg.validate(Some(&preconf), false),
+                    Err(FlashblockProducerConfigError::BlockTimeTooShort { .. })
+                ),
+                "{block_time:?}"
+            );
+        }
+        let at_minimum =
+            FlashblockProducerConfig { block_time: MIN_FLASHBLOCK_BLOCK_TIME, ..cfg() };
+        assert!(at_minimum.validate(Some(&preconf), false).is_ok());
     }
 
     #[test]

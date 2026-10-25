@@ -155,7 +155,7 @@ impl<T: SignedTransaction + OpTransaction> ExecutionInfo<T> {
     /// Record a transaction the block executor has committed.
     ///
     /// A transaction whose nonce field is not its sender's nonce (see
-    /// [`carries_its_senders_nonce`]) is executed but leaves no entry in
+    /// `carries_its_senders_nonce`) is executed but leaves no entry in
     /// [`Self::executed_sender_nonces`].
     pub fn record(&mut self, tx: Recovered<T>) {
         if carries_its_senders_nonce(tx.inner()) {

@@ -106,7 +106,8 @@ struct Args {
     #[arg(long, env, default_value = "")]
     metrics_global_labels: String,
 
-    /// Upper bound on upstream reconnect backoff, in milliseconds.
+    /// Upper bound on upstream reconnect backoff, in milliseconds. Must be
+    /// greater than zero.
     #[arg(long, env, default_value = "20000")]
     subscriber_max_interval_ms: u64,
 
@@ -114,7 +115,8 @@ struct Args {
     #[arg(long, env, default_value = "2000")]
     subscriber_ping_interval_ms: u64,
 
-    /// How long to wait for an upstream pong before declaring the connection dead.
+    /// How long to wait for an upstream pong before declaring the connection
+    /// dead. Must exceed `--subscriber-ping-interval-ms`.
     #[arg(long, env, default_value = "4000")]
     subscriber_pong_timeout_ms: u64,
 
@@ -127,6 +129,7 @@ struct Args {
     client_ping_interval_ms: u64,
 
     /// How long to wait for a client pong before dropping it, in milliseconds.
+    /// With `--client-ping-enabled`, must exceed `--client-ping-interval-ms`.
     #[arg(long, env, default_value = "30000")]
     client_pong_timeout_ms: u64,
 
@@ -163,6 +166,31 @@ fn refuse_unusable_args(args: &Args) -> eyre::Result<Vec<String>> {
     }
     if args.subscriber_ping_interval_ms == 0 {
         eyre::bail!("--subscriber-ping-interval-ms must be greater than zero");
+    }
+    // The three below start, then cycle a connection forever.
+    if args.subscriber_pong_timeout_ms <= args.subscriber_ping_interval_ms {
+        eyre::bail!(
+            "--subscriber-pong-timeout-ms ({}) must be greater than \
+             --subscriber-ping-interval-ms ({}): a pong cannot arrive before the ping it answers, \
+             so the upstream connection would be declared dead and reopened forever",
+            args.subscriber_pong_timeout_ms,
+            args.subscriber_ping_interval_ms,
+        );
+    }
+    if args.subscriber_max_interval_ms == 0 {
+        eyre::bail!(
+            "--subscriber-max-interval-ms must be greater than zero: it caps the reconnect \
+             backoff, so zero reconnects without pause"
+        );
+    }
+    if args.client_ping_enabled && args.client_pong_timeout_ms <= args.client_ping_interval_ms {
+        eyre::bail!(
+            "--client-pong-timeout-ms ({}) must be greater than --client-ping-interval-ms ({}) \
+             when --client-ping-enabled is set: every client would be dropped before its pong \
+             is due",
+            args.client_pong_timeout_ms,
+            args.client_ping_interval_ms,
+        );
     }
 
     // Fail closed. An unauthenticated endpoint is a supported configuration —
@@ -486,6 +514,54 @@ mod tests {
             let err = refuse_unusable_args(&args_with(&["--public-access-enabled", flag, "0"]))
                 .expect_err("zero is not a usable value");
             assert!(err.to_string().contains(flag), "the message must name {flag}: {err}");
+        }
+    }
+
+    /// Combinations that start but cycle a connection forever, and the values
+    /// just inside each boundary that do not.
+    #[test]
+    fn contradictory_timing_flags_are_refused_by_name() {
+        let refused = [
+            (
+                &["--subscriber-ping-interval-ms", "2000", "--subscriber-pong-timeout-ms", "2000"]
+                    [..],
+                "--subscriber-pong-timeout-ms",
+            ),
+            (&["--subscriber-max-interval-ms", "0"][..], "--subscriber-max-interval-ms"),
+            (
+                &[
+                    "--client-ping-enabled",
+                    "--client-ping-interval-ms",
+                    "15000",
+                    "--client-pong-timeout-ms",
+                    "15000",
+                ][..],
+                "--client-pong-timeout-ms",
+            ),
+        ];
+        for (flags, named) in refused {
+            let mut argv = vec!["--public-access-enabled"];
+            argv.extend_from_slice(flags);
+            let err = refuse_unusable_args(&args_with(&argv)).expect_err("must not start");
+            assert!(err.to_string().contains(named), "the message must name {named}: {err}");
+        }
+
+        for flags in [
+            &["--subscriber-ping-interval-ms", "2000", "--subscriber-pong-timeout-ms", "2001"][..],
+            &["--subscriber-max-interval-ms", "1"][..],
+            &[
+                "--client-ping-enabled",
+                "--client-ping-interval-ms",
+                "15000",
+                "--client-pong-timeout-ms",
+                "15001",
+            ][..],
+            // Without client pings the pong timeout is not compared.
+            &["--client-ping-interval-ms", "15000", "--client-pong-timeout-ms", "15000"][..],
+        ] {
+            let mut argv = vec!["--public-access-enabled"];
+            argv.extend_from_slice(flags);
+            refuse_unusable_args(&args_with(&argv)).unwrap_or_else(|e| panic!("{flags:?}: {e}"));
         }
     }
 }
