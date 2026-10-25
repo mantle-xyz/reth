@@ -815,6 +815,73 @@ fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: Prec
     status == PreconfStatus::Waiting && !loop_state.is_committed(hash)
 }
 
+/// Whether this build may still execute a [`PreconfSource::Replay`] entry: only
+/// while its parent is on the canonical chain.
+///
+/// A replayed commitment was promised on some earlier block. If this build's
+/// parent is a block a reorg has taken back, that block may already hold it,
+/// and executing it again fails nonce-too-low and ends the commitment as
+/// broken. A build on a parent off the canonical chain will not be adopted, so
+/// the check abandons it and leaves the entry for a build on the new chain.
+///
+/// On the canonical chain, not at its head: a reorg arrives as a forkchoice
+/// update onto an ancestor with attributes, and the engine builds on that
+/// ancestor while the head stays where it was until the rebuilt block is
+/// inserted. That build is exactly where reverted commitments re-land.
+///
+/// Asked after the entry is read from the queue, never before. The engine
+/// updates its in-memory canonical chain before it sends the canonical-state
+/// notification, and the canon handler requeues from that notification, so a
+/// build that has read a requeued entry always sees the chain that reverted
+/// its parent. Asked earlier, the requeue could land between the check and the
+/// read. The lookup must read that in-memory chain (`BlockHashReader` on the
+/// blockchain provider does); a persisted-only view would lag it.
+pub(crate) struct ReplayParentCheck<'a> {
+    parent: B256,
+    canonical_at_parent_height:
+        &'a dyn Fn() -> reth_storage_api::errors::provider::ProviderResult<Option<B256>>,
+    cancel: &'a JobCancel,
+}
+
+impl<'a> ReplayParentCheck<'a> {
+    pub(crate) fn new(
+        parent: B256,
+        canonical_at_parent_height: &'a dyn Fn()
+            -> reth_storage_api::errors::provider::ProviderResult<Option<B256>>,
+        cancel: &'a JobCancel,
+    ) -> Self {
+        Self { parent, canonical_at_parent_height, cancel }
+    }
+
+    /// `true` if the entry may run. A parent off the canonical chain abandons
+    /// the build; an unreadable chain only holds this entry back.
+    fn allows_replay(&self, hash: &TxHash) -> bool {
+        match (self.canonical_at_parent_height)() {
+            Ok(Some(canonical)) if canonical == self.parent => true,
+            Ok(canonical) => {
+                metrics::counter!("preconf.build.stale_parent_abandoned_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, parent = ?self.parent, ?canonical,
+                    "build parent is no longer on the canonical chain; abandoning the build \
+                     before it replays a commitment"
+                );
+                self.cancel.abandon();
+                false
+            }
+            Err(err) => {
+                metrics::counter!("preconf.build.canonical_chain_unreadable_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?err,
+                    "canonical chain unreadable; holding the replayed commitment for a later build"
+                );
+                false
+            }
+        }
+    }
+}
+
 /// Block-capacity admission + same-sender cascade for a single preconf hash,
 /// run **before** dispatching to [`dispatch::apply_one_preconf`] (which drives
 /// the [`PreconfTxSet`] entry status machine). This is the one funnel all
@@ -841,6 +908,7 @@ async fn admit_and_dispatch<N, B, ChainSpec>(
     limits: BuildConstraints,
     whitelist: &Whitelist,
     l1_ctx: &mut L1FeeCtx<'_, ChainSpec>,
+    replay_parent: &ReplayParentCheck<'_>,
 ) -> Result<(), PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
@@ -861,6 +929,12 @@ where
     drop(entry);
 
     if !needs_admission(loop_state, &hash, status) {
+        return Ok(());
+    }
+
+    // (0) A replayed commitment runs only on the canonical chain — see
+    // `ReplayParentCheck`. The entry stays `Waiting` for the next build.
+    if source == PreconfSource::Replay && !replay_parent.allows_replay(&hash) {
         return Ok(());
     }
 
@@ -1021,11 +1095,6 @@ where
 /// the senders alone avoids cloning a view of every entry, and one sweep avoids
 /// re-reading every entry once per sender — quadratic at the volumes
 /// [`PreconfTxSet::forward_all`] describes.
-///
-/// This is also the nonce check a reorg re-injection relies on: the canon
-/// handler requeues reverted transactions without a broadcast
-/// ([`PreconfTxSet::requeue_reverted`]), so they are first seen here, judged
-/// against this build's parent, before the carryover can execute them.
 ///
 /// A sender whose nonce cannot be read is left out, so its entries stay until
 /// a later build can read it.
@@ -1892,6 +1961,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///    unlanded pool transactions the sweep handed to the fifo, all dispatched through
     ///    [`admit_and_dispatch`]. They bypass the broadcast queue and the pool arm, so they land
     ///    ahead of concurrently-queued RPC pushes and fresh pool traffic.
+    ///
+    ///    On every path, a [`PreconfSource::Replay`] entry runs only while this build's parent is
+    ///    on the canonical chain; otherwise the build abandons itself (`ReplayParentCheck`).
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).
     /// 6. **Stage 5** — `builder.finish` → seal + wrap into `OpBuiltPayload`.
     ///
@@ -1917,6 +1989,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 Transaction: reth_optimism_txpool::OpPooledTx<Consensus = N::SignedTx>,
             >,
         Client: reth_storage_api::StateProviderFactory
+            + reth_storage_api::BlockHashReader
             + reth_chainspec::ChainSpecProvider<ChainSpec: reth_optimism_forks::OpHardforks>,
         <Client as reth_chainspec::ChainSpecProvider>::ChainSpec:
             reth_chainspec::EthChainSpec + reth_optimism_forks::OpHardforks,
@@ -2140,6 +2213,12 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         };
 
         let mut loop_state = dispatch::LoopState::new(predicted_height);
+
+        let parent_number = ctx.parent().number();
+        let canonical_at_parent_height =
+            || reth_storage_api::BlockHashReader::block_hash(&self.client, parent_number);
+        let replay_parent =
+            ReplayParentCheck::new(parent_hash, &canonical_at_parent_height, &cancel);
 
         // Adaptive-N pool quota schedule — see `derive_pool_quota_schedule`.
         // SystemTime is read only here for the initial offset; the tokio
@@ -2385,6 +2464,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     constraints,
                     &whitelist,
                     &mut l1_ctx,
+                    &replay_parent,
                 )
                 .await?;
             }
@@ -2452,6 +2532,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                 &mut builder, &mut info, constraints,
                                 &whitelist,
                                 &mut l1_ctx,
+                                &replay_parent,
                             )
                             .await?;
                         }
@@ -2466,12 +2547,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                 "fifo broadcast lagged; reconciling via snapshot"
                             );
                             for hash in self.fifo.snapshot().await {
+                                // Same reason as the carryover loop: the check
+                                // below can abandon the build mid-scan.
+                                if cancel.is_abandoned() {
+                                    break;
+                                }
                                 admit_and_dispatch::<N, _, _>(
                                     &self.fifo, &self.cfg, self.journal.as_deref(), hash,
                                 &mut loop_state,
                                     &mut builder, &mut info, constraints,
                                     &whitelist,
                                     &mut l1_ctx,
+                                    &replay_parent,
                                 )
                                 .await?;
                             }
@@ -2946,6 +3033,53 @@ mod tests {
     async fn replay_fifo_carryover_on_empty_fifo_is_noop() {
         let fifo = PreconfTxSet::new(16);
         assert!(replay_fifo_carryover(&fifo).await.is_empty());
+    }
+
+    /// Includes a parent below the head: a reorg rebuilds on an ancestor while
+    /// the head has not moved yet, and that build is where commitments re-land.
+    #[test]
+    fn a_replay_runs_while_the_parent_is_on_the_canonical_chain() {
+        let parent = B256::repeat_byte(1);
+        let cancel = JobCancel::new();
+        let canonical = || Ok(Some(parent));
+
+        let allowed =
+            ReplayParentCheck::new(parent, &canonical, &cancel).allows_replay(&B256::ZERO);
+
+        assert!(allowed);
+        assert_eq!(cancel.reason(), None, "and the build carries on");
+    }
+
+    /// A parent a reorg replaced, or one above a chain that got shorter, will
+    /// not be adopted: the build stops, and the entry is left for a build on
+    /// the new chain.
+    #[test]
+    fn a_parent_off_the_canonical_chain_abandons_the_build_instead_of_replaying() {
+        for canonical_at_height in [Some(B256::repeat_byte(2)), None] {
+            let cancel = JobCancel::new();
+            let canonical = || Ok(canonical_at_height);
+
+            let allowed = ReplayParentCheck::new(B256::repeat_byte(1), &canonical, &cancel)
+                .allows_replay(&B256::ZERO);
+
+            assert!(!allowed, "{canonical_at_height:?}");
+            assert!(cancel.is_abandoned(), "{canonical_at_height:?}");
+        }
+    }
+
+    /// Not knowing the chain is not evidence the build is stale: the entry is
+    /// held back, the build goes on.
+    #[test]
+    fn an_unreadable_chain_holds_the_replay_back_without_abandoning() {
+        let cancel = JobCancel::new();
+        let canonical =
+            || Err(reth_storage_api::errors::provider::ProviderError::BestBlockNotFound);
+
+        let allowed = ReplayParentCheck::new(B256::repeat_byte(1), &canonical, &cancel)
+            .allows_replay(&B256::ZERO);
+
+        assert!(!allowed);
+        assert_eq!(cancel.reason(), None);
     }
 
     /// A sender whose nonce cannot be read is left out of the forward sweep,

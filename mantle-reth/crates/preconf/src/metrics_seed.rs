@@ -81,6 +81,13 @@ const COUNTERS: &[&str] = &[
     // A job abandoned while it waited for the build lock, so it built nothing.
     // Routine when jobs are superseded; not counted as a failure.
     "preconf.build.abandoned_before_start_total",
+    // A build that found its parent no longer on the canonical chain when
+    // about to replay a commitment, and abandoned itself. Steady state is 0; it
+    // moves with reorgs.
+    "preconf.build.stale_parent_abandoned_total",
+    // The canonical chain could not be read at that check, so the replayed
+    // commitment waited for a later build.
+    "preconf.build.canonical_chain_unreadable_total",
     "preconf.build.watchdog_cancel_total",
     "preconf.fifo.da_rejected_total",
     "preconf.fifo.block_gas_rejected_total",
