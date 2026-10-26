@@ -76,8 +76,10 @@ fn mainnet_from_cutoff() -> Arc<OpChainSpec> {
 }
 
 /// HTTP and WS with the debug namespace, so raw block reads have a local handler.
-fn rpc_with_debug(rpc: RpcServerArgs) -> RpcServerArgs {
-    rpc.with_http()
+fn rpc_with_debug() -> RpcServerArgs {
+    RpcServerArgs::default()
+        .with_unused_ports()
+        .with_http()
         .with_http_api("eth,net,web3,debug".parse().unwrap())
         .with_ws()
         .with_ws_api("eth,net,web3,debug".parse().unwrap())
@@ -196,7 +198,7 @@ async fn historical_rpc_cutoff_http_and_ws() {
         mantle_payload_attributes,
         TreeConfig::default(),
         None,
-        rpc_with_debug,
+        rpc_with_debug(),
         move |node, http| async move {
             check_routes(&http, &requests).await;
             let ws = node.inner.rpc_server_handle().ws_client().await.unwrap();
@@ -260,7 +262,7 @@ async fn historical_rpc_configured_cutoff() {
         mantle_payload_attributes,
         TreeConfig::default(),
         None,
-        |rpc: RpcServerArgs| rpc.with_http(),
+        RpcServerArgs::default().with_unused_ports().with_http(),
         move |node, http| async move {
             // Keeps the node, and so its RPC server, alive while the requests run.
             let _node = node;
