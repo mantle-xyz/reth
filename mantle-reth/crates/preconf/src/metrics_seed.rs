@@ -81,6 +81,12 @@ const COUNTERS: &[&str] = &[
     // A job abandoned while it waited for the build lock, so it built nothing.
     // Routine when jobs are superseded; not counted as a failure.
     "preconf.build.abandoned_before_start_total",
+    // A build found the shared allowlist behind its parent (`listsHash` differs)
+    // and read the parent's lists itself. Occasional; a steady rate means the
+    // whitelist watcher lags block production.
+    "preconf.whitelist.build_reread_total",
+    // That check or read failed; the build used the shared allowlist.
+    "preconf.whitelist.build_reread_failed_total",
     // A build that found its parent no longer on the canonical chain when
     // about to replay a commitment, and abandoned itself. Steady state is 0; it
     // moves with reorgs.
@@ -128,6 +134,9 @@ const COUNTERS: &[&str] = &[
     // from "refreshing fine".
     "preconf.whitelist.reload_ok",
     "preconf.whitelist.reload_failed",
+    // A reorg or a notification gap where `listsHash` at the head matched the
+    // shared lists, so the watcher skipped the full re-read.
+    "preconf.whitelist.reload_skipped_total",
 ];
 
 /// Gauge series. Registered **non-destructively** via `increment(0.0)`: the
