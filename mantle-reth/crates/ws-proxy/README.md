@@ -44,6 +44,12 @@ the upstream.
 Run `mantle-ws-proxy --help` for the full list. Every flag also reads from the
 equivalent uppercase environment variable.
 
+The keepalive flags are checked at startup, and a combination that would cycle
+a connection forever is refused: `--subscriber-pong-timeout-ms` must exceed
+`--subscriber-ping-interval-ms`, `--subscriber-max-interval-ms` must be
+non-zero, and with `--client-ping-enabled` the client pong timeout must exceed
+the client ping interval.
+
 ```bash
 mantle-ws-proxy \
   --upstream-ws ws://mantle-sequencer:1111 \

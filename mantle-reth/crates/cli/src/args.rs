@@ -25,7 +25,8 @@ use alloy_primitives::Address;
 use clap::Args;
 use mantle_reth_flashblocks::{
     DEFAULT_MAX_CACHE_AHEAD_BLOCKS, DEFAULT_MAX_LEADING_DEPTH, DEFAULT_MAX_TRAILING_DEPTH,
-    DEFAULT_SUBSCRIBER_PING_INTERVAL, FlashblocksConfig,
+    DEFAULT_SUBSCRIBER_PING_INTERVAL, FlashblocksConfig, MAX_CACHE_AHEAD_BLOCKS,
+    MAX_SUBSCRIBER_PING_INTERVAL,
 };
 use mantle_reth_preconf::{
     FlashblockProducerConfig, FlashblockProducerConfigError, PreconfConfig,
@@ -33,6 +34,7 @@ use mantle_reth_preconf::{
         DEFAULT_BROADCAST_CAP, DEFAULT_JOURNAL_MAX_SIZE, DEFAULT_PRECONF_MAX_GAS_PER_BLOCK,
         DEFAULT_PRECONF_MAX_GAS_PER_TX, DEFAULT_PRECONF_QUEUE_GAS_BLOCKS, DEFAULT_PRECONF_TIMEOUT,
         DEFAULT_REJOURNAL_INTERVAL, DEFAULT_SLOT_DURATION, DEFAULT_SWEEP_INTERVAL,
+        PreconfConfigError,
     },
     flashblocks::{
         DEFAULT_BEST_TX_LEAD_SLICES, DEFAULT_FLASHBLOCK_ADDR, DEFAULT_FLASHBLOCK_BLOCK_TIME,
@@ -76,14 +78,19 @@ impl MantleArgs {
     /// consumer are resolved independently: running both on one node is
     /// permitted but unusual, and `main` warns about it.
     ///
+    /// Preconf is validated first: the publisher's checks read its slot duration.
+    ///
     /// # Errors
-    /// Returns an error when the publisher is enabled without preconf, when
-    /// the publisher is enabled together with the boot-time SDM opt-in
-    /// (`--rollup.operator-sdm-opt-in`), or when both this consumer and
-    /// upstream's are requested.
+    /// See [`MantleArgsError`].
     pub fn into_configs(self) -> Result<MantleConfigs, MantleArgsError> {
         let sdm_enabled = self.rollup.operator_sdm_opt_in;
-        let preconf = self.preconf.into_config();
+        let preconf = self.preconf.into_config().map(PreconfConfig::validate).transpose()?;
+        if preconf.is_some() && self.rollup.sequencer.is_some() {
+            return Err(MantleArgsError::PreconfOnForwardingNode);
+        }
+        if self.flashblocks.enable && self.flashblocks.port == Some(0) {
+            return Err(MantleArgsError::ZeroFlashblocksPort);
+        }
         let publisher = self
             .flashblocks
             .into_config()
@@ -112,6 +119,25 @@ pub struct MantleConfigs {
 /// Errors produced while resolving [`MantleArgs`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MantleArgsError {
+    /// The preconf config is invalid.
+    #[error(transparent)]
+    Preconf(#[from] PreconfConfigError),
+
+    /// Preconf was enabled on a node that forwards transactions to a sequencer.
+    #[error(
+        "--preconf.enable and --rollup.sequencer are mutually exclusive: preconf requests are \
+         then answered here instead of being forwarded, and a node that does not build blocks \
+         times every one of them out"
+    )]
+    PreconfOnForwardingNode,
+
+    /// The publisher was asked to bind port 0.
+    #[error(
+        "--flashblocks.port must not be 0: the OS would pick a port, and nothing downstream could \
+         know which"
+    )]
+    ZeroFlashblocksPort,
+
     /// The publisher was enabled in a combination that cannot work.
     #[error(transparent)]
     Publisher(#[from] FlashblockProducerConfigError),
@@ -142,23 +168,40 @@ pub struct FlashblocksConsumerArgs {
     #[arg(long = "flashblocks.websocket-url", alias = "subblocks.websocket-url")]
     pub websocket_url: Option<Url>,
 
-    /// Interval between upstream websocket ping frames, in seconds. Default 2.
-    #[arg(long = "flashblocks.ping-interval-secs", alias = "subblocks.ping-interval-secs")]
+    /// Interval between upstream websocket ping frames, in seconds. Default 2,
+    /// at most 300.
+    #[arg(
+        long = "flashblocks.ping-interval-secs",
+        alias = "subblocks.ping-interval-secs",
+        requires = "websocket_url"
+    )]
     pub ping_interval_secs: Option<u64>,
 
     /// Canonical blocks the pending overlay may trail behind before a rebuild.
     /// Default 3.
-    #[arg(long = "flashblocks.max-trailing-depth", alias = "subblocks.max-trailing-depth")]
+    #[arg(
+        long = "flashblocks.max-trailing-depth",
+        alias = "subblocks.max-trailing-depth",
+        requires = "websocket_url"
+    )]
     pub max_trailing_depth: Option<u64>,
 
     /// Blocks the pending overlay may lead canonical by before slices are dropped.
     /// Default 3.
-    #[arg(long = "flashblocks.max-leading-depth", alias = "subblocks.max-leading-depth")]
+    #[arg(
+        long = "flashblocks.max-leading-depth",
+        alias = "subblocks.max-leading-depth",
+        requires = "websocket_url"
+    )]
     pub max_leading_depth: Option<u64>,
 
     /// Blocks ahead of canonical for which early-arriving slices are cached.
-    /// Default 5.
-    #[arg(long = "flashblocks.max-cache-ahead-blocks", alias = "subblocks.max-cache-ahead-blocks")]
+    /// Default 5, at most 256.
+    #[arg(
+        long = "flashblocks.max-cache-ahead-blocks",
+        alias = "subblocks.max-cache-ahead-blocks",
+        requires = "websocket_url"
+    )]
     pub max_cache_ahead_blocks: Option<u64>,
 }
 
@@ -185,6 +228,9 @@ impl FlashblocksConsumerArgs {
         // not abort the process.
         let subscriber_ping_interval = match self.ping_interval_secs {
             Some(0) => return Err(FlashblocksConsumerArgsError::ZeroPingInterval),
+            Some(secs) if Duration::from_secs(secs) > MAX_SUBSCRIBER_PING_INTERVAL => {
+                return Err(FlashblocksConsumerArgsError::PingIntervalTooLong { secs });
+            }
             Some(secs) => Duration::from_secs(secs),
             None => DEFAULT_SUBSCRIBER_PING_INTERVAL,
         };
@@ -194,8 +240,12 @@ impl FlashblocksConsumerArgs {
         if self.max_trailing_depth == Some(0) {
             return Err(FlashblocksConsumerArgsError::ZeroTrailingDepth);
         }
-        if self.max_cache_ahead_blocks == Some(0) {
-            return Err(FlashblocksConsumerArgsError::ZeroCacheAheadBlocks);
+        match self.max_cache_ahead_blocks {
+            Some(0) => return Err(FlashblocksConsumerArgsError::ZeroCacheAheadBlocks),
+            Some(blocks) if blocks > MAX_CACHE_AHEAD_BLOCKS => {
+                return Err(FlashblocksConsumerArgsError::CacheAheadTooLarge { blocks });
+            }
+            _ => {}
         }
 
         Ok(Some(FlashblocksConfig {
@@ -235,11 +285,24 @@ pub enum FlashblocksConsumerArgsError {
     /// Early-arriving slices could never be cached.
     #[error("--flashblocks.max-cache-ahead-blocks must be positive")]
     ZeroCacheAheadBlocks,
+    /// Longer than [`MAX_SUBSCRIBER_PING_INTERVAL`].
+    #[error("--flashblocks.ping-interval-secs ({secs}) must be <= {}", MAX_SUBSCRIBER_PING_INTERVAL.as_secs())]
+    PingIntervalTooLong {
+        /// Configured interval, in seconds.
+        secs: u64,
+    },
+    /// Wider than [`MAX_CACHE_AHEAD_BLOCKS`].
+    #[error("--flashblocks.max-cache-ahead-blocks ({blocks}) must be <= {MAX_CACHE_AHEAD_BLOCKS}")]
+    CacheAheadTooLarge {
+        /// Configured window, in blocks.
+        blocks: u64,
+    },
 }
 
 /// Flashblocks publisher CLI flags.
 ///
-/// Sequencer-side only. `--flashblocks.enable` requires `--preconf.enable`;
+/// Sequencer-side only. The other flags here are refused without
+/// `--flashblocks.enable`. `--flashblocks.enable` requires `--preconf.enable`;
 /// the check lives in [`FlashblockProducerConfig::validate`] rather than in
 /// clap, because the two flags come from different flattened groups.
 ///
@@ -258,21 +321,32 @@ pub struct FlashblocksArgs {
     pub enable: bool,
 
     /// Address the flashblocks publisher binds. Default `127.0.0.1`.
-    #[arg(id = "flashblocks.addr", long = "flashblocks.addr", alias = "subblocks.addr")]
+    #[arg(
+        id = "flashblocks.addr",
+        long = "flashblocks.addr",
+        alias = "subblocks.addr",
+        requires = "flashblocks.enable"
+    )]
     pub addr: Option<IpAddr>,
 
-    /// Port the flashblocks publisher binds. Default `1111`.
-    #[arg(id = "flashblocks.port", long = "flashblocks.port", alias = "subblocks.port")]
+    /// Port the flashblocks publisher binds. Default `1111`; 0 is refused.
+    #[arg(
+        id = "flashblocks.port",
+        long = "flashblocks.port",
+        alias = "subblocks.port",
+        requires = "flashblocks.enable"
+    )]
     pub port: Option<u16>,
 
-    /// Interval between slices, in milliseconds. Default 200ms.
+    /// Interval between slices, in milliseconds. Default 200ms, at least 100ms.
     ///
     /// When flashblocks are enabled this also becomes the payload builder's
     /// ticker cadence, superseding `--preconf.sweep-interval-ms`.
     #[arg(
         id = "flashblocks.block-time",
         long = "flashblocks.block-time",
-        alias = "subblocks.block-time"
+        alias = "subblocks.block-time",
+        requires = "flashblocks.enable"
     )]
     pub block_time_ms: Option<u64>,
 
@@ -283,7 +357,8 @@ pub struct FlashblocksArgs {
     #[arg(
         id = "flashblocks.leeway-time",
         long = "flashblocks.leeway-time",
-        alias = "subblocks.leeway-time"
+        alias = "subblocks.leeway-time",
+        requires = "flashblocks.enable"
     )]
     pub leeway_time_ms: Option<u64>,
 
@@ -296,7 +371,8 @@ pub struct FlashblocksArgs {
     #[arg(
         id = "flashblocks.best-tx-lead-slices",
         long = "flashblocks.best-tx-lead-slices",
-        alias = "subblocks.best-tx-lead-slices"
+        alias = "subblocks.best-tx-lead-slices",
+        requires = "flashblocks.enable"
     )]
     pub best_tx_lead_slices: Option<u64>,
 }
@@ -331,7 +407,9 @@ impl FlashblocksArgs {
 /// Preconfirmation subsystem CLI flags.
 ///
 /// Leave everything at defaults and preconf stays disabled (matches
-/// `MantleNode::new` behavior without `.with_preconf()`).
+/// `MantleNode::new` behavior without `.with_preconf()`). The other flags here
+/// are refused without `--preconf.enable`, as is `--preconf.enable` together
+/// with `--rollup.sequencer`.
 #[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
 pub struct PreconfArgs {
     /// Enable the mantle preconfirmation subsystem.
@@ -347,12 +425,12 @@ pub struct PreconfArgs {
     /// datadir-relative default (`<datadir>/mantle-preconf/journal.jsonl`).
     /// The file is opened in append mode; existing contents are preserved
     /// (restart-replay is a separate step).
-    #[arg(long = "preconf.journal-path")]
+    #[arg(long = "preconf.journal-path", requires = "enable")]
     pub journal_path: Option<PathBuf>,
 
     /// Treat all transactions as preconf-eligible (bypasses the from/to
     /// allowlist). Aligns with op-geth's `--txpool.allpreconfs`.
-    #[arg(long = "preconf.all")]
+    #[arg(long = "preconf.all", requires = "enable")]
     pub all: bool,
 
     /// Address of the L2 `PreconfWhitelist` contract, the single source of
@@ -363,19 +441,20 @@ pub struct PreconfArgs {
     /// of this contract's storage at startup and refreshes them whenever it
     /// emits `WhitelistUpdated`, so the lists are governed on-chain — this
     /// address is the only allowlist input the CLI accepts.
-    #[arg(long = "preconf.whitelist-contract", value_name = "ADDRESS")]
+    #[arg(long = "preconf.whitelist-contract", value_name = "ADDRESS", requires = "enable")]
     pub whitelist_contract: Option<Address>,
 
     /// Client-visible RPC oneshot timeout, in milliseconds. Default matches
-    /// [`mantle_reth_preconf::config::DEFAULT_PRECONF_TIMEOUT`] (1s).
-    #[arg(long = "preconf.timeout-ms")]
+    /// [`mantle_reth_preconf::config::DEFAULT_PRECONF_TIMEOUT`] (1s). Must
+    /// exceed the 40ms dispatch safety margin, or no request would be tried.
+    #[arg(long = "preconf.timeout-ms", requires = "enable")]
     pub timeout_ms: Option<u64>,
 
     /// Payload-builder sweep-ticker interval, in milliseconds — cadence at
     /// which the builder admits a fresh batch of pool best-txs. Each tick
     /// admits pool txs up to the time-proportional cumulative gas quota
     /// (see `--preconf.slot-duration-ms`). Default 200ms.
-    #[arg(long = "preconf.sweep-interval-ms")]
+    #[arg(long = "preconf.sweep-interval-ms", requires = "enable")]
     pub sweep_interval_ms: Option<u64>,
 
     /// Slot duration in milliseconds — the ceiling on the remaining-time input
@@ -384,17 +463,17 @@ pub struct PreconfArgs {
     /// `block_gas_limit` evenly across the ticks that fit in it. The tick is
     /// `--flashblocks.block-time` when the publisher is enabled and
     /// `--preconf.sweep-interval-ms` otherwise. Default 2000ms (OP-stack block
-    /// time). Change only on chains with non-standard cadence.
-    #[arg(long = "preconf.slot-duration-ms")]
+    /// time), at most 60000ms. Change only on chains with non-standard cadence.
+    #[arg(long = "preconf.slot-duration-ms", requires = "enable")]
     pub slot_duration_ms: Option<u64>,
 
     /// Per-tx gas cap for preconf-eligible txs. Default `2_000_000`.
-    #[arg(long = "preconf.max-gas-per-tx")]
+    #[arg(long = "preconf.max-gas-per-tx", requires = "enable")]
     pub max_gas_per_tx: Option<u64>,
 
     /// Cumulative preconf gas budget per block. Default `6_000_000`. Must be
     /// `>=` `preconf.max-gas-per-tx` (checked by `PreconfConfig::validate`).
-    #[arg(long = "preconf.max-gas-per-block")]
+    #[arg(long = "preconf.max-gas-per-block", requires = "enable")]
     pub max_gas_per_block: Option<u64>,
 
     /// How much backlog the preconf queue will hold, in blocks' worth of
@@ -403,26 +482,28 @@ pub struct PreconfArgs {
     /// ordinary and recoverable, and refusing that at admission would remove a
     /// recovery path that exists on purpose. See
     /// `DEFAULT_PRECONF_QUEUE_GAS_BLOCKS`.
-    #[arg(long = "preconf.queue-gas-blocks")]
+    #[arg(long = "preconf.queue-gas-blocks", requires = "enable")]
     pub queue_gas_blocks: Option<u64>,
 
-    /// Journal rotation interval, in seconds. Default 60s. Always in effect
+    /// Journal rotation interval, in seconds. Default 60s, at most 86400 (one
+    /// day). Always in effect
     /// when preconf is enabled: the journal has no disabled mode, and an unset
     /// `--preconf.journal-path` only selects the datadir default.
-    #[arg(long = "preconf.rejournal-interval-secs")]
+    #[arg(long = "preconf.rejournal-interval-secs", requires = "enable")]
     pub rejournal_interval_secs: Option<u64>,
 
     /// Journal file size ceiling, in bytes. Default 1 GiB (`1_073_741_824`).
     /// Above this, rotation renames the current file and starts a new one.
     /// Always in effect when preconf is enabled, like
     /// `--preconf.rejournal-interval-secs`.
-    #[arg(long = "preconf.journal-max-size")]
+    #[arg(long = "preconf.journal-max-size", requires = "enable")]
     pub journal_max_size: Option<u64>,
 
-    /// Broadcast channel capacity. Default 65536. Advanced tuning knob — sizes
+    /// Broadcast channel capacity. Default 65536, at most 1048576. Advanced
+    /// tuning knob — sizes
     /// the fifo notifier broadcast channel; consumers see `Lagged(n)` and fall
     /// back to snapshot reconcile when full.
-    #[arg(long = "preconf.broadcast-cap")]
+    #[arg(long = "preconf.broadcast-cap", requires = "enable")]
     pub broadcast_cap: Option<usize>,
 }
 
@@ -504,9 +585,8 @@ mod tests {
     fn enable_flag_produces_enabled_config() {
         // Minimal opt-in: --preconf.enable alone parses. No whitelist
         // address was given, so this IS a config that `validate()` rejects with
-        // `MissingWhitelistContract` — but that's a semantic check enforced at
-        // PreconfServiceBuilder::new time, not CLI parse time. Two-layer
-        // defense: clap catches syntax, validate() catches semantics.
+        // `MissingWhitelistContract` — a semantic check, which
+        // `MantleArgs::into_configs` runs, not clap.
         let a = parse(&["--preconf.enable"]);
         assert!(a.enable);
         let cfg = a.into_config().expect("enabled");
@@ -558,7 +638,7 @@ mod tests {
     fn numeric_overrides_replace_defaults() {
         // Every optional numeric flag must land on the corresponding
         // PreconfConfig field with the right unit conversion (ms/secs → Duration).
-        // Covers all 7 numeric tuning knobs — regression against silent
+        // Covers all 9 numeric tuning knobs — regression against silent
         // wiring drift when new flags are added.
         let a = parse(&[
             "--preconf.enable",
@@ -567,6 +647,10 @@ mod tests {
             "500",
             "--preconf.sweep-interval-ms",
             "25",
+            "--preconf.slot-duration-ms",
+            "3000",
+            "--preconf.queue-gas-blocks",
+            "4",
             "--preconf.max-gas-per-tx",
             "3000000",
             "--preconf.max-gas-per-block",
@@ -581,6 +665,8 @@ mod tests {
         let cfg = a.into_config().expect("enabled");
         assert_eq!(cfg.preconf_timeout, Duration::from_millis(500));
         assert_eq!(cfg.sweep_interval, Duration::from_millis(25));
+        assert_eq!(cfg.slot_duration, Duration::from_millis(3000));
+        assert_eq!(cfg.preconf_queue_gas_blocks, 4);
         assert_eq!(cfg.preconf_max_gas_per_tx, 3_000_000);
         assert_eq!(cfg.preconf_max_gas_per_block, 9_000_000);
         assert_eq!(cfg.rejournal_interval, Duration::from_secs(30));
@@ -963,5 +1049,168 @@ mod tests {
 
         assert!(cfgs.publisher.is_some());
         assert!(cfgs.consumer.is_some());
+    }
+
+    /// Preconf is validated before the publisher reads it: an invalid preconf
+    /// config is refused even where the publisher's own checks would pass.
+    #[test]
+    fn an_invalid_preconf_config_fails_the_startup_gate() {
+        let err = parse_mantle(&["--preconf.enable"]).into_configs().unwrap_err();
+        assert_eq!(err, MantleArgsError::Preconf(PreconfConfigError::MissingWhitelistContract));
+
+        let err = parse_mantle(&[
+            "--preconf.enable",
+            "--preconf.all",
+            "--preconf.slot-duration-ms",
+            "60001",
+            "--flashblocks.enable",
+        ])
+        .into_configs()
+        .unwrap_err();
+        assert!(
+            matches!(err, MantleArgsError::Preconf(PreconfConfigError::SlotDurationTooLong { .. })),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_preconf_timeout_within_the_safety_margin_fails_the_startup_gate() {
+        let err =
+            parse_mantle(&["--preconf.enable", "--preconf.all", "--preconf.timeout-ms", "40"])
+                .into_configs()
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MantleArgsError::Preconf(PreconfConfigError::TimeoutWithinSafetyMargin { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A node with `--rollup.sequencer` forwards transactions instead of
+    /// building blocks; preconf there would answer requests locally and time
+    /// every one of them out.
+    #[test]
+    fn preconf_on_a_forwarding_node_fails_the_startup_gate() {
+        let err = parse_mantle(&[
+            "--preconf.enable",
+            "--preconf.all",
+            "--rollup.sequencer",
+            "http://sequencer:8545",
+        ])
+        .into_configs()
+        .unwrap_err();
+        assert_eq!(err, MantleArgsError::PreconfOnForwardingNode);
+
+        assert!(
+            parse_mantle(&["--rollup.sequencer", "http://sequencer:8545"]).into_configs().is_ok(),
+            "forwarding without preconf is the ordinary follower"
+        );
+    }
+
+    #[test]
+    fn a_flashblocks_block_time_below_the_minimum_fails_the_startup_gate() {
+        let err = parse_mantle(&[
+            "--preconf.enable",
+            "--preconf.all",
+            "--flashblocks.enable",
+            "--flashblocks.block-time",
+            "99",
+        ])
+        .into_configs()
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MantleArgsError::Publisher(FlashblockProducerConfigError::BlockTimeTooShort { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn flashblocks_port_zero_fails_the_startup_gate() {
+        let err = parse_mantle(&[
+            "--preconf.enable",
+            "--preconf.all",
+            "--flashblocks.enable",
+            "--flashblocks.port",
+            "0",
+        ])
+        .into_configs()
+        .unwrap_err();
+        assert_eq!(err, MantleArgsError::ZeroFlashblocksPort);
+    }
+
+    /// Every tuning flag of a group is refused at parse time without the
+    /// group's switch, and accepted with it.
+    #[test]
+    fn tuning_flags_require_their_switch() {
+        let preconf = [
+            ("--preconf.journal-path", Some("/tmp/journal")),
+            ("--preconf.all", None),
+            ("--preconf.whitelist-contract", Some("0x1111111111111111111111111111111111111111")),
+            ("--preconf.timeout-ms", Some("500")),
+            ("--preconf.sweep-interval-ms", Some("100")),
+            ("--preconf.slot-duration-ms", Some("2000")),
+            ("--preconf.max-gas-per-tx", Some("1")),
+            ("--preconf.max-gas-per-block", Some("1")),
+            ("--preconf.queue-gas-blocks", Some("1")),
+            ("--preconf.rejournal-interval-secs", Some("1")),
+            ("--preconf.journal-max-size", Some("1")),
+            ("--preconf.broadcast-cap", Some("1")),
+        ];
+        let publisher = [
+            ("--flashblocks.addr", Some("0.0.0.0")),
+            ("--flashblocks.port", Some("2222")),
+            ("--flashblocks.block-time", Some("200")),
+            ("--flashblocks.leeway-time", Some("0")),
+            ("--flashblocks.best-tx-lead-slices", Some("1")),
+        ];
+        let consumer = [
+            ("--flashblocks.ping-interval-secs", Some("2")),
+            ("--flashblocks.max-trailing-depth", Some("3")),
+            ("--flashblocks.max-leading-depth", Some("3")),
+            ("--flashblocks.max-cache-ahead-blocks", Some("5")),
+        ];
+        let try_parse = |argv: &[&str]| {
+            TestMantleCli::try_parse_from(std::iter::once(&"reth").chain(argv.iter()))
+        };
+        for (switch, flags) in [
+            (&["--preconf.enable"][..], &preconf[..]),
+            (&["--flashblocks.enable"][..], &publisher[..]),
+            (&["--flashblocks.websocket-url", "ws://sequencer:1111"][..], &consumer[..]),
+        ] {
+            for &(name, value) in flags {
+                let flag: Vec<&str> = std::iter::once(name).chain(value).collect();
+
+                let err = try_parse(&flag).expect_err(name);
+                assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument, "{name}");
+
+                let with_switch: Vec<&str> = switch.iter().copied().chain(flag).collect();
+                assert!(try_parse(&with_switch).is_ok(), "{name} with {switch:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn consumer_intervals_above_their_maximum_fail() {
+        let consumer = |argv: &[&str]| {
+            let mut full = vec!["--flashblocks.websocket-url", "ws://sequencer:1111"];
+            full.extend_from_slice(argv);
+            parse_mantle(&full).flashblocks_consumer.into_config(None)
+        };
+
+        assert_eq!(
+            consumer(&["--flashblocks.ping-interval-secs", "301"]).unwrap_err(),
+            FlashblocksConsumerArgsError::PingIntervalTooLong { secs: 301 },
+        );
+        assert!(consumer(&["--flashblocks.ping-interval-secs", "300"]).is_ok());
+        assert_eq!(
+            consumer(&["--flashblocks.max-cache-ahead-blocks", "257"]).unwrap_err(),
+            FlashblocksConsumerArgsError::CacheAheadTooLarge { blocks: 257 },
+        );
+        assert!(consumer(&["--flashblocks.max-cache-ahead-blocks", "256"]).is_ok());
     }
 }
