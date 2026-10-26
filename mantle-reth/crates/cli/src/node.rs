@@ -531,8 +531,7 @@ where
             // build the RPC handler.
             let preconf_handler: Option<Arc<dyn mantle_reth_rpc_ext::DynPreconfHandler>> =
                 preconf.as_ref().map(|svc| {
-                    let canon =
-                        svc.canon_handler(ctx.node().provider().clone());
+                    let canon = svc.canon_handler(ctx.node().provider().clone());
                     ctx.node()
                         .task_executor()
                         .spawn_critical_task("mantle-preconf-canon-handler", canon.run());
@@ -657,7 +656,11 @@ where
                     );
                     ctx.modules.replace_configured(pubsub.into_rpc())?;
 
-                    info!(target: "reth::cli", url = %cfg.websocket_url, "Mantle flashblock consumer started");
+                    info!(
+                        target: "reth::cli",
+                        url = %mantle_reth_flashblocks::redact_ws_url(cfg.websocket_url.as_str()),
+                        "Mantle flashblock consumer started",
+                    );
                     Ok(state)
                 })
                 .transpose()?;
@@ -668,9 +671,10 @@ where
                 sequencer_client,
                 preconf_handler,
             )
-            .with_pending_overrides(flashblocks_state.map(|state| {
-                state as Arc<dyn mantle_reth_flashblocks::PendingStateOverrides>
-            }));
+            .with_pending_overrides(
+                flashblocks_state
+                    .map(|state| state as Arc<dyn mantle_reth_flashblocks::PendingStateOverrides>),
+            );
             // `replace_configured`, not `merge_configured`: this module now also serves
             // `eth_simulateV1`, which the standard `eth_` namespace already registers. Merging a
             // duplicate method name fails, so remove-then-add to override it. The other methods in

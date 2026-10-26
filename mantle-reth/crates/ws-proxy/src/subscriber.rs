@@ -8,7 +8,9 @@ use std::{
 use axum::http::Uri;
 use backoff::{ExponentialBackoff, backoff::Backoff};
 use futures::{SinkExt, StreamExt};
-use mantle_reth_flashblocks_types::MAX_DECOMPRESSED_FLASHBLOCK_BYTES as MAX_SLICE_BYTES;
+use mantle_reth_flashblocks_types::{
+    MAX_DECOMPRESSED_FLASHBLOCK_BYTES as MAX_SLICE_BYTES, redact_ws_url, ws_url_endpoint,
+};
 use tokio::{select, sync::oneshot};
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -92,6 +94,9 @@ where
     F: Fn(String) + Send + Sync + 'static,
 {
     uri: Uri,
+    /// `uri` for logs: the upstream's API key and query hidden.
+    uri_redacted: String,
+    /// `uri`'s `host:port`, for metric labels.
     uri_label: String,
     handler: F,
     backoff: ExponentialBackoff,
@@ -105,7 +110,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebsocketSubscriber")
-            .field("uri", &self.uri)
+            .field("uri", &self.uri_redacted)
             .field("options", &self.options)
             .field("last_position", &self.last_position)
             .finish_non_exhaustive()
@@ -125,19 +130,20 @@ where
             ..Default::default()
         };
 
-        let uri_label = uri.to_string();
-        Self { uri, uri_label, handler, backoff, options, last_position: None }
+        let uri_redacted = redact_ws_url(&uri.to_string());
+        let uri_label = ws_url_endpoint(&uri.to_string());
+        Self { uri, uri_redacted, uri_label, handler, backoff, options, last_position: None }
     }
 
     /// Runs the subscriber loop, reconnecting on failure until the token is cancelled.
     pub async fn run(&mut self, token: CancellationToken) {
-        info!(message = "starting upstream subscription", uri = %self.uri);
+        info!(message = "starting upstream subscription", uri = %self.uri_redacted);
         loop {
             select! {
                 _ = token.cancelled() => {
                     info!(
                         message = "cancelled upstream subscription",
-                        uri = %self.uri
+                        uri = %self.uri_redacted
                     );
                     return;
                 }
@@ -146,13 +152,13 @@ where
                         Ok(()) => {
                             info!(
                                 message = "upstream connection closed",
-                                uri = %self.uri
+                                uri = %self.uri_redacted
                             );
                         }
                         Err(e) => {
                             error!(
                                 message = "upstream websocket error",
-                                uri = %self.uri,
+                                uri = %self.uri_redacted,
                                 error = e.to_string()
                             );
                             Metrics::upstream_errors().increment(1);
@@ -160,14 +166,14 @@ where
                             if let Some(duration) = self.backoff.next_backoff() {
                                 warn!(
                                     message = "reconnecting",
-                                    uri = %self.uri,
+                                    uri = %self.uri_redacted,
                                     seconds = duration.as_secs()
                                 );
                                 select! {
                                     _ = token.cancelled() => {
                                         info!(
                                             message = "cancelled subscriber during backoff",
-                                            uri = %self.uri
+                                            uri = %self.uri_redacted
                                         );
                                         return
                                     }
@@ -195,14 +201,18 @@ where
         );
 
         with_params.parse().unwrap_or_else(|e| {
-            warn!(error = %e, uri = %with_params, "Failed to parse reconnect URI, falling back to base URI");
+            warn!(error = %e, uri = %self.uri_redacted, "Failed to parse reconnect URI, falling back to base URI");
             self.uri.clone()
         })
     }
 
     async fn connect_and_listen(&mut self) -> Result<(), Error> {
         let connect_uri = self.connect_uri();
-        info!(message = "connecting to websocket", uri = %connect_uri);
+        info!(
+            message = "connecting to websocket",
+            uri = %self.uri_redacted,
+            resume_from = ?self.last_position,
+        );
 
         Metrics::upstream_connection_attempts().increment(1);
 
@@ -222,7 +232,7 @@ where
                 }
             };
 
-        info!(message = "websocket connection established", uri = %connect_uri);
+        info!(message = "websocket connection established", uri = %self.uri_redacted);
 
         Metrics::upstream_connections().increment(1);
         self.backoff.reset();
@@ -256,7 +266,7 @@ where
                     if Instant::now() >= pong_deadline {
                         error!(
                             message = "pong timeout from upstream",
-                            uri = %self.uri
+                            uri = %self.uri_redacted
                         );
                         break Err(ConnectionClosed);
                     }
@@ -304,7 +314,7 @@ where
             Err(e) => {
                 error!(
                     message = "error receiving message",
-                    uri = %self.uri,
+                    uri = %self.uri_redacted,
                     error = e.to_string()
                 );
                 return Err(e);
@@ -316,7 +326,7 @@ where
                 if text.len() > MAX_SLICE_BYTES {
                     warn!(
                         message = "dropping oversized text message",
-                        uri = %self.uri,
+                        uri = %self.uri_redacted,
                         size = text.len(),
                         max = MAX_SLICE_BYTES
                     );
@@ -325,29 +335,29 @@ where
 
                 trace!(
                     message = "received text message",
-                    uri = %self.uri,
+                    uri = %self.uri_redacted,
                     payload = text.as_str()
                 );
                 self.deliver(text.to_string());
             }
             Message::Binary(data) => {
-                trace!(message = "received binary message", uri = %self.uri, size = data.len());
+                trace!(message = "received binary message", uri = %self.uri_redacted, size = data.len());
 
                 match decode_binary_slice(&data) {
                     Some(text) => self.deliver(text),
                     None => warn!(
                         message = "dropping undecodable binary message",
-                        uri = %self.uri,
+                        uri = %self.uri_redacted,
                         size = data.len()
                     ),
                 }
             }
             Message::Pong(_) => {
-                trace!(message = "received pong from upstream", uri = %self.uri);
+                trace!(message = "received pong from upstream", uri = %self.uri_redacted);
                 *pong_deadline = Instant::now() + pong_timeout;
             }
             Message::Close(_) => {
-                info!(message = "received close frame from upstream", uri = %self.uri);
+                info!(message = "received close frame from upstream", uri = %self.uri_redacted);
                 return Err(ConnectionClosed);
             }
             _ => {}
@@ -924,5 +934,19 @@ mod tests {
             connect_uri.to_string(),
             "ws://localhost:9999/ws?token=abc&block_number=200&flashblock_index=3"
         );
+    }
+
+    /// The upstream may be another proxy's `/ws/<key>` endpoint: neither the
+    /// key nor a query token may reach a log line or a metric label.
+    #[test]
+    fn the_upstream_key_stays_out_of_logs_and_labels() {
+        let uri: Uri = "ws://proxy:8545/ws/secret-key?token=secret-token".parse().unwrap();
+        let subscriber =
+            WebsocketSubscriber::new(uri, |_: String| {}, SubscriberOptions::default());
+
+        assert_eq!(subscriber.uri_redacted, "ws://proxy:8545/ws/***");
+        assert_eq!(subscriber.uri_label, "proxy:8545");
+        let debug = format!("{subscriber:?}");
+        assert!(!debug.contains("secret"), "{debug}");
     }
 }

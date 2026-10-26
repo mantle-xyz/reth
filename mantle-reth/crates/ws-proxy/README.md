@@ -213,7 +213,7 @@ Useful first checks:
 
 | Series | Reading |
 |---|---|
-| `flashblocks.proxy.upstream_messages` | **Absent** — not zero — means the upstream has delivered nothing; the proxy sends no subscribe request, it only reads |
+| `flashblocks.proxy.upstream_messages` | **Absent** — not zero — means the upstream has delivered nothing; the proxy sends no subscribe request, it only reads. Labelled `upstream=<host:port>`: the path and query, which can carry an API key, are never used in labels or logs |
 | `flashblocks.proxy.upstream_connection_failures` | Growing means the upstream URI or network is wrong |
 | `flashblocks.proxy.active_connections` | Current downstream subscribers |
 | `flashblocks.proxy.lagged_connections` | Subscribers dropped for falling more than `--message-buffer-size` behind |

@@ -264,7 +264,11 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
         Metrics::init();
     }
 
-    info!(target: "ws-proxy", uri = %args.upstream_ws, "using upstream URI");
+    info!(
+        target: "ws-proxy",
+        uri = %mantle_reth_flashblocks_types::redact_ws_url(&args.upstream_ws.to_string()),
+        "using upstream URI",
+    );
 
     // `_rec` keeps the channel alive through any moment with no clients, and is
     // discounted from the connection gauge by `upstream_listener`.
@@ -285,7 +289,11 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
         let mut subscriber = WebsocketSubscriber::new(uri.clone(), listener, options);
         let token = token.clone();
         tokio::spawn(async move {
-            info!(target: "ws-proxy", uri = %uri, "starting subscriber");
+            info!(
+                target: "ws-proxy",
+                uri = %mantle_reth_flashblocks_types::redact_ws_url(&uri.to_string()),
+                "starting subscriber",
+            );
             subscriber.run(token).await;
         })
     };
@@ -347,18 +355,37 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
 
-    tokio::select! {
-        _ = subscriber_task => {
-            info!(target: "ws-proxy", "all subscriber tasks terminated");
+    // Only a signal ends the proxy cleanly. Any task ending first is a failure,
+    // returned so the process exits non-zero and an on-failure supervisor
+    // restarts it.
+    let outcome = tokio::select! {
+        joined = subscriber_task => Err(unexpected_end("subscriber", joined)),
+        () = server_task => Err(eyre::eyre!("server task stopped")),
+        joined = ping_task => Err(unexpected_end("client ping", joined)),
+        _ = interrupt.recv() => {
+            info!(target: "ws-proxy", "interrupted, shutting down");
+            Ok(())
         }
-        _ = server_task => info!(target: "ws-proxy", "server task terminated"),
-        _ = ping_task => info!(target: "ws-proxy", "ping task terminated"),
-        _ = interrupt.recv() => info!(target: "ws-proxy", "interrupted, shutting down"),
-        _ = terminate.recv() => info!(target: "ws-proxy", "terminated, shutting down"),
+        _ = terminate.recv() => {
+            info!(target: "ws-proxy", "terminated, shutting down");
+            Ok(())
+        }
+    };
+    if let Err(error) = &outcome {
+        error!(target: "ws-proxy", %error, "a task ended while the proxy was running; exiting");
     }
 
     token.cancel();
-    Ok(())
+    outcome
+}
+
+/// The error for a spawned task that ended while the proxy was running.
+fn unexpected_end(task: &str, joined: Result<(), tokio::task::JoinError>) -> eyre::Report {
+    match joined {
+        Ok(()) => eyre::eyre!("{task} task stopped"),
+        Err(e) if e.is_panic() => eyre::eyre!("{task} task panicked"),
+        Err(e) => eyre::eyre!("{task} task failed: {e}"),
+    }
 }
 
 /// Parses `label1=value1,label2=value2`, skipping malformed entries with a warning.
@@ -563,5 +590,14 @@ mod tests {
             argv.extend_from_slice(flags);
             refuse_unusable_args(&args_with(&argv)).unwrap_or_else(|e| panic!("{flags:?}: {e}"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_task_that_ends_is_reported_as_a_failure() {
+        let stopped = unexpected_end("subscriber", tokio::spawn(async {}).await);
+        assert!(stopped.to_string().contains("subscriber task stopped"), "{stopped}");
+
+        let panicked = unexpected_end("client ping", tokio::spawn(async { panic!("boom") }).await);
+        assert!(panicked.to_string().contains("client ping task panicked"), "{panicked}");
     }
 }
