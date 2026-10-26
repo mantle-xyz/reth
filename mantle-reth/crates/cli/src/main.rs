@@ -30,7 +30,6 @@ static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 fn main() {
     reth_cli_util::sigsegv_handler::install();
     mantle_reth_cli::version::init_mantle_version();
-    mantle_reth_cli::rpc_defaults::init_rpc_defaults();
 
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         unsafe {
