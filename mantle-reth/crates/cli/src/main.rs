@@ -120,7 +120,7 @@ fn main() {
                 Some(cfg) => {
                     info!(
                         target: "reth::cli",
-                        url = %cfg.websocket_url,
+                        url = %mantle_reth_flashblocks::redact_ws_url(cfg.websocket_url.as_str()),
                         max_leading_depth = cfg.max_leading_depth,
                         "Mantle flashblock consumer ENABLED",
                     );

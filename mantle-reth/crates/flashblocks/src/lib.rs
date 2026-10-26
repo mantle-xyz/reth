@@ -51,6 +51,8 @@ pub use block_assembler::{AssembledBlock, BlockAssembler};
 mod canonical;
 pub use canonical::{await_canonical_match, forward_canonical_state};
 
+pub use mantle_reth_flashblocks_types::redact_ws_url;
+
 mod cache;
 pub use cache::{DEFAULT_MAX_CACHE_AHEAD_BLOCKS, FlashblockCache, MAX_CACHE_AHEAD_BLOCKS};
 

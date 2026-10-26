@@ -155,7 +155,9 @@ pub enum MantleArgsError {
 /// Separate from [`FlashblocksArgs`] despite sharing the `--flashblocks.`
 /// prefix: that group configures the publisher on a sequencer, this one the
 /// consumer on an RPC node. The flag names are disjoint.
-#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+///
+/// `Debug` shows `websocket_url` redacted: it can carry an API key.
+#[derive(Clone, PartialEq, Eq, Args, Default)]
 pub struct FlashblocksConsumerArgs {
     /// Websocket endpoint streaming flashblocks to the Mantle consumer.
     ///
@@ -203,6 +205,30 @@ pub struct FlashblocksConsumerArgs {
         requires = "websocket_url"
     )]
     pub max_cache_ahead_blocks: Option<u64>,
+}
+
+impl std::fmt::Debug for FlashblocksConsumerArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            websocket_url,
+            ping_interval_secs,
+            max_trailing_depth,
+            max_leading_depth,
+            max_cache_ahead_blocks,
+        } = self;
+        f.debug_struct("FlashblocksConsumerArgs")
+            .field(
+                "websocket_url",
+                &websocket_url
+                    .as_ref()
+                    .map(|url| mantle_reth_flashblocks::redact_ws_url(url.as_str())),
+            )
+            .field("ping_interval_secs", ping_interval_secs)
+            .field("max_trailing_depth", max_trailing_depth)
+            .field("max_leading_depth", max_leading_depth)
+            .field("max_cache_ahead_blocks", max_cache_ahead_blocks)
+            .finish()
+    }
 }
 
 impl FlashblocksConsumerArgs {
@@ -1212,5 +1238,23 @@ mod tests {
             FlashblocksConsumerArgsError::CacheAheadTooLarge { blocks: 257 },
         );
         assert!(consumer(&["--flashblocks.max-cache-ahead-blocks", "256"]).is_ok());
+    }
+
+    /// The consumer URL can carry an API key, and both the parsed arguments
+    /// and the resolved configs are `Debug`; neither may print it.
+    #[test]
+    fn debug_output_hides_the_consumer_key() {
+        let args = parse_mantle(&[
+            "--flashblocks.websocket-url",
+            "ws://proxy:8545/ws/secret-key?token=secret-token",
+        ]);
+        let printed = format!("{args:?}");
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(printed.contains("ws://proxy:8545/ws/***"), "{printed}");
+
+        let configs = args.into_configs().expect("a consumer alone is valid");
+        let printed = format!("{configs:?}");
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(printed.contains("ws://proxy:8545/ws/***"), "{printed}");
     }
 }

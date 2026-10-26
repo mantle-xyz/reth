@@ -29,8 +29,10 @@ pub mod decoding;
 pub mod error;
 pub mod metadata;
 pub mod payload;
+pub mod redact;
 
 pub use decoding::MAX_DECOMPRESSED_FLASHBLOCK_BYTES;
 pub use error::FlashblockDecodeError;
 pub use metadata::{FlashblockId, MantleFlashblockMetadata};
 pub use payload::MantleFlashblockPayload;
+pub use redact::{redact_ws_url, ws_url_endpoint};

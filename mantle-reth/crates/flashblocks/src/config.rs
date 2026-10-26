@@ -35,7 +35,9 @@ pub const DEFAULT_MAX_TRAILING_DEPTH: u64 = 3;
 pub const DEFAULT_MAX_LEADING_DEPTH: u64 = 3;
 
 /// Flashblocks-specific configuration knobs.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows `websocket_url` redacted: it can carry an API key.
+#[derive(Clone)]
 pub struct FlashblocksConfig {
     /// The websocket endpoint that streams flashblock updates.
     pub websocket_url: Url,
@@ -49,6 +51,25 @@ pub struct FlashblocksConfig {
     /// See [`DEFAULT_SUBSCRIBER_PING_INTERVAL`]. Capped at
     /// [`MAX_SUBSCRIBER_PING_INTERVAL`].
     pub subscriber_ping_interval: Duration,
+}
+
+impl std::fmt::Debug for FlashblocksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            websocket_url,
+            max_trailing_depth,
+            max_leading_depth,
+            max_cache_ahead_blocks,
+            subscriber_ping_interval,
+        } = self;
+        f.debug_struct("FlashblocksConfig")
+            .field("websocket_url", &crate::redact_ws_url(websocket_url.as_str()))
+            .field("max_trailing_depth", max_trailing_depth)
+            .field("max_leading_depth", max_leading_depth)
+            .field("max_cache_ahead_blocks", max_cache_ahead_blocks)
+            .field("subscriber_ping_interval", subscriber_ping_interval)
+            .finish()
+    }
 }
 
 impl FlashblocksConfig {

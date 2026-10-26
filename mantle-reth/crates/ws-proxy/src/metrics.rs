@@ -54,7 +54,7 @@ macro_rules! proxy_metrics {
                 );
                 metrics::describe_counter!(
                     UPSTREAM_MESSAGES,
-                    "Messages received from upstream, by upstream URI"
+                    "Messages received from upstream, by upstream host:port"
                 );
             }
         }
@@ -139,7 +139,8 @@ impl Metrics {
         metrics::counter!(CONNECTIONS_BY_APP, "app" => app)
     }
 
-    /// The `flashblocks.proxy.upstream_messages` series, labelled by upstream URL.
+    /// The `flashblocks.proxy.upstream_messages` series, labelled by upstream
+    /// `host:port` — never the full URI, which can carry an API key.
     pub fn upstream_messages(upstream: String) -> Counter {
         metrics::counter!(UPSTREAM_MESSAGES, "upstream" => upstream)
     }

@@ -3,7 +3,9 @@
 use std::{sync::Arc, time::Duration};
 
 use futures::{SinkExt as _, StreamExt};
-use mantle_reth_flashblocks_types::{MAX_DECOMPRESSED_FLASHBLOCK_BYTES, MantleFlashblockPayload};
+use mantle_reth_flashblocks_types::{
+    MAX_DECOMPRESSED_FLASHBLOCK_BYTES, MantleFlashblockPayload, redact_ws_url,
+};
 use tokio::{
     sync::mpsc,
     time::{Instant, interval_at},
@@ -25,11 +27,19 @@ struct StreamPosition {
 }
 
 /// Subscribes to flashblocks via `WebSocket` and forwards them to the receiver.
-#[derive(Debug)]
 pub struct FlashblocksSubscriber<Receiver> {
     flashblocks_state: Arc<Receiver>,
     ws_url: Url,
     ping_interval: Duration,
+}
+
+impl<Receiver> std::fmt::Debug for FlashblocksSubscriber<Receiver> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlashblocksSubscriber")
+            .field("ws_url", &redact_ws_url(self.ws_url.as_str()))
+            .field("ping_interval", &self.ping_interval)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Appends `block_number` / `flashblock_index` resume parameters to `ws_url`.
@@ -47,7 +57,11 @@ fn resume_url(ws_url: &Url, position: Option<StreamPosition>) -> Url {
         format!("{base}{separator}block_number={block_number}&flashblock_index={flashblock_index}");
 
     with_params.parse().unwrap_or_else(|e| {
-        warn!(error = %e, url = %with_params, "failed to parse resume URL, falling back to base URL");
+        warn!(
+            error = %e,
+            url = %redact_ws_url(ws_url.as_str()),
+            "failed to parse resume URL, falling back to base URL",
+        );
         ws_url.clone()
     })
 }
@@ -70,7 +84,10 @@ where
 
     /// Starts the `WebSocket` subscription to receive flashblocks.
     pub fn start(&mut self) {
-        info!(message = "starting flashblocks subscription", url = %self.ws_url);
+        info!(
+            message = "starting flashblocks subscription",
+            url = %redact_ws_url(self.ws_url.as_str()),
+        );
 
         let ws_url = self.ws_url.clone();
         let ping_period = effective_ping_period(self.ping_interval);
@@ -89,7 +106,11 @@ where
                 match connect_async_with_config(connect_url.as_str(), Some(config), false).await {
                     Ok((ws_stream, _)) => {
                         backoff = Duration::from_secs(1);
-                        info!(message = "websocket connection established", url = %connect_url);
+                        info!(
+                            message = "websocket connection established",
+                            url = %redact_ws_url(connect_url.as_str()),
+                            resume_from = ?last_position,
+                        );
 
                         let mut ping_interval =
                             interval_at(Instant::now() + ping_period, ping_period);
@@ -353,5 +374,23 @@ mod tests {
         let resumed =
             resume_url(&url, Some(StreamPosition { block_number: 7, flashblock_index: 0 }));
         assert_eq!(resumed.as_str(), "ws://localhost:9999/ws?block_number=7&flashblock_index=0");
+    }
+
+    #[test]
+    fn debug_output_hides_the_key_in_the_url() {
+        let url: Url = "ws://proxy:8545/ws/secret-key?token=secret-token".parse().unwrap();
+        struct Ignore;
+        impl crate::FlashblocksReceiver for Ignore {
+            fn on_flashblock_received(&self, _: MantleFlashblockPayload) {}
+        }
+        let subscriber = FlashblocksSubscriber::new(
+            std::sync::Arc::new(Ignore),
+            url,
+            std::time::Duration::from_secs(2),
+        );
+
+        let debug = format!("{subscriber:?}");
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(debug.contains("ws://proxy:8545/ws/***"), "{debug}");
     }
 }
