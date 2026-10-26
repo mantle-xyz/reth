@@ -129,13 +129,12 @@ const COUNTERS: &[&str] = &[
     "preconf.whitelist.revoked_total",
     // The pair that says whether the in-memory allowlist is still tracking the
     // contract. Seeding matters more than usual here: a refresh only ever runs on
-    // a governance update or a reorg, so on a quiet chain both series would stay
-    // unregistered for hours and "never refreshed" would be indistinguishable
-    // from "refreshing fine".
+    // a governance update, or a reorg or gap that moved `listsHash`, so on a quiet
+    // chain both series would stay unregistered for hours and "never refreshed"
+    // would be indistinguishable from "refreshing fine".
     "preconf.whitelist.reload_ok",
     "preconf.whitelist.reload_failed",
-    // A reorg or a notification gap where `listsHash` at the head matched the
-    // shared lists, so the watcher skipped the full re-read.
+    // The watcher skipped a full re-read: `listsHash` at the head was unchanged.
     "preconf.whitelist.reload_skipped_total",
 ];
 

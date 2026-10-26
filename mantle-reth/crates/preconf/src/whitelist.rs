@@ -11,9 +11,9 @@
 //!
 //! * [`bootstrap_whitelist`] — cold start. Verifies the configured address actually holds a
 //!   contract, then loads all three sets.
-//! * [`run_whitelist_watcher`] — long-running task. Re-reads whenever a canonical block carries a
-//!   `WhitelistUpdated` log, or a reorg lands.
-//! * [`refresh_for_parent`] — at the start of each build. The watcher can still be behind the
+//! * [`run_whitelist_watcher`] — long-running task. Re-reads on a `WhitelistUpdated` log; after a
+//!   reorg or a notification gap, only if `listsHash` moved.
+//! * `whitelist_for_build` — at the start of each build. The watcher can still be behind the
 //!   build's parent; the contract's `listsHash` at that parent says so, and the build then uses the
 //!   parent's lists instead.
 //!
@@ -102,8 +102,8 @@ pub const LAYOUT_VERSION_SLOT: u64 = 6;
 /// Slot of `bytes32 listsHash`: a commitment the contract chains forward on
 /// every update, `keccak256(abi.encode(previous, add, remove))`.
 ///
-/// Read with the lists, and on its own at a block's parent to tell whether the
-/// lists a build is about to use are that parent's — see [`refresh_for_parent`].
+/// Read with the lists, and on its own to check whether a copy of them is
+/// current.
 pub const LISTS_HASH_SLOT: u64 = 8;
 
 /// The layout this binary knows how to read.
@@ -125,8 +125,8 @@ pub const EXPECTED_LAYOUT_VERSION: u64 = 3;
 /// `test_whitelistUpdatedTopic0_matchesTheEmittedLog_succeeds` in
 /// `test/PreconfWhitelist.t.sol`, which reads it off an emitted log rather than
 /// hashing the signature as a string. If the event signature changes and this
-/// constant does not, the watcher stops firing and the sequencer runs forever on
-/// a stale allowlist — silently, having loaded the lists once at bootstrap.
+/// constant does not, the watcher stops re-reading on updates: builds still get
+/// the right lists through `listsHash`, but RPC admission's copy goes stale.
 pub const WHITELIST_UPDATED_TOPIC0: B256 = B256::new([
     0x53, 0x2f, 0xe7, 0x09, 0xf3, 0x40, 0xed, 0xa4, 0x0c, 0x9d, 0x51, 0xe7, 0xdb, 0xba, 0xcf, 0x9d,
     0x5b, 0x25, 0x5b, 0x36, 0x42, 0x9e, 0xd9, 0x0f, 0x86, 0x5b, 0xd2, 0xa3, 0x13, 0x1e, 0xf1, 0xbc,
@@ -810,10 +810,8 @@ pub(crate) fn refresh_for_parent(
 
 /// The allowlist a build on `parent_hash` judges its preconf entries against.
 ///
-/// `snapshot` itself when it is the parent's lists; the parent's lists, for this
-/// build only, when [`refresh_for_parent`] finds it behind. If that check or read
-/// fails, `snapshot` is used anyway: the watcher still corrects the shared copy,
-/// and only this build risks using the lists from before the parent's update.
+/// `snapshot`, or the parent's lists when [`refresh_for_parent`] finds it behind.
+/// If that fails, `snapshot`: the watcher still corrects the shared copy.
 pub(crate) fn whitelist_for_build(
     state: &StateProviderBox,
     contract: Address,
@@ -843,9 +841,7 @@ pub(crate) fn whitelist_for_build(
     }
 }
 
-/// Whether the shared allowlist was read with the `listsHash` the contract holds
-/// at the canonical head, which means a full re-read would install the same
-/// lists.
+/// Whether the shared allowlist was read with the head's `listsHash`.
 fn shared_lists_are_current<P: WhitelistState>(
     provider: &P,
     contract: Address,
@@ -951,12 +947,11 @@ pub fn has_whitelist_event<N: NodePrimitives>(chain: &Chain<N>, contract: Addres
     })
 }
 
-/// Whether `notif` means the allowlists must be re-read.
+/// Whether `notif` may have changed the allowlists — see
+/// [`run_whitelist_watcher`] for what follows.
 ///
-/// The watcher's whole decision, extracted so it can be unit-tested against real
-/// [`CanonStateNotification`]s without standing up a notification stream
-/// (`MockEthProvider` cannot emit any — its subscription drops the sender). See
-/// [`run_whitelist_watcher`] for why a reorg counts on its own.
+/// Split out so it can be unit-tested against real [`CanonStateNotification`]s
+/// (`MockEthProvider` cannot emit any).
 pub fn should_reload<N: NodePrimitives>(
     notif: &CanonStateNotification<N>,
     contract: Address,
@@ -976,12 +971,14 @@ pub fn should_reload<N: NodePrimitives>(
 /// Event-driven rather than parsing the deposit that carried the update.
 /// Watching for the effect rather than decoding the cause is reorg-safe for free
 /// — a revert un-happens without emitting anything, and `latest()` already
-/// accounts for it — and it needs no ABI binding at all, so this path cannot be
-/// broken by a signature change. [`decode_whitelist_update`] exists for the one
-/// caller that genuinely cannot wait for the block to land (the payload builder,
-/// binding the block it is still building); everything here reads state.
+/// accounts for it — and it needs no ABI binding, so an `updatePreconfs`
+/// signature change cannot break it (topic0 can: [`WHITELIST_UPDATED_TOPIC0`]).
+/// [`decode_whitelist_update`] exists
+/// for the one caller that genuinely cannot wait for the block to land (the
+/// payload builder, binding the block it is still building); everything here
+/// reads state.
 ///
-/// # Why a reorg alone triggers a reload
+/// # Why a reorg alone triggers a check
 ///
 /// Two independent triggers, because **an event can only say that something
 /// happened, never that something un-happened**:
@@ -999,12 +996,9 @@ pub fn should_reload<N: NodePrimitives>(
 /// being an empty segment with no logs to scan.
 ///
 /// Deliberately coarse — it does not check whether the reverted segment contained
-/// a `WhitelistUpdated`. Instead the contract's `listsHash` at the new head is
-/// compared with the one the shared lists were read with: equal means they are
-/// current, and the full read is skipped; different means memory drifted, for
-/// whatever reason (a missed notification, a race between `latest()` and the
-/// notification), and the full read corrects it. A gap in the notifications
-/// takes the same check.
+/// a `WhitelistUpdated`; the head's `listsHash` decides instead. Equal skips the
+/// full read; different means memory drifted, for whatever reason, and the full
+/// read corrects it. A notification gap takes the same check.
 ///
 /// A failed refresh is logged and never kills the task — the previous allowlists
 /// stay in force, and every canonical notification retries until one succeeds.
@@ -1046,8 +1040,7 @@ pub async fn run_whitelist_watcher<Pr, N>(
     loop {
         // The failure log below reports whether this pass was triggered by a
         // reorg; a gap has no notification to ask, so it answers `false`.
-        // `may_be_unchanged`: nothing announced an update — only a reorg or a gap
-        // triggered this pass, so the lists may well be as they were.
+        // `may_be_unchanged`: only a reorg or a gap triggered this pass.
         let (reverted, may_be_unchanged) = match receiver.recv().await {
             Ok(notif) => {
                 if !should_reload(&notif, contract) && !retry_pending {
@@ -1057,8 +1050,7 @@ pub async fn run_whitelist_watcher<Pr, N>(
                 (notif.reverted().is_some(), !has_whitelist_event(&committed, contract))
             }
             // A gap may have carried the governance event this watcher exists
-            // for, and there is no way to ask which blocks were skipped, so it is
-            // treated like a reorg: the head's `listsHash` decides.
+            // for; like a reorg, the head's `listsHash` decides.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 metrics::counter!(
                     "mantle.canon.notifications_lagged_total",
@@ -1076,9 +1068,8 @@ pub async fn run_whitelist_watcher<Pr, N>(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         };
 
-        // One storage read instead of the full one. A failed check falls through
-        // to the full read, which reports the error. Not while a failure is
-        // pending: that path keeps its own accounting until a read succeeds.
+        // One storage read instead of the full one. A failed check, or a pending
+        // retry, takes the full read.
         if may_be_unchanged &&
             !retry_pending &&
             matches!(shared_lists_are_current(&provider, contract, &classifier), Ok(true))
@@ -1526,8 +1517,8 @@ mod tests {
         assert!(scrape.contains("preconf_whitelist_build_reread_total 1\n"), "{scrape}");
     }
 
-    /// When the parent's lists cannot be read, the build falls back to the shared
-    /// snapshot rather than failing, and counts the failure.
+    /// When the parent's lists cannot be read, the build keeps the shared
+    /// snapshot, and counts the failure.
     #[test]
     fn a_build_whose_parent_read_fails_keeps_the_shared_snapshot() {
         // `listsHash` moved, so the lists are read — and the pairs length is not
@@ -1556,8 +1547,7 @@ mod tests {
         assert!(!scrape.contains("preconf_whitelist_build_reread_total"), "{scrape}");
     }
 
-    /// The watcher's check: the shared lists are current exactly when they were
-    /// read with the head's `listsHash`.
+    /// The watcher's check: current exactly when the hashes match.
     #[test]
     fn shared_lists_are_current_when_the_head_hash_matches() {
         let head = B256::repeat_byte(0x42);
@@ -2199,8 +2189,7 @@ mod tests {
 
         #[test]
         fn reorg_triggers_reload_even_with_no_whitelist_activity() {
-            // Deliberately coarse: any reorg re-reads, which is what makes the
-            // cache self-healing after a missed notification or a failed reload.
+            // Any reorg goes to the `listsHash` check.
             let notif = CanonStateNotification::Reorg { old: quiet_chain(), new: quiet_chain() };
             assert!(should_reload(&notif, WL));
         }
@@ -2213,8 +2202,7 @@ mod tests {
 
         #[test]
         fn other_contracts_reorg_still_triggers_reload() {
-            // The reorg branch is contract-agnostic on purpose — we cannot know
-            // whether our contract's state moved without re-reading it.
+            // Contract-agnostic on purpose; the `listsHash` check settles it.
             let notif = CanonStateNotification::Reorg {
                 old: Arc::new(chain_with_logs(vec![log(addr(1), WHITELIST_UPDATED_TOPIC0)])),
                 new: Arc::new(Chain::<OpPrimitives>::default()),

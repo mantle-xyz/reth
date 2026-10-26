@@ -53,9 +53,9 @@ pub struct Whitelist {
     /// Recipients that make any transaction to them eligible, whatever the
     /// sender.
     pub to_wildcards: HashSet<Address>,
-    /// The contract's `listsHash` these sets were read with — what a build
-    /// compares against its parent's to tell whether they are current (see
-    /// `whitelist::refresh_for_parent`). Zero when not read from a contract.
+    /// The contract's `listsHash` these sets were read with; comparing it with
+    /// the contract's tells whether they are current. Zero when not read from a
+    /// contract.
     pub lists_hash: B256,
 }
 
