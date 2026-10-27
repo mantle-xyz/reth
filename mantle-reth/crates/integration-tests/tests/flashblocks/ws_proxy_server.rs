@@ -66,8 +66,8 @@ async fn a_filter_subscription_is_refused_when_filters_are_disabled() {
     let body = response.body().as_ref().expect("the refusal carries a body");
     let body = String::from_utf8_lossy(body);
     assert!(
-        body.contains("--enable-filters"),
-        "the refusal must name the flag that turns it on; got {body}",
+        body.contains("/ws/<api_key>"),
+        "the refusal must point at the unfiltered route; got {body}",
     );
 }
 

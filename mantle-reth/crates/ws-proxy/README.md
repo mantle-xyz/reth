@@ -37,7 +37,7 @@ the upstream.
 | API-key authentication | `--api-keys app:key,...`, `--public-access-enabled` |
 | Client IP through forwarding proxies | `--ip-addr-http-header`, `--trusted-proxy-cidrs` |
 | Brotli compression downstream | `--enable-compression` |
-| Per-subscriber address/topic filtering ⚠️ **off by default — see below** | `--enable-filters`, query parameters on the subscribe URL |
+| Per-subscriber address/topic filtering ⚠️ **not supported — see below** | `--enable-filters` (refused at startup), query parameters on the subscribe URL |
 | Upstream keepalive and backoff | `--subscriber-ping-interval-ms`, `--subscriber-pong-timeout-ms`, `--subscriber-max-interval-ms` |
 | Downstream keepalive | `--client-ping-enabled`, `--client-ping-interval-ms`, `--client-pong-timeout-ms` |
 
@@ -158,7 +158,7 @@ still replay transactions locally rather than believe what arrives here.
 The exception is `FilterType`, which parses the slice as JSON to evaluate a
 subscriber's address and topic filters.
 
-### ⚠️ Filters are off by default, because this upstream cannot feed them
+### ⚠️ Filters are not supported, because this upstream cannot feed them
 
 Both filter kinds read `metadata.receipts` and `metadata.new_account_balances`,
 which the Mantle producer leaves empty on every slice. A topic filter therefore
@@ -170,11 +170,14 @@ Rather than accept a filter and silently return an empty stream,
 `/ws/{api_key}/filter` refuses a subscription carrying filter parameters with
 `501` and an explanation. The same route still serves an **unfiltered**
 subscription, which is what it is without query parameters.
+`flashblocks.proxy.filter_subscriptions_refused` counts subscribers who tried.
 
-`--enable-filters` turns the filtering on for an upstream that does populate
-those maps — a Base-derived one does. The matching logic itself is correct and
-covered; what is missing here is the data. `flashblocks.proxy.filter_subscriptions_refused`
-counts subscribers who tried.
+`--enable-filters` is refused at startup. Besides the missing data, filtering
+runs once per filtered client per slice — a full brotli decompress and JSON
+parse each time — so CPU grows with the number of filtered clients, and
+nothing caps the addresses or topics in one filter. Lifting the refusal needs
+all three fixed: a producer that fills those maps, one parse per slice shared
+by every client, and a per-filter cap.
 
 Which input feeds which filter, and why each spelling of an address behaves the
 way it does, is the module doc on `filter::mantle_shape`.
