@@ -20,11 +20,15 @@ use reth_rpc_eth_api::{
 };
 use reth_tasks::Runtime;
 use serde::Serialize;
-use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
+use tokio::sync::broadcast;
+use tokio_stream::{
+    Stream, StreamExt,
+    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
+};
 use tracing::error;
 
 use crate::{
-    FlashblocksAPI, TransactionWithLogs,
+    FlashblocksAPI, Metrics, TransactionWithLogs,
     rpc::types::{ExtendedSubscriptionKind, FlashblocksSubscriptionKind},
 };
 
@@ -76,16 +80,8 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
     where
         FB: FlashblocksAPI + Send + Sync + 'static,
     {
-        BroadcastStream::new(flashblocks_state.subscribe_to_flashblocks()).filter_map(|result| {
-            let pending_blocks = match result {
-                Ok(blocks) => blocks,
-                Err(err) => {
-                    error!(message = "error in flashblocks stream", error = %err);
-                    return None;
-                }
-            };
-            Some(pending_blocks.get_latest_block(true))
-        })
+        flashblock_updates(flashblocks_state.subscribe_to_flashblocks(), "newFlashblocks")
+            .map(|pending_blocks| pending_blocks.get_latest_block(true))
     }
 
     /// Yields matching logs from the latest flashblock only, one per message.
@@ -95,15 +91,8 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
     {
         futures::StreamExt::flat_map(
             StreamExt::filter_map(
-                BroadcastStream::new(flashblocks_state.subscribe_to_flashblocks()),
-                move |result| {
-                    let pending_blocks = match result {
-                        Ok(blocks) => blocks,
-                        Err(err) => {
-                            error!(message = "error in flashblocks stream for pending logs", error = %err);
-                            return None;
-                        }
-                    };
+                flashblock_updates(flashblocks_state.subscribe_to_flashblocks(), "pendingLogs"),
+                move |pending_blocks| {
                     let logs = pending_blocks.get_latest_flashblock_logs(&filter);
                     if logs.is_empty() { None } else { Some(logs) }
                 },
@@ -121,15 +110,11 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
     {
         futures::StreamExt::flat_map(
             StreamExt::filter_map(
-                BroadcastStream::new(flashblocks_state.subscribe_to_flashblocks()),
-                |result| {
-                    let pending_blocks = match result {
-                        Ok(blocks) => blocks,
-                        Err(err) => {
-                            error!(message = "error in flashblocks stream for transactions", error = %err);
-                            return None;
-                        }
-                    };
+                flashblock_updates(
+                    flashblocks_state.subscribe_to_flashblocks(),
+                    "newFlashblockTransactions(full)",
+                ),
+                |pending_blocks| {
                     let txs = pending_blocks.get_latest_flashblock_transactions_with_logs();
                     if txs.is_empty() { None } else { Some(txs) }
                 },
@@ -149,15 +134,11 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
     {
         futures::StreamExt::flat_map(
             StreamExt::filter_map(
-                BroadcastStream::new(flashblocks_state.subscribe_to_flashblocks()),
-                move |result| {
-                    let pending_blocks = match result {
-                        Ok(blocks) => blocks,
-                        Err(err) => {
-                            error!(message = "error in flashblocks stream for filtered transactions", error = %err);
-                            return None;
-                        }
-                    };
+                flashblock_updates(
+                    flashblocks_state.subscribe_to_flashblocks(),
+                    "newFlashblockTransactions(filtered)",
+                ),
+                move |pending_blocks| {
                     let txs = pending_blocks
                         .get_latest_flashblock_transactions_with_logs_filtered(&filter);
                     if txs.is_empty() { None } else { Some(txs) }
@@ -176,15 +157,11 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
     {
         futures::StreamExt::flat_map(
             StreamExt::filter_map(
-                BroadcastStream::new(flashblocks_state.subscribe_to_flashblocks()),
-                |result| {
-                    let pending_blocks = match result {
-                        Ok(blocks) => blocks,
-                        Err(err) => {
-                            error!(message = "error in flashblocks stream for transaction hashes", error = %err);
-                            return None;
-                        }
-                    };
+                flashblock_updates(
+                    flashblocks_state.subscribe_to_flashblocks(),
+                    "newFlashblockTransactions(hashes)",
+                ),
+                |pending_blocks| {
                     let hashes = pending_blocks.get_latest_flashblock_transaction_hashes();
                     if hashes.is_empty() { None } else { Some(hashes) }
                 },
@@ -284,6 +261,53 @@ where
     }
 }
 
+/// The overlay updates one flashblocks subscription reads.
+///
+/// A subscriber that falls behind the broadcast loses the updates it dropped
+/// and carries on from the oldest one still held; the subscriber is not told,
+/// so `subscription_lagged_total` is the only record. The stream also counts
+/// itself in `subscriptions_active` until it is dropped.
+fn flashblock_updates<T>(
+    updates: broadcast::Receiver<T>,
+    subscription: &'static str,
+) -> impl Stream<Item = T>
+where
+    T: Clone + Send + 'static,
+{
+    let open = OpenSubscription::new();
+    StreamExt::filter_map(BroadcastStream::new(updates), move |update| {
+        let _open = &open;
+        match update {
+            Ok(update) => Some(update),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                Metrics::subscription_lagged().increment(skipped);
+                error!(
+                    subscription,
+                    skipped, "flashblocks subscriber fell behind; updates skipped"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// Holds one count in `subscriptions_active` for as long as it lives.
+#[derive(Debug)]
+struct OpenSubscription;
+
+impl OpenSubscription {
+    fn new() -> Self {
+        Metrics::subscriptions_active().increment(1.0);
+        Self
+    }
+}
+
+impl Drop for OpenSubscription {
+    fn drop(&mut self) {
+        Metrics::subscriptions_active().decrement(1.0);
+    }
+}
+
 /// Pipes all stream items to the subscription sink until the stream ends, the
 /// client disconnects, or serialization fails.
 async fn pipe_from_stream<T, St>(sink: SubscriptionSink, mut stream: St)
@@ -321,5 +345,61 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::{StreamExt as _, executor::block_on};
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use tokio::sync::broadcast;
+
+    use super::flashblock_updates;
+
+    /// A subscriber that falls behind loses what the channel dropped, and the
+    /// subscription carries on rather than ending. The count of skipped updates
+    /// is the only trace that anything was lost.
+    #[test]
+    fn a_lagging_subscription_counts_the_updates_it_skipped() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            let (tx, rx) = broadcast::channel(2);
+            let updates = flashblock_updates(rx, "test");
+            for update in 0..5u32 {
+                tx.send(update).expect("the subscription is listening");
+            }
+            drop(tx);
+
+            let received: Vec<u32> = block_on(updates.collect());
+            assert_eq!(received, [3, 4], "the subscription keeps going after the gap");
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| line == "flashblocks_consumer_subscription_lagged_total 3"),
+            "the three dropped updates must be counted:\n{rendered}",
+        );
+    }
+
+    /// Counted while the stream exists, which is as long as the subscription
+    /// task holds it.
+    #[test]
+    fn an_open_subscription_is_counted_until_it_is_dropped() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let active = |value: u32| format!("flashblocks_consumer_subscriptions_active {value}");
+
+        metrics::with_local_recorder(&recorder, || {
+            let (_tx, rx) = broadcast::channel::<u32>(2);
+            let updates = flashblock_updates(rx, "test");
+            let rendered = handle.render();
+            assert!(rendered.lines().any(|line| line == active(1)), "{rendered}");
+
+            drop(updates);
+            let rendered = handle.render();
+            assert!(rendered.lines().any(|line| line == active(0)), "{rendered}");
+        });
     }
 }
