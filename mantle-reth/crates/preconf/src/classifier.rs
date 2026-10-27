@@ -31,7 +31,7 @@
 //! lock covers the lists and nothing else: commitment records live in
 //! [`crate::commitments`], behind their own lock.
 
-use alloy_primitives::{Address, map::foldhash::HashSet};
+use alloy_primitives::{Address, B256, map::foldhash::HashSet};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -53,6 +53,10 @@ pub struct Whitelist {
     /// Recipients that make any transaction to them eligible, whatever the
     /// sender.
     pub to_wildcards: HashSet<Address>,
+    /// The contract's `listsHash` these sets were read with; comparing it with
+    /// the contract's tells whether they are current. Zero when not read from a
+    /// contract.
+    pub lists_hash: B256,
 }
 
 impl Whitelist {
@@ -150,7 +154,18 @@ impl PreconfClassifier {
         from_wildcards: HashSet<Address>,
         to_wildcards: HashSet<Address>,
     ) {
-        *self.whitelist.write() = Arc::new(Whitelist { pairs, from_wildcards, to_wildcards });
+        self.install_whitelist(Whitelist {
+            pairs,
+            from_wildcards,
+            to_wildcards,
+            lists_hash: B256::ZERO,
+        });
+    }
+
+    /// [`Self::update_whitelist`] for a whitelist read from the contract,
+    /// `lists_hash` included. The path the watcher and the cold start take.
+    pub fn install_whitelist(&self, whitelist: Whitelist) {
+        *self.whitelist.write() = Arc::new(whitelist);
     }
 
     /// Current allowlist sizes as `(pairs, from_wildcards, to_wildcards)`.

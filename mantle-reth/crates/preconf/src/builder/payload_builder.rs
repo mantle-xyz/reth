@@ -2139,6 +2139,21 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // build that is superseded or never sealed must not leave its delta
         // visible to the RPC admission path.
         let mut whitelist = self.classifier.whitelist_snapshot();
+        // The shared allowlist may not have caught up with the parent yet: the
+        // watcher refreshes it from the same forkchoice update that started this
+        // build. `listsHash` at the parent says whether it has; if not, the
+        // parent's lists are read here, for this build only. A derivation build
+        // executes no preconf entries and skips this.
+        if !ctx.attributes().no_tx_pool() &&
+            let Some(contract) = crate::whitelist::wants_whitelist(&self.cfg)
+        {
+            whitelist = crate::whitelist::whitelist_for_build(
+                &state_provider_for_finish,
+                contract,
+                whitelist,
+                parent_hash,
+            );
+        }
         if !whitelist_deltas.is_empty() {
             let mut updated = (*whitelist).clone();
             for delta in &whitelist_deltas {
@@ -3518,6 +3533,7 @@ mod tests {
                 pairs: HashSet::from_iter([(a(1), a(2))]),
                 from_wildcards: HashSet::default(),
                 to_wildcards: HashSet::default(),
+                lists_hash: B256::ZERO,
             }
         }
 

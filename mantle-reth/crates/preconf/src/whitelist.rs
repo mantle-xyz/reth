@@ -7,12 +7,15 @@
 //! sequencer-local mirror of that state — it is a policy input to the
 //! classifier, not part of consensus.
 //!
-//! Two entry points:
+//! Three entry points:
 //!
 //! * [`bootstrap_whitelist`] — cold start. Verifies the configured address actually holds a
 //!   contract, then loads all three sets.
-//! * [`run_whitelist_watcher`] — long-running task. Re-reads whenever a canonical block carries a
-//!   `WhitelistUpdated` log, or a reorg lands.
+//! * [`run_whitelist_watcher`] — long-running task. Re-reads on a `WhitelistUpdated` log; after a
+//!   reorg or a notification gap, only if `listsHash` moved.
+//! * `whitelist_for_build` — at the start of each build. The watcher can still be behind the
+//!   build's parent; the contract's `listsHash` at that parent says so, and the build then uses the
+//!   parent's lists instead.
 //!
 //! ## Whose decision is it
 //!
@@ -40,11 +43,11 @@
 //! [`TO_WILDCARDS_SLOT`] / [`LAYOUT_VERSION_SLOT`] would make the sequencer read
 //! garbage — or, worse, an empty list.
 //!
-//! The contract occupies slots 0..=7; this module reads 0, 2, 4 and 6. Slots 1, 3
-//! and 5 are the membership mappings, and slot 7 is `authorizedL1`, the one L1
-//! address permitted to govern the lists — the contract's own business, never
-//! read here. A variable appended past slot 7 disturbs none of this, which is why
-//! adding one is not a layout-version change; touching slots 0..=6 is.
+//! The contract occupies slots 0..=8; this module reads 0, 2, 4, 6 and 8. Slots
+//! 1, 3 and 5 are the membership mappings, and slot 7 is `authorizedL1`, the one
+//! L1 address permitted to govern the lists — the contract's own business, never
+//! read here. Moving a slot this module reads, or starting to read a new one, is a
+//! layout-version change; appending a variable it does not read is not.
 
 use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::foldhash::HashSet};
@@ -96,6 +99,13 @@ pub const TO_WILDCARDS_SLOT: u64 = 4;
 /// module docs for where a further variable has to go.
 pub const LAYOUT_VERSION_SLOT: u64 = 6;
 
+/// Slot of `bytes32 listsHash`: a commitment the contract chains forward on
+/// every update, `keccak256(abi.encode(previous, add, remove))`.
+///
+/// Read with the lists, and on its own to check whether a copy of them is
+/// current.
+pub const LISTS_HASH_SLOT: u64 = 8;
+
 /// The layout this binary knows how to read.
 ///
 /// A pre-`layoutVersion` contract never wrote [`LAYOUT_VERSION_SLOT`], so it
@@ -103,7 +113,10 @@ pub const LAYOUT_VERSION_SLOT: u64 = 6;
 ///
 /// The comparison is **exact**, not a minimum: a future layout moves slots, so a
 /// binary built for this one has no business reading it.
-pub const EXPECTED_LAYOUT_VERSION: u64 = 2;
+///
+/// 3 added [`LISTS_HASH_SLOT`]: a version-2 contract has no such slot, reads it
+/// back as zero, and would look as if it never changed.
+pub const EXPECTED_LAYOUT_VERSION: u64 = 3;
 
 /// `keccak256("WhitelistUpdated(uint256,uint256,uint256)")` — topic0 of the
 /// contract's only event.
@@ -112,8 +125,8 @@ pub const EXPECTED_LAYOUT_VERSION: u64 = 2;
 /// `test_whitelistUpdatedTopic0_matchesTheEmittedLog_succeeds` in
 /// `test/PreconfWhitelist.t.sol`, which reads it off an emitted log rather than
 /// hashing the signature as a string. If the event signature changes and this
-/// constant does not, the watcher stops firing and the sequencer runs forever on
-/// a stale allowlist — silently, having loaded the lists once at bootstrap.
+/// constant does not, the watcher stops re-reading on updates: builds still get
+/// the right lists through `listsHash`, but RPC admission's copy goes stale.
 pub const WHITELIST_UPDATED_TOPIC0: B256 = B256::new([
     0x53, 0x2f, 0xe7, 0x09, 0xf3, 0x40, 0xed, 0xa4, 0x0c, 0x9d, 0x51, 0xe7, 0xdb, 0xba, 0xcf, 0x9d,
     0x5b, 0x25, 0x5b, 0x36, 0x42, 0x9e, 0xd9, 0x0f, 0x86, 0x5b, 0xd2, 0xa3, 0x13, 0x1e, 0xf1, 0xbc,
@@ -631,12 +644,11 @@ pub fn wants_whitelist(cfg: &PreconfConfig) -> Option<Address> {
 fn apply_whitelist(
     classifier: &PreconfClassifier,
     contract: Address,
-    pairs: HashSet<(Address, Address)>,
-    from_wildcards: HashSet<Address>,
-    to_wildcards: HashSet<Address>,
+    whitelist: Whitelist,
 ) -> (usize, usize, usize) {
-    let (pair_len, from_len, to_len) = (pairs.len(), from_wildcards.len(), to_wildcards.len());
-    classifier.update_whitelist(pairs, from_wildcards, to_wildcards);
+    let (pair_len, from_len, to_len) =
+        (whitelist.pairs.len(), whitelist.from_wildcards.len(), whitelist.to_wildcards.len());
+    classifier.install_whitelist(whitelist);
 
     // The authoritative sizes, for dashboards and alerting. An empty allowlist is
     // a legitimate state that the node accepts silently otherwise (see below), so
@@ -728,10 +740,9 @@ fn reload_from_state<P: WhitelistState>(
     classifier: &PreconfClassifier,
 ) -> Result<(), WhitelistError> {
     let state = provider.latest_state()?;
-    let (pairs, from_wildcards, to_wildcards) = read_all(&state, contract)?;
+    let whitelist = read_all(&state, contract)?;
 
-    let (pair_len, from_len, to_len) =
-        apply_whitelist(classifier, contract, pairs, from_wildcards, to_wildcards);
+    let (pair_len, from_len, to_len) = apply_whitelist(classifier, contract, whitelist);
     info!(
         target: "mantle::preconf::whitelist",
         %contract, pairs = pair_len, from_wildcards = from_len, to_wildcards = to_len,
@@ -740,14 +751,9 @@ fn reload_from_state<P: WhitelistState>(
     Ok(())
 }
 
-/// The three allowlist collections a full read yields: exact `(from, to)` pairs,
-/// `from` wildcards, `to` wildcards. Named so the read/reload signatures stay
-/// legible — the tuple is threaded through several layers.
-type AllowlistSets = (HashSet<(Address, Address)>, HashSet<Address>, HashSet<Address>);
-
-/// Reads all three sets from one state view.
+/// Reads all three sets, and the `listsHash` they belong to, from one state view.
 ///
-/// One `StateProviderBox` for all three on purpose: they are three parts of a
+/// One `StateProviderBox` for all of them on purpose: they are three parts of a
 /// single policy, and reading them against different views could produce a
 /// combination governance never wrote — a pair whose covering wildcard has
 /// already been revoked, say. `latest()` is taken once by the caller and shared
@@ -755,7 +761,7 @@ type AllowlistSets = (HashSet<(Address, Address)>, HashSet<Address>, HashSet<Add
 ///
 /// One [`ReadBudget`] for all three for a different reason — see
 /// [`WHITELIST_READ_BUDGET`].
-fn read_all(state: &StateProviderBox, contract: Address) -> Result<AllowlistSets, WhitelistError> {
+fn read_all(state: &StateProviderBox, contract: Address) -> Result<Whitelist, WhitelistError> {
     read_all_within(state, contract, &mut ReadBudget::new(WHITELIST_READ_BUDGET))
 }
 
@@ -765,11 +771,84 @@ fn read_all_within(
     state: &StateProviderBox,
     contract: Address,
     budget: &mut ReadBudget,
-) -> Result<AllowlistSets, WhitelistError> {
+) -> Result<Whitelist, WhitelistError> {
     let pairs = read_preconf_pairs_within(state, contract, PAIRS_SLOT, budget)?;
     let from_wildcards = read_preconf_set_within(state, contract, FROM_WILDCARDS_SLOT, budget)?;
     let to_wildcards = read_preconf_set_within(state, contract, TO_WILDCARDS_SLOT, budget)?;
-    Ok((pairs, from_wildcards, to_wildcards))
+    let lists_hash = read_lists_hash(state, contract)?;
+    Ok(Whitelist { pairs, from_wildcards, to_wildcards, lists_hash })
+}
+
+/// The contract's `listsHash` in `state`.
+fn read_lists_hash(state: &StateProviderBox, contract: Address) -> Result<B256, WhitelistError> {
+    let word = state.storage(contract, B256::from(U256::from(LISTS_HASH_SLOT)))?;
+    Ok(B256::from(word.unwrap_or_default()))
+}
+
+/// Read budget for [`refresh_for_parent`]'s full read. Far tighter than
+/// [`WHITELIST_READ_BUDGET`]: it runs at the start of a block build.
+const BUILD_READ_BUDGET: Duration = Duration::from_millis(100);
+
+/// The allowlist at `parent`'s state, when `snapshot` is not it.
+///
+/// The shared allowlist is refreshed by [`run_whitelist_watcher`] from canonical
+/// notifications, and a build can start before the watcher has handled its
+/// parent — so an update in the parent would otherwise reach the block after.
+/// `listsHash` settles it with one storage read: equal means the snapshot is the
+/// parent's lists (`None`), different means they are re-read from `state`. The
+/// result is for this build only; the watcher still owns the shared copy.
+pub(crate) fn refresh_for_parent(
+    state: &StateProviderBox,
+    contract: Address,
+    snapshot: &Whitelist,
+) -> Result<Option<Whitelist>, WhitelistError> {
+    if read_lists_hash(state, contract)? == snapshot.lists_hash {
+        return Ok(None);
+    }
+    read_all_within(state, contract, &mut ReadBudget::new(BUILD_READ_BUDGET)).map(Some)
+}
+
+/// The allowlist a build on `parent_hash` judges its preconf entries against.
+///
+/// `snapshot`, or the parent's lists when [`refresh_for_parent`] finds it behind.
+/// If that fails, `snapshot`: the watcher still corrects the shared copy.
+pub(crate) fn whitelist_for_build(
+    state: &StateProviderBox,
+    contract: Address,
+    snapshot: Arc<Whitelist>,
+    parent_hash: B256,
+) -> Arc<Whitelist> {
+    match refresh_for_parent(state, contract, &snapshot) {
+        Ok(None) => snapshot,
+        Ok(Some(at_parent)) => {
+            metrics::counter!("preconf.whitelist.build_reread_total").increment(1);
+            debug!(
+                target: "mantle::preconf::payload_builder",
+                ?parent_hash,
+                "shared allowlist behind the parent; using the parent's lists for this build",
+            );
+            Arc::new(at_parent)
+        }
+        Err(err) => {
+            metrics::counter!("preconf.whitelist.build_reread_failed_total").increment(1);
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                %err, ?parent_hash,
+                "could not check the allowlist against the parent; using the shared one",
+            );
+            snapshot
+        }
+    }
+}
+
+/// Whether the shared allowlist was read with the head's `listsHash`.
+fn shared_lists_are_current<P: WhitelistState>(
+    provider: &P,
+    contract: Address,
+    classifier: &PreconfClassifier,
+) -> Result<bool, WhitelistError> {
+    let state = provider.latest_state()?;
+    Ok(read_lists_hash(&state, contract)? == classifier.whitelist_snapshot().lists_hash)
 }
 
 /// Cold start: validate the configured address, then load all three sets.
@@ -846,9 +925,8 @@ pub fn bootstrap_whitelist<P: WhitelistState>(
         });
     }
 
-    let (pairs, from_wildcards, to_wildcards) = read_all(&state, contract)?;
-    let (pair_len, from_len, to_len) =
-        apply_whitelist(classifier, contract, pairs, from_wildcards, to_wildcards);
+    let whitelist = read_all(&state, contract)?;
+    let (pair_len, from_len, to_len) = apply_whitelist(classifier, contract, whitelist);
 
     info!(
         target: "mantle::preconf::whitelist",
@@ -869,12 +947,11 @@ pub fn has_whitelist_event<N: NodePrimitives>(chain: &Chain<N>, contract: Addres
     })
 }
 
-/// Whether `notif` means the allowlists must be re-read.
+/// Whether `notif` may have changed the allowlists — see
+/// [`run_whitelist_watcher`] for what follows.
 ///
-/// The watcher's whole decision, extracted so it can be unit-tested against real
-/// [`CanonStateNotification`]s without standing up a notification stream
-/// (`MockEthProvider` cannot emit any — its subscription drops the sender). See
-/// [`run_whitelist_watcher`] for why a reorg counts on its own.
+/// Split out so it can be unit-tested against real [`CanonStateNotification`]s
+/// (`MockEthProvider` cannot emit any).
 pub fn should_reload<N: NodePrimitives>(
     notif: &CanonStateNotification<N>,
     contract: Address,
@@ -894,12 +971,14 @@ pub fn should_reload<N: NodePrimitives>(
 /// Event-driven rather than parsing the deposit that carried the update.
 /// Watching for the effect rather than decoding the cause is reorg-safe for free
 /// — a revert un-happens without emitting anything, and `latest()` already
-/// accounts for it — and it needs no ABI binding at all, so this path cannot be
-/// broken by a signature change. [`decode_whitelist_update`] exists for the one
-/// caller that genuinely cannot wait for the block to land (the payload builder,
-/// binding the block it is still building); everything here reads state.
+/// accounts for it — and it needs no ABI binding, so an `updatePreconfs`
+/// signature change cannot break it (topic0 can: [`WHITELIST_UPDATED_TOPIC0`]).
+/// [`decode_whitelist_update`] exists
+/// for the one caller that genuinely cannot wait for the block to land (the
+/// payload builder, binding the block it is still building); everything here
+/// reads state.
 ///
-/// # Why a reorg alone triggers a reload
+/// # Why a reorg alone triggers a check
 ///
 /// Two independent triggers, because **an event can only say that something
 /// happened, never that something un-happened**:
@@ -917,10 +996,9 @@ pub fn should_reload<N: NodePrimitives>(
 /// being an empty segment with no logs to scan.
 ///
 /// Deliberately coarse — it does not check whether the reverted segment contained
-/// a `WhitelistUpdated`. Reorgs are rare and a reload is three array reads, so the
-/// unconditional re-read buys **self-healing**: memory that drifted for any reason
-/// (a missed notification, a reload that only warned, a race between `latest()`
-/// and the notification) is corrected on the next reorg.
+/// a `WhitelistUpdated`; the head's `listsHash` decides instead. Equal skips the
+/// full read; different means memory drifted, for whatever reason, and the full
+/// read corrects it. A notification gap takes the same check.
 ///
 /// A failed refresh is logged and never kills the task — the previous allowlists
 /// stay in force, and every canonical notification retries until one succeeds.
@@ -962,18 +1040,17 @@ pub async fn run_whitelist_watcher<Pr, N>(
     loop {
         // The failure log below reports whether this pass was triggered by a
         // reorg; a gap has no notification to ask, so it answers `false`.
-        let reverted = match receiver.recv().await {
+        // `may_be_unchanged`: only a reorg or a gap triggered this pass.
+        let (reverted, may_be_unchanged) = match receiver.recv().await {
             Ok(notif) => {
                 if !should_reload(&notif, contract) && !retry_pending {
                     continue;
                 }
-                notif.reverted().is_some()
+                let committed = notif.committed();
+                (notif.reverted().is_some(), !has_whitelist_event(&committed, contract))
             }
             // A gap may have carried the governance event this watcher exists
-            // for, and there is no way to ask which blocks were skipped. So
-            // reload unconditionally rather than record the gap and move on:
-            // `reload_whitelist` reads `latest()` and is idempotent, which
-            // makes an unnecessary refresh free and a missed one impossible.
+            // for; like a reorg, the head's `listsHash` decides.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 metrics::counter!(
                     "mantle.canon.notifications_lagged_total",
@@ -983,13 +1060,28 @@ pub async fn run_whitelist_watcher<Pr, N>(
                 warn!(
                     target: "mantle::preconf::whitelist",
                     skipped,
-                    "canonical notifications dropped; reloading the allowlist in case one \
+                    "canonical notifications dropped; checking the allowlist in case one \
                      carried a governance event"
                 );
-                false
+                (false, true)
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         };
+
+        // One storage read instead of the full one. A failed check, or a pending
+        // retry, takes the full read.
+        if may_be_unchanged &&
+            !retry_pending &&
+            matches!(shared_lists_are_current(&provider, contract, &classifier), Ok(true))
+        {
+            metrics::counter!("preconf.whitelist.reload_skipped_total").increment(1);
+            debug!(
+                target: "mantle::preconf::whitelist",
+                %contract, reverted,
+                "listsHash unchanged at the head; allowlist is current, not re-reading it",
+            );
+            continue;
+        }
 
         match reload_whitelist(&provider, &cfg, &classifier) {
             Ok(()) => {
@@ -1182,36 +1274,36 @@ mod tests {
         out
     }
 
-    /// Provider with a `PreconfWhitelist` at [`WL`] holding the given allowlist.
+    /// Provider with a `PreconfWhitelist` at [`WL`] holding the given allowlist,
+    /// at the expected layout version and a zero `listsHash`.
     fn provider_with(
         pairs: &[(Address, Address)],
         from_wildcards: &[Address],
         to_wildcards: &[Address],
         with_code: bool,
     ) -> MockEthProvider {
-        provider_with_layout(
-            pairs,
-            from_wildcards,
-            to_wildcards,
-            with_code,
-            EXPECTED_LAYOUT_VERSION,
-        )
+        provider_with_slots(pairs, from_wildcards, to_wildcards, with_code, &[])
     }
 
-    /// As [`provider_with`], but declaring an arbitrary layout version. `0` is
-    /// the signature of the contract this layout replaced (see
-    /// [`WhitelistError::LayoutVersionMismatch`]), which never wrote that slot.
-    fn provider_with_layout(
+    /// As [`provider_with`], with `overrides` written last: `(slot, value)`,
+    /// e.g. a [`LAYOUT_VERSION_SLOT`] other than the expected one. `0` there is
+    /// the contract the first layout replaced, which never wrote that slot.
+    fn provider_with_slots(
         pairs: &[(Address, Address)],
         from_wildcards: &[Address],
         to_wildcards: &[Address],
         with_code: bool,
-        layout: u64,
+        overrides: &[(u64, U256)],
     ) -> MockEthProvider {
         let mut storage = pair_array_storage(PAIRS_SLOT, pairs);
         storage.extend(array_storage(FROM_WILDCARDS_SLOT, from_wildcards));
         storage.extend(array_storage(TO_WILDCARDS_SLOT, to_wildcards));
-        storage.push((B256::from(U256::from(LAYOUT_VERSION_SLOT)), U256::from(layout)));
+        storage.push((
+            B256::from(U256::from(LAYOUT_VERSION_SLOT)),
+            U256::from(EXPECTED_LAYOUT_VERSION),
+        ));
+        storage
+            .extend(overrides.iter().map(|&(slot, value)| (B256::from(U256::from(slot)), value)));
 
         let mut account = ExtendedAccount::new(0, U256::ZERO).extend_storage(storage);
         if with_code {
@@ -1274,7 +1366,8 @@ mod tests {
     #[test]
     fn layout_version_constants_are_pinned() {
         assert_eq!(LAYOUT_VERSION_SLOT, 6);
-        assert_eq!(EXPECTED_LAYOUT_VERSION, 2);
+        assert_eq!(LISTS_HASH_SLOT, 8, "slot 7 is `authorizedL1`");
+        assert_eq!(EXPECTED_LAYOUT_VERSION, 3);
         const {
             assert!(
                 LAYOUT_VERSION_SLOT > TO_WILDCARDS_SLOT,
@@ -1287,33 +1380,207 @@ mod tests {
     /// never wrote the marker, so it reads back as `0`. Without the check this
     /// same state would load, silently — see
     /// [`WhitelistError::LayoutVersionMismatch`] for what it would install.
+    ///
+    /// Version 2 is refused as well: it has no `listsHash`, which reads back as
+    /// zero and would make the allowlist look as if it never changed.
     #[test]
     fn bootstrap_refuses_a_contract_from_the_previous_layout() {
-        let provider = provider_with_layout(&[(addr(1), addr(2))], &[addr(3)], &[], true, 0);
+        for found in [0, 2] {
+            let provider = provider_with_slots(
+                &[(addr(1), addr(2))],
+                &[addr(3)],
+                &[],
+                true,
+                &[(LAYOUT_VERSION_SLOT, U256::from(found))],
+            );
+            let (cfg, c) = onchain_pair();
+
+            let err = bootstrap_whitelist(&provider, &cfg, &c).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    WhitelistError::LayoutVersionMismatch { contract, expected: 3, found: f }
+                        if contract == WL && f == found
+                ),
+                "got {err:?}",
+            );
+            assert_eq!(c.whitelist_counts(), (0, 0, 0), "and nothing was loaded from it");
+        }
+    }
+
+    /// The lists and their `listsHash` are read from one state and installed
+    /// together, so a snapshot knows which contract state it is.
+    #[test]
+    fn bootstrap_installs_the_lists_hash_with_the_lists() {
+        let hash = B256::repeat_byte(0x42);
+        let provider = provider_with_slots(
+            &[(addr(1), addr(2))],
+            &[],
+            &[],
+            true,
+            &[(LISTS_HASH_SLOT, hash.into())],
+        );
         let (cfg, c) = onchain_pair();
 
-        let err = bootstrap_whitelist(&provider, &cfg, &c).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WhitelistError::LayoutVersionMismatch { contract, expected: 2, found: 0 }
-                    if contract == WL
-            ),
-            "got {err:?}",
+        bootstrap_whitelist(&provider, &cfg, &c).unwrap();
+
+        assert_eq!(c.whitelist_snapshot().lists_hash, hash);
+    }
+
+    /// A snapshot whose `listsHash` matches the parent's is current, and nothing
+    /// more is read.
+    #[test]
+    fn a_snapshot_matching_the_parent_is_kept() {
+        let hash = B256::repeat_byte(0x42);
+        let provider = provider_with_slots(
+            &[(addr(1), addr(2))],
+            &[],
+            &[],
+            true,
+            &[(LISTS_HASH_SLOT, hash.into())],
         );
-        assert_eq!(c.whitelist_counts(), (0, 0, 0), "and nothing was loaded from it");
+        let state = provider.latest_state().unwrap();
+        let snapshot = Whitelist { lists_hash: hash, ..Default::default() };
+
+        assert_eq!(refresh_for_parent(&state, WL, &snapshot).unwrap(), None);
+    }
+
+    /// A snapshot behind the parent is replaced by the parent's lists, which a
+    /// revocation the watcher has not applied yet is then part of.
+    #[test]
+    fn a_snapshot_behind_the_parent_is_replaced_by_the_parents_lists() {
+        let parent_hash = B256::repeat_byte(0x43);
+        let provider = provider_with_slots(
+            &[(addr(1), addr(2))],
+            &[],
+            &[],
+            true,
+            &[(LISTS_HASH_SLOT, parent_hash.into())],
+        );
+        let state = provider.latest_state().unwrap();
+        let stale = Whitelist {
+            pairs: HashSet::from_iter([(addr(1), addr(2)), (addr(5), addr(6))]),
+            lists_hash: B256::repeat_byte(0x42),
+            ..Default::default()
+        };
+
+        let at_parent = refresh_for_parent(&state, WL, &stale).unwrap().expect("stale");
+
+        assert_eq!(at_parent.pairs, HashSet::from_iter([(addr(1), addr(2))]));
+        assert_eq!(at_parent.lists_hash, parent_hash);
+    }
+
+    /// Runs `f` against a fresh Prometheus recorder and returns what it scraped.
+    fn scrape_after(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    /// A build whose snapshot is the parent's lists uses it as it is.
+    #[test]
+    fn a_build_keeps_a_snapshot_matching_its_parent() {
+        let hash = B256::repeat_byte(0x42);
+        let provider = provider_with_slots(&[], &[], &[], true, &[(LISTS_HASH_SLOT, hash.into())]);
+        let state = provider.latest_state().unwrap();
+        let snapshot = Arc::new(Whitelist { lists_hash: hash, ..Default::default() });
+
+        let used = whitelist_for_build(&state, WL, snapshot.clone(), B256::ZERO);
+
+        assert!(Arc::ptr_eq(&used, &snapshot));
+    }
+
+    /// A build whose snapshot is behind uses the parent's lists, and counts it.
+    #[test]
+    fn a_build_behind_its_parent_uses_the_parents_lists() {
+        let provider = provider_with_slots(
+            &[(addr(1), addr(2))],
+            &[],
+            &[],
+            true,
+            &[(LISTS_HASH_SLOT, B256::repeat_byte(0x43).into())],
+        );
+        let state = provider.latest_state().unwrap();
+        let stale = Arc::new(Whitelist {
+            pairs: HashSet::from_iter([(addr(5), addr(6))]),
+            lists_hash: B256::repeat_byte(0x42),
+            ..Default::default()
+        });
+
+        let mut used = None;
+        let scrape = scrape_after(|| {
+            used = Some(whitelist_for_build(&state, WL, stale.clone(), B256::ZERO));
+        });
+
+        assert_eq!(used.unwrap().pairs, HashSet::from_iter([(addr(1), addr(2))]));
+        assert!(scrape.contains("preconf_whitelist_build_reread_total 1\n"), "{scrape}");
+    }
+
+    /// When the parent's lists cannot be read, the build keeps the shared
+    /// snapshot, and counts the failure.
+    #[test]
+    fn a_build_whose_parent_read_fails_keeps_the_shared_snapshot() {
+        // `listsHash` moved, so the lists are read — and the pairs length is not
+        // a length at all, so that read fails.
+        let provider = provider_with_slots(
+            &[],
+            &[],
+            &[],
+            true,
+            &[(LISTS_HASH_SLOT, B256::repeat_byte(0x43).into()), (PAIRS_SLOT, U256::MAX)],
+        );
+        let state = provider.latest_state().unwrap();
+        let snapshot = Arc::new(Whitelist {
+            pairs: HashSet::from_iter([(addr(5), addr(6))]),
+            lists_hash: B256::repeat_byte(0x42),
+            ..Default::default()
+        });
+
+        let mut used = None;
+        let scrape = scrape_after(|| {
+            used = Some(whitelist_for_build(&state, WL, snapshot.clone(), B256::ZERO));
+        });
+
+        assert!(Arc::ptr_eq(&used.unwrap(), &snapshot));
+        assert!(scrape.contains("preconf_whitelist_build_reread_failed_total 1\n"), "{scrape}");
+        assert!(!scrape.contains("preconf_whitelist_build_reread_total"), "{scrape}");
+    }
+
+    /// The watcher's check: current exactly when the hashes match.
+    #[test]
+    fn shared_lists_are_current_when_the_head_hash_matches() {
+        let head = B256::repeat_byte(0x42);
+        let provider = provider_with_slots(
+            &[(addr(1), addr(2))],
+            &[],
+            &[],
+            true,
+            &[(LISTS_HASH_SLOT, head.into())],
+        );
+        let (_, c) = onchain_pair();
+
+        c.install_whitelist(Whitelist { lists_hash: head, ..Default::default() });
+        assert!(shared_lists_are_current(&provider, WL, &c).unwrap());
+
+        c.install_whitelist(Whitelist {
+            lists_hash: B256::repeat_byte(0x41),
+            ..Default::default()
+        });
+        assert!(!shared_lists_are_current(&provider, WL, &c).unwrap());
     }
 
     /// A *future* layout is refused too, the comparison being exact rather than
     /// a minimum — see [`EXPECTED_LAYOUT_VERSION`].
     #[test]
     fn bootstrap_refuses_a_newer_layout() {
-        let provider = provider_with_layout(&[], &[], &[], true, 3);
+        let provider =
+            provider_with_slots(&[], &[], &[], true, &[(LAYOUT_VERSION_SLOT, U256::from(4))]);
         let (cfg, c) = onchain_pair();
 
         let err = bootstrap_whitelist(&provider, &cfg, &c).unwrap_err();
         assert!(
-            matches!(err, WhitelistError::LayoutVersionMismatch { found: 3, .. }),
+            matches!(err, WhitelistError::LayoutVersionMismatch { found: 4, .. }),
             "got {err:?}",
         );
     }
@@ -1323,7 +1590,13 @@ mod tests {
     /// from a contract whose layout it never re-validates.
     #[test]
     fn reload_does_not_recheck_the_layout_version() {
-        let provider = provider_with_layout(&[(addr(1), addr(2))], &[], &[], true, 0);
+        let provider = provider_with_slots(
+            &[(addr(1), addr(2))],
+            &[],
+            &[],
+            true,
+            &[(LAYOUT_VERSION_SLOT, U256::ZERO)],
+        );
         let (cfg, c) = onchain_pair();
 
         reload_whitelist(&provider, &cfg, &c).expect("reload must not re-validate the layout");
@@ -1916,8 +2189,7 @@ mod tests {
 
         #[test]
         fn reorg_triggers_reload_even_with_no_whitelist_activity() {
-            // Deliberately coarse: any reorg re-reads, which is what makes the
-            // cache self-healing after a missed notification or a failed reload.
+            // Any reorg goes to the `listsHash` check.
             let notif = CanonStateNotification::Reorg { old: quiet_chain(), new: quiet_chain() };
             assert!(should_reload(&notif, WL));
         }
@@ -1930,8 +2202,7 @@ mod tests {
 
         #[test]
         fn other_contracts_reorg_still_triggers_reload() {
-            // The reorg branch is contract-agnostic on purpose — we cannot know
-            // whether our contract's state moved without re-reading it.
+            // Contract-agnostic on purpose; the `listsHash` check settles it.
             let notif = CanonStateNotification::Reorg {
                 old: Arc::new(chain_with_logs(vec![log(addr(1), WHITELIST_UPDATED_TOPIC0)])),
                 new: Arc::new(Chain::<OpPrimitives>::default()),
@@ -2150,6 +2421,7 @@ mod tests {
                 pairs: HashSet::from_iter([(addr(1), addr(2)), (addr(5), addr(6))]),
                 from_wildcards: HashSet::from_iter([addr(7)]),
                 to_wildcards: HashSet::default(),
+                lists_hash: B256::ZERO,
             };
 
             // Governance revokes one pair and the from-wildcard, and authorizes
@@ -2171,9 +2443,9 @@ mod tests {
             let provider =
                 provider_with(&[(addr(5), addr(6)), (addr(3), addr(4))], &[], &[addr(8)], true);
             let state = provider.latest_state().unwrap();
-            let (pairs, from_wildcards, to_wildcards) = read_all(&state, WL).unwrap();
+            let read = read_all(&state, WL).unwrap();
 
-            assert_eq!(delta_side, Whitelist { pairs, from_wildcards, to_wildcards });
+            assert_eq!(delta_side, Whitelist { lists_hash: B256::ZERO, ..read });
         }
 
         /// The whole point of the delta path: it edits an existing allowlist in
@@ -2185,6 +2457,7 @@ mod tests {
                 pairs: HashSet::from_iter([(addr(1), addr(2)), (addr(5), addr(6))]),
                 from_wildcards: HashSet::from_iter([addr(7)]),
                 to_wildcards: HashSet::default(),
+                lists_hash: B256::ZERO,
             };
 
             apply_delta(&mut wl, &WhitelistDelta { add: vec![], remove: vec![(addr(1), addr(2))] });

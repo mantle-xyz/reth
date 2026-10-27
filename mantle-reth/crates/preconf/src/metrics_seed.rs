@@ -81,6 +81,12 @@ const COUNTERS: &[&str] = &[
     // A job abandoned while it waited for the build lock, so it built nothing.
     // Routine when jobs are superseded; not counted as a failure.
     "preconf.build.abandoned_before_start_total",
+    // A build found the shared allowlist behind its parent (`listsHash` differs)
+    // and read the parent's lists itself. Occasional; a steady rate means the
+    // whitelist watcher lags block production.
+    "preconf.whitelist.build_reread_total",
+    // That check or read failed; the build used the shared allowlist.
+    "preconf.whitelist.build_reread_failed_total",
     // A build that found its parent no longer on the canonical chain when
     // about to replay a commitment, and abandoned itself. Steady state is 0; it
     // moves with reorgs.
@@ -123,11 +129,13 @@ const COUNTERS: &[&str] = &[
     "preconf.whitelist.revoked_total",
     // The pair that says whether the in-memory allowlist is still tracking the
     // contract. Seeding matters more than usual here: a refresh only ever runs on
-    // a governance update or a reorg, so on a quiet chain both series would stay
-    // unregistered for hours and "never refreshed" would be indistinguishable
-    // from "refreshing fine".
+    // a governance update, or a reorg or gap that moved `listsHash`, so on a quiet
+    // chain both series would stay unregistered for hours and "never refreshed"
+    // would be indistinguishable from "refreshing fine".
     "preconf.whitelist.reload_ok",
     "preconf.whitelist.reload_failed",
+    // The watcher skipped a full re-read: `listsHash` at the head was unchanged.
+    "preconf.whitelist.reload_skipped_total",
 ];
 
 /// Gauge series. Registered **non-destructively** via `increment(0.0)`: the
