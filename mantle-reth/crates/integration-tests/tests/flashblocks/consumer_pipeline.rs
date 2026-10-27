@@ -74,8 +74,16 @@ async fn a_broken_predecessor_link_clears_the_overlay() {
     harness.send(base_slice(1)).await;
     assert!(harness.pending().is_some());
 
-    // Claims to follow (1, 5), but the overlay tracks (1, 0).
-    harness.send(FlashblockBuilder::new(1, 1).prev(1, 5).build()).await;
+    // Claims to follow (1, 5), but the overlay tracks (1, 0). The content hash is
+    // (1, 0)'s, so only the position is wrong.
+    harness
+        .send(
+            FlashblockBuilder::new(1, 1)
+                .prev(1, 5)
+                .prev_hash(FlashblockBuilder::slice_hash(1, 0))
+                .build(),
+        )
+        .await;
 
     assert!(harness.pending().is_none(), "a mismatched predecessor must clear the overlay");
 }
@@ -210,7 +218,7 @@ async fn a_rebuilt_latest_block_keeps_the_block_under_it() {
     harness
         .send(
             base_slice_builder(2)
-                .prev(2, 1)
+                .prev(1, 1)
                 .transactions(vec![l1_info_deposit(2), only_in_the_rebuild])
                 .payload_id(rebuild_id())
                 .build(),
@@ -339,7 +347,7 @@ async fn a_slice_carrying_a_post_exec_transaction_replays_it_as_a_noop() {
 
     // The processor keeps running, so a clean slice for the next height is
     // still accepted and extends the same overlay.
-    harness.send(base_slice(2)).await;
+    harness.send(base_slice_builder(2).prev(1, 0).build()).await;
     let pending = harness.pending().expect("a clean slice should still be accepted");
     assert_eq!(pending.latest_block_number(), 2);
     assert_eq!(

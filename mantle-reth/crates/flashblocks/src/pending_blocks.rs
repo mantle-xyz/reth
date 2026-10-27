@@ -519,6 +519,14 @@ impl PendingBlocks {
             .collect()
     }
 
+    /// The last slice the overlay holds for `block_number`.
+    pub fn last_flashblock_of(
+        &self,
+        block_number: BlockNumber,
+    ) -> Option<&MantleFlashblockPayload> {
+        self.flashblocks.iter().rev().find(|fb| fb.metadata.block_number == block_number)
+    }
+
     /// Returns the EVM state for a transaction.
     pub fn get_transaction_state(&self, hash: &B256) -> Option<EvmState> {
         self.transaction_state.get(hash).cloned()

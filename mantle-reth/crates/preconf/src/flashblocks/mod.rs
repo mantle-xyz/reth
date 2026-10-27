@@ -19,7 +19,9 @@ pub use config::{
     MIN_FLASHBLOCK_BLOCK_TIME, tick_interval,
 };
 pub use pool_maintenance::{PoolMaintenance, SenderBalances, maintain_pool_at_slice_boundary};
-pub use producer::{FlashblocksProducer, FlashblocksProducerHandles};
+pub use producer::{
+    FlashblocksProducer, FlashblocksProducerHandles, SealedSliceLink, SealedSliceLinks,
+};
 pub use publisher::{MantleFlashblocksPublisher, PublisherHandle};
 pub use ring_buffer::{FlashblockPosition, FlashblockRingBuffer};
 pub use slice_pacer::{Reservation, SliceLimits, SlicePacer, SliceSchedule, derive_slice_schedule};

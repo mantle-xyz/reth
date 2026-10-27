@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 /// Mantle's flashblock metadata.
 ///
 /// A superset of the metadata `op-alloy` defines: same three fields, plus the
-/// predecessor pointer. `block_number` is required; the other three carry
+/// predecessor's position and content hash. `block_number` is required; the others carry
 /// `#[serde(default)]`, so metadata produced elsewhere parses as long as it
 /// names the block.
 ///
@@ -29,6 +29,13 @@ pub struct MantleFlashblockMetadata {
     /// The slice this one follows, for gap detection.
     #[serde(default)]
     pub prev_flashblock_id: FlashblockId,
+
+    /// `diff.block_hash` of the slice named by
+    /// [`prev_flashblock_id`](Self::prev_flashblock_id): the content the
+    /// producer says this slice follows, where the id only gives its position.
+    /// Zero when not provided — the sentinel, or a producer that predates it.
+    #[serde(default)]
+    pub prev_flashblock_hash: B256,
 
     /// Always empty: `build_flashblock` in `mantle-reth-preconf` leaves it at
     /// `BTreeMap::default()`. Present so the payload stays shaped like the
@@ -62,8 +69,11 @@ pub struct FlashblockId {
 }
 
 impl FlashblockId {
-    /// Sentinel for "no predecessor". A producer emits it on the first
-    /// flashblock after a restart; consumers skip the predecessor check.
+    /// Sentinel for "no predecessor". A base slice carries it when the
+    /// producer did not seal the parent block or that build's closing slice
+    /// never went out. A consumer holding the parent in its overlay then
+    /// executes the base from the canonical parent instead of extending the
+    /// overlay.
     pub const NO_PREV: Self = Self { block_number: 0, index: 0 };
 
     /// Whether this is the [`NO_PREV`](Self::NO_PREV) sentinel.
@@ -102,7 +112,27 @@ impl<'de> Deserialize<'de> for FlashblockId {
 
 #[cfg(test)]
 mod tests {
-    use super::FlashblockId;
+    use alloy_primitives::B256;
+
+    use super::{FlashblockId, MantleFlashblockMetadata};
+
+    #[test]
+    fn prev_flashblock_hash_defaults_to_zero_and_round_trips() {
+        // Absent on the wire (an older producer): zero, meaning "not provided".
+        let old: MantleFlashblockMetadata =
+            serde_json::from_str(r#"{"block_number":7,"prev_flashblock_id":"7-2"}"#).unwrap();
+        assert_eq!(old.prev_flashblock_hash, B256::ZERO);
+
+        let meta = MantleFlashblockMetadata {
+            block_number: 7,
+            prev_flashblock_id: FlashblockId { block_number: 7, index: 2 },
+            prev_flashblock_hash: B256::repeat_byte(0xab),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"prev_flashblock_hash\""), "{json}");
+        assert_eq!(serde_json::from_str::<MantleFlashblockMetadata>(&json).unwrap(), meta);
+    }
 
     #[test]
     fn flashblock_id_serializes_as_block_dash_index() {

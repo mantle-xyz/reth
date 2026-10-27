@@ -28,6 +28,7 @@ mod reverted_tx;
 mod rpc_pending;
 mod rpc_pubsub;
 mod slice_journal;
+mod slice_links;
 mod slice_replay;
 mod subscriber_resume;
 mod wire_compat;

@@ -52,6 +52,10 @@ fn sequence() -> Vec<MantleFlashblockPayload> {
                     0 => FlashblockId::NO_PREV,
                     _ => FlashblockId { block_number: BLOCK_NUMBER, index: index - 1 },
                 },
+                prev_flashblock_hash: match index {
+                    0 => B256::ZERO,
+                    _ => B256::repeat_byte(index as u8),
+                },
                 ..Default::default()
             },
         })
@@ -107,4 +111,24 @@ fn dropping_the_empty_metadata_maps_would_break_upstream_decoding() {
     metadata.remove("receipts");
 
     assert!(serde_json::from_value::<OpFlashblockPayload>(json).is_err());
+}
+
+/// The predecessor hash is a Mantle-only key: it is published, and a message
+/// from an older producer that lacks it still decodes, as zero.
+#[test]
+fn the_predecessor_hash_is_published_and_optional_on_decode() {
+    let slice = sequence().remove(2);
+    let mut json = serde_json::to_value(&slice).unwrap();
+
+    assert_eq!(
+        json["metadata"]["prev_flashblock_hash"],
+        serde_json::json!(B256::repeat_byte(2)),
+        "published under this exact key"
+    );
+    let decoded: MantleFlashblockPayload = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(decoded.metadata.prev_flashblock_hash, B256::repeat_byte(2));
+
+    json["metadata"].as_object_mut().unwrap().remove("prev_flashblock_hash");
+    let old: MantleFlashblockPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(old.metadata.prev_flashblock_hash, B256::ZERO);
 }

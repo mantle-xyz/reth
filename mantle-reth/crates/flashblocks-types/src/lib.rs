@@ -19,7 +19,7 @@
 //!
 //! let decoded = MantleFlashblockPayload::try_decode_message(&bytes)?;
 //! assert_eq!(decoded.index, 3);
-//! // A slice with no recorded predecessor reports the sentinel.
+//! // Metadata without a predecessor decodes to the sentinel.
 //! assert_eq!(decoded.metadata.prev_flashblock_id, FlashblockId::NO_PREV);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

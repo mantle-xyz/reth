@@ -703,7 +703,7 @@ mod tests {
 
     /// After a restart the archive is empty, so there is nothing to replay
     /// whatever the subscriber asks for. It joins live and finds out from the
-    /// first slice's predecessor that the producer started over.
+    /// first slice's predecessor that the history is not continuous.
     #[tokio::test]
     async fn an_empty_archive_replays_nothing_for_any_position() {
         let (mut server, _client) = socket_pair().await;
