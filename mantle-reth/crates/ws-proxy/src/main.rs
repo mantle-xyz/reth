@@ -85,12 +85,14 @@ struct Args {
 
     /// Honour the address and topic filters on `/ws/{api_key}/filter`.
     ///
-    /// Off by default, because both read `metadata.receipts` and
-    /// `metadata.new_account_balances`, which the Mantle producer leaves empty
-    /// — a filter would silently match nothing rather than filter. With this
-    /// off the route still serves unfiltered subscriptions; one carrying
-    /// filter parameters is refused with `501` and an explanation. Turn it on
-    /// only for an upstream that populates those maps.
+    /// Refused at startup. Both filters read `metadata.receipts` and
+    /// `metadata.new_account_balances`, which the Mantle producer leaves empty,
+    /// so a filter would silently match nothing; and every filtered client
+    /// decompresses and parses every slice on its own, so CPU grows with the
+    /// number of filtered clients. Lifting the refusal needs a producer that
+    /// fills those maps, one parse per slice shared by all clients, and a cap
+    /// on addresses and topics per filter. While off, the route still serves
+    /// unfiltered subscriptions; one carrying filter parameters gets `501`.
     #[arg(long, env, default_value = "false")]
     enable_filters: bool,
 
@@ -190,6 +192,13 @@ fn refuse_unusable_args(args: &Args) -> eyre::Result<Vec<String>> {
              is due",
             args.client_pong_timeout_ms,
             args.client_ping_interval_ms,
+        );
+    }
+    if args.enable_filters {
+        eyre::bail!(
+            "--enable-filters is not supported: the Mantle producer leaves the slice metadata \
+             filters read empty, and every filtered client decompresses and parses every slice \
+             on its own, so CPU grows with the number of filtered clients"
         );
     }
 
@@ -590,6 +599,20 @@ mod tests {
             argv.extend_from_slice(flags);
             refuse_unusable_args(&args_with(&argv)).unwrap_or_else(|e| panic!("{flags:?}: {e}"));
         }
+    }
+
+    /// Filters cost a full decompress and JSON parse per slice per filtered
+    /// client, and match nothing useful against a Mantle producer, so the
+    /// proxy refuses to start with them on.
+    #[test]
+    fn enable_filters_is_refused() {
+        let err =
+            refuse_unusable_args(&args_with(&["--public-access-enabled", "--enable-filters"]))
+                .expect_err("filters must not be switched on");
+        assert!(
+            err.to_string().contains("--enable-filters"),
+            "the message must name the flag: {err}"
+        );
     }
 
     #[tokio::test]

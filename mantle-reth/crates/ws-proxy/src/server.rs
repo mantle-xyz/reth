@@ -237,9 +237,8 @@ async fn authenticated_filter_websocket_handler(
                 Metrics::filter_subscriptions_refused().increment(1);
                 // The application, not the key. Reaching this closure means
                 // the key was *valid*, so logging it writes a live customer
-                // credential to disk — and `--enable-filters` is off by
-                // default, so an ordinary first attempt at this route is all
-                // it takes.
+                // credential to disk — and filters cannot be switched on, so
+                // an ordinary first attempt at this route is all it takes.
                 warn!(
                     application = %app,
                     "refused a filter subscription; --enable-filters is off"
@@ -248,11 +247,10 @@ async fn authenticated_filter_websocket_handler(
                     .status(StatusCode::NOT_IMPLEMENTED)
                     .body(Body::from(
                         json!({
-                            "message": "address and topic filters are disabled on this proxy: \
-                                        the configured upstream does not populate the slice \
+                            "message": "address and topic filters are not supported on this \
+                                        proxy: the upstream does not populate the slice \
                                         metadata they read. Subscribe to /ws/<api_key> and \
-                                        filter locally, or start the proxy with --enable-filters \
-                                        if its upstream does populate it.",
+                                        filter locally.",
                         })
                         .to_string(),
                     ))
