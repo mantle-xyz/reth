@@ -622,18 +622,13 @@ where
                             // re-executes for itself, so it needs nothing out of
                             // the chain that went away.
                             //
-                            // The cost is that a reorg is inferred, not
-                            // reported: `ReorgDetector::detect` compares the
-                            // overlay's tx list for a height with the canonical
-                            // block's, and `base_is_canonical` checks the hash
-                            // under the overlay's earliest block. A reorg that
-                            // re-seals a tracked height with the same
-                            // transactions and a different header passes
-                            // both, and the overlay keeps publishing on the
-                            // old block's hash until the next `CatchUp`.
-                            // Accepted: an OP sequencer does not re-seal a
-                            // block with identical contents, and the window
-                            // closes at the next canonical block.
+                            // A reorg is therefore inferred, not reported:
+                            // `ReorgDetector::detect` compares the overlay's tx
+                            // list for a height with the canonical block's, and
+                            // a block whose declared parent is no longer the
+                            // canonical one is refused before it runs — which
+                            // also catches a height re-sealed with the same
+                            // transactions and a different header.
                             for block in notification.committed().blocks_iter() {
                                 // op-reth v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
                                 state_for_canonical

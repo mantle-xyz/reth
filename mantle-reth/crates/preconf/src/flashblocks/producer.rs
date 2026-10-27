@@ -9,6 +9,8 @@
 
 use std::{future::Future, io, pin::Pin, sync::Arc};
 
+use alloy_primitives::B256;
+use mantle_reth_flashblocks_types::FlashblockId;
 use parking_lot::Mutex;
 
 use crate::flashblocks::{
@@ -26,6 +28,40 @@ pub struct FlashblocksProducer {
     pub cfg: Arc<FlashblockProducerConfig>,
     /// Where finished slices go.
     pub publisher: PublisherHandle,
+    /// The closing slice of the block this producer sealed last.
+    pub sealed_links: SealedSliceLinks,
+}
+
+/// The closing slice of a block this producer sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedSliceLink {
+    /// Hash of the sealed block.
+    pub block_hash: B256,
+    /// Position of its last published slice.
+    pub last_slice: FlashblockId,
+    /// Content hash of that slice.
+    pub last_slice_hash: B256,
+}
+
+/// The newest [`SealedSliceLink`], shared between builds.
+///
+/// Holds one entry: it is looked up by block hash, so a build on any other
+/// parent finds nothing and names no predecessor.
+#[derive(Debug, Clone, Default)]
+pub struct SealedSliceLinks(Arc<Mutex<Option<SealedSliceLink>>>);
+
+impl SealedSliceLinks {
+    /// Remember `link`, replacing the previous one.
+    pub fn record(&self, link: SealedSliceLink) {
+        *self.0.lock() = Some(link);
+    }
+
+    /// `(position, content hash)` to name as the predecessor of a block built
+    /// on `parent_hash`.
+    pub fn predecessor_of(&self, parent_hash: B256) -> Option<(FlashblockId, B256)> {
+        let link = (*self.0.lock())?;
+        (link.block_hash == parent_hash).then_some((link.last_slice, link.last_slice_hash))
+    }
 }
 
 /// Everything a node needs to keep the flashblocks **producer** endpoint
@@ -68,7 +104,11 @@ impl FlashblocksProducerHandles {
     /// both for the reasons in [`MantleFlashblocksPublisher::bind`].
     pub fn bind(cfg: FlashblockProducerConfig) -> io::Result<Self> {
         let (publisher, accepting) = MantleFlashblocksPublisher::bind(&cfg)?;
-        let producer = FlashblocksProducer { cfg: Arc::new(cfg), publisher: publisher.handle() };
+        let producer = FlashblocksProducer {
+            cfg: Arc::new(cfg),
+            publisher: publisher.handle(),
+            sealed_links: SealedSliceLinks::default(),
+        };
 
         Ok(Self { producer, publisher, accepting: Mutex::new(Some(Box::pin(accepting))) })
     }
@@ -96,6 +136,21 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+
+    #[test]
+    fn a_sealed_link_is_found_only_by_the_block_it_sealed() {
+        let links = SealedSliceLinks::default();
+        let sealed = B256::repeat_byte(1);
+        let last = FlashblockId { block_number: 9, index: 4 };
+        links.record(SealedSliceLink {
+            block_hash: sealed,
+            last_slice: last,
+            last_slice_hash: B256::repeat_byte(2),
+        });
+
+        assert_eq!(links.predecessor_of(sealed), Some((last, B256::repeat_byte(2))));
+        assert_eq!(links.predecessor_of(B256::repeat_byte(3)), None, "another parent gets nothing");
+    }
 
     /// Bind on an OS-assigned port so tests never collide.
     fn cfg() -> FlashblockProducerConfig {

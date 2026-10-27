@@ -218,7 +218,8 @@ pub type SlotClaim = Result<(), TxHash>;
 #[derive(Debug, Default)]
 struct SealedPayload {
     block: Option<B256>,
-    /// Generation of the build that wrote `block`; `0` before any seal.
+    /// Newest generation that sealed or cleared; a seal older than it is
+    /// refused. `0` before any build.
     generation: u64,
 }
 
@@ -541,7 +542,8 @@ impl Commitments {
     /// `generation` is the sealing build's, from `BuildGuard::generation`. A
     /// seal from an older generation than the one already recorded is dropped:
     /// the seal runs after the build has handed the queue on, so a build that
-    /// was slow to seal can arrive here after its successor did, and taking
+    /// was slow to seal can arrive here after a successor took the queue —
+    /// sealed or not — and taking
     /// its block would make the next prologue read the successor's executed
     /// transactions as landed in a block that never carried them.
     pub fn note_sealed(&self, block: B256, generation: u64) {
@@ -552,7 +554,8 @@ impl Commitments {
         *sealed = SealedPayload { block: Some(block), generation };
     }
 
-    /// Forget which block the last build sealed.
+    /// Forget which block the last build sealed, and raise the recorded
+    /// generation to the clearing build's.
     ///
     /// [`Self::note_sealed`] runs at the seal, after the build has stopped
     /// executing; until then the answer here still names the build *before*
@@ -563,10 +566,12 @@ impl Commitments {
     ///
     /// Reached through `BuildGuard`'s `Drop` and nowhere else: what makes it
     /// safe is being ordered before the queue is handed on.
-    pub(crate) fn clear_sealed(&self) {
-        // The generation stays: it is what keeps a late seal from an older
-        // build out, and clearing it would let that seal back in.
-        self.sealed_payload.lock().block = None;
+    pub(crate) fn clear_sealed(&self, generation: u64) {
+        // Raised to the clearing build's generation: a build that took the
+        // queue later outranks any seal still in flight from before it.
+        let mut sealed = self.sealed_payload.lock();
+        sealed.block = None;
+        sealed.generation = sealed.generation.max(generation);
     }
 
     /// Whether `parent_hash` is the block the last build sealed — if so,
@@ -1738,7 +1743,7 @@ mod tests {
         let previous = B256::repeat_byte(7);
         c.note_sealed(previous, c.next_build_generation());
 
-        c.clear_sealed();
+        c.clear_sealed(0);
 
         assert!(
             !c.parent_is_ours(previous),
@@ -1751,7 +1756,7 @@ mod tests {
     fn the_seal_after_a_clear_restores_the_shortcut() {
         let c = classifier();
         c.note_sealed(B256::repeat_byte(7), c.next_build_generation());
-        c.clear_sealed();
+        c.clear_sealed(0);
 
         let ours = B256::repeat_byte(9);
         c.note_sealed(ours, c.next_build_generation());
@@ -1770,7 +1775,7 @@ mod tests {
         c.note_sealed(B256::repeat_byte(1), older);
         assert!(c.parent_is_ours(B256::repeat_byte(2)), "the newer seal stands");
 
-        c.clear_sealed();
+        c.clear_sealed(0);
         c.note_sealed(B256::repeat_byte(1), older);
         assert!(!c.parent_is_ours(B256::repeat_byte(1)), "still refused after a clear");
     }

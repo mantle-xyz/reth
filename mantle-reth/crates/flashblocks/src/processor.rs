@@ -15,14 +15,16 @@ use alloy_consensus::{
 };
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
 use alloy_network::TransactionResponse;
-use alloy_primitives::{Address, BlockNumber};
+use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::state::StateOverride;
 use arc_swap::ArcSwapOption;
-use mantle_reth_flashblocks_types::MantleFlashblockPayload;
+use mantle_reth_flashblocks_types::{FlashblockId, MantleFlashblockPayload};
 use op_alloy_consensus::OpTxEnvelope;
+use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
+use op_revm::OpSpecId;
 use rayon::prelude::*;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
-use reth_evm::ConfigureEvm;
+use reth_evm::{ConfigureEvm, EvmEnv};
 use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::OpBlock;
@@ -40,7 +42,8 @@ use crate::{
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, IncomingBuild,
-        ReconciliationStrategy, ReorgDetector, SequenceValidationResult,
+        ReconciliationStrategy, ReorgDetector, SequenceValidationResult, base_links_to_overlay,
+        slice_follows_by_content,
     },
 };
 
@@ -212,7 +215,19 @@ where
             match update {
                 StateUpdate::Canonical(block, ack) => {
                     debug!(message = "processing canonical block", block_number = block.number);
-                    match self.process_canonical_block(prev_pending_blocks, &block, tip) {
+                    let reconciled =
+                        match self.process_canonical_block(prev_pending_blocks, &block, tip) {
+                            Err(
+                                e @ StateProcessorError::Protocol(
+                                    ProtocolError::ParentHashMismatch { .. },
+                                ),
+                            ) => {
+                                self.drop_on_parent_hash_mismatch(&e);
+                                Ok(None)
+                            }
+                            other => other,
+                        };
+                    match reconciled {
                         Ok(new_pending_blocks) => {
                             self.pending_blocks.swap(new_pending_blocks);
 
@@ -316,11 +331,36 @@ where
         tip.is_none_or(|tip| pending_blocks.latest_block_number() > tip)
     }
 
+    /// Fails when the chain has the parent height under a different hash.
+    ///
+    /// Earlier than `base_is_canonical` and per block: executing on the wrong
+    /// parent is never useful, and only the overlay's earliest block is checked at
+    /// publish. A parent the chain does not have yet, or a provider error, is left
+    /// to the other guards.
+    fn ensure_canonical_parent(&self, block_number: BlockNumber, declared: B256) -> Result<()> {
+        let Some(parent_number) = block_number.checked_sub(1) else { return Ok(()) };
+        match self.client.block_hash(parent_number) {
+            Ok(Some(canonical)) if canonical != declared => {
+                Err(ProtocolError::ParentHashMismatch { block_number, declared, canonical }.into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Drops the overlay after a base payload named a non-canonical parent.
+    fn drop_on_parent_hash_mismatch(&self, error: &StateProcessorError) {
+        Metrics::parent_hash_mismatch().increment(1);
+        warn!(message = "base payload is not built on the canonical parent, dropping the overlay", %error);
+        self.clear_live_state();
+        self.pending_blocks.swap(None);
+    }
+
     /// Returns `true` when the snapshot's base block is still the canonical block
     /// at that height.
     ///
-    /// Every other guard here compares heights only, so this is the one that
-    /// catches a reorg or a failover putting a different block at the same height.
+    /// The parent-hash and predecessor checks judge a block before it runs; this
+    /// one catches a snapshot whose base the chain replaced after it was built —
+    /// a reorg or a failover putting a different block at the same height.
     ///
     /// Read on every publish rather than driven by canonical notifications: a head
     /// rollback whose target has left the engine's in-memory tree emits none, and a
@@ -497,6 +537,50 @@ where
             }
             Err(e) => {
                 match e {
+                    StateProcessorError::Protocol(ProtocolError::StalePredecessor) => {
+                        Metrics::stale_predecessor().increment(1);
+                        warn!(
+                            message = "base slice does not link to the overlay's parent; restarting from the canonical parent",
+                            block = %flashblock.metadata.block_number,
+                        );
+                        // Fail closed: the overlay this slice refused to extend is not served.
+                        self.clear_live_state();
+                        self.pending_blocks.swap(None);
+                        // The same path as a fresh start, cached if the parent has not landed.
+                        match self.process_flashblock(None, &flashblock) {
+                            Ok(new_pending_blocks) => {
+                                if let Some(ref pb) = new_pending_blocks {
+                                    _ = self.sender.send(Arc::clone(pb));
+                                }
+                                self.pending_blocks.swap(new_pending_blocks);
+                                Metrics::block_processing_duration().record(start_time.elapsed());
+                            }
+                            Err(StateProcessorError::Provider(
+                                ProviderError::MissingCanonicalHeader { .. },
+                            )) => {
+                                self.cache.lock().await.insert(flashblock);
+                            }
+                            Err(
+                                e @ StateProcessorError::Protocol(
+                                    ProtocolError::ParentHashMismatch { .. },
+                                ),
+                            ) => self.drop_on_parent_hash_mismatch(&e),
+                            Err(e) => {
+                                error!(
+                                    message = "could not process flashblock from the canonical parent",
+                                    error = %e,
+                                );
+                                Metrics::block_processing_error().increment(1);
+                            }
+                        }
+                        return;
+                    }
+                    StateProcessorError::Protocol(ProtocolError::ParentHashMismatch { .. }) => {
+                        // Fail closed and do not cache: the parent is canonical already,
+                        // so a replay would hit the same mismatch.
+                        self.drop_on_parent_hash_mismatch(&e);
+                        return;
+                    }
                     StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
                     }) => {
@@ -651,6 +735,48 @@ where
                 return Err(StateProcessorError::MissingFirstFlashblock);
             }
         };
+
+        // A base slice whose parent block is in the overlay extends it only when it
+        // names that block's last slice by position and content. Anything else goes
+        // to the canonical parent instead.
+        if flashblock.index == 0 &&
+            let Some(parent_number) = flashblock.metadata.block_number.checked_sub(1) &&
+            let Some(parent_last) = pending_blocks.last_flashblock_of(parent_number) &&
+            !base_links_to_overlay(
+                (
+                    FlashblockId { block_number: parent_number, index: parent_last.index },
+                    parent_last.diff.block_hash,
+                ),
+                flashblock.metadata.prev_flashblock_id,
+                flashblock.metadata.prev_flashblock_hash,
+            )
+        {
+            return Err(ProtocolError::StalePredecessor.into());
+        }
+
+        // The next slice of the tracked build must follow the overlay's latest slice by
+        // content. Only the next one: a duplicate names the slice before the latest,
+        // and gaps and other builds are the validator's to judge.
+        if flashblock.index > 0 &&
+            flashblock.payload_id == pending_blocks.payload_id() &&
+            flashblock.metadata.block_number == pending_blocks.latest_block_number() &&
+            flashblock.index == pending_blocks.latest_flashblock_index().saturating_add(1) &&
+            let Some(latest) =
+                pending_blocks.last_flashblock_of(pending_blocks.latest_block_number()) &&
+            !slice_follows_by_content(
+                latest.diff.block_hash,
+                flashblock.metadata.prev_flashblock_hash,
+            )
+        {
+            Metrics::slice_content_mismatch().increment(1);
+            warn!(
+                message = "slice does not follow the overlay's latest slice by content; dropping the overlay",
+                block = %flashblock.metadata.block_number,
+                index = %flashblock.index,
+            );
+            self.clear_live_state();
+            return Ok(None);
+        }
 
         let incoming_build = if flashblock.payload_id == pending_blocks.payload_id() {
             IncomingBuild::Same
@@ -923,6 +1049,7 @@ where
         let Some(base) = flashblock.base.clone() else {
             return Err(StateProcessorError::MissingFirstFlashblock);
         };
+        self.ensure_canonical_parent(base.block_number, base.parent_hash)?;
 
         // Taken through a temporary guard: the rebuild in the fallback below writes the
         // live state back, so holding the guard across it deadlocks this thread.
@@ -967,10 +1094,7 @@ where
         db.block_hashes.insert(base.block_number - 1, base.parent_hash);
 
         let evm_config = OpEvmConfig::optimism(self.client.chain_spec());
-        let block_env_attributes = OpNextBlockEnvAttributes::from(base.clone());
-        let evm_env = evm_config
-            .next_evm_env(&previous_header, &block_env_attributes)
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+        let evm_env = next_block_evm_env(&evm_config, &previous_header, &base)?;
         let evm = evm_config.evm_with_env(db, evm_env);
 
         let recovery_start = Instant::now();
@@ -1072,6 +1196,7 @@ where
         let mut total_transaction_count = 0usize;
         for (_block_number, flashblocks) in flashblocks_per_block {
             let assembled = BlockAssembler::assemble(&flashblocks)?;
+            self.ensure_canonical_parent(assembled.base.block_number, assembled.base.parent_hash)?;
             let latest_flashblock_tx_count =
                 flashblocks.last().map(|latest| latest.diff.transactions.len()).unwrap_or_default();
             let latest_block_base = assembled.base.clone();
@@ -1083,14 +1208,10 @@ where
             let latest_block_l1_block_info = l1_block_info.clone();
             let latest_block_transaction_count = assembled.block.body.transactions.len();
 
-            let block_env_attributes = OpNextBlockEnvAttributes::from(assembled.base.clone());
-
             db.block_hashes
                 .insert(latest_block_base.block_number - 1, latest_block_base.parent_hash);
 
-            let evm_env = evm_config
-                .next_evm_env(&last_block_header, &block_env_attributes)
-                .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+            let evm_env = next_block_evm_env(&evm_config, &last_block_header, &assembled.base)?;
             let evm = evm_config.evm_with_env(db, evm_env);
 
             let recovery_start = Instant::now();
@@ -1161,6 +1282,34 @@ where
 
         self.publish_pending_blocks(pending_blocks_builder, db, state_overrides)
     }
+}
+
+/// The EVM environment for the block `base` opens, on `parent`. The basefee is
+/// the producer's: it is what the sealed header carries, and deriving it from
+/// a parent the overlay assembled would follow any gap in that parent.
+fn next_block_evm_env<ChainSpec>(
+    evm_config: &OpEvmConfig<ChainSpec>,
+    parent: &Header,
+    base: &OpFlashblockPayloadBase,
+) -> Result<EvmEnv<OpSpecId>>
+where
+    ChainSpec: EthChainSpec<Header = Header> + OpHardforks + 'static,
+{
+    let mut evm_env = evm_config
+        .next_evm_env(parent, &OpNextBlockEnvAttributes::from(base.clone()))
+        .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+    let declared: u64 = base.base_fee_per_gas.saturating_to();
+    if evm_env.block_env.basefee != declared {
+        Metrics::base_fee_mismatch().increment(1);
+        warn!(
+            message = "derived basefee differs from the base slice; using the base slice's",
+            block = %base.block_number,
+            derived = evm_env.block_env.basefee,
+            declared,
+        );
+        evm_env.block_env.basefee = declared;
+    }
+    Ok(evm_env)
 }
 
 impl<Client> StateProcessor<Client> {

@@ -93,6 +93,14 @@ flashblock_metrics! {
         "Blocks whose overlay was replaced by a new build of the same height";
     counter   foreign_build_slice                       => "flashblocks.consumer.foreign_build_slice_total",
         "Continuation slices from a build this node never saw the base of";
+    counter   stale_predecessor                         => "flashblocks.consumer.stale_predecessor_total",
+        "Base slices that did not link to the overlay's parent block, restarted from the canonical parent";
+    counter   parent_hash_mismatch                      => "flashblocks.consumer.parent_hash_mismatch_total",
+        "Base payloads whose parent hash differed from the canonical parent, dropping the overlay";
+    counter   slice_content_mismatch                    => "flashblocks.consumer.slice_content_mismatch_total",
+        "Slices that did not follow the overlay's latest slice by content, dropping the overlay";
+    counter   base_fee_mismatch                         => "flashblocks.consumer.base_fee_mismatch_total",
+        "Base slices whose basefee differed from the one derived from the parent header, using the slice's";
     histogram flashblocks_in_block                      => "flashblocks.consumer.slices_per_block",
         "Slices the consumer saw for one block (the producer's view is `flashblocks.slices_per_block`)";
     counter   block_processing_error                    => "flashblocks.consumer.block_processing_error_total",

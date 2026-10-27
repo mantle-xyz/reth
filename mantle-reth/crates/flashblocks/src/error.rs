@@ -30,6 +30,24 @@ pub enum ProtocolError {
     /// Genesis has no parent block to execute a flashblock against.
     #[error("cannot execute a genesis flashblock: block zero has no parent")]
     GenesisFlashblock,
+
+    /// A base slice whose parent block is in the overlay does not name that
+    /// block's last slice by position and content.
+    #[error("base slice does not link to the overlay's parent block")]
+    StalePredecessor,
+
+    /// A base payload names a parent other than the canonical block at that height.
+    #[error(
+        "block {block_number} declares parent {declared}, but the canonical parent is {canonical}"
+    )]
+    ParentHashMismatch {
+        /// The block the base payload is for.
+        block_number: u64,
+        /// The parent hash the base payload declares.
+        declared: B256,
+        /// The canonical hash at `block_number - 1`.
+        canonical: B256,
+    },
 }
 
 /// Errors related to state provider and infrastructure operations.
@@ -221,6 +239,17 @@ mod tests {
     #[case(ProtocolError::InvalidSequence.into(), "must be processed in order")]
     #[case(ProtocolError::MissingBase.into(), "first flashblock in sequence")]
     #[case(ProtocolError::EmptyFlashblocks.into(), "zero flashblocks")]
+    #[case(ProtocolError::StalePredecessor.into(), "does not link to the overlay's parent")]
+    #[case(
+        ProtocolError::ParentHashMismatch {
+            block_number: 5,
+            declared: B256::repeat_byte(0x11),
+            canonical: B256::repeat_byte(0x22),
+        }
+        .into(),
+        "block 5 declares parent 0x1111111111111111111111111111111111111111111111111111111111111111, \
+         but the canonical parent is 0x2222222222222222222222222222222222222222222222222222222222222222"
+    )]
     #[case(
         ProviderError::MissingCanonicalHeader { block_number: 7 }.into(),
         "missing canonical header for block 7"

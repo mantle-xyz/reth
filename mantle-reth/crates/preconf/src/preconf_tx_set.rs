@@ -563,9 +563,9 @@ impl AccountView {
 /// The queue, held by the build that is executing — see
 /// [`PreconfTxSet::lock_for_build`].
 ///
-/// Dropping it clears the sealed-block hash and then hands the queue on, in
-/// that order: the next build reads that hash the moment it takes the queue,
-/// and until this build seals it still names the build before it.
+/// Dropping it clears the sealed-block hash, raising the recorded generation
+/// to this build's, and then hands the queue on, in that order: the next build reads that hash the
+/// moment it takes the queue, and until this build seals it still names the build before it.
 ///
 /// Coupled to the drop because the caller's own exits would skip it — every
 /// `?` between taking the queue and the seal, and an unwind — and those are
@@ -601,7 +601,7 @@ impl Drop for BuildGuard {
     fn drop(&mut self) {
         // Before the mutex goes, or the next build takes the queue and reads
         // the hash this is about to erase.
-        self.claims.clear_sealed();
+        self.claims.clear_sealed(self.generation);
         self.lock.take();
     }
 }
@@ -2626,6 +2626,26 @@ mod tests {
         let c = set.lock_for_build().await;
         assert!(c.parent_is_ours(sealed_by_b), "B is the last build that sealed");
         assert!(!c.parent_is_ours(sealed_by_a), "A's late seal must not stand");
+    }
+
+    /// A build that took the queue after A and was then abandoned without sealing
+    /// still outranks A: A's late seal must not make the next build read A's
+    /// parent as "everything in the queue is on chain".
+    #[tokio::test]
+    async fn a_late_seal_is_refused_after_a_newer_build_cleared_without_sealing() {
+        let set = PreconfTxSet::new(16);
+        let sealed_by_a = h(0xaa);
+
+        let a = set.lock_for_build().await;
+        let generation_a = a.generation();
+        drop(a);
+        let b = set.lock_for_build().await; // abandoned: never seals
+        drop(b);
+
+        set.claims().note_sealed(sealed_by_a, generation_a);
+
+        let c = set.lock_for_build().await;
+        assert!(!c.parent_is_ours(sealed_by_a), "A's seal arrived after a newer build");
     }
 
     /// `unindex` is the point every removal converges on, and it releases the

@@ -80,8 +80,8 @@ use crate::{
     },
     classifier::Whitelist,
     flashblocks::{
-        BlockInvariants, FlashblocksProducer, SenderBalances, SliceHeader, SliceLimits,
-        build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
+        BlockInvariants, FlashblocksProducer, SealedSliceLink, SenderBalances, SliceHeader,
+        SliceLimits, build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
     },
     journal::PreconfJournal,
     preconf_tx_set::TxEntryView,
@@ -1642,8 +1642,9 @@ impl<P: reth_storage_api::AccountReader + ?Sized> SenderBalances for ProviderBal
 /// Everything slicing carries from one tick to the next.
 ///
 /// Held for the life of one block: the block-level fields a subscriber needs
-/// are established once, and the index and predecessor pointer are what let a
-/// subscriber tell a gap from a fresh start.
+/// are established once, and the index and the predecessor's position and
+/// content hash are what let a subscriber tell whether a slice extends what it
+/// holds.
 struct SliceState {
     producer: FlashblocksProducer,
     /// Post-Jovian DA footprint scalar, or `None` before Jovian.
@@ -1660,6 +1661,14 @@ struct SliceState {
     invariants: Option<BlockInvariants>,
     next_index: u64,
     previous: FlashblockId,
+    /// Content hash of the slice `previous` names; zero when none.
+    previous_hash: B256,
+    /// Position and content hash of the last slice that went out.
+    last_sent: Option<(FlashblockId, B256)>,
+    /// Whether the closing slice went out. Only then does the next block name
+    /// this one: without it the sealed block holds transactions no slice
+    /// described.
+    closing_sent: bool,
 }
 
 impl SliceState {
@@ -1672,24 +1681,18 @@ impl SliceState {
         self.next_index
     }
 
-    fn new(producer: &FlashblocksProducer, da_footprint_gas_scalar: Option<u16>) -> Self {
-        // The predecessor of this block's first slice is the last slice of the
-        // previous block, which a block-scoped builder does not know — so it
-        // comes from what the publisher has actually sent. Only a producer that
-        // has published nothing has no predecessor, and the sentinel is how a
-        // subscriber tells that fresh start from a gap it should go and fill.
-        //
-        // Rebuilding a block points the new first slice at the last slice of
-        // the attempt being replaced. Deliberate: the index restarting at zero
-        // with `base` present is what says a build began again, and claiming no
-        // predecessor at all would say something less true.
-        let previous =
-            producer.publisher.latest_position().map_or(FlashblockId::NO_PREV, |position| {
-                FlashblockId {
-                    block_number: position.block_number,
-                    index: position.flashblock_index,
-                }
-            });
+    fn new(
+        producer: &FlashblocksProducer,
+        parent_hash: B256,
+        da_footprint_gas_scalar: Option<u16>,
+    ) -> Self {
+        // The first slice names the closing slice of the build that sealed the
+        // parent. A parent this node did not seal, or whose closing slice never
+        // went out, gets `NO_PREV` and a zero hash.
+        let (previous, previous_hash) = producer
+            .sealed_links
+            .predecessor_of(parent_hash)
+            .unwrap_or((FlashblockId::NO_PREV, B256::ZERO));
 
         Self {
             producer: producer.clone(),
@@ -1699,7 +1702,16 @@ impl SliceState {
             invariants: None,
             next_index: 0,
             previous,
+            previous_hash,
+            last_sent: None,
+            closing_sent: false,
         }
+    }
+
+    /// The link the next block names, when this block's closing slice went out.
+    fn sealed_link(&self, block_hash: B256) -> Option<SealedSliceLink> {
+        let (last_slice, last_slice_hash) = self.last_sent?;
+        self.closing_sent.then_some(SealedSliceLink { block_hash, last_slice, last_slice_hash })
     }
 
     /// Write this slice's transactions to the journal, then publish it.
@@ -1781,8 +1793,9 @@ impl SliceState {
     /// Never fails the build. Publishing a slice is a side channel: a state read
     /// that fell over, or an encoding that did not, costs a slice and leaves its
     /// transactions pending for the next one — whereas failing here would cost
-    /// the slot its block. A subscriber that ends up short is told by
-    /// `prev_flashblock_id` and fills the gap from the canonical chain.
+    /// the slot its block. A subscriber that ends up short is told by the
+    /// predecessor link (`prev_flashblock_id`, `prev_flashblock_hash`) and
+    /// fills the gap from the canonical chain.
     fn publish<N, Evm, ChainSpec, Attrs, B, P>(
         &mut self,
         ctx: &OpPayloadBuilderCtx<Evm, ChainSpec, Attrs>,
@@ -1859,6 +1872,7 @@ impl SliceState {
             ctx.payload_id(),
             self.next_index,
             self.previous,
+            self.previous_hash,
         );
         let block_number = invariants.base.block_number;
 
@@ -1916,7 +1930,11 @@ impl SliceState {
         // subscriber would have no way to notice the hole.
         info.advance_publish_cursor();
 
-        self.previous = FlashblockId { block_number, index: self.next_index };
+        let hash = payload.diff.block_hash;
+        let sent_id = FlashblockId { block_number, index: self.next_index };
+        self.last_sent = Some((sent_id, hash));
+        self.previous = sent_id;
+        self.previous_hash = hash;
         self.next_index += 1;
     }
 }
@@ -2422,7 +2440,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             .flashblocks
             .as_ref()
             .filter(|_| allow_preconf)
-            .map(|producer| SliceState::new(producer, da_footprint_gas_scalar));
+            .map(|producer| SliceState::new(producer, parent_hash, da_footprint_gas_scalar));
 
         // The first slice goes out before any preconf or pool transaction has
         // been applied, so it carries exactly the deposits and system
@@ -2695,9 +2713,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // its own once the budgeted count is reached, so it has published
         // everything by the time it finalizes. A difference in shape, not in
         // policy.
+        //
+        // Nothing may execute between this slice and `finish`: the next block
+        // names this slice as the sealed block's content.
         if let Some(state) = slices.as_mut() &&
             cancel.reason() == Some(CancelReason::Resolved)
         {
+            let before = state.published_count();
             state
                 .journal_and_publish(
                     &ctx,
@@ -2708,6 +2730,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     self.journal.as_deref(),
                 )
                 .await;
+            state.closing_sent = state.published_count() > before;
         }
 
         // ── Stage 5: finalize ─────────────────────────────────────────
@@ -2757,6 +2780,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // safe direction by construction.
         if allow_preconf {
             self.fifo.claims().note_sealed(sealed_block.hash(), build_generation);
+            if let Some(state) = slices.as_ref() &&
+                let Some(link) = state.sealed_link(sealed_block.hash())
+            {
+                state.producer.sealed_links.record(link);
+            }
         }
         debug!(
             target: "mantle::preconf::payload_builder",
@@ -3636,5 +3664,39 @@ mod tests {
             !c.whitelist_snapshot().is_eligible(&sender, Some(&to)),
             "while a fresh snapshot sees the revocation"
         );
+    }
+
+    /// A block whose closing slice did not go out leaves no link for the next block.
+    #[tokio::test]
+    async fn a_block_whose_closing_slice_did_not_go_out_leaves_no_link() {
+        use crate::flashblocks::{FlashblocksProducerHandles, config::FlashblockProducerConfig};
+
+        let cfg = FlashblockProducerConfig {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            ..Default::default()
+        };
+        let handles = FlashblocksProducerHandles::bind(cfg).expect("binds");
+        let mut state = SliceState::new(handles.producer(), B256::repeat_byte(1), None);
+        let hash = B256::repeat_byte(9);
+        let last = FlashblockId { block_number: 1, index: 3 };
+        let last_hash = B256::repeat_byte(7);
+
+        state.last_sent = Some((last, last_hash));
+        state.closing_sent = false;
+        assert_eq!(state.sealed_link(hash), None);
+
+        state.closing_sent = true;
+        assert_eq!(
+            state.sealed_link(hash),
+            Some(SealedSliceLink {
+                block_hash: hash,
+                last_slice: last,
+                last_slice_hash: last_hash
+            })
+        );
+
+        state.last_sent = None;
+        assert_eq!(state.sealed_link(hash), None);
     }
 }

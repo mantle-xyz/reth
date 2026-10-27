@@ -148,10 +148,6 @@ impl PublisherHandle {
 
     /// Where the most recently published slice sits, across every block this
     /// producer has published. `None` means nothing has been published yet.
-    ///
-    /// Scoped to the producer rather than to a block because that is what lets
-    /// one block's first slice point at the last slice of the previous one —
-    /// see `SliceState::new`, which turns this into `prev_flashblock_id`.
     pub fn latest_position(&self) -> Option<FlashblockPosition> {
         self.ring.read().latest()
     }

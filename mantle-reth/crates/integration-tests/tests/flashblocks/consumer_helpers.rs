@@ -51,6 +51,9 @@ pub struct FlashblockBuilder {
     transactions: Vec<Bytes>,
     gas_used: u64,
     prev: mantle_reth_flashblocks_types::FlashblockId,
+    block_hash: Option<B256>,
+    prev_hash: Option<B256>,
+    base_fee: U256,
 }
 
 impl FlashblockBuilder {
@@ -64,6 +67,9 @@ impl FlashblockBuilder {
             transactions: Vec::new(),
             gas_used: 0,
             prev: mantle_reth_flashblocks_types::FlashblockId::NO_PREV,
+            block_hash: None,
+            prev_hash: None,
+            base_fee: U256::ZERO,
         }
     }
 
@@ -86,9 +92,33 @@ impl FlashblockBuilder {
         self
     }
 
+    /// The `diff.block_hash` a test slice at `(block_number, index)` carries
+    /// unless overridden. Deterministic, so `.prev(b, i)` can name it.
+    pub fn slice_hash(block_number: u64, index: u64) -> B256 {
+        alloy_primitives::keccak256([block_number.to_be_bytes(), index.to_be_bytes()].concat())
+    }
+
+    /// Overrides this slice's `diff.block_hash`.
+    pub const fn block_hash(mut self, block_hash: B256) -> Self {
+        self.block_hash = Some(block_hash);
+        self
+    }
+
+    /// Overrides the predecessor content hash `.prev()` derived.
+    pub const fn prev_hash(mut self, prev_hash: B256) -> Self {
+        self.prev_hash = Some(prev_hash);
+        self
+    }
+
     /// Adds encoded transactions to this slice's delta.
     pub fn transactions(mut self, transactions: Vec<Bytes>) -> Self {
         self.transactions = transactions;
+        self
+    }
+
+    /// Sets the basefee the base payload declares (default zero, what the test chain derives).
+    pub const fn base_fee(mut self, base_fee: U256) -> Self {
+        self.base_fee = base_fee;
         self
     }
 
@@ -112,14 +142,16 @@ impl FlashblockBuilder {
                 gas_limit: 30_000_000,
                 timestamp: l2_ts(self.block_number),
                 extra_data: Bytes::default(),
-                base_fee_per_gas: U256::from(1_000_000_000u64),
+                base_fee_per_gas: self.base_fee,
             }),
             diff: OpFlashblockPayloadDelta {
                 state_root: B256::ZERO,
                 receipts_root: B256::ZERO,
                 logs_bloom: Default::default(),
                 gas_used: self.gas_used,
-                block_hash: B256::ZERO,
+                block_hash: self
+                    .block_hash
+                    .unwrap_or_else(|| Self::slice_hash(self.block_number, self.index)),
                 transactions: self.transactions,
                 withdrawals: vec![],
                 withdrawals_root: B256::ZERO,
@@ -129,6 +161,11 @@ impl FlashblockBuilder {
             metadata: MantleFlashblockMetadata {
                 block_number: self.block_number,
                 prev_flashblock_id: self.prev,
+                prev_flashblock_hash: self.prev_hash.unwrap_or(if self.prev.is_no_prev() {
+                    B256::ZERO
+                } else {
+                    Self::slice_hash(self.prev.block_number, self.prev.index)
+                }),
                 ..MantleFlashblockMetadata::default()
             },
         }
@@ -254,7 +291,8 @@ pub fn base_slice_builder(block_number: u64) -> FlashblockBuilder {
     FlashblockBuilder::new(block_number, 0).transactions(vec![l1_info_deposit(block_number)])
 }
 
-/// [`base_slice_builder`] with no predecessor link.
+/// [`base_slice_builder`] with no predecessor link (`NO_PREV`), so it does not
+/// extend an overlay that holds its parent.
 pub fn base_slice(block_number: u64) -> MantleFlashblockPayload {
     base_slice_builder(block_number).build()
 }
@@ -432,13 +470,24 @@ pub async fn signed_deploy(nonce: u64, init_code: Bytes) -> Bytes {
 
 /// Signs a call from [`test_sender`] for inclusion in a slice.
 pub async fn signed_call(nonce: u64, to: Address, value: U256) -> Bytes {
+    signed_call_with_fees(nonce, to, value, 20_000_000_000, 20_000_000_000).await
+}
+
+/// [`signed_call`] with explicit fee caps, so the effective gas price can follow the basefee.
+pub async fn signed_call_with_fees(
+    nonce: u64,
+    to: Address,
+    value: U256,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Bytes {
     let request = TransactionRequest {
         chain_id: Some(TEST_CHAIN_ID),
         nonce: Some(nonce),
         to: Some(TxKind::Call(to)),
         gas: Some(100_000),
-        max_fee_per_gas: Some(20_000_000_000),
-        max_priority_fee_per_gas: Some(20_000_000_000),
+        max_fee_per_gas: Some(max_fee_per_gas),
+        max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
         value: Some(value),
         input: TransactionInput::default(),
         ..Default::default()

@@ -16,9 +16,10 @@
 //! particular build, and an overlay assembled from two predicts nothing that
 //! ever ran — while looking, to every caller and every counter, like it did.
 //!
-//! The staleness and anchor checks in [`StateProcessor`], the build check in
-//! [`FlashblockSequenceValidator`] and the eviction in [`FlashblockCache`] are
-//! instances of this one rule rather than separate policies. A recovery that
+//! The staleness, anchor, parent-hash and predecessor checks in
+//! [`StateProcessor`], the build check in [`FlashblockSequenceValidator`] and
+//! the eviction in [`FlashblockCache`] are instances of this one rule rather
+//! than separate policies. A recovery that
 //! would shorten the gap is worth adding; one that would narrow it by accepting
 //! slices from a build this node did not follow is not.
 //!
