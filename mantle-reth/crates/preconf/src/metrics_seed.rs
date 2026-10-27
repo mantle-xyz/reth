@@ -58,6 +58,7 @@ const COUNTERS: &[&str] = &[
     // which is exactly why they need counting.
     "flashblocks.slice_assembly_failed_total",
     "flashblocks.slice_serialize_failed_total",
+    "flashblocks.pool_maintenance_balance_unreadable_total",
     // Slices published for a block whose seal then failed. Zero on a healthy
     // chain; non-zero means subscribers held a prefix of a block that does
     // not exist, which the rebuild replaces but nothing else reports.
@@ -176,6 +177,11 @@ const HISTOGRAMS: &[&str] = &[
     "flashblocks.journal_write_duration_ms",
     "flashblocks.publish_interval_ms",
     "flashblocks.slices_per_block",
+    // The slice-boundary arm as a whole, and its two pool steps.
+    "flashblocks.slice_boundary_duration_ms",
+    "flashblocks.pool_maintenance_duration_ms",
+    "flashblocks.pool_maintenance_accounts",
+    "flashblocks.best_txs_refresh_duration_ms",
     "mantle.canon.notification_duration",
     "preconf.api.handle_duration_ms",
     "preconf.build.lock_wait_ms",

@@ -217,6 +217,35 @@ async fn holding_a_block_open_produces_a_slice_per_tick() {
     );
 }
 
+/// While the work at a slice boundary runs, the build loop polls neither the
+/// preconf queue nor cancellation, so it is timed as a whole and in its pool
+/// steps.
+///
+/// Reads the process-wide recorder the node installs, which prefixes every
+/// name with `reth_`. Other tests in this binary only add observations, so
+/// "at least one" holds whatever runs alongside; no other code emits these
+/// names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slice_boundaries_are_timed() {
+    one_sliced_block(Duration::from_millis(600)).await;
+
+    let rendered = reth_node_metrics::recorder::install_prometheus_recorder().handle().render();
+    for histogram in [
+        "reth_flashblocks_slice_boundary_duration_ms",
+        "reth_flashblocks_best_txs_refresh_duration_ms",
+        "reth_flashblocks_pool_maintenance_duration_ms",
+    ] {
+        let count = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{histogram}_count ")))
+            .and_then(|count| count.parse::<u64>().ok());
+        assert!(
+            count.is_some_and(|count| count > 0),
+            "{histogram} must have observations after a sliced block:\n{rendered}",
+        );
+    }
+}
+
 /// The invariant the whole producer rests on: the transactions a subscriber
 /// has been shown, concatenated in order, are a prefix of the block that gets
 /// sealed. Anything else means a consumer displayed something that never

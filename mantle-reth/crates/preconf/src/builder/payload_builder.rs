@@ -2501,6 +2501,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 // makes a slice the delta since the previous one.
                 _ = flashblock_ticker.tick() => {
                     if let Some(state) = slices.as_mut() {
+                        // The loop polls neither the preconf queue nor
+                        // cancellation until this arm returns.
+                        let boundary_started = std::time::Instant::now();
                         state.journal_and_publish(
                             &ctx,
                             &mut builder,
@@ -2520,10 +2523,15 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             &ProviderBalances(state_provider_for_finish.as_ref()),
                             &mut info,
                         );
+                        let refresh_started = std::time::Instant::now();
                         let attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
                         best_txs.refresh(BestPayloadTransactions::new(
                             self.pool.best_transactions_with_attributes(attrs).without_updates(),
                         ));
+                        metrics::histogram!("flashblocks.best_txs_refresh_duration_ms")
+                            .record(refresh_started.elapsed().as_secs_f64() * 1000.0);
+                        metrics::histogram!("flashblocks.slice_boundary_duration_ms")
+                            .record(boundary_started.elapsed().as_secs_f64() * 1000.0);
                     }
 
                     if catch_up_budget {

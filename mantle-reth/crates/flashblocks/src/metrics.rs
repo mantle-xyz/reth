@@ -119,6 +119,10 @@ flashblock_metrics! {
         "Slices waiting in the state-update queue";
     counter   reconnect_attempts                        => "flashblocks.consumer.reconnect_attempts_total",
         "Reconnections attempted against the upstream";
+    counter   subscription_lagged                       => "flashblocks.consumer.subscription_lagged_total",
+        "Overlay updates eth_subscribe flashblocks subscribers fell too far behind to receive";
+    gauge     subscriptions_active                      => "flashblocks.consumer.subscriptions_active",
+        "Open eth_subscribe flashblocks subscriptions";
     counter   rpc_get_transaction_count                 => "flashblocks.consumer.rpc.get_transaction_count_total",
         "`eth_getTransactionCount` calls served from the overlay";
     counter   rpc_get_transaction_receipt               => "flashblocks.consumer.rpc.get_transaction_receipt_total",
