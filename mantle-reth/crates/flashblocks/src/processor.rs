@@ -392,7 +392,7 @@ where
         pending_blocks: &PendingBlocks,
         tip: Option<BlockNumber>,
     ) -> bool {
-        tip.is_none_or(|tip| pending_blocks.latest_block_number() > tip)
+        tip.is_none_or(|tip| pending_blocks.leads(tip))
     }
 
     /// Fails when the chain has the parent height under a different hash.

@@ -409,6 +409,15 @@ impl PendingBlocks {
         self.latest_header.number
     }
 
+    /// Whether the preview still holds content above the canonical `tip`.
+    ///
+    /// Equal heights count as stale. The earliest block is not consulted: a
+    /// preview may legitimately keep blocks that are already on chain.
+    #[inline]
+    pub fn leads(&self, tip: BlockNumber) -> bool {
+        self.latest_block_number() > tip
+    }
+
     /// Returns the canonical block number (the block before pending).
     #[inline]
     pub fn canonical_block_number(&self) -> BlockNumberOrTag {
@@ -1172,6 +1181,58 @@ mod tests {
         assert_eq!(pending_blocks.latest_block_transaction_count(), 1);
         assert_eq!(pending_blocks.latest_block_cumulative_gas_used(), 42_000);
         assert_eq!(pending_blocks.latest_block_next_log_index(), 1);
+    }
+
+    #[test]
+    fn leads_only_when_the_latest_block_is_above_the_tip() {
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_flashblocks([test_flashblock_for_block(1), test_flashblock_for_block(2)]);
+        builder.with_header(header_at(1));
+        builder.with_header(header_at(2));
+        let pending_blocks = builder.build().expect("build should succeed");
+
+        assert!(pending_blocks.leads(1));
+        assert!(!pending_blocks.leads(2));
+        assert!(!pending_blocks.leads(3));
+    }
+
+    #[test]
+    fn pending_execution_context_requires_the_preview_to_lead_the_tip() {
+        use crate::PendingStateOverrides;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_flashblocks([test_flashblock_for_block(1), test_flashblock_for_block(2)]);
+        builder.with_header(header_at(1));
+        builder.with_header(header_at(2));
+        let pending = builder.build().expect("build should succeed");
+        let state = crate::FlashblocksState::new(3, 3, 5);
+        state.set_pending_blocks_for_testing(Some(pending));
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            assert!(state.pending_execution_context(&|| Some(1)).is_some());
+            assert!(state.pending_execution_context(&|| Some(2)).is_none(), "equal is stale");
+            assert!(state.pending_execution_context(&|| None).is_none(), "read error is stale");
+
+            // The preview is loaded before the tip is read.
+            assert!(
+                state
+                    .pending_execution_context(&|| {
+                        state.set_pending_blocks_for_testing(None);
+                        Some(1)
+                    })
+                    .is_some()
+            );
+            assert!(state.pending_execution_context(&|| Some(0)).is_none());
+        });
+
+        assert!(
+            handle.render().contains("flashblocks_consumer_pending_stale_fallback_total 2"),
+            "{}",
+            handle.render()
+        );
     }
 
     #[test]

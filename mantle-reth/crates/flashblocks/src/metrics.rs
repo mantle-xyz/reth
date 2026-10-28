@@ -122,6 +122,8 @@ flashblock_metrics! {
         "Overlays dropped for being stranded off the canonical chain";
     counter   pending_drop_base_mismatch                => "flashblocks.consumer.pending_drop_base_mismatch_total",
         "Overlays dropped because their base no longer matches the chain";
+    counter   pending_stale_fallback                    => "flashblocks.consumer.pending_stale_fallback_total",
+        "Reads that skipped the overlay because it did not lead the canonical tip, or the tip could not be read";
     gauge     pending_snapshot_fb_index                 => "flashblocks.consumer.pending_snapshot_fb_index",
         "Slice index of the overlay currently served";
     gauge     pending_snapshot_height                   => "flashblocks.consumer.pending_snapshot_height",

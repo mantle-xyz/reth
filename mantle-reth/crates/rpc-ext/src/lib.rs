@@ -767,9 +767,9 @@ where
         let context = block_id
             .is_pending()
             .then(|| {
-                self.pending_overrides
-                    .as_ref()
-                    .and_then(|overlay| overlay.pending_execution_context())
+                self.pending_overrides.as_ref().and_then(|overlay| {
+                    overlay.pending_execution_context(&|| self.provider().best_block_number().ok())
+                })
             })
             .flatten();
         let (block_id, timestamp, header_base_fee, l1_block_info) = if let Some(context) =
@@ -962,7 +962,7 @@ where
         let context = if block_number.is_some_and(|block| block.is_pending()) {
             self.pending_overrides.as_ref().and_then(|overlay| {
                 Metrics::rpc_simulate_v1().increment(1);
-                overlay.pending_execution_context()
+                overlay.pending_execution_context(&|| self.provider().best_block_number().ok())
             })
         } else {
             None

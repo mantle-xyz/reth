@@ -10,6 +10,9 @@
 //! way: the overlay is **dropped, never spliced**. `pending` falls back to
 //! `latest` until the next base slice opens a fresh one, in practice the next
 //! block.
+//! The read path applies the same fallback to an overlay that is still held:
+//! once the canonical tip reaches its latest block, `pending` reads answer from
+//! `latest`.
 //!
 //! Losing the rest of a block is the accepted cost. Serving state no build
 //! produced is not: what the sequencer promises is a prediction of one
