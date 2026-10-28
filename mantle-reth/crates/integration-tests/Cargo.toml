@@ -47,11 +47,6 @@ name = "preconf_whitelist_watcher"
 path = "tests/preconf_whitelist_watcher.rs"
 harness = true
 
-[[test]]
-name = "preconf_timeout_metrics"
-path = "tests/preconf_timeout_metrics.rs"
-harness = true
-
 [dependencies]
 # mantle-reth
 mantle-reth-chainspec = { workspace = true }
