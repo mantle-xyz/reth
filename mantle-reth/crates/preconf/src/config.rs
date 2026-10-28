@@ -230,13 +230,13 @@ impl Default for PreconfConfig {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PreconfConfigError {
     /// `rejournal_interval == 0`.
-    #[error("rejournal_interval must be > 0")]
+    #[error("--preconf.rejournal-interval-secs must be > 0")]
     InvalidRejournalInterval,
     /// `journal_max_size == 0`.
-    #[error("journal_max_size must be > 0")]
+    #[error("--preconf.journal-max-size must be > 0")]
     InvalidJournalMaxSize,
     /// `broadcast_cap == 0` — tokio broadcast requires capacity > 0.
-    #[error("broadcast_cap must be > 0")]
+    #[error("--preconf.broadcast-cap must be > 0")]
     InvalidBroadcastCap,
     /// `broadcast_cap` above [`MAX_BROADCAST_CAP`].
     #[error("--preconf.broadcast-cap ({cap}) must be <= {max}")]
@@ -247,7 +247,7 @@ pub enum PreconfConfigError {
         max: usize,
     },
     /// `preconf_timeout == 0`.
-    #[error("preconf_timeout must be > 0")]
+    #[error("--preconf.timeout-ms must be > 0")]
     InvalidPreconfTimeout,
     /// `preconf_timeout <= safety_margin`: dispatch would skip every RPC
     /// preconf.
@@ -277,14 +277,16 @@ pub enum PreconfConfigError {
         max: Duration,
     },
     /// `sweep_interval == 0`.
-    #[error("sweep_interval must be > 0")]
+    #[error("--preconf.sweep-interval-ms must be > 0")]
     InvalidSweepInterval,
     /// `slot_duration == 0`.
-    #[error("slot_duration must be > 0")]
+    #[error("--preconf.slot-duration-ms must be > 0")]
     InvalidSlotDuration,
     /// `sweep_interval > slot_duration` — a single tick would exceed the
     /// entire slot, making the time-proportional pool quota meaningless.
-    #[error("sweep_interval ({sweep:?}) must be <= slot_duration ({slot:?})")]
+    #[error(
+        "--preconf.sweep-interval-ms ({sweep:?}) must be <= --preconf.slot-duration-ms ({slot:?})"
+    )]
     SweepIntervalExceedsSlot {
         /// Configured sweep interval.
         sweep: Duration,
@@ -292,14 +294,14 @@ pub enum PreconfConfigError {
         slot: Duration,
     },
     /// `preconf_max_gas_per_tx == 0`.
-    #[error("preconf_max_gas_per_tx must be > 0")]
+    #[error("--preconf.max-gas-per-tx must be > 0")]
     InvalidPreconfMaxGasPerTx,
     /// `preconf_max_gas_per_block == 0`.
-    #[error("preconf_max_gas_per_block must be > 0")]
+    #[error("--preconf.max-gas-per-block must be > 0")]
     InvalidPreconfMaxGasPerBlock,
     /// `preconf_queue_gas_blocks == 0` — the queue could hold nothing, so
     /// every submission would be refused.
-    #[error("preconf_queue_gas_blocks must be > 0")]
+    #[error("--preconf.queue-gas-blocks must be > 0")]
     InvalidPreconfQueueGasBlocks,
     /// The derived queued gas ceiling cannot be represented as `u64`.
     #[error(
@@ -313,7 +315,7 @@ pub enum PreconfConfigError {
     },
     /// `preconf_max_gas_per_block < preconf_max_gas_per_tx` — a single tx
     /// could never fit the block budget.
-    #[error("preconf_max_gas_per_block ({block}) must be >= preconf_max_gas_per_tx ({per_tx})")]
+    #[error("--preconf.max-gas-per-block ({block}) must be >= --preconf.max-gas-per-tx ({per_tx})")]
     BlockBudgetSmallerThanPerTx {
         /// Configured per-block budget.
         block: u64,
