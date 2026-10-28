@@ -135,7 +135,8 @@ struct Args {
     #[arg(long, env, default_value = "30000")]
     client_pong_timeout_ms: u64,
 
-    /// Timeout for a single send to a client, in milliseconds.
+    /// Timeout for a single send to a client, in milliseconds. Must be
+    /// greater than zero.
     #[arg(long, env, default_value = "1000")]
     client_send_timeout_ms: u64,
 }
@@ -168,6 +169,14 @@ fn refuse_unusable_args(args: &Args) -> eyre::Result<Vec<String>> {
     }
     if args.subscriber_ping_interval_ms == 0 {
         eyre::bail!("--subscriber-ping-interval-ms must be greater than zero");
+    }
+    // Zero starts and serves, then drops whichever client's socket is not
+    // writable at the instant a slice goes out, with nothing saying why.
+    if args.client_send_timeout_ms == 0 {
+        eyre::bail!(
+            "--client-send-timeout-ms must be greater than zero: a zero timeout drops any client \
+             whose socket is not ready the moment a slice is sent"
+        );
     }
     // The three below start, then cycle a connection forever.
     if args.subscriber_pong_timeout_ms <= args.subscriber_ping_interval_ms {
@@ -540,13 +549,16 @@ mod tests {
         .expect("4 is the smallest that still ticks");
     }
 
-    /// The three that would fail loudly anyway are refused here too, so the
-    /// message names the flag instead of surfacing as a panic.
+    /// Zero-valued timing flags are refused by name, so the message names the
+    /// flag instead of surfacing as a panic or as clients dropped unexplained.
     #[test]
     fn the_zero_valued_timing_flags_are_refused_by_name() {
-        for flag in
-            ["--message-buffer-size", "--client-ping-interval-ms", "--subscriber-ping-interval-ms"]
-        {
+        for flag in [
+            "--message-buffer-size",
+            "--client-ping-interval-ms",
+            "--subscriber-ping-interval-ms",
+            "--client-send-timeout-ms",
+        ] {
             let err = refuse_unusable_args(&args_with(&["--public-access-enabled", flag, "0"]))
                 .expect_err("zero is not a usable value");
             assert!(err.to_string().contains(flag), "the message must name {flag}: {err}");
