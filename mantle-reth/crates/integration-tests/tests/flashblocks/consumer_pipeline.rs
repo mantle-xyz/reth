@@ -593,3 +593,30 @@ async fn a_next_block_that_fails_drops_the_preview() {
 
     assert!(harness.pending().is_none(), "a failed next block must drop the overlay");
 }
+
+/// A slice that can neither extend the overlay nor be cached as a restart
+/// point is dropped with a count, not silently: here a consumer with no
+/// overlay, joining mid-block, receives a continuation whose base it missed.
+///
+/// Reads the process-wide recorder, which prefixes every name with `reth_`.
+/// Other tests here only add to the counter, so "grew" holds whatever runs
+/// alongside.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_that_cannot_be_cached_is_counted_when_dropped() {
+    const SERIES: &str = "reth_flashblocks_consumer_uncached_slices_dropped_total";
+    let metrics = reth_node_metrics::recorder::install_prometheus_recorder().handle();
+    let dropped = || {
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(SERIES)?.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let (harness, _node) = launch!();
+    let before = dropped();
+
+    harness.send(FlashblockBuilder::new(1, 2).prev(1, 1).build()).await;
+
+    assert!(dropped() > before, "the dropped slice is counted");
+    assert!(harness.pending().is_none(), "nothing was opened from it");
+}

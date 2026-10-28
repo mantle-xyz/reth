@@ -620,7 +620,7 @@ where
                             Err(StateProcessorError::Provider(
                                 ProviderError::MissingCanonicalHeader { .. },
                             )) => {
-                                self.cache.lock().await.insert_resumable(flashblock);
+                                self.cache_or_drop(flashblock, "pending canonical parent").await;
                             }
                             Err(
                                 e @ StateProcessorError::Protocol(
@@ -658,15 +658,7 @@ where
                         // valid restart point when it carries a base payload, so cache
                         // it instead of dropping it; higher indices are only useful
                         // once their predecessor is cached.
-                        let mut cache = self.cache.lock().await;
-                        let block_number = flashblock.metadata.block_number;
-                        let index = flashblock.index;
-                        if cache.insert_resumable(flashblock) {
-                            debug!(
-                                message = "cached flashblock pending its predecessor",
-                                block_number, index
-                            );
-                        }
+                        self.cache_or_drop(flashblock, "pending its predecessor").await;
                         return;
                     }
                     _ => {}
@@ -679,6 +671,26 @@ where
                 Metrics::block_processing_error().increment(1);
             }
         }
+    }
+
+    /// Caches `flashblock` as a restart point, or, when it cannot be one,
+    /// drops it with a warning and a count rather than without a trace.
+    ///
+    /// Only index 0, or a slice whose predecessor is cached, can be resumed
+    /// from; anything else is lost, along with the preview of its block until
+    /// the canonical chain or a later base slice catches up.
+    async fn cache_or_drop(&self, flashblock: MantleFlashblockPayload, waiting_for: &str) {
+        let block_number = flashblock.metadata.block_number;
+        let index = flashblock.index;
+        if self.cache.lock().await.insert_resumable(flashblock) {
+            debug!(message = "cached flashblock", waiting_for, block_number, index);
+            return;
+        }
+        Metrics::uncached_slice_dropped().increment(1);
+        warn!(
+            message = "flashblock can neither extend the overlay nor be cached, dropping",
+            waiting_for, block_number, index,
+        );
     }
 
     #[instrument(level = "debug", skip_all, fields(block_number = block.number))]
