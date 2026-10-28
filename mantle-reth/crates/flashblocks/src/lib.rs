@@ -19,9 +19,15 @@
 //! The staleness, anchor, parent-hash and predecessor checks in
 //! [`StateProcessor`], the build check in [`FlashblockSequenceValidator`] and
 //! the eviction in [`FlashblockCache`] are instances of this one rule rather
-//! than separate policies. A recovery that
-//! would shorten the gap is worth adding; one that would narrow it by accepting
-//! slices from a build this node did not follow is not.
+//! than separate policies. Failures follow it too: a slice or canonical block
+//! the processor fails to process drops the overlay, and a panic also empties
+//! the early-arrival cache before the processor restarts after
+//! [`PROCESSOR_RESTART_DELAY`]. Only slices set aside without being applied
+//! leave the overlay in place: duplicates, superseded slices, `MissingFirstFlashblock`
+//! and `NonConsecutiveBlock`, slices past the leading depth, and slices cached
+//! until their canonical parent lands. A recovery that would shorten the gap is
+//! worth adding; one that would narrow it by accepting slices from a build this
+//! node did not follow is not.
 //!
 //! # A prefix cannot answer a question about a sealed block
 //!
@@ -50,7 +56,7 @@ mod block_assembler;
 pub use block_assembler::{AssembledBlock, BlockAssembler};
 
 mod canonical;
-pub use canonical::{await_canonical_match, forward_canonical_state};
+pub use canonical::{await_canonical_match, forward_canonical_state, run_canonical_forwarder};
 
 pub use mantle_reth_flashblocks_types::redact_ws_url;
 
@@ -72,7 +78,7 @@ mod metrics;
 pub use metrics::Metrics;
 
 mod processor;
-pub use processor::{QueueConsumer, StateProcessor, StateUpdate};
+pub use processor::{PROCESSOR_RESTART_DELAY, QueueConsumer, StateProcessor, StateUpdate};
 
 mod pending_blocks;
 pub use pending_blocks::{PendingBlocks, PendingBlocksBuilder};
@@ -88,7 +94,7 @@ pub use rpc::{
 };
 
 mod state;
-pub use state::FlashblocksState;
+pub use state::{FlashblocksState, MAX_QUEUED_SLICES};
 
 mod state_builder;
 pub use state_builder::{ExecutedPendingTransaction, PendingStateBuilder};

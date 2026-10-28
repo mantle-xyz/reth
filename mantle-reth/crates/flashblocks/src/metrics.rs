@@ -53,6 +53,7 @@ macro_rules! flashblock_metrics {
             pub fn init() {
                 $( flashblock_metrics!(@describe $kind $series, $desc); )*
                 $( flashblock_metrics!(@zero $kind $series); )*
+                Self::init_canonical_forwarder_exited();
             }
         }
     };
@@ -99,12 +100,16 @@ flashblock_metrics! {
         "Base payloads whose parent hash differed from the canonical parent, dropping the overlay";
     counter   slice_content_mismatch                    => "flashblocks.consumer.slice_content_mismatch_total",
         "Slices that did not follow the overlay's latest slice by content, dropping the overlay";
+    counter   execution_gas_mismatch                    => "flashblocks.consumer.execution_gas_mismatch_total",
+        "Slices whose locally executed block gas differed from the gas the slice reported";
     counter   base_fee_mismatch                         => "flashblocks.consumer.base_fee_mismatch_total",
         "Base slices whose basefee differed from the one derived from the parent header, using the slice's";
     histogram flashblocks_in_block                      => "flashblocks.consumer.slices_per_block",
         "Slices the consumer saw for one block (the producer's view is `flashblocks.slices_per_block`)";
     counter   block_processing_error                    => "flashblocks.consumer.block_processing_error_total",
-        "Slices that failed to apply";
+        "Slices that failed to apply, dropping the overlay";
+    counter   canonical_reconcile_error                 => "flashblocks.consumer.canonical_reconcile_error_total",
+        "Canonical blocks the overlay could not be reconciled against, dropping the overlay";
     counter   pending_clear_catchup                     => "flashblocks.consumer.pending_clear_catchup_total",
         "Overlays cleared because the canonical chain caught up with them";
     counter   pending_clear_reorg                       => "flashblocks.consumer.pending_clear_reorg_total",
@@ -124,7 +129,11 @@ flashblock_metrics! {
     counter   leading_depth_exceeded                    => "flashblocks.consumer.leading_depth_exceeded_total",
         "Slices refused for running too far ahead of the canonical tip";
     gauge     queue_depth                               => "flashblocks.consumer.queue_depth",
-        "Slices waiting in the state-update queue";
+        "Updates (slices and canonical notifications) waiting in the state-update queue";
+    counter   queue_dropped_slices                      => "flashblocks.consumer.queue_dropped_slices_total",
+        "Slices dropped because the state-update queue already held the maximum";
+    counter   processor_restarts                        => "flashblocks.consumer.processor_restarts_total",
+        "Times the state processor panicked and was restarted with the overlay and cache cleared";
     counter   reconnect_attempts                        => "flashblocks.consumer.reconnect_attempts_total",
         "Reconnections attempted against the upstream";
     counter   subscription_lagged                       => "flashblocks.consumer.subscription_lagged_total",
@@ -161,6 +170,26 @@ flashblock_metrics! {
         "Time spent cloning the bundle state for one overlay";
     histogram bundle_state_clone_size                   => "flashblocks.consumer.bundle_state_clone_size",
         "Accounts cloned with the bundle state for one overlay";
+}
+
+const CANONICAL_FORWARDER_EXITED: &str = "flashblocks.consumer.canonical_forwarder_exited_total";
+
+impl Metrics {
+    /// Counts one canonical-state forwarder exit; `reason` is `panic` or `closed`.
+    pub(crate) fn canonical_forwarder_exited(reason: &'static str) {
+        metrics::counter!(CANONICAL_FORWARDER_EXITED, "reason" => reason).increment(1);
+    }
+
+    /// Describes and zeroes the labelled series, as [`Metrics::init`] does for the rest.
+    fn init_canonical_forwarder_exited() {
+        metrics::describe_counter!(
+            CANONICAL_FORWARDER_EXITED,
+            "Times the canonical-state forwarder stopped, by reason (panic or closed channel); it is not restarted"
+        );
+        for reason in ["panic", "closed"] {
+            metrics::counter!(CANONICAL_FORWARDER_EXITED, "reason" => reason).absolute(0);
+        }
+    }
 }
 
 #[cfg(test)]

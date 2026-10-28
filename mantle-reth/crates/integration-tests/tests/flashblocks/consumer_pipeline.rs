@@ -7,12 +7,12 @@ use mantle_reth_flashblocks::{
     FlashblocksAPI, FlashblocksReceiver, FlashblocksState, PendingBlocksAPI,
 };
 
-use alloy_primitives::keccak256;
+use alloy_primitives::{U256, keccak256};
 use alloy_rpc_types_engine::PayloadId;
 
 use crate::consumer_helpers::{
-    FlashblockBuilder, base_slice, base_slice_builder, filler_deposit, l1_info_deposit,
-    launch_flashblocks_consumer, mine_canonical_block as mine,
+    FlashblockBuilder, LOGGER, base_slice, base_slice_builder, filler_deposit, l1_info_deposit,
+    launch_flashblocks_consumer, mine_canonical_block as mine, signed_call,
 };
 
 /// Default depths: three blocks of trailing history, three of leading slack.
@@ -407,7 +407,7 @@ async fn the_overlay_reports_its_canonical_base() {
 
 /// Updates waiting for the processor are counted.
 ///
-/// The queue is unbounded and shared by both sources, so a backlog is invisible
+/// Canonical notifications and slices share the queue, so a backlog is invisible
 /// unless it is counted: it shows up only as guards reasoning about a stale height
 /// and `pending` answering from an older base.
 #[tokio::test(flavor = "multi_thread")]
@@ -420,6 +420,57 @@ async fn the_queue_depth_counts_updates_the_processor_has_not_taken() {
     state.on_flashblock_received(base_slice_builder(2).prev(1, 0).build());
 
     assert_eq!(state.queued_updates(), 2, "nothing is consuming the queue");
+}
+
+/// Slices beyond `MAX_QUEUED_SLICES` are dropped; canonical notifications are
+/// always queued, since losing one would judge the overlay against a stale tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_queue_caps_slices_but_always_accepts_canonical_blocks() {
+    use mantle_reth_flashblocks::MAX_QUEUED_SLICES;
+
+    // Never started, so nothing drains what is queued here.
+    let state = FlashblocksState::new(3, 3, 5);
+
+    for _ in 0..MAX_QUEUED_SLICES + 3 {
+        state.on_flashblock_received(base_slice(1));
+    }
+    assert_eq!(state.queued_updates(), MAX_QUEUED_SLICES, "slices beyond the cap are dropped");
+
+    state.on_canonical_block_received(Default::default());
+    state.on_canonical_block_received(Default::default());
+    assert_eq!(
+        state.queued_updates(),
+        MAX_QUEUED_SLICES + 2,
+        "canonical notifications are accepted while the slice queue is full"
+    );
+}
+
+/// Taking a slice frees its place under the cap: after more than
+/// `MAX_QUEUED_SLICES` slices have passed through, a further one is still accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn taken_slices_free_their_place_under_the_cap() {
+    use mantle_reth_flashblocks::MAX_QUEUED_SLICES;
+
+    let (harness, _node) = launch!();
+
+    for _ in 0..MAX_QUEUED_SLICES + 10 {
+        harness.send(base_slice(1)).await;
+    }
+    assert_eq!(harness.state().queued_updates(), 0, "everything sent has been taken");
+
+    // `on_flashblock_received` is the capped path: the slice extends the overlay
+    // only if it was queued, not dropped.
+    harness.send(base_slice(1)).await;
+    assert!(harness.pending().is_some_and(|p| p.latest_flashblock_index() == 0));
+    harness.state().on_flashblock_received(FlashblockBuilder::new(1, 1).prev(1, 0).build());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if harness.pending().is_some_and(|p| p.latest_flashblock_index() == 1) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the slice was dropped, not queued");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// The count drops back as the processor consumes.
@@ -438,10 +489,9 @@ async fn a_consumed_update_leaves_the_queue_empty() {
 
 /// A rebuild forced by missing live state must not re-enter the live-state lock.
 ///
-/// A slice that fails mid-execution has already taken the live state, and the error
-/// path leaves the overlay in place. The next slice for that block therefore finds an
-/// overlay but no live state and takes the full-rebuild fallback, which writes the
-/// live state back. Holding the lock across that fallback deadlocks the single
+/// A failed slice clears the live state and the overlay; restoring only the
+/// overlay makes the retry take the full-rebuild fallback, which writes the live
+/// state back. Holding the lock across that fallback deadlocks the single
 /// consumer thread and stops the whole pipeline.
 ///
 /// On regression this wedges the test binary rather than failing tidily: the timeout
@@ -449,26 +499,23 @@ async fn a_consumed_update_leaves_the_queue_empty() {
 /// worker. A CI timeout naming this test is the signal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rebuild_without_live_state_does_not_deadlock() {
-    use alloy_network::eip2718::Encodable2718;
-    use alloy_primitives::Sealable;
-    use op_alloy_consensus::{OpTxEnvelope, SDMGasEntry, build_post_exec_tx};
-
     let (harness, _node) = launch!();
 
     harness.send(base_slice(1)).await;
+    let snapshot = harness.pending().expect("the base slice opens an overlay");
 
-    let post_exec = OpTxEnvelope::PostExec(
-        build_post_exec_tx(1, vec![SDMGasEntry { index: 1, gas_refund: 2_500 }]).seal_slow(),
-    );
     harness
         .send(
             FlashblockBuilder::new(1, 1)
                 .prev(1, 0)
-                .transactions(vec![post_exec.encoded_2718().into()])
+                .transactions(vec![unexecutable_call().await])
                 .build(),
         )
         .await;
-    assert!(harness.pending().is_some(), "a failed slice must leave the overlay in place");
+    assert!(harness.pending().is_none(), "a failed slice must drop the overlay");
+
+    // An overlay with no live state behind it.
+    harness.state().set_pending_blocks_for_testing(Some((*snapshot).clone()));
 
     // Same (block, index) as the failed slice, so the sequence check still passes.
     let retry = FlashblockBuilder::new(1, 1).prev(1, 0).build();
@@ -478,4 +525,71 @@ async fn a_rebuild_without_live_state_does_not_deadlock() {
 
     let pending = harness.pending().expect("the retry should rebuild the overlay");
     assert_eq!(pending.latest_flashblock_index(), 1);
+}
+
+/// A transaction whose nonce is ahead of the sender's, so executing it fails.
+async fn unexecutable_call() -> alloy_primitives::Bytes {
+    signed_call(5, LOGGER, U256::from(1)).await
+}
+
+/// A slice that fails to execute drops the overlay it was extending: the
+/// overlay no longer matches what the sequencer is building.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_that_fails_to_execute_drops_the_preview() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+    assert!(harness.pending().is_some());
+
+    harness
+        .send(
+            FlashblockBuilder::new(1, 1)
+                .prev(1, 0)
+                .transactions(vec![unexecutable_call().await])
+                .build(),
+        )
+        .await;
+
+    assert!(harness.pending().is_none(), "a failed slice must drop the overlay");
+}
+
+/// A rebuild whose base slice fails must not leave the abandoned build served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_that_fails_drops_the_abandoned_preview() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice_builder(1).payload_id(job_id(1)).build()).await;
+    assert!(harness.pending().is_some());
+
+    harness
+        .send(
+            base_slice_builder(1)
+                .prev(1, 0)
+                .payload_id(rebuild_id())
+                .transactions(vec![l1_info_deposit(1), unexecutable_call().await])
+                .build(),
+        )
+        .await;
+
+    assert!(harness.pending().is_none(), "the abandoned build must not be served");
+}
+
+/// A next block whose base slice fails drops the overlay of the block before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_next_block_that_fails_drops_the_preview() {
+    let (harness, _node) = launch!();
+
+    harness.send(base_slice(1)).await;
+    assert!(harness.pending().is_some());
+
+    harness
+        .send(
+            base_slice_builder(2)
+                .prev(1, 0)
+                .transactions(vec![l1_info_deposit(2), unexecutable_call().await])
+                .build(),
+        )
+        .await;
+
+    assert!(harness.pending().is_none(), "a failed next block must drop the overlay");
 }
