@@ -4,7 +4,7 @@
 //! test's [`FlashblocksState`], the same pair `MantleNode::add_ons` wires up, and
 //! its methods are called directly rather than over JSON-RPC.
 
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, bytes, keccak256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, BlockOverrides, Filter};
 use mantle_reth_flashblocks::EthApiOverrideServer;
 
@@ -1258,6 +1258,43 @@ async fn call_at_pending_executes_against_the_overlay_state() {
     assert_eq!(U256::from_be_slice(&latest), U256::ZERO);
 }
 
+/// A pending call reads the beacon root the pending block's system call wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_calls_see_the_beacon_root_of_the_pending_block() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let root = B256::repeat_byte(0xbe);
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .parent_beacon_block_root(root)
+                .transactions(vec![l1_info_deposit(1)])
+                .build(),
+        )
+        .await;
+    assert!(harness.pending().is_some(), "the slice should open an overlay");
+
+    let timestamp = crate::consumer_helpers::l2_ts(1);
+    let request = serde_json::json!({
+        "to": format!("{:#x}", alloy_eips::eip4788::BEACON_ROOTS_ADDRESS),
+        "data": format!("{:#x}", B256::from(U256::from(timestamp))),
+    });
+
+    let pending = api
+        .call(request.clone(), Some(BlockNumberOrTag::Pending.into()), None, None)
+        .await
+        .expect("the beacon roots contract answers at pending");
+    assert_eq!(B256::from_slice(&pending), root);
+
+    // The contract reverts on a timestamp it holds no root for.
+    let latest = api.call(request, Some(BlockNumberOrTag::Latest.into()), None, None).await;
+    assert!(
+        !latest.is_ok_and(|out| out.as_ref() == root.as_slice()),
+        "latest must not carry the pending block's root"
+    );
+}
+
 /// `eth_estimateGas` at `pending` resolves against the overlay, so a sender
 /// funded only there can be estimated for.
 #[tokio::test(flavor = "multi_thread")]
@@ -1475,6 +1512,64 @@ async fn get_code_serves_a_contract_the_overlay_deployed() {
     let latest =
         api.get_code(deployed, Some(BlockNumberOrTag::Latest.into())).await.expect("query");
     assert_eq!(latest, Bytes::new(), "canonical state has no such contract");
+}
+
+/// Init code of a factory: CREATEs a child, then CALLs it. The child writes
+/// slot 1 and deploys `ADDRESS SELFDESTRUCT`, so it destroys itself in the
+/// transaction that created it.
+const FACTORY_INIT_CODE: Bytes = bytes!(
+    "6f60076001556130ff6000526002601ef3600052601060106000f060006000600060006000855af1505000"
+);
+
+/// A contract destroyed in its creating transaction is an empty account in the
+/// pending view, and a later transaction touching the address leaves it usable
+/// by `eth_call` (a storage replacement never sits beside a storage diff).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contract_destroyed_in_its_creating_transaction_is_empty_at_pending() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw = signed_deploy(0, FACTORY_INIT_CODE).await;
+    let tx_hash = keccak256(&raw);
+    harness
+        .send(FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw]).build())
+        .await;
+    let receipt = api.get_transaction_receipt(tx_hash).await.unwrap().unwrap();
+    assert_eq!(receipt["status"], "0x1");
+
+    let child = test_sender().create(0).create(1);
+    // PUSH20 child EXTCODEHASH PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+    let probe =
+        probe_override(&format!("0x73{}3f60005260206000f3", alloy_primitives::hex::encode(child)));
+    let hash = api
+        .call(
+            serde_json::json!({ "to": LOGGER }),
+            Some(BlockNumberOrTag::Pending.into()),
+            Some(probe.clone()),
+            None,
+        )
+        .await
+        .expect("probe call");
+    assert_eq!(B256::from_slice(&hash), B256::ZERO, "a destroyed account is empty");
+
+    harness
+        .send(
+            FlashblockBuilder::new(1, 1)
+                .prev(1, 0)
+                .transactions(vec![signed_call(1, child, U256::from(1)).await])
+                .build(),
+        )
+        .await;
+    let hash = api
+        .call(
+            serde_json::json!({ "to": LOGGER }),
+            Some(BlockNumberOrTag::Pending.into()),
+            Some(probe),
+            None,
+        )
+        .await
+        .expect("the overrides must still be accepted by the evm");
+    assert_eq!(B256::from_slice(&hash), keccak256([]), "funded, no code");
 }
 
 /// A wallet the overlay touched must still report no code.

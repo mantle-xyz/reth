@@ -91,6 +91,7 @@ reth-tracing = { workspace = true }
 # `TxReceipt` — the full-receipt test reads `logs()` / `bloom()` / `status()`
 # off the sealed receipt's inner consensus type.
 alloy-consensus = { workspace = true }
+alloy-eips = { workspace = true }
 alloy-genesis = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }

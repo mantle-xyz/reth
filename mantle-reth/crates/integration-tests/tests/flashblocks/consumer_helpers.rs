@@ -48,6 +48,7 @@ pub struct FlashblockBuilder {
     block_number: u64,
     index: u64,
     parent_hash: B256,
+    parent_beacon_block_root: B256,
     transactions: Vec<Bytes>,
     gas_used: u64,
     prev: mantle_reth_flashblocks_types::FlashblockId,
@@ -64,6 +65,7 @@ impl FlashblockBuilder {
             block_number,
             index,
             parent_hash: B256::ZERO,
+            parent_beacon_block_root: B256::ZERO,
             transactions: Vec::new(),
             gas_used: 0,
             prev: mantle_reth_flashblocks_types::FlashblockId::NO_PREV,
@@ -76,6 +78,12 @@ impl FlashblockBuilder {
     /// Sets the parent hash carried by the base payload.
     pub const fn parent_hash(mut self, parent_hash: B256) -> Self {
         self.parent_hash = parent_hash;
+        self
+    }
+
+    /// Sets the parent beacon block root carried by the base payload.
+    pub const fn parent_beacon_block_root(mut self, root: B256) -> Self {
+        self.parent_beacon_block_root = root;
         self
     }
 
@@ -134,7 +142,7 @@ impl FlashblockBuilder {
             payload_id: self.payload_id,
             index: self.index,
             base: (self.index == 0).then(|| OpFlashblockPayloadBase {
-                parent_beacon_block_root: B256::ZERO,
+                parent_beacon_block_root: self.parent_beacon_block_root,
                 parent_hash: self.parent_hash,
                 fee_recipient: Address::ZERO,
                 prev_randao: B256::ZERO,
@@ -547,6 +555,16 @@ pub fn flashblocks_test_chain_spec() -> Arc<OpChainSpec> {
     genesis.alloc.insert(
         test_sender(),
         GenesisAccount { balance: U256::from(10u64).pow(U256::from(20u64)), ..Default::default() },
+    );
+    // The pending block's system call writes the parent beacon root here.
+    genesis.alloc.insert(
+        alloy_eips::eip4788::BEACON_ROOTS_ADDRESS,
+        GenesisAccount {
+            code: Some(alloy_eips::eip4788::BEACON_ROOTS_CODE.clone()),
+            nonce: Some(1),
+            balance: U256::ZERO,
+            ..Default::default()
+        },
     );
     genesis.alloc.insert(
         LOGGER,
