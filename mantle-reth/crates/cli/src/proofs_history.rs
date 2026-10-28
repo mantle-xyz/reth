@@ -42,12 +42,16 @@ use tracing::info;
 ///
 /// Both entry points call this; keeping the body in one place is the point of the module.
 macro_rules! install_proofs_history {
-    ($builder:expr, $args:expr, $mdbx:expr) => {{
+    ($builder:expr, $args:expr, $mdbx:expr, $sequencer_url:expr, $preconf:expr, $flashblocks_cfg:expr) => {{
         let storage: OpProofsStorage<Arc<_>> = $mdbx.into();
         let storage_exec = storage.clone();
 
         let RollupArgs { proofs_history_window, proofs_history_verification_interval, .. } =
             *$args;
+
+        let sequencer_url = $sequencer_url;
+        let preconf = $preconf;
+        let flashblocks_cfg = $flashblocks_cfg;
 
         $builder
             .install_exex("proofs-history", async move |exex_context| {
@@ -58,7 +62,19 @@ macro_rules! install_proofs_history {
                     .run()
                     .boxed())
             })
-            .extend_rpc_modules(move |ctx| {
+            .extend_rpc_modules(move |mut ctx| {
+                // reth keeps a single `extend_rpc_modules` slot, so this hook replaces the one
+                // `MantleNode::add_ons` installed. Run the Mantle extensions here first, then the
+                // proofs-history overrides on top — otherwise the Mantle methods
+                // (eth_estimateTotalFee / eth_sendRawTransactionWithPreconf)
+                // and, with --preconf/--flashblocks, their handlers would be silently dropped.
+                crate::node::install_mantle_rpc_extensions(
+                    &mut ctx,
+                    sequencer_url,
+                    preconf,
+                    flashblocks_cfg,
+                )?;
+
                 info!(
                     target: "reth::cli",
                     "Installing proofs-history RPC overrides (eth_getProof, debug_*)"
@@ -79,6 +95,8 @@ macro_rules! install_proofs_history {
                     ctx.node().task_executor().clone(),
                     ctx.node().evm_config().clone(),
                 );
+                // After the Mantle hook: the sidecar's getProof (window-aware) must win over the
+                // Mantle stock-path getProof, so these `replace_configured` calls run last.
                 ctx.modules.replace_configured(api_ext.into_rpc())?;
                 ctx.modules.replace_configured(debug_ext.into_rpc())?;
                 info!(target: "reth::cli", "Proofs-history RPC overrides installed");
@@ -95,6 +113,9 @@ pub fn with_proofs_history<T, CB, AO, S>(
     builder: NodeBuilderWithComponents<T, CB, AO>,
     args: &RollupArgs,
     mdbx: Arc<S>,
+    sequencer_url: Option<String>,
+    preconf: Option<Arc<mantle_reth_preconf::PreconfServiceBuilder>>,
+    flashblocks_cfg: Option<mantle_reth_flashblocks::FlashblocksConfig>,
 ) -> NodeBuilderWithComponents<T, CB, AO>
 where
     T: FullNodeTypes<
@@ -109,11 +130,21 @@ where
             alloy_consensus::Header,
             <T::Types as NodeTypes>::ChainSpec,
         >,
-    AO: RethRpcAddOns<NodeAdapter<T, CB::Components>, EthApi: FullEthApi>,
+    AO: RethRpcAddOns<
+            NodeAdapter<T, CB::Components>,
+            EthApi: FullEthApi<NetworkTypes = op_alloy_network::Optimism>
+                        + reth_rpc_eth_api::helpers::LoadPendingBlock,
+        >,
+    <AO::EthApi as reth_rpc_eth_api::EthApiTypes>::Error: reth_rpc_eth_api::FromEthApiError,
+    <AO::EthApi as reth_rpc_eth_api::RpcNodeCore>::Primitives:
+        reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header>,
+    <AO::EthApi as reth_rpc_eth_api::RpcNodeCore>::Provider:
+        reth_chainspec::ChainSpecProvider<ChainSpec: reth_optimism_forks::OpHardforks>
+            + reth_provider::BlockReaderIdExt,
     ErrorObject<'static>: From<<AO::EthApi as reth_rpc_eth_api::EthApiTypes>::Error>,
     S: OpProofsStore + DatabaseMetrics + Send + Sync + 'static,
 {
-    install_proofs_history!(builder, args, mdbx)
+    install_proofs_history!(builder, args, mdbx, sequencer_url, preconf, flashblocks_cfg)
 }
 
 /// Same as [`with_proofs_history`], for a builder that already carries a launch context — the
@@ -126,6 +157,9 @@ pub fn with_proofs_history_launch_ctx<T, CB, AO, S>(
     builder: WithLaunchContext<NodeBuilderWithComponents<T, CB, AO>>,
     args: &RollupArgs,
     mdbx: Arc<S>,
+    sequencer_url: Option<String>,
+    preconf: Option<Arc<mantle_reth_preconf::PreconfServiceBuilder>>,
+    flashblocks_cfg: Option<mantle_reth_flashblocks::FlashblocksConfig>,
 ) -> WithLaunchContext<NodeBuilderWithComponents<T, CB, AO>>
 where
     T: FullNodeTypes<
@@ -140,11 +174,21 @@ where
             alloy_consensus::Header,
             <T::Types as NodeTypes>::ChainSpec,
         >,
-    AO: RethRpcAddOns<NodeAdapter<T, CB::Components>, EthApi: FullEthApi>,
+    AO: RethRpcAddOns<
+            NodeAdapter<T, CB::Components>,
+            EthApi: FullEthApi<NetworkTypes = op_alloy_network::Optimism>
+                        + reth_rpc_eth_api::helpers::LoadPendingBlock,
+        >,
+    <AO::EthApi as reth_rpc_eth_api::EthApiTypes>::Error: reth_rpc_eth_api::FromEthApiError,
+    <AO::EthApi as reth_rpc_eth_api::RpcNodeCore>::Primitives:
+        reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header>,
+    <AO::EthApi as reth_rpc_eth_api::RpcNodeCore>::Provider:
+        reth_chainspec::ChainSpecProvider<ChainSpec: reth_optimism_forks::OpHardforks>
+            + reth_provider::BlockReaderIdExt,
     ErrorObject<'static>: From<<AO::EthApi as reth_rpc_eth_api::EthApiTypes>::Error>,
     S: OpProofsStore + DatabaseMetrics + Send + Sync + 'static,
 {
-    install_proofs_history!(builder, args, mdbx)
+    install_proofs_history!(builder, args, mdbx, sequencer_url, preconf, flashblocks_cfg)
 }
 
 /// Spawns a task that periodically reports metrics for the proofs DB.

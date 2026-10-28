@@ -1,12 +1,16 @@
 //! Optimism payload builder implementation.
 use crate::{
-    OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives, config::OpBuilderConfig,
-    error::OpPayloadBuilderError, payload::OpBuiltPayload,
+    OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives,
+    block_size::{BlockSizeBudget, RawSizeAdmission},
+    config::OpBuilderConfig,
+    error::OpPayloadBuilderError,
+    payload::OpBuiltPayload,
 };
 use alloy_consensus::{BlockHeader, Sealable, Transaction, Typed2718, transaction::Recovered};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_evm::Evm as AlloyEvm;
 use alloy_primitives::{Address, B256, Sealed, U256};
+use alloy_rlp::Encodable;
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_engine::PayloadId;
 use op_alloy_consensus::{
@@ -521,8 +525,12 @@ impl<Txs> OpBuilder<'_, Txs> {
             let block_number = builder.evm_mut().block().number().saturating_to();
             let entries = builder.executor_mut().take_post_exec_entries();
             let refund_gas = self::sdm_refund_gas(&entries);
-            try_include_post_exec_tx(block_number, entries, |tx| {
-                builder.execute_transaction(tx).map(|g| g.tx_gas_used())
+            try_include_post_exec_tx::<N::SignedTx, _>(block_number, entries, |tx| {
+                let tx_rlp_length = tx.length();
+                builder.execute_transaction(tx).map(|g| {
+                    info.block_size.record_post_exec(tx_rlp_length);
+                    g.tx_gas_used()
+                })
             })?;
             refund_gas
         } else {
@@ -538,6 +546,10 @@ impl<Txs> OpBuilder<'_, Txs> {
         } = builder.finish(state_provider, None)?;
 
         OpPayloadBuilderMetrics::default().record_sdm_refund_gas(sdm_refund_gas);
+
+        info.block_size
+            .validate_final_rlp_length(block.rlp_length())
+            .map_err(PayloadBuilderError::other)?;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
@@ -731,6 +743,8 @@ pub struct ExecutionInfo {
     pub cumulative_uncompressed_bytes: u64,
     /// Tracks fees from executed mempool transactions
     pub total_fees: U256,
+    /// Shared Mantle Osaka raw RLP budget, including a possible SDM post-exec transaction.
+    pub block_size: BlockSizeBudget,
 }
 
 impl ExecutionInfo {
@@ -742,6 +756,7 @@ impl ExecutionInfo {
             cumulative_da_bytes_used: 0,
             cumulative_uncompressed_bytes: 0,
             total_fees: U256::ZERO,
+            block_size: BlockSizeBudget::disabled(),
         }
     }
 
@@ -989,7 +1004,15 @@ where
         builder: &mut impl BlockBuilder<Primitives = Evm::Primitives>,
         mut committed_txs: Option<&mut Vec<Recovered<TxTy<Evm::Primitives>>>>,
     ) -> Result<ExecutionInfo, PayloadBuilderError> {
-        let mut info = ExecutionInfo::new();
+        let mut info = ExecutionInfo {
+            block_size: BlockSizeBudget::new(
+                self.chain_spec.is_mantle(),
+                self.chain_spec.is_osaka_active_at_timestamp(self.attributes().timestamp()),
+                self.parent().number().saturating_add(1),
+                self.sdm_production_enabled(),
+            ),
+            ..ExecutionInfo::new()
+        };
 
         for sequencer_tx in self.attributes().sequencer_transactions() {
             // A sequencer's block should never contain blob transactions.
@@ -1030,6 +1053,10 @@ where
             // Count the sequencer tx towards the block's uncompressed size so the pool-tx
             // uncompressed-size check starts from the right total.
             info.cumulative_uncompressed_bytes += sequencer_tx.encode_2718_len() as u64;
+            info.block_size.record_transaction(
+                sequencer_tx.length(),
+                !sequencer_tx.inner().is_deposit() && sequencer_tx.inner().as_post_exec().is_none(),
+            );
 
             // Record the successfully committed transaction for callers that want per-call
             // visibility.
@@ -1115,16 +1142,20 @@ where
                     ),
                 );
 
-            if info.is_tx_over_limits(
-                tx_da_size,
-                block_gas_limit,
-                tx_da_limit,
-                block_da_limit,
-                tx.gas_limit(),
-                da_footprint_gas_scalar,
-                tx_uncompressed_size,
-                max_uncompressed_block_size,
-            ) {
+            let sdm_refund_possible =
+                !tx.inner().is_deposit() && tx.inner().as_post_exec().is_none();
+            if info.block_size.admission(tx.length(), sdm_refund_possible) != RawSizeAdmission::Fits ||
+                info.is_tx_over_limits(
+                    tx_da_size,
+                    block_gas_limit,
+                    tx_da_limit,
+                    block_da_limit,
+                    tx.gas_limit(),
+                    da_footprint_gas_scalar,
+                    tx_uncompressed_size,
+                    max_uncompressed_block_size,
+                )
+            {
                 // we can't fit this transaction into the block, so we need to mark it as
                 // invalid which also removes all dependent transaction from
                 // the iterator before we can continue
@@ -1190,6 +1221,7 @@ where
             info.accumulate_gas(tx_gas_used, evm_gas_used);
             info.cumulative_da_bytes_used += tx_da_size;
             info.cumulative_uncompressed_bytes += tx_uncompressed_size;
+            info.block_size.record_transaction(tx.length(), sdm_refund_possible);
 
             // update and add to total fees
             info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);

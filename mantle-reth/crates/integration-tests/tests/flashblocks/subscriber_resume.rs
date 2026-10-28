@@ -1,0 +1,282 @@
+//! Reconnect and resume behaviour of [`FlashblocksSubscriber`].
+//!
+//! A stub websocket server stands in for the sequencer: it records the request
+//! URI of every connection, replays a scripted set of slices, then closes. No
+//! node is launched — the subscriber only needs a [`FlashblocksReceiver`].
+//!
+//! What this cannot cover: whether a producer honours the resume parameters.
+//! That is the other half of the contract and needs a producer.
+//!
+//! Scripted slices sit past index 0 on purpose. A reconnect lands mid-block far
+//! more often than on a block boundary, and a resume that always reported
+//! index 0 would have passed against base slices alone.
+
+use std::{sync::Arc, time::Duration};
+
+use futures::{SinkExt, StreamExt};
+use mantle_reth_flashblocks::{FlashblocksReceiver, FlashblocksSubscriber};
+use mantle_reth_flashblocks_types::MantleFlashblockPayload;
+use tokio::{
+    net::TcpListener,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        Message,
+        handshake::server::{Request, Response},
+    },
+};
+use url::Url;
+
+use crate::consumer_helpers::FlashblockBuilder;
+
+/// A slice's place in the stream: `(block_number, index)`.
+type Position = (u64, u64);
+
+/// Long enough that the keepalive never fires during a test.
+const NO_PINGS: Duration = Duration::from_secs(600);
+
+/// Slices delivered by the subscriber, in order.
+#[derive(Debug)]
+struct Recorder(UnboundedSender<MantleFlashblockPayload>);
+
+impl FlashblocksReceiver for Recorder {
+    fn on_flashblock_received(&self, flashblock: MantleFlashblockPayload) {
+        let _ = self.0.send(flashblock);
+    }
+}
+
+/// What one connection to the stub server sends before closing.
+enum Script {
+    /// A slice at each of these positions, in order.
+    Slices(Vec<Position>),
+    /// A message that is neither JSON nor brotli, then a slice.
+    Garbage(Position),
+    /// A slice, then silence: the connection is never read again, so pings go
+    /// unanswered.
+    Deaf(Position),
+    /// A slice, then the TCP stream is dropped — an end with no close frame,
+    /// which is what a draining load balancer or a killed upstream looks like.
+    Abort(Position),
+}
+
+/// Serves `script[n]` on the n-th connection, repeating the last entry, and
+/// reports every connection's request URI.
+async fn stub_server(script: Vec<Script>) -> (Url, UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the stub server");
+    let url: Url = format!("ws://{}/ws", listener.local_addr().expect("stub address"))
+        .parse()
+        .expect("stub url");
+    let (uri_tx, uri_rx) = unbounded_channel();
+
+    let script = Arc::new(script);
+    tokio::spawn(async move {
+        let mut connection = 0usize;
+        while let Ok((stream, _)) = listener.accept().await {
+            let uri_tx = uri_tx.clone();
+            let script = Arc::clone(&script);
+            let step = connection.min(script.len().saturating_sub(1));
+            connection += 1;
+
+            // One task per connection: a step may hold its connection open for
+            // the rest of the test while later connections are still served.
+            tokio::spawn(async move {
+                let mut websocket =
+                    accept_hdr_async(stream, |request: &Request, response: Response| {
+                        let _ = uri_tx.send(request.uri().to_string());
+                        Ok(response)
+                    })
+                    .await?;
+
+                match script.get(step) {
+                    Some(Script::Slices(positions)) => {
+                        for position in positions {
+                            websocket.send(slice_message(*position)).await?;
+                        }
+                    }
+                    Some(Script::Garbage(position)) => {
+                        websocket.send(Message::binary(vec![0xff; 32])).await?;
+                        websocket.send(slice_message(*position)).await?;
+                        // Held open: the decode error must not drop the connection.
+                        while websocket.next().await.is_some() {}
+                        return Ok(());
+                    }
+                    Some(Script::Deaf(position)) => {
+                        websocket.send(slice_message(*position)).await?;
+                        // Never polled again, so tungstenite never answers a ping.
+                        std::future::pending::<()>().await;
+                    }
+                    Some(Script::Abort(position)) => {
+                        websocket.send(slice_message(*position)).await?;
+                        drop(websocket);
+                        return Ok(());
+                    }
+                    None => {}
+                }
+
+                websocket.close(None).await
+            });
+        }
+    });
+
+    (url, uri_rx)
+}
+
+/// The slice at `position`, as a websocket text frame.
+fn slice_message((block_number, index): Position) -> Message {
+    let slice = FlashblockBuilder::new(block_number, index).build();
+    Message::text(serde_json::to_string(&slice).expect("serialise slice"))
+}
+
+/// Where a delivered slice sits in the stream.
+fn position_of(slice: &MantleFlashblockPayload) -> Position {
+    (slice.metadata.block_number, slice.index)
+}
+
+/// Starts a subscriber against `url` and returns the slices it delivers.
+fn subscribe_every(
+    url: Url,
+    ping_interval: Duration,
+) -> UnboundedReceiver<MantleFlashblockPayload> {
+    let (tx, rx) = unbounded_channel();
+    let mut subscriber = FlashblocksSubscriber::new(Arc::new(Recorder(tx)), url, ping_interval);
+    subscriber.start();
+    rx
+}
+
+/// [`subscribe_every`] with the keepalive effectively disabled.
+fn subscribe(url: Url) -> UnboundedReceiver<MantleFlashblockPayload> {
+    subscribe_every(url, NO_PINGS)
+}
+
+/// Awaits one item, failing the test rather than hanging.
+async fn next<T>(receiver: &mut UnboundedReceiver<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(20), receiver.recv())
+        .await
+        .expect("an item should arrive")
+        .expect("the channel should stay open")
+}
+
+/// Slices from the stream reach the receiver in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn slices_are_forwarded_in_order() {
+    let (url, _uris) = stub_server(vec![Script::Slices(vec![(1, 0), (1, 1), (2, 0)])]).await;
+    let mut slices = subscribe(url);
+
+    assert_eq!(position_of(&next(&mut slices).await), (1, 0));
+    assert_eq!(position_of(&next(&mut slices).await), (1, 1));
+    assert_eq!(position_of(&next(&mut slices).await), (2, 0));
+}
+
+/// Both the decoder and the websocket frame limit must accommodate a block-sized slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn q01_large_slice_reaches_the_consumer_directly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+    let (expected, json) = crate::consumer_helpers::large_slice_message();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        websocket.send(Message::text(json)).await.unwrap();
+        websocket.send(slice_message((1, 1))).await.unwrap();
+        while websocket.next().await.is_some() {}
+    });
+    let mut slices = subscribe(url);
+    assert_eq!(next(&mut slices).await, expected);
+    assert_eq!(position_of(&next(&mut slices).await), (1, 1));
+    server.abort();
+}
+
+/// The first connection has no position to resume from.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_connection_carries_no_resume_parameters() {
+    let (url, mut uris) = stub_server(vec![Script::Slices(vec![(1, 0)])]).await;
+    let _slices = subscribe(url);
+
+    assert_eq!(next(&mut uris).await, "/ws");
+}
+
+/// After the upstream closes, the subscriber reconnects and asks to resume from
+/// the last slice it saw — mid-block, so the index is part of what it names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconnect_resumes_from_the_last_delivered_slice() {
+    let (url, mut uris) =
+        stub_server(vec![Script::Slices(vec![(2, 0), (2, 3)]), Script::Slices(vec![])]).await;
+    let mut slices = subscribe(url);
+
+    assert_eq!(next(&mut uris).await, "/ws");
+    assert_eq!(position_of(&next(&mut slices).await), (2, 0));
+    assert_eq!(position_of(&next(&mut slices).await), (2, 3));
+
+    assert_eq!(
+        next(&mut uris).await,
+        "/ws?block_number=2&flashblock_index=3",
+        "the reconnect must name the last slice received"
+    );
+}
+
+/// Resume parameters are appended to a URL that already carries a query.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_parameters_extend_an_existing_query() {
+    let (base, mut uris) =
+        stub_server(vec![Script::Slices(vec![(7, 1)]), Script::Slices(vec![])]).await;
+    let url: Url = format!("{base}?token=abc").parse().expect("url with query");
+    let _slices = subscribe(url);
+
+    assert_eq!(next(&mut uris).await, "/ws?token=abc");
+    assert_eq!(next(&mut uris).await, "/ws?token=abc&block_number=7&flashblock_index=1");
+}
+
+/// An undecodable message is skipped; the connection survives it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undecodable_message_does_not_drop_the_connection() {
+    let (url, mut uris) = stub_server(vec![Script::Garbage((4, 2))]).await;
+    let mut slices = subscribe(url);
+
+    assert_eq!(next(&mut uris).await, "/ws");
+    assert_eq!(position_of(&next(&mut slices).await), (4, 2), "the valid slice still arrives");
+
+    // Longer than the first backoff, so a dropped connection would have shown
+    // up as a second request by now.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(uris.try_recv().is_err(), "no reconnect should have been attempted");
+}
+
+/// An unanswered ping reconnects, and the reconnect still resumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_ping_reconnects_and_resumes() {
+    let (url, mut uris) = stub_server(vec![Script::Deaf((9, 4)), Script::Slices(vec![])]).await;
+    let mut slices = subscribe_every(url, Duration::from_millis(200));
+
+    assert_eq!(next(&mut uris).await, "/ws");
+    assert_eq!(position_of(&next(&mut slices).await), (9, 4));
+
+    assert_eq!(next(&mut uris).await, "/ws?block_number=9&flashblock_index=4");
+}
+
+/// An upstream that ends the stream without a close frame is noticed at once,
+/// not at the next keepalive.
+///
+/// The read branch is written `Some(msg) = read.next()`, which would leave the
+/// loop waiting on the keepalive if the stream ever yielded `None` — two ping
+/// intervals to infer what the socket already reported. It does not: tungstenite
+/// surfaces an abrupt end as an error, so the error arm reconnects immediately.
+/// This holds that arm in place; the keepalive is left effectively off so that
+/// anything reconnecting here did so because the read side said so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_that_ends_the_stream_is_noticed_without_waiting_for_a_ping() {
+    let (url, mut uris) =
+        stub_server(vec![Script::Abort((1, 2)), Script::Slices(vec![(1, 3)])]).await;
+    let mut slices = subscribe(url);
+
+    assert_eq!(next(&mut uris).await, "/ws");
+    assert_eq!(position_of(&next(&mut slices).await), (1, 2));
+
+    assert_eq!(
+        next(&mut uris).await,
+        "/ws?block_number=1&flashblock_index=2",
+        "the reconnect must name the last slice received",
+    );
+    assert_eq!(position_of(&next(&mut slices).await), (1, 3));
+}

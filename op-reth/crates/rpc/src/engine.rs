@@ -190,7 +190,6 @@ pub trait OpEngineApi<Engine: EngineTypes> {
     ///
     /// OP modifications:
     /// - the response type is extended to [`EngineTypes::ExecutionPayloadEnvelopeV5`].
-    /// - required for the Mantle Limb fork (maps to the Osaka/Prague payload envelope).
     #[method(name = "getPayloadV5")]
     async fn get_payload_v5(
         &self,

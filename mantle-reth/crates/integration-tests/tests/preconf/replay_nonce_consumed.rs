@@ -24,8 +24,7 @@
 //!   - the apply loop additionally tolerates `is_nonce_too_low()` without `mark_invalid`, as a
 //!     second-line defense if a stale entry still reaches apply.
 //!
-//! The Replay path was previously untested (`nonce_too_low` skip was only
-//! covered on the pool-sweep path). These tests assert the
+//! These tests assert the
 //! observable contract — hash on chain exactly once, node healthy — rather
 //! than which layer did the skipping.
 
@@ -34,7 +33,7 @@ use crate::{canonize_built, launch_preconf_node};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use mantle_reth_preconf::JournalEntry;
+use mantle_reth_preconf::{ClaimKind, JournalEntry};
 use mantle_reth_rpc_ext::PreconfStatus;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
@@ -133,8 +132,13 @@ async fn replay_skip_of_consumed_nonce_does_not_block_other_sender() {
     // Pre-seed a Replay commitment for A's nonce 0.
     let tx_a = signed_transfer(chain_id, &wallet_a, 0).await;
     let hash_a = keccak256(&tx_a);
-    let entry =
-        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0 };
+    let entry = JournalEntry {
+        hash: hash_a,
+        tx_rlp: tx_a.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    };
     let (journal_file, journal_dir) = write_journal(&[entry]);
 
     let cfg = PreconfCfgBuilder::new()
@@ -215,8 +219,13 @@ async fn sender_continues_with_next_nonce_after_replay_skip() {
 
     let tx0 = signed_transfer(chain_id, &wallet, 0).await;
     let hash0 = keccak256(&tx0);
-    let entry =
-        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0 };
+    let entry = JournalEntry {
+        hash: hash0,
+        tx_rlp: tx0.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    };
     let (journal_file, journal_dir) = write_journal(&[entry]);
 
     let cfg = PreconfCfgBuilder::new()

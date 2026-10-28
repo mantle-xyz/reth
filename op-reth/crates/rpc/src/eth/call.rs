@@ -1,9 +1,9 @@
 use crate::{OpEthApi, OpEthApiError, eth::RpcNodeCore};
-use alloy_consensus::BlockHeader;
-use alloy_eips::BlockId;
+use alloy_consensus::{BlockHeader, SignableTransaction, TxEip1559};
+use alloy_eips::{BlockId, eip2718::Encodable2718};
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{TxKind, U256};
-use alloy_rpc_types_eth::state::EvmOverrides;
+use alloy_primitives::{Signature, TxKind, U256};
+use alloy_rpc_types_eth::{TransactionRequest, state::EvmOverrides};
 use reth_chainspec::{ChainSpecProvider, MIN_TRANSACTION_GAS};
 use reth_evm::{
     ConfigureEvm, Evm, EvmEnvFor, TransactionEnvMut,
@@ -25,7 +25,7 @@ use reth_rpc_eth_api::{
     },
 };
 use reth_rpc_eth_types::{
-    RpcInvalidTransactionError,
+    EthApiError, RpcInvalidTransactionError,
     error::api::{FromEvmHalt, FromRevert},
 };
 use reth_rpc_server_types::constants::gas_oracle::{CALL_STIPEND_GAS, ESTIMATE_GAS_ERROR_RATIO};
@@ -110,13 +110,11 @@ where
                 let Ok(Some(block)) = self.provider().block_by_id(at) &&
                 chain_spec.is_mantle_arsia_active_at_timestamp(block.header().timestamp())
             {
-                let fee_cap = U256::from(
-                    request
-                        .as_ref()
-                        .max_fee_per_gas
-                        .unwrap_or(request.as_ref().gas_price.unwrap_or(0)),
-                );
-                if !fee_cap.is_zero() &&
+                let fee_cap = request
+                    .as_ref()
+                    .max_fee_per_gas
+                    .unwrap_or(request.as_ref().gas_price.unwrap_or(0));
+                if fee_cap != 0 &&
                     let Ok(mut l1_block_info) = extract_l1_info(block.body()) &&
                     let Ok(state) = self.provider().state_by_block_id(at) &&
                     let Some(from) = request.as_ref().from
@@ -130,16 +128,17 @@ where
                     let balance = from_override_balance
                         .or_else(|| state.account_balance(&from).ok().flatten())
                         .unwrap_or(U256::ZERO);
-                    let input = request.as_ref().input.input().cloned().unwrap_or_default();
+                    let gas_limit = estimate.try_into().unwrap_or(u64::MAX);
+                    let tx_envelope = build_arsia_funds_check_envelope(request.as_ref(), gas_limit);
 
                     if let Err(e) = mantle_reth_eth_api::mantle_arsia_check_funds(
                         &mantle_reth_eth_api::ArsiaFundsCheck {
-                            gas_limit: estimate.try_into().unwrap_or(u64::MAX),
-                            fee_cap,
+                            gas_limit,
+                            fee_cap: U256::from(fee_cap),
                             value: request.as_ref().value.unwrap_or(U256::ZERO),
                             from_balance: balance,
                             l1_block_info: &l1_block_info,
-                            tx_input: &input,
+                            tx_envelope: &tx_envelope,
                             chain_spec: chain_spec.as_ref(),
                             timestamp: block.header().timestamp(),
                         },
@@ -156,6 +155,62 @@ where
     }
 }
 
+/// Encodes the proxy transaction that op-geth prices in `mantleArsiaCheckFunds`.
+///
+/// op-geth intentionally constructs a dynamic-fee transaction from only the message fields used
+/// here. Its chain ID and recipient are nil, and its access list is empty. Zero-valued signature
+/// fields make the result an EIP-2718 envelope without pretending it is a sendable transaction.
+fn build_arsia_funds_check_envelope(request: &TransactionRequest, gas_limit: u64) -> Vec<u8> {
+    let (max_fee_per_gas, max_priority_fee_per_gas) = request.gas_price.map_or_else(
+        || {
+            (
+                request.max_fee_per_gas.unwrap_or_default(),
+                request.max_priority_fee_per_gas.unwrap_or_default(),
+            )
+        },
+        |gas_price| (gas_price, gas_price),
+    );
+    TxEip1559 {
+        chain_id: 0,
+        nonce: request.nonce.unwrap_or_default(),
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        to: TxKind::Create,
+        value: request.value.unwrap_or_default(),
+        access_list: Default::default(),
+        input: request.input.input().cloned().unwrap_or_default(),
+    }
+    .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
+    .encoded_2718()
+}
+
+#[cfg(test)]
+mod arsia_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn eip1559_request_without_priority_fee_encodes_zero_tip() {
+        let request = TransactionRequest { max_fee_per_gas: Some(100), ..Default::default() };
+        let actual = build_arsia_funds_check_envelope(&request, 21_000);
+        let expected = TxEip1559 {
+            chain_id: 0,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        }
+        .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
+        .encoded_2718();
+
+        assert_eq!(actual, expected);
+    }
+}
+
 impl<N, Rpc> EstimateCall for OpEthApi<N, Rpc>
 where
     N: RpcNodeCore,
@@ -166,13 +221,15 @@ where
     /// gate the caller balance allowance by the fee cap (`maxFeePerGas`) instead of the effective
     /// gas price (`geth_style_gas_allowance`, rejecting on `value >= balance` / blob-exposure like
     /// op-geth), ignore a
-    /// request gas limit below the intrinsic minimum, and only take the basic-transfer
-    /// short-circuit when the allowance permits it.
+    /// request gas limit below the intrinsic minimum, only take the basic-transfer
+    /// short-circuit when the allowance permits it, report running out of gas at the ceiling
+    /// as `gas required exceeds allowance`, and bound the ceiling by the RPC gas cap.
     ///
     /// Everything else is a verbatim copy of
     /// `reth_rpc_eth_api::helpers::estimate::EstimateCall::estimate_gas_with` (reth rev
-    /// 88505c7). The `[MANTLE]` blocks below are the only deviations. See
-    /// `docs/op-reth-estimategas-fix-and-upstream.md` for the rationale.
+    /// aef8d3e). The `[MANTLE]` blocks below are the only deviations: re-check this function
+    /// against upstream's on every reth bump, because upstream fixes to the default
+    /// implementation never reach this override on their own.
     fn estimate_gas_with<S>(
         &self,
         mut evm_env: EvmEnvFor<Self::Evm>,
@@ -201,31 +258,14 @@ where
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.as_ref().gas_limit();
         let tx_request_gas_price = request.as_ref().gas_price();
-        // the gas limit of the corresponding block
-        let max_gas_limit = evm_env
-            .cfg_env
-            .tx_gas_limit_cap
-            // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
-            .filter(|_| !evm_env.cfg_env.is_amsterdam_eip8037_enabled())
-            .map_or_else(
-                || evm_env.block_env.gas_limit(),
-                |cap| cap.min(evm_env.block_env.gas_limit()),
-            );
-
-        // Determine the highest possible gas limit, considering both the request's specified
-        // limit and the block's limit. Like op-geth, a user-supplied gas limit below the intrinsic
-        // minimum is ignored (the block limit is used) rather than taken as the search ceiling.
-        let mut highest_gas_limit = tx_request_gas_limit
-            .filter(|&tx_gas_limit| tx_gas_limit >= MIN_TRANSACTION_GAS)
-            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
-            .unwrap_or(max_gas_limit);
 
         // Configure the evm env
         let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
 
-        // Apply block overrides first, so `gasLimit` / `baseFee` / `blobBaseFee` are visible to
-        // estimation. v2.4.2 added this upstream (mirroring go-ethereum#30695); this Mantle
-        // override predates it and would otherwise drop them silently.
+        // Apply any block overrides before deriving block-derived limits and the tx env so
+        // overrides for `gasLimit`, `baseFee` and `blobBaseFee` are visible to estimation.
+        // Mirrors geth's behavior, see:
+        // <https://github.com/ethereum/go-ethereum/pull/30695>
         if let Some(block_overrides) = overrides.block {
             apply_block_overrides(*block_overrides, &mut db, evm_env.block_env.inner_mut());
         }
@@ -234,6 +274,31 @@ where
         if let Some(state_override) = overrides.state {
             apply_state_overrides(state_override, &mut db).map_err(Self::Error::from_eth_err)?;
         }
+
+        // the gas limit of the corresponding block
+        let block_gas_limit = evm_env.block_env.gas_limit();
+        // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
+        let max_gas_limit = if evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
+            block_gas_limit
+        } else {
+            evm_env.cfg_env.tx_gas_limit_cap().min(block_gas_limit)
+        };
+        // [MANTLE] The RPC gas cap bounds the ceiling too, as it does in op-geth
+        // (`gasestimator.go`: `if gasCap != 0 && hi > gasCap`). Block overrides apply first, and
+        // Arsia lifts the per-transaction cap, so without it a raised `gasLimit` would have the
+        // estimate execute however much gas the request names.
+        let max_gas_limit = match self.call_gas_limit() {
+            0 => max_gas_limit,
+            gas_cap => max_gas_limit.min(gas_cap),
+        };
+
+        // Determine the highest possible gas limit, considering both the request's specified
+        // limit and the block's limit. Like op-geth, a user-supplied gas limit below the intrinsic
+        // minimum is ignored (the block limit is used) rather than taken as the search ceiling.
+        let mut highest_gas_limit = tx_request_gas_limit
+            .filter(|&tx_gas_limit| tx_gas_limit >= MIN_TRANSACTION_GAS)
+            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
+            .unwrap_or(max_gas_limit);
 
         let mut tx_env = self.create_txn_env(&evm_env, request, &mut db)?;
 
@@ -344,7 +409,24 @@ where
         let gas_refund = match res.result {
             ExecutionResult::Success { gas, .. } => gas.final_refunded(),
             ExecutionResult::Halt { reason, .. } => {
-                return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()));
+                let error = Self::Error::from_evm_halt(reason, tx_env.gas_limit());
+                // [MANTLE] A call that runs out of gas at the ceiling is reported the way op-geth
+                // reports it (`gasestimator.go`, after the first execution at `hi`), not as reth's
+                // out-of-gas error with its -32003.
+                if matches!(
+                    error.as_err(),
+                    Some(EthApiError::InvalidTransaction(
+                        RpcInvalidTransactionError::BasicOutOfGas(_) |
+                            RpcInvalidTransactionError::MemoryOutOfGas(_) |
+                            RpcInvalidTransactionError::PrecompileOutOfGas(_)
+                    ))
+                ) {
+                    return Err(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
+                        gas_limit: tx_env.gas_limit(),
+                    }
+                    .into_eth_err());
+                }
+                return Err(error);
             }
             ExecutionResult::Revert { output, .. } => {
                 return if tx_request_gas_limit.is_some() || tx_request_gas_price.is_some() {

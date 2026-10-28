@@ -616,7 +616,7 @@ mod test {
             value: U256::ZERO,
             gas_limit: 1_000_000,
             is_system_transaction: false,
-            eth_value: 0,
+            eth_value: U256::ZERO,
             input: Bytes::copy_from_slice(calldata),
             eth_tx_value: None,
         }
@@ -1145,7 +1145,7 @@ mod test {
             value: U256::ZERO,
             gas_limit: 1_000_000,
             is_system_transaction: false,
-            eth_value: 0,
+            eth_value: U256::ZERO,
             eth_tx_value: None,
             // init code: PUSH1 0x42, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
             input: Bytes::from_static(&hex!("604260005260206000f3")),
@@ -1326,7 +1326,7 @@ mod test {
             value: U256::ZERO,
             gas_limit: 1_000_000,
             is_system_transaction: false,
-            eth_value: 0,
+            eth_value: U256::ZERO,
             input: Bytes::new(),
             eth_tx_value: None,
         }
@@ -1452,7 +1452,7 @@ mod test {
             value: U256::ZERO,
             gas_limit: 1_000_000,
             is_system_transaction: false,
-            eth_value: 0,
+            eth_value: U256::ZERO,
             input: Bytes::new(),
             eth_tx_value: None,
         }

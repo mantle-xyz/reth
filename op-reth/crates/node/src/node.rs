@@ -73,6 +73,23 @@ use url::Url;
 
 use reth_optimism_payload_builder::OpPayloadAttrs;
 
+/// [MANTLE] Mantle mainnet's first complete block after imported anchor 87,370,342.
+const MANTLE_MAINNET_HISTORY_START: u64 = 87_370_343;
+
+/// [MANTLE] Returns the first block served locally when historical forwarding is on: the
+/// configured cutoff, else Mantle mainnet's first complete block after its state-import anchor,
+/// else the Bedrock block. Forwarding stays off when this is `None`.
+fn resolve_historical_rpc_cutoff(
+    configured: Option<u64>,
+    chain_id: u64,
+    bedrock_block: Option<u64>,
+) -> Option<u64> {
+    configured
+        .or_else(|| (chain_id == 5000).then_some(MANTLE_MAINNET_HISTORY_START))
+        .or(bedrock_block)
+        .filter(|cutoff| *cutoff > 0)
+}
+
 /// Builds [`OpPayloadAttrs`] for local/dev-mode payload generation.
 struct OpLocalPayloadAttributesBuilder {
     chain_spec: Arc<OpChainSpec>,
@@ -323,6 +340,7 @@ impl OpNode {
             .with_enable_tx_conditional(self.args.enable_tx_conditional)
             .with_min_suggested_priority_fee(self.args.min_suggested_priority_fee)
             .with_historical_rpc(self.args.historical_rpc.clone())
+            .with_historical_rpc_cutoff(self.args.historical_rpc_cutoff)
             .with_flashblocks(self.args.flashblocks_url.clone())
             .with_flashblock_consensus(self.args.flashblock_consensus)
             .with_retain_forwarded_txs(self.args.retain_forwarded_txs)
@@ -453,6 +471,9 @@ pub struct OpAddOns<
     ///
     /// This can be used to forward pre-bedrock rpc requests (op-mainnet).
     pub historical_rpc: Option<String>,
+    /// [MANTLE] First block served locally when historical forwarding is on; see
+    /// [`RollupArgs::historical_rpc_cutoff`].
+    pub historical_rpc_cutoff: Option<u64>,
     /// Enable transaction conditionals.
     enable_tx_conditional: bool,
     min_suggested_priority_fee: u64,
@@ -473,6 +494,7 @@ where
         sequencer_url: Option<String>,
         sequencer_headers: Vec<String>,
         historical_rpc: Option<String>,
+        historical_rpc_cutoff: Option<u64>,
         enable_tx_conditional: bool,
         min_suggested_priority_fee: u64,
     ) -> Self {
@@ -484,6 +506,7 @@ where
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             enable_tx_conditional,
             min_suggested_priority_fee,
         }
@@ -536,6 +559,7 @@ where
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             enable_tx_conditional,
             min_suggested_priority_fee,
             ..
@@ -548,6 +572,7 @@ where
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             enable_tx_conditional,
             min_suggested_priority_fee,
         )
@@ -568,6 +593,7 @@ where
             enable_tx_conditional,
             min_suggested_priority_fee,
             historical_rpc,
+            historical_rpc_cutoff,
             ..
         } = self;
         OpAddOns::new(
@@ -578,6 +604,7 @@ where
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             enable_tx_conditional,
             min_suggested_priority_fee,
         )
@@ -598,6 +625,7 @@ where
             enable_tx_conditional,
             min_suggested_priority_fee,
             historical_rpc,
+            historical_rpc_cutoff,
             ..
         } = self;
         OpAddOns::new(
@@ -608,6 +636,7 @@ where
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             enable_tx_conditional,
             min_suggested_priority_fee,
         )
@@ -631,6 +660,7 @@ where
             enable_tx_conditional,
             min_suggested_priority_fee,
             historical_rpc,
+            historical_rpc_cutoff,
             ..
         } = self;
         OpAddOns::new(
@@ -641,6 +671,7 @@ where
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             enable_tx_conditional,
             min_suggested_priority_fee,
         )
@@ -707,6 +738,7 @@ where
             sequencer_headers,
             enable_tx_conditional,
             historical_rpc,
+            historical_rpc_cutoff,
             ..
         } = self;
 
@@ -715,13 +747,14 @@ where
 
         let maybe_pre_bedrock_historical_rpc = historical_rpc
             .and_then(|historical_rpc| {
-                ctx.node
-                    .provider()
-                    .chain_spec()
-                    .op_fork_activation(OpHardfork::Bedrock)
-                    .block_number()
-                    .filter(|activation| *activation > 0)
-                    .map(|bedrock_block| (historical_rpc, bedrock_block))
+                let chain_spec = ctx.node.provider().chain_spec();
+                // [MANTLE] The cutoff may be configured or Mantle's, not only Bedrock.
+                resolve_historical_rpc_cutoff(
+                    historical_rpc_cutoff,
+                    chain_spec.chain().id(),
+                    chain_spec.op_fork_activation(OpHardfork::Bedrock).block_number(),
+                )
+                .map(|bedrock_block| (historical_rpc, bedrock_block))
             })
             .map(|(historical_rpc, bedrock_block)| -> eyre::Result<_> {
                 info!(target: "reth::cli", %bedrock_block, ?historical_rpc, "Using historical RPC endpoint pre bedrock");
@@ -887,6 +920,8 @@ pub struct OpAddOnsBuilder<NetworkT, RpcMiddleware = Identity> {
     sequencer_headers: Vec<String>,
     /// RPC endpoint for historical data.
     historical_rpc: Option<String>,
+    /// [MANTLE] First block served locally when historical forwarding is on.
+    historical_rpc_cutoff: Option<u64>,
     /// Data availability configuration for the OP builder.
     da_config: Option<OpDAConfig>,
     /// Gas limit configuration for the OP builder.
@@ -918,6 +953,7 @@ impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
             sequencer_url: None,
             sequencer_headers: Vec::new(),
             historical_rpc: None,
+            historical_rpc_cutoff: None,
             da_config: None,
             gas_limit_config: None,
             operator_sdm_opt_in: None,
@@ -990,6 +1026,13 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
         self
     }
 
+    /// [MANTLE] Configures the first block served locally when historical forwarding is on.
+    /// `None` keeps the chain default.
+    pub const fn with_historical_rpc_cutoff(mut self, historical_rpc_cutoff: Option<u64>) -> Self {
+        self.historical_rpc_cutoff = historical_rpc_cutoff;
+        self
+    }
+
     /// Configures a custom tokio runtime for the RPC server.
     ///
     /// Caution: This runtime must not be created from within asynchronous context.
@@ -1004,6 +1047,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             da_config,
             gas_limit_config,
             operator_sdm_opt_in,
@@ -1020,6 +1064,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             da_config,
             gas_limit_config,
             operator_sdm_opt_in,
@@ -1069,6 +1114,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             retain_forwarded_txs,
             min_suggested_priority_fee,
             historical_rpc,
+            historical_rpc_cutoff,
             rpc_middleware,
             tokio_runtime,
             flashblocks_url,
@@ -1098,6 +1144,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             sequencer_url,
             sequencer_headers,
             historical_rpc,
+            historical_rpc_cutoff,
             enable_tx_conditional,
             min_suggested_priority_fee,
         )
@@ -1859,5 +1906,39 @@ mod tests {
             cfg.operator_sdm_opt_in.enabled(),
             "builder_config must carry the node's live SDM opt-in handle, not a detached copy"
         );
+    }
+
+    /// [MANTLE] A configured cutoff wins over the Mantle mainnet default, which wins over
+    /// Bedrock. A zero cutoff leaves forwarding off.
+    #[test]
+    fn historical_rpc_cutoff_precedence() {
+        for (configured, chain_id, bedrock_block, expected) in [
+            (None, 5000, Some(0), Some(MANTLE_MAINNET_HISTORY_START)),
+            (Some(90_000_001), 5000, Some(0), Some(90_000_001)),
+            (Some(0), 5000, Some(0), None),
+            (None, 10, Some(105_235_063), Some(105_235_063)),
+            (Some(42), 10, Some(105_235_063), Some(42)),
+            (None, 5003, Some(0), None),
+            (None, 5003, None, None),
+            (Some(42), 5003, Some(0), Some(42)),
+        ] {
+            assert_eq!(
+                resolve_historical_rpc_cutoff(configured, chain_id, bedrock_block),
+                expected,
+                "configured={configured:?} chain={chain_id} bedrock={bedrock_block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_ons_builder_forwards_historical_rpc_cutoff() {
+        let node = OpNode::new(RollupArgs {
+            historical_rpc: Some("http://history:8545".to_string()),
+            historical_rpc_cutoff: Some(90_000_001),
+            ..Default::default()
+        });
+        let builder = node.add_ons_builder::<op_alloy_network::Optimism>();
+        assert_eq!(builder.historical_rpc.as_deref(), Some("http://history:8545"));
+        assert_eq!(builder.historical_rpc_cutoff, Some(90_000_001));
     }
 }
