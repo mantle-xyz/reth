@@ -5,7 +5,7 @@
 //! its methods are called directly rather than over JSON-RPC.
 
 use alloy_primitives::{Address, B256, Bytes, U256, bytes, keccak256};
-use alloy_rpc_types_eth::{BlockNumberOrTag, BlockOverrides, Filter};
+use alloy_rpc_types_eth::{BlockNumberOrTag, BlockOverrides, Filter, Log};
 use mantle_reth_flashblocks::EthApiOverrideServer;
 
 use crate::consumer_helpers::{
@@ -405,6 +405,7 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
     use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
     use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
     use reth_chainspec::EthChainSpec;
+    use reth_provider::BlockNumReader;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -417,7 +418,10 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
         reads: AtomicUsize,
     }
     impl PendingStateOverrides for AdvancingPreview {
-        fn pending_execution_context(&self) -> Option<PendingExecutionContext> {
+        fn pending_execution_context(
+            &self,
+            _canonical_tip: &dyn Fn() -> Option<alloy_primitives::BlockNumber>,
+        ) -> Option<PendingExecutionContext> {
             Some(if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first.clone()
             } else {
@@ -480,7 +484,10 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
         )
         .await;
     let first = estimate().await.expect("first preview fee");
-    let captured = harness.state().pending_execution_context().unwrap();
+    let captured = harness
+        .state()
+        .pending_execution_context(&|| node.inner.provider.best_block_number().ok())
+        .unwrap();
     // Transfer costs exactly 21,000 gas; operator fee = 21,000 * 2 * 100 + 7.
     let fixed = U256::from(21_000 + 4_200_007);
     assert!(first > fixed, "nonzero L1 fee must be included");
@@ -528,7 +535,10 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
     // must retain its first capture for both gas estimation and fee parameters.
     let advancing = Arc::new(AdvancingPreview {
         first: captured,
-        next: harness.state().pending_execution_context().unwrap(),
+        next: harness
+            .state()
+            .pending_execution_context(&|| node.inner.provider.best_block_number().ok())
+            .unwrap(),
         reads: AtomicUsize::new(0),
     });
     let captured_api = MantleRpcExt::new(
@@ -766,11 +776,14 @@ async fn pending_simulation_keeps_captured_block_hashes_after_canonical_advances
     use crate::consumer_helpers::mine_canonical_block;
     use mantle_reth_flashblocks::{PendingExecutionContext, PendingStateOverrides};
     use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
-    use reth_provider::{BlockHashReader, StateProviderFactory};
+    use reth_provider::{BlockHashReader, BlockNumReader, StateProviderFactory};
     #[derive(Debug)]
     struct Captured(PendingExecutionContext);
     impl PendingStateOverrides for Captured {
-        fn pending_execution_context(&self) -> Option<PendingExecutionContext> {
+        fn pending_execution_context(
+            &self,
+            _canonical_tip: &dyn Fn() -> Option<alloy_primitives::BlockNumber>,
+        ) -> Option<PendingExecutionContext> {
             Some(self.0.clone())
         }
     }
@@ -781,7 +794,10 @@ async fn pending_simulation_keeps_captured_block_hashes_after_canonical_advances
         persist_each_block = true
     );
     overlay_with_user_call!(harness);
-    let captured = harness.state().pending_execution_context().expect("captured preview");
+    let captured = harness
+        .state()
+        .pending_execution_context(&|| node.inner.provider.best_block_number().ok())
+        .expect("captured preview");
     assert_eq!(captured.header.hash(), B256::ZERO, "the preview tip is not sealed");
     let canonical = mine_canonical_block!(node);
     assert_ne!(canonical.hash(), B256::ZERO);
@@ -1020,6 +1036,39 @@ async fn a_transaction_in_the_overlay_is_served_by_hash_and_has_a_receipt() {
     assert_eq!(receipt["status"], "0x1", "the call must have succeeded");
 }
 
+/// A preview transaction the canonical tip has already passed is not served by
+/// hash; one in a block still ahead of the tip is.
+#[tokio::test(flavor = "multi_thread")]
+async fn by_hash_lookups_skip_preview_transactions_the_tip_has_passed() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let first = overlay_with_user_call!(harness);
+    let raw = signed_call(1, LOGGER, VALUE).await;
+    let second = keccak256(&raw);
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 0)
+                .transactions(vec![l1_info_deposit(2), raw])
+                .build(),
+        )
+        .await;
+
+    // Canonical block 1 holds only the deposit; the preview still ends at block 2.
+    assert_eq!(mine_canonical_block!(node).number, 1);
+
+    assert!(api.transaction_by_hash(first).await.unwrap().is_none());
+    assert!(api.get_transaction_receipt(first).await.unwrap().is_none());
+
+    let transaction = api.transaction_by_hash(second).await.unwrap().expect("ahead of the tip");
+    assert_eq!(transaction["blockNumber"], "0x2");
+    let receipt = api.get_transaction_receipt(second).await.unwrap().expect("ahead of the tip");
+    assert_eq!(receipt["blockNumber"], "0x2");
+}
+
 /// `eth_getBalance` sees the overlay's transfer under `pending` only.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_balance_sees_the_overlay_only_under_pending() {
@@ -1133,9 +1182,10 @@ async fn get_logs_filters_older_blocks_from_a_multi_block_overlay() {
     assert_eq!(logs.iter().map(|log| log.block_number).collect::<Vec<_>>(), vec![Some(1), Some(2)]);
 }
 
-/// Resolved start tags apply to retained preview history as well as canonical logs.
+/// Resolved start tags apply to retained preview history as well as canonical logs;
+/// blocks at or below the tip come from the canonical chain, the rest from the preview.
 #[tokio::test(flavor = "multi_thread")]
-async fn get_logs_resolves_latest_and_deduplicates_canonical_preview_overlap() {
+async fn get_logs_resolves_latest_and_takes_settled_blocks_from_canonical() {
     use crate::consumer_helpers::mine_canonical_block;
 
     let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
@@ -1180,6 +1230,72 @@ async fn get_logs_resolves_latest_and_deduplicates_canonical_preview_overlap() {
         logs.iter().map(|log| log.block_number).collect::<Vec<_>>(),
         vec![Some(1), Some(2), Some(3)]
     );
+}
+
+/// A preview the chain has passed no longer shapes `eth_getLogs`: the range is
+/// answered from the canonical chain alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_with_a_stale_preview_returns_the_latest_canonical_logs() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw0 = signed_call(0, LOGGER, VALUE).await;
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), raw0.clone()])
+                .build(),
+        )
+        .await;
+    node.rpc.inject_tx(raw0).await.expect("canonical call");
+    assert_eq!(mine_canonical_block!(node).number, 1);
+    node.rpc.inject_tx(signed_call(1, LOGGER, VALUE).await).await.expect("canonical call");
+    assert_eq!(mine_canonical_block!(node).number, 2);
+    assert_eq!(harness.pending().expect("stale preview").latest_block_number(), 1);
+
+    let blocks = |logs: Vec<Log>| logs.iter().map(|log| log.block_number).collect::<Vec<_>>();
+    let filter = Filter::new().address(LOGGER).to_block(BlockNumberOrTag::Pending);
+    let latest = api.get_logs(filter.clone().from_block(BlockNumberOrTag::Latest)).await.unwrap();
+    assert_eq!(blocks(latest), vec![Some(2)]);
+    let from_pending = api.get_logs(filter.clone().from_block(BlockNumberOrTag::Pending)).await;
+    assert_eq!(
+        blocks(from_pending.unwrap()),
+        vec![Some(2)],
+        "answered by the standard implementation, not the stale preview"
+    );
+    let earliest = api.get_logs(filter.from_block(BlockNumberOrTag::Earliest)).await.unwrap();
+    assert_eq!(blocks(earliest), vec![Some(1), Some(2)]);
+}
+
+/// Preview blocks at or below the tip are never returned from the preview, even
+/// when the canonical block holds different transactions.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_takes_blocks_at_or_below_the_tip_from_canonical_only() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    overlay_with_user_call!(harness);
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 0)
+                .transactions(vec![l1_info_deposit(2), signed_call(1, LOGGER, VALUE).await])
+                .build(),
+        )
+        .await;
+    // Canonical block 1 holds only the deposit; the preview still ends at block 2.
+    assert_eq!(mine_canonical_block!(node).number, 1);
+
+    let filter = Filter::new()
+        .address(LOGGER)
+        .from_block(BlockNumberOrTag::Earliest)
+        .to_block(BlockNumberOrTag::Pending);
+    let logs = api.get_logs(filter).await.expect("query");
+    assert_eq!(logs.iter().map(|log| log.block_number).collect::<Vec<_>>(), vec![Some(2)]);
 }
 
 /// A code-less account touched by the overlay must not gain code in the overrides.
@@ -1726,4 +1842,189 @@ async fn receipt_positions_continue_across_slices() {
     };
     assert_eq!(log_index(&first), 0);
     assert_eq!(log_index(&second), 1, "log indices are block-global too");
+}
+
+/// Once the canonical tip has caught up with the preview, every pending read
+/// answers from `latest` instead of the stale preview.
+///
+/// The harness never delivers the canonical notification, so the preview stays
+/// published, which is the window a real node has between a block landing and
+/// the consumer noticing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_preview_answers_pending_reads_from_latest() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    let pending = || Some(BlockNumberOrTag::Pending.into());
+
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![
+                    l1_info_deposit(1),
+                    signed_deploy(0, DEPLOY_INIT_CODE).await,
+                    signed_call(1, SETTER, U256::ZERO).await,
+                    signed_call(2, LOGGER, VALUE).await,
+                ])
+                .build(),
+        )
+        .await;
+    assert_eq!(api.get_balance(LOGGER, pending()).await.unwrap(), VALUE);
+    assert_eq!(
+        api.get_block_transaction_count_by_number(BlockNumberOrTag::Pending).await.unwrap(),
+        Some(U256::from(4))
+    );
+
+    let request = serde_json::json!({
+        "from": format!("{LOGGER:#x}"),
+        "to": format!("{:#x}", Address::ZERO),
+        "value": format!("{VALUE:#x}"),
+    });
+    let called = api
+        .call(serde_json::json!({ "to": format!("{LOGGER:#x}") }), pending(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(&called), VALUE, "call on the live preview");
+    api.estimate_gas(request.clone(), pending(), None, None)
+        .await
+        .expect("estimate_gas on the live preview");
+
+    let canonical = mine_canonical_block!(node);
+    assert_eq!(canonical.number, 1);
+    assert!(harness.pending().is_some(), "the preview is still published");
+
+    let block = api.block_by_number(pending_tag(), false).await.unwrap().expect("a block");
+    assert_eq!(block["hash"], format!("{:#x}", canonical.hash()), "block_by_number");
+    assert_eq!(
+        api.get_block_transaction_count_by_number(BlockNumberOrTag::Pending).await.unwrap(),
+        Some(U256::from(1)),
+        "get_block_transaction_count_by_number"
+    );
+    assert_eq!(api.get_balance(LOGGER, pending()).await.unwrap(), U256::ZERO, "get_balance");
+    assert_eq!(
+        api.get_code(test_sender().create(0), pending()).await.unwrap(),
+        Bytes::new(),
+        "get_code"
+    );
+    assert_eq!(
+        api.storage_at(SETTER, SETTER_SLOT.into(), pending()).await.unwrap(),
+        B256::ZERO,
+        "storage_at"
+    );
+    assert_eq!(
+        api.get_transaction_count(test_sender(), pending()).await.unwrap(),
+        U256::ZERO,
+        "get_transaction_count"
+    );
+    let called = api
+        .call(serde_json::json!({ "to": format!("{LOGGER:#x}") }), pending(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(&called), U256::ZERO, "call");
+    let err = api
+        .estimate_gas(request, pending(), None, None)
+        .await
+        .expect_err("estimate_gas: canonically the sender cannot cover the transfer");
+    let message = err.message().to_lowercase();
+    assert!(
+        message.contains("outoffunds") || message.contains("insufficient funds"),
+        "estimate_gas: unexpected error: {err}"
+    );
+}
+
+/// A preview whose first block is already canonical but whose last block is
+/// still ahead of the tip keeps serving `pending`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_that_still_leads_keeps_serving_after_its_first_block_is_canonical() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    let pending = || Some(BlockNumberOrTag::Pending.into());
+
+    overlay_with_user_call!(harness);
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 0)
+                .transactions(vec![l1_info_deposit(2), signed_call(1, LOGGER, VALUE).await])
+                .build(),
+        )
+        .await;
+    let preview = harness.pending().expect("two-block preview");
+    assert_eq!((preview.earliest_block_number(), preview.latest_block_number()), (1, 2));
+
+    node.rpc.inject_tx(signed_call(0, LOGGER, VALUE).await).await.expect("canonical call");
+    assert_eq!(mine_canonical_block!(node).number, 1);
+
+    assert_eq!(api.get_balance(LOGGER, pending()).await.unwrap(), VALUE * U256::from(2), "balance");
+    let block = api.block_by_number(pending_tag(), false).await.unwrap().expect("a block");
+    assert_eq!(block["number"], "0x2", "block number");
+    assert_eq!(
+        api.get_transaction_count(test_sender(), pending()).await.unwrap(),
+        U256::from(2),
+        "nonce"
+    );
+}
+
+/// Once the canonical tip has caught up with the preview, the Mantle RPC
+/// extension answers pending simulation and fee estimates from `latest`.
+#[tokio::test(flavor = "multi_thread")]
+async fn mantle_pending_reads_fall_back_to_latest_when_the_preview_is_stale() {
+    use crate::consumer_helpers::mine_canonical_block;
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    overlay_with_storage_write!(harness);
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+
+    let request = serde_json::json!({ "from": test_sender(), "to": SETTER, "gasPrice": "0x1" });
+    let fee = |tag: BlockNumberOrTag| {
+        let api = &api;
+        let request = request.clone();
+        async move {
+            api.estimate_total_fee(serde_json::from_value(request).unwrap(), Some(tag.into()))
+                .await
+                .expect("total fee")
+        }
+    };
+    let simulated_gas = |tag: BlockNumberOrTag| {
+        let api = &api;
+        async move {
+            let result = api
+                .simulate_v1(
+                    serde_json::json!({ "blockStateCalls": [{
+                        "calls": [{ "from": test_sender(), "to": SETTER }]
+                    }] }),
+                    Some(tag.into()),
+                )
+                .await
+                .expect("simulation");
+            result[0]["calls"][0]["gasUsed"].clone()
+        }
+    };
+
+    // Premise: the preview's storage write makes the two answers differ.
+    assert_ne!(fee(BlockNumberOrTag::Pending).await, fee(BlockNumberOrTag::Latest).await);
+    assert_ne!(
+        simulated_gas(BlockNumberOrTag::Pending).await,
+        simulated_gas(BlockNumberOrTag::Latest).await
+    );
+
+    // The tip reaches the preview's block; the consumer is not told.
+    mine_canonical_block!(node);
+    assert!(harness.pending().is_some(), "the preview is still published");
+
+    assert_eq!(fee(BlockNumberOrTag::Pending).await, fee(BlockNumberOrTag::Latest).await);
+    assert_eq!(
+        simulated_gas(BlockNumberOrTag::Pending).await,
+        simulated_gas(BlockNumberOrTag::Latest).await
+    );
 }

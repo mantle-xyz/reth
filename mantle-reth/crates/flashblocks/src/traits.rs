@@ -20,6 +20,10 @@ pub trait FlashblocksReceiver {
 /// Core API for accessing flashblock state and data.
 pub trait FlashblocksAPI {
     /// Retrieves the pending blocks.
+    ///
+    /// RPC readers must go through `EthApiExt::fresh_pending` or
+    /// `PendingStateOverrides::pending_execution_context`, which skip a preview that no
+    /// longer leads the canonical tip.
     fn get_pending_blocks(&self) -> Guard<Option<Arc<PendingBlocks>>>;
 
     /// Subscribes to flashblock updates.
