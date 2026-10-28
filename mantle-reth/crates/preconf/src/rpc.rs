@@ -170,7 +170,7 @@ impl PreconfRpcHandler {
             // matching the deadline branch's own timeout handling.
             Some(Ok(Err(err))) => {
                 if matches!(err, PreconfError::Timeout { .. }) {
-                    Ok(build_timeout_event(hash, preconf_timeout))
+                    Ok(timeout_reply(hash, preconf_timeout))
                 } else {
                     Err(preconf_error_to_rpc(&err))
                 }
@@ -190,7 +190,6 @@ impl PreconfRpcHandler {
             // resolution.
             None => {
                 debug!(target: "mantle::preconf::rpc", ?hash, ?preconf_timeout, "preconf deadline elapsed; resolving race");
-                metrics::counter!("preconf.api.timeout_total").increment(1);
 
                 // Every completion holds this lock from its decision through
                 // the send, so holding it means none is in flight and **the
@@ -214,7 +213,7 @@ impl PreconfRpcHandler {
                     // JSON-RPC error — same as the pre-deadline arm above.
                     Ok(Err(err)) => {
                         if matches!(err, PreconfError::Timeout { .. }) {
-                            Ok(build_timeout_event(hash, preconf_timeout))
+                            Ok(timeout_reply(hash, preconf_timeout))
                         } else {
                             Err(preconf_error_to_rpc(&err))
                         }
@@ -280,8 +279,22 @@ impl PreconfRpcHandler {
         // whatever did answered this client on the way out. Nothing left to do
         // either way.
         let _ = self.fifo.complete_failure(hash, timed_out).await;
-        Ok(build_timeout_event(*hash, preconf_timeout))
+        Ok(timeout_reply(*hash, preconf_timeout))
     }
+}
+
+/// The `Timeout` answer a client receives, counted once per answer.
+///
+/// `preconf.api.timeout_total` counts what clients were told, whichever path
+/// decided it: the RPC deadline, or dispatch giving up before apply because
+/// the deadline was too close. Counting where the deadline fires instead would
+/// miss the second and count a deadline whose race resolved to a receipt.
+fn timeout_reply(
+    hash: alloy_primitives::TxHash,
+    preconf_timeout: std::time::Duration,
+) -> PreconfTxEvent {
+    metrics::counter!("preconf.api.timeout_total").increment(1);
+    build_timeout_event(hash, preconf_timeout)
 }
 
 /// Construct the wire `Timeout` event returned to the client when the
