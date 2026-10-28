@@ -71,6 +71,8 @@ const COUNTERS: &[&str] = &[
     "flashblocks.slow_subscriber_dropped_total",
     "flashblocks.resume_before_archive_total",
     "flashblocks.superseded_slices_total",
+    // `Timeout` answers sent to clients, from the RPC deadline and from
+    // dispatch's pre-apply gate alike.
     "preconf.api.timeout_total",
     // The completion protocol was broken: an entry finished without a result
     // reaching its client. Should stay flat at zero.

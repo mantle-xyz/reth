@@ -136,7 +136,7 @@ things follow for configuration:
 
 ## Frame handling
 
-Text frames are forwarded as-is. Binary frames are sniffed — already-JSON, or
+Upstream, text frames are taken as they are. Binary frames are sniffed — already-JSON, or
 brotli to be decompressed — before being placed on the broadcast channel, so a
 compressing upstream works; `decode_binary_slice` in `subscriber.rs` carries the
 sniff rule and the reason dropping binary frames (as Base's proxy does) would
@@ -147,7 +147,13 @@ fails at the transport layer and causes the upstream connection to reconnect.
 A compressed message that fits the transport limit but decompresses beyond
 17 MiB is dropped without reconnecting. Neither path forwards oversized content.
 
-Downstream compression is separate and opt-in via `--enable-compression`.
+Downstream, **every slice goes out as a binary frame**, whatever frame type it
+arrived in. Without `--enable-compression` the frame carries the slice's JSON
+text byte-for-byte as UTF-8; with it, the same JSON brotli-compressed. Clients
+must read binary frames — a browser `WebSocket` hands them over as a `Blob` or
+`ArrayBuffer`, not a string — and, when compression is on, decompress them. The
+flashblocks consumer in `op-reth` accepts either frame type and either encoding,
+so it works behind the proxy with or without compression.
 
 ## The payload is opaque, with one exception
 

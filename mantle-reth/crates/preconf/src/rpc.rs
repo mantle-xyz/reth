@@ -170,7 +170,7 @@ impl PreconfRpcHandler {
             // matching the deadline branch's own timeout handling.
             Some(Ok(Err(err))) => {
                 if matches!(err, PreconfError::Timeout { .. }) {
-                    Ok(build_timeout_event(hash, preconf_timeout))
+                    Ok(timeout_reply(hash, preconf_timeout))
                 } else {
                     Err(preconf_error_to_rpc(&err))
                 }
@@ -190,7 +190,6 @@ impl PreconfRpcHandler {
             // resolution.
             None => {
                 debug!(target: "mantle::preconf::rpc", ?hash, ?preconf_timeout, "preconf deadline elapsed; resolving race");
-                metrics::counter!("preconf.api.timeout_total").increment(1);
 
                 // Every completion holds this lock from its decision through
                 // the send, so holding it means none is in flight and **the
@@ -214,7 +213,7 @@ impl PreconfRpcHandler {
                     // JSON-RPC error — same as the pre-deadline arm above.
                     Ok(Err(err)) => {
                         if matches!(err, PreconfError::Timeout { .. }) {
-                            Ok(build_timeout_event(hash, preconf_timeout))
+                            Ok(timeout_reply(hash, preconf_timeout))
                         } else {
                             Err(preconf_error_to_rpc(&err))
                         }
@@ -280,16 +279,22 @@ impl PreconfRpcHandler {
         // whatever did answered this client on the way out. Nothing left to do
         // either way.
         let _ = self.fifo.complete_failure(hash, timed_out).await;
-        Ok(build_timeout_event(*hash, preconf_timeout))
+        Ok(timeout_reply(*hash, preconf_timeout))
     }
 }
 
-/// Construct the wire `Timeout` event returned to the client when the
-/// preconf deadline expires without a committed apply.
-fn build_timeout_event(
+/// The `Timeout` answer a client receives, counted once per answer.
+///
+/// `preconf.api.timeout_total` counts what clients were told, whichever path
+/// decided it: the RPC deadline, or dispatch giving up before apply because
+/// the deadline was too close. Counting where the deadline fires instead would
+/// miss the second and count a deadline whose race resolved to a receipt. The
+/// count lives here so that no `Timeout` answer can be built without it.
+fn timeout_reply(
     hash: alloy_primitives::TxHash,
     preconf_timeout: std::time::Duration,
 ) -> PreconfTxEvent {
+    metrics::counter!("preconf.api.timeout_total").increment(1);
     PreconfTxEvent {
         tx_hash: hash,
         status: WireStatus::Timeout,
@@ -764,11 +769,20 @@ mod tests {
 
     /// A timeout means no EVM apply happened, so nothing but the tri-state
     /// `logs: null` may appear — the response stays byte-identical to op-geth's.
+    /// Each answer is counted once.
     #[test]
-    fn timeout_event_carries_no_receipt_fields() {
-        let event = build_timeout_event(
-            alloy_primitives::TxHash::from([1u8; 32]),
-            std::time::Duration::from_millis(500),
+    fn timeout_reply_carries_no_receipt_fields_and_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let event = metrics::with_local_recorder(&recorder, || {
+            timeout_reply(
+                alloy_primitives::TxHash::from([1u8; 32]),
+                std::time::Duration::from_millis(500),
+            )
+        });
+        assert!(
+            handle.render().lines().any(|l| l == "preconf_api_timeout_total 1"),
+            "every Timeout answer is counted"
         );
         assert!(event.receipt.logs.is_none());
         assert!(event.receipt.status.is_none());
