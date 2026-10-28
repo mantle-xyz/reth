@@ -4,12 +4,13 @@
 //! the node's canonical-state task does; the websocket subscriber is not
 //! started.
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use alloy_rpc_types_engine::PayloadId;
 
 use crate::consumer_helpers::{
-    FlashblockBuilder, base_slice, base_slice_builder, filler_deposit, l1_info_deposit,
-    launch_flashblocks_consumer, mine_canonical_block as mine,
+    FlashblockBuilder, LOGGER, base_slice, base_slice_builder, commit_submitted_block,
+    filler_deposit, l1_info_deposit, launch_flashblocks_consumer, mine_canonical_block as mine,
+    signed_call, submit_uncommitted_block,
 };
 
 /// Overlay spans blocks 1 to 3, then canonical advances to block 2 and is
@@ -302,5 +303,109 @@ async fn a_build_after_a_rejected_build_carries_only_its_own_transaction() {
         rebuilt.pending_transaction_count(),
         1,
         "the rebuilt overlay must hold only its own transaction",
+    );
+}
+
+/// Sends payload A for blocks 1 and 2 on top of the submitted but not yet
+/// canonical `block_1_hash`, then commits block 1 and delivers it.
+///
+/// A's block 1 carries a transfer canonical block 1 lacks, so reconciliation
+/// rebuilds A's block 2 on canonical block 1, where that block's transfer has a
+/// nonce too high to execute.
+macro_rules! deliver_a_block_payload_a_cannot_be_rebuilt_on {
+    ($harness:expr, $node:expr, $block_1_hash:expr) => {{
+        $harness
+            .send(
+                base_slice_builder(1)
+                    .transactions(vec![
+                        l1_info_deposit(1),
+                        signed_call(0, LOGGER, U256::from(1)).await,
+                    ])
+                    .build(),
+            )
+            .await;
+        $harness
+            .send(
+                base_slice_builder(2)
+                    .prev(1, 0)
+                    .parent_hash($block_1_hash)
+                    .transactions(vec![
+                        l1_info_deposit(2),
+                        signed_call(1, LOGGER, U256::from(1)).await,
+                    ])
+                    .build(),
+            )
+            .await;
+        let pending = $harness.pending().expect("payload A spans blocks 1 and 2");
+        assert_eq!((pending.earliest_block_number(), pending.latest_block_number()), (1, 2));
+        assert_eq!(pending.payload_id(), PayloadId::default(), "premise: the overlay is payload A");
+
+        let block_1 = commit_submitted_block!($node, $block_1_hash);
+        assert_eq!(
+            block_1.body().transactions.len(),
+            1,
+            "premise: canonical block 1 lacks the transfer"
+        );
+        $harness.send_canonical(block_1).await;
+    }};
+}
+
+/// A canonical block the overlay cannot be rebuilt on stops the overlay being
+/// served. Had the rebuild succeeded, payload A's block 2 would be served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_canonical_block_that_fails_to_reconcile_drops_the_preview() {
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let block_1_hash = submit_uncommitted_block!(node);
+
+    deliver_a_block_payload_a_cannot_be_rebuilt_on!(harness, node, block_1_hash);
+
+    assert!(harness.pending().is_none(), "a preview that failed to reconcile must not be served");
+}
+
+/// A failed reconciliation still advances the cache: payload B's block 2, cached
+/// while block 1 was unknown and built on the block 1 the chain has, is replayed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_canonical_block_that_fails_to_reconcile_drops_the_preview_and_replays_the_cache() {
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let payload_b = PayloadId::new([0xb; 8]);
+    let block_1_hash = submit_uncommitted_block!(node);
+
+    harness
+        .send(base_slice_builder(2).payload_id(payload_b).parent_hash(block_1_hash).build())
+        .await;
+    assert!(harness.pending().is_none(), "premise: block 2 waits in the cache for block 1");
+
+    deliver_a_block_payload_a_cannot_be_rebuilt_on!(harness, node, block_1_hash);
+
+    let pending = harness.pending().expect("the cached block 2 is replayed on canonical block 1");
+    assert_eq!(pending.earliest_block_number(), 2, "payload A's block 1 must not be served");
+    assert_eq!(pending.payload_id(), payload_b, "payload A's block 2 must not be served");
+}
+
+/// A reset drops the preview and the early-arrival cache: block 2's slice,
+/// cached until block 1 lands, is not replayed when it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_processor_reset_drops_the_preview_and_the_cache() {
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let payload_b = PayloadId::new([0xb; 8]);
+    let block_1_hash = submit_uncommitted_block!(node);
+
+    // Block 2's parent, block 1, is not canonical yet: the slice is cached.
+    harness
+        .send(base_slice_builder(2).payload_id(payload_b).parent_hash(block_1_hash).build())
+        .await;
+    assert!(harness.pending().is_none(), "premise: block 2 waits in the cache for block 1");
+    // An unrelated preview is being served.
+    harness.send(base_slice(1)).await;
+    assert!(harness.pending().is_some(), "premise: a preview is being served");
+
+    harness.reset_after_panic().await;
+    assert!(harness.pending().is_none(), "the reset must drop the preview");
+
+    let block_1 = commit_submitted_block!(node, block_1_hash);
+    harness.send_canonical(block_1).await;
+    assert!(
+        harness.pending().is_none_or(|p| p.payload_id() != payload_b),
+        "the cache was cleared, so block 2 must not be replayed"
     );
 }

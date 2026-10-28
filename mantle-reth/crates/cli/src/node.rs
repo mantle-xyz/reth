@@ -610,7 +610,7 @@ where
                     subscriber.start();
 
                     let state_for_canonical = Arc::clone(&state);
-                    tokio::spawn(mantle_reth_flashblocks::forward_canonical_state(
+                    let forwarder = mantle_reth_flashblocks::forward_canonical_state(
                         "flashblocks_overlay",
                         ctx.node().provider().subscribe_to_canonical_state(),
                         move |notification| {
@@ -635,7 +635,15 @@ where
                                     .on_canonical_block_received(block.as_ref().clone());
                             }
                         },
-                    ));
+                    );
+                    // Non-critical on purpose: losing the canonical feed
+                    // degrades the overlay, it must not stop the node.
+                    ctx.node().task_executor().spawn_task(
+                        mantle_reth_flashblocks::run_canonical_forwarder(
+                            "flashblocks_overlay",
+                            forwarder,
+                        ),
+                    );
 
                     let eth_api_ext = FlashblocksEthApiExt::new(
                         ctx.registry.eth_api().clone(),

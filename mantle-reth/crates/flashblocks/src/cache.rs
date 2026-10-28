@@ -17,17 +17,14 @@ pub const DEFAULT_MAX_CACHE_AHEAD_BLOCKS: u64 = 5;
 /// anything the overlay can use.
 pub const MAX_CACHE_AHEAD_BLOCKS: u64 = 256;
 
-/// Buffers flashblocks that cannot be applied to the overlay yet. Two paths in
-/// `StateProcessor::apply_flashblock` feed it: slices whose canonical block has
-/// not landed ([`ProviderError::MissingCanonicalHeader`]), and slices that
-/// cannot extend the tracked overlay ([`StateProcessorError::MissingFirstFlashblock`],
-/// [`StateProcessorError::NonConsecutiveBlock`]) but are a valid restart point.
-/// Once the gap closes, the caller drains the corresponding entries and feeds
-/// them through normal execution.
-///
-/// That second path is what [`FlashblockCache::has_flashblock`] exists for:
-/// a slice with `index > 0` is worth keeping only when its predecessor is
-/// already buffered, otherwise a replay would start mid-block.
+/// Buffers flashblocks that cannot be applied to the overlay yet. Every entry
+/// goes in through [`FlashblockCache::insert_resumable`], from three paths in
+/// `StateProcessor::apply_flashblock`: slices whose canonical block has not
+/// landed ([`ProviderError::MissingCanonicalHeader`]), slices that cannot extend
+/// the tracked overlay ([`StateProcessorError::MissingFirstFlashblock`],
+/// [`StateProcessorError::NonConsecutiveBlock`]), and slices past the overlay's
+/// leading depth. Once the gap closes, the caller drains the corresponding
+/// entries and feeds them through normal execution.
 ///
 /// [`ProviderError::MissingCanonicalHeader`]: crate::ProviderError::MissingCanonicalHeader
 /// [`StateProcessorError::MissingFirstFlashblock`]: crate::StateProcessorError::MissingFirstFlashblock
@@ -66,7 +63,8 @@ impl FlashblockCache {
         }
     }
 
-    /// Inserts a flashblock into the cache.
+    /// Inserts a flashblock into the cache. The processor uses
+    /// [`Self::insert_resumable`] instead, which adds the resumability check.
     ///
     /// Slices already held for this height under a different payload id are
     /// dropped first: they belong to a build that was replaced, and draining
@@ -99,6 +97,17 @@ impl FlashblockCache {
         true
     }
 
+    /// Caches the flashblock only if the consumer could resume from it: index 0,
+    /// or its predecessor is already held. A slice without its predecessor could
+    /// never be replayed, so keeping it would only waste a slot.
+    ///
+    /// Returns what [`Self::insert`] returns, or `false` if not resumable.
+    pub fn insert_resumable(&mut self, flashblock: MantleFlashblockPayload) -> bool {
+        let resumable = flashblock.index == 0 ||
+            self.has_flashblock(flashblock.metadata.block_number, flashblock.index - 1);
+        resumable && self.insert(flashblock)
+    }
+
     /// Drains all cached flashblocks for the given block number, returning them
     /// sorted by index. Returns an empty `Vec` when nothing is cached.
     pub fn drain(&mut self, block_number: BlockNumber) -> Vec<MantleFlashblockPayload> {
@@ -115,6 +124,12 @@ impl FlashblockCache {
     pub fn update_canonical(&mut self, block_number: BlockNumber) {
         self.latest_canonical = Some(block_number);
         self.entries.retain(|&bn, _| bn > block_number);
+    }
+
+    /// Drops every cached slice. The canonical anchor, and so the cacheable
+    /// window, is kept.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 
     /// Returns the number of distinct block numbers currently cached.
@@ -308,5 +323,41 @@ mod tests {
         assert_eq!(drained[0].index, 0);
         assert_eq!(drained[1].index, 1);
         assert_eq!(drained[2].index, 2);
+    }
+
+    #[test]
+    fn a_continuation_without_its_predecessor_is_not_cached() {
+        let mut cache = cache_at(10);
+        assert!(!cache.insert_resumable(make_flashblock(11, 2)));
+        assert!(!cache.has_flashblock(11, 2));
+    }
+
+    #[test]
+    fn a_continuation_after_its_predecessor_is_cached() {
+        let mut cache = cache_at(10);
+        assert!(cache.insert_resumable(make_flashblock(11, 0)));
+        assert!(cache.insert_resumable(make_flashblock(11, 1)));
+        assert!(cache.insert_resumable(make_flashblock(11, 2)));
+    }
+
+    #[test]
+    fn clear_drops_every_slice_but_keeps_the_window() {
+        let mut cache = cache_at(10);
+        assert!(cache.insert(make_flashblock(11, 0)));
+        assert!(cache.insert(make_flashblock(12, 0)));
+
+        cache.clear();
+
+        assert!(!cache.has_flashblock(11, 0));
+        assert!(!cache.has_flashblock(12, 0));
+        assert!(cache.is_empty());
+        assert!(cache.is_cacheable(16), "the window is still anchored at canonical 10");
+        assert!(!cache.is_cacheable(17));
+    }
+
+    #[test]
+    fn a_base_slice_is_always_resumable() {
+        let mut cache = cache_at(10);
+        assert!(cache.insert_resumable(make_flashblock(11, 0)));
     }
 }

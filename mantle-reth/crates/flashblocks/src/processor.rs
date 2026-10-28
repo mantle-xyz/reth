@@ -2,11 +2,13 @@
 
 use std::{
     collections::BTreeMap,
+    future::Future,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alloy_consensus::{
@@ -18,6 +20,7 @@ use alloy_network::TransactionResponse;
 use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::state::StateOverride;
 use arc_swap::ArcSwapOption;
+use futures::FutureExt;
 use mantle_reth_flashblocks_types::{FlashblockId, MantleFlashblockPayload};
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
@@ -39,6 +42,7 @@ use crate::{
     AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks,
     PendingBlocksBuilder, PendingStateBuilder, ProtocolError, ProviderError, Result,
     StateProcessorError,
+    canonical::panic_message,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, IncomingBuild,
@@ -53,6 +57,30 @@ type PendingExecutionDb = State<StateProviderDatabase<StateProviderBox>>;
 struct LivePendingState {
     db: PendingExecutionDb,
     state_overrides: StateOverride,
+}
+
+/// How long the processor waits after a panic before taking updates again.
+pub const PROCESSOR_RESTART_DELAY: Duration = Duration::from_secs(2);
+
+/// Runs `run` until it returns, running it again after each panic.
+///
+/// A panic awaits `on_restart` with the panic's message, then waits `delay`. There is no cap on
+/// restarts. The panicked future is dropped before `on_restart` runs, so any lock it held
+/// is already released.
+pub(crate) async fn supervise<F, Fut, R, RFut>(mut run: F, mut on_restart: R, delay: Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+    R: FnMut(String) -> RFut,
+    RFut: Future<Output = ()>,
+{
+    loop {
+        match AssertUnwindSafe(run()).catch_unwind().await {
+            Ok(()) => return,
+            Err(panic) => on_restart(panic_message(&*panic).to_owned()).await,
+        }
+        tokio::time::sleep(delay).await;
+    }
 }
 
 /// Messages consumed by the state processor.
@@ -71,28 +99,35 @@ pub enum StateUpdate {
     Flashblock(MantleFlashblockPayload, Option<oneshot::Sender<()>>),
 }
 
-/// The consuming end of the update queue, paired with the depth its producers keep.
+/// The consuming end of the update queue, paired with the depth counters its
+/// producers keep (all updates, and slices alone).
 ///
-/// The two travel together: taking an update is what makes the depth drop, so an
-/// owner that held only the receiver could not keep the count honest.
+/// They travel together: taking an update is what makes the counters drop, so an
+/// owner that held only the receiver could not keep them honest.
 #[derive(Debug)]
 pub struct QueueConsumer {
     rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
     depth: Arc<AtomicUsize>,
+    slice_depth: Arc<AtomicUsize>,
 }
 
 impl QueueConsumer {
-    /// Pairs a receiver with the depth counter its senders increment.
+    /// Pairs a receiver with the counters its senders increment: all updates, and
+    /// slices alone.
     pub const fn new(
         rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
         depth: Arc<AtomicUsize>,
+        slice_depth: Arc<AtomicUsize>,
     ) -> Self {
-        Self { rx, depth }
+        Self { rx, depth, slice_depth }
     }
 
     /// Takes the next update, reporting how many remain queued behind it.
     async fn recv(&self) -> Option<(StateUpdate, usize)> {
         let update = self.rx.lock().await.recv().await?;
+        if matches!(update, StateUpdate::Flashblock(..)) {
+            self.slice_depth.fetch_sub(1, Ordering::Relaxed);
+        }
         let waiting = self.depth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
         Some((update, waiting))
     }
@@ -202,6 +237,23 @@ where
         }
     }
 
+    /// Forgets everything a panicked run may have left half-applied: the
+    /// served preview, the live execution state and the cached slices.
+    ///
+    /// The update being processed when the panic hit is lost; the rest of the
+    /// queue is untouched.
+    pub async fn reset_after_panic(&self, panic: &str) {
+        self.pending_blocks.swap(None);
+        self.clear_live_state();
+        self.cache.lock().await.clear();
+        Metrics::processor_restarts().increment(1);
+        error!(
+            message = "flashblocks state processor panicked; cleared the preview and the slice cache, restarting",
+            panic = %panic,
+            restart_in = ?PROCESSOR_RESTART_DELAY,
+        );
+    }
+
     /// Processes updates from the queue until the channel closes.
     pub async fn start(&self) {
         while let Some((update, waiting)) = self.queue.recv().await {
@@ -215,43 +267,32 @@ where
             match update {
                 StateUpdate::Canonical(block, ack) => {
                     debug!(message = "processing canonical block", block_number = block.number);
-                    let reconciled =
-                        match self.process_canonical_block(prev_pending_blocks, &block, tip) {
-                            Err(
-                                e @ StateProcessorError::Protocol(
-                                    ProtocolError::ParentHashMismatch { .. },
-                                ),
-                            ) => {
-                                self.drop_on_parent_hash_mismatch(&e);
-                                Ok(None)
-                            }
-                            other => other,
-                        };
-                    match reconciled {
-                        Ok(new_pending_blocks) => {
-                            self.pending_blocks.swap(new_pending_blocks);
-
-                            let mut cache = self.cache.lock().await;
-                            cache.update_canonical(block.number);
-                            let cached = cache.drain(block.number + 1);
-                            drop(cache);
-
-                            if !cached.is_empty() {
-                                debug!(
-                                    message = "replaying cached flashblocks after canonical block",
-                                    canonical_block = block.number,
-                                    cached_count = cached.len(),
-                                );
-                                for flashblock in cached {
-                                    let fb_prev = self.load_pending_or_drop_stranded(tip);
-                                    self.apply_flashblock(fb_prev, flashblock, tip).await;
-                                }
-                            }
+                    let next = match self.process_canonical_block(prev_pending_blocks, &block, tip)
+                    {
+                        Ok(pending) => pending,
+                        Err(
+                            e @ StateProcessorError::Protocol(ProtocolError::ParentHashMismatch {
+                                ..
+                            }),
+                        ) => {
+                            self.drop_on_parent_hash_mismatch(&e);
+                            None
                         }
                         Err(e) => {
-                            error!(message = "could not process canonical block", error = %e);
+                            Metrics::canonical_reconcile_error().increment(1);
+                            error!(
+                                message = "could not process canonical block; dropping the preview",
+                                error = %e,
+                            );
+                            None
                         }
+                    };
+                    if next.is_none() {
+                        // An empty preview has no live state behind it.
+                        self.clear_live_state();
                     }
+                    self.pending_blocks.swap(next);
+                    self.finish_canonical(block.number, tip).await;
                     if let Some(ack) = ack {
                         let _ = ack.send(());
                     }
@@ -268,6 +309,29 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// Advances the cache to canonical `block_number` and replays what it held for
+    /// the next block, whether or not reconciliation succeeded.
+    async fn finish_canonical(&self, block_number: BlockNumber, tip: Option<BlockNumber>) {
+        let mut cache = self.cache.lock().await;
+        cache.update_canonical(block_number);
+        let cached = cache.drain(block_number + 1);
+        // `apply_flashblock` takes this lock again and it is not reentrant.
+        drop(cache);
+
+        if cached.is_empty() {
+            return;
+        }
+        debug!(
+            message = "replaying cached flashblocks after canonical block",
+            canonical_block = block_number,
+            cached_count = cached.len(),
+        );
+        for flashblock in cached {
+            let prev = self.load_pending_or_drop_stranded(tip);
+            self.apply_flashblock(prev, flashblock, tip).await;
         }
     }
 
@@ -496,9 +560,7 @@ where
             let block_number = flashblock.metadata.block_number;
             let index = flashblock.index;
             let mut cache = self.cache.lock().await;
-            let resumable = index == 0 || cache.has_flashblock(block_number, index - 1);
-            if resumable && cache.is_cacheable(block_number) {
-                cache.insert(flashblock);
+            if cache.is_cacheable(block_number) && cache.insert_resumable(flashblock) {
                 debug!(
                     message = "cached flashblock beyond the overlay leading depth",
                     block_number, index,
@@ -508,8 +570,8 @@ where
             Metrics::leading_depth_exceeded().increment(1);
             warn!(
                 message = "flashblock leads canonical beyond the configured depth, dropping",
-                block_number = flashblock.metadata.block_number,
-                flashblock_index = flashblock.index,
+                block_number,
+                flashblock_index = index,
                 max_leading_depth = self.max_leading_depth,
             );
             return;
@@ -558,7 +620,7 @@ where
                             Err(StateProcessorError::Provider(
                                 ProviderError::MissingCanonicalHeader { .. },
                             )) => {
-                                self.cache.lock().await.insert(flashblock);
+                                self.cache.lock().await.insert_resumable(flashblock);
                             }
                             Err(
                                 e @ StateProcessorError::Protocol(
@@ -584,7 +646,7 @@ where
                     StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
                     }) => {
-                        let inserted = self.cache.lock().await.insert(flashblock);
+                        let inserted = self.cache.lock().await.insert_resumable(flashblock);
                         if inserted {
                             debug!(message = "cached flashblock pending canonical block", error = %e);
                             return;
@@ -597,33 +659,24 @@ where
                         // it instead of dropping it; higher indices are only useful
                         // once their predecessor is cached.
                         let mut cache = self.cache.lock().await;
-                        let resumable = flashblock.index == 0 ||
-                            cache.has_flashblock(
-                                flashblock.metadata.block_number,
-                                flashblock.index - 1,
+                        let block_number = flashblock.metadata.block_number;
+                        let index = flashblock.index;
+                        if cache.insert_resumable(flashblock) {
+                            debug!(
+                                message = "cached flashblock pending its predecessor",
+                                block_number, index
                             );
-                        if resumable {
-                            let block_number = flashblock.metadata.block_number;
-                            let index = flashblock.index;
-                            if cache.insert(flashblock) {
-                                debug!(
-                                    message = "cached flashblock pending its predecessor",
-                                    block_number, index
-                                );
-                            }
                         }
                         return;
                     }
                     _ => {}
                 }
 
-                if !matches!(
-                    e,
-                    StateProcessorError::Provider(ProviderError::MissingCanonicalHeader { .. })
-                ) {
-                    error!(message = "could not process flashblock", error = %e);
-                    Metrics::block_processing_error().increment(1);
-                }
+                // Fail closed: an overlay that could not take this slice is stale.
+                self.clear_live_state();
+                self.pending_blocks.swap(None);
+                error!(message = "could not process flashblock, dropping the overlay", error = %e);
+                Metrics::block_processing_error().increment(1);
             }
         }
     }
@@ -688,7 +741,7 @@ where
                 Metrics::pending_clear_reorg().increment(1);
 
                 flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
-                self.build_pending_state(None, &flashblocks)
+                self.build_pending_state(None, &flashblocks, false)
             }
             ReconciliationStrategy::DepthLimitExceeded { depth, max_depth } => {
                 debug!(
@@ -698,7 +751,7 @@ where
                 );
 
                 flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
-                self.build_pending_state(None, &flashblocks)
+                self.build_pending_state(None, &flashblocks, false)
             }
             ReconciliationStrategy::Continue => {
                 debug!(
@@ -711,7 +764,7 @@ where
                 );
                 // Deliberately not retained: dropping older flashblocks would lose
                 // the `earliest` block number that the trailing-depth guard measures.
-                self.build_pending_state(prev_pending_blocks, &flashblocks)
+                self.build_pending_state(prev_pending_blocks, &flashblocks, false)
             }
             ReconciliationStrategy::NoPendingState => {
                 debug!(message = "no pending state to update with canonical block, skipping");
@@ -729,7 +782,7 @@ where
             Some(pb) => pb,
             None => {
                 if flashblock.index == 0 {
-                    return self.build_pending_state(None, std::slice::from_ref(flashblock));
+                    return self.build_pending_state(None, std::slice::from_ref(flashblock), true);
                 }
 
                 return Err(StateProcessorError::MissingFirstFlashblock);
@@ -832,7 +885,7 @@ where
                 flashblocks
                     .retain(|fb| fb.metadata.block_number < flashblock.metadata.block_number);
                 flashblocks.push(flashblock.clone());
-                self.build_pending_state(None, &flashblocks)
+                self.build_pending_state(None, &flashblocks, true)
             }
             SequenceValidationResult::ForeignBuild => {
                 // Its own counter, not `unexpected_block_order`: the stream is
@@ -918,14 +971,9 @@ where
         // Taken through a temporary guard: the rebuild in the fallback below writes the
         // live state back, so holding the guard across it deadlocks this thread.
         //
-        // Taken, and on every failure below **not put back**. That is the
-        // point: each fallible step from here owns the `db`, so a failure
-        // leaves it holding half a transaction's writes. Returning that to the
-        // slot would hand the next slice a state no block ever had. The cost
-        // of dropping it is one full rebuild — `build_pending_state` replays
-        // the overlay from the canonical parent, the same path a cold start
-        // takes — and `state_overrides` survives it because replaying the same
-        // slices yields the same values (last writer wins per address/slot).
+        // On every failure below the `db` is **not put back**: it may hold half a
+        // transaction's writes. The caller drops the overlay on failure, so nothing
+        // would read it anyway.
         let live_state = self.lock_live_state().take();
         let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
@@ -936,7 +984,11 @@ where
             );
             let mut flashblocks = prev_pending_blocks.get_flashblocks();
             flashblocks.push(flashblock.clone());
-            return self.build_pending_state(Some(Arc::clone(prev_pending_blocks)), &flashblocks);
+            return self.build_pending_state(
+                Some(Arc::clone(prev_pending_blocks)),
+                &flashblocks,
+                true,
+            );
         };
 
         let latest_header = prev_pending_blocks.latest_header();
@@ -1020,6 +1072,12 @@ where
         }
 
         let latest_block_cumulative_gas_used = pending_state_builder.cumulative_gas_used();
+        check_execution_gas(
+            flashblock.metadata.block_number,
+            flashblock.index,
+            latest_block_cumulative_gas_used,
+            flashblock.diff.gas_used,
+        );
         let latest_block_next_log_index = pending_state_builder.next_log_index();
         let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
         pending_blocks_builder.with_latest_block_context(
@@ -1054,14 +1112,9 @@ where
         // Taken through a temporary guard: the rebuild in the fallback below writes the
         // live state back, so holding the guard across it deadlocks this thread.
         //
-        // Taken, and on every failure below **not put back**. That is the
-        // point: each fallible step from here owns the `db`, so a failure
-        // leaves it holding half a transaction's writes. Returning that to the
-        // slot would hand the next slice a state no block ever had. The cost
-        // of dropping it is one full rebuild — `build_pending_state` replays
-        // the overlay from the canonical parent, the same path a cold start
-        // takes — and `state_overrides` survives it because replaying the same
-        // slices yields the same values (last writer wins per address/slot).
+        // On every failure below the `db` is **not put back**: it may hold half a
+        // transaction's writes. The caller drops the overlay on failure, so nothing
+        // would read it anyway.
         let live_state = self.lock_live_state().take();
         let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
@@ -1072,7 +1125,11 @@ where
             );
             let mut flashblocks = prev_pending_blocks.get_flashblocks();
             flashblocks.push(flashblock.clone());
-            return self.build_pending_state(Some(Arc::clone(prev_pending_blocks)), &flashblocks);
+            return self.build_pending_state(
+                Some(Arc::clone(prev_pending_blocks)),
+                &flashblocks,
+                true,
+            );
         };
 
         let previous_header = prev_pending_blocks.latest_header();
@@ -1138,6 +1195,12 @@ where
         }
 
         let latest_block_cumulative_gas_used = pending_state_builder.cumulative_gas_used();
+        check_execution_gas(
+            flashblock.metadata.block_number,
+            flashblock.index,
+            latest_block_cumulative_gas_used,
+            flashblock.diff.gas_used,
+        );
         let latest_block_next_log_index = pending_state_builder.next_log_index();
         let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
         pending_blocks_builder.with_latest_block_context(
@@ -1157,6 +1220,7 @@ where
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblocks: &[MantleFlashblockPayload],
+        compare_reported_gas: bool,
     ) -> Result<Option<Arc<PendingBlocks>>> {
         let mut flashblocks_per_block =
             BTreeMap::<BlockNumber, Vec<MantleFlashblockPayload>>::new();
@@ -1193,8 +1257,10 @@ where
                 pending_blocks.get_state_overrides().unwrap_or_default()
             });
 
+        let last_block_number =
+            *flashblocks_per_block.keys().next_back().unwrap_or(&earliest_block_number);
         let mut total_transaction_count = 0usize;
-        for (_block_number, flashblocks) in flashblocks_per_block {
+        for (block_number, flashblocks) in flashblocks_per_block {
             let assembled = BlockAssembler::assemble(&flashblocks)?;
             self.ensure_canonical_parent(assembled.base.block_number, assembled.base.parent_hash)?;
             let latest_flashblock_tx_count =
@@ -1263,6 +1329,18 @@ where
                 )?;
             }
 
+            if compare_reported_gas &&
+                block_number == last_block_number &&
+                let Some(last) = flashblocks.last()
+            {
+                check_execution_gas(
+                    block_number,
+                    last.index,
+                    pending_state_builder.cumulative_gas_used(),
+                    last.diff.gas_used,
+                );
+            }
+
             let latest_flashblock_tx_start = total_transaction_count
                 .saturating_add(latest_block_transaction_count)
                 .saturating_sub(latest_flashblock_tx_count);
@@ -1281,6 +1359,22 @@ where
         }
 
         self.publish_pending_blocks(pending_blocks_builder, db, state_overrides)
+    }
+}
+
+/// Counts and warns when the gas the overlay executed for a block differs from
+/// the block-cumulative `gas_used` the slice reported. Never drops the overlay:
+/// it serves the local execution either way.
+fn check_execution_gas(block_number: BlockNumber, index: u64, local: u64, reported: u64) {
+    if local != reported {
+        Metrics::execution_gas_mismatch().increment(1);
+        warn!(
+            message = "executed block gas differs from the gas the slice reported",
+            block = %block_number,
+            index = %index,
+            local_gas_used = local,
+            reported_gas_used = reported,
+        );
     }
 }
 
@@ -1349,5 +1443,57 @@ impl<Client> StateProcessor<Client> {
         pending_blocks_builder.with_transaction_result(tx_hash, executed_transaction.result);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    use super::*;
+
+    const SERIES: &str = "flashblocks_consumer_execution_gas_mismatch_total";
+
+    fn mismatch_count(run: impl FnOnce()) -> Option<String> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, run);
+        handle.render().lines().find(|l| l.starts_with(SERIES)).map(str::to_owned)
+    }
+
+    #[test]
+    fn equal_gas_is_not_counted() {
+        assert_eq!(mismatch_count(|| check_execution_gas(7, 2, 21_000, 21_000)), None);
+    }
+
+    #[test]
+    fn differing_gas_is_counted_once() {
+        let line = mismatch_count(|| check_execution_gas(7, 2, 21_000, 42_000));
+        assert_eq!(line.as_deref(), Some(&*format!("{SERIES} 1")));
+    }
+
+    #[tokio::test]
+    async fn supervise_restarts_after_a_panic_and_stops_on_return() {
+        let runs = AtomicUsize::new(0);
+        let restarts = AtomicUsize::new(0);
+
+        supervise(
+            || {
+                let run = runs.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert!(run != 0, "first run panics");
+                }
+            },
+            |panic| {
+                restarts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(panic, "first run panics");
+                async {}
+            },
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
     }
 }

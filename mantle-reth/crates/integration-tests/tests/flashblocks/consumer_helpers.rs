@@ -388,6 +388,11 @@ impl<P: reth_provider::BlockHashReader> FlashblocksHarness<P> {
             .expect("canonical block processing should be acknowledged");
     }
 
+    /// Resets the processor as its supervisor does after a panic.
+    pub async fn reset_after_panic(&self) {
+        self.state.reset_processor_after_panic_for_testing("test panic").await;
+    }
+
     /// Current pending snapshot, if any.
     pub fn pending(&self) -> Option<Arc<PendingBlocks>> {
         self.state.get_pending_blocks().clone()

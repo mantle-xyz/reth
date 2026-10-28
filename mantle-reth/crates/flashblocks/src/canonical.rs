@@ -17,12 +17,15 @@
 //!
 //! [`CanonStateSubscriptions::subscribe_to_canonical_state`]: reth_chain_state::CanonStateSubscriptions::subscribe_to_canonical_state
 
-use std::time::Instant;
+use std::{any::Any, future::Future, panic::AssertUnwindSafe, time::Instant};
 
+use futures::FutureExt;
 use reth_chain_state::CanonStateNotification;
 use reth_primitives_traits::NodePrimitives;
 use tokio::sync::broadcast::{Receiver, error::RecvError};
-use tracing::warn;
+use tracing::{error, warn};
+
+use crate::Metrics;
 
 /// Counts notifications the broadcast dropped before `subscriber` read them.
 ///
@@ -40,9 +43,7 @@ fn record_gap(subscriber: &'static str, skipped: u64) {
 }
 
 /// Hands every canonical-state notification to `on_notification` until the
-/// sender is dropped.
-///
-/// Returns only when the channel closes, which happens at node shutdown.
+/// channel closes, then returns.
 pub async fn forward_canonical_state<N, F>(
     subscriber: &'static str,
     mut receiver: Receiver<CanonStateNotification<N>>,
@@ -68,6 +69,44 @@ pub async fn forward_canonical_state<N, F>(
             Err(RecvError::Closed) => return,
         }
     }
+}
+
+/// Runs `forwarder`, catching a panic. Every exit is logged as an error and
+/// counted in `flashblocks.consumer.canonical_forwarder_exited_total` with
+/// `reason` `panic` or `closed`; the forwarder is not restarted. The executor
+/// drops it on shutdown, so `closed` means the feed was lost on a running node.
+pub async fn run_canonical_forwarder<F>(subscriber: &'static str, forwarder: F)
+where
+    F: Future<Output = ()>,
+{
+    match AssertUnwindSafe(forwarder).catch_unwind().await {
+        Ok(()) => {
+            Metrics::canonical_forwarder_exited("closed");
+            error!(
+                target: "mantle::flashblocks::canonical",
+                subscriber,
+                "canonical state notification channel closed; forwarder stopped"
+            );
+        }
+        Err(panic) => {
+            Metrics::canonical_forwarder_exited("panic");
+            error!(
+                target: "mantle::flashblocks::canonical",
+                subscriber,
+                panic = panic_message(&*panic),
+                "canonical state forwarder panicked and stopped; it is not restarted"
+            );
+        }
+    }
+}
+
+/// The text of a caught panic payload.
+pub(crate) fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
 }
 
 /// Waits for the first notification `matches` accepts, or `None` once the
@@ -103,6 +142,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use reth_execution_types::Chain;
     use reth_optimism_primitives::OpPrimitives;
     use tokio::sync::broadcast;
@@ -150,6 +190,40 @@ mod tests {
             delivered.load(Ordering::SeqCst),
             2,
             "the two notifications still in the channel have to be delivered after the gap",
+        );
+    }
+
+    fn forwarder_exits(forwarder: impl Future<Output = ()>) -> Option<String> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(run_canonical_forwarder("test", forwarder));
+        });
+        handle
+            .render()
+            .lines()
+            .find(|l| l.starts_with("flashblocks_consumer_canonical_forwarder_exited_total"))
+            .map(str::to_owned)
+    }
+
+    /// A panicking forwarder ends quietly for its caller and is counted.
+    #[test]
+    fn a_panicking_forwarder_is_caught_and_counted() {
+        let line = forwarder_exits(async { panic!("forwarder broke") });
+        assert_eq!(
+            line.as_deref(),
+            Some("flashblocks_consumer_canonical_forwarder_exited_total{reason=\"panic\"} 1")
+        );
+    }
+
+    /// A forwarder that returns is counted as `closed`.
+    #[test]
+    fn a_returning_forwarder_is_counted_as_closed() {
+        let line = forwarder_exits(async {});
+        assert_eq!(
+            line.as_deref(),
+            Some("flashblocks_consumer_canonical_forwarder_exited_total{reason=\"closed\"} 1")
         );
     }
 
