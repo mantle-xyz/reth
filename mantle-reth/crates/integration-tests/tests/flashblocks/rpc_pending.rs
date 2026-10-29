@@ -1729,6 +1729,51 @@ async fn send_raw_transaction_sync_ignores_a_preview_receipt_the_tip_has_passed(
     assert!(error.message().contains("wasn't confirmed"), "unexpected error: {error}");
 }
 
+/// A preview broadcast while `eth_sendRawTransactionSync` waits is held to the
+/// same rule as the lookup right after sending: a receipt in a block the
+/// canonical tip has reached is not an answer, even though the new preview
+/// still leads the tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_raw_transaction_sync_waiting_ignores_a_preview_receipt_the_tip_has_passed() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw = signed_call(0, LOGGER, VALUE).await;
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), raw.clone()])
+                .build(),
+        )
+        .await;
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0).prev(1, 0).transactions(vec![l1_info_deposit(2)]).build(),
+        )
+        .await;
+
+    // Canonical block 1 holds only the deposit; the consumer is not told about it.
+    assert_eq!(mine_canonical_block!(node).number, 1);
+
+    let announce = async {
+        // Assumed to land after the call's own post-send lookup, so the broadcast is
+        // what is judged. If it landed first, the lookup alone would reject the receipt
+        // and this test would pass without reaching the waiting branch.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        harness.send(FlashblockBuilder::new(2, 1).prev(2, 0).build()).await;
+        let pending = harness.pending().expect("the slice extends the preview");
+        assert_eq!((pending.earliest_block_number(), pending.latest_block_number()), (1, 2));
+        assert!(pending.get_receipt(keccak256(&raw)).is_some(), "the preview still holds block 1");
+    };
+    let (result, ()) =
+        tokio::join!(api.send_raw_transaction_sync(raw.clone(), Some(1_000)), announce);
+
+    let error = result.expect_err("the broadcast preview's block 1 is behind the tip");
+    assert!(error.message().contains("wasn't confirmed"), "unexpected error: {error}");
+}
+
 /// Opens an overlay at block 1 whose user transaction calls [`SETTER`], so the
 /// overlay — and only the overlay — holds [`SETTER_SLOT`].
 macro_rules! overlay_with_storage_write {
