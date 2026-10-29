@@ -184,4 +184,7 @@ reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-optimism-chainspec = { workspace = true, features = ["superchain-configs"] }
 reth-optimism-primitives.workspace = true
 alloy-signer.workspace = true
+# `TransactionConditional` — named by a test pool-tx wrapper's
+# `MaybeConditionalTransaction` impl.
+alloy-rpc-types-eth.workspace = true
 alloy-signer-local.workspace = true

@@ -181,6 +181,7 @@ impl PreconfRpcHandler {
             // Log loudly — no healthy path drops one — and fail only ourselves.
             Some(Err(_recv_err)) => {
                 warn!(target: "mantle::preconf::rpc", ?hash, "responder dropped before send");
+                metrics::counter!("preconf.api.no_result_total").increment(1);
                 let err = PreconfError::Internal("responder dropped before send".to_string());
                 Err(preconf_error_to_rpc(&err))
             }

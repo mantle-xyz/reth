@@ -768,7 +768,9 @@ where
             .is_pending()
             .then(|| {
                 self.pending_overrides.as_ref().and_then(|overlay| {
-                    overlay.pending_execution_context(&|| self.provider().best_block_number().ok())
+                    overlay
+                        .pending_execution_context(&|| self.provider().best_block_number().ok())
+                        .inspect(|_| Metrics::rpc_estimate_total_fee().increment(1))
                 })
             })
             .flatten();
@@ -961,8 +963,9 @@ where
         }
         let context = if block_number.is_some_and(|block| block.is_pending()) {
             self.pending_overrides.as_ref().and_then(|overlay| {
-                Metrics::rpc_simulate_v1().increment(1);
-                overlay.pending_execution_context(&|| self.provider().best_block_number().ok())
+                overlay
+                    .pending_execution_context(&|| self.provider().best_block_number().ok())
+                    .inspect(|_| Metrics::rpc_simulate_v1().increment(1))
             })
         } else {
             None

@@ -304,7 +304,7 @@ where
         if number.is_pending() {
             Metrics::rpc_get_block_by_number().increment(1);
             if let Some((pending, _)) = self.fresh_pending() {
-                return Ok(serde_json::to_value(pending.get_latest_block(full)).ok());
+                return to_value(pending.get_latest_block(full)).map(Some);
             }
             // No fresh overlay: fall through so the standard implementation serves `pending`.
         }

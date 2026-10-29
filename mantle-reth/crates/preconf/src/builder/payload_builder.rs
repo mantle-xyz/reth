@@ -1314,6 +1314,10 @@ where
     let interop = tx.interop_deadline();
     let tx_da_size = tx.estimated_da_size();
     let tx_hash = *tx.hash();
+    // Pool wrappers may override the tip, so read it before unwrapping.
+    let miner_fee = tx.effective_tip_per_gas(constraints.base_fee).expect(
+        "selected pool transaction must have a valid effective miner tip at the block base fee",
+    );
     let tx = tx.into_consensus();
     let tx_uncompressed_size = tx.encode_2718_len() as u64;
 
@@ -1420,9 +1424,6 @@ where
     // Recorded only now: a transaction the executor refused contributes no
     // bytes, while a revert or halt still occupies its RLP item in the block.
     info.block_size.record_transaction(tx_rlp_length, sdm_refund_possible);
-    let miner_fee = tx
-        .effective_tip_per_gas(constraints.base_fee)
-        .expect("fee is always valid; execution succeeded");
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
     // The one class of transaction nothing else brings back after a restart.
     // Only the slice path drains these, so **with slicing off they are marked
@@ -3698,5 +3699,282 @@ mod tests {
 
         state.last_sent = None;
         assert_eq!(state.sealed_link(hash), None);
+    }
+
+    /// The miner fee a pool transaction contributes to `total_fees` comes from
+    /// the pool wrapper, not from the consensus transaction it unwraps to.
+    mod miner_fee {
+        use super::*;
+        use alloy_consensus::{Header, SignableTransaction, TxEip1559};
+        use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
+        use alloy_primitives::{Bytes, Signature, TxKind};
+        use alloy_rpc_types_eth::erc4337::TransactionConditional;
+        use reth_basic_payload_builder::PayloadConfig;
+        use reth_optimism_chainspec::{OpChainSpec, OpChainSpecBuilder};
+        use reth_optimism_evm::OpEvmConfig;
+        use reth_optimism_payload_builder::OpPayloadBuilderAttributes;
+        use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
+        use reth_optimism_txpool::{OpPooledTransaction, conditional::MaybeConditionalTransaction};
+        use reth_payload_util::PayloadTransactionsFixed;
+        use reth_primitives_traits::{InMemorySize, SealedHeader};
+        use reth_revm::{
+            db::{CacheDB, EmptyDB},
+            state::AccountInfo,
+        };
+        use std::borrow::Cow;
+
+        /// Reports a forced priority fee (and so a forced default
+        /// `effective_tip_per_gas`) while `into_consensus()` still hands back
+        /// the unmodified inner transaction — the shape of a wrapper that
+        /// converts a non-native fee denomination into a native-wei tip.
+        #[derive(Debug, Clone)]
+        struct ForcedTipPooledTx {
+            inner: OpPooledTransaction,
+            forced_priority_fee: u128,
+        }
+
+        impl Typed2718 for ForcedTipPooledTx {
+            fn ty(&self) -> u8 {
+                self.inner.ty()
+            }
+        }
+
+        impl InMemorySize for ForcedTipPooledTx {
+            fn size(&self) -> usize {
+                self.inner.size()
+            }
+        }
+
+        impl Transaction for ForcedTipPooledTx {
+            fn chain_id(&self) -> Option<u64> {
+                self.inner.chain_id()
+            }
+            fn nonce(&self) -> u64 {
+                self.inner.nonce()
+            }
+            fn gas_limit(&self) -> u64 {
+                self.inner.gas_limit()
+            }
+            fn gas_price(&self) -> Option<u128> {
+                self.inner.gas_price()
+            }
+            fn max_fee_per_gas(&self) -> u128 {
+                // High enough that the default `effective_tip_per_gas` does not
+                // cap `forced_priority_fee` at `max_fee_per_gas - base_fee`.
+                u128::MAX
+            }
+            fn max_priority_fee_per_gas(&self) -> Option<u128> {
+                Some(self.forced_priority_fee)
+            }
+            fn max_fee_per_blob_gas(&self) -> Option<u128> {
+                self.inner.max_fee_per_blob_gas()
+            }
+            fn priority_fee_or_price(&self) -> u128 {
+                self.inner.priority_fee_or_price()
+            }
+            fn effective_gas_price(&self, base_fee: Option<u64>) -> u128 {
+                self.inner.effective_gas_price(base_fee)
+            }
+            fn is_dynamic_fee(&self) -> bool {
+                self.inner.is_dynamic_fee()
+            }
+            fn kind(&self) -> TxKind {
+                self.inner.kind()
+            }
+            fn is_create(&self) -> bool {
+                self.inner.is_create()
+            }
+            fn value(&self) -> U256 {
+                self.inner.value()
+            }
+            fn input(&self) -> &Bytes {
+                self.inner.input()
+            }
+            fn access_list(&self) -> Option<&AccessList> {
+                self.inner.access_list()
+            }
+            fn blob_versioned_hashes(&self) -> Option<&[B256]> {
+                self.inner.blob_versioned_hashes()
+            }
+            fn authorization_list(&self) -> Option<&[SignedAuthorization]> {
+                self.inner.authorization_list()
+            }
+        }
+
+        impl MaybeConditionalTransaction for ForcedTipPooledTx {
+            fn set_conditional(&mut self, conditional: TransactionConditional) {
+                self.inner.set_conditional(conditional);
+            }
+            fn conditional(&self) -> Option<&TransactionConditional> {
+                self.inner.conditional()
+            }
+        }
+
+        impl MaybeInteropTransaction for ForcedTipPooledTx {
+            fn set_interop_deadline(&self, deadline: u64) {
+                self.inner.set_interop_deadline(deadline);
+            }
+            fn interop_deadline(&self) -> Option<u64> {
+                self.inner.interop_deadline()
+            }
+        }
+
+        impl DataAvailabilitySized for ForcedTipPooledTx {
+            fn estimated_da_size(&self) -> u64 {
+                self.inner.estimated_da_size()
+            }
+        }
+
+        impl PoolTransaction for ForcedTipPooledTx {
+            type TryFromConsensusError =
+                <OpPooledTransaction as PoolTransaction>::TryFromConsensusError;
+            type Consensus = <OpPooledTransaction as PoolTransaction>::Consensus;
+            type Pooled = <OpPooledTransaction as PoolTransaction>::Pooled;
+
+            fn clone_into_consensus(&self) -> Recovered<Self::Consensus> {
+                self.inner.clone_into_consensus()
+            }
+            fn consensus_ref(&self) -> Recovered<&Self::Consensus> {
+                self.inner.consensus_ref()
+            }
+            fn into_consensus(self) -> Recovered<Self::Consensus> {
+                self.inner.into_consensus()
+            }
+            fn into_consensus_with2718(self) -> WithEncoded<Recovered<Self::Consensus>> {
+                self.inner.into_consensus_with2718()
+            }
+            fn from_pooled(_pooled: Recovered<Self::Pooled>) -> Self {
+                unreachable!("the build loop never calls from_pooled on the wrapper")
+            }
+            fn hash(&self) -> &TxHash {
+                self.inner.hash()
+            }
+            fn sender(&self) -> Address {
+                self.inner.sender()
+            }
+            fn sender_ref(&self) -> &Address {
+                self.inner.sender_ref()
+            }
+            fn cost(&self) -> &U256 {
+                self.inner.cost()
+            }
+            fn encoded_length(&self) -> usize {
+                self.inner.encoded_length()
+            }
+        }
+
+        impl OpPooledTx for ForcedTipPooledTx {
+            fn encoded_2718(&self) -> Cow<'_, alloy_primitives::Bytes> {
+                OpPooledTx::encoded_2718(&self.inner)
+            }
+            fn set_extra_balance_cost(&mut self, cost: U256) {
+                self.inner.set_extra_balance_cost(cost);
+            }
+        }
+
+        type TestCtx = OpPayloadBuilderCtx<
+            OpEvmConfig<OpChainSpec, OpPrimitives>,
+            OpChainSpec,
+            OpPayloadBuilderAttributes<OpTransactionSigned>,
+        >;
+
+        fn payload_builder_ctx(gas_limit: u64) -> TestCtx {
+            let chain_spec =
+                Arc::new(OpChainSpecBuilder::optimism_mainnet().regolith_activated().build());
+            let parent = SealedHeader::seal_slow(Header { gas_limit, ..Default::default() });
+            let attributes = OpPayloadBuilderAttributes {
+                timestamp: 1,
+                gas_limit: Some(gas_limit),
+                ..Default::default()
+            };
+            OpPayloadBuilderCtx {
+                evm_config: OpEvmConfig::optimism(chain_spec.clone()),
+                builder_config: OpBuilderConfig::default(),
+                chain_spec,
+                config: PayloadConfig {
+                    parent_header: Arc::new(parent),
+                    parent_block_info: None,
+                    payload_id: attributes.id,
+                    attributes,
+                },
+                cancel: Default::default(),
+                best_payload: None,
+            }
+        }
+
+        /// A plain transfer whose own tip is `natural_priority_fee` wei/gas.
+        fn transfer(signer: Address, natural_priority_fee: u128) -> OpPooledTransaction {
+            let tx: OpTransactionSigned = TxEip1559 {
+                chain_id: 10,
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: natural_priority_fee,
+                max_priority_fee_per_gas: natural_priority_fee,
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                ..Default::default()
+            }
+            .into_signed(Signature::test_signature())
+            .into();
+            let encoded_len = tx.encode_2718_len();
+            OpPooledTransaction::new(Recovered::new_unchecked(tx, signer), encoded_len)
+        }
+
+        #[tokio::test]
+        async fn miner_fee_uses_pool_wrapper_tip() {
+            let gas_limit = 1_000_000;
+            let signer = Address::repeat_byte(0x11);
+            let natural_priority_fee: u128 = 1;
+            let forced_priority_fee: u128 = 1_000_000;
+
+            let ctx = payload_builder_ctx(gas_limit);
+            let mut cache = CacheDB::new(EmptyDB::default());
+            cache.insert_account_info(
+                signer,
+                AccountInfo { balance: U256::MAX, ..Default::default() },
+            );
+            let mut db = State::builder().with_database(cache).with_bundle_update().build();
+            let mut builder = ctx.block_builder(&mut db).expect("block builder can be created");
+            let base_fee = builder.evm_mut().block().basefee();
+
+            let tx = ForcedTipPooledTx {
+                inner: transfer(signer, natural_priority_fee),
+                forced_priority_fee,
+            };
+            let mut best_txs = PayloadTransactionsFixed::new(vec![tx]);
+            let mut info = ExecutionInfo::<OpTransactionSigned>::default();
+            let fifo = PreconfTxSet::new(8);
+            let constraints = BuildConstraints {
+                block_gas_limit: gas_limit,
+                block_da_limit: None,
+                tx_da_limit: None,
+                da_footprint_gas_scalar: None,
+                base_fee,
+                predicted_height: 1,
+                timestamp: 1,
+                max_uncompressed_block_size: None,
+            };
+            let mut pacer = AdmissionPacer::sweeping(gas_limit, gas_limit);
+
+            let step = apply_one_best_tx::<OpPrimitives, _>(
+                &mut best_txs,
+                &mut builder,
+                &mut info,
+                &fifo,
+                &constraints,
+                &mut pacer,
+            )
+            .await
+            .expect("the transfer executes");
+            assert!(matches!(step, BestTxStep::Continue));
+            assert_eq!(info.cumulative_gas_used, 21_000, "the transfer was included");
+
+            let gas_used = U256::from(info.cumulative_gas_used);
+            let expected_fees = U256::from(forced_priority_fee) * gas_used;
+            let natural_fees = U256::from(natural_priority_fee) * gas_used;
+            // Both sides: reading the tip after `into_consensus()` would land on
+            // `natural_fees`.
+            assert_eq!(info.total_fees, expected_fees);
+            assert_ne!(info.total_fees, natural_fees);
+        }
     }
 }

@@ -304,9 +304,10 @@ impl PreconfJournal {
             return Err(JournalError::Io(e));
         }
         let new_size = self.size_bytes.fetch_add(len, Ordering::Relaxed) + len;
+        // Reset under the lock so a concurrent failing append cannot be overwritten.
+        metrics::gauge!("preconf.journal.pending_entries").set(0.0);
         drop(writer);
 
-        metrics::gauge!("preconf.journal.pending_entries").set(0.0);
         metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
         if new_size >= self.max_size {
             self.rotate_notify.notify_one();

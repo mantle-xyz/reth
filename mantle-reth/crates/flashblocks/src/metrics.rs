@@ -165,7 +165,10 @@ flashblock_metrics! {
     // Emitted from `mantle-reth-rpc-ext`, not from this crate — `eth_simulateV1`
     // is owned by `MantleEthApiExt`, which injects the pending overrides.
     counter   rpc_simulate_v1                           => "flashblocks.consumer.rpc.simulate_v1_total",
-        "`eth_simulateV1` calls served with pending overrides";
+        "`eth_simulateV1` calls served with a pending execution context";
+    // Emitted from `mantle-reth-rpc-ext`, like `rpc_simulate_v1`.
+    counter   rpc_estimate_total_fee                    => "flashblocks.consumer.rpc.estimate_total_fee_total",
+        "`eth_estimateTotalFee` calls served with a pending execution context";
     counter   rpc_get_logs                              => "flashblocks.consumer.rpc.get_logs_total",
         "`eth_getLogs` calls served from the overlay";
     counter   rpc_get_block_transaction_count_by_number => "flashblocks.consumer.rpc.get_block_transaction_count_by_number_total",
