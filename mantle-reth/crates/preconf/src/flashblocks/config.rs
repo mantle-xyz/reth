@@ -124,7 +124,9 @@ pub enum FlashblockProducerConfigError {
     InvalidBroadcastCapacity,
     /// A single slice would span more than the whole slot, which leaves the
     /// per-slice budget meaningless.
-    #[error("flashblocks block_time ({block_time:?}) must be <= slot_duration ({slot:?})")]
+    #[error(
+        "--flashblocks.block-time ({block_time:?}) must be <= --preconf.slot-duration-ms ({slot:?})"
+    )]
     BlockTimeExceedsSlot {
         /// Configured slice interval.
         block_time: Duration,
@@ -132,7 +134,9 @@ pub enum FlashblockProducerConfigError {
         slot: Duration,
     },
     /// Leeway at or past a whole slot leaves no time to build in.
-    #[error("flashblocks leeway_time ({leeway:?}) must be < slot_duration ({slot:?})")]
+    #[error(
+        "--flashblocks.leeway-time ({leeway:?}) must be < --preconf.slot-duration-ms ({slot:?})"
+    )]
     LeewayReachesSlot {
         /// Configured leeway.
         leeway: Duration,
@@ -185,7 +189,11 @@ pub enum FlashblockProducerConfigError {
     )]
     SdmNotSupportedWithFlashblocks,
     /// The lead spans the slot, so no refresh ever matures before the seal.
-    #[error("flashblocks best_tx_lead_slices ({lead}) must be < the slices in a slot ({slices})")]
+    #[error(
+        "--flashblocks.best-tx-lead-slices ({lead}) must be less than the slices in a slot \
+         ({slices}: --preconf.slot-duration-ms divided by --flashblocks.block-time); lower \
+         --flashblocks.best-tx-lead-slices or --flashblocks.block-time"
+    )]
     BestTxLeadSpansSlot {
         /// Configured lead, in slice boundaries.
         lead: u64,
