@@ -1630,16 +1630,27 @@ async fn estimate_gas_honours_a_block_override() {
     );
 }
 
-/// `eth_sendRawTransactionSync` rejects a timeout above the configured ceiling.
+/// `eth_sendRawTransactionSync` cuts a timeout above the configured one down to
+/// it rather than refusing the call.
 #[tokio::test(flavor = "multi_thread")]
-async fn send_raw_transaction_sync_rejects_an_overlong_timeout() {
+async fn send_raw_transaction_sync_accepts_an_overlong_timeout() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let raw = signed_call(0, LOGGER, VALUE).await;
-    let error =
-        api.send_raw_transaction_sync(raw, Some(6_001)).await.expect_err("the ceiling is 6000 ms");
-    assert!(error.message().contains("time out too long"), "unexpected error: {error}");
+    let tx_hash = keccak256(&raw);
+    let slice =
+        FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw.clone()]).build();
+
+    let announce = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        harness.send(slice).await;
+    };
+    let (receipt, ()) =
+        tokio::join!(api.send_raw_transaction_sync(raw, Some(10 * 60 * 1_000)), announce);
+
+    let receipt = receipt.expect("an overlong timeout is clamped, not refused");
+    assert_eq!(receipt["transactionHash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
 }
 
 /// `eth_sendRawTransactionSync` returns once the transaction shows up in a slice.

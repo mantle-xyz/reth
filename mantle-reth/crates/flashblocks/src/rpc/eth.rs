@@ -75,8 +75,15 @@ use tracing::{debug, trace, warn};
 
 use crate::{FlashblocksAPI, PendingBlocks, metrics::Metrics};
 
-/// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
-const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
+/// How long `eth_sendRawTransactionSync` waits: the caller's timeout, cut down
+/// to the node's configured one; the configured one when the caller gives none.
+/// `0` means unset. Clamped rather than refused, as op-geth and upstream do.
+fn sync_timeout(requested_ms: Option<u64>, configured: Duration) -> Duration {
+    requested_ms
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .map_or(configured, |requested| requested.min(configured))
+}
 
 /// Supplies one coherent pending execution snapshot to RPC methods owned elsewhere,
 /// only while the preview leads the canonical tip.
@@ -447,23 +454,10 @@ where
     ) -> RpcResult<serde_json::Value> {
         debug!(message = "rpc::send_raw_transaction_sync");
 
-        // `0` means "unset", as it does upstream (`.filter(|ms| *ms > 0)`).
-        // Taken literally it is a `sleep(0)`, which times the caller out
-        // before the transaction could possibly land — an answer that is
-        // always wrong, so there is nothing to preserve in honouring it.
-        let timeout_ms = match timeout_ms.filter(|ms| *ms > 0) {
-            Some(ms) if ms > MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS => {
-                return Err(ErrorObjectOwned::owned(
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "time out too long, timeout: {ms} ms, max: {MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS} ms"
-                    ),
-                    None::<()>,
-                ));
-            }
-            Some(ms) => ms,
-            None => MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS,
-        };
+        let timeout = sync_timeout(
+            timeout_ms,
+            EthTransactions::send_raw_transaction_sync_timeout(&self.eth_api),
+        );
 
         // Subscribed before sending: a receipt published from here on reaches a
         // waiter, and one published earlier is found by the lookup below.
@@ -475,7 +469,7 @@ where
         debug!(
             message = "rpc::send_raw_transaction_sync::sent_transaction",
             tx_hash = %tx_hash,
-            timeout_ms = timeout_ms,
+            timeout_ms = timeout.as_millis() as u64,
         );
 
         // The transaction is already sent; a failed lookup here must not read as a failed send.
@@ -486,7 +480,6 @@ where
             return to_value(receipt);
         }
 
-        let timeout = Duration::from_millis(timeout_ms);
         match first_receipt(
             self.wait_for_flashblocks_receipt(tx_hash, previews),
             self.wait_for_canonical_receipt(tx_hash, canonical),
@@ -859,5 +852,34 @@ mod first_receipt_tests {
 
         assert_eq!(first_receipt(async { None::<u8> }, async { None }, timeout).await, None);
         assert!(started.elapsed() >= timeout, "two waiters giving up must not end the wait early");
+    }
+}
+
+#[cfg(test)]
+mod sync_timeout_tests {
+    use super::*;
+
+    const CONFIGURED: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn no_timeout_waits_the_configured_time() {
+        assert_eq!(sync_timeout(None, CONFIGURED), CONFIGURED);
+    }
+
+    /// `0` means unset, as upstream reads it.
+    #[test]
+    fn a_zero_timeout_waits_the_configured_time() {
+        assert_eq!(sync_timeout(Some(0), CONFIGURED), CONFIGURED);
+    }
+
+    #[test]
+    fn a_shorter_timeout_is_honoured() {
+        assert_eq!(sync_timeout(Some(500), CONFIGURED), Duration::from_millis(500));
+    }
+
+    /// Clamped rather than refused, as op-geth and upstream reth do.
+    #[test]
+    fn a_longer_timeout_is_cut_to_the_configured_time() {
+        assert_eq!(sync_timeout(Some(60_000), CONFIGURED), CONFIGURED);
     }
 }
