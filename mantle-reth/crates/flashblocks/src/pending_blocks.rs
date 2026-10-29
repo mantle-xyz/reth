@@ -404,6 +404,22 @@ impl PendingBlocks {
         self.latest_block_number() > tip
     }
 
+    /// Whether this preview extends the chain whose head is `tip`: it holds
+    /// block `tip + 1`, and that block's base names `tip_hash` as its parent.
+    ///
+    /// Stronger than [`Self::leads`]: a head of the right height but another
+    /// hash is a reorg the consumer has not processed yet, and the preview is
+    /// built on a block the chain no longer has.
+    pub fn extends(&self, tip: BlockNumber, tip_hash: B256) -> bool {
+        let Some(next) = tip.checked_add(1) else { return false };
+        self.flashblocks.iter().any(|slice| {
+            slice
+                .base
+                .as_ref()
+                .is_some_and(|base| base.block_number == next && base.parent_hash == tip_hash)
+        })
+    }
+
     /// Returns the canonical block number (the block before pending).
     #[inline]
     pub fn canonical_block_number(&self) -> BlockNumberOrTag {
@@ -1143,6 +1159,31 @@ mod tests {
         assert!(!pending_blocks.leads(3));
     }
 
+    /// The preview extends the chain only if the block it holds right above
+    /// the head names that head as its parent. A head of the same height but
+    /// another hash is a reorg the consumer has not processed yet.
+    #[test]
+    fn extends_only_the_head_its_next_block_names() {
+        let (one, two, other) = (B256::repeat_byte(1), B256::repeat_byte(2), B256::repeat_byte(9));
+        let on = |block_number, parent_hash| {
+            let mut slice = test_flashblock_for_block(block_number);
+            slice.base.as_mut().expect("a base slice").parent_hash = parent_hash;
+            slice
+        };
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_flashblocks([on(2, one), on(3, two)]);
+        builder.with_header(header_at(2));
+        builder.with_header(header_at(3));
+        let pending = builder.build().expect("build should succeed");
+
+        assert!(pending.extends(1, one), "the head the preview was built on");
+        assert!(!pending.extends(1, other), "same height, another block");
+        assert!(pending.extends(2, two), "its first block is canonical, its second still leads");
+        assert!(!pending.extends(2, other), "the chain took another block 2");
+        assert!(!pending.extends(3, other), "the head has reached the preview's last block");
+        assert!(!pending.extends(0, B256::ZERO), "below the anchor nothing can be confirmed");
+    }
+
     #[test]
     fn pending_execution_context_requires_the_preview_to_lead_the_tip() {
         use crate::PendingStateOverrides;
@@ -1159,8 +1200,15 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            assert!(state.pending_execution_context(&|| Some(1)).is_some());
-            assert!(state.pending_execution_context(&|| Some(2)).is_none(), "equal is stale");
+            assert!(state.pending_execution_context(&|| Some((1, B256::ZERO))).is_some());
+            assert!(
+                state.pending_execution_context(&|| Some((1, B256::repeat_byte(9)))).is_none(),
+                "another block 1 is stale"
+            );
+            assert!(
+                state.pending_execution_context(&|| Some((2, B256::ZERO))).is_none(),
+                "equal is stale"
+            );
             assert!(state.pending_execution_context(&|| None).is_none(), "read error is stale");
 
             // The preview is loaded before the tip is read.
@@ -1168,15 +1216,15 @@ mod tests {
                 state
                     .pending_execution_context(&|| {
                         state.set_pending_blocks_for_testing(None);
-                        Some(1)
+                        Some((1, B256::ZERO))
                     })
                     .is_some()
             );
-            assert!(state.pending_execution_context(&|| Some(0)).is_none());
+            assert!(state.pending_execution_context(&|| Some((0, B256::ZERO))).is_none());
         });
 
         assert!(
-            handle.render().contains("flashblocks_consumer_pending_stale_fallback_total 2"),
+            handle.render().contains("flashblocks_consumer_pending_stale_fallback_total 3"),
             "{}",
             handle.render()
         );

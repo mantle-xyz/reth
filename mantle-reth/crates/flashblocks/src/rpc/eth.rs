@@ -86,27 +86,29 @@ fn sync_timeout(requested_ms: Option<u64>, configured: Duration) -> Duration {
 }
 
 /// Supplies one coherent pending execution snapshot to RPC methods owned elsewhere,
-/// only while the preview leads the canonical tip.
+/// only while the preview extends the canonical head.
 pub trait PendingStateOverrides: std::fmt::Debug + Send + Sync {
     /// Returns state and execution header from the same published snapshot, or
-    /// `None` when there is none or it no longer leads the tip. `canonical_tip`
-    /// is read after the snapshot is loaded; `None` from it counts as stale.
+    /// `None` when there is none or it no longer extends the head (see
+    /// [`PendingBlocks::extends`]). `canonical_head` returns the head's number and
+    /// hash, and is read after the snapshot is loaded; `None` from it counts as
+    /// stale.
     fn pending_execution_context(
         &self,
-        canonical_tip: &dyn Fn() -> Option<BlockNumber>,
+        canonical_head: &dyn Fn() -> Option<(BlockNumber, B256)>,
     ) -> Option<super::PendingExecutionContext>;
 }
 
 impl<FB: FlashblocksAPI + std::fmt::Debug + Send + Sync> PendingStateOverrides for FB {
     fn pending_execution_context(
         &self,
-        canonical_tip: &dyn Fn() -> Option<BlockNumber>,
+        canonical_head: &dyn Fn() -> Option<(BlockNumber, B256)>,
     ) -> Option<super::PendingExecutionContext> {
-        // Load the preview before reading the tip: a tip read first can miss a
+        // Load the preview before reading the head: a head read first can miss a
         // block that lands before the preview is loaded, letting a stale
-        // preview pass as leading.
+        // preview pass as extending it.
         let pending = Guard::into_inner(self.get_pending_blocks())?;
-        if !canonical_tip().is_some_and(|tip| pending.leads(tip)) {
+        if !canonical_head().is_some_and(|(tip, tip_hash)| pending.extends(tip, tip_hash)) {
             Metrics::pending_stale_fallback().increment(1);
             return None;
         }
@@ -650,15 +652,18 @@ where
     FB: FlashblocksAPI + Send + Sync + 'static,
 {
     /// The published preview and the tip it was checked against, while it still
-    /// leads the chain. A failed tip read counts as stale.
+    /// extends the chain (see [`PendingBlocks::extends`]). A failed head read
+    /// counts as stale.
     fn fresh_pending(&self) -> Option<(Arc<PendingBlocks>, BlockNumber)> {
-        // Load the preview before reading the tip: a tip read first can miss a
+        // Load the preview before reading the head: a head read first can miss a
         // block that lands before the preview is loaded, letting a stale
-        // preview pass as leading.
+        // preview pass as extending it.
         let pending = Guard::into_inner(self.flashblocks_state.get_pending_blocks())?;
-        let tip = self.eth_api.provider().best_block_number().ok();
-        match tip {
-            Some(tip) if pending.leads(tip) => Some((pending, tip)),
+        let head = self.eth_api.provider().chain_info().ok();
+        match head {
+            Some(head) if pending.extends(head.best_number, head.best_hash) => {
+                Some((pending, head.best_number))
+            }
             _ => {
                 Metrics::pending_stale_fallback().increment(1);
                 None
