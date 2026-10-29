@@ -113,6 +113,47 @@ impl JournalEntry {
     }
 }
 
+/// On-disk format version written on every journal line.
+///
+/// Adding an optional field with `#[serde(default)]` does not bump it. Bump it
+/// only for a change an older binary must refuse to read. A line without a
+/// `version` is version 1.
+pub const JOURNAL_FORMAT_VERSION: u16 = 1;
+
+/// Version of a line written before the field existed.
+const fn legacy_version() -> u16 {
+    1
+}
+
+/// A [`JournalEntry`] as written: the entry's fields plus `version`.
+#[derive(Serialize)]
+struct OnDisk<'a> {
+    version: u16,
+    #[serde(flatten)]
+    entry: &'a JournalEntry,
+}
+
+impl<'a> OnDisk<'a> {
+    const fn new(entry: &'a JournalEntry) -> Self {
+        Self { version: JOURNAL_FORMAT_VERSION, entry }
+    }
+}
+
+/// A journal line as read.
+#[derive(Deserialize)]
+struct OnDiskOwned {
+    #[serde(default = "legacy_version")]
+    version: u16,
+    #[serde(flatten)]
+    entry: JournalEntry,
+}
+
+/// The `version` of a line that is a JSON object, if it has a numeric one. Lets
+/// a newer format be told from a corrupt line; a torn line does not parse.
+fn probe_version(line: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(line).ok()?.as_object()?.get("version")?.as_u64()
+}
+
 /// How many unwritten records the retry buffer holds before the oldest are
 /// dropped: thirty blocks of 1,500 simple transfers (30M gas each).
 ///
@@ -157,9 +198,22 @@ pub enum JournalError {
     #[error("journal IO: {0}")]
     Io(#[from] io::Error),
     /// A record `serde_json` could not encode; retrying cannot fix it. Decode
-    /// failures have no variant: a bad line is skipped and counted.
+    /// failures have no variant: a bad line is skipped and counted, except one
+    /// from a newer format ([`Self::UnsupportedVersion`]).
     #[error("journal serialisation: {0}")]
     Encode(#[source] serde_json::Error),
+    /// A line written by a newer format version than this binary reads. Not
+    /// skipped: rotation would delete it as untracked.
+    #[error(
+        "journal written by a newer version (format {found}, this binary reads up to {supported}); \
+         run the newer binary or restore the journal from before the upgrade"
+    )]
+    UnsupportedVersion {
+        /// The version found on the line.
+        found: u16,
+        /// [`JOURNAL_FORMAT_VERSION`].
+        supported: u16,
+    },
 }
 
 /// On-disk append-only journal (see the module docs).
@@ -253,7 +307,7 @@ impl PreconfJournal {
         // for retry.
         let mut lines = Vec::with_capacity(entries.len());
         for entry in entries {
-            let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
+            let mut line = serde_json::to_vec(&OnDisk::new(entry)).map_err(JournalError::Encode)?;
             line.push(b'\n');
             lines.push(line);
         }
@@ -411,9 +465,27 @@ impl PreconfJournal {
             if let Some(rest) = line.strip_suffix(b"\r") {
                 line = rest;
             }
-            match serde_json::from_slice::<JournalEntry>(line) {
-                Ok(entry) => out.push(entry),
+            match serde_json::from_slice::<OnDiskOwned>(line) {
+                Ok(on_disk) => {
+                    if on_disk.version > JOURNAL_FORMAT_VERSION {
+                        return Err(JournalError::UnsupportedVersion {
+                            found: on_disk.version,
+                            supported: JOURNAL_FORMAT_VERSION,
+                        });
+                    }
+                    out.push(on_disk.entry);
+                }
                 Err(source) => {
+                    // A newer format may change the fields themselves, so the
+                    // full decode fails; the version alone still tells.
+                    if let Some(version) = probe_version(line) &&
+                        version > u64::from(JOURNAL_FORMAT_VERSION)
+                    {
+                        return Err(JournalError::UnsupportedVersion {
+                            found: u16::try_from(version).unwrap_or(u16::MAX),
+                            supported: JOURNAL_FORMAT_VERSION,
+                        });
+                    }
                     warn!(
                         target: "mantle::preconf::journal",
                         line = line_no,
@@ -479,7 +551,7 @@ impl PreconfJournal {
                 dropped += 1;
                 continue;
             }
-            let mut line = serde_json::to_vec(entry).map_err(JournalError::Encode)?;
+            let mut line = serde_json::to_vec(&OnDisk::new(entry)).map_err(JournalError::Encode)?;
             line.push(b'\n');
             tmp.write_all(&line).await?;
             kept_bytes += line.len() as u64;
@@ -708,9 +780,10 @@ fn nonce_still_free<C: CommitmentChainView>(chain: &C, rec: &RestoredEnvelope) -
 /// already acknowledged comes back whatever the current policy says.
 ///
 /// A bad record (corrupt bytes, a type the preconf path does not carry) is
-/// logged and skipped. Failing to read the file at all is returned as `Err`,
-/// and the caller must not start: nothing restored would be tracked, so the
-/// first rotation would delete every commitment still in the file.
+/// logged and skipped. Failing to read the file at all (an IO failure, or a line
+/// from a newer format version) is returned as `Err`, and the caller must not
+/// start: nothing restored would be tracked, so the first rotation would delete
+/// every commitment still in the file.
 pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
     journal: &PreconfJournal,
     source: &P,
@@ -727,11 +800,12 @@ pub async fn restore_preconf_state<P: RestoreSource, C: CommitmentChainView>(
             // Starting anyway would lose every commitment in the file: none of
             // them would enter `Commitments`, so the first rotation would delete
             // them all. A missing file (`Ok`, the first start) and a corrupt
-            // line (skipped) do not reach here; only a real IO failure does.
+            // line (skipped) do not reach here; only a real IO failure or a newer
+            // format version does.
             metrics::counter!("preconf.journal.restore_load_failed_total").increment(1);
             error!(
                 target: "mantle::preconf::journal",
-                ?e,
+                error = %e,
                 "journal load failed; refusing to start rather than lose its commitments"
             );
             return Err(e);
@@ -1731,6 +1805,141 @@ mod tests {
         let path_ino = std::fs::metadata(&j.path).unwrap().ino();
         assert_eq!(writer_ino, path_ino);
         assert!(!tmp_path_for(&j.path).exists(), "the tmp file was renamed into place");
+    }
+
+    #[tokio::test]
+    async fn a_line_without_a_version_reads_as_format_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let line = serde_json::to_string(&entry(7, 70)).unwrap();
+        assert!(!line.contains("version"));
+        tokio::fs::write(&path, format!("{line}\n")).await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, vec![entry(7, 70)]);
+        assert_eq!(bad, 0);
+    }
+
+    #[tokio::test]
+    async fn written_lines_carry_the_version_and_round_trip() {
+        let (dir, j) = fresh_journal().await;
+        j.append_batch(&[entry(1, 10), entry(2, 20)]).await.unwrap();
+        let text = std::fs::read_to_string(dir.path().join("preconf.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().all(|l| l.contains("\"version\":1")), "{text}");
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, vec![entry(1, 10), entry(2, 20)]);
+        assert_eq!(bad, 0);
+
+        j.rotate(|_| true).await.unwrap();
+        let text = std::fs::read_to_string(dir.path().join("preconf.jsonl")).unwrap();
+        assert!(text.lines().all(|l| l.contains("\"version\":1")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_line_with_an_unknown_extra_field_still_parses() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let mut v = serde_json::to_value(entry(5, 50)).unwrap();
+        v["version"] = 1.into();
+        v["added_later"] = "x".into();
+        tokio::fs::write(&path, format!("{v}\n")).await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, vec![entry(5, 50)]);
+        assert_eq!(bad, 0);
+    }
+
+    /// A newer version is an error, not a corrupt line to skip: the next
+    /// rotation would delete the record as untracked.
+    #[tokio::test]
+    async fn a_newer_version_fails_load_and_restore_instead_of_being_skipped() {
+        for reshaped in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("preconf.jsonl");
+            let mut v = serde_json::to_value(entry(5, 50)).unwrap();
+            v["version"] = (JOURNAL_FORMAT_VERSION + 1).into();
+            if reshaped {
+                // A breaking change that the current fields cannot decode.
+                v.as_object_mut().unwrap().remove("tx_rlp");
+            }
+            tokio::fs::write(&path, format!("{v}\n")).await.unwrap();
+            let j = PreconfJournal::open(&path, 0).await.unwrap();
+
+            let err = j.load().await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    JournalError::UnsupportedVersion { found, supported }
+                        if found == JOURNAL_FORMAT_VERSION + 1
+                            && supported == JOURNAL_FORMAT_VERSION
+                ),
+                "got {err:?}"
+            );
+            assert!(err.to_string().contains("newer version"));
+            assert!(j.rotate(|_| false).await.is_err(), "rotation must not eat the line");
+
+            let fifo = Arc::new(PreconfTxSet::new(16));
+            let result = restore_preconf_state(
+                &j,
+                &StubSource::new(),
+                &landed(),
+                &fifo,
+                &empty_commitments(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(JournalError::UnsupportedVersion { .. })),
+                "got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_torn_final_line_is_skipped_even_when_it_mentions_a_newer_version() {
+        for version in [1, 2] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("preconf.jsonl");
+            let full = serde_json::to_vec(&OnDisk::new(&entry(5, 50))).unwrap();
+            let mut torn = format!(r#"{{"version":{version},"#).into_bytes();
+            torn.extend_from_slice(&full[full.len() / 2..full.len() / 2 + 10]);
+            let mut file = torn;
+            file.push(b'\n');
+            file.extend_from_slice(&serde_json::to_vec(&OnDisk::new(&entry(8, 80))).unwrap());
+            file.push(b'\n');
+            tokio::fs::write(&path, file).await.unwrap();
+            let j = PreconfJournal::open(&path, 0).await.unwrap();
+            let (loaded, bad) = j.load().await.expect("a torn line is not a newer format");
+            assert_eq!(loaded, vec![entry(8, 80)]);
+            assert_eq!(bad, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_cut_in_half_is_skipped_and_the_next_line_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        let full = serde_json::to_vec(&OnDisk::new(&entry(5, 50))).unwrap();
+        let mut file = full[..full.len() / 2].to_vec();
+        file.push(b'\n');
+        file.extend_from_slice(&serde_json::to_vec(&OnDisk::new(&entry(8, 80))).unwrap());
+        file.push(b'\n');
+        tokio::fs::write(&path, file).await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, vec![entry(8, 80)]);
+        assert_eq!(bad, 1);
+    }
+
+    #[tokio::test]
+    async fn a_json_array_line_is_corrupt_not_a_newer_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preconf.jsonl");
+        tokio::fs::write(&path, b"[2]\n").await.unwrap();
+        let j = PreconfJournal::open(&path, 0).await.unwrap();
+        let (loaded, bad) = j.load().await.unwrap();
+        assert!(loaded.is_empty());
+        assert_eq!(bad, 1);
     }
 
     /// An unreadable journal makes restore return the error, not an empty
@@ -2736,7 +2945,7 @@ mod tests {
     #[tokio::test]
     async fn size_trigger_fires_at_exact_boundary_not_below() {
         let line_len = {
-            let mut v = serde_json::to_vec(&entry(1, 10)).unwrap();
+            let mut v = serde_json::to_vec(&OnDisk::new(&entry(1, 10))).unwrap();
             v.push(b'\n');
             v.len() as u64
         };

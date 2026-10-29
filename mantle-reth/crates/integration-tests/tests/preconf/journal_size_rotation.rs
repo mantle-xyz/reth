@@ -75,9 +75,10 @@ async fn size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet() {
 
     // Size the cap between one and two journal entries so the trigger arms
     // only on the *second* append. `line_len` is computed from a
-    // representative entry that matches exactly what the RPC handler writes
-    // for tx0 (same hash / tx bytes / block_height=1, and a 13-digit
-    // `committed_at_ms` matching real wall-clock ms width). The ~0.5-line
+    // representative entry like what the RPC handler writes for tx0 (same
+    // hash / tx bytes / block_height=1, and a 13-digit `committed_at_ms`
+    // matching real wall-clock ms width), plus the `"version":1,` prefix the
+    // on-disk form adds (the wrapper type is private). The ~0.5-line
     // margin dwarfs any few-byte variance in the second entry.
     let tx0 = signed_transfer(chain_id, &wallet, 0).await;
     let sample = JournalEntry {
@@ -87,7 +88,9 @@ async fn size_triggered_rotation_keeps_a_commitment_that_is_not_buried_yet() {
         committed_at_ms: 1_700_000_000_000,
         kind: ClaimKind::Promised,
     };
-    let line_len = serde_json::to_vec(&sample).expect("encode sample").len() as u64 + 1;
+    let line_len = serde_json::to_vec(&sample).expect("encode sample").len() as u64 +
+        r#""version":1,"#.len() as u64 +
+        1;
     let cap = line_len + line_len / 2;
 
     let (journal_file, journal_dir) = fresh_journal_path();
