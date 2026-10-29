@@ -130,6 +130,8 @@ flashblock_metrics! {
         "Block height of the overlay currently served";
     counter   leading_depth_exceeded                    => "flashblocks.consumer.leading_depth_exceeded_total",
         "Slices refused for running too far ahead of the canonical tip";
+    counter   uncached_slice_dropped                    => "flashblocks.consumer.uncached_slices_dropped_total",
+        "Slices that could not extend the overlay or be cached as a restart point, dropped";
     gauge     queue_depth                               => "flashblocks.consumer.queue_depth",
         "Updates (slices and canonical notifications) waiting in the state-update queue";
     counter   queue_dropped_slices                      => "flashblocks.consumer.queue_dropped_slices_total",
