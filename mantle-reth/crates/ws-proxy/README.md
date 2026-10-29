@@ -222,7 +222,8 @@ Useful first checks:
 
 | Series | Reading |
 |---|---|
-| `flashblocks.proxy.upstream_messages` | **Absent** — not zero — means the upstream has delivered nothing; the proxy sends no subscribe request, it only reads. Labelled `upstream=<host:port>`: the path and query, which can carry an API key, are never used in labels or logs |
+| `flashblocks.proxy.upstream_messages` | **Absent** — not zero — means the upstream has delivered nothing; the proxy sends no subscribe request, it only reads. Counts slices placed on the broadcast channel: text frames within the size limit and binary frames that decode. Pings, pongs, close frames, read errors and dropped frames are not counted. Labelled `upstream=<host:port>`: the path and query, which can carry an API key, are never used in labels or logs |
+| `flashblocks.proxy.connections_by_app` | Upgrade attempts per application, counted once the key is accepted and **before** the rate limits run: an attempt then refused with 429 by `--per-ip-connection-limit` or `--instance-connection-limit` is counted too. It counts attempts, not open connections; use `active_connections` for those |
 | `flashblocks.proxy.upstream_connection_failures` | Growing means the upstream URI or network is wrong |
 | `flashblocks.proxy.active_connections` | Current downstream subscribers |
 | `flashblocks.proxy.lagged_connections` | Subscribers dropped for falling more than `--message-buffer-size` behind |
