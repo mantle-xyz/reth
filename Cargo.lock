@@ -5451,7 +5451,9 @@ dependencies = [
  "alloy-eips",
  "alloy-op-evm",
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-rpc-types-eth",
+ "alloy-rpc-types-trace",
  "alloy-serde",
  "async-trait",
  "jsonrpsee",
@@ -5461,15 +5463,22 @@ dependencies = [
  "op-revm",
  "reth-chainspec",
  "reth-errors",
+ "reth-evm",
  "reth-optimism-evm",
  "reth-optimism-forks",
  "reth-optimism-rpc",
  "reth-primitives-traits",
+ "reth-rpc",
+ "reth-rpc-api",
+ "reth-rpc-convert",
  "reth-rpc-eth-api",
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
  "reth-storage-api",
+ "reth-tasks",
  "reth-trie-common",
+ "revm",
+ "revm-inspectors",
  "serde",
  "serde_json",
  "tracing",
@@ -10798,7 +10807,7 @@ dependencies = [
 [[package]]
 name = "revm-inspectors"
 version = "0.41.4"
-source = "git+https://github.com/mantle-xyz/revm-inspectors?branch=dev%2Fmantle-v1.6.3#8122efc207cc2ccbaa54572ce64f8145f51fe40e"
+source = "git+https://github.com/mantle-xyz/revm-inspectors?branch=dev%2Fmantle-v1.7.0#6ae8f7d451e061993e131ca196298100de192603"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",

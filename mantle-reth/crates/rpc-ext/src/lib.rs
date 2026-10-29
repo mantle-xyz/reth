@@ -4,6 +4,8 @@
 //!
 //! - `eth_sendRawTransactionWithPreconf` — submits a raw transaction and returns a preconfirmation
 //!   event from the sequencer
+//! - `debug_traceBlock*` overrides that report a failed transaction trace per transaction, see
+//!   [`debug_trace`]
 //!
 //! # Preconfirmation types
 //!
@@ -17,6 +19,9 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
+
+pub mod debug_trace;
+pub use debug_trace::{MantleDebugTrace, MantleDebugTraceApiServer};
 
 use alloy_consensus::Header;
 use alloy_eips::{BlockId, BlockNumberOrTag};

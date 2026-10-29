@@ -18,7 +18,9 @@ use mantle_reth_preconf::{
     PreconfServiceBuilder, PreconfTxSet, admission::capacity_from_pool_config, bootstrap_whitelist,
     run_whitelist_watcher,
 };
-use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+use mantle_reth_rpc_ext::{
+    MantleDebugTrace, MantleDebugTraceApiServer, MantleEthApiExtServer, MantleRpcExt,
+};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, PrimitivesTy, TxTy};
@@ -710,6 +712,15 @@ where
     // duplicate method name fails, so remove-then-add to override it. The other methods in
     // this module are new names and are unaffected by the choice.
     ctx.modules.replace_configured(mantle_ext.into_rpc())?;
+
+    // A transaction whose trace fails gets `{"error": …}` instead of failing the whole
+    // `debug_traceBlock*` call, as on op-geth.
+    let debug_trace = MantleDebugTrace::new(
+        ctx.registry.debug_api(),
+        ctx.registry.eth_api().clone(),
+        ctx.config().rpc.rpc_max_tracing_requests,
+    );
+    ctx.modules.replace_configured(debug_trace.into_rpc())?;
     info!(target: "reth::cli", "Mantle RPC extensions registered");
 
     Ok(())
