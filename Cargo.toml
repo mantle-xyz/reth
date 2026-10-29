@@ -266,7 +266,7 @@ revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = 
 
 # ==================== REVM-INSPECTORS (Mantle fork: mantle-elysium branch) ====================
 # TODO: Switch to tag once mantle-elysium is tagged
-revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "dev/mantle-v1.6.3" }
+revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "dev/mantle-v1.7.0" }
 
 # ==================== ALLOY-EVM (upstream crates.io, no Mantle patches; see mantle-v2#359) ====================
 alloy-evm = { version = "0.37.0", default-features = false }
@@ -464,7 +464,7 @@ revm-inspector = { git = "https://github.com/mantle-xyz/revm", branch = "dev/man
 revm-context = { git = "https://github.com/mantle-xyz/revm", branch = "dev/mantle-v1.6.3" }
 revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = "dev/mantle-v1.6.3" }
 # revm-inspectors: mantle-xyz/revm-inspectors
-revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "dev/mantle-v1.6.3" }
+revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "dev/mantle-v1.7.0" }
 # op-revm moved out of mantle-xyz/revm into the mantle-v2 workspace when upstream
 # bluealloy dropped crates/op-revm after revm v107.
 op-revm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "dev/mantle-v1.6.3" }

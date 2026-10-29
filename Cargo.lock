@@ -10807,7 +10807,7 @@ dependencies = [
 [[package]]
 name = "revm-inspectors"
 version = "0.41.4"
-source = "git+https://github.com/mantle-xyz/revm-inspectors?branch=dev%2Fmantle-v1.6.3#8122efc207cc2ccbaa54572ce64f8145f51fe40e"
+source = "git+https://github.com/mantle-xyz/revm-inspectors?branch=dev%2Fmantle-v1.7.0#5924f494d021ae1e680a2e999963b1c6a6166d48"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",
