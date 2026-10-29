@@ -50,3 +50,13 @@ The default interval between simulated blocks comes from the chain's block-time
 hint, unless the caller provides a timestamp override. It is not universally
 two seconds: the development chain with ID 1337 uses a one-second interval,
 while Mantle mainnet and Sepolia use two seconds.
+
+## Metrics
+
+`flashblocks.consumer.upstream_messages_total` counts every item read from the
+upstream connection, not only slices: text and binary frames, pings, pongs,
+close frames and read errors all add one, as do frames that fail to decode
+(those also add to `flashblocks.consumer.upstream_decode_errors_total`). Its
+help text says "Slices received from upstream"; read it as messages read. The
+`_count` of `flashblocks.consumer.block_processing_duration` counts slices
+actually folded into the preview.
