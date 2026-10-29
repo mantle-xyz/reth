@@ -20,7 +20,11 @@ use reth_primitives_traits::SignedTransaction;
 pub struct BlockInvariants {
     /// Header fields a consumer needs to reconstruct the block.
     pub base: OpFlashblockPayloadBase,
-    /// Withdrawals for the block, repeated on every slice.
+    /// Withdrawals for the block, repeated in full on every slice — not a delta.
+    ///
+    /// The Mantle consumer concatenates the lists of a block's slices, which is
+    /// correct only while the list is empty, as OP consensus requires. Sending
+    /// a non-empty list means changing one side to match the other.
     pub withdrawals: Vec<Withdrawal>,
     /// Root of those withdrawals.
     pub withdrawals_root: B256,

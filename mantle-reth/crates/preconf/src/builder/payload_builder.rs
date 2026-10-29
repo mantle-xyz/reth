@@ -284,9 +284,10 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     /// preconf transactions and so has nothing to persist — `node.rs` skips
     /// opening a file there because the default config leaves its path unset.
     journal: Option<Arc<PreconfJournal>>,
-    /// Slice publishing, when it is switched on. `None` leaves the build loop
-    /// behaving exactly as it did before slicing existed, which is what makes
-    /// turning flashblocks off a real rollback rather than a second code path.
+    /// Slice publishing, when it is switched on. `None` stops slicing and
+    /// publishing, but executed pool transactions are still staged in the fifo
+    /// and claim their `(sender, nonce)` (see `apply_one_best_tx`), so it is
+    /// not a rollback to the loop as it was before slicing existed.
     flashblocks: Option<FlashblocksProducer>,
 }
 
@@ -1433,6 +1434,11 @@ where
     // announced, and pruned from the pool half a slot before the block could be
     // canonical. `Replay` because no client is waiting; `Announced` because
     // none was told. See `ClaimKind`.
+    //
+    // Staged with slicing off too, where nothing was announced or pruned. Then
+    // a block that is not taken replays it before the pool, and the claim
+    // makes the pool arm skip any other transaction on its `(sender, nonce)`
+    // until the claim is released.
     let signer = recovered.signer();
     let nonce = recovered.nonce();
     let staged: Option<TxEnvelope> =
@@ -1615,10 +1621,11 @@ fn block_invariants<B: reth_primitives_traits::Block>(sealed: &SealedBlock<B>) -
 /// Sender balances for pool maintenance, read from the parent state.
 ///
 /// The live mid-block balances are not reachable from here — the block builder
-/// holds the state for the whole build — so a sender who has already spent in
-/// this block reads higher than they now are. Only ever higher, which makes it
-/// a cost rather than a hazard: too much balance admits a transaction that
-/// execution then refuses, too little would withhold a good one.
+/// holds the state for the whole build — so every balance is the parent's. A
+/// sender who has spent in this block reads higher than they now are, which is
+/// a cost rather than a hazard: the pool admits a transaction that execution
+/// then refuses. A sender who has received in this block reads lower, and the
+/// pool parks a transaction that would succeed until this block is canonical.
 ///
 /// Measured: of three transfers spending a third of a balance each, the last
 /// falls short by the gas the first two burned, and the pool — told the parent
@@ -1717,10 +1724,11 @@ impl SliceState {
 
     /// Write this slice's transactions to the journal, then publish it.
     ///
-    /// The order is the whole point. A transaction a subscriber has been shown
-    /// has to land, so it must be on disk before anyone hears about it —
-    /// reversing this leaves a crash window in which a transaction was
-    /// announced but not persisted, which is the case the journal exists for.
+    /// Writing first lets a restart replay what subscribers were shown. For an
+    /// ordinary transaction that is best-effort recovery, not a promise to land
+    /// it: it is written as `ClaimKind::Announced`, and one that cannot be
+    /// replayed is dropped and counted in `preconf.tx.announced_dropped_total`,
+    /// not reported as a broken commitment.
     ///
     /// The write stays outside the cancel gate because it cannot go inside:
     /// [`JobCancel::unless_abandoned`] takes a synchronous closure. The cost is
@@ -2260,9 +2268,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         let slot_deadline =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(attrs_timestamp);
         // With slicing on, the tick is what publishes, so its cadence is the
-        // slice interval. With it off the cadence is what preconf always used,
-        // which is what keeps turning the feature off a true rollback rather
-        // than a second code path.
+        // slice interval. With it off the cadence is what preconf always used.
         let flashblock_cfg = self.flashblocks.as_ref().map(|producer| producer.cfg.as_ref());
         let tick_interval =
             crate::flashblocks::tick_interval(flashblock_cfg, self.cfg.sweep_interval);

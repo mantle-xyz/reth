@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// **`Success` is not terminal either**: an entry still in the fifo means
 /// "applied to an in-flight builder whose block was never canon'd" — the
 /// `PayloadJob` prologue's canon-forward (`sync_fifo_forward_to_head` →
-/// `PreconfTxSet::forward`) drops it once the sender's nonce moves past. Stale
+/// `PreconfTxSet::forward_all`) drops it once the sender's nonce moves past. Stale
 /// `Success` entries are reset to `Waiting` and replayed against the new
 /// builder, honouring the SLA "receipt returned → tx must land on chain". The
 /// presence of the entry is the "in-flight, not canon" flag; no separate
@@ -238,8 +238,10 @@ pub enum PreconfError {
     /// Distinct from [`Self::BuilderRejected`], which reports the same class of
     /// apply failure on a live RPC submission — one the client is still waiting
     /// on and can simply retry. This one says a promise already made cannot be
-    /// kept. There is no retry: every transient cause is filtered out before
-    /// apply (see `builder::dispatch::apply_one_preconf`).
+    /// kept. There is no retry, and only capacity is checked before apply; an
+    /// EVM rejection that could clear in a later block (base fee, balance,
+    /// nonce ahead of the chain) also ends here. See
+    /// `builder::dispatch::apply_one_preconf`.
     #[error(
         "preconf commitment cannot be honored: apply was rejected after the receipt was returned"
     )]

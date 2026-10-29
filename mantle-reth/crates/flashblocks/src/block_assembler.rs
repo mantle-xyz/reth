@@ -79,6 +79,8 @@ impl BlockAssembler {
             .flat_map(|flashblock| flashblock.diff.transactions.clone())
             .collect();
 
+        // The producer repeats the block's full list on every slice, so this
+        // concatenation is right only because OP consensus keeps it empty.
         let withdrawals: Vec<Withdrawal> =
             flashblocks.iter().flat_map(|flashblock| flashblock.diff.withdrawals.clone()).collect();
 

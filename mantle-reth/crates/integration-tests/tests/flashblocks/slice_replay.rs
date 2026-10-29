@@ -4,7 +4,7 @@
 //! transaction reaches the file (`slice_journal`), and that a hand-written file
 //! is replayed correctly (`preconf::restart_replay`). This joins them: one node
 //! slices a block and writes what it announced, another starts against the same
-//! file and has to land all of it.
+//! file and lands all of it.
 //!
 //! The first node is left running rather than shut down. A journal only has to
 //! survive a process that did not get to clean up, and shutting down cleanly
@@ -138,9 +138,9 @@ fn ordinary_transactions(payload: &reth_optimism_node::OpBuiltPayload) -> Vec<B2
 /// Everything a slice announced comes back, in the order it executed.
 ///
 /// The first node slices a block it never seals. The second starts against the
-/// journal that block left behind and builds the same height — and every
-/// transaction subscribers were shown has to be in it, or someone watched a
-/// transaction that then vanished.
+/// journal that block left behind and builds the same height, replaying every
+/// transaction subscribers were shown. For an ordinary transaction this replay
+/// is best-effort, not a promise: here nothing stands in its way, so all land.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_process_lands_everything_the_slices_announced() {
     let sender = Wallet::default().inner.address();

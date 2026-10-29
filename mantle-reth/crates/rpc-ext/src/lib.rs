@@ -70,10 +70,10 @@ use tracing::debug;
 ///   produced; before that, queueing is only queueing and reserves no nonce.
 /// - **Everything else is a prediction of one particular build.** If that in-flight block is
 ///   discarded (a competing block takes the height, the payload job is superseded, the process
-///   restarts), the sequencer re-applies the transaction to a *later* block — honouring the
-///   promise, but against different state. `block_height`, `status` and `receipt.logs` are all
-///   recomputed then, and the client is **not** sent a corrected event: the response to this call
-///   has already been delivered.
+///   restarts), the sequencer re-applies the transaction to another block — a rebuild at the same
+///   height or a later one — honouring the promise, but against different state. `block_height`,
+///   `status` and `receipt.logs` are all recomputed then, and the client is **not** sent a
+///   corrected event: the response to this call has already been delivered.
 /// - The fields added to `receipt` are all **positions and figures from one particular build**.
 ///   `transactionIndex`, `cumulativeGasUsed` and each log's `logIndex` say where this transaction
 ///   sat in the block that was being built; a replay puts it somewhere else, and no corrected event
@@ -106,8 +106,9 @@ pub struct PreconfTxEvent {
     ///
     /// Computed as `parent_number + 1` for the block being built when this
     /// preconfirmation was issued. If that block is discarded the transaction
-    /// lands at a **later** height and this value is never corrected. Use
-    /// `eth_getTransactionReceipt` for the authoritative height.
+    /// lands in another block, at the same height or a later one, and this
+    /// value is never corrected. Use `eth_getTransactionReceipt` for the
+    /// authoritative height.
     #[serde(with = "alloy_serde::quantity")]
     pub block_height: u64,
     /// Preconfirmation transaction receipt
