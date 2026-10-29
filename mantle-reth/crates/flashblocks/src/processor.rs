@@ -1434,7 +1434,6 @@ impl<Client> StateProcessor<Client> {
         ChainSpec: OpHardforks + EthChainSpec + Clone,
     {
         pending_blocks_builder.with_transaction_sender(tx_hash, sender);
-        pending_blocks_builder.increment_nonce(sender);
 
         let executed_transaction = pending_state_builder
             .execute_transaction(idx, Recovered::new_unchecked(transaction, sender))?;

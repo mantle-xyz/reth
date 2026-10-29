@@ -3,9 +3,7 @@
 //! Slices are injected straight into the state processor and awaited; the
 //! websocket subscriber is not started.
 
-use mantle_reth_flashblocks::{
-    FlashblocksAPI, FlashblocksReceiver, FlashblocksState, PendingBlocksAPI,
-};
+use mantle_reth_flashblocks::{FlashblocksReceiver, FlashblocksState};
 
 use alloy_primitives::{U256, keccak256};
 use alloy_rpc_types_engine::PayloadId;
@@ -387,21 +385,16 @@ async fn a_transaction_with_a_non_canonical_encoding_is_rejected() {
     assert_eq!(pending.pending_transaction_count(), 1);
 }
 
-/// The overlay reports the canonical block it was built on; with no overlay the base
-/// stays `pending` so the standard implementation keeps serving that tag.
+/// The overlay reports the canonical block it was built on.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_overlay_reports_its_canonical_base() {
     let (harness, _node) = launch!();
 
-    assert_eq!(
-        harness.state().get_pending_blocks().get_canonical_block_number(),
-        alloy_rpc_types_eth::BlockNumberOrTag::Pending,
-        "no overlay yet, so `pending` passes through"
-    );
+    assert!(harness.pending().is_none(), "no slice yet, so no overlay");
 
     harness.send(base_slice(1)).await;
 
-    let base = harness.state().get_pending_blocks().get_canonical_block_number();
+    let base = harness.pending().expect("overlay").canonical_block_number();
     assert_eq!(base, alloy_rpc_types_eth::BlockNumberOrTag::Number(0), "block 1 sits on genesis");
 }
 

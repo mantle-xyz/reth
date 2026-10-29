@@ -105,7 +105,7 @@ pub use state_builder::{ExecutedPendingTransaction, PendingStateBuilder};
 mod subscription;
 pub use subscription::FlashblocksSubscriber;
 mod traits;
-pub use traits::{FlashblocksAPI, FlashblocksReceiver, PendingBlocksAPI};
+pub use traits::{FlashblocksAPI, FlashblocksReceiver};
 
 mod validation;
 pub use validation::{

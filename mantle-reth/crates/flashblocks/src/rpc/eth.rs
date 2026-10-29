@@ -13,19 +13,18 @@
 //! `eth_getLogs` serves the tip and below from the canonical chain and
 //! the range above it from the preview.
 //!
-//! # Four overlay representations, and what is not covered
+//! # Three overlay representations, and what is not covered
 //!
-//! The overlay keeps the same execution in four separately maintained shapes on
+//! The overlay keeps the same execution in three separately maintained shapes on
 //! [`PendingBlocks`], and each overridden method answers from exactly one:
 //!
 //! | Source | Methods served from it |
 //! |---|---|
-//! | [`BundleState`] | `eth_getCode`, `eth_getStorageAt` |
+//! | [`BundleState`] | `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` |
 //! | `state_overrides` | `eth_call`, `eth_estimateGas`, `eth_simulateV1` |
 //! | `account_balances` | `eth_getBalance` |
-//! | `transaction_count` (a delta added to the canonical count) | `eth_getTransactionCount` |
 //!
-//! Nothing keeps the four in step, so do not assume they agree on a given
+//! Nothing keeps the three in step, so do not assume they agree on a given
 //! account or slot. The bundle is the widest of them — it also carries the
 //! EIP-4788 and EIP-2935 pre-execution writes and the writes of a cached replay.
 //!
@@ -55,6 +54,7 @@ use jsonrpsee::{
 };
 use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use op_alloy_network::Optimism;
+use reth_chain_state::CanonStateNotification;
 use reth_chainspec::ChainSpecProvider;
 use reth_execution_types::BlockReceipts;
 use reth_optimism_forks::OpHardforks;
@@ -66,7 +66,10 @@ use reth_rpc_eth_api::{
     helpers::{EthBlocks, EthCall, EthState, EthTransactions, FullEthApi, LoadPendingBlock},
 };
 use reth_rpc_eth_types::EthApiError;
-use tokio::{sync::broadcast::error::RecvError, time};
+use tokio::{
+    sync::broadcast::{self, error::RecvError},
+    time,
+};
 use tracing::{debug, trace, warn};
 
 use crate::{FlashblocksAPI, PendingBlocks, metrics::Metrics};
@@ -204,7 +207,8 @@ pub trait EthApiOverride {
 
     /// Sends a raw transaction and waits for its receipt from either a
     /// flashblock or a canonical block, whichever answers first, until
-    /// `timeout_ms` elapses.
+    /// `timeout_ms` elapses. A receipt already on the chain or in the preview
+    /// when the transaction is sent is returned at once.
     #[method(name = "sendRawTransactionSync")]
     async fn send_raw_transaction_sync(
         &self,
@@ -321,11 +325,7 @@ where
             return Ok(Some(receipt));
         }
 
-        if let Some((pending, tip)) = self.fresh_pending() &&
-            let Some(receipt) = pending
-                .get_receipt(tx_hash)
-                .filter(|receipt| receipt.inner.block_number.is_some_and(|number| number > tip))
-        {
+        if let Some(receipt) = self.fresh_preview_receipt(tx_hash) {
             Metrics::rpc_get_transaction_receipt().increment(1);
             return to_value(receipt).map(Some);
         }
@@ -401,18 +401,16 @@ where
 
         if block_id.is_pending() {
             Metrics::rpc_get_transaction_count().increment(1);
-            let (base, fb_count) = match self.fresh_pending() {
-                Some((pending, _)) => {
-                    (BlockId::from(pending.parent_hash()), pending.get_transaction_count(address))
-                }
-                None => (BlockId::latest(), U256::ZERO),
+            let base = match self.fresh_pending() {
+                Some((pending, _)) => match pending.get_nonce(address) {
+                    Some(nonce) => return Ok(U256::from(nonce)),
+                    None => BlockId::from(pending.parent_hash()),
+                },
+                None => BlockId::latest(),
             };
-
-            let canon_count = EthState::transaction_count(&self.eth_api, address, Some(base))
+            return EthState::transaction_count(&self.eth_api, address, Some(base))
                 .await
-                .map_err(Into::into)?;
-
-            return Ok(canon_count + fb_count);
+                .map_err(Into::into);
         }
 
         EthState::transaction_count(&self.eth_api, address, block_number).await.map_err(Into::into)
@@ -449,10 +447,6 @@ where
         // Taken literally it is a `sleep(0)`, which times the caller out
         // before the transaction could possibly land — an answer that is
         // always wrong, so there is nothing to preserve in honouring it.
-        //
-        // Refusing an over-long timeout, by contrast, is left alone: upstream
-        // clamps instead, but which of the two is right is a question about
-        // what the client should be told, not a bug. See `API-A`.
         let timeout_ms = match timeout_ms.filter(|ms| *ms > 0) {
             Some(ms) if ms > MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS => {
                 return Err(ErrorObjectOwned::owned(
@@ -467,6 +461,11 @@ where
             None => MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS,
         };
 
+        // Subscribed before sending: a receipt published from here on reaches a
+        // waiter, and one published earlier is found by the lookup below.
+        let previews = self.flashblocks_state.subscribe_to_flashblocks();
+        let canonical = self.eth_api.provider().subscribe_to_canonical_state();
+
         let tx_hash = EthTransactions::send_raw_transaction(&self.eth_api, transaction).await?;
 
         debug!(
@@ -475,14 +474,22 @@ where
             timeout_ms = timeout_ms,
         );
 
-        let timeout = Duration::from_millis(timeout_ms);
-        let receipt = tokio::select! {
-            receipt = self.wait_for_flashblocks_receipt(tx_hash) => receipt,
-            receipt = self.wait_for_canonical_receipt(tx_hash) => receipt,
-            _ = time::sleep(timeout) => None,
-        };
+        // The transaction is already sent; a failed lookup here must not read as a failed send.
+        if let Some(receipt) = self.canonical_receipt(tx_hash).await.ok().flatten() {
+            return Ok(receipt);
+        }
+        if let Some(receipt) = self.fresh_preview_receipt(tx_hash) {
+            return to_value(receipt);
+        }
 
-        match receipt {
+        let timeout = Duration::from_millis(timeout_ms);
+        match first_receipt(
+            self.wait_for_flashblocks_receipt(tx_hash, previews),
+            self.wait_for_canonical_receipt(tx_hash, canonical),
+            timeout,
+        )
+        .await
+        {
             Some(receipt) => to_value(receipt),
             None => Err(EthApiError::TransactionConfirmationTimeout {
                 hash: tx_hash,
@@ -664,6 +671,16 @@ where
         }
     }
 
+    /// The preview's receipt for `tx_hash`, if the preview leads the tip and
+    /// holds the transaction in a block above it.
+    fn fresh_preview_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Optimism>> {
+        let (pending, tip) = self.fresh_pending()?;
+        pending
+            .get_receipt(tx_hash)
+            .filter(|receipt| receipt.inner.block_number.is_some_and(|number| number > tip))
+            .cloned()
+    }
+
     async fn canonical_receipt(&self, tx_hash: TxHash) -> RpcResult<Option<serde_json::Value>> {
         match EthTransactions::transaction_receipt(&self.eth_api, tx_hash).await? {
             Some(receipt) => to_value(receipt).map(Some),
@@ -683,9 +700,11 @@ where
         }
     }
 
-    async fn wait_for_flashblocks_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Optimism>> {
-        let mut receiver = self.flashblocks_state.subscribe_to_flashblocks();
-
+    async fn wait_for_flashblocks_receipt(
+        &self,
+        tx_hash: TxHash,
+        mut receiver: broadcast::Receiver<Arc<PendingBlocks>>,
+    ) -> Option<RpcReceipt<Optimism>> {
         loop {
             match receiver.recv().await {
                 Ok(pending_state) if pending_state.get_receipt(tx_hash).is_some() => {
@@ -706,9 +725,11 @@ where
         }
     }
 
-    async fn wait_for_canonical_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Optimism>> {
-        let mut receiver = self.eth_api.provider().subscribe_to_canonical_state();
-
+    async fn wait_for_canonical_receipt<N: NodePrimitives>(
+        &self,
+        tx_hash: TxHash,
+        mut receiver: broadcast::Receiver<CanonStateNotification<N>>,
+    ) -> Option<RpcReceipt<Optimism>> {
         crate::await_canonical_match("send_raw_transaction_sync", &mut receiver, |canon_state| {
             names_a_canonical_receipt(&canon_state.block_receipts(), tx_hash)
         })
@@ -727,6 +748,22 @@ fn names_a_canonical_receipt<R>(receipts: &[(BlockReceipts<R>, bool)], tx_hash: 
     receipts.iter().any(|(block_receipt, reverted)| {
         !reverted && block_receipt.tx_receipts.iter().any(|(canonical, _)| *canonical == tx_hash)
     })
+}
+
+/// The first receipt either waiter yields within `timeout`.
+///
+/// A waiter that gives up (`None`: its channel closed, or the lookup after a
+/// match found nothing) drops out rather than ending the wait.
+async fn first_receipt<R>(
+    preview: impl Future<Output = Option<R>>,
+    canonical: impl Future<Output = Option<R>>,
+    timeout: Duration,
+) -> Option<R> {
+    tokio::select! {
+        Some(receipt) = preview => Some(receipt),
+        Some(receipt) = canonical => Some(receipt),
+        () = time::sleep(timeout) => None,
+    }
 }
 
 #[cfg(test)]
@@ -771,5 +808,36 @@ mod canonical_receipt_tests {
         let other = B256::from([8; 32]);
 
         assert!(!names_a_canonical_receipt(&[receipts_naming(other, false)], tx_hash));
+    }
+}
+
+#[cfg(test)]
+mod first_receipt_tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_waiter_that_gives_up_does_not_end_the_wait() {
+        let canonical = async {
+            time::sleep(Duration::from_millis(20)).await;
+            Some(1u8)
+        };
+        assert_eq!(first_receipt(async { None }, canonical, Duration::from_secs(5)).await, Some(1));
+
+        let preview = async {
+            time::sleep(Duration::from_millis(20)).await;
+            Some(2u8)
+        };
+        assert_eq!(first_receipt(preview, async { None }, Duration::from_secs(5)).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn the_wait_times_out_once_both_waiters_give_up() {
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+
+        assert_eq!(first_receipt(async { None::<u8> }, async { None }, timeout).await, None);
+        assert!(started.elapsed() >= timeout, "two waiters giving up must not end the wait early");
     }
 }

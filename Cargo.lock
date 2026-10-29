@@ -5327,6 +5327,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
+ "alloy-signer",
  "alloy-signer-local",
  "eyre",
  "futures",
