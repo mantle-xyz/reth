@@ -646,6 +646,19 @@ where
                     StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
                     }) => {
+                        if previous.is_some() {
+                            // With a preview held, only its own anchor can be missing, so
+                            // the preview must not be served any longer.
+                            warn!(
+                                message = "canonical anchor of the overlay is gone, dropping the overlay",
+                                error = %e,
+                            );
+                            Metrics::block_processing_error().increment(1);
+                            self.clear_live_state();
+                            self.pending_blocks.swap(None);
+                            self.cache_or_drop(flashblock, "pending canonical block").await;
+                            return;
+                        }
                         let inserted = self.cache.lock().await.insert_resumable(flashblock);
                         if inserted {
                             debug!(message = "cached flashblock pending canonical block", error = %e);

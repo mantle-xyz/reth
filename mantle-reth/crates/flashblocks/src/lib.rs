@@ -28,9 +28,9 @@
 //! [`PROCESSOR_RESTART_DELAY`]. Only slices set aside without being applied
 //! leave the overlay in place: duplicates, superseded slices, `MissingFirstFlashblock`
 //! and `NonConsecutiveBlock`, slices past the leading depth, and slices cached
-//! until their canonical parent lands. A recovery that would shorten the gap is
-//! worth adding; one that would narrow it by accepting slices from a build this
-//! node did not follow is not.
+//! until their canonical parent lands while there is no overlay to keep. A
+//! recovery that would shorten the gap is worth adding; one that would narrow
+//! it by accepting slices from a build this node did not follow is not.
 //!
 //! # A prefix cannot answer a question about a sealed block
 //!
