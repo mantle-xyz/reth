@@ -6,11 +6,14 @@
 
 use std::sync::Arc;
 
+use alloy_eips::eip7702::{Authorization, SignedAuthorization};
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, bytes, hex, keccak256};
 use alloy_rpc_types_engine::{PayloadAttributes, PayloadId};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
 use mantle_reth_chainspec::from_mantle_genesis;
 use mantle_reth_flashblocks::{FlashblocksAPI, FlashblocksState, PendingBlocks};
 use mantle_reth_flashblocks_types::{MantleFlashblockMetadata, MantleFlashblockPayload};
@@ -459,6 +462,11 @@ pub fn test_sender() -> Address {
     Wallet::default().inner.address()
 }
 
+/// Signer of [`test_sender`].
+pub fn test_signer() -> PrivateKeySigner {
+    Wallet::default().inner
+}
+
 /// Signs a contract creation from [`test_sender`] for inclusion in a slice.
 pub async fn signed_deploy(nonce: u64, init_code: Bytes) -> Bytes {
     let request = TransactionRequest {
@@ -503,6 +511,48 @@ pub async fn signed_call_with_fees(
         max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
         value: Some(value),
         input: TransactionInput::default(),
+        ..Default::default()
+    };
+    TransactionTestContext::sign_tx(
+        Wallet::default().with_chain_id(TEST_CHAIN_ID).inner.clone(),
+        request,
+    )
+    .await
+    .encoded_2718()
+    .into()
+}
+
+/// A second key from the test mnemonic, unfunded in genesis: an EIP-7702
+/// authority that is not the transaction's sender.
+pub fn second_signer() -> PrivateKeySigner {
+    Wallet::new(2).wallet_gen().remove(1)
+}
+
+/// Signs an EIP-7702 authorization delegating `signer`'s account to `delegate`.
+pub fn signed_authorization(
+    signer: &PrivateKeySigner,
+    delegate: Address,
+    nonce: u64,
+) -> SignedAuthorization {
+    let authorization =
+        Authorization { chain_id: U256::from(TEST_CHAIN_ID), address: delegate, nonce };
+    let signature =
+        signer.sign_hash_sync(&authorization.signature_hash()).expect("a local key signs");
+    authorization.into_signed(signature)
+}
+
+/// Signs a type-4 (EIP-7702) call from [`test_sender`] to [`LOGGER`] carrying
+/// `authorizations`.
+pub async fn signed_set_code(nonce: u64, authorizations: Vec<SignedAuthorization>) -> Bytes {
+    let request = TransactionRequest {
+        chain_id: Some(TEST_CHAIN_ID),
+        nonce: Some(nonce),
+        to: Some(TxKind::Call(LOGGER)),
+        gas: Some(200_000),
+        max_fee_per_gas: Some(20_000_000_000),
+        max_priority_fee_per_gas: Some(20_000_000_000),
+        value: Some(U256::ZERO),
+        authorization_list: Some(authorizations),
         ..Default::default()
     };
     TransactionTestContext::sign_tx(

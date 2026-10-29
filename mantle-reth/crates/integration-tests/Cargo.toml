@@ -99,6 +99,9 @@ alloy-rpc-types-eth = { workspace = true }
 alloy-rpc-types-engine = { workspace = true }
 alloy-network = { workspace = true }
 alloy-op-hardforks = { workspace = true }
+# alloy-signer — `SignerSync::sign_hash_sync` signs the EIP-7702 authorizations
+# the pending-nonce tests put into slices.
+alloy-signer = { workspace = true }
 # alloy-signer-local — `PrivateKeySigner` type named by the journal-rotation
 # test's per-sender signing helper (`Wallet::wallet_gen()` element type).
 alloy-signer-local = { workspace = true }

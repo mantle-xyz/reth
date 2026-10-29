@@ -10,8 +10,9 @@ use mantle_reth_flashblocks::EthApiOverrideServer;
 
 use crate::consumer_helpers::{
     DEPLOY_INIT_CODE, DEPLOYED_RUNTIME, FlashblockBuilder, LOGGER, SETTER, SETTER_SLOT,
-    SETTER_UNWRITTEN_SLOT, SETTER_UNWRITTEN_VALUE, SETTER_VALUE, l1_info_deposit,
-    launch_flashblocks_consumer, signed_call, signed_deploy, test_sender,
+    SETTER_UNWRITTEN_SLOT, SETTER_UNWRITTEN_VALUE, SETTER_VALUE, base_slice, l1_info_deposit,
+    launch_flashblocks_consumer, second_signer, signed_authorization, signed_call, signed_deploy,
+    signed_set_code, test_sender, test_signer,
 };
 
 /// Value the overlay's user transaction moves into [`LOGGER`].
@@ -1086,9 +1087,9 @@ async fn get_balance_sees_the_overlay_only_under_pending() {
     assert_eq!(latest, U256::ZERO, "canonical state is untouched");
 }
 
-/// `eth_getTransactionCount` adds the overlay's nonce bumps to the canonical count.
+/// `eth_getTransactionCount` at `pending` reads the overlay's absolute nonce.
 #[tokio::test(flavor = "multi_thread")]
-async fn get_transaction_count_adds_the_overlay_to_canonical() {
+async fn get_transaction_count_reads_the_overlay_nonce() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
@@ -1105,6 +1106,156 @@ async fn get_transaction_count_adds_the_overlay_to_canonical() {
         .await
         .expect("query");
     assert_eq!(latest, U256::ZERO, "canonical state is untouched");
+}
+
+/// The pending nonce of a contract the preview created is its absolute nonce,
+/// whichever block of the preview wrote it.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_counts_a_created_contract_across_every_block_of_the_preview() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), signed_deploy(0, DEPLOY_INIT_CODE).await])
+                .build(),
+        )
+        .await;
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 0)
+                .transactions(vec![l1_info_deposit(2), signed_call(1, LOGGER, VALUE).await])
+                .build(),
+        )
+        .await;
+    let preview = harness.pending().expect("the slices open a preview");
+    assert_eq!((preview.earliest_block_number(), preview.latest_block_number()), (1, 2));
+
+    let pending = || Some(BlockNumberOrTag::Pending.into());
+    let contract = test_sender().create(0);
+    // EIP-161: a new contract starts at 1. It was written in block 1 only.
+    assert_eq!(api.get_transaction_count(contract, pending()).await.unwrap(), U256::from(1));
+    assert_eq!(api.get_transaction_count(test_sender(), pending()).await.unwrap(), U256::from(2));
+    assert_eq!(
+        api.get_transaction_count(contract, Some(BlockNumberOrTag::Latest.into())).await.unwrap(),
+        U256::ZERO,
+    );
+}
+
+/// A contract that CREATEs bumps its own nonce, which only the overlay knows.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_counts_creates_made_by_a_contract() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw = signed_deploy(0, FACTORY_INIT_CODE).await;
+    let tx_hash = keccak256(&raw);
+    harness
+        .send(FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw]).build())
+        .await;
+
+    let receipt = api.get_transaction_receipt(tx_hash).await.unwrap().unwrap();
+    assert_eq!(receipt["status"], "0x1");
+    let pending = || Some(BlockNumberOrTag::Pending.into());
+    let factory = test_sender().create(0);
+    // Created at 1, then one CREATE of its own.
+    assert_eq!(api.get_transaction_count(factory, pending()).await.unwrap(), U256::from(2));
+    // The child is created and destroyed in one transaction, so revm keeps no
+    // bundle entry for it: this read takes the canonical fallback, not the
+    // destroyed-account branch.
+    let child = factory.create(1);
+    assert_eq!(api.get_transaction_count(child, pending()).await.unwrap(), U256::ZERO);
+}
+
+/// The authority of an EIP-7702 authorization is not the sender, yet its nonce
+/// moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_bumps_an_eip7702_authority() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let authority = second_signer();
+    let auth = signed_authorization(&authority, SETTER, 0);
+    let raw = signed_set_code(0, vec![auth]).await;
+    let tx_hash = keccak256(&raw);
+    harness
+        .send(FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw]).build())
+        .await;
+
+    let receipt = api.get_transaction_receipt(tx_hash).await.unwrap().unwrap();
+    assert_eq!(receipt["status"], "0x1");
+    let pending = || Some(BlockNumberOrTag::Pending.into());
+    let marker = Bytes::from([&[0xef, 0x01, 0x00][..], SETTER.as_slice()].concat());
+    assert_eq!(
+        api.get_code(authority.address(), pending()).await.unwrap(),
+        marker,
+        "the authorization must have taken effect"
+    );
+
+    assert_eq!(
+        api.get_transaction_count(authority.address(), pending()).await.unwrap(),
+        U256::from(1),
+    );
+    assert_eq!(
+        api.get_transaction_count(authority.address(), Some(BlockNumberOrTag::Latest.into()))
+            .await
+            .unwrap(),
+        U256::ZERO,
+    );
+    assert_eq!(api.get_transaction_count(test_sender(), pending()).await.unwrap(), U256::from(1));
+}
+
+/// A sender that authorizes itself is bumped twice: once for the transaction,
+/// once for the authorization.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_counts_both_bumps_of_a_self_paid_eip7702_transaction() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let sender = test_signer();
+    // The transaction's own nonce bump comes first, so the authorization is
+    // checked against nonce 1.
+    let auth = signed_authorization(&sender, SETTER, 1);
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), signed_set_code(0, vec![auth]).await])
+                .build(),
+        )
+        .await;
+
+    let pending = || Some(BlockNumberOrTag::Pending.into());
+    let marker = Bytes::from([&[0xef, 0x01, 0x00][..], SETTER.as_slice()].concat());
+    assert_eq!(
+        api.get_code(test_sender(), pending()).await.unwrap(),
+        marker,
+        "the authorization must have taken effect"
+    );
+    assert_eq!(api.get_transaction_count(test_sender(), pending()).await.unwrap(), U256::from(2));
+}
+
+/// An account the preview never touched keeps its canonical nonce.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_nonce_of_an_account_the_preview_never_touched_is_canonical() {
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    node.rpc.inject_tx(signed_call(0, LOGGER, U256::ZERO).await).await.unwrap();
+    crate::consumer_helpers::mine_canonical_block!(node);
+
+    harness.send(base_slice(2)).await;
+    let preview = harness.pending().expect("the slice opens a preview");
+    assert_eq!(preview.latest_block_number(), 2);
+    assert_eq!(preview.get_nonce(test_sender()), None);
+
+    assert_eq!(
+        api.get_transaction_count(test_sender(), Some(BlockNumberOrTag::Pending.into()))
+            .await
+            .unwrap(),
+        U256::from(1),
+    );
 }
 
 /// `eth_getLogs` appends the overlay's logs when the range ends at `pending`.
@@ -1503,8 +1654,7 @@ async fn send_raw_transaction_sync_returns_the_flashblock_receipt() {
         FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw.clone()]).build();
 
     let announce = async {
-        // The call subscribes to the flashblock broadcast before waiting; the
-        // broadcast has no replay, so the slice must not land before it does.
+        // Lands after the call's own lookup, so the broadcast is what answers.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         harness.send(slice).await;
     };
@@ -1513,6 +1663,70 @@ async fn send_raw_transaction_sync_returns_the_flashblock_receipt() {
     let receipt = receipt.expect("the slice carries the transaction");
     assert_eq!(receipt["transactionHash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
     assert_eq!(receipt["status"], "0x1");
+}
+
+/// A transaction the preview already holds when it is sent is answered at
+/// once: the preview broadcast has no replay, so waiting for a later slice
+/// would time out.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_raw_transaction_sync_returns_at_once_when_the_preview_already_holds_it() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw = signed_call(0, LOGGER, VALUE).await;
+    let tx_hash = keccak256(&raw);
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), raw.clone()])
+                .build(),
+        )
+        .await;
+
+    let receipt = api
+        .send_raw_transaction_sync(raw, Some(2_000))
+        .await
+        .expect("the preview already holds it");
+    assert_eq!(receipt["transactionHash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
+    assert_eq!(receipt["status"], "0x1");
+}
+
+/// The lookup right after sending skips a preview receipt in a block the
+/// canonical tip has already reached, even while the preview as a whole still
+/// leads the tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_raw_transaction_sync_ignores_a_preview_receipt_the_tip_has_passed() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+
+    let raw = signed_call(0, LOGGER, VALUE).await;
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), raw.clone()])
+                .build(),
+        )
+        .await;
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0).prev(1, 0).transactions(vec![l1_info_deposit(2)]).build(),
+        )
+        .await;
+
+    // Canonical block 1 holds only the deposit, so the pool still takes nonce 0.
+    // The consumer is not told about it, so the preview keeps its block 1 and
+    // still leads the tip: only the RPC's block-number filter is under test.
+    assert_eq!(mine_canonical_block!(node).number, 1);
+    let pending = harness.pending().expect("the consumer was not told about canonical block 1");
+    assert_eq!(pending.latest_block_number(), 2);
+
+    let error = api
+        .send_raw_transaction_sync(raw, Some(500))
+        .await
+        .expect_err("the preview's block 1 is behind the tip");
+    assert!(error.message().contains("wasn't confirmed"), "unexpected error: {error}");
 }
 
 /// Opens an overlay at block 1 whose user transaction calls [`SETTER`], so the
@@ -1559,6 +1773,41 @@ async fn pending_partial_account_overrides_preserve_preview_storage() {
         api.call(request, Some(BlockNumberOrTag::Latest.into()), Some(user), None,).await.is_err(),
         "the canonical slot is still zero"
     );
+}
+
+/// A user code override in `eth_simulateV1` must retain preview storage.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_simulation_partial_account_overrides_preserve_preview_storage() {
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    overlay_with_storage_write!(harness);
+    let api = MantleRpcExt::new(
+        node.inner.provider.clone(),
+        node.rpc.inner.eth_api().clone().into(),
+        None,
+        None,
+    )
+    .with_pending_overrides(Some(harness.state().clone()));
+    // Read slot 1, revert unless it is 7, then return the value.
+    let request = serde_json::json!({ "blockStateCalls": [{
+        "stateOverrides": { format!("{SETTER:#x}"): {
+            "code": "0x60015480600714600d575f5ffd5b5f5260205ff3"
+        } },
+        "calls": [{ "from": test_sender(), "to": SETTER }]
+    }] });
+    let pending = api
+        .simulate_v1(request.clone(), Some(BlockNumberOrTag::Pending.into()))
+        .await
+        .expect("pending simulation");
+    assert_eq!(pending[0]["calls"][0]["status"], "0x1");
+    let output: Bytes =
+        serde_json::from_value(pending[0]["calls"][0]["returnData"].clone()).expect("return data");
+    assert_eq!(U256::from_be_slice(&output), U256::from(SETTER_VALUE));
+    let latest = api
+        .simulate_v1(request, Some(BlockNumberOrTag::Latest.into()))
+        .await
+        .expect("latest simulation");
+    assert_eq!(latest[0]["calls"][0]["status"], "0x0", "the canonical slot is still zero");
 }
 
 /// `eth_getStorageAt` sees the overlay's write under `pending` only.
