@@ -30,6 +30,7 @@ mod full_receipt;
 mod gas_budgets;
 mod happy_path;
 mod insufficient_funds;
+mod journal_order;
 mod journal_rotation;
 mod journal_size_rotation;
 mod journal_write;

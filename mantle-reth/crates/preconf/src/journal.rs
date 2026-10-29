@@ -12,15 +12,14 @@
 //! [`PreconfJournal::rotate`], and restore asks `Commitments::is_tracked`. A
 //! second, journal-local rule could drop a record the registry still holds.
 //!
-//! **Two writers.** [`PreconfJournal::append_promised`] records a commitment
-//! from the apply; [`PreconfJournal::append_batch`] records a whole slice,
-//! ordinary pool transactions included (as [`ClaimKind::Announced`]). A line
-//! survives rotation while the registry tracks its hash.
-//!
-//! With flashblocks off only commitments are written, so a restart replays
-//! them without the ordinary transactions they executed after; a commitment
-//! that depended on one of those fails on replay. See
-//! `builder::payload_builder`'s pool arm.
+//! **Written in execution order.** An ordinary pool transaction is held in
+//! memory as it executes ([`PreconfJournal::hold`], as [`ClaimKind::Announced`])
+//! and written by the next write: a commitment's ([`PreconfJournal::append_promised`]),
+//! a slice boundary's, or the next build's before it replays anything
+//! ([`PreconfJournal::flush`]). A restart replays the file in order, so a
+//! commitment that depends on a transaction executed before it finds that
+//! transaction first. A line survives rotation while the registry tracks its
+//! hash.
 //!
 //! Besides the write and rotation API, the module provides the startup helper
 //! [`restore_preconf_state`] and the background loop [`spawn_rejournal_loop`].
@@ -31,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -113,14 +112,14 @@ impl JournalEntry {
     }
 }
 
-/// How many unwritten records the retry buffer holds before the oldest are
+/// How many unwritten records the buffer holds before the oldest are
 /// dropped: thirty blocks of 1,500 simple transfers (30M gas each).
 ///
 /// Thirty blocks is one rotation interval (60s default, 2s blocks). A record
 /// older than that is no longer needed: its block has most likely sealed.
 const PENDING_CAPACITY: usize = 30 * 1_500;
 
-/// Byte limit on the retry buffer, as a fuse against memory blow-up.
+/// Byte limit on the buffer, as a fuse against memory blow-up.
 ///
 /// [`PENDING_CAPACITY`] is the limit that normally applies. It does not bound
 /// memory: at the pool's 128 KiB per-transaction ceiling a full buffer would be
@@ -185,7 +184,10 @@ pub struct PreconfJournal {
     /// Signalled by `write_lines` once `size_bytes` reaches `max_size`, waking
     /// [`run_rejournal_loop`]. `notify_one` coalesces a burst into one wake.
     rotate_notify: Notify,
-    /// Records a failed write could not place, carried by the next write.
+    /// Records not yet in the file, oldest first, carried by the next write:
+    /// those [`Self::hold`] was given, and those a failed write could not place.
+    /// One queue, so every write keeps execution order without reasoning about
+    /// which kind came first.
     ///
     /// Bounded by [`PENDING_CAPACITY`], with [`PENDING_MAX_BYTES`] as a fuse;
     /// past either the oldest are dropped, as their blocks are the likeliest to
@@ -193,6 +195,13 @@ pub struct PreconfJournal {
     pending: SyncMutex<VecDeque<Vec<u8>>>,
     /// Running size of `pending` in bytes.
     pending_bytes: AtomicUsize,
+    /// How many records at the front of `pending` are there because a write
+    /// failed. Held records are not counted: `preconf.journal.pending_entries`
+    /// reports this, and is meant to be zero unless the disk is failing.
+    unplaced: AtomicUsize,
+    /// The last write failed and may have stopped mid-line, so the next one
+    /// opens with a newline to close it. Read and written under `writer`.
+    torn: AtomicBool,
 }
 
 impl PreconfJournal {
@@ -220,6 +229,8 @@ impl PreconfJournal {
             rotate_notify: Notify::new(),
             pending: SyncMutex::new(VecDeque::new()),
             pending_bytes: AtomicUsize::new(0),
+            unplaced: AtomicUsize::new(0),
+            torn: AtomicBool::new(false),
         };
         // Nothing to seed in memory: rebuilding state from the file is
         // `restore_preconf_state`'s job.
@@ -230,6 +241,31 @@ impl PreconfJournal {
     #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Keep `entry` in memory for the next write, which writes it ahead of its
+    /// own records. Does no IO.
+    ///
+    /// For ordinary pool transactions: they are written when something else
+    /// is — a commitment, a slice boundary, the start of the next build — so a
+    /// commitment that executed after one finds it ahead of itself in the file.
+    pub fn hold(&self, entry: &JournalEntry) {
+        match serde_json::to_vec(entry) {
+            Ok(mut line) => {
+                line.push(b'\n');
+                self.buffer(vec![line]);
+            }
+            Err(e) => warn!(
+                target: "mantle::preconf::journal",
+                hash = ?entry.hash, %e,
+                "journal record could not be encoded; not held"
+            ),
+        }
+    }
+
+    /// Write whatever is held. Nothing held, no IO.
+    pub async fn flush(&self) -> Result<(), JournalError> {
+        self.write_lines(Vec::new()).await
     }
 
     /// Append one commitment: [`Self::append_batch`] with a batch of one.
@@ -260,9 +296,10 @@ impl PreconfJournal {
         self.write_lines(lines).await
     }
 
-    /// Write `lines`, preceded by anything an earlier write could not place.
+    /// Write `lines`, preceded by everything held: records given to
+    /// [`Self::hold`] and records an earlier write could not place.
     ///
-    /// On IO failure everything goes to the retry buffer and the error is
+    /// On IO failure everything goes back to the buffer and the error is
     /// returned. Callers carry on regardless: the transactions are in the block
     /// either way, and the record only matters if the process dies before that
     /// block is canonical.
@@ -280,7 +317,7 @@ impl PreconfJournal {
         };
 
         let mut buf = Vec::new();
-        if !retried.is_empty() {
+        if self.torn.load(Ordering::Relaxed) {
             // The failed write may have stopped mid-line. A newline closes that
             // line so this write does not fuse onto it; `load` counts it as one
             // corrupt entry.
@@ -292,9 +329,15 @@ impl PreconfJournal {
         let len = buf.len() as u64;
 
         if let Err(e) = writer.write_all(&buf).await.and(writer.flush().await) {
-            // Buffered while still holding the lock, to keep the order.
+            // Buffered while still holding the lock, to keep the order. Anything
+            // held since the drain above is newer, so it stays behind these.
             retried.append(&mut lines);
-            self.buffer(retried);
+            // Everything this write drained is unplaced now, including what was
+            // only held; set before buffering so an eviction there counts down.
+            self.unplaced.store(retried.len(), Ordering::Relaxed);
+            self.torn.store(true, Ordering::Relaxed);
+            self.buffer_front(retried);
+            self.report_pending();
             // The write may have placed part of `buf` before failing, so the
             // counter no longer matches the file. Re-read the true length;
             // if even that fails, rotation does not depend on the counter.
@@ -305,7 +348,9 @@ impl PreconfJournal {
         }
         let new_size = self.size_bytes.fetch_add(len, Ordering::Relaxed) + len;
         // Reset under the lock so a concurrent failing append cannot be overwritten.
-        metrics::gauge!("preconf.journal.pending_entries").set(0.0);
+        self.torn.store(false, Ordering::Relaxed);
+        self.unplaced.store(0, Ordering::Relaxed);
+        self.report_pending();
         drop(writer);
 
         metrics::gauge!("preconf.journal.size_bytes").set(new_size as f64);
@@ -315,27 +360,51 @@ impl PreconfJournal {
         Ok(())
     }
 
-    /// Hold `lines` for the next write, dropping the oldest once full.
+    /// Add `lines` behind everything already held, dropping the oldest once
+    /// full.
     fn buffer(&self, lines: Vec<Vec<u8>>) {
         let mut pending = self.pending.lock();
-        let mut bytes = self.pending_bytes.load(Ordering::Relaxed);
-        let mut dropped = 0u64;
         for line in lines {
-            dropped += evict_to_fit(
-                &mut pending,
-                &mut bytes,
-                line.len(),
-                PENDING_CAPACITY,
-                PENDING_MAX_BYTES,
-            );
-            bytes += line.len();
-            pending.push_back(line);
+            self.push_evicting(&mut pending, line);
         }
+        drop(pending);
+        self.report_pending();
+    }
+
+    /// Put a failed write's `lines` back ahead of anything held since it
+    /// drained the buffer: they executed first. Called under `writer`.
+    fn buffer_front(&self, lines: Vec<Vec<u8>>) {
+        let mut pending = self.pending.lock();
+        let newer: Vec<Vec<u8>> = pending.drain(..).collect();
+        self.pending_bytes.store(0, Ordering::Relaxed);
+        for line in lines.into_iter().chain(newer) {
+            self.push_evicting(&mut pending, line);
+        }
+    }
+
+    /// Push `line` at the back, first dropping the oldest records if it would
+    /// not fit. A dropped record that a failed write left is no longer unplaced.
+    fn push_evicting(&self, pending: &mut VecDeque<Vec<u8>>, line: Vec<u8>) {
+        let mut bytes = self.pending_bytes.load(Ordering::Relaxed);
+        let dropped =
+            evict_to_fit(pending, &mut bytes, line.len(), PENDING_CAPACITY, PENDING_MAX_BYTES);
+        bytes += line.len();
+        pending.push_back(line);
         self.pending_bytes.store(bytes, Ordering::Relaxed);
         if dropped > 0 {
             metrics::counter!("preconf.journal.dropped_entries_total").increment(dropped);
+            let _ = self.unplaced.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(dropped as usize))
+            });
         }
-        metrics::gauge!("preconf.journal.pending_entries").set(pending.len() as f64);
+    }
+
+    /// `pending_entries` counts only what a failed write left; `buffered_entries`
+    /// counts everything not yet in the file.
+    fn report_pending(&self) {
+        metrics::gauge!("preconf.journal.pending_entries")
+            .set(self.unplaced.load(Ordering::Relaxed) as f64);
+        metrics::gauge!("preconf.journal.buffered_entries").set(self.pending.lock().len() as f64);
     }
 
     /// How many records are waiting for a write to succeed. Test-only; in
@@ -343,6 +412,13 @@ impl PreconfJournal {
     #[cfg(test)]
     pub fn pending_len(&self) -> usize {
         self.pending.lock().len()
+    }
+
+    /// How many held records a failed write left. Test-only; in production this
+    /// is the `preconf.journal.pending_entries` gauge.
+    #[cfg(test)]
+    pub fn unplaced_len(&self) -> usize {
+        self.unplaced.load(Ordering::Relaxed)
     }
 
     /// Read every entry that parses, skipping and counting the lines that do
@@ -362,7 +438,7 @@ impl PreconfJournal {
     /// compacts. `limit` is the file length taken under the writer lock, so no
     /// append is in progress at the cut. The cut can still follow the partial
     /// line of a failed write; that line is skipped as corrupt, and its records
-    /// are rewritten whole from the retry buffer.
+    /// are rewritten whole from the buffer.
     async fn load_upto(&self, limit: u64) -> Result<(Vec<JournalEntry>, usize), JournalError> {
         let file = match tokio::fs::File::open(&self.path).await {
             Ok(f) => f,
@@ -1130,6 +1206,83 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
+    /// A held record is not written by holding it.
+    #[tokio::test]
+    async fn holding_a_record_writes_nothing() {
+        let (_dir, j) = fresh_journal().await;
+
+        j.hold(&announced_entry(1, 10));
+
+        let (loaded, _) = j.load().await.unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    /// The next write carries held records ahead of its own, in the order they
+    /// were held — which is execution order.
+    #[tokio::test]
+    async fn held_records_go_ahead_of_the_next_commitment() {
+        let (_dir, j) = fresh_journal().await;
+        let (first, second, commitment) =
+            (announced_entry(1, 10), announced_entry(2, 10), entry(3, 10));
+
+        j.hold(&first);
+        j.hold(&second);
+        j.append_promised(&commitment).await.unwrap();
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, vec![first, second, commitment]);
+        assert_eq!(bad, 0, "held records add no separator line");
+    }
+
+    /// `flush` writes what is held and nothing else.
+    #[tokio::test]
+    async fn flush_writes_what_is_held() {
+        let (_dir, j) = fresh_journal().await;
+        let held = announced_entry(1, 10);
+
+        j.hold(&held);
+        j.flush().await.unwrap();
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(loaded, vec![held]);
+        assert_eq!(bad, 0);
+        assert_eq!(j.pending_len(), 0);
+    }
+
+    /// Held records are not unplaced records: only a failed write makes one.
+    #[tokio::test]
+    async fn held_records_do_not_count_as_unplaced() {
+        let (_dir, j) = read_only_journal().await;
+
+        j.hold(&announced_entry(1, 10));
+        assert_eq!(j.unplaced_len(), 0, "nothing has failed yet");
+
+        j.append_promised(&entry(2, 10)).await.expect_err("the handle is read-only");
+        assert_eq!(j.unplaced_len(), 2, "the failed write takes the held record with it");
+    }
+
+    /// Only the first write after a failure opens with a separator: a held
+    /// record waiting for a later write is not a sign of a torn line.
+    #[tokio::test]
+    async fn a_separator_follows_a_failure_and_nothing_else() {
+        let (dir, j) = read_only_journal().await;
+        j.append_promised(&entry(1, 10)).await.expect_err("the handle is read-only");
+        let writable =
+            OpenOptions::new().append(true).open(dir.path().join("preconf.jsonl")).await.unwrap();
+        *j.writer.lock().await = writable;
+
+        j.append_promised(&entry(2, 10)).await.expect("the disk is back");
+        j.hold(&announced_entry(3, 10));
+        j.append_promised(&entry(4, 10)).await.unwrap();
+
+        let (loaded, bad) = j.load().await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.hash).collect::<Vec<_>>(),
+            [1, 2, 3, 4].map(|b| entry(b, 10).hash)
+        );
+        assert_eq!(bad, 1, "one separator, for the one failure");
+    }
+
     /// A journal whose writes fail with a real IO error.
     async fn read_only_journal() -> (TempDir, PreconfJournal) {
         let dir = TempDir::new().unwrap();
@@ -1383,6 +1536,8 @@ mod tests {
             rotate_notify: Notify::new(),
             pending: SyncMutex::new(VecDeque::new()),
             pending_bytes: AtomicUsize::new(0),
+            unplaced: AtomicUsize::new(0),
+            torn: AtomicBool::new(false),
         };
         let (loaded, bad) = j.load().await.unwrap();
         assert!(loaded.is_empty());
@@ -1682,8 +1837,8 @@ mod tests {
     /// loses the record written after the failure.
     ///
     /// The partial write is staged by hand (a fragment appended directly, its
-    /// record put in the retry buffer); no portable way stops a real write
-    /// half-way.
+    /// record put back in the buffer, the torn flag set); no portable way stops
+    /// a real write half-way.
     #[tokio::test]
     async fn rotation_after_a_partial_write_keeps_every_record() {
         let (_dir, j) = fresh_journal().await;
@@ -1700,6 +1855,7 @@ mod tests {
         let mut held = failed_line;
         held.push(b'\n');
         j.buffer(vec![held]);
+        j.torn.store(true, Ordering::Relaxed);
 
         let after = entry(3, 10);
         j.append_promised(&after).await.expect("the disk is back");

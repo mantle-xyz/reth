@@ -14,7 +14,7 @@ use reth_optimism_payload_builder::{
 use reth_optimism_primitives::OpTransaction;
 use reth_primitives_traits::SignedTransaction;
 
-use crate::{ClaimKind, journal::JournalEntry, preconf_tx_set::PreconfTxSet};
+use crate::preconf_tx_set::PreconfTxSet;
 
 /// Whether this transaction's nonce field is its sender's account nonce.
 ///
@@ -39,7 +39,6 @@ pub(crate) fn record_executed<T: SignedTransaction + OpTransaction>(
     info: &mut ExecutionInfo<T>,
     fifo: &PreconfTxSet,
     tx: Recovered<T>,
-    journalable: bool,
 ) {
     let signer = tx.signer();
     if carries_its_senders_nonce(tx.inner()) {
@@ -48,11 +47,7 @@ pub(crate) fn record_executed<T: SignedTransaction + OpTransaction>(
         fifo.observe_nonceless(signer);
     }
 
-    if journalable {
-        info.record_journalable(tx);
-    } else {
-        info.record(tx);
-    }
+    info.record(tx);
 }
 
 /// The upstream execution counters, plus what slicing a block needs on top.
@@ -74,12 +69,6 @@ pub struct ExecutionInfo<T> {
     executed_sender_nonces: HashMap<Address, u64>,
     published_upto: usize,
     pruned_upto: usize,
-    /// Positions in `executed` of the transactions that need a journal record,
-    /// in execution order. Positions rather than copies: the transaction is
-    /// already held once, and a second copy is a pair that can fall out of step.
-    journalable: Vec<usize>,
-    /// How far into `journalable` the journal has been handed records.
-    journaled_upto: usize,
     /// Distinct pool hashes skipped for RLP headroom in this build, across snapshots.
     block_rlp_full_skipped: HashSet<TxHash>,
 }
@@ -92,8 +81,6 @@ impl<T> Default for ExecutionInfo<T> {
             executed_sender_nonces: HashMap::new(),
             published_upto: 0,
             pruned_upto: 0,
-            journalable: Vec::new(),
-            journaled_upto: 0,
             block_rlp_full_skipped: HashSet::new(),
         }
     }
@@ -167,53 +154,12 @@ impl<T: SignedTransaction + OpTransaction> ExecutionInfo<T> {
         }
         self.executed.push(tx);
     }
-
-    /// Record a transaction that also has to survive a restart.
-    ///
-    /// Only pool transactions do. A deposit arrives with the attributes on
-    /// every rebuild, a preconf commitment is journaled when its receipt goes
-    /// out, and the post-execution transaction is produced by the executor
-    /// rather than sent by anyone — putting any of them back in the pool on
-    /// restart would be wrong.
-    pub fn record_journalable(&mut self, tx: Recovered<T>) {
-        self.journalable.push(self.executed.len());
-        self.record(tx);
-    }
 }
 
 impl<T: SignedTransaction> ExecutionInfo<T> {
     /// Everything executed this block, in execution order.
     pub fn executed(&self) -> &[Recovered<T>] {
         &self.executed
-    }
-
-    /// Everything `record_journalable` marked since the last call, as
-    /// [`JournalEntry`] records — and moves past them in the same step.
-    ///
-    /// One operation rather than a read and an advance, because there is no
-    /// correct way to do one without the other: records left behind are written
-    /// twice, records skipped are never written at all. Repeating a handover is
-    /// the journal's own business — it keeps what a write could not place and
-    /// carries it forward — so a record leaves here exactly once, whether or not
-    /// the disk took it.
-    ///
-    /// Separate from the publish cursor because the two diverge: a slice dropped
-    /// by the cancel guard was handed over all the same.
-    ///
-    /// Only the slice path calls this, so with slicing off nothing drains what
-    /// `record_journalable` marked — see the pool arm in
-    /// `builder::payload_builder` for what that costs and why it stands.
-    pub fn take_journal_records(&mut self, block_height: u64) -> Vec<JournalEntry> {
-        let taken = &self.journalable[self.journaled_upto..];
-        let records: Vec<JournalEntry> = taken
-            .iter()
-            .map(|&at| {
-                let tx = &self.executed[at];
-                JournalEntry::for_executed(*tx.tx_hash(), tx, block_height, ClaimKind::Announced)
-            })
-            .collect();
-        self.journaled_upto = self.journalable.len();
-        records
     }
 
     /// The highest nonce executed this block per sender.
@@ -463,76 +409,6 @@ mod tests {
 
         assert!(info.pending_slice().is_empty());
         assert_eq!(info.published_upto(), 0);
-    }
-
-    /// Only pool transactions need a journal record. Deposits arrive with the
-    /// attributes on every rebuild, preconf commitments are journaled when
-    /// their receipt goes out, and the post-execution transaction is not a
-    /// user transaction at all — journaling any of them would put something
-    /// back in the pool that does not belong there.
-    #[test]
-    fn only_transactions_recorded_as_journalable_are_queued_for_the_journal() {
-        let mut info = Info::default();
-
-        info.record(tx(sender(0xaa), 0));
-        info.record_journalable(tx(sender(0xbb), 1));
-        info.record(tx(sender(0xcc), 2));
-
-        let records = info.take_journal_records(7);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].hash, *info.executed()[1].tx_hash());
-        assert_eq!(records[0].block_height, 7);
-        assert_eq!(info.executed().len(), 3, "all three still executed, in order");
-    }
-
-    /// A record comes out for each transaction `record_journalable` marked,
-    /// in execution order, and for no other.
-    #[test]
-    fn the_records_are_the_journalable_transactions_in_execution_order() {
-        let mut info = Info::default();
-        info.record(tx(sender(0xaa), 0));
-        info.record_journalable(tx(sender(0xbb), 1));
-        info.record_journalable(tx(sender(0xcc), 2));
-
-        let records = info.take_journal_records(7);
-
-        // Only what `record_journalable` marked, in execution order.
-        assert_eq!(
-            records.iter().map(|r| r.hash).collect::<Vec<_>>(),
-            vec![*tx(sender(0xbb), 1).tx_hash(), *tx(sender(0xcc), 2).tx_hash()],
-        );
-    }
-
-    /// The journal cursor tracks what has been handed over, the publish cursor
-    /// what reached subscribers. A slice dropped by the cancel guard was handed
-    /// to the journal all the same, so its transactions must not be offered
-    /// again when the next slice carries them.
-    #[test]
-    fn a_dropped_slice_does_not_journal_its_transactions_twice() {
-        let mut info = Info::default();
-        info.record_journalable(tx(sender(0xaa), 0));
-
-        // The slice was journaled, then dropped before it went out.
-        assert_eq!(info.take_journal_records(7).len(), 1);
-
-        assert!(info.take_journal_records(7).is_empty(), "already handed over");
-        assert_eq!(info.pending_slice().len(), 1, "but never published");
-    }
-
-    #[test]
-    fn the_journal_cursor_keeps_the_order_transactions_executed_in() {
-        let mut info = Info::default();
-        info.record_journalable(tx(sender(0xaa), 0));
-        info.record(tx(sender(0xbb), 0));
-        info.take_journal_records(7);
-        info.record_journalable(tx(sender(0xaa), 1));
-        info.record_journalable(tx(sender(0xaa), 2));
-
-        let taken: Vec<_> = info.take_journal_records(7).iter().map(|r| r.hash).collect();
-        let expected: Vec<_> = info.executed()[2..].iter().map(|tx| *tx.tx_hash()).collect();
-
-        assert_eq!(taken, expected, "in execution order, and only the new ones");
     }
 
     /// The pool is told a sender's nonce has moved on. Only the highest one
