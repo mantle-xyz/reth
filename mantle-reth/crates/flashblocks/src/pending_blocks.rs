@@ -550,8 +550,10 @@ impl PendingBlocks {
     ///
     /// The result is empty either way today — OP consensus requires the block
     /// body's withdrawals list to be empty, so every slice carries an empty
-    /// one and concatenating them changes nothing. The filter is here because
-    /// the unfiltered version is only correct *because of* that rule: the
+    /// one and concatenating them changes nothing. The producer repeats the
+    /// full list on every slice rather than sending a delta, so the
+    /// concatenation itself is also only correct while the list is empty. The filter is here
+    /// because the unfiltered version is only correct *because of* that rule: the
     /// overlay spans more than one block, and the day the rule relaxes this
     /// would start reporting a neighbouring block's withdrawals without
     /// anything failing.

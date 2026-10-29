@@ -266,8 +266,7 @@ impl FlashblockProducerConfig {
 
 /// Interval the build loop's ticker fires at.
 ///
-/// Without flashblocks the cadence stays exactly what preconf used before,
-/// which keeps turning the feature off a true rollback.
+/// Without flashblocks the cadence stays exactly what preconf used before.
 pub fn tick_interval(
     flashblocks: Option<&FlashblockProducerConfig>,
     preconf_sweep: Duration,

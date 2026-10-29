@@ -223,11 +223,11 @@ pub struct AdmitRequest {
     pub bytecode_hash: Option<B256>,
 }
 
-/// A receipt owed to a client, held back until the journal has it.
+/// A receipt owed to a client, held back until the journal write is done.
 ///
 /// `#[must_use]`: dropping one leaves a client waiting on a transaction that
 /// did land.
-#[must_use = "a success ticket holds a client's receipt; send it once the journal has the commitment"]
+#[must_use = "a success ticket holds a client's receipt; send it after the journal write"]
 #[derive(Debug)]
 pub struct SuccessTicket {
     responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
@@ -1206,7 +1206,7 @@ impl PreconfTxSet {
     /// One completion cannot avoid the gap: [`Self::begin_success`] takes the
     /// responder, and the receipt only goes out after the journal write, which
     /// is an `await`. Removing the entry during that write leaves the client
-    /// told `Timeout` for a transaction that is in the block and on disk.
+    /// told `Timeout` for a transaction that is already in the block.
     ///
     /// `try_lock`, not `lock`: a held lock means someone is finishing, and they
     /// will — this runs at every build, so leaving the entry for the next one
@@ -1360,10 +1360,9 @@ impl PreconfTxSet {
     // one fans out to every subscriber and is a different cost.
     //
     // The one completion that cannot do this is [`Self::begin_success`]: the
-    // journal must hold the commitment before the client holds the receipt, and
-    // that write is an `await`. It hands back a [`SuccessTicket`] instead, and
-    // the caller's `apply_lock` is what covers the gap — which works only
-    // because nothing removes a `Success` entry while that lock is held.
+    // journal write comes before the receipt, and that write is an `await`. It hands back a
+    // [`SuccessTicket`] instead, and the caller's `apply_lock` is what covers the gap — which
+    // works only because nothing removes a `Success` entry while that lock is held.
 
     /// End a commitment with a reason, and answer the client.
     ///
@@ -1399,10 +1398,12 @@ impl PreconfTxSet {
 
     /// `Waiting → Success`, taking the responder but **not** answering it.
     ///
-    /// The receipt must not go out before the commitment is on disk: a client
-    /// holding a receipt no journal remembers is what a restart must never
-    /// produce. The caller writes the journal between this and
-    /// [`SuccessTicket::send`], holding its `apply_lock` throughout.
+    /// The journal write comes before the receipt, so a restart replays every
+    /// commitment it was able to record. The write is best-effort: flushed, not
+    /// fsynced, and a failed write is logged while the receipt still goes out
+    /// (see [`crate::journal::PreconfJournal::append_batch`]). The caller
+    /// writes the journal between this and [`SuccessTicket::send`], holding its
+    /// `apply_lock` throughout.
     ///
     /// The responder is taken here, not after that write — the write is an
     /// `await`, and a responder left in the entry across it can be taken by a
@@ -2812,7 +2813,7 @@ mod tests {
     /// the journal write — an `await`. If `forward_all` removed the entry
     /// during that window, `lock_for_apply` would hand `rpc`'s deadline branch
     /// a `None`, and with nothing to wait on it would answer `Timeout` for a
-    /// transaction already in the block and on disk.
+    /// transaction already in the block.
     ///
     /// Holding the `apply_lock` is what dispatch does across that whole span,
     /// so holding it here stands in for "a completion is in flight". The entry

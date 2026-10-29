@@ -338,8 +338,9 @@ pub enum FlashblocksConsumerArgsError {
 pub struct FlashblocksArgs {
     /// Slice each block as it is built and publish the slices.
     ///
-    /// Off by default: leaving it off keeps the payload builder's
-    /// pre-flashblock behaviour byte for byte, which is the rollback path.
+    /// Off by default. Leaving it off stops slicing and publishing, but
+    /// executed pool transactions are still staged for replay and hold their
+    /// nonce; leaving `--preconf.enable` off is the full rollback.
     ///
     /// Every flag in this group also answers to a `--subblocks.` prefix, the
     /// name Optimism's documentation now uses for the same thing.
@@ -379,7 +380,9 @@ pub struct FlashblocksArgs {
     /// How far ahead of the slot deadline the budgeted slice grid finishes,
     /// in milliseconds. Default 0 — the loop runs until `getPayload`, so
     /// unlike the reference implementation there is no self-imposed seal to
-    /// reserve time for. A non-zero value only shifts the tick grid earlier.
+    /// reserve time for. A non-zero value shifts the tick grid earlier, so the
+    /// last budgeted slice goes out that much before `getPayload`, and can
+    /// drop ticks.
     #[arg(
         id = "flashblocks.leeway-time",
         long = "flashblocks.leeway-time",
@@ -440,8 +443,10 @@ impl FlashblocksArgs {
 pub struct PreconfArgs {
     /// Enable the mantle preconfirmation subsystem.
     ///
-    /// When absent (default), the node behaves exactly like upstream
-    /// `op-reth` — no admission, canon handler, or RPC method registration.
+    /// When absent (default), the payload builder is upstream `op-reth`'s and
+    /// there is no admission or canon handler. The Mantle RPC methods are
+    /// still registered: `eth_sendRawTransactionWithPreconf` forwards to
+    /// `--rollup.sequencer` when one is set and is refused otherwise.
     #[arg(long = "preconf.enable")]
     pub enable: bool,
 

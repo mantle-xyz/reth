@@ -211,9 +211,11 @@ where
             Some(journal) => builder.with_journal(journal),
             None => builder,
         };
-        // Only now: `with_flashblocks` is what turns slice publishing on, and
-        // leaving it off has to keep the loop byte-identical to what it ran
-        // before slicing existed.
+        // Only now: `with_flashblocks` is what turns slice publishing on.
+        // Leaving it off stops slicing, not every change that came with it:
+        // executed pool transactions are still staged for replay and claim
+        // their `(sender, nonce)`. Leaving `--preconf.enable` off is the full
+        // rollback.
         let builder = match flashblocks.as_deref() {
             Some(handles) => builder.with_flashblocks(handles.producer().clone()),
             None => builder,

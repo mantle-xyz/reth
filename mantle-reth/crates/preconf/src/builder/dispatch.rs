@@ -399,7 +399,7 @@ where
                     );
                 }
             }
-            // The journal has it; the client may now have it too.
+            // The receipt goes out whether or not the write above succeeded.
             if let Some(ticket) = ticket {
                 ticket.send(receipt);
             }
@@ -447,10 +447,13 @@ where
         // The claim for this entry already went out, so reaching here means it
         // cannot be kept — and this is the only moment that is observable.
         //
-        // No retry: every transient cause is filtered before apply (capacity
-        // becomes `Defer`, a blocked predecessor's successor never reaches
-        // here, `Fatal` returns above). What is left is permanent, so the
-        // claim ends on the first failure, releasing the `(sender, nonce)`.
+        // No retry: the claim ends on the first rejection, releasing the
+        // `(sender, nonce)`. Only capacity is checked before apply (a replay
+        // that overflows this block is deferred, one too large for any block
+        // ends there); a blocked predecessor's successor never reaches here,
+        // and `Fatal` returns above. A cause that could clear in a later block
+        // — base fee rose, balance short, nonce ahead of the chain — still
+        // ends the claim here.
         Err(ApplyError::Rejected(rejected)) => {
             // Only a claim a client was handed counts as broken; an announced
             // one has readers that self-correct (see `ClaimKind`). Logging both
