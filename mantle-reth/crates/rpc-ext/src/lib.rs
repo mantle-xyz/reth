@@ -43,8 +43,8 @@ use reth_rpc_eth_api::{
 use reth_rpc_eth_types::{EthApiError, simulate};
 use reth_rpc_server_types::result::invalid_params_rpc_err;
 use reth_storage_api::{
-    BlockIdReader, BlockReaderIdExt, StateProofProvider, StateProviderBox, StateProviderFactory,
-    errors::ProviderResult,
+    BlockIdReader, BlockNumReader, BlockReaderIdExt, StateProofProvider, StateProviderBox,
+    StateProviderFactory, errors::ProviderResult,
 };
 use reth_trie_common::AccountProof;
 use std::sync::Arc;
@@ -452,6 +452,12 @@ const MAX_BLOCK_RANGE: u64 = 1000;
 const GETH_MANTLE_RPC_GAS_CAP: u64 = 0x4000000000000;
 
 /// Caps gas for the L1 cost envelope, matching geth's `CallDefaults` behavior.
+/// The canonical head's number and hash, for checking that a pending preview
+/// still extends it; `None` when it cannot be read.
+fn canonical_head(provider: &impl BlockNumReader) -> Option<(u64, B256)> {
+    provider.chain_info().ok().map(|head| (head.best_number, head.best_hash))
+}
+
 fn capped_gas_for_l1_envelope(request_gas: Option<u64>) -> u64 {
     request_gas.map(|gas| gas.min(GETH_MANTLE_RPC_GAS_CAP)).unwrap_or(GETH_MANTLE_RPC_GAS_CAP)
 }
@@ -770,7 +776,7 @@ where
             .then(|| {
                 self.pending_overrides.as_ref().and_then(|overlay| {
                     overlay
-                        .pending_execution_context(&|| self.provider().best_block_number().ok())
+                        .pending_execution_context(&|| canonical_head(self.provider()))
                         .inspect(|_| Metrics::rpc_estimate_total_fee().increment(1))
                 })
             })
@@ -965,7 +971,7 @@ where
         let context = if block_number.is_some_and(|block| block.is_pending()) {
             self.pending_overrides.as_ref().and_then(|overlay| {
                 overlay
-                    .pending_execution_context(&|| self.provider().best_block_number().ok())
+                    .pending_execution_context(&|| canonical_head(self.provider()))
                     .inspect(|_| Metrics::rpc_simulate_v1().increment(1))
             })
         } else {

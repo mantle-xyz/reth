@@ -20,6 +20,7 @@
 /// `increment(0)` never clobbers.
 const COUNTERS: &[&str] = &[
     "flashblocks.slice_allowance_exhausted_total",
+    "flashblocks.oversized_slices_total",
     "preconf.build.failed_total",
     "preconf.build.resolved_payload_superseded_total",
     "preconf.build.pool_tx_on_committed_nonce_total",

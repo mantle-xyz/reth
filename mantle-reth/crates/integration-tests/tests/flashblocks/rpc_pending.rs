@@ -421,7 +421,10 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
     impl PendingStateOverrides for AdvancingPreview {
         fn pending_execution_context(
             &self,
-            _canonical_tip: &dyn Fn() -> Option<alloy_primitives::BlockNumber>,
+            _canonical_head: &dyn Fn() -> Option<(
+                alloy_primitives::BlockNumber,
+                alloy_primitives::B256,
+            )>,
         ) -> Option<PendingExecutionContext> {
             Some(if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first.clone()
@@ -487,7 +490,9 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
     let first = estimate().await.expect("first preview fee");
     let captured = harness
         .state()
-        .pending_execution_context(&|| node.inner.provider.best_block_number().ok())
+        .pending_execution_context(&|| {
+            node.inner.provider.chain_info().ok().map(|head| (head.best_number, head.best_hash))
+        })
         .unwrap();
     // Transfer costs exactly 21,000 gas; operator fee = 21,000 * 2 * 100 + 7.
     let fixed = U256::from(21_000 + 4_200_007);
@@ -538,7 +543,9 @@ async fn pending_total_fee_tracks_ratio_and_fee_parameters_across_slices() {
         first: captured,
         next: harness
             .state()
-            .pending_execution_context(&|| node.inner.provider.best_block_number().ok())
+            .pending_execution_context(&|| {
+                node.inner.provider.chain_info().ok().map(|head| (head.best_number, head.best_hash))
+            })
             .unwrap(),
         reads: AtomicUsize::new(0),
     });
@@ -783,7 +790,10 @@ async fn pending_simulation_keeps_captured_block_hashes_after_canonical_advances
     impl PendingStateOverrides for Captured {
         fn pending_execution_context(
             &self,
-            _canonical_tip: &dyn Fn() -> Option<alloy_primitives::BlockNumber>,
+            _canonical_head: &dyn Fn() -> Option<(
+                alloy_primitives::BlockNumber,
+                alloy_primitives::B256,
+            )>,
         ) -> Option<PendingExecutionContext> {
             Some(self.0.clone())
         }
@@ -797,7 +807,9 @@ async fn pending_simulation_keeps_captured_block_hashes_after_canonical_advances
     overlay_with_user_call!(harness);
     let captured = harness
         .state()
-        .pending_execution_context(&|| node.inner.provider.best_block_number().ok())
+        .pending_execution_context(&|| {
+            node.inner.provider.chain_info().ok().map(|head| (head.best_number, head.best_hash))
+        })
         .expect("captured preview");
     assert_eq!(captured.header.hash(), B256::ZERO, "the preview tip is not sealed");
     let canonical = mine_canonical_block!(node);
@@ -1041,7 +1053,7 @@ async fn a_transaction_in_the_overlay_is_served_by_hash_and_has_a_receipt() {
 /// hash; one in a block still ahead of the tip is.
 #[tokio::test(flavor = "multi_thread")]
 async fn by_hash_lookups_skip_preview_transactions_the_tip_has_passed() {
-    use crate::consumer_helpers::mine_canonical_block;
+    use crate::consumer_helpers::{commit_submitted_block, submit_uncommitted_block};
 
     let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
@@ -1049,17 +1061,21 @@ async fn by_hash_lookups_skip_preview_transactions_the_tip_has_passed() {
     let first = overlay_with_user_call!(harness);
     let raw = signed_call(1, LOGGER, VALUE).await;
     let second = keccak256(&raw);
+    // Block 2 names the block 1 the chain will take, as the sequencer that
+    // sealed it would.
+    let canonical_one = submit_uncommitted_block!(node);
     harness
         .send(
             FlashblockBuilder::new(2, 0)
                 .prev(1, 0)
+                .parent_hash(canonical_one)
                 .transactions(vec![l1_info_deposit(2), raw])
                 .build(),
         )
         .await;
 
     // Canonical block 1 holds only the deposit; the preview still ends at block 2.
-    assert_eq!(mine_canonical_block!(node).number, 1);
+    assert_eq!(commit_submitted_block!(node, canonical_one).number, 1);
 
     assert!(api.transaction_by_hash(first).await.unwrap().is_none());
     assert!(api.get_transaction_receipt(first).await.unwrap().is_none());
@@ -1424,22 +1440,26 @@ async fn get_logs_with_a_stale_preview_returns_the_latest_canonical_logs() {
 /// when the canonical block holds different transactions.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_logs_takes_blocks_at_or_below_the_tip_from_canonical_only() {
-    use crate::consumer_helpers::mine_canonical_block;
+    use crate::consumer_helpers::{commit_submitted_block, submit_uncommitted_block};
 
     let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     overlay_with_user_call!(harness);
+    // Block 2 names the block 1 the chain will take, as the sequencer that
+    // sealed it would.
+    let canonical_one = submit_uncommitted_block!(node);
     harness
         .send(
             FlashblockBuilder::new(2, 0)
                 .prev(1, 0)
+                .parent_hash(canonical_one)
                 .transactions(vec![l1_info_deposit(2), signed_call(1, LOGGER, VALUE).await])
                 .build(),
         )
         .await;
     // Canonical block 1 holds only the deposit; the preview still ends at block 2.
-    assert_eq!(mine_canonical_block!(node).number, 1);
+    assert_eq!(commit_submitted_block!(node, canonical_one).number, 1);
 
     let filter = Filter::new()
         .address(LOGGER)
@@ -1630,16 +1650,27 @@ async fn estimate_gas_honours_a_block_override() {
     );
 }
 
-/// `eth_sendRawTransactionSync` rejects a timeout above the configured ceiling.
+/// `eth_sendRawTransactionSync` cuts a timeout above the configured one down to
+/// it rather than refusing the call.
 #[tokio::test(flavor = "multi_thread")]
-async fn send_raw_transaction_sync_rejects_an_overlong_timeout() {
+async fn send_raw_transaction_sync_accepts_an_overlong_timeout() {
     let (harness, node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
 
     let raw = signed_call(0, LOGGER, VALUE).await;
-    let error =
-        api.send_raw_transaction_sync(raw, Some(6_001)).await.expect_err("the ceiling is 6000 ms");
-    assert!(error.message().contains("time out too long"), "unexpected error: {error}");
+    let tx_hash = keccak256(&raw);
+    let slice =
+        FlashblockBuilder::new(1, 0).transactions(vec![l1_info_deposit(1), raw.clone()]).build();
+
+    let announce = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        harness.send(slice).await;
+    };
+    let (receipt, ()) =
+        tokio::join!(api.send_raw_transaction_sync(raw, Some(10 * 60 * 1_000)), announce);
+
+    let receipt = receipt.expect("an overlong timeout is clamped, not refused");
+    assert_eq!(receipt["transactionHash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
 }
 
 /// `eth_sendRawTransactionSync` returns once the transaction shows up in a slice.
@@ -2231,17 +2262,22 @@ async fn a_stale_preview_answers_pending_reads_from_latest() {
 /// still ahead of the tip keeps serving `pending`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_preview_that_still_leads_keeps_serving_after_its_first_block_is_canonical() {
-    use crate::consumer_helpers::mine_canonical_block;
+    use crate::consumer_helpers::{commit_submitted_block, submit_uncommitted_block};
 
     let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
     let api = eth_api!(node, harness);
     let pending = || Some(BlockNumberOrTag::Pending.into());
 
     overlay_with_user_call!(harness);
+    // Block 2 names the block 1 the chain will take, as the sequencer that
+    // sealed it would.
+    node.rpc.inject_tx(signed_call(0, LOGGER, VALUE).await).await.expect("canonical call");
+    let canonical_one = submit_uncommitted_block!(node);
     harness
         .send(
             FlashblockBuilder::new(2, 0)
                 .prev(1, 0)
+                .parent_hash(canonical_one)
                 .transactions(vec![l1_info_deposit(2), signed_call(1, LOGGER, VALUE).await])
                 .build(),
         )
@@ -2249,8 +2285,7 @@ async fn a_preview_that_still_leads_keeps_serving_after_its_first_block_is_canon
     let preview = harness.pending().expect("two-block preview");
     assert_eq!((preview.earliest_block_number(), preview.latest_block_number()), (1, 2));
 
-    node.rpc.inject_tx(signed_call(0, LOGGER, VALUE).await).await.expect("canonical call");
-    assert_eq!(mine_canonical_block!(node).number, 1);
+    assert_eq!(commit_submitted_block!(node, canonical_one).number, 1);
 
     assert_eq!(api.get_balance(LOGGER, pending()).await.unwrap(), VALUE * U256::from(2), "balance");
     let block = api.block_by_number(pending_tag(), false).await.unwrap().expect("a block");
@@ -2260,6 +2295,52 @@ async fn a_preview_that_still_leads_keeps_serving_after_its_first_block_is_canon
         U256::from(2),
         "nonce"
     );
+}
+
+/// A preview built on a block the chain has since replaced at the same height
+/// is stale, though it still leads the tip by number.
+///
+/// The harness never delivers the canonical notifications, so the preview stays
+/// published across the reorg — the window a real node has before the consumer
+/// processes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_on_a_replaced_parent_answers_pending_reads_from_latest() {
+    use crate::consumer_helpers::{commit_submitted_block, submit_uncommitted_block};
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    let pending = || Some(BlockNumberOrTag::Pending.into());
+
+    // Two blocks at height 1; the preview is built on the first.
+    let built_on = submit_uncommitted_block!(node);
+    let replacement = submit_uncommitted_block!(node);
+    assert_ne!(built_on, replacement);
+    commit_submitted_block!(node, built_on);
+
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .transactions(vec![l1_info_deposit(2), signed_call(0, LOGGER, VALUE).await])
+                .build(),
+        )
+        .await;
+    let preview = harness.pending().expect("a preview on block 1");
+    assert_eq!(preview.parent_hash(), built_on, "premise: built on the first block 1");
+    assert_eq!(api.get_balance(LOGGER, pending()).await.unwrap(), VALUE, "premise: served");
+
+    // The chain switches to the other block 1; the consumer is not told.
+    let head = commit_submitted_block!(node, replacement);
+    assert_eq!(head.number, 1);
+    assert!(harness.pending().is_some(), "the preview is still published");
+
+    let block = api.block_by_number(pending_tag(), false).await.unwrap().expect("a block");
+    assert_eq!(block["hash"], format!("{replacement:#x}"), "block_by_number");
+    assert_eq!(api.get_balance(LOGGER, pending()).await.unwrap(), U256::ZERO, "get_balance");
+    let called = api
+        .call(serde_json::json!({ "to": format!("{LOGGER:#x}") }), pending(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(&called), U256::ZERO, "call");
 }
 
 /// Once the canonical tip has caught up with the preview, the Mantle RPC

@@ -10,7 +10,7 @@ use std::{
 };
 
 use alloy_rpc_types_engine::PayloadId;
-use mantle_reth_flashblocks_types::MantleFlashblockPayload;
+use mantle_reth_flashblocks_types::{MAX_DECOMPRESSED_FLASHBLOCK_BYTES, MantleFlashblockPayload};
 use parking_lot::RwLock;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -131,6 +131,20 @@ impl PublisherHandle {
         // Against the decoder's `MAX_DECOMPRESSED_FLASHBLOCK_BYTES` ceiling, and
         // the input to whether compression is worth adding to the wire.
         metrics::histogram!("flashblocks.byte_size").record(size as f64);
+        // Block-size limits keep a slice under the ceiling, so this is not
+        // expected to fire. Published anyway: consumers and the ws-proxy refuse
+        // it on their side, and this is where the broken assumption shows.
+        if size > MAX_DECOMPRESSED_FLASHBLOCK_BYTES {
+            metrics::counter!("flashblocks.oversized_slices_total").increment(1);
+            warn!(
+                target: "mantle::preconf::flashblocks",
+                block_number = payload.metadata.block_number,
+                index = payload.index,
+                size,
+                limit = MAX_DECOMPRESSED_FLASHBLOCK_BYTES,
+                "slice is over the decoder's size limit; subscribers will refuse it",
+            );
+        }
         let text = Utf8Bytes::from(json);
         let position = FlashblockPosition {
             block_number: payload.metadata.block_number,
@@ -271,6 +285,41 @@ mod tests {
         let mut payload = MantleFlashblockPayload { index, ..Default::default() };
         payload.metadata.block_number = block_number;
         payload
+    }
+
+    /// A slice over the decoder's ceiling is counted. Consumers and the
+    /// ws-proxy refuse it, and block-size limits are meant to keep it from
+    /// happening, so the counter is the alarm that the assumption broke.
+    #[test]
+    fn a_slice_over_the_decoder_ceiling_is_counted() {
+        use mantle_reth_flashblocks_types::MAX_DECOMPRESSED_FLASHBLOCK_BYTES;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let publisher = publisher(8, 8);
+                let handle = publisher.handle();
+
+                handle.publish(&slice(1, 0)).expect("an ordinary slice");
+                assert!(
+                    !metrics.render().contains("flashblocks_oversized_slices_total 1"),
+                    "an ordinary slice is not counted",
+                );
+
+                // Hex encoding doubles the bytes, so half the ceiling is enough.
+                let mut oversized = slice(1, 1);
+                oversized.diff.transactions =
+                    vec![vec![0u8; MAX_DECOMPRESSED_FLASHBLOCK_BYTES / 2 + 1].into()];
+                handle.publish(&oversized).expect("still published");
+                assert!(
+                    metrics.render().contains("flashblocks_oversized_slices_total 1"),
+                    "{}",
+                    metrics.render(),
+                );
+            });
+        });
     }
 
     async fn connect(
