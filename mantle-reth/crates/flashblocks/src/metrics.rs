@@ -145,7 +145,7 @@ flashblock_metrics! {
     gauge     subscriptions_active                      => "flashblocks.consumer.subscriptions_active",
         "Open eth_subscribe flashblocks subscriptions";
     counter   rpc_get_transaction_count                 => "flashblocks.consumer.rpc.get_transaction_count_total",
-        "`eth_getTransactionCount` calls served from the overlay";
+        "`eth_getTransactionCount` calls answered with a leading preview (its nonce, or its parent block's)";
     counter   rpc_get_transaction_receipt               => "flashblocks.consumer.rpc.get_transaction_receipt_total",
         "`eth_getTransactionReceipt` calls served from the overlay";
     counter   rpc_get_transaction_by_hash               => "flashblocks.consumer.rpc.get_transaction_by_hash_total",
@@ -159,9 +159,9 @@ flashblock_metrics! {
     counter   rpc_get_block_by_number                   => "flashblocks.consumer.rpc.get_block_by_number_total",
         "`eth_getBlockByNumber` calls served from the overlay";
     counter   rpc_call                                  => "flashblocks.consumer.rpc.call_total",
-        "`eth_call` calls served from the overlay";
+        "`eth_call` calls served with a pending execution context";
     counter   rpc_estimate_gas                          => "flashblocks.consumer.rpc.estimate_gas_total",
-        "`eth_estimateGas` calls served from the overlay";
+        "`eth_estimateGas` calls served with a pending execution context";
     // Emitted from `mantle-reth-rpc-ext`, not from this crate — `eth_simulateV1`
     // is owned by `MantleEthApiExt`, which injects the pending overrides.
     counter   rpc_simulate_v1                           => "flashblocks.consumer.rpc.simulate_v1_total",
@@ -170,7 +170,7 @@ flashblock_metrics! {
     counter   rpc_estimate_total_fee                    => "flashblocks.consumer.rpc.estimate_total_fee_total",
         "`eth_estimateTotalFee` calls served with a pending execution context";
     counter   rpc_get_logs                              => "flashblocks.consumer.rpc.get_logs_total",
-        "`eth_getLogs` calls served from the overlay";
+        "`eth_getLogs` calls ending at `pending` answered with a leading preview";
     counter   rpc_get_block_transaction_count_by_number => "flashblocks.consumer.rpc.get_block_transaction_count_by_number_total",
         "`eth_getBlockTransactionCountByNumber` calls served from the overlay";
     histogram bundle_state_clone_duration               => "flashblocks.consumer.bundle_state_clone_duration",
