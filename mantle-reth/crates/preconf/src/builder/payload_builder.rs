@@ -68,7 +68,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use crate::{
-    PreconfClassifier, PreconfConfig, PreconfTxSet,
+    ClaimKind, PreconfClassifier, PreconfConfig, PreconfTxSet,
     apply::{ApplyError, BuilderRejected, TxFacts, apply_preconf_tx},
     builder::{
         ExecutionInfo,
@@ -83,7 +83,7 @@ use crate::{
         BlockInvariants, FlashblocksProducer, SealedSliceLink, SenderBalances, SliceHeader,
         SliceLimits, build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
     },
-    journal::PreconfJournal,
+    journal::{JournalEntry, PreconfJournal},
     preconf_tx_set::TxEntryView,
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
@@ -214,7 +214,7 @@ where
         // derivation build (`no_tx_pool=true`) the batched user transactions
         // arrive this way too, and those it reads outright — which is why this
         // stage is on the funnel at all.
-        record_executed(&mut info, fifo, recovered, false);
+        record_executed(&mut info, fifo, recovered);
     }
 
     Ok((info, deltas))
@@ -771,7 +771,7 @@ where
     // `alloy_consensus::TxEnvelope`, which has no deposit and no post-exec
     // variant, so that predicate could only ever return `true` for one.
     info.block_size.record_transaction(tx_rlp_length, true);
-    record_executed(info, fifo, recovered, false);
+    record_executed(info, fifo, recovered);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
     // `blockValue` and `is_better_payload` ignore preconf-sourced revenue.
@@ -1245,6 +1245,7 @@ async fn apply_one_best_tx<N, Builder>(
     builder: &mut Builder,
     info: &mut ExecutionInfo<N::SignedTx>,
     fifo: &PreconfTxSet,
+    journal: Option<&PreconfJournal>,
     constraints: &BuildConstraints,
     pacer: &mut AdmissionPacer,
 ) -> Result<BestTxStep, PayloadBuilderError>
@@ -1427,9 +1428,18 @@ where
     info.block_size.record_transaction(tx_rlp_length, sdm_refund_possible);
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
     // The one class of transaction nothing else brings back after a restart.
-    // Only the slice path drains these, so **with slicing off they are marked
-    // and never written** — known, and left that way rather than put a disk
-    // write on the `engine_getPayload` path.
+    // Held, not written: the next write — a commitment's, a slice boundary's,
+    // or the next build's before it replays anything — carries it ahead of
+    // itself, so the file keeps execution order and a commitment that executed
+    // after it finds it first.
+    if let Some(journal) = journal {
+        journal.hold(&JournalEntry::for_executed(
+            tx_hash,
+            recovered.inner(),
+            constraints.predicted_height,
+            ClaimKind::Announced,
+        ));
+    }
     // Staged like a commitment, because by the next slice it is one: executed,
     // announced, and pruned from the pool half a slot before the block could be
     // canonical. `Replay` because no client is waiting; `Announced` because
@@ -1443,7 +1453,7 @@ where
     let nonce = recovered.nonce();
     let staged: Option<TxEnvelope> =
         crate::admission::op_envelope_to_alloy(OpTxEnvelope::from(recovered.inner().clone()));
-    record_executed(info, fifo, recovered, true);
+    record_executed(info, fifo, recovered);
     if let Some(envelope) = staged {
         let hash = *envelope.tx_hash();
         fifo.stage_executed(Arc::new(envelope), signer).await;
@@ -1764,16 +1774,12 @@ impl SliceState {
     {
         // Before the publish below, always. See this function's docs.
         if let Some(journal) = journal {
-            let height = ctx.parent().number() + 1;
-            // The apply puts every executed transaction into the fifo as it
-            // runs, so by the time a slice is assembled the index is already
-            // complete. What is left here is the disk write, which is allowed
-            // to fail and retry.
-            let entries = info.take_journal_records(height);
-            // The one part of a slice that touches the disk, and the one that
-            // could put a tick over its interval.
+            // The pool arm holds each transaction's record as it executes, so
+            // what is left here is the disk write, which is allowed to fail and
+            // retry. The one part of a slice that touches the disk, and the one
+            // that could put a tick over its interval.
             let started = std::time::Instant::now();
-            let write = journal.append_batch(&entries).await;
+            let write = journal.flush().await;
             metrics::histogram!("flashblocks.journal_write_duration_ms")
                 .record(started.elapsed().as_secs_f64() * 1000.0);
             if let Err(err) = write {
@@ -2468,6 +2474,20 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 .await;
         }
 
+        // Whatever earlier builds executed and nobody has written yet goes to
+        // the file before this one replays any of it. With slicing on the
+        // first slice above has done it already; with slicing off nothing else
+        // would until a commitment arrived.
+        if let Some(journal) = self.journal.as_deref() &&
+            let Err(err) = journal.flush().await
+        {
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                %err,
+                "journal write before replay failed; the records are held for the next write",
+            );
+        }
+
         // Carryover replay preamble — apply stale in-flight / journal-
         // restored entries directly (see `replay_fifo_carryover`), including
         // the unlanded pool transactions the sweep above just handed over. The
@@ -2631,6 +2651,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         &mut builder,
                         &mut info,
                         &self.fifo,
+                        self.journal.as_deref(),
                         &constraints,
                         &mut pool_pacer,
                     )
@@ -2703,7 +2724,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     // The closing slice is published after this stage, so leaving
                     // the transaction out would make the published slices stop
                     // one short of the sealed block.
-                    record_executed(&mut info, &self.fifo, recorded, false);
+                    record_executed(&mut info, &self.fifo, recorded);
                     tx_gas_used
                 })
             })?;
@@ -3966,6 +3987,7 @@ mod tests {
                 &mut builder,
                 &mut info,
                 &fifo,
+                None,
                 &constraints,
                 &mut pacer,
             )
