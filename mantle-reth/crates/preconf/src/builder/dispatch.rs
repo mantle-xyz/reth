@@ -342,7 +342,7 @@ where
             loop_state.record_committed(hash);
             // The claim is made by executing, not below by a client hearing
             // about it — which is what leaves a replay's nonce guarded.
-            // `mark_promised` upgrades the kind when the receipt lands.
+            // `mark_promised` upgrades the kind just before the receipt goes out.
             if let Err(owner) = fifo.claims().record_announced(
                 hash,
                 &entry.from,
@@ -400,7 +400,25 @@ where
                 }
             }
             // The receipt goes out whether or not the write above succeeded.
+            //
+            // Promised first, still under the `apply_lock`: a receipt without
+            // the promise reads as an executed-but-unpromised entry, which
+            // `trim_staged` may evict before the RPC task records it. That
+            // task records it again; the call is idempotent.
             if let Some(ticket) = ticket {
+                if let Err(owner) = fifo.claims().mark_promised(
+                    hash,
+                    &entry.from,
+                    entry.nonce,
+                    loop_state.predicted_height,
+                ) {
+                    warn!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?owner, sender = ?entry.from, nonce = entry.nonce,
+                        "a different tx already owns this (sender, nonce) at receipt time; \
+                         the commitment may not be honoured"
+                    );
+                }
                 ticket.send(receipt);
             }
         }
@@ -878,6 +896,32 @@ mod tests {
             !fifo.claims().was_promised(&hash),
             "and must not call it promised — no receipt reached anyone",
         );
+    }
+
+    /// A receipt never leaves dispatch ahead of the promise it makes.
+    ///
+    /// Recorded only by the RPC task, the promise would trail the receipt by a
+    /// wakeup, and in that window `trim_staged` reads the entry as executed but
+    /// unpromised — evictable — and the commitment is lost without a trace.
+    #[tokio::test]
+    async fn the_promise_is_recorded_before_the_receipt_goes_out() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x41);
+        let hash = *tx.tx_hash();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
+        resp_rx.await.expect("responder closed").expect("synthetic ok");
+
+        // Nothing from the RPC side has run: only dispatch can have recorded it.
+        assert!(fifo.claims().was_promised(&hash), "the client holds a receipt");
     }
 
     #[tokio::test]

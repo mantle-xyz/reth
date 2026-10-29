@@ -79,6 +79,9 @@ impl PreconfRpcHandler {
     /// Claim the `(sender, nonce)` slot for a commitment whose receipt is going
     /// out, and record the promise in `Commitments` (`fifo.claims()`).
     ///
+    /// Dispatch has normally recorded it already, before sending the receipt;
+    /// this repeats it, which changes nothing.
+    ///
     /// Why here and not at canonical time:
     /// [`Commitments::mark_promised`](crate::commitments::Commitments::mark_promised).
     ///

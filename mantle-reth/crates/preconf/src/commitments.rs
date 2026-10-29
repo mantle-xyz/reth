@@ -227,9 +227,9 @@ struct SealedPayload {
 ///
 /// Held by [`PreconfTxSet`](crate::preconf_tx_set::PreconfTxSet) and shared
 /// through it. The writers are the payload builder's apply
-/// ([`Self::record_announced`]), the RPC handler the instant a client is handed
-/// an event ([`Self::mark_promised`]), journal restore, the canonical handler
-/// ([`Self::observe_persisted`], [`Self::mark_committed`], [`Self::uncommit`],
+/// ([`Self::record_announced`]) and, just before a receipt goes out, its
+/// dispatch and then the RPC handler ([`Self::mark_promised`]), journal restore, the canonical
+/// handler ([`Self::observe_persisted`], [`Self::mark_committed`], [`Self::uncommit`],
 /// [`Self::sweep`]) and the fifo's removal path
 /// ([`Self::release_unless_committed`]). The readers are journal rotation
 /// ([`Self::is_tracked`]), fifo admission ([`Self::slot_conflict`]) and the pool
@@ -375,9 +375,10 @@ impl Commitments {
     /// Upgrade `hash` to [`ClaimKind::Promised`]: a receipt has gone out to a
     /// client. Claims the `(sender, nonce)` if the apply has not already.
     ///
-    /// Two callers: the RPC handler the instant it hands a client an event, and
-    /// journal restore's pre-pass, where the event went out in a previous
-    /// process.
+    /// Called by dispatch just before a receipt goes out, so the promise never
+    /// trails it; again by the RPC handler as it hands the client the event
+    /// (idempotent); and by journal restore's pre-pass, where the event went
+    /// out in a previous process.
     ///
     /// **Not in lockstep with the journal.** A record is what keeps a journal
     /// line alive (rotation's only rule is [`Self::is_tracked`]), but the
