@@ -2,7 +2,8 @@
 //!
 //! ## Responsibilities
 //!
-//! 1. Track in-flight preconf-eligible transactions in FIFO order
+//! 1. Track in-flight preconf-eligible transactions in arrival order, and the order they executed
+//!    in, which is the order a later build replays them in
 //! 2. Notify the builder via [`tokio::sync::broadcast`] (the single fifo event source)
 //! 3. Hold RPC `oneshot::Sender` responders attached by the RPC handler
 //! 4. Survive across slots — entries a build does not apply stay queued, and the next build's
@@ -248,6 +249,14 @@ struct PreconfTxSetInner {
     /// worst-case burst is bounded by pool ingestion rate.
     order: VecDeque<TxHash>,
 
+    /// Entries that have executed, in the order they did: what a later build
+    /// replays them in. Not `order`: a commitment is queued on admission and
+    /// executes later, a pool transaction is staged only after it executes.
+    ///
+    /// Executing, again or not, puts an entry at the back; a reorg puts what it
+    /// took back at the front. Removal takes a hash out of both orders.
+    executed_order: VecDeque<TxHash>,
+
     /// Hash → entry. All mutations + lookups go through this.
     entries: HashMap<TxHash, TxEntry>,
 
@@ -296,18 +305,36 @@ impl PreconfTxSetInner {
         })
     }
     fn new(claims: Arc<Commitments>) -> Self {
-        Self { order: VecDeque::new(), entries: HashMap::new(), by_sender: HashMap::new(), claims }
+        Self {
+            order: VecDeque::new(),
+            executed_order: VecDeque::new(),
+            entries: HashMap::new(),
+            by_sender: HashMap::new(),
+            claims,
+        }
     }
 
-    /// Removes a hash from all indices (`entries` / `by_sender` / `order`).
-    /// Returns the evicted entry if one existed.
+    /// Records `hash` as the latest to execute: at the back of
+    /// `executed_order`, and only once.
+    fn record_executed(&mut self, hash: TxHash) {
+        if let Some(pos) = self.executed_order.iter().position(|h| *h == hash) {
+            self.executed_order.remove(pos);
+        }
+        self.executed_order.push_back(hash);
+    }
+
+    /// Removes a hash from all indices (`entries` / `by_sender` / `order` /
+    /// `executed_order`). Returns the evicted entry if one existed.
     ///
-    /// Everything except `order` happens in [`Self::unindex`], including the
-    /// defensive fallback for torn index state.
+    /// Everything except the two orders happens in [`Self::unindex`], including
+    /// the defensive fallback for torn index state.
     fn drop_hash(&mut self, hash: &TxHash, why: Removal) -> Option<TxEntry> {
         let entry = self.unindex(hash, why);
         if let Some(pos) = self.order.iter().position(|h| h == hash) {
             self.order.remove(pos);
+        }
+        if let Some(pos) = self.executed_order.iter().position(|h| h == hash) {
+            self.executed_order.remove(pos);
         }
         Self::report_unanswered(entry.as_ref());
         entry
@@ -350,6 +377,7 @@ impl PreconfTxSetInner {
         }
         let dropping: HashSet<TxHash> = hashes.iter().copied().collect();
         self.order.retain(|hash| !dropping.contains(hash));
+        self.executed_order.retain(|hash| !dropping.contains(hash));
     }
 
     /// Drop one `(sender, nonce)` from the nested index, and the sender with
@@ -1058,6 +1086,12 @@ impl PreconfTxSet {
         inner.entries.insert(hash, entry);
         inner.by_sender.entry(from).or_default().insert(nonce, hash);
         inner.order.push_back(hash);
+        // Both have executed: a staged pool transaction just now, a `Replay`
+        // push earlier (journal restore, in file order; a reorg's put-back,
+        // which `put_reverted_first` then moves to the front).
+        if status == PreconfStatus::Success || source == PreconfSource::Replay {
+            inner.record_executed(hash);
+        }
         drop(inner);
 
         if notify && status == PreconfStatus::Waiting {
@@ -1120,9 +1154,8 @@ impl PreconfTxSet {
         self.inner.lock().await.entries.get(hash).map(|entry| entry.status)
     }
 
-    /// Snapshot of hashes in FIFO order. Used by the payload builder when
-    /// it starts a new job to replay any pending commitments accumulated
-    /// since the previous block.
+    /// Snapshot of hashes in arrival order. The payload builder re-scans it
+    /// after the broadcast reports `Lagged`.
     pub async fn snapshot(&self) -> Vec<TxHash> {
         self.inner.lock().await.order.iter().copied().collect()
     }
@@ -1408,6 +1441,8 @@ impl PreconfTxSet {
     /// The responder is taken here, not after that write — the write is an
     /// `await`, and a responder left in the entry across it can be taken by a
     /// concurrent removal.
+    ///
+    /// Records the entry as the latest to execute (see `executed_order`).
     pub async fn begin_success(&self, hash: &TxHash) -> Result<Option<SuccessTicket>, MarkError> {
         let mut inner = self.inner.lock().await;
         let entry = inner.entries.get_mut(hash).ok_or(MarkError::NotFound)?;
@@ -1415,7 +1450,32 @@ impl PreconfTxSet {
             return Err(MarkError::IllegalTransition(entry.status));
         }
         entry.status = PreconfStatus::Success;
-        Ok(entry.responder.take().map(|responder| SuccessTicket { responder }))
+        let ticket = entry.responder.take().map(|responder| SuccessTicket { responder });
+        inner.record_executed(*hash);
+        Ok(ticket)
+    }
+
+    /// Puts `hashes` at the front of `executed_order`, in the order given,
+    /// skipping hashes the queue does not hold. For what a reorg took back: it
+    /// executed before anything a build stacked on its block.
+    pub async fn put_reverted_first(&self, hashes: &[TxHash]) {
+        let mut inner = self.inner.lock().await;
+        let moving: Vec<TxHash> =
+            hashes.iter().copied().filter(|h| inner.entries.contains_key(h)).collect();
+        if moving.is_empty() {
+            return;
+        }
+        let set: HashSet<TxHash> = moving.iter().copied().collect();
+        inner.executed_order.retain(|h| !set.contains(h));
+        for hash in moving.into_iter().rev() {
+            inner.executed_order.push_front(hash);
+        }
+    }
+
+    /// The entries that have executed, in the order they did. See the field of
+    /// the same name.
+    pub async fn executed_order(&self) -> Vec<TxHash> {
+        self.inner.lock().await.executed_order.iter().copied().collect()
     }
 
     // ============ Status transitions ============
@@ -1423,8 +1483,8 @@ impl PreconfTxSet {
     /// `Waiting → Success` on its own. **Tests only.**
     ///
     /// Production goes through [`Self::begin_success`], which makes the same
-    /// transition and takes the responder with it. This leaves the responder
-    /// attached — a shape only a test needs.
+    /// transition, records the execution the same way, and takes the responder
+    /// with it. This leaves the responder attached — a shape only a test needs.
     ///
     /// Terminal for the build that set it — nothing moves it again, and
     /// [`Self::forward_all`] is the only path that drops it. The one way out is
@@ -1441,6 +1501,7 @@ impl PreconfTxSet {
             return Err(MarkError::IllegalTransition(entry.status));
         }
         entry.status = PreconfStatus::Success;
+        inner.record_executed(*hash);
         Ok(())
     }
 
@@ -2902,6 +2963,90 @@ mod tests {
             l1_fields: Default::default(),
         });
         assert!(matches!(resp_rx.try_recv(), Ok(Ok(r)) if r.block_height == 7));
+    }
+
+    /// An executed commitment is recorded behind what executed before it, while
+    /// its place in `order` stays where admission put it. A pool transaction
+    /// staged after that place may be one it relied on.
+    #[tokio::test]
+    async fn begin_success_records_the_entry_after_what_executed_before_it() {
+        let set = PreconfTxSet::new(16);
+        let commitment = make_tx(0, 1);
+        let other = make_tx(0, 2);
+        set.push_if_absent(commitment.clone(), addr(1), PreconfSource::Rpc).await;
+        set.push_if_absent(other.clone(), addr(2), PreconfSource::Rpc).await;
+        let funding = make_tx(0, 3);
+        set.stage_executed(funding.clone(), addr(3)).await;
+
+        set.begin_success(commitment.tx_hash()).await.unwrap();
+
+        assert_eq!(
+            set.snapshot().await,
+            vec![*commitment.tx_hash(), *other.tx_hash(), *funding.tx_hash()],
+            "arrival order is untouched",
+        );
+        assert_eq!(set.executed_order().await, vec![*funding.tx_hash(), *commitment.tx_hash()]);
+    }
+
+    /// An entry that executes again is recorded once, at its latest execution.
+    #[tokio::test]
+    async fn an_entry_executed_again_is_recorded_at_its_latest_execution() {
+        let set = PreconfTxSet::new(16);
+        let (first, second) = (make_tx(0, 1), make_tx(0, 2));
+        set.push_if_absent(first.clone(), addr(1), PreconfSource::Rpc).await;
+        set.push_if_absent(second.clone(), addr(2), PreconfSource::Rpc).await;
+        set.begin_success(first.tx_hash()).await.unwrap();
+        set.begin_success(second.tx_hash()).await.unwrap();
+
+        set.reset_success_to_waiting(first.tx_hash()).await.unwrap();
+        set.begin_success(first.tx_hash()).await.unwrap();
+
+        assert_eq!(set.executed_order().await, vec![*second.tx_hash(), *first.tx_hash()]);
+    }
+
+    /// A `Replay` push executed before this process saw it, so it is recorded
+    /// in the order pushed; an `Rpc` push has not executed and is not.
+    #[tokio::test]
+    async fn a_replay_push_is_recorded_as_executed_and_an_rpc_push_is_not() {
+        let set = PreconfTxSet::new(16);
+        for byte in 1..=3u8 {
+            let source = if byte == 2 { PreconfSource::Rpc } else { PreconfSource::Replay };
+            set.push_if_absent(make_tx(0, byte), addr(byte), source).await;
+        }
+
+        assert_eq!(set.executed_order().await, vec![h(1), h(3)]);
+    }
+
+    /// Leaving the queue takes a hash out of `executed_order` too, whether one
+    /// at a time or in a batch.
+    #[tokio::test]
+    async fn removal_takes_the_hash_out_of_the_execution_order() {
+        let set = PreconfTxSet::new(16);
+        for byte in 1..=3u8 {
+            set.push_if_absent(make_tx(0, byte), addr(byte), PreconfSource::Replay).await;
+        }
+
+        let mut inner = set.inner.lock().await;
+        inner.drop_hash(&h(1), Removal::Ended);
+        inner.drop_hashes(&[h(3)], Removal::Ended);
+
+        assert_eq!(inner.executed_order, VecDeque::from([h(2)]));
+    }
+
+    /// `put_reverted_first` puts the given hashes first in `executed_order`, in
+    /// the order given, skips a hash the queue does not hold, and leaves
+    /// `order` alone.
+    #[tokio::test]
+    async fn put_reverted_first_keeps_the_given_order_and_skips_unknown_hashes() {
+        let set = PreconfTxSet::new(16);
+        for byte in 1..=4u8 {
+            set.push_if_absent(make_tx(0, byte), addr(byte), PreconfSource::Replay).await;
+        }
+
+        set.put_reverted_first(&[h(3), h(9), h(4)]).await;
+
+        assert_eq!(set.executed_order().await, vec![h(3), h(4), h(1), h(2)]);
+        assert_eq!(set.snapshot().await, vec![h(1), h(2), h(3), h(4)]);
     }
 
     /// A replayed commitment has no client — its receipt went out in an

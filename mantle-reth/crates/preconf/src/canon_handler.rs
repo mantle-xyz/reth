@@ -303,6 +303,7 @@ where
     // enough for reorg-drift aggregation and avoids an outer loop over
     // blocks.
     let block_number = old.tip().number();
+    let mut reverted = Vec::new();
     for recovered in old.blocks_iter().flat_map(|block| block.clone_transactions_recovered()) {
         let hash = *recovered.inner().tx_hash();
         if new_chain.contains(&hash) {
@@ -346,6 +347,7 @@ where
         // `status_of`); if the queue loses it, the pool arm executes it as an
         // ordinary transaction, since the slot gate there lets the slot's own
         // transaction through. Do not filter it out of the pool.
+        reverted.push(hash);
         let signer = recovered.signer();
         let (signed, _) = recovered.into_parts();
         match op_envelope_to_alloy(OpTxEnvelope::from(signed)) {
@@ -393,6 +395,11 @@ where
             ),
         }
     }
+
+    // Each push was recorded as the latest to execute, but these ran before
+    // anything a build stacked on the reverted block, such as the same sender's
+    // next nonce.
+    fifo.put_reverted_first(&reverted).await;
 
     outcome
 }
@@ -473,13 +480,20 @@ mod reorg_tests {
 
     /// A reverted chain of one block holding `tx` from [`sender`].
     fn reverted_chain(tx: OpTransactionSigned) -> Chain<OpPrimitives> {
-        let body = BlockBody { transactions: vec![tx], ommers: vec![], withdrawals: None };
+        reverted_block(vec![tx])
+    }
+
+    /// A reverted chain of one block holding `txs`, in that order, all from
+    /// [`sender`].
+    fn reverted_block(txs: Vec<OpTransactionSigned>) -> Chain<OpPrimitives> {
+        let senders = vec![sender(); txs.len()];
+        let body = BlockBody { transactions: txs, ommers: vec![], withdrawals: None };
         let block = alloy_consensus::Block {
             header: Header { number: REVERTED_AT, ..Default::default() },
             body,
         };
         Chain::new(
-            vec![RecoveredBlock::new_unhashed(block, vec![sender()])],
+            vec![RecoveredBlock::new_unhashed(block, senders)],
             ExecutionOutcome::default(),
             BTreeMap::default(),
         )
@@ -547,6 +561,32 @@ mod reorg_tests {
             fifo.find_by_hash(&hash).await.map(|entry| entry.source),
             Some(PreconfSource::Replay),
         );
+    }
+
+    /// What a reorg puts back goes to the front of `executed_order`, in block
+    /// order. Left at the back, nonces 0 and 1 would replay after the nonce 2
+    /// built on them, and nonce 2 would fail.
+    #[tokio::test]
+    async fn what_a_reorg_puts_back_goes_ahead_of_what_was_built_on_it() {
+        let fifo = fifo();
+        let built_on_top = op_tx(2, 1);
+        let on_top_hash = built_on_top.tx_hash();
+        let envelope = op_envelope_to_alloy(built_on_top).expect("a user type");
+        fifo.push_if_absent(Arc::new(envelope), sender(), PreconfSource::Rpc).await;
+        fifo.mark_succeeded(&on_top_hash).await.unwrap();
+
+        let (n0, n1) = (op_tx(0, 1), op_tx(1, 1));
+        let (h0, h1) = (n0.tx_hash(), n1.tx_hash());
+        for (hash, nonce) in [(h0, 0), (h1, 1)] {
+            assert_eq!(fifo.claims().mark_promised(hash, &sender(), nonce, REVERTED_AT), Ok(()));
+            assert!(fifo.claims().mark_committed(&hash, REVERTED_AT));
+        }
+
+        let outcome =
+            reinject_reverted(&fifo, &reverted_block(vec![n0, n1]), &HashSet::default()).await;
+
+        assert_eq!(outcome.reinjected, 2);
+        assert_eq!(fifo.executed_order().await, vec![h0, h1, on_top_hash]);
     }
 
     /// A transaction the new chain also carries is still on chain: it is not
