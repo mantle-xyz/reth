@@ -511,17 +511,24 @@ where
 
     fn add_ons(&self) -> Self::AddOns {
         let sequencer_url = self.op_node.args.sequencer.clone();
+        let sequencer_headers = self.op_node.args.sequencer_headers.clone();
         let preconf = self.preconf.clone();
         let flashblocks_cfg = self.flashblocks.clone();
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |ctx| {
-            // Build SequencerClient if a sequencer URL is configured.
-            // SequencerClient::new is async; use block_in_place since we're inside tokio.
+            // Build SequencerClient if a sequencer URL is configured, with the same
+            // `--rollup.sequencer-headers` op-reth gives its own forwarding client.
+            // SequencerClient::new_with_headers is async; use block_in_place since we're
+            // inside tokio.
             let sequencer_client = sequencer_url
                 .map(|url| {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(reth_optimism_rpc::SequencerClient::new(url))
+                        tokio::runtime::Handle::current().block_on(
+                            reth_optimism_rpc::SequencerClient::new_with_headers(
+                                url,
+                                sequencer_headers,
+                            ),
+                        )
                     })
                 })
                 .transpose()
