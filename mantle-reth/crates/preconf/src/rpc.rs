@@ -76,41 +76,6 @@ impl PreconfRpcHandler {
         Self { admission, fifo, cfg }
     }
 
-    /// Claim the `(sender, nonce)` slot for a commitment whose receipt is going
-    /// out, and record the promise in `Commitments` (`fifo.claims()`).
-    ///
-    /// Dispatch has normally recorded it already, before sending the receipt;
-    /// this repeats it, which changes nothing.
-    ///
-    /// Why here and not at canonical time:
-    /// [`Commitments::mark_promised`](crate::commitments::Commitments::mark_promised).
-    ///
-    /// **Every receipt counts, not only `Success`.** A `Failed` event on a
-    /// receipt path is an EVM revert that *produced* a receipt; every
-    /// not-on-chain outcome leaves through an `Err(..)` return and never reaches
-    /// here. The receipt goes out before the block is sealed, so a reverted tx is
-    /// owed a replay exactly as a successful one is — and `builder::dispatch`
-    /// agrees, marking the fifo entry `Success` without reading `receipt.status`.
-    /// Pinned by `a_reverted_receipt_is_still_recorded_as_a_commitment`.
-    fn claim_commitment_slot(
-        &self,
-        event: &PreconfTxEvent,
-        hash: alloy_primitives::TxHash,
-        sender: &alloy_primitives::Address,
-        nonce: u64,
-    ) {
-        if let Err(owner) =
-            self.fifo.claims().mark_promised(hash, sender, nonce, event.block_height)
-        {
-            warn!(
-                target: "mantle::preconf::rpc",
-                ?hash, ?owner,
-                "a different tx already owns this (sender, nonce) at receipt time; \
-                 the commitment may not be honoured"
-            );
-        }
-    }
-
     /// Process a single `eth_sendRawTransactionWithPreconf` submission:
     /// admit, then wait out the deadline.
     pub async fn handle_inner(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
@@ -132,7 +97,7 @@ impl PreconfRpcHandler {
             .admit(bytes, origin_instant, resp_tx)
             .await
             .map_err(|e| preconf_error_to_rpc(&e))?;
-        let AdmittedTx { hash, sender, nonce } = admitted;
+        let AdmittedTx { hash, .. } = admitted;
 
         // Await receipt or deadline, with race-safe handling.
         //
@@ -159,13 +124,9 @@ impl PreconfRpcHandler {
         };
 
         match recv_result {
-            // Receipt arrived within the deadline. Every receipt is recorded,
-            // reverts included — see `claim_commitment_slot`.
-            Some(Ok(Ok(receipt))) => {
-                let event = PreconfTxEvent::from(receipt);
-                self.claim_commitment_slot(&event, hash, &sender, nonce);
-                Ok(event)
-            }
+            // Receipt arrived within the deadline. Dispatch recorded the
+            // promise before sending it, reverts included.
+            Some(Ok(Ok(receipt))) => Ok(PreconfTxEvent::from(receipt)),
 
             // Builder signalled an error through the responder. A
             // `Timeout` error is surfaced as an `Ok(Timeout event)`
@@ -206,13 +167,8 @@ impl PreconfRpcHandler {
                 let apply_guard = self.fifo.lock_for_apply(&hash).await;
 
                 let outcome = match resp_rx.try_recv() {
-                    // Every receipt is recorded, reverts included — see
-                    // `claim_commitment_slot`.
-                    Ok(Ok(receipt)) => {
-                        let event = PreconfTxEvent::from(receipt);
-                        self.claim_commitment_slot(&event, hash, &sender, nonce);
-                        Ok(event)
-                    }
+                    // Dispatch recorded the promise before sending it.
+                    Ok(Ok(receipt)) => Ok(PreconfTxEvent::from(receipt)),
                     // A `Timeout` is the op-geth-aligned wire shape, never a
                     // JSON-RPC error — same as the pre-deadline arm above.
                     Ok(Err(err)) => {
@@ -667,7 +623,6 @@ mod tests {
                         );
                         assert_eq!(event.receipt.status, Some(u64::from(success)));
                         assert_eq!(h.fifo.claims().slot_owner(&h.sender, 0), Some(incumbent));
-                        assert!(h.fifo.claims().was_promised(&hash));
                         assert_eq!(h.fifo.claims().was_promised(&incumbent), incumbent_promised);
                     }
                 }
@@ -678,49 +633,6 @@ mod tests {
                 );
             });
         });
-    }
-
-    /// An EVM revert that produced a receipt is a commitment like any other —
-    /// see `claim_commitment_slot` for why the gate is not on `Success`.
-    ///
-    /// `builder::dispatch` marks the fifo entry `Success` regardless of
-    /// `receipt.status`, so a gate here would leave the fifo saying "committed"
-    /// about a transaction `Commitments` had never heard of.
-    #[tokio::test]
-    async fn a_reverted_receipt_is_still_recorded_as_a_commitment() {
-        let h = harness();
-        let hash = B256::from([0xab; 32]);
-        let sender = h.sender;
-
-        let event = PreconfTxEvent::from(PreconfReceipt {
-            tx_hash: hash,
-            block_height: 42,
-            status: false, // EVM revert — a receipt exists all the same
-            logs: vec![],
-            gas_used: 21_000,
-            reason: "execution reverted".to_string(),
-            revert_data: PrimBytes::new(),
-            tx_index: 0,
-            cumulative_gas_used: 21_000,
-            logs_bloom: Bloom::default(),
-            log_index_base: 0,
-            tx_type: 2,
-            from: sender,
-            to: Some(RECIPIENT),
-            contract_address: None,
-            effective_gas_price: 1_000_000_000,
-            block_timestamp: 0,
-            l1_fields: Default::default(),
-        });
-        assert_eq!(event.status, WireStatus::Failed, "precondition: this is the reverted arm");
-
-        h.handler.claim_commitment_slot(&event, hash, &sender, 0);
-
-        assert!(
-            h.fifo.claims().is_tracked(&hash),
-            "`Commitments` must know the commitment, or a reorg reinject is \
-             re-gated as a fresh submission and `mark_committed` cannot count it",
-        );
     }
 
     /// `logIndex` is block-global: the first log of a transaction whose block

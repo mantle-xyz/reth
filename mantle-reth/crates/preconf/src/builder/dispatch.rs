@@ -403,8 +403,8 @@ where
             //
             // Promised first, still under the `apply_lock`: a receipt without
             // the promise reads as an executed-but-unpromised entry, which
-            // `trim_staged` may evict before the RPC task records it. That
-            // task records it again; the call is idempotent.
+            // `trim_staged` may evict. Every receipt a client gets goes out
+            // here, so this is the only place a live commitment is promised.
             if let Some(ticket) = ticket {
                 if let Err(owner) = fifo.claims().mark_promised(
                     hash,
@@ -922,6 +922,65 @@ mod tests {
 
         // Nothing from the RPC side has run: only dispatch can have recorded it.
         assert!(fifo.claims().was_promised(&hash), "the client holds a receipt");
+    }
+
+    /// An EVM revert that produced a receipt is a commitment like any other.
+    ///
+    /// Dispatch marks the entry `Success` whatever `receipt.status` says, so
+    /// gating the promise on it would leave the queue saying "committed" about
+    /// a transaction `Commitments` never heard of: a reorg would re-gate it as
+    /// a fresh submission, and `mark_committed` could not count it.
+    #[tokio::test]
+    async fn a_reverted_receipt_is_still_promised() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x42);
+        let hash = *tx.tx_hash();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, |tx, h, height| {
+            synthetic_ok(tx, h, height).map(|receipt| PreconfReceipt { status: false, ..receipt })
+        })
+        .await
+        .unwrap();
+        let receipt = resp_rx.await.expect("responder closed").expect("a receipt");
+        assert!(!receipt.status, "precondition: the reverted arm");
+
+        assert!(fifo.claims().was_promised(&hash));
+    }
+
+    /// A receipt-time slot conflict leaves the incumbent owning the nonce, and
+    /// the commitment is still recorded as promised, so `trim_staged` cannot
+    /// evict it. The receipt the client gets is unchanged.
+    #[tokio::test]
+    async fn a_slot_conflict_at_receipt_time_still_promises() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x43);
+        let hash = *tx.tx_hash();
+        let nonce = tx.nonce();
+        let incumbent = TxHash::from([0xbb; 32]);
+        assert_eq!(fifo.claims().record_announced(incumbent, &Address::ZERO, nonce, 41), Ok(()));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
+        let receipt = resp_rx.await.expect("responder closed").expect("a receipt");
+
+        assert_eq!(receipt.tx_hash, hash, "the receipt is the one the apply produced");
+        assert_eq!(fifo.claims().slot_owner(&Address::ZERO, nonce), Some(incumbent));
+        assert!(fifo.claims().was_promised(&hash));
     }
 
     #[tokio::test]
