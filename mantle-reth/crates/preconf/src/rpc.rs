@@ -12,15 +12,13 @@
 //! and the client's channel goes in under the queue's lock as part of it, so
 //! the builder can never reach an entry with nobody to answer for it.
 //!
-//! That leaves this module two jobs:
-//!
-//! * **Race the deadline.** `select!` rather than `timeout`, so the receiver outlives the elapsed
-//!   branch. On elapse the per-entry apply lock is taken, which serialises with dispatch's point of
-//!   no return; once held, no completion is in flight, so a result dispatch already sent is in the
-//!   channel to pick up. Without that the client could be told `Timeout` for a transaction already
-//!   committed to the block being built.
-//! * **Record the commitment.** Every receipt is recorded, reverts included — a revert is an
-//!   outcome, not a failure to keep the promise.
+//! That leaves this module one job: **racing the deadline.** `select!` rather
+//! than `timeout`, so the receiver outlives the elapsed branch. On elapse the
+//! per-entry apply lock is taken, which serialises with dispatch's point of no
+//! return; once held, no completion is in flight, so a result dispatch already
+//! sent is in the channel to pick up. Without that the client could be told
+//! `Timeout` for a transaction already committed to the block being built.
+//! Recording the promise is dispatch's, before it sends the receipt.
 //!
 //! No client ever waits on a replaying commitment. `PreconfTxSet::admit`
 //! refuses a resubmit of its hash, and the entry a client waits on is the
@@ -124,8 +122,8 @@ impl PreconfRpcHandler {
         };
 
         match recv_result {
-            // Receipt arrived within the deadline. Dispatch recorded the
-            // promise before sending it, reverts included.
+            // Receipt arrived within the deadline; dispatch already recorded
+            // the promise.
             Some(Ok(Ok(receipt))) => Ok(PreconfTxEvent::from(receipt)),
 
             // Builder signalled an error through the responder. A
@@ -167,7 +165,6 @@ impl PreconfRpcHandler {
                 let apply_guard = self.fifo.lock_for_apply(&hash).await;
 
                 let outcome = match resp_rx.try_recv() {
-                    // Dispatch recorded the promise before sending it.
                     Ok(Ok(receipt)) => Ok(PreconfTxEvent::from(receipt)),
                     // A `Timeout` is the op-geth-aligned wire shape, never a
                     // JSON-RPC error — same as the pre-deadline arm above.

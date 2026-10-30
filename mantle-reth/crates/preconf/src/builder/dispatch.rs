@@ -401,10 +401,8 @@ where
             }
             // The receipt goes out whether or not the write above succeeded.
             //
-            // Promised first, still under the `apply_lock`: a receipt without
-            // the promise reads as an executed-but-unpromised entry, which
-            // `trim_staged` may evict. Every receipt a client gets goes out
-            // here, so this is the only place a live commitment is promised.
+            // Promised first, under the `apply_lock`: an executed, unpromised
+            // entry is what `trim_staged` evicts. Every live receipt goes out here.
             if let Some(ticket) = ticket {
                 if let Err(owner) = fifo.claims().mark_promised(
                     hash,
@@ -898,11 +896,8 @@ mod tests {
         );
     }
 
-    /// A receipt never leaves dispatch ahead of the promise it makes.
-    ///
-    /// Recorded only by the RPC task, the promise would trail the receipt by a
-    /// wakeup, and in that window `trim_staged` reads the entry as executed but
-    /// unpromised — evictable — and the commitment is lost without a trace.
+    /// A receipt never leaves dispatch ahead of its promise; in that gap
+    /// `trim_staged` could evict the commitment.
     #[tokio::test]
     async fn the_promise_is_recorded_before_the_receipt_goes_out() {
         let fifo = PreconfTxSet::new(8);
@@ -920,16 +915,12 @@ mod tests {
         apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
         resp_rx.await.expect("responder closed").expect("synthetic ok");
 
-        // Nothing from the RPC side has run: only dispatch can have recorded it.
+        // No RPC code ran: dispatch alone recorded it.
         assert!(fifo.claims().was_promised(&hash), "the client holds a receipt");
     }
 
-    /// An EVM revert that produced a receipt is a commitment like any other.
-    ///
-    /// Dispatch marks the entry `Success` whatever `receipt.status` says, so
-    /// gating the promise on it would leave the queue saying "committed" about
-    /// a transaction `Commitments` never heard of: a reorg would re-gate it as
-    /// a fresh submission, and `mark_committed` could not count it.
+    /// A reverted transaction still has a receipt, so it is still promised —
+    /// as the queue's `Success` says, whatever `receipt.status` is.
     #[tokio::test]
     async fn a_reverted_receipt_is_still_promised() {
         let fifo = PreconfTxSet::new(8);
@@ -955,9 +946,8 @@ mod tests {
         assert!(fifo.claims().was_promised(&hash));
     }
 
-    /// A receipt-time slot conflict leaves the incumbent owning the nonce, and
-    /// the commitment is still recorded as promised, so `trim_staged` cannot
-    /// evict it. The receipt the client gets is unchanged.
+    /// A slot conflict at receipt time leaves the incumbent owning the nonce,
+    /// but the commitment is still promised and the receipt unchanged.
     #[tokio::test]
     async fn a_slot_conflict_at_receipt_time_still_promises() {
         let fifo = PreconfTxSet::new(8);

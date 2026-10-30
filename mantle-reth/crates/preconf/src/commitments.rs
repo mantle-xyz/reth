@@ -69,7 +69,7 @@ pub const SEAL_DEPTH: u64 = 32;
 /// answer** to "is this one still owed" — there is no "not claimed" record.
 ///
 /// Created by [`Commitments::record_announced`] at the apply and upgraded by
-/// [`Commitments::mark_promised`] when a receipt reaches a client.
+/// [`Commitments::mark_promised`] just before a receipt goes to a client.
 ///
 /// `slot` is the reverse link into [`CommitmentStore::by_slot`], so every
 /// removal can release the claim without scanning the index. The invariant is
@@ -226,9 +226,9 @@ struct SealedPayload {
 /// The claims this node has made, and the nonces they hold.
 ///
 /// Held by [`PreconfTxSet`](crate::preconf_tx_set::PreconfTxSet) and shared
-/// through it. The writers are the payload builder's apply
-/// ([`Self::record_announced`]) and, just before a receipt goes out, its
-/// dispatch ([`Self::mark_promised`]), journal restore, the canonical
+/// through it. The writers are the payload builder — its apply
+/// ([`Self::record_announced`]) and its dispatch before a receipt goes out
+/// ([`Self::mark_promised`]) — journal restore, the canonical
 /// handler ([`Self::observe_persisted`], [`Self::mark_committed`], [`Self::uncommit`],
 /// [`Self::sweep`]) and the fifo's removal path
 /// ([`Self::release_unless_committed`]). The readers are journal rotation
