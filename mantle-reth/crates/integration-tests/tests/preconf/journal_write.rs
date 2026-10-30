@@ -130,8 +130,8 @@ async fn rpc_success_appends_to_journal_file() {
         event.reason
     );
 
-    // The RPC handler awaits `append_promised` before returning the
-    // Success event, so by now the entry is on disk.
+    // Dispatch writes the journal before it sends the receipt, so by now the
+    // entry is in the file.
     let entries = read_journal(&journal_file);
     assert_eq!(entries.len(), 1, "exactly one commitment must be journaled");
     let entry = &entries[0];
