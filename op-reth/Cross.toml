@@ -69,4 +69,5 @@ env.passthrough = [
 ]
 
 [build.env]
-passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS", "LIBCLANG_PATH"]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS", "LIBCLANG_PATH",
+               "GIT_VERSION", "GIT_COMMIT", "GIT_DATE"]

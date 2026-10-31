@@ -11,8 +11,9 @@
 //! - `journal_replay_lands_promised_tx_in_next_block` — base case: single entry, restore → apply →
 //!   land.
 //! - `journal_replay_multiple_entries_all_land_in_first_block` — 3 entries from same sender (nonces
-//!   0/1/2) all land in block 1. Guards `restore_preconf_state`'s per-entry loop + nonce-order
-//!   preservation in `replay_fifo_carryover`.
+//!   0/1/2) all land in block 1. Guards `restore_preconf_state`'s per-entry loop.
+//! - `journal_replay_keeps_a_commitment_behind_the_transfer_it_relies_on` — replay keeps file order
+//!   across senders, so a commitment funded by another sender's transfer still lands.
 //! - `journal_replay_across_multiple_senders` — 2 senders, each 1 entry, both land in block 1.
 //!   Guards per-entry independence in restore.
 //! - `empty_journal_file_starts_normally` — journal file exists but is empty. Startup must not
@@ -29,11 +30,11 @@
 //! restart a process.
 
 use super::helpers::{PreconfCfgBuilder, mantle_test_chain_spec};
-use crate::launch_preconf_node;
+use crate::{launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use mantle_reth_preconf::JournalEntry;
+use mantle_reth_preconf::{ClaimKind, JournalEntry};
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
@@ -76,8 +77,13 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
 
-    let entry =
-        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0 };
+    let entry = JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    };
     let mut line = serde_json::to_vec(&entry).expect("encode JournalEntry");
     line.push(b'\n');
     std::fs::write(&journal_file, &line).expect("write journal file");
@@ -127,6 +133,83 @@ async fn journal_replay_lands_promised_tx_in_next_block() {
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
+/// **C4 regression guard.** A commitment already acknowledged to a client must
+/// come back after a restart even if the operator has since *lowered*
+/// `--preconf.max-gas-per-tx` below that tx's gas limit.
+///
+/// The tx below asks for 21 000 gas while the restarted node caps preconf txs at
+/// 20 000. The cap is an admission-time check, so restore's `recover_envelope` runs
+/// straight into it — unless the entry is already promised, which the
+/// validator waves past every preconf gate. Without that exemption `recover_envelope`
+/// returns `Err`, restore logs and skips, and the commitment is **silently
+/// dropped**: the client was told it succeeded and nothing lands.
+///
+/// Cold start runs *ahead* of restore — it has to, because restore must judge a
+/// commitment against the policy in force — so the lowered ceiling is live by
+/// the time `recover_envelope` runs, and the exemption is the only thing
+/// carrying the entry past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn journal_replay_survives_a_lowered_per_tx_gas_cap() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_id = mantle_test_chain_spec().chain().id();
+    let wallet = Wallet::default().with_chain_id(chain_id);
+    let wallet_addr = wallet.inner.address();
+
+    let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
+    let tx_hash = keccak256(&raw_tx);
+
+    let (journal_file, journal_dir) = write_journal(&[JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    }]);
+
+    // Allowlisted *and* over the cap: the tx would be classified `Eligible` on a
+    // fresh submission, so only the `Promised` exemption can get it through.
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .journal_path(journal_file.clone())
+        .max_gas_per_tx(20_000)
+        .build();
+
+    let (mut node, _http, _node_wallet, _launched_chain_id) = launch_preconf_node!(cfg).await;
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(
+        sealed.contains(&tx_hash),
+        "a promised tx must be restored even when it exceeds the current \
+         per-tx gas cap; hash {tx_hash:?} not in sealed {sealed:?}",
+    );
+
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
 /// Helper: create a fresh JSON-Lines journal file under `tempdir` with
 /// the given entries and return the file path + tempdir handle.
 fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -144,6 +227,106 @@ fn write_journal(entries: &[JournalEntry]) -> (std::path::PathBuf, std::path::Pa
     }
     std::fs::write(&journal_file, &buf).expect("write journal file");
     (journal_file, journal_dir)
+}
+
+/// A client resubmitting a hash that is mid-replay cannot disturb the
+/// commitment — and is refused rather than made to wait.
+///
+/// Shape: journal restore leaves the entry in the fifo as `Waiting` /
+/// `PreconfSource::Replay` with no responder. Its receipt went out in the
+/// previous process and cannot be reconstructed, so there is nothing a second
+/// client could be handed; admission says so instead of attaching a channel
+/// nobody will answer.
+///
+/// The protection is that the entry never acquires a client at all, so nothing
+/// in this test *can* touch it. Two observables:
+///
+/// 1. the commitment is still queued after the refusal;
+/// 2. it still lands in the next block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resubmit_cannot_disturb_a_replaying_commitment() {
+    use super::helpers::send_preconf;
+    use jsonrpsee::core::ClientError;
+
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_id = mantle_test_chain_spec().chain().id();
+    let wallet = Wallet::default().with_chain_id(chain_id);
+    let wallet_addr = wallet.inner.address();
+
+    let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
+    let tx_hash = keccak256(&raw_tx);
+
+    let (journal_file, journal_dir) = write_journal(&[JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    }]);
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .journal_path(journal_file.clone())
+        .preconf_timeout_ms(150)
+        .build();
+
+    let (mut node, http, _node_wallet, _launched_chain_id, fifo) =
+        launch_preconf_node_with_fifo!(cfg).await;
+
+    // Restore has already re-injected the tx and pushed a `Replay` fifo entry.
+    // The resubmit is refused outright: there is no second receipt to give it.
+    // Note this returns immediately — it does not wait out `preconf_timeout`.
+    let err = send_preconf(&http, raw_tx.clone())
+        .await
+        .expect_err("a replaying commitment takes on no second client");
+    assert!(
+        matches!(&err, ClientError::Call(e)
+            if e.message().contains("already in progress")),
+        "expected AlreadyInProgress, got {err:?}",
+    );
+
+    // Observable 1: the commitment is still queued. Commitments do not enter
+    // the transaction pool, so the queue is the only place the survival is
+    // visible — and the more direct one.
+    assert!(
+        fifo.contains(&tx_hash).await,
+        "the replaying commitment must survive this client's timeout",
+    );
+
+    // Observable 2: it still lands. A `Timeout` fifo entry is terminal for
+    // `replay_fifo_carryover`, so a regression leaves the block empty.
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+    assert!(
+        sealed.contains(&tx_hash),
+        "the commitment must still land after the resubmit's deadline; \
+         hash {tx_hash:?} not in sealed {sealed:?}",
+    );
+
+    let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
 /// Multi-entry journal replay: three consecutive nonces from the same
@@ -170,9 +353,27 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
     let hash2 = keccak256(&tx2);
 
     let entries = [
-        JournalEntry { hash: hash0, tx_rlp: tx0.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash1, tx_rlp: tx1.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash2, tx_rlp: tx2.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry {
+            hash: hash0,
+            tx_rlp: tx0.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
+        JournalEntry {
+            hash: hash1,
+            tx_rlp: tx1.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
+        JournalEntry {
+            hash: hash2,
+            tx_rlp: tx2.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 
@@ -233,6 +434,112 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
+/// A journal in execution order where one sender's commitment relies on
+/// another sender's transaction between two of its own: S1 nonce 0, S2 funds
+/// S1, S1 nonce 1. Nonce 0 leaves S1 too little for nonce 1; the transfer is
+/// what pays for it.
+///
+/// Replay has to keep that order. Gathering S1's entries by nonce runs nonce 1
+/// ahead of the transfer, against a balance that cannot cover it, and a
+/// commitment a client holds a receipt for is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn journal_replay_keeps_a_commitment_behind_the_transfer_it_relies_on() {
+    let recipient: Address = RECIPIENT.parse().unwrap();
+    let chain_spec = mantle_test_chain_spec();
+    let chain_id = chain_spec.chain().id();
+    let wallets = Wallet::new(2).with_chain_id(chain_id).wallet_gen();
+    let (s1, s2) = (wallets[0].clone(), wallets[1].clone());
+    let s1_addr = s1.address();
+    let balance =
+        chain_spec.genesis().alloc.get(&s1_addr).expect("S1 is funded by genesis").balance;
+
+    // What one transfer reserves for gas: `gas * max_fee`. Nonce 0 leaves half
+    // of that, so nonce 1 fits only once the transfer has paid in.
+    let fee = U256::from(21_000u64) * U256::from(20e9 as u128);
+    let tx0 =
+        signed_value_transfer(chain_id, &s1, 0, recipient, balance - fee - fee / U256::from(2))
+            .await;
+    let funding = signed_value_transfer(chain_id, &s2, 0, s1_addr, fee * U256::from(2)).await;
+    let tx1 = signed_value_transfer(chain_id, &s1, 1, recipient, U256::from(1u64)).await;
+    let hashes = [keccak256(&tx0), keccak256(&funding), keccak256(&tx1)];
+
+    let entries: Vec<JournalEntry> = [&tx0, &funding, &tx1]
+        .into_iter()
+        .zip(hashes)
+        .map(|(tx, hash)| JournalEntry {
+            hash,
+            tx_rlp: tx.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        })
+        .collect();
+    let (journal_file, journal_dir) = write_journal(&entries);
+
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(s1_addr)
+        .whitelist_to(recipient)
+        .journal_path(journal_file.clone())
+        .build();
+
+    let (mut node, _http, _wallet_launched, _launched_chain_id) = launch_preconf_node!(cfg).await;
+
+    let attrs = node.payload.next_attributes();
+    let fcu_state = node.current_forkchoice_state().expect("forkchoice state");
+    let payload_id = node
+        .inner
+        .add_ons_handle
+        .beacon_engine_handle
+        .fork_choice_updated(fcu_state, Some(attrs))
+        .await
+        .expect("FCU must succeed")
+        .payload_id
+        .expect("payload_id present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let payload = node
+        .inner
+        .payload_builder_handle
+        .resolve_kind(payload_id, reth_node_api::PayloadKind::Earliest)
+        .await
+        .expect("resolve_kind")
+        .expect("payload build");
+
+    let sealed: Vec<alloy_primitives::B256> =
+        payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
+
+    for (label, h) in
+        [("S1 nonce 0", hashes[0]), ("transfer", hashes[1]), ("S1 nonce 1", hashes[2])]
+    {
+        assert!(sealed.contains(&h), "missing {label}, sealed={sealed:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+/// A transfer of `value` to `to`, with the gas terms of [`signed_transfer`].
+async fn signed_value_transfer(
+    chain_id: u64,
+    signer: &alloy_signer_local::PrivateKeySigner,
+    nonce: u64,
+    to: Address,
+    value: U256,
+) -> alloy_primitives::Bytes {
+    let request = TransactionRequest {
+        chain_id: Some(chain_id),
+        nonce: Some(nonce),
+        to: Some(TxKind::Call(to)),
+        gas: Some(21_000),
+        max_fee_per_gas: Some(20e9 as u128),
+        max_priority_fee_per_gas: Some(20e9 as u128),
+        value: Some(value),
+        input: TransactionInput::default(),
+        ..Default::default()
+    };
+    TransactionTestContext::sign_tx(signer.clone(), request).await.encoded_2718().into()
+}
+
 /// Multi-sender journal replay: two independent senders, each with a
 /// single promised commitment, both land in the first block.
 ///
@@ -274,8 +581,20 @@ async fn journal_replay_across_multiple_senders() {
     let hash_b = keccak256(&tx_b);
 
     let entries = [
-        JournalEntry { hash: hash_a, tx_rlp: tx_a.clone(), block_height: 1, committed_at_ms: 0 },
-        JournalEntry { hash: hash_b, tx_rlp: tx_b.clone(), block_height: 1, committed_at_ms: 0 },
+        JournalEntry {
+            hash: hash_a,
+            tx_rlp: tx_a.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
+        JournalEntry {
+            hash: hash_b,
+            tx_rlp: tx_b.clone(),
+            block_height: 1,
+            committed_at_ms: 0,
+            kind: ClaimKind::Promised,
+        },
     ];
     let (journal_file, journal_dir) = write_journal(&entries);
 
@@ -352,9 +671,8 @@ async fn empty_journal_file_starts_normally() {
     assert_eq!(launched_chain_id, chain_id);
 
     // Sanity-check: startup completed and the RPC still accepts a
-    // fresh preconf tx. If restore-of-empty-file corrupted anything
-    // (e.g. left `pending_responders` in a weird state), this would
-    // fail either at the RPC layer or during dispatch.
+    // fresh preconf tx. If restore-of-empty-file corrupted any of the queue's
+    // state, this would fail either at the RPC layer or during dispatch.
     let raw_tx = signed_transfer(chain_id, &wallet, 0).await;
     let expected_hash = keccak256(&raw_tx);
 

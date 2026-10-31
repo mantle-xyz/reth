@@ -1,6 +1,6 @@
-//! A preconf must-land commitment survives a 1-block shallow reorg.
+//! A preconf commitment survives a 1-block shallow reorg.
 //!
-//! A preconf tx that returns `success` is a must-land promise. If the unsafe
+//! The node makes a best effort to land a preconf tx that returned `success`. If the unsafe
 //! block carrying it is reverted, the commitment must re-land on the new
 //! canonical chain (same hash, exactly once).
 //!
@@ -52,7 +52,9 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        .journal_path(fresh_journal("shallow")) // journal ON — so the reverted commitment can be replayed
+        // The journal is mandatory; re-landing does not read it (the canon
+        // handler requeues the commitment from the reverted block itself).
+        .journal_path(fresh_journal("shallow"))
         .build();
 
     let (node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
@@ -72,7 +74,12 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     // L1-attributes deposit; the preconf lands right after it.
     let (_commit_head, sealed_commit) = op_node_slot_l1!(node, on = base, n = 1, l1 = 100);
     let ev = rpc.await.expect("rpc join").expect("preconf submission must not error");
-    assert_eq!(ev.status, PreconfStatus::Success, "must-land commitment; reason={:?}", ev.reason);
+    assert_eq!(
+        ev.status,
+        PreconfStatus::Success,
+        "the preconf must succeed; reason={:?}",
+        ev.reason
+    );
     assert!(
         sealed_commit.contains(&hash),
         "committed tx must land in the commitment block; sealed={sealed_commit:?}",
@@ -86,7 +93,8 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     // ── Reorg: rebuild at the SAME height (n=1 → SAME timestamp) but a DIFFERENT
     //    L1 origin (200). This reverts the commitment block and re-derives it
     //    against a new L1 origin — exactly what an L1 reorg does. The commitment
-    //    must re-land via the preconf carryover / journal-replay path.
+    //    must re-land: the canon handler re-injects it from the reverted block,
+    //    and the rebuild executes it as a Replay entry.
     let (relanded_head, sealed_relanded) = reorg_to!(node, base, n = 1, l1 = 200);
     assert!(
         sealed_relanded.contains(&hash),

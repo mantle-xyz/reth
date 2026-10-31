@@ -7,18 +7,17 @@
 //! consensus and cause a safe-head fork.
 //!
 //! This module locks the gate: even a `PreconfSource::Replay` fifo
-//! entry (which normally bypasses deadline / gas-budget gates because
-//! "receipt returned → tx must land") is skipped during a
-//! `no_tx_pool=true` build. The Replay SLA is upheld by delayed
-//! landing on the next `no_tx_pool=false` build, NOT by forcing the
-//! tx into the derivation block.
+//! entry (which normally bypasses deadline / gas-budget gates because its
+//! receipt has gone out) is skipped during a `no_tx_pool=true` build. It
+//! lands later, on the next `no_tx_pool=false` build, NOT by being forced
+//! into the derivation block.
 
 use super::helpers::{PreconfCfgBuilder, mantle_payload_attributes};
 use crate::launch_preconf_node;
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use mantle_reth_preconf::JournalEntry;
+use mantle_reth_preconf::{ClaimKind, JournalEntry};
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 
@@ -40,7 +39,7 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 }
 
 /// Replay-sourced fifo entry (journal-restored, promised commitment) is
-/// the **strongest** carrier of the "must-land" SLA — deadline and the block-gas-budget gate
+/// the entry the node tries hardest to land — the deadline and
 /// gas-budget gates both bypass it. Verifying it is NOT applied during
 /// a `no_tx_pool=true` build proves the gate wraps the entire preconf
 /// pipeline (not just the RPC-sourced arm).
@@ -73,8 +72,13 @@ async fn no_tx_pool_gates_replay_source_entry() {
     std::fs::create_dir_all(&journal_dir).expect("mkdir journal_dir");
     let journal_file = journal_dir.join("preconf.journal");
 
-    let entry =
-        JournalEntry { hash: tx_hash, tx_rlp: raw_tx.clone(), block_height: 1, committed_at_ms: 0 };
+    let entry = JournalEntry {
+        hash: tx_hash,
+        tx_rlp: raw_tx.clone(),
+        block_height: 1,
+        committed_at_ms: 0,
+        kind: ClaimKind::Promised,
+    };
     let mut line = serde_json::to_vec(&entry).expect("encode JournalEntry");
     line.push(b'\n');
     std::fs::write(&journal_file, &line).expect("write journal file");

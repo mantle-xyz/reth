@@ -120,3 +120,105 @@ async fn preconf_forward_accepts_null_logs_from_sequencer() {
     )
     .await;
 }
+
+/// Starts a mock sequencer that records the value of `header` on every request and answers
+/// `eth_sendRawTransactionWithPreconf` with `response`. Speaks raw HTTP so the test sees the
+/// request headers exactly as they arrive on the wire.
+async fn start_header_recording_sequencer(
+    header: &'static str,
+    response: Value,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                let n = stream.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(pos + 4);
+                }
+            };
+            let Some(head_end) = head_end else { continue };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let field = |name: &str| {
+                head.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+                })
+            };
+            let len: usize = field("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = stream.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            recorded.lock().unwrap().push(field(header));
+            let request: Value =
+                serde_json::from_slice(&buf[head_end..head_end + len]).unwrap_or(Value::Null);
+            let body =
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": response}).to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// `--rollup.sequencer-headers` must reach the sequencer on the preconf forward too, not only on
+/// the `eth_sendRawTransaction` forward that op-reth wires itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn preconf_forward_sends_configured_sequencer_headers() {
+    let seq_response = json!({
+        "txHash": "0x66199f44ede67884fa62012bde48a4e7823c2ce6a827f4c33e28d001a9c37cf3",
+        "status": "success",
+        "reason": "",
+        "blockHeight": "0x2",
+        "receipt": { "logs": [] },
+    });
+    let (sequencer_url, seen) = start_header_recording_sequencer("x-api-key", seq_response).await;
+
+    let node = MantleNode::new(RollupArgs {
+        sequencer: Some(sequencer_url),
+        sequencer_headers: vec!["X-Api-Key=secret".to_string()],
+        ..Default::default()
+    });
+
+    with_configured_mantle_node(
+        node,
+        mantle_test_chain_spec(),
+        mantle_payload_attributes,
+        TreeConfig::default(),
+        move |node, client| async move {
+            let _node = node;
+            let _: Value = client
+                .request("eth_sendRawTransactionWithPreconf", vec![json!("0x02f8")])
+                .await
+                .expect("the mock sequencer accepts every forward");
+
+            let seen = seen.lock().unwrap().clone();
+            assert!(!seen.is_empty(), "the preconf call must reach the sequencer");
+            assert!(
+                seen.iter().all(|value| value.as_deref() == Some("secret")),
+                "every forward must carry the configured header, got {seen:?}"
+            );
+        },
+    )
+    .await;
+}

@@ -7,53 +7,145 @@
 //! release the in-flight EVM state, and stop polling the fifo / sweep
 //! sources.
 //!
-//! Implementation: a `watch::Sender<bool>` shared between the outer job
-//! (writer) and the builder loop (reader). `signal()` flips the flag to
-//! `true`; `is_cancelled()` is a fast non-async check the builder loop
-//! can call between iterations; `wait()` is the async path used inside
-//! `tokio::select!` so the loop wakes immediately on cancel instead of
-//! waiting for the next sweep tick.
+//! Implementation: a `watch::Sender<Option<CancelReason>>` shared between the
+//! outer job (writer) and the builder loop (reader). `resolve()` / `abandon()`
+//! record the reason; `wait()` is the async path used inside `tokio::select!`
+//! so the loop wakes immediately on cancel instead of waiting for the next
+//! sweep tick; `reason()` is the non-async read, for the loop's tail — which
+//! has to tell a resolved build from an abandoned one, so there is no
+//! bool-shaped "is it cancelled" question anywhere.
 //!
 //! The signal is **one-shot** — once flipped, callers expect the loop to
 //! exit shortly after. There is no "uncancel".
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tokio::sync::watch;
+
+/// Returned by `build_payload` for a job abandoned while it waited for the
+/// build lock. Not a failure: the job generator logs it at debug level and
+/// does not count it in `preconf.build.failed_total`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("payload job abandoned before it started building")]
+pub struct AbandonedBeforeStart;
+
+/// Why a build stopped.
+///
+/// The build loop reacts to both the same way — wrap up — but what becomes of
+/// the work differs, and only the loop's tail can act on that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// `engine_getPayload` arrived: the block is on its way to the consensus
+    /// layer, and what it executed is expected to land.
+    Resolved,
+    /// The job was thrown away — superseded by a later one for the same height,
+    /// timed out by the stall watchdog, or dropped with its payload never
+    /// asked for. Nothing it executed will reach the chain through it.
+    Abandoned,
+}
 
 /// Cancel handle for a single payload job. Constructed once per job by
 /// [`PreconfPayloadJobGenerator`]; cloned into the inner builder loop.
 ///
-/// [`PreconfPayloadJobGenerator`]: crate::builder::generator::PreconfPayloadJobGenerator
+/// [`PreconfPayloadJobGenerator`]: crate::builder::payload_job_generator::PreconfPayloadJobGenerator
 #[derive(Debug, Clone)]
 pub struct JobCancel {
-    tx: Arc<watch::Sender<bool>>,
-    rx: watch::Receiver<bool>,
+    tx: Arc<watch::Sender<Option<CancelReason>>>,
+    rx: watch::Receiver<Option<CancelReason>>,
+    /// Serializes cancelling against work that must not be cut in half — see
+    /// [`Self::unless_abandoned`].
+    gate: Arc<Mutex<()>>,
 }
 
 impl JobCancel {
     /// Create a new cancel handle in the un-cancelled state.
     pub fn new() -> Self {
-        let (tx, rx) = watch::channel(false);
-        Self { tx: Arc::new(tx), rx }
+        let (tx, rx) = watch::channel(None);
+        Self { tx: Arc::new(tx), rx, gate: Arc::new(Mutex::new(())) }
     }
 
-    /// Flip the cancel flag. Subsequent `is_cancelled()` calls return
-    /// `true`, and any task awaiting `wait()` is woken. Idempotent — a
-    /// second call is a no-op.
-    pub fn signal(&self) {
+    /// Stop the build because the consensus layer asked for the payload.
+    ///
+    /// The first reason recorded is the one that sticks, and a later call
+    /// changes nothing; see [`Self::reason`].
+    pub fn resolve(&self) {
+        self.signal_with(CancelReason::Resolved);
+    }
+
+    /// Stop the build because the job is being thrown away.
+    ///
+    /// The first reason recorded is the one that sticks, and a later call
+    /// changes nothing; see [`Self::reason`].
+    pub fn abandon(&self) {
+        self.signal_with(CancelReason::Abandoned);
+    }
+
+    /// Record the reason the build stopped. [`Self::reason`] returns it from
+    /// here on, and any task awaiting `wait()` is woken.
+    ///
+    /// **The first reason is the one that sticks**, and a second call changes
+    /// nothing. Both can fire for one job — `resolve_kind` asks for a payload
+    /// and the job is dropped straight after — and what the build has to know
+    /// is what stopped it, not what happened to the handle afterwards.
+    ///
+    /// Waits for any [`Self::unless_abandoned`] work already in flight, so a
+    /// cancel cannot land in the middle of one. Whoever got past the check
+    /// finishes first, then this takes effect.
+    fn signal_with(&self, reason: CancelReason) {
+        let _gate = self.gate.lock();
+        if self.rx.borrow().is_some() {
+            return;
+        }
         // `send` only fails when all receivers have been dropped, in
         // which case the cancel is meaningless anyway.
-        let _ = self.tx.send(true);
+        let _ = self.tx.send(Some(reason));
     }
 
-    /// Fast non-async read of the cancel flag.
-    pub fn is_cancelled(&self) -> bool {
+    /// Why the build stopped, or `None` while it is still running.
+    pub fn reason(&self) -> Option<CancelReason> {
         *self.rx.borrow()
     }
 
-    /// Async wait until the cancel flag flips to `true`. Returns
-    /// immediately if already cancelled.
+    /// Whether the build has been given up on. For loops outside `select!`,
+    /// which never reach [`Self::wait`].
+    ///
+    /// Abandoned, not cancelled: a resolved payload is on its way to the
+    /// consensus layer carrying the work the build is still doing, so stopping
+    /// on `Resolved` strands transactions the block was about to take.
+    pub fn is_abandoned(&self) -> bool {
+        self.reason() == Some(CancelReason::Abandoned)
+    }
+
+    /// Run `work` unless the job has been abandoned, holding off both endings
+    /// until it returns. `None` means it had been abandoned already.
+    ///
+    /// Abandoned rather than cancelled: only one of the two endings makes what
+    /// the build executed untrue. A resolved payload is on its way to the
+    /// consensus layer carrying exactly that work.
+    ///
+    /// Check and `work` both stay inside the gate, because an ending landing
+    /// between them is what this exists to stop. Lifting the check out, into a
+    /// local acted on afterwards, compiles, reads the same, and gives up the
+    /// guarantee.
+    ///
+    /// `work` must not `.await`: the gate is a blocking mutex, and holding it
+    /// across a yield point deadlocks whoever is ending the job.
+    ///
+    /// It also has to be **short**, which the deadlock warning alone does not
+    /// say. `resolve()` and `abandon()` take the same gate, so whatever `work`
+    /// spends is spent by whoever ends the job — on the critical path of
+    /// `engine_getPayload`. Today's caller serialises one slice's delta
+    /// (tens to hundreds of microseconds, low single-digit milliseconds on a
+    /// slice carrying most of a block), which is why this is not a problem;
+    /// it stops being true the moment something larger is put inside.
+    pub fn unless_abandoned<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
+        let _gate = self.gate.lock();
+        (*self.rx.borrow() != Some(CancelReason::Abandoned)).then(work)
+    }
+
+    /// Async wait until a reason is recorded. Returns immediately if the build
+    /// has already been stopped.
     ///
     /// Designed to be awaited inside `tokio::select!` alongside the
     /// builder loop's fifo / sweep / resolve branches.
@@ -62,7 +154,7 @@ impl JobCancel {
         // takes `&mut self`) without exposing `&mut self` on `JobCancel`.
         let mut rx = self.rx.clone();
         // Already cancelled? Return immediately.
-        if *rx.borrow() {
+        if rx.borrow().is_some() {
             return;
         }
         // `changed()` returns Err only when the sender is dropped — by
@@ -83,31 +175,112 @@ mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
 
+    /// A resolved job is being sealed, so what it executed is going on chain
+    /// and announcing it is telling the truth. Only an abandoned one has to be
+    /// held back.
     #[tokio::test]
-    async fn new_is_not_cancelled() {
-        let c = JobCancel::new();
-        assert!(!c.is_cancelled());
+    async fn work_runs_for_a_live_job_and_for_a_resolved_one() {
+        let live = JobCancel::new();
+        assert_eq!(live.unless_abandoned(|| "ran"), Some("ran"));
+
+        let asked_for = JobCancel::new();
+        asked_for.resolve();
+        assert_eq!(
+            asked_for.unless_abandoned(|| "ran"),
+            Some("ran"),
+            "a resolved payload is on its way to the chain; its slices are not a lie",
+        );
     }
 
     #[tokio::test]
-    async fn signal_flips_flag() {
-        let c = JobCancel::new();
-        c.signal();
-        assert!(c.is_cancelled());
+    async fn work_does_not_run_for_an_abandoned_job() {
+        let dropped = JobCancel::new();
+        dropped.abandon();
+        assert_eq!(dropped.unless_abandoned(|| "ran"), None);
     }
 
+    /// The gate, not just the predicate: abandoning waits for work already
+    /// inside. Without it a slice could go out after the build was thrown away,
+    /// which is the single thing this guard exists to prevent.
+    #[tokio::test]
+    async fn abandoning_waits_for_work_already_inside_the_gate() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let cancel = Arc::new(JobCancel::new());
+        let inside = Arc::new(AtomicBool::new(false));
+        let left = Arc::new(AtomicBool::new(false));
+
+        let held = {
+            let (cancel, inside, left) = (cancel.clone(), inside.clone(), left.clone());
+            std::thread::spawn(move || {
+                cancel.unless_abandoned(|| {
+                    inside.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    left.store(true, Ordering::SeqCst);
+                })
+            })
+        };
+
+        while !inside.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        cancel.abandon();
+        assert!(left.load(Ordering::SeqCst), "abandon returned while the work was still running");
+        held.join().expect("the work completes");
+    }
+
+    /// The two ways a build ends are not the same thing, and only one of them
+    /// means the block is on its way to the consensus layer.
+    #[tokio::test]
+    async fn a_resolved_job_is_distinguishable_from_an_abandoned_one() {
+        let asked_for = JobCancel::new();
+        asked_for.resolve();
+        assert_eq!(asked_for.reason(), Some(CancelReason::Resolved));
+
+        let dropped = JobCancel::new();
+        dropped.abandon();
+        assert_eq!(dropped.reason(), Some(CancelReason::Abandoned));
+    }
+
+    #[tokio::test]
+    async fn a_live_job_has_no_reason_yet() {
+        assert_eq!(JobCancel::new().reason(), None);
+    }
+
+    /// Whichever came first is what the build sees. A job the generator
+    /// superseded and the consensus layer then asked for is still a job whose
+    /// work was thrown away, and the reverse — asked for, then dropped — is a
+    /// block already on its way.
+    #[tokio::test]
+    async fn the_first_reason_is_the_one_that_sticks() {
+        let c = JobCancel::new();
+        c.resolve();
+        c.abandon();
+        assert_eq!(c.reason(), Some(CancelReason::Resolved));
+
+        let c = JobCancel::new();
+        c.abandon();
+        c.resolve();
+        assert_eq!(c.reason(), Some(CancelReason::Abandoned));
+    }
+
+    /// Distinct from `the_first_reason_is_the_one_that_sticks`, which is about
+    /// two *different* reasons racing: this is the same one arriving twice.
     #[tokio::test]
     async fn signal_is_idempotent() {
         let c = JobCancel::new();
-        c.signal();
-        c.signal();
-        assert!(c.is_cancelled());
+        c.abandon();
+        c.abandon();
+        assert_eq!(c.reason(), Some(CancelReason::Abandoned));
     }
 
     #[tokio::test]
     async fn wait_returns_immediately_when_already_cancelled() {
         let c = JobCancel::new();
-        c.signal();
+        c.abandon();
         // Should not block — wrap in a tight timeout to prove that.
         timeout(Duration::from_millis(50), c.wait()).await.expect("wait should be instant");
     }
@@ -118,7 +291,7 @@ mod tests {
         let c2 = c.clone();
         let waiter = tokio::spawn(async move { c2.wait().await });
         tokio::time::sleep(Duration::from_millis(10)).await;
-        c.signal();
+        c.abandon();
         timeout(Duration::from_millis(100), waiter)
             .await
             .expect("wait should resolve after signal")
@@ -129,15 +302,15 @@ mod tests {
     async fn cancel_propagates_across_clones() {
         let a = JobCancel::new();
         let b = a.clone();
-        a.signal();
-        assert!(b.is_cancelled(), "clone should observe parent's signal");
+        a.abandon();
+        assert_eq!(b.reason(), Some(CancelReason::Abandoned), "clone observes the parent's signal");
     }
 
     #[tokio::test]
     async fn cancel_from_clone_propagates_back() {
         let a = JobCancel::new();
         let b = a.clone();
-        b.signal();
-        assert!(a.is_cancelled(), "parent should observe clone's signal");
+        b.abandon();
+        assert_eq!(a.reason(), Some(CancelReason::Abandoned), "parent observes the clone's signal");
     }
 }

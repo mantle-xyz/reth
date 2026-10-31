@@ -1,7 +1,7 @@
 # Mantle op-reth Build System
 
 GIT_SHA := `git rev-parse HEAD`
-GIT_TAG := `git describe --tags --abbrev=0 2>/dev/null || echo "unknown"`
+GIT_TAG := `git describe --tags --exact-match --match 'mantle-v*' 2>/dev/null || echo "dev-$(git rev-parse --short=7 HEAD)"`
 BIN_DIR := "dist/bin"
 CARGO_TARGET_DIR := env("CARGO_TARGET_DIR", "target")
 
@@ -16,6 +16,9 @@ PROFILE := env("PROFILE", "release")
 # Docker image name (override in CI)
 DOCKER_IMAGE_NAME := env("DOCKER_IMAGE_NAME", "ghcr.io/mantle-xyz/op-reth")
 
+# The proxy ships as its own image, not as a second binary inside the node's
+DOCKER_WS_PROXY_IMAGE_NAME := env("DOCKER_WS_PROXY_IMAGE_NAME", "ghcr.io/mantle-xyz/mantle-ws-proxy")
+
 # default recipe
 default:
   @just --list
@@ -28,6 +31,18 @@ build:
 
 # Alias: backward-compatible with old Makefile `make build-op`
 build-op: build
+
+# `mantle-ws-proxy` is not in `default-members`, so a bare `cargo build` never
+# produces it. Name the recipe rather than leaving the `-p` incantation as
+# folklore: the devnet's flashblocks tests expect the binary at
+# `target/release/mantle-ws-proxy`.
+
+# Build the flashblocks relay binary (release)
+build-ws-proxy:
+  cargo build -p mantle-reth-ws-proxy --bin mantle-ws-proxy --profile "{{PROFILE}}"
+
+# Build both binaries
+build-all: build build-ws-proxy
 
 # Build op-reth binary (debug, with Mantle state-export feature)
 build-debug:
@@ -118,25 +133,34 @@ lint: fmt clippy
 # plus ALL Mantle integration suites (offline `replay`/`token_ratio_midblock` and the
 # node-spawning `it` harness, incl. the estimate_total_fee token_ratio regression).
 #
-# Two invocations on purpose: `-p mantle-reth-integration-tests --tests` runs *every*
-# test target of that crate, so newly-added suites are covered automatically without
-# editing a name list — and it is scoped to the Mantle crate, so it does NOT pull in
-# the ~24 upstream op-reth integration tests a bare `--workspace --tests` would.
-# Measured: the second invocation only re-links the Mantle test binaries (~45s, no
-# op-reth/revm/alloy recompile), so the resolver thrash this previously feared does
-# not occur for this lib-then-tests ordering.
+# `--lib --bins`, not `--lib`: `--lib` never compiles a crate's `main.rs`, so a bin
+# crate's own `mod tests` (ws-proxy's startup-argument checks live there) would run
+# nowhere and the gap would not show — the run still prints `N passed`.
+#
+# Separate invocations on purpose: `-p mantle-reth-integration-tests --tests` runs
+# *every* test target of that crate, so newly-added suites are covered automatically
+# without editing a name list — and it is scoped to the Mantle crate, so it does NOT
+# pull in the ~24 upstream op-reth integration tests a bare `--workspace --tests`
+# would. The price is paid in CI: the `-p` invocations resolve features differently
+# from `--workspace`, so each recompiles a slice of alloy/revm/reth (measured on
+# 2026-10-16, run 38862570322: 889 + 317 + 202 crates across the first three).
 #
 # Doctests run here too, but with DEFAULT features so they reuse the codegen from the
 # `--lib` build above (~30s incremental). The exhaustive `--all-features` doctest pass
 # is a full from-scratch build (~11min) and stays in nightly (`just test-doc`).
 #
-# The node-spawning integration tests run under nextest with `--retries 2`: an
-# irreducible ~1-in-8 timing blip hits a different test each run (systematic
-# classes are already code-fixed), and retries absorb it while still reporting
-# any flaky-passed test. Doctests stay on `cargo test` (nextest can't run them).
+# The node-spawning integration tests run under nextest; its retries and JUnit
+# report are set in `.config/nextest.toml`, so a pass on a retry is reported the
+# same way here and in CI (`FLAKY` in the summary, a warning on the CI run page).
+# Doctests stay on `cargo test` (nextest can't run them).
+#
+# CI wall clock, same run: 57 min, of which ~54 min is compilation and 2.6 min is
+# nextest running its 267 tests. `ci.yml`'s `timeout-minutes` is sized against the
+# compile, not the test count.
 test-ci:
-  cargo test --workspace --lib
-  cargo nextest run -p mantle-reth-integration-tests --tests --retries 2
+  cargo test --workspace --lib --bins
+  cargo test -p mantle-reth-cli --test build_version
+  cargo nextest run -p mantle-reth-integration-tests --tests
   cargo test --doc --workspace
 
 # Run the full local test suite (examples + benches + all features)
@@ -146,6 +170,11 @@ test:
 # Run documentation tests
 test-doc:
   cargo test --doc --workspace --all-features
+
+# Tests quarantined with `#[ignore]` for failing under parallel load only. Run
+# serially (`--test-threads=1`) they are deterministic; nightly runs this.
+test-quarantined:
+  cargo test -p mantle-reth-integration-tests --test preconf -- --ignored --test-threads=1
 
 # Full pre-PR check: lint + CI tests + doc tests (use `just test` for the exhaustive suite)
 pr: lint test-ci test-doc
@@ -177,6 +206,19 @@ docker-build-push-git-sha: (docker-build-push-tags GIT_SHA GIT_SHA)
 
 # Docker: tag with latest
 docker-build-push-latest: (docker-build-push-tags GIT_TAG "latest")
+
+# `mantle-ws-proxy` is delivered as its own image: a stateless relay that is
+# scaled and restarted independently of any node. It builds from source in the
+# image (`DockerfileWsProxy`), the same way the deployment pipeline builds
+# `DockerfileOp` — not from a pre-cross-compiled binary like the `.cross` path
+# above, which exists for multi-arch pushes the proxy does not yet need.
+
+# Build the standalone mantle-ws-proxy image (single arch, local)
+docker-build-ws-proxy tag=GIT_TAG:
+  docker build --file ./DockerfileWsProxy . \
+    --build-arg VERSION={{tag}} \
+    --build-arg GIT_COMMIT={{GIT_SHA}} \
+    --tag {{DOCKER_WS_PROXY_IMAGE_NAME}}:{{tag}}
 
 # ==================== Misc ====================
 
