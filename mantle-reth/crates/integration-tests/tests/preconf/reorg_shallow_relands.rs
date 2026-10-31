@@ -1,6 +1,6 @@
-//! A preconf must-land commitment survives a 1-block shallow reorg.
+//! A preconf commitment survives a 1-block shallow reorg.
 //!
-//! A preconf tx that returns `success` is a must-land promise. If the unsafe
+//! The node makes a best effort to land a preconf tx that returned `success`. If the unsafe
 //! block carrying it is reverted, the commitment must re-land on the new
 //! canonical chain (same hash, exactly once).
 //!
@@ -74,7 +74,12 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     // L1-attributes deposit; the preconf lands right after it.
     let (_commit_head, sealed_commit) = op_node_slot_l1!(node, on = base, n = 1, l1 = 100);
     let ev = rpc.await.expect("rpc join").expect("preconf submission must not error");
-    assert_eq!(ev.status, PreconfStatus::Success, "must-land commitment; reason={:?}", ev.reason);
+    assert_eq!(
+        ev.status,
+        PreconfStatus::Success,
+        "the preconf must succeed; reason={:?}",
+        ev.reason
+    );
     assert!(
         sealed_commit.contains(&hash),
         "committed tx must land in the commitment block; sealed={sealed_commit:?}",

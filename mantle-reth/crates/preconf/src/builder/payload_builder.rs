@@ -599,7 +599,8 @@ fn preconf_admission(
     if over_block_da || over_footprint || over_gas {
         // Transient: fits an empty block, but the current block is too full.
         return match source {
-            // Replay is a must-land commitment — keep it Waiting and retry
+            // Replay's receipt has gone out and the node makes a best
+            // effort to land it — keep it Waiting and retry
             // next slot (fresh block DA/gas budget). Handled by the caller as
             // "do not dispatch"; the commitment is never ended.
             PreconfSource::Replay => Admission::Defer,
@@ -1150,8 +1151,8 @@ fn readable_nonces(
 ///   get timed out by the deadline gate.
 /// - **`Success`** — stale in-flight from a discarded prior job. A canon'd entry would have been
 ///   removed by the immediately-preceding [`sync_fifo_forward_to_head`], so any Success reaching
-///   here is an un-canon'd in-flight (client already got a receipt; must land).
-///   `reset_success_to_waiting` promotes the source to `Replay` so gates bypass and the
+///   here is an un-canon'd in-flight (client already got a receipt; the node makes a best effort to
+///   land it). `reset_success_to_waiting` promotes the source to `Replay` so gates bypass and the
 ///   previously-returned receipt is honored; then the hash is returned for dispatch.
 ///
 /// There is no third case: a commitment that ended is not in the queue to be carried over.
@@ -2360,7 +2361,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // from the network consensus and cause a safe-head fork. Gate
         // the entire preconf pipeline on this flag; fifo entries stay
         // put and get dispatched on the next `no_tx_pool=false` build
-        // (their SLA is upheld by delayed landing, NOT by forcing them
+        // (they land later, on a best-effort basis, NOT by being forced
         // into the derivation block).
         let allow_preconf = !ctx.attributes().no_tx_pool();
 
@@ -2483,7 +2484,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // before the select! loop's arms.
         //
         // Skipped entirely when `!allow_preconf` — the fifo entries (including
-        // Replay-sourced ones with `must-land` SLA) remain in the fifo and get
+        // Replay-sourced ones, whose receipts have gone out) remain in the fifo and get
         // dispatched on the next normal-slot build. That is also what keeps a
         // derivation build from replaying anything: it has to execute exactly
         // what its attributes name, or the block it derives will not match the
@@ -3055,7 +3056,7 @@ mod tests {
 
     /// Stale `Success` entries are promoted to `Waiting` + `Replay` so the
     /// downstream dispatch bypasses the RPC-only deadline / gas gates and the
-    /// previously-returned receipt is honored (SLA: must land).
+    /// previously-returned receipt is honored where it can be.
     #[tokio::test]
     async fn replay_fifo_carryover_promotes_success_to_replay() {
         let fifo = PreconfTxSet::new(16);

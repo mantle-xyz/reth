@@ -4,7 +4,7 @@
 //!
 //! A plain re-land assertion (the tx reappears on chain) can pass vacuously: a
 //! transfer would re-land via ordinary pool mechanics even if the preconf
-//! must-land machinery were removed. The discriminator: the preconf builder
+//! replay machinery were removed. The discriminator: the preconf builder
 //! applies carryover/replay entries in a preamble BEFORE the tip-ordered pool
 //! loop, and the preconf FIFO is arrival-ordered / tip-AGNOSTIC. So we co-submit
 //!

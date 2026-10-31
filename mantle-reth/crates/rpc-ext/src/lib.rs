@@ -58,22 +58,22 @@ use tracing::debug;
 /// block it is **currently building** — before that block is sealed, and long
 /// before it is canonical. So it is a prediction, not a record:
 ///
-/// - **`tx_hash` is binding.** The sequencer has committed to landing *this* transaction, and holds
-///   the `(sender, nonce)` it occupies against any other transaction for as long as the commitment
-///   stands. The one exception is a breach: if the transaction later proves un-appliable (its nonce
-///   was consumed elsewhere, its balance spent), the sequencer releases the nonce so the sender is
-///   not wedged, and logs `COMMITMENT BROKEN` / `preconf.tx.commitment_broken_total`. A client that
-///   re-submits the same hash then gets `CommitmentBroken` — the only channel through which the
-///   breach is reported.
+/// - **`tx_hash` is binding.** The sequencer makes a best effort to land *this* transaction, and
+///   holds the `(sender, nonce)` it occupies against any other transaction for as long as the
+///   commitment stands. The one exception is a breach: if the transaction later proves un-appliable
+///   (its nonce was consumed elsewhere, its balance spent), the sequencer releases the nonce so the
+///   sender is not wedged, and logs `COMMITMENT BROKEN` / `preconf.tx.commitment_broken_total`. The
+///   client is not told: re-submitting the same hash is handled as a new request. Whether the
+///   transaction landed is answered by its receipt or the sender's nonce.
 /// - **A preconfirmation does not preempt an ordinary transaction.** Whichever of the two the
 ///   builder executes first takes the `(sender, nonce)`. The hold above begins when this event is
 ///   produced; before that, queueing is only queueing and reserves no nonce.
 /// - **Everything else is a prediction of one particular build.** If that in-flight block is
 ///   discarded (a competing block takes the height, the payload job is superseded, the process
 ///   restarts), the sequencer re-applies the transaction to another block — a rebuild at the same
-///   height or a later one — honouring the promise, but against different state. `block_height`,
-///   `status` and `receipt.logs` are all recomputed then, and the client is **not** sent a
-///   corrected event: the response to this call has already been delivered.
+///   height or a later one — against different state. `block_height`, `status` and `receipt.logs`
+///   are all recomputed then, and the client is **not** sent a corrected event: the response to
+///   this call has already been delivered.
 /// - The fields added to `receipt` are all **positions and figures from one particular build**.
 ///   `transactionIndex`, `cumulativeGasUsed` and each log's `logIndex` say where this transaction
 ///   sat in the block that was being built; a replay puts it somewhere else, and no corrected event

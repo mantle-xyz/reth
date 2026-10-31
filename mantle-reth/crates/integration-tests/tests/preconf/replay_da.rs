@@ -1,6 +1,6 @@
 //! DA-footprint gate on the preconf replay (reorg-reinject) path.
 //!
-//! A preconf `success` is a must-land commitment, yet the DA-footprint gate
+//! The node makes a best effort to land a preconf `success`, yet the DA-footprint gate
 //! is a consensus constraint that also applies to replayed entries (unlike
 //! the preconf gas budget, which Replay bypasses). So a committed tx that a
 //! reorg reverts and re-injects can still fail to land if the block it
