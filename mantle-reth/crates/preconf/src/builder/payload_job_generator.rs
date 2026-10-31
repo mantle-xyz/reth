@@ -30,7 +30,7 @@
 //! It is a no-op in steady state (the previous job was already cancelled by its own
 //! `resolve_kind`); it only matters for abandoned / superseded jobs. Upstream
 //! [`BasicPayloadJobGenerator`] instead bounds job lifetime with a per-job deadline, which we avoid
-//! — it would cut a slow build short and break the preconf must-land SLA.
+//! — it would cut a slow build short and abandon commitments whose receipts have gone out.
 //!
 //! ## What this generator does NOT do (yet)
 //!

@@ -1491,8 +1491,8 @@ impl PreconfTxSet {
     /// [`Self::reset_success_to_waiting`], which the *next* payload job's
     /// carryover preamble uses on a `Success` entry that outlived the block it
     /// was applied to (`replay_fifo_carryover` in `payload_builder`): the client
-    /// already holds a receipt, so the commitment still has to land, in a block
-    /// that will actually commit.
+    /// already holds a receipt, so the node makes a best effort to land it, in a
+    /// block that will actually commit.
     #[cfg(test)]
     pub(crate) async fn mark_succeeded(&self, hash: &TxHash) -> Result<(), MarkError> {
         let mut inner = self.inner.lock().await;
@@ -1513,9 +1513,9 @@ impl PreconfTxSet {
     /// this same payload job (`sync_fifo_forward_to_head` in
     /// `payload_builder`, which runs before the carryover) would have
     /// dropped the entry entirely. On a new payload job start, such
-    /// entries represent commitments the client was already promised;
-    /// the mantle preconf SLA ("receipt returned → tx must land on
-    /// chain") requires re-applying them to the new build.
+    /// entries represent commitments the client was already promised,
+    /// which the node makes a best effort to land, so they are re-applied
+    /// to the new build.
     ///
     /// This API performs two coupled changes atomically under the
     /// fifo lock:
@@ -2523,7 +2523,7 @@ mod tests {
     ///
     /// Eviction is a backstop for a chain that has stopped taking what this
     /// node builds. Dropping an announced transaction there costs a resend;
-    /// dropping a promised one breaks the only guarantee the subsystem makes.
+    /// dropping a promised one gives up on a receipt a client already holds.
     #[tokio::test]
     async fn the_staging_cap_evicts_announced_claims_and_never_promised_ones() {
         let set = PreconfTxSet::new(16);

@@ -112,8 +112,8 @@ impl Commitment {
 
 /// How strong a claim this node made about a transaction.
 ///
-/// Both are public statements and both have to be kept, which is why they
-/// share a record, a slot and the must-land machinery. They differ in **who
+/// Both are public statements, which is why they share a record, a slot and
+/// the machinery that makes a best effort to land them. They differ in **who
 /// cleans up if the claim turns out false**, and the per-kind behaviour below
 /// follows from that.
 ///

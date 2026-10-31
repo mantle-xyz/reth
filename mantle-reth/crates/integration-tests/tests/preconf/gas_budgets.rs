@@ -193,7 +193,7 @@ async fn block_gas_budget_exceeded_rejects_third_tx() {
 /// (`push_if_absent`'s Timeout | Canceled → Waiting branch) and land
 /// the tx on chain. Symmetric to Timeout recovery, but the trigger is
 /// the server-side block-gas-budget gate (`mark_canceled`), not the client-side
-/// deadline. Guards the must-land SLA's promise that Canceled is not terminal.
+/// deadline. Guards that Canceled is not terminal.
 ///
 /// Two determinism gates keep this stable under parallel load:
 /// `wait_fifo_entry` (slot-1 nonce-gap race) and `wait_latest_nonce`
@@ -671,13 +671,13 @@ async fn canceled_tx_same_slot_resubmit_is_rejected_again() {
 }
 
 /// Journal-replay-sourced fifo entries **bypass** the block-gas-budget
-/// gate — required by the SLA "once a receipt was returned to the client,
-/// the tx must land on chain, even across a restart".
+/// gate: their receipts went out before the restart, and the node makes a
+/// best effort to land them.
 ///
 /// The bypass is a single guard in `apply_one_preconf`
 /// (`dispatch.rs:246`, `if is_rpc && used + limit > max`). If someone
 /// accidentally deletes the `is_rpc &&` half, replay txs would silently
-/// be rejected under budget pressure and the SLA would break. The other
+/// be rejected under budget pressure, ending promised txs. The other
 /// available regression test (`journal_replay_lands_promised_tx_in_next_block`)
 /// only exercises a single replay tx that is well under budget, so it
 /// would still pass under such a regression.

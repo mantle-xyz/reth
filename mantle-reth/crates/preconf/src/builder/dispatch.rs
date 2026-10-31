@@ -220,12 +220,11 @@ where
     }
 
     // The deadline and per-block gas budget gates below only apply to
-    // RPC-sourced entries. Journal-replayed entries bypass both to
-    // honor the mantle preconf SLA: "once a receipt has been returned
-    // to the client, the tx must land on chain". Rejecting them here
-    // would silently break that commitment. They remain subject to the
-    // status / dedup gates above and to the underlying block gas limit
-    // enforced by the block builder.
+    // RPC-sourced entries. Replayed entries bypass both: a preconf
+    // transaction whose receipt has gone out is one the node makes a best
+    // effort to land, and these gates would end it. They remain subject to
+    // the status / dedup gates above and to the block gas limit enforced by
+    // the block builder.
     let is_rpc = entry.source == PreconfSource::Rpc;
 
     // Pre-apply deadline check — see crate-level docs. `cfg.safety_margin`
@@ -1514,8 +1513,8 @@ mod tests {
         assert_eq!(entry.status, PreconfStatus::Success);
     }
 
-    // ── Source-differentiated gate tests (mantle preconf SLA: journal
-    //    replay must never silently drop a promised tx). ─────────────
+    // ── Source-differentiated gate tests (these gates never end a
+    //    replayed commitment). ─────────────────────────
 
     /// Journal-replayed entries bypass the pre-apply deadline gate.
     /// Even after the timeout has elapsed since insertion, `apply_fn`

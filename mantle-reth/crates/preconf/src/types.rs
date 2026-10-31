@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// `PayloadJob` prologue's canon-forward (`sync_fifo_forward_to_head` →
 /// `PreconfTxSet::forward_all`) drops it once the sender's nonce moves past. Stale
 /// `Success` entries are reset to `Waiting` and replayed against the new
-/// builder, honouring the SLA "receipt returned → tx must land on chain". The
+/// builder: a receipt has gone out, and the node makes a best effort to land it. The
 /// presence of the entry is the "in-flight, not canon" flag; no separate
 /// variant is needed.
 ///
@@ -63,17 +63,16 @@ pub enum PreconfStatus {
 ///       rather than of the journal: the journal's notion of a finished commitment is "canonical
 ///       once", which is exactly what a reorg undoes.
 ///
-///   In both cases the Mantle preconf SLA (*"once a receipt has been returned to the client, the
-///   tx must land on chain"*) requires these entries to **bypass** the deadline and per-block gas
-///   budget gates. They remain subject to the status / dedup gates and the underlying block gas
-///   limit.
+///   In both cases a receipt has gone out, and the node makes a best effort to land the
+///   transaction, so these entries **bypass** the deadline and per-block gas budget gates. They
+///   remain subject to the status / dedup gates and the underlying block gas limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
     /// Live RPC submission — subject to all pre-apply gates.
     Rpc,
     /// Replay of a previously-promised commitment (startup journal
     /// restore or pool reorg reinject). Bypasses deadline and
-    /// gas-budget gates so promised txs are guaranteed to land.
+    /// gas-budget gates, which would otherwise end a promised tx.
     Replay,
 }
 
@@ -242,6 +241,10 @@ pub enum PreconfError {
     /// EVM rejection that could clear in a later block (base fee, balance,
     /// nonce ahead of the chain) also ends here. See
     /// `builder::dispatch::apply_one_preconf`.
+    ///
+    /// Never sent to a client: only a replayed entry ends this way, and nobody
+    /// is waiting on it. The `COMMITMENT BROKEN` log and
+    /// `preconf.tx.commitment_broken_total` are what record the breach.
     #[error(
         "preconf commitment cannot be honored: apply was rejected after the receipt was returned"
     )]

@@ -91,7 +91,7 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
     // ── Reorg all commitment blocks out in one shot: rebuild at the FIRST
     //    commitment's height (n=1 → same timestamp) against a NEW L1 origin
     //    (200). This reverts the whole commitment chain. Every commitment must
-    //    re-land; the SLA promises eventual re-land, not same-block, so the
+    //    re-land; re-landing is eventual, not same-block, so the
     //    requeued commitments may drain across the rebuild block and a few
     //    following blocks — accumulate and count.
     use std::collections::HashMap;
@@ -122,9 +122,8 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
         head = h;
     }
 
-    // Primary invariant — must-land: every commitment must come back after the
-    // reorg (no omission). This is the core preconf SLA the multi-block reorg
-    // stresses.
+    // Primary invariant: every commitment comes back after the reorg (no
+    // omission) — the best-effort landing this multi-block reorg stresses.
     //
     // Secondary invariant — no duplicate: a re-landed commitment must not appear
     // twice. Deep no-duplicate (late resurrection over many blocks) is the
@@ -134,7 +133,7 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
         let n = counts.get(hash).copied().unwrap_or(0);
         assert!(
             n >= 1,
-            "commitment {i} must RE-LAND after the multi-block reorg (must-land SLA) — \
+            "commitment {i} must RE-LAND after the multi-block reorg — \
              got 0, it was DROPPED",
         );
         assert!(n <= 1, "commitment {i} must not be duplicated after re-land — got {n}");
