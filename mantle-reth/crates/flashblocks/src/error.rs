@@ -31,8 +31,9 @@ pub enum ProtocolError {
     #[error("cannot execute a genesis flashblock: block zero has no parent")]
     GenesisFlashblock,
 
-    /// A base slice whose parent block is in the overlay does not name that
-    /// block's last slice by position and content.
+    /// A base slice does not link to the overlay: its parent block is in the
+    /// overlay but it names a different last slice, or it names a slice of a
+    /// block the overlay never held.
     #[error("base slice does not link to the overlay's parent block")]
     StalePredecessor,
 
