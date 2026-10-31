@@ -210,12 +210,6 @@ async fn a_second_process_lands_everything_the_slices_announced() {
 /// Both are journaled, by different writers at different moments, and both have
 /// to come back. The commitment additionally keeps what it always had: it is
 /// replayed as a commitment, not re-judged as a fresh request.
-///
-/// The file order the two writers leave behind is not forced here — that needs
-/// a tick boundary to fall between two transactions of one sender, which is a
-/// race to arrange and a flake to keep. `preconf::restart_replay`'s
-/// `journal_replay_out_of_nonce_order_still_lands_every_commitment` writes the
-/// bad order by hand instead, and covers it without depending on timing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commitment_and_ordinary_transactions_both_survive_the_restart() {
     let sender = Wallet::default().inner.address();
