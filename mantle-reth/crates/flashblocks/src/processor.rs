@@ -312,26 +312,35 @@ where
         }
     }
 
-    /// Advances the cache to canonical `block_number` and replays what it held for
-    /// the next block, whether or not reconciliation succeeded.
+    /// Advances the cache to canonical `block_number` and replays the heights
+    /// after it, whether or not reconciliation succeeded. A height is replayed
+    /// once the overlay ends at the one before it: stopping at `block_number + 1`
+    /// strands later heights, and the next live slice then drops the overlay.
     async fn finish_canonical(&self, block_number: BlockNumber, tip: Option<BlockNumber>) {
-        let mut cache = self.cache.lock().await;
-        cache.update_canonical(block_number);
-        let cached = cache.drain(block_number + 1);
-        // `apply_flashblock` takes this lock again and it is not reentrant.
-        drop(cache);
+        self.cache.lock().await.update_canonical(block_number);
 
-        if cached.is_empty() {
-            return;
-        }
-        debug!(
-            message = "replaying cached flashblocks after canonical block",
-            canonical_block = block_number,
-            cached_count = cached.len(),
-        );
-        for flashblock in cached {
-            let prev = self.load_pending_or_drop_stranded(tip);
-            self.apply_flashblock(prev, flashblock, tip).await;
+        let mut next = block_number + 1;
+        loop {
+            // `apply_flashblock` takes this lock again and it is not reentrant.
+            let cached = self.cache.lock().await.drain(next);
+            if cached.is_empty() {
+                return;
+            }
+            debug!(
+                message = "replaying cached flashblocks after canonical block",
+                canonical_block = block_number,
+                replayed_block = next,
+                cached_count = cached.len(),
+            );
+            for flashblock in cached {
+                let prev = self.load_pending_or_drop_stranded(tip);
+                self.apply_flashblock(prev, flashblock, tip).await;
+            }
+            if self.pending_blocks.load().as_ref().is_none_or(|pb| pb.latest_block_number() != next)
+            {
+                return;
+            }
+            next += 1;
         }
     }
 

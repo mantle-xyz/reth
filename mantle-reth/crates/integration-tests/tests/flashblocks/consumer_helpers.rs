@@ -569,6 +569,28 @@ pub async fn signed_set_code(nonce: u64, authorizations: Vec<SignedAuthorization
 /// All OP and Mantle forks are active from genesis so slice replay exercises the
 /// same code paths as a live chain.
 pub fn flashblocks_test_chain_spec() -> Arc<OpChainSpec> {
+    Arc::new(from_mantle_genesis(flashblocks_test_genesis()))
+}
+
+/// [`flashblocks_test_chain_spec`] whose genesis lets another node's block 1
+/// import: the expected base fee comes from the parent's Jovian `extra_data`,
+/// which the default genesis lacks. A node skips this check for blocks it built
+/// itself, so only a test with a separate sequencer node needs it.
+pub fn flashblocks_importable_chain_spec() -> Arc<OpChainSpec> {
+    let mut spec = from_mantle_genesis(flashblocks_test_genesis());
+    let mut header = spec.inner.genesis_header.clone_header();
+    // Jovian layout: version 1, denominator, elasticity, minimum base fee.
+    let mut extra_data = vec![1u8];
+    extra_data.extend_from_slice(&50u32.to_be_bytes());
+    extra_data.extend_from_slice(&6u32.to_be_bytes());
+    extra_data.extend_from_slice(&0u64.to_be_bytes());
+    header.extra_data = extra_data.into();
+    header.base_fee_per_gas = Some(0);
+    spec.inner.genesis_header = reth_primitives_traits::SealedHeader::seal_slow(header);
+    Arc::new(spec)
+}
+
+fn flashblocks_test_genesis() -> Genesis {
     let mut genesis: Genesis = serde_json::from_str(
         r#"{
             "config": {
@@ -630,7 +652,7 @@ pub fn flashblocks_test_chain_spec() -> Arc<OpChainSpec> {
             ..Default::default()
         },
     );
-    Arc::new(from_mantle_genesis(genesis))
+    genesis
 }
 
 /// Payload attributes builder for the flashblock suite.
