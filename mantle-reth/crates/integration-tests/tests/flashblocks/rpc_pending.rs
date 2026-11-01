@@ -311,17 +311,19 @@ async fn pending_total_fee_uses_actual_pending_when_local_pending_is_disabled() 
     .await;
     let init = "600e600c600039600e6000f343600114600c5760006000fd5b00".parse().unwrap();
     node.rpc.inject_tx(signed_deploy(0, init).await).await.unwrap();
-    node.build_and_submit_payload().await.expect("build and execute without canonicalizing");
-    assert_eq!(
-        node.inner
-            .provider
-            .pending_block()
-            .unwrap()
-            .expect("real provider pending")
-            .header()
-            .number,
-        1
-    );
+    // Built, not submitted: the node hands its own build to the engine, which is
+    // what sets the provider's pending block. A `newPayload` from the test would
+    // race that hand-off, and the engine skips a block it already holds.
+    node.new_payload().await.expect("build without canonicalizing");
+    let mut pending = None;
+    for _ in 0..100 {
+        pending = node.inner.provider.pending_block().unwrap();
+        if pending.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(pending.expect("real provider pending").header().number, 1);
     let request = serde_json::json!({
         "from": test_sender(), "to": test_sender().create(0), "gasPrice": "0x1"
     });
