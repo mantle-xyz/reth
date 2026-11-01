@@ -316,6 +316,10 @@ where
     /// after it, whether or not reconciliation succeeded. A height is replayed
     /// once the overlay ends at the one before it: stopping at `block_number + 1`
     /// strands later heights, and the next live slice then drops the overlay.
+    ///
+    /// A height the overlay already holds is not replayed: it got there live,
+    /// after these slices were cached, so they are an earlier build or slices it
+    /// already has.
     async fn finish_canonical(&self, block_number: BlockNumber, tip: Option<BlockNumber>) {
         self.cache.lock().await.update_canonical(block_number);
 
@@ -326,15 +330,27 @@ where
             if cached.is_empty() {
                 return;
             }
-            debug!(
-                message = "replaying cached flashblocks after canonical block",
-                canonical_block = block_number,
-                replayed_block = next,
-                cached_count = cached.len(),
-            );
-            for flashblock in cached {
-                let prev = self.load_pending_or_drop_stranded(tip);
-                self.apply_flashblock(prev, flashblock, tip).await;
+            let held = self.pending_blocks.load().as_ref().is_some_and(|pb| {
+                (pb.earliest_block_number()..=pb.latest_block_number()).contains(&next)
+            });
+            if held {
+                debug!(
+                    message = "dropping cached flashblocks for a block the overlay already holds",
+                    canonical_block = block_number,
+                    dropped_block = next,
+                    cached_count = cached.len(),
+                );
+            } else {
+                debug!(
+                    message = "replaying cached flashblocks after canonical block",
+                    canonical_block = block_number,
+                    replayed_block = next,
+                    cached_count = cached.len(),
+                );
+                for flashblock in cached {
+                    let prev = self.load_pending_or_drop_stranded(tip);
+                    self.apply_flashblock(prev, flashblock, tip).await;
+                }
             }
             if self.pending_blocks.load().as_ref().is_none_or(|pb| pb.latest_block_number() != next)
             {

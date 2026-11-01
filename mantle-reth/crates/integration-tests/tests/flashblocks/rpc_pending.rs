@@ -1300,6 +1300,20 @@ async fn get_logs_appends_the_overlay_when_the_range_ends_at_pending() {
     );
 }
 
+/// `fromBlock: pending` with no `toBlock` ends at `pending`, as in reth: it
+/// returns the overlay's logs, the same as an explicit `toBlock: pending`.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_from_pending_without_an_end_ends_at_pending() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    let api = eth_api!(node, harness);
+    overlay_with_user_call!(harness);
+
+    let filter = Filter::new().address(LOGGER).from_block(BlockNumberOrTag::Pending);
+    let logs = api.get_logs(filter).await.expect("query");
+    assert_eq!(logs.len(), 1, "the overlay's call emits one log");
+    assert_eq!(logs[0].block_number, Some(1));
+}
+
 /// A log range starting beyond the preview must not return older logs.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_logs_excludes_the_overlay_before_a_future_start_block() {

@@ -577,6 +577,8 @@ where
             FilterBlockOption::Range { from_block, to_block } => (*from_block, *to_block),
             _ => return self.eth_filter.logs(filter).await,
         };
+        // As in reth: a range starting at `pending` with no end ends at `pending`.
+        let to_block = to_block.or(from_block.filter(BlockNumberOrTag::is_pending));
 
         if !matches!(to_block, Some(BlockNumberOrTag::Pending)) {
             return self.eth_filter.logs(filter).await;
