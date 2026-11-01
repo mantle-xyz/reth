@@ -48,7 +48,9 @@ The keepalive flags are checked at startup, and a combination that would cycle
 a connection forever is refused: `--subscriber-pong-timeout-ms` must exceed
 `--subscriber-ping-interval-ms`, `--subscriber-max-interval-ms` must be
 non-zero, and with `--client-ping-enabled` the client pong timeout must exceed
-the client ping interval.
+the client ping interval. So is a configuration that starts but never serves:
+`--upstream-ws` must be a `ws://` URL (there is no TLS, see below), and both
+connection limits must be non-zero.
 
 ```bash
 mantle-ws-proxy \
