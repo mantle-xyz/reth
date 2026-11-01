@@ -19,8 +19,8 @@
 //! Several tests here raise `preconf_timeout_ms` well above the 1.5s default — they assert
 //! *where* a tx is routed after a canon commit, never how fast.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf};
-use crate::{canonicalize_payload, launch_preconf_node};
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_fifo_entry};
+use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -163,7 +163,7 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
         .preconf_timeout_ms(8_000)
         .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // ── Slot 1: land nonces 0, 1, 2 in one block, canonicalise ───────
     let tx0 = signed_transfer(chain_id, &wallet, 0).await;
@@ -185,15 +185,17 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
         .payload_id
         .expect("payload_id 1");
 
-    // Serial submit with 30ms gaps preserves nonce order into the pool.
+    // Each nonce waits until the previous one is queued: otherwise it can
+    // reach admission first and be refused as a nonce gap.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2).await });
+    wait_fifo_entry(&fifo, wallet_addr, 2).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let payload_1 = node
