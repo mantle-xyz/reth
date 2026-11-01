@@ -245,3 +245,36 @@ async fn slices_after_a_missed_block_replay_once_their_parent_lands() {
 
     assert_eq!(position(), Some((3, LAST)), "block 3 replays once block 2 lands");
 }
+
+/// A build cached past the leading depth must not replace the newer build of
+/// the same height that the overlay took live in the meantime.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_build_does_not_replace_the_one_the_overlay_follows() {
+    use alloy_rpc_types_engine::PayloadId;
+    let (abandoned, followed) = (PayloadId::new([1; 8]), PayloadId::new([2; 8]));
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 1);
+    let block_1_hash = submit_uncommitted_block!(node);
+
+    harness.send(base_slice(1)).await;
+    // Two blocks ahead of canonical 0: past the leading depth of 1, so cached.
+    harness
+        .send(
+            base_slice_builder(2)
+                .parent_hash(block_1_hash)
+                .prev(1, 0)
+                .payload_id(abandoned)
+                .build(),
+        )
+        .await;
+
+    let block_1 = commit_submitted_block!(node, block_1_hash);
+    // One ahead of canonical 1 now: the rebuild extends the overlay live.
+    harness.send(base_slice_builder(2).prev(1, 0).payload_id(followed).build()).await;
+    assert_eq!(harness.pending().map(|p| p.payload_id()), Some(followed));
+
+    harness.send_canonical(block_1).await;
+
+    let pending = harness.pending().expect("block 2 is still pending");
+    assert_eq!(pending.latest_block_number(), 2);
+    assert_eq!(pending.payload_id(), followed, "the abandoned build must not come back");
+}
