@@ -210,6 +210,21 @@ fn refuse_unusable_args(args: &Args) -> eyre::Result<Vec<String>> {
              on its own, so CPU grows with the number of filtered clients"
         );
     }
+    // The two below start and answer `/healthz`, then never serve: no TLS means
+    // any upstream but ws:// reconnects forever, and a zero limit admits no one.
+    if args.upstream_ws.scheme_str() != Some("ws") {
+        eyre::bail!(
+            "--upstream-ws ({}) must be a ws:// URL: this proxy speaks no TLS, so any other \
+             scheme never connects",
+            mantle_reth_flashblocks_types::redact_ws_url(&args.upstream_ws.to_string()),
+        );
+    }
+    if args.instance_connection_limit == 0 {
+        eyre::bail!("--instance-connection-limit must be greater than zero: zero admits no client");
+    }
+    if args.per_ip_connection_limit == 0 {
+        eyre::bail!("--per-ip-connection-limit must be greater than zero: zero admits no client");
+    }
 
     // Fail closed. An unauthenticated endpoint is a supported configuration —
     // this proxy runs inside trusted networks — but it is not one a process
@@ -563,6 +578,35 @@ mod tests {
                 .expect_err("zero is not a usable value");
             assert!(err.to_string().contains(flag), "the message must name {flag}: {err}");
         }
+    }
+
+    /// Zero connection limits start and answer `/healthz`, then refuse every
+    /// client; they are refused by name instead.
+    #[test]
+    fn the_zero_connection_limits_are_refused_by_name() {
+        for flag in ["--instance-connection-limit", "--per-ip-connection-limit"] {
+            let err = refuse_unusable_args(&args_with(&["--public-access-enabled", flag, "0"]))
+                .expect_err("zero admits no client");
+            assert!(err.to_string().contains(flag), "the message must name {flag}: {err}");
+        }
+    }
+
+    /// The proxy speaks no TLS, so only a `ws://` upstream can connect; any
+    /// other scheme starts and then reconnects forever.
+    #[test]
+    fn an_upstream_other_than_ws_is_refused() {
+        for upstream in ["wss://sequencer:1111", "http://sequencer:1111"] {
+            let args = Args::try_parse_from([
+                "mantle-ws-proxy",
+                "--upstream-ws",
+                upstream,
+                "--public-access-enabled",
+            ])
+            .expect("the URI parses");
+            let err = refuse_unusable_args(&args).expect_err("cannot connect");
+            assert!(err.to_string().contains("--upstream-ws"), "{upstream}: {err}");
+        }
+        refuse_unusable_args(&args_with(&["--public-access-enabled"])).expect("ws:// is accepted");
     }
 
     /// Combinations that start but cycle a connection forever, and the values
