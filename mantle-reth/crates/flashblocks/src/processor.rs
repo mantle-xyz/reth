@@ -611,7 +611,7 @@ where
                     StateProcessorError::Protocol(ProtocolError::StalePredecessor) => {
                         Metrics::stale_predecessor().increment(1);
                         warn!(
-                            message = "base slice does not link to the overlay's parent; restarting from the canonical parent",
+                            message = "base slice does not link to the overlay; restarting from the canonical parent",
                             block = %flashblock.metadata.block_number,
                         );
                         // Fail closed: the overlay this slice refused to extend is not served.
@@ -965,6 +965,16 @@ where
                 );
                 self.clear_live_state();
                 Ok(None)
+            }
+            // A later block's base naming a slice this overlay never saw: a block
+            // was missed. Unlike a base with no predecessor, the link says the
+            // stream and the overlay disagree, so the overlay is dropped; the
+            // `StalePredecessor` path then keeps the slice as a restart point.
+            SequenceValidationResult::NonSequentialPredecessor { .. }
+                if flashblock.base.is_some() &&
+                    flashblock.metadata.block_number > pending_blocks.latest_block_number() =>
+            {
+                Err(ProtocolError::StalePredecessor.into())
             }
             SequenceValidationResult::NonSequentialPredecessor { expected, actual } => {
                 Metrics::unexpected_block_order().increment(1);

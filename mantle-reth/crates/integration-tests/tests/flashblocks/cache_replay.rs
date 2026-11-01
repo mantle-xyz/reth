@@ -191,3 +191,57 @@ async fn an_overlay_keeps_up_while_canonical_trails_by_two_blocks() {
         ]
     );
 }
+
+/// A whole block missed from the stream: the next block's base names a last
+/// slice the overlay never saw. The overlay is dropped, but the slices are kept
+/// as a restart point and replay once their canonical parent lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn slices_after_a_missed_block_replay_once_their_parent_lands() {
+    const LAST: u64 = 3;
+
+    let chain_spec = crate::consumer_helpers::flashblocks_importable_chain_spec;
+    let (harness, follower) = launch_flashblocks_consumer!(3, 3, chain_spec());
+    let (mut sequencer, _http, _wallet, _chain_id) =
+        mantle_reth_integration_tests::launch_mantle_node!(
+            chain_spec(),
+            mantle_reth_cli::node::MantleNode::default(),
+            crate::consumer_helpers::flashblocks_payload_attributes
+        )
+        .await;
+
+    let mut hashes = vec![alloy_primitives::B256::ZERO];
+    for _ in 1..=3 {
+        let payload = sequencer.advance_block().await.expect("sequencer block");
+        let status = follower
+            .inner
+            .add_ons_handle
+            .beacon_engine_handle
+            .new_payload(payload.clone().into())
+            .await
+            .expect("follower imports the block");
+        assert!(status.is_valid(), "the follower must accept the sequencer's block: {status:?}");
+        hashes.push(payload.block().hash());
+    }
+    let position =
+        || harness.pending().map(|p| (p.latest_block_number(), p.latest_flashblock_index()));
+
+    harness.send(base_slice(1)).await;
+    for index in 1..=LAST {
+        harness.send(FlashblockBuilder::new(1, index).prev(1, index - 1).build()).await;
+    }
+    assert_eq!(position(), Some((1, LAST)));
+
+    // Block 2 never arrives. Block 3 names its last slice.
+    harness.send(base_slice_builder(3).parent_hash(hashes[2]).prev(2, LAST).build()).await;
+    assert!(harness.pending().is_none(), "a base that does not link drops the overlay");
+    for index in 1..=LAST {
+        harness.send(FlashblockBuilder::new(3, index).prev(3, index - 1).build()).await;
+    }
+
+    for hash in &hashes[1..=2] {
+        let block = commit_submitted_block!(follower, *hash);
+        harness.send_canonical(block).await;
+    }
+
+    assert_eq!(position(), Some((3, LAST)), "block 3 replays once block 2 lands");
+}
