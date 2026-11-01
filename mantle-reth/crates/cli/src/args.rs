@@ -523,10 +523,12 @@ pub struct PreconfArgs {
     #[arg(long = "preconf.rejournal-interval-secs", requires = "enable")]
     pub rejournal_interval_secs: Option<u64>,
 
-    /// Journal file size ceiling, in bytes. Default 1 GiB (`1_073_741_824`).
-    /// Above this, rotation renames the current file and starts a new one.
-    /// Always in effect when preconf is enabled, like
-    /// `--preconf.rejournal-interval-secs`.
+    /// Journal file size, in bytes, at which rotation runs early instead of
+    /// waiting for `--preconf.rejournal-interval-secs`. Default 1 GiB
+    /// (`1_073_741_824`). Rotation rewrites the file in place with only the
+    /// records still tracked; the rest are not kept anywhere. If the tracked
+    /// records alone exceed this size, the file stays above it. Always in
+    /// effect when preconf is enabled.
     #[arg(long = "preconf.journal-max-size", requires = "enable")]
     pub journal_max_size: Option<u64>,
 
