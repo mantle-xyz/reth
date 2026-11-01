@@ -819,6 +819,77 @@ fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: Prec
     status == PreconfStatus::Waiting && !loop_state.is_committed(hash)
 }
 
+/// How long a build that replays waits for the canon handler to finish with
+/// its parent's notification before giving up on replaying. Well under a slot:
+/// the handler takes milliseconds per notification.
+const CANON_CATCHUP_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether a build that may take transactions should: replay its carryover,
+/// run the pool and preconf arms, and record its block for `note_sealed`.
+///
+/// No when its parent is not the canonical head. A forkchoice update onto an
+/// ancestor with attributes builds on that ancestor while the head stays where
+/// it was until the rebuilt block is inserted; nothing the reorg reverts has
+/// been requeued yet, so a replay there can miss its nonce, and a replay that
+/// misses ends the transaction for good.
+///
+/// Also no when the parent is not the block the last build sealed and the
+/// canon handler has not finished with the parent's notification within
+/// `cap`: the reorg that made it the head may be reverting transactions the
+/// carryover's successors need.
+///
+/// A build told no carries only its attributes' transactions, and leaves the
+/// queue for the next build on the head.
+async fn replay_ready(
+    fifo: &PreconfTxSet,
+    client: &impl reth_storage_api::BlockNumReader,
+    parent_hash: B256,
+    parent_is_ours: bool,
+    cap: std::time::Duration,
+) -> bool {
+    match client.chain_info() {
+        Ok(info) if info.best_hash == parent_hash => {}
+        Ok(info) => {
+            metrics::counter!("preconf.build.parent_not_canonical_head_total").increment(1);
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                ?parent_hash, head = ?info.best_hash,
+                "build parent is not the canonical head; this block replays nothing \
+                 and takes no pool or preconf transactions",
+            );
+            return false;
+        }
+        Err(err) => {
+            metrics::counter!("preconf.build.canonical_chain_unreadable_total").increment(1);
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                ?parent_hash, ?err,
+                "canonical chain unreadable; this block replays nothing \
+                 and takes no pool or preconf transactions",
+            );
+            return false;
+        }
+    }
+    // Our own block cannot have been reorged into place: nothing to wait for.
+    if parent_is_ours {
+        return true;
+    }
+    let started = std::time::Instant::now();
+    let caught_up = fifo.wait_canon_processed(parent_hash, cap).await;
+    metrics::histogram!("preconf.build.canon_catchup_wait_ms")
+        .record(started.elapsed().as_secs_f64() * 1000.0);
+    if !caught_up {
+        metrics::counter!("preconf.build.canon_catchup_timeout_total").increment(1);
+        warn!(
+            target: "mantle::preconf::payload_builder",
+            ?parent_hash,
+            "canon handler has not processed the parent; this block replays nothing \
+             and takes no pool or preconf transactions",
+        );
+    }
+    caught_up
+}
+
 /// Whether this build may still execute a [`PreconfSource::Replay`] entry: only
 /// while its parent is on the canonical chain.
 ///
@@ -828,10 +899,9 @@ fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: Prec
 /// broken. A build on a parent off the canonical chain will not be adopted, so
 /// the check abandons it and leaves the entry for a build on the new chain.
 ///
-/// On the canonical chain, not at its head: a reorg arrives as a forkchoice
-/// update onto an ancestor with attributes, and the engine builds on that
-/// ancestor while the head stays where it was until the rebuilt block is
-/// inserted. That build is exactly where reverted commitments re-land.
+/// A build replays only when its parent is the canonical head as it starts
+/// (see [`replay_ready`]); this per-entry check covers a head that
+/// moves while the build runs.
 ///
 /// Asked after the entry is read from the queue, never before. The engine
 /// updates its in-memory canonical chain before it sends the canonical-state
@@ -2012,6 +2082,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             >,
         Client: reth_storage_api::StateProviderFactory
             + reth_storage_api::BlockHashReader
+            + reth_storage_api::BlockNumReader
             + reth_chainspec::ChainSpecProvider<ChainSpec: reth_optimism_forks::OpHardforks>,
         <Client as reth_chainspec::ChainSpecProvider>::ChainSpec:
             reth_chainspec::EthChainSpec + reth_optimism_forks::OpHardforks,
@@ -2363,7 +2434,20 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // put and get dispatched on the next `no_tx_pool=false` build
         // (they land later, on a best-effort basis, NOT by being forced
         // into the derivation block).
-        let allow_preconf = !ctx.attributes().no_tx_pool();
+        //
+        // A build `replay_ready` turns down takes the same path. Off, the
+        // block also skips `note_sealed`, so the next build does not drop as
+        // landed the entries this one left alone.
+        let parent_is_ours = build_guard.parent_is_ours(parent_hash);
+        let allow_preconf = !ctx.attributes().no_tx_pool() &&
+            replay_ready(
+                &self.fifo,
+                &self.client,
+                parent_hash,
+                parent_is_ours,
+                CANON_CATCHUP_CAP,
+            )
+            .await;
 
         // Sample the pending-backlog gauge once per build job (~per slot).
         self.fifo.publish_pending_gauge().await;
@@ -2372,7 +2456,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // Yes: everything it executed is on chain — drop those entries in one
         // pass. No: it may be in no block at all — put back the sender nonces
         // the slice boundaries advanced on its behalf.
-        if build_guard.parent_is_ours(parent_hash) {
+        if parent_is_ours {
             let released = self.fifo.drop_landed_claims().await;
             if released > 0 {
                 debug!(
@@ -3073,6 +3157,69 @@ mod tests {
         assert_eq!(entry.source, PreconfSource::Replay);
     }
 
+    fn chain_with_head(head: B256) -> reth_provider::test_utils::MockEthProvider {
+        let provider = reth_provider::test_utils::MockEthProvider::default();
+        provider.add_header(
+            B256::repeat_byte(0xa0),
+            alloy_consensus::Header { number: 4, ..Default::default() },
+        );
+        provider.add_header(head, alloy_consensus::Header { number: 5, ..Default::default() });
+        provider
+    }
+
+    const LONG: std::time::Duration = std::time::Duration::from_secs(10);
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// A build on an ancestor of the head replays nothing, and does not wait
+    /// to find that out.
+    #[tokio::test]
+    async fn a_build_below_the_head_replays_nothing() {
+        let head = B256::repeat_byte(5);
+        let fifo = PreconfTxSet::new(8);
+        fifo.note_canon_processed(head);
+        let started = std::time::Instant::now();
+
+        let ready =
+            replay_ready(&fifo, &chain_with_head(head), B256::repeat_byte(0xa0), false, LONG).await;
+
+        assert!(!ready);
+        assert!(started.elapsed() < LONG / 2, "turned down without waiting");
+    }
+
+    /// The healthy path: on the block this node just sealed, nothing to wait for.
+    #[tokio::test]
+    async fn a_build_on_our_own_head_replays_without_waiting() {
+        let head = B256::repeat_byte(5);
+        // Unseeded: a wait here would run out the cap and say no.
+        let fifo = PreconfTxSet::new(8);
+
+        assert!(replay_ready(&fifo, &chain_with_head(head), head, true, SHORT).await);
+    }
+
+    /// A head someone else put there replays once the canon handler has
+    /// finished with it, and not before.
+    #[tokio::test]
+    async fn a_build_on_a_head_it_did_not_seal_waits_for_the_canon_handler() {
+        let head = B256::repeat_byte(5);
+        let chain = chain_with_head(head);
+        let fifo = PreconfTxSet::new(8);
+        fifo.note_canon_processed(B256::repeat_byte(0xa0));
+
+        assert!(!replay_ready(&fifo, &chain, head, false, SHORT).await, "handler behind");
+
+        fifo.note_canon_processed(head);
+        assert!(replay_ready(&fifo, &chain, head, false, SHORT).await, "handler caught up");
+    }
+
+    /// Not knowing where the head is, the build replays nothing.
+    #[tokio::test]
+    async fn an_unreadable_head_replays_nothing() {
+        let fifo = PreconfTxSet::new(8);
+        let empty = reth_provider::test_utils::MockEthProvider::default();
+
+        assert!(!replay_ready(&fifo, &empty, B256::repeat_byte(5), true, SHORT).await);
+    }
+
     /// Empty fifo — helper returns an empty list, no error.
     #[tokio::test]
     async fn replay_fifo_carryover_on_empty_fifo_is_noop() {
@@ -3080,8 +3227,8 @@ mod tests {
         assert!(replay_fifo_carryover(&fifo).await.is_empty());
     }
 
-    /// Includes a parent below the head: a reorg rebuilds on an ancestor while
-    /// the head has not moved yet, and that build is where commitments re-land.
+    /// A parent below the head passes this check; `replay_ready` is what keeps
+    /// a build on it from replaying.
     #[test]
     fn a_replay_runs_while_the_parent_is_on_the_canonical_chain() {
         let parent = B256::repeat_byte(1);

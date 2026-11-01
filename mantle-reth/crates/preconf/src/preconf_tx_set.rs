@@ -67,9 +67,9 @@ use parking_lot::RwLock;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot, watch};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -649,6 +649,11 @@ pub struct PreconfTxSet {
 
     notifier: broadcast::Sender<TxHash>,
 
+    /// The tip of the last canonical-state notification the canon handler has
+    /// finished with, requeue of what it reverted included. `None` until the
+    /// handler starts.
+    canon_processed: watch::Sender<Option<B256>>,
+
     /// The claims this node has made, and the nonces they hold.
     ///
     /// Owned here because every removal path already runs under this type.
@@ -685,8 +690,29 @@ impl PreconfTxSet {
             accounts: RwLock::new(AccountView::default()),
             build_lock: Arc::new(Mutex::new(())),
             notifier,
+            canon_processed: watch::Sender::new(None),
             claims,
         }
+    }
+
+    /// Records that the canon handler is done with the notification whose
+    /// tip is `tip`, everything that notification reverted back in the queue.
+    pub fn note_canon_processed(&self, tip: B256) {
+        self.canon_processed.send_replace(Some(tip));
+    }
+
+    /// Waits, at most `cap`, for the canon handler to finish with the
+    /// notification whose tip is `parent`. `false` on timeout.
+    ///
+    /// The engine sends that notification before it starts the build, but the
+    /// handler reads it asynchronously. A build that replays before then can
+    /// find a requeued transaction's successor in the queue and not the
+    /// transaction itself, and a replay that misses its nonce ends there.
+    pub async fn wait_canon_processed(&self, parent: B256, cap: Duration) -> bool {
+        let mut processed = self.canon_processed.subscribe();
+        tokio::time::timeout(cap, processed.wait_for(|tip| *tip == Some(parent)))
+            .await
+            .is_ok_and(|seen| seen.is_ok())
     }
 
     /// Claimed by a build before it touches the queue, released when it stops
@@ -2451,6 +2477,43 @@ mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559};
     use alloy_primitives::{B256, Bloom, Signature};
+
+    /// A build waiting on its parent goes as soon as the canon handler names it.
+    #[tokio::test]
+    async fn a_build_waits_until_the_canon_handler_has_processed_its_parent() {
+        let set = Arc::new(PreconfTxSet::new(8));
+        let parent = B256::repeat_byte(1);
+        set.note_canon_processed(B256::repeat_byte(9));
+
+        let waiter = {
+            let set = set.clone();
+            tokio::spawn(
+                async move { set.wait_canon_processed(parent, Duration::from_secs(10)).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "not before the handler gets to the parent");
+
+        set.note_canon_processed(parent);
+        assert!(waiter.await.expect("the waiter does not panic"));
+    }
+
+    /// A handler that never reaches the parent costs the build `cap`, not more.
+    #[tokio::test]
+    async fn a_build_gives_up_when_the_canon_handler_never_reaches_its_parent() {
+        let set = PreconfTxSet::new(8);
+        set.note_canon_processed(B256::repeat_byte(9));
+
+        assert!(!set.wait_canon_processed(B256::repeat_byte(1), Duration::from_millis(20)).await);
+    }
+
+    /// Before the handler starts nothing counts as processed.
+    #[tokio::test]
+    async fn nothing_is_processed_before_the_canon_handler_starts() {
+        let set = PreconfTxSet::new(8);
+
+        assert!(!set.wait_canon_processed(B256::ZERO, Duration::from_millis(20)).await);
+    }
 
     fn addr(byte: u8) -> Address {
         Address::from([byte; 20])
