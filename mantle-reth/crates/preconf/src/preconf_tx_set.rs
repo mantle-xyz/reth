@@ -36,6 +36,7 @@
 //!
 //! builder (sync):  writes AccountView only, never touches `inner`
 //! admit   (async): reads AccountView first, then takes `inner`
+//! dispatch (async): takes an entry's `apply_lock`, then `inner`
 //! forbidden:       taking `inner` while holding the AccountView write lock
 //! ```
 //!
@@ -135,8 +136,8 @@ pub struct TxEntry {
     /// Per-entry lock serialising dispatch's completion with the RPC deadline
     /// branch. A completion holds it from the decision through the send, so a
     /// deadline acquiring it afterwards finds the result already in the
-    /// channel. Never held while acquiring `PreconfTxSet::inner` — that
-    /// direction deadlocks.
+    /// channel. Taken before `PreconfTxSet::inner`, never while holding it:
+    /// the order is `apply_lock → inner`, and the reverse deadlocks.
     pub apply_lock: Arc<Mutex<()>>,
 }
 
