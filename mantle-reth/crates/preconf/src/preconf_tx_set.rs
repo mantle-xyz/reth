@@ -739,8 +739,8 @@ impl PreconfTxSet {
     /// Shared body of both constructors.
     fn with_claims(broadcast_cap: usize, claims: Arc<Commitments>) -> Self {
         let (notifier, _) = broadcast::channel(broadcast_cap);
-        // Register the gauge at 0 so it has a baseline from startup.
-        metrics::gauge!("preconf.fifo.pending").set(0.0);
+        // No gauge baseline here: a node without preconf builds a queue too.
+        // `seed_preconf_metrics` registers them, on preconf nodes only.
         Self {
             inner: Mutex::new(PreconfTxSetInner::new(claims.clone())),
             accounts: RwLock::new(AccountView::default()),
@@ -1709,6 +1709,20 @@ mod admit_tests {
             Signature::test_signature(),
             B256::from([hash_byte; 32]),
         )))
+    }
+
+    /// Building a queue exports nothing: a node without preconf builds one too,
+    /// and must not show `preconf_*` series.
+    #[test]
+    fn an_untouched_queue_exports_no_gauges() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || drop(PreconfTxSet::new(8)));
+
+        let rendered = handle.render();
+        assert!(!rendered.contains("preconf_fifo"), "{rendered}");
     }
 
     /// The queue gauges follow every change, with no build to sample them: a
