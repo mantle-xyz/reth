@@ -2365,7 +2365,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // into the derivation block).
         let allow_preconf = !ctx.attributes().no_tx_pool();
 
-        // Sample the pending-backlog gauge once per build job (~per slot).
+        // Every queue change publishes the gauges; this covers a node with nothing queued yet.
         self.fifo.publish_pending_gauge().await;
 
         // Did the block the last build produced become this one's parent?
