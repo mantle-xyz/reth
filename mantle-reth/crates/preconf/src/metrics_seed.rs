@@ -95,9 +95,15 @@ const COUNTERS: &[&str] = &[
     // about to replay a commitment, and abandoned itself. Steady state is 0; it
     // moves with reorgs.
     "preconf.build.stale_parent_abandoned_total",
-    // The canonical chain could not be read at that check, so the replayed
-    // commitment waited for a later build.
+    // The canonical chain could not be read at that check or at the build's
+    // start, so nothing was replayed until a later build.
     "preconf.build.canonical_chain_unreadable_total",
+    // A build whose parent was not the canonical head, so it replayed nothing
+    // and took no transactions. Steady state is 0; it moves with reorgs.
+    "preconf.build.parent_not_canonical_head_total",
+    // A build that gave up waiting for the canon handler to process its parent
+    // and replayed nothing. Steady state is 0.
+    "preconf.build.canon_catchup_timeout_total",
     "preconf.build.watchdog_cancel_total",
     "preconf.fifo.da_rejected_total",
     "preconf.fifo.block_gas_rejected_total",
@@ -189,6 +195,7 @@ const HISTOGRAMS: &[&str] = &[
     "mantle.canon.notification_duration",
     "preconf.api.handle_duration_ms",
     "preconf.build.lock_wait_ms",
+    "preconf.build.canon_catchup_wait_ms",
     "preconf.execute.duration_ms",
     "preconf.dispatch.elapsed_at_gate_ms",
     "preconf.journal.rotate_duration_ms",

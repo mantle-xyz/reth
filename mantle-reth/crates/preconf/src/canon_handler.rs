@@ -21,9 +21,11 @@
 //!   carried is put back as `PreconfSource::Replay` through [`PreconfTxSet::push_if_absent`]. A
 //!   build already running may stand on the reverted block; it does not execute the entry, because
 //!   a replayed commitment runs only on the canonical chain (`ReplayParentCheck` in
-//!   `builder::payload_builder`). A transaction the new chain also carries is skipped; the
-//!   committed-chain pass records it at its new height. The client-observed `block_height` may
-//!   drift for reorged commitments; op-geth has the same behavior.
+//!   `builder::payload_builder`), and a build that replays first waits for this handler to finish
+//!   with its parent's notification (`PreconfTxSet::note_canon_processed`). A transaction the new
+//!   chain also carries is skipped; the committed-chain pass records it at its new height. The
+//!   client-observed `block_height` may drift for reorged commitments; op-geth has the same
+//!   behavior.
 //!
 //! Lifecycle: instantiated once at node startup when preconf is enabled,
 //! then spawned as a `spawn_critical_task` on the reth task executor.
@@ -124,6 +126,17 @@ where
     /// broadcast sender is dropped).
     pub async fn run(self) {
         let mut receiver = self.provider.subscribe_to_canonical_state();
+        // Seeded with the head, read after subscribing so no notification
+        // falls between the two. Unseeded, the first build after a restart
+        // would wait on a notification that is never sent.
+        match self.provider.chain_info() {
+            Ok(info) => self.fifo.note_canon_processed(info.best_hash),
+            Err(e) => warn!(
+                target: "mantle::preconf::canon",
+                ?e,
+                "could not read the canonical head; builds replay nothing until the next notification"
+            ),
+        }
         loop {
             let notif = match receive_canonical(&mut receiver).await {
                 CanonUpdate::Notification(notif) => notif,
@@ -252,6 +265,10 @@ where
                 "subscriber" => "preconf_canon"
             )
             .record(started.elapsed());
+
+            // Last, so a build waiting on this tip finds the reverted
+            // transactions back in the queue.
+            self.fifo.note_canon_processed(notif.tip().hash());
         }
         debug!(target: "mantle::preconf::canon", "canonical state stream closed");
     }
@@ -406,11 +423,31 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use alloy_primitives::B256;
     use reth_execution_types::Chain;
     use reth_optimism_primitives::OpPrimitives;
+    use reth_provider::test_utils::MockEthProvider;
     use tokio::sync::broadcast;
 
     use super::*;
+
+    /// No notification is sent for the head a node starts on, so the handler
+    /// names it itself; otherwise the first build after a restart would wait
+    /// out its cap and replay nothing.
+    #[tokio::test]
+    async fn the_handler_starts_with_the_head_processed() {
+        let provider = MockEthProvider::<OpPrimitives>::new();
+        let head = B256::repeat_byte(5);
+        provider.add_header(head, alloy_consensus::Header { number: 5, ..Default::default() });
+        let fifo = Arc::new(PreconfTxSet::new(8));
+
+        // The mock's stream is closed from the start: `run` seeds and returns.
+        PreconfCanonHandler::new(provider, fifo.clone()).run().await;
+
+        assert!(fifo.wait_canon_processed(head, Duration::from_millis(1)).await);
+    }
 
     fn notification() -> CanonStateNotification<OpPrimitives> {
         CanonStateNotification::Commit { new: Arc::new(Chain::default()) }

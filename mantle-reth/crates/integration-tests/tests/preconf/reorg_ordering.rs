@@ -106,12 +106,15 @@ async fn preconf_carryover_orders_ahead_of_higher_tip_after_reorg() {
         "low-tip preconf P must precede high-tip normal N pre-reorg; sealed={sealed:?}"
     );
 
-    // ── Reorg (same height n=1, NEW L1 origin 200), then assert P re-lands
-    //    through the carryover preamble: it must be the FIRST user tx (index 1,
-    //    right after the L1-info deposit), ahead of any pool tx. The normal N
-    //    re-lands via reth's native pool re-injection, not bound to the same
-    //    block — so we only assert the ordering when the two co-locate.
-    let (_relanded_head, sealed_re) = reorg_to!(node, base, n = 1, l1 = 200);
+    // ── Reorg (same height n=1, NEW L1 origin 200). The rebuild's parent is
+    //    not the head yet, so it carries only its deposit. The block on it must
+    //    re-land P through the carryover preamble: it must be the FIRST user tx
+    //    (index 1, right after the L1-info deposit), ahead of any pool tx. The
+    //    normal N re-lands via reth's native pool re-injection, not bound to the
+    //    same block — so we only assert the ordering when the two co-locate.
+    let (rebuilt, sealed_rebuilt) = reorg_to!(node, base, n = 1, l1 = 200);
+    assert_eq!(sealed_rebuilt.len(), 1, "the rebuild carries only its deposit; {sealed_rebuilt:?}");
+    let (_relanded_head, sealed_re) = op_node_slot_l1!(node, on = rebuilt, n = 2, l1 = 201);
     let (ip_re, in_re) = (index_of(&sealed_re, &hash_p), index_of(&sealed_re, &hash_n));
     eprintln!(
         "[ordering] post-reorg P idx={ip_re:?}  N idx={in_re:?}  sealed_len={}",
