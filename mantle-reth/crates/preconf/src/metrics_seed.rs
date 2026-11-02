@@ -21,6 +21,9 @@
 const COUNTERS: &[&str] = &[
     "flashblocks.slice_allowance_exhausted_total",
     "flashblocks.oversized_slices_total",
+    // Subscribers the publisher closed because `--flashblocks.max-subscribers`
+    // were already connected. Steady state is 0.
+    "flashblocks.subscribers_refused_total",
     "preconf.build.failed_total",
     "preconf.build.resolved_payload_superseded_total",
     "preconf.build.pool_tx_on_committed_nonce_total",
