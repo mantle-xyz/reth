@@ -461,6 +461,8 @@ mod tests {
         let err = svc.start(&UnreachableSource, &UnreachableChain).await.unwrap_err();
 
         assert!(matches!(err, PreconfStartError::Journal(_)), "got {err:?}");
+        // What operators search the startup log for.
+        assert!(err.to_string().starts_with("preconf journal restore: journal IO:"), "{err}");
     }
 
     /// `start` reads a populated journal and pushes each entry into the fifo.

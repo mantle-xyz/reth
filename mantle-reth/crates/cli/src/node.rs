@@ -288,7 +288,9 @@ where
             let chain_view = ProviderChainView::new(ctx.provider().clone());
             svc.start(&adapter, &chain_view)
                 .await
-                .map_err(|e| eyre::eyre!("preconf service start: {e:?}"))?;
+                // Display, not Debug: the error's own text names the journal
+                // and the cause, which the variant names do not.
+                .map_err(|e| eyre::eyre!("preconf service start: {e}"))?;
             info!(target: "reth::cli", "Mantle preconf service builder started (restore + wire)");
         }
 
