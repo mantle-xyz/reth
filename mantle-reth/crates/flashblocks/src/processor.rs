@@ -1,7 +1,7 @@
 //! Flashblocks state processor.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     panic::AssertUnwindSafe,
     sync::{
@@ -18,6 +18,7 @@ use alloy_consensus::{
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
 use alloy_network::TransactionResponse;
 use alloy_primitives::{Address, B256, BlockNumber};
+use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::state::StateOverride;
 use arc_swap::ArcSwapOption;
 use futures::FutureExt;
@@ -144,6 +145,7 @@ pub struct StateProcessor<Client> {
     sender: Sender<Arc<PendingBlocks>>,
     cache: Arc<Mutex<FlashblockCache>>,
     live_state: StdMutex<Option<LivePendingState>>,
+    base_fee_mismatches: ReportedBaseFeeMismatches,
 }
 
 impl<Client> StateProcessor<Client>
@@ -234,6 +236,7 @@ where
             sender,
             cache: Arc::new(Mutex::new(cache)),
             live_state: StdMutex::new(None),
+            base_fee_mismatches: ReportedBaseFeeMismatches::default(),
         }
     }
 
@@ -1211,7 +1214,13 @@ where
         db.block_hashes.insert(base.block_number - 1, base.parent_hash);
 
         let evm_config = OpEvmConfig::optimism(self.client.chain_spec());
-        let evm_env = next_block_evm_env(&evm_config, &previous_header, &base)?;
+        let evm_env = next_block_evm_env(
+            &evm_config,
+            &previous_header,
+            &base,
+            flashblock.payload_id,
+            &self.base_fee_mismatches,
+        )?;
         let evm = evm_config.evm_with_env(db, evm_env);
 
         let recovery_start = Instant::now();
@@ -1337,7 +1346,13 @@ where
             db.block_hashes
                 .insert(latest_block_base.block_number - 1, latest_block_base.parent_hash);
 
-            let evm_env = next_block_evm_env(&evm_config, &last_block_header, &assembled.base)?;
+            let evm_env = next_block_evm_env(
+                &evm_config,
+                &last_block_header,
+                &assembled.base,
+                flashblocks[0].payload_id,
+                &self.base_fee_mismatches,
+            )?;
             let evm = evm_config.evm_with_env(db, evm_env);
 
             let recovery_start = Instant::now();
@@ -1438,6 +1453,32 @@ fn check_execution_gas(block_number: BlockNumber, index: u64, local: u64, report
     }
 }
 
+/// Base slices whose basefee mismatch has already been reported.
+///
+/// The overlay executes a block again on every rebuild, so counting each
+/// execution would multiply one mismatch by the blocks the overlay spans. A
+/// rebuild of the same height under a new payload id is a new base slice and is
+/// reported again. Holds more entries than an overlay has blocks.
+#[derive(Debug, Default)]
+struct ReportedBaseFeeMismatches(StdMutex<VecDeque<(BlockNumber, PayloadId)>>);
+
+impl ReportedBaseFeeMismatches {
+    const CAPACITY: usize = 16;
+
+    /// `true` the first time the base slice `(block, payload_id)` is seen.
+    fn first_report(&self, block: BlockNumber, payload_id: PayloadId) -> bool {
+        let mut seen = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seen.contains(&(block, payload_id)) {
+            return false;
+        }
+        if seen.len() == Self::CAPACITY {
+            seen.pop_front();
+        }
+        seen.push_back((block, payload_id));
+        true
+    }
+}
+
 /// The EVM environment for the block `base` opens, on `parent`. The basefee is
 /// the producer's: it is what the sealed header carries, and deriving it from
 /// a parent the overlay assembled would follow any gap in that parent.
@@ -1445,6 +1486,8 @@ fn next_block_evm_env<ChainSpec>(
     evm_config: &OpEvmConfig<ChainSpec>,
     parent: &Header,
     base: &OpFlashblockPayloadBase,
+    payload_id: PayloadId,
+    reported: &ReportedBaseFeeMismatches,
 ) -> Result<EvmEnv<OpSpecId>>
 where
     ChainSpec: EthChainSpec<Header = Header> + OpHardforks + 'static,
@@ -1454,13 +1497,15 @@ where
         .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
     let declared: u64 = base.base_fee_per_gas.saturating_to();
     if evm_env.block_env.basefee != declared {
-        Metrics::base_fee_mismatch().increment(1);
-        warn!(
-            message = "derived basefee differs from the base slice; using the base slice's",
-            block = %base.block_number,
-            derived = evm_env.block_env.basefee,
-            declared,
-        );
+        if reported.first_report(base.block_number, payload_id) {
+            Metrics::base_fee_mismatch().increment(1);
+            warn!(
+                message = "derived basefee differs from the base slice; using the base slice's",
+                block = %base.block_number,
+                derived = evm_env.block_env.basefee,
+                declared,
+            );
+        }
         evm_env.block_env.basefee = declared;
     }
     Ok(evm_env)
@@ -1518,6 +1563,34 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, run);
         handle.render().lines().find(|l| l.starts_with(SERIES)).map(str::to_owned)
+    }
+
+    /// A block the overlay executes again is not reported again; a rebuild of
+    /// the same height under a new payload id is.
+    #[test]
+    fn a_base_fee_mismatch_is_reported_once_per_base_slice() {
+        let reported = ReportedBaseFeeMismatches::default();
+        let (first, rebuild) = (PayloadId::new([1; 8]), PayloadId::new([2; 8]));
+
+        assert!(reported.first_report(7, first));
+        assert!(!reported.first_report(7, first), "re-executed by a rebuild");
+        assert!(!reported.first_report(7, first), "and again");
+        assert!(reported.first_report(7, rebuild), "a new build of the same height");
+        assert!(reported.first_report(8, first), "the next block");
+    }
+
+    /// Bounded: the oldest base slice is forgotten first.
+    #[test]
+    fn reported_base_fee_mismatches_forget_the_oldest() {
+        let reported = ReportedBaseFeeMismatches::default();
+        let id = PayloadId::new([1; 8]);
+        for block in 0..ReportedBaseFeeMismatches::CAPACITY as u64 {
+            assert!(reported.first_report(block, id));
+        }
+
+        assert!(reported.first_report(100, id));
+        assert!(reported.first_report(0, id), "evicted");
+        assert!(!reported.first_report(100, id), "still held");
     }
 
     #[test]
