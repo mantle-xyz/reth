@@ -611,7 +611,8 @@ async fn pending_simulation_starts_after_the_overlay_tip() {
     assert_eq!(U256::from_be_slice(&output[..32]), U256::from(2));
     assert_eq!(
         U256::from_be_slice(&output[32..64]),
-        U256::from(crate::consumer_helpers::l2_ts(1) + 2)
+        U256::from(crate::consumer_helpers::l2_ts(1) + 12),
+        "a simulated block steps 12s from the preview, as op-geth steps it"
     );
     assert_eq!(
         U256::from_be_slice(&output[64..96]),
@@ -887,12 +888,13 @@ async fn pending_simulation_keeps_captured_block_hashes_after_canonical_advances
 }
 
 /// The Arsia guard must inspect the preview parent and actual simulated timestamps,
-/// including empty blocks inserted for number gaps.
+/// including empty blocks inserted for number gaps. Simulated blocks step 12s from
+/// the preview, as they do from a canonical parent.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_simulation_checks_the_actual_arsia_boundary() {
     use crate::consumer_helpers::{flashblocks_test_chain_spec, l2_ts};
     use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
-    let activation = l2_ts(6);
+    let activation = l2_ts(20);
     let mut spec = flashblocks_test_chain_spec().as_ref().clone();
     spec.inner.hardforks.insert(
         mantle_reth_chainspec::MantleHardfork::Arsia,
@@ -914,11 +916,11 @@ async fn pending_simulation_checks_the_actual_arsia_boundary() {
             Some(BlockNumberOrTag::Pending.into()),
         )
         .await
-        .expect("default time is preview + 2, before activation");
-    assert_eq!(result[0]["timestamp"], format!("{:#x}", l2_ts(3)));
+        .expect("default time is preview + 12, before activation");
+    assert_eq!(result[0]["timestamp"], format!("{:#x}", l2_ts(13)));
     for block in [
         serde_json::json!({ "blockOverrides": { "time": format!("{activation:#x}") }, "calls": [] }),
-        // Preview 1, fillers 2/3 at +2/+4, requested block 4 at +6 crosses activation.
+        // Preview 1, fillers 2/3 at +12/+24, requested block 4 at +36 crosses activation.
         serde_json::json!({ "blockOverrides": { "number": "0x4" }, "calls": [] }),
     ] {
         let error = api

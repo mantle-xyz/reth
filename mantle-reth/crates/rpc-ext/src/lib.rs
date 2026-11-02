@@ -1001,12 +1001,10 @@ where
         // Use the same normalization as execution: chain-specific spacing, explicit
         // timestamps and filler blocks for number gaps all affect the Arsia boundary.
         // On Mantle the spacing is op-geth's, so that a request answers as it does on
-        // op-geth; a flashblocks preview has no op-geth counterpart and keeps the chain's.
-        let spacing_chain_id = if chain_spec.is_mantle() && context.is_none() {
-            OP_GETH_SIMULATE_CHAIN_ID
-        } else {
-            chain_spec.chain_id()
-        };
+        // op-geth. A preview parent keeps it too: otherwise the same request would step
+        // 12s or 2s depending on whether a preview happened to be fresh.
+        let spacing_chain_id =
+            if chain_spec.is_mantle() { OP_GETH_SIMULATE_CHAIN_ID } else { chain_spec.chain_id() };
         payload.block_state_calls = simulate::sanitize_chain(
             payload.block_state_calls,
             &parent,
