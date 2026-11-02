@@ -257,20 +257,20 @@ revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branc
 alloy-evm = { version = "0.34.0", default-features = false }
 
 # ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantle-xyz/mantle-v2) ====================
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
 
 # ==================== OP-REVM (Mantle fork: mantle-xyz/revm, same repo as revm) ====================
 op-revm = { git = "https://github.com/mantle-xyz/revm", tag = "v107-mantle-arsia.2", default-features = false }
 
 # ==================== OP-ALLOY (Mantle: mantle-xyz/mantle-v2) ====================
-op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
-op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork", default-features = false }
+op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
+op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation", default-features = false }
 op-alloy-flz = { version = "0.13.1", default-features = false }
 
 # ==================== ALLOY ====================
@@ -444,11 +444,11 @@ revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branc
 # op-revm: mantle-xyz/revm (same as workspace dep)
 op-revm = { git = "https://github.com/mantle-xyz/revm", tag = "v107-mantle-arsia.2" }
 # alloy-op-evm / alloy-op-hardforks: mantle-xyz/mantle-v2 (Mantle version)
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork" }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork" }
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation" }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation" }
 # op-alloy: mantle-xyz/mantle-v2 (Mantle version)
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork" }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork" }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork" }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork" }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "feat/hoodi-bvm-predeploy-fork" }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation" }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation" }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation" }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation" }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", branch = "test/hoodi-qa3-bvm-activation" }
