@@ -95,7 +95,7 @@ where
         let (sender, mut mailbox) = mpsc::channel(100);
 
         tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
+            let mut backoff = INITIAL_BACKOFF;
             let mut last_position: Option<StreamPosition> = None;
 
             loop {
@@ -105,7 +105,9 @@ where
                     .max_frame_size(Some(MAX_DECOMPRESSED_FLASHBLOCK_BYTES));
                 match connect_async_with_config(connect_url.as_str(), Some(config), false).await {
                     Ok((ws_stream, _)) => {
-                        backoff = Duration::from_secs(1);
+                        // Not a reset: an upstream that accepts and then drops
+                        // every connection would otherwise be retried each second.
+                        let connected_at = Instant::now();
                         info!(
                             message = "websocket connection established",
                             url = %redact_ws_url(connect_url.as_str()),
@@ -146,7 +148,7 @@ where
                                         }
                                         Ok(Message::Close(_)) => {
                                             info!(message = "websocket connection closed by upstream");
-                                            backoff = Self::sleep(backoff).await;
+                                            backoff = Self::sleep(backoff_after(connected_at.elapsed(), backoff)).await;
                                             break 'conn;
                                         }
                                         Ok(Message::Pong(data)) => {
@@ -156,7 +158,7 @@ where
                                         Err(e) => {
                                             Metrics::upstream_errors().increment(1);
                                             error!(message = "error receiving message", error = %e);
-                                            backoff = Self::sleep(backoff).await;
+                                            backoff = Self::sleep(backoff_after(connected_at.elapsed(), backoff)).await;
                                             break 'conn;
                                         }
                                         _ => {}
@@ -171,7 +173,7 @@ where
                                             "no pong response from upstream, reconnecting",
                                         );
 
-                                        backoff = Self::sleep(backoff).await;
+                                        backoff = Self::sleep(backoff_after(connected_at.elapsed(), backoff)).await;
                                         break 'conn;
                                     }
 
@@ -185,7 +187,7 @@ where
                                             "websocket connection lost, reconnecting",
                                         );
 
-                                        backoff = Self::sleep(backoff).await;
+                                        backoff = Self::sleep(backoff_after(connected_at.elapsed(), backoff)).await;
                                         break 'conn;
                                     }
                                     awaiting_pong_resp = true
@@ -222,8 +224,21 @@ where
     }
 }
 
+/// First wait between reconnect attempts.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Longest wait between reconnect attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// How long a connection has to stay up before its end restarts the backoff.
+/// As long as the longest wait: a connection that outlived it was serving.
+const HEALTHY_CONNECTION: Duration = MAX_BACKOFF;
+
+/// The wait before reconnecting after a connection that stayed up for
+/// `lasted`: [`INITIAL_BACKOFF`] once it proved healthy, `backoff` otherwise.
+fn backoff_after(lasted: Duration, backoff: Duration) -> Duration {
+    if lasted >= HEALTHY_CONNECTION { INITIAL_BACKOFF } else { backoff }
+}
 
 /// The wait after `current`: doubled, capped at [`MAX_BACKOFF`].
 fn next_backoff(current: Duration) -> Duration {
@@ -332,6 +347,52 @@ mod tests {
                 server.abort();
             })
         });
+    }
+
+    /// An upstream that completes the handshake and drops at once is retried
+    /// on a growing wait (1s, 2s, 4s), not once a second.
+    #[tokio::test]
+    async fn an_upstream_that_drops_after_the_handshake_is_retried_on_a_growing_wait() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        struct Ignore;
+        impl FlashblocksReceiver for Ignore {
+            fn on_flashblock_received(&self, _: MantleFlashblockPayload) {}
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let accepts = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    drop(tokio_tungstenite::accept_async(stream).await);
+                }
+            })
+        };
+
+        FlashblocksSubscriber::new(Arc::new(Ignore), url, Duration::from_secs(600)).start();
+        tokio::time::sleep(Duration::from_millis(4_500)).await;
+        server.abort();
+
+        // Connects at 0s, 1s and 3s; the next is due at 7s. Reset on every
+        // handshake, it would connect at 0s, 1s, 2s, 3s and 4s.
+        assert_eq!(accepts.load(Ordering::SeqCst), 3);
+    }
+
+    /// Only a connection that stayed up as long as the longest wait restarts
+    /// the backoff; one dropped right after the handshake keeps it growing.
+    #[test]
+    fn only_a_connection_that_stayed_up_restarts_the_backoff() {
+        let grown = Duration::from_secs(8);
+
+        assert_eq!(backoff_after(Duration::ZERO, grown), grown, "dropped at once");
+        assert_eq!(backoff_after(HEALTHY_CONNECTION - Duration::from_millis(1), grown), grown);
+        assert_eq!(backoff_after(HEALTHY_CONNECTION, grown), INITIAL_BACKOFF);
     }
 
     /// The schedule a dead upstream produces: 1, 2, 4, 8, then 10 for good.

@@ -110,6 +110,9 @@ struct Args {
 
     /// Upper bound on upstream reconnect backoff, in milliseconds. Must be
     /// greater than zero.
+    ///
+    /// Also how long a connection has to stay up before its end restarts the
+    /// backoff: an upstream that drops connections sooner keeps it growing.
     #[arg(long, env, default_value = "20000")]
     subscriber_max_interval_ms: u64,
 
