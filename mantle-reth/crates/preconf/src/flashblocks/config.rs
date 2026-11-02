@@ -65,6 +65,15 @@ pub const DEFAULT_RING_CAPACITY: usize = 32;
 /// Default capacity of the live broadcast channel — 32.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 32;
 
+/// Default number of subscribers the publisher serves at once — 64.
+///
+/// The endpoint is meant for a handful of relays (`mantle-ws-proxy`), not for
+/// the public. Each subscriber holds a socket for as long as it stays, so an
+/// unbounded count lets anyone who can reach the port exhaust the node's file
+/// descriptors, and with them the database and the consensus engine. A
+/// connection over the limit is closed before the `WebSocket` handshake.
+pub const DEFAULT_MAX_SUBSCRIBERS: usize = 64;
+
 /// Default boundaries a pool snapshot waits before it is used — 1.
 ///
 /// A mid-block pool transaction is therefore offered to the builder a slice
@@ -92,6 +101,8 @@ pub struct FlashblockProducerConfig {
     pub broadcast_capacity: usize,
     /// Slice boundaries a refreshed pool snapshot waits before it is used.
     pub best_tx_lead_slices: u64,
+    /// Subscribers served at once; see [`DEFAULT_MAX_SUBSCRIBERS`].
+    pub max_subscribers: usize,
 }
 
 impl Default for FlashblockProducerConfig {
@@ -104,6 +115,7 @@ impl Default for FlashblockProducerConfig {
             ring_capacity: DEFAULT_RING_CAPACITY,
             broadcast_capacity: DEFAULT_BROADCAST_CAPACITY,
             best_tx_lead_slices: DEFAULT_BEST_TX_LEAD_SLICES,
+            max_subscribers: DEFAULT_MAX_SUBSCRIBERS,
         }
     }
 }
@@ -122,6 +134,9 @@ pub enum FlashblockProducerConfigError {
     /// `broadcast_capacity == 0` — tokio broadcast requires capacity > 0.
     #[error("flashblocks broadcast_capacity must be > 0")]
     InvalidBroadcastCapacity,
+    /// `max_subscribers == 0` would refuse every subscriber, the relay included.
+    #[error("--flashblocks.max-subscribers must be > 0: zero refuses every subscriber")]
+    NoSubscribersAllowed,
     /// A single slice would span more than the whole slot, which leaves the
     /// per-slice budget meaningless.
     #[error(
@@ -227,6 +242,9 @@ impl FlashblockProducerConfig {
         if self.broadcast_capacity == 0 {
             return Err(FlashblockProducerConfigError::InvalidBroadcastCapacity);
         }
+        if self.max_subscribers == 0 {
+            return Err(FlashblockProducerConfigError::NoSubscribersAllowed);
+        }
         if self.ring_capacity < self.broadcast_capacity {
             return Err(FlashblockProducerConfigError::RingSmallerThanBroadcast {
                 ring: self.ring_capacity,
@@ -316,6 +334,17 @@ mod tests {
         let preconf = preconf_with_slot(Duration::from_secs(2));
 
         assert!(cfg().validate(Some(&preconf), false).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_subscribers() {
+        let preconf = preconf_with_slot(Duration::from_secs(2));
+        let cfg = FlashblockProducerConfig { max_subscribers: 0, ..cfg() };
+
+        assert_eq!(
+            cfg.validate(Some(&preconf), false),
+            Err(FlashblockProducerConfigError::NoSubscribersAllowed)
+        );
     }
 
     #[test]
@@ -420,6 +449,7 @@ mod tests {
             ring_capacity: 64,
             broadcast_capacity: 16,
             best_tx_lead_slices: 2,
+            max_subscribers: 8,
         };
 
         assert_eq!(configured.clone().validate(Some(&preconf), false), Ok(configured));

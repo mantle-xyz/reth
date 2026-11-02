@@ -14,11 +14,11 @@ use mantle_reth_flashblocks_types::{MAX_DECOMPRESSED_FLASHBLOCK_BYTES, MantleFla
 use parking_lot::RwLock;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::broadcast,
+    sync::{Semaphore, broadcast},
 };
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::flashblocks::{
     FlashblockPosition, FlashblockRingBuffer, broadcast::serve_subscriber,
@@ -79,6 +79,9 @@ impl MantleFlashblocksPublisher {
     ) -> io::Result<(Self, impl Future<Output = ()> + Send + use<>)> {
         let ring_capacity = NonZeroUsize::new(cfg.ring_capacity)
             .ok_or_else(|| io::Error::other("flashblocks ring capacity must be non-zero"))?;
+        if cfg.max_subscribers == 0 {
+            return Err(io::Error::other("flashblocks max subscribers must be non-zero"));
+        }
 
         // Bound the archive below by the live channel; see
         // `FlashblockProducerConfigError::RingSmallerThanBroadcast`.
@@ -93,8 +96,9 @@ impl MantleFlashblocksPublisher {
         let local_addr = std_listener.local_addr()?;
         let listener = TcpListener::from_std(std_listener)?;
 
+        let slots = Arc::new(Semaphore::new(cfg.max_subscribers));
         let accepting =
-            accept_loop(listener, pipe.clone(), Arc::clone(&ring), cancel.child_token());
+            accept_loop(listener, pipe.clone(), Arc::clone(&ring), slots, cancel.child_token());
 
         info!(target: "mantle::preconf::flashblocks", %local_addr, "flashblocks publisher bound");
 
@@ -219,10 +223,15 @@ impl AcceptBackoff {
 }
 
 /// Accept subscribers until cancelled, serving each on its own task.
+///
+/// At most `slots` are served at once. A connection over the limit is closed
+/// straight away, before the `WebSocket` handshake: its socket is freed at
+/// once, and refusing costs no more than accepting.
 async fn accept_loop<L: Accept>(
     listener: L,
     pipe: broadcast::Sender<PositionedSlice>,
     ring: Arc<RwLock<FlashblockRingBuffer>>,
+    slots: Arc<Semaphore>,
     cancel: CancellationToken,
 ) {
     let mut backoff = AcceptBackoff::default();
@@ -245,12 +254,25 @@ async fn accept_loop<L: Accept>(
             },
         };
 
+        // Held by the subscriber's task, so the slot frees when it ends.
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            metrics::counter!("flashblocks.subscribers_refused_total").increment(1);
+            debug!(
+                target: "mantle::preconf::flashblocks",
+                peer = ?connection.peer_addr().ok(),
+                "subscriber limit reached; closing the connection"
+            );
+            drop(connection);
+            continue;
+        };
+
         let pipe = pipe.clone();
         let ring = Arc::clone(&ring);
         let cancel = cancel.child_token();
 
         tokio::spawn(async move {
             serve_subscriber(connection, &pipe, ring, cancel).await;
+            drop(slot);
         });
     }
 }
@@ -352,6 +374,42 @@ mod tests {
             positions.push((decoded.metadata.block_number, decoded.index));
         }
         positions
+    }
+
+    /// Over the limit a connection is closed before the handshake, and the
+    /// slot a subscriber held is free again once it leaves.
+    #[tokio::test]
+    async fn subscribers_over_the_limit_are_closed_until_a_slot_frees() {
+        let (publisher, accepting) = MantleFlashblocksPublisher::bind(&FlashblockProducerConfig {
+            addr: Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            max_subscribers: 1,
+            ..Default::default()
+        })
+        .expect("bind on an ephemeral port");
+        tokio::spawn(accepting);
+        let url = format!("ws://{}", publisher.local_addr());
+
+        let first = connect(&publisher, "").await;
+        while publisher.handle().subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio_tungstenite::connect_async(url.as_str()).await.is_err(),
+            "the second subscriber is refused"
+        );
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio_tungstenite::connect_async(url.as_str()).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the slot frees once the first subscriber leaves");
     }
 
     #[tokio::test]
@@ -492,6 +550,7 @@ mod tests {
             FailingAccept { attempts: std::sync::Arc::clone(&attempts), limit },
             pipe,
             ring,
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             cancel.clone(),
         ));
         (attempts, cancel, handle)

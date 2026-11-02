@@ -38,7 +38,7 @@ use mantle_reth_preconf::{
     },
     flashblocks::{
         DEFAULT_BEST_TX_LEAD_SLICES, DEFAULT_FLASHBLOCK_ADDR, DEFAULT_FLASHBLOCK_BLOCK_TIME,
-        DEFAULT_FLASHBLOCK_LEEWAY, DEFAULT_FLASHBLOCK_PORT,
+        DEFAULT_FLASHBLOCK_LEEWAY, DEFAULT_FLASHBLOCK_PORT, DEFAULT_MAX_SUBSCRIBERS,
     },
 };
 use reth_optimism_node::args::RollupArgs;
@@ -404,6 +404,20 @@ pub struct FlashblocksArgs {
         requires = "flashblocks.enable"
     )]
     pub best_tx_lead_slices: Option<u64>,
+
+    /// Subscribers the publisher serves at once. Default 64; 0 is refused.
+    ///
+    /// The endpoint is for relays such as `mantle-ws-proxy`. A connection over
+    /// the limit is closed before the `WebSocket` handshake and counted in
+    /// `flashblocks_subscribers_refused_total`, so a flood of connections
+    /// cannot exhaust the node's file descriptors.
+    #[arg(
+        id = "flashblocks.max-subscribers",
+        long = "flashblocks.max-subscribers",
+        alias = "subblocks.max-subscribers",
+        requires = "flashblocks.enable"
+    )]
+    pub max_subscribers: Option<usize>,
 }
 
 impl FlashblocksArgs {
@@ -428,6 +442,7 @@ impl FlashblocksArgs {
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_FLASHBLOCK_LEEWAY),
             best_tx_lead_slices: self.best_tx_lead_slices.unwrap_or(DEFAULT_BEST_TX_LEAD_SLICES),
+            max_subscribers: self.max_subscribers.unwrap_or(DEFAULT_MAX_SUBSCRIBERS),
             ..Default::default()
         })
     }
@@ -781,6 +796,8 @@ mod tests {
             "0",
             "--subblocks.best-tx-lead-slices",
             "2",
+            "--subblocks.max-subscribers",
+            "8",
         ])
         .into_config()
         .expect("enabled");
@@ -790,6 +807,7 @@ mod tests {
         assert_eq!(cfg.block_time, Duration::from_millis(250));
         assert_eq!(cfg.leeway_time, Duration::ZERO);
         assert_eq!(cfg.best_tx_lead_slices, 2);
+        assert_eq!(cfg.max_subscribers, 8);
     }
 
     /// The two groups are validated against each other, and enabling
@@ -1200,6 +1218,7 @@ mod tests {
             ("--flashblocks.block-time", Some("200")),
             ("--flashblocks.leeway-time", Some("0")),
             ("--flashblocks.best-tx-lead-slices", Some("1")),
+            ("--flashblocks.max-subscribers", Some("8")),
         ];
         let consumer = [
             ("--flashblocks.ping-interval-secs", Some("2")),

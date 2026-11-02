@@ -102,6 +102,9 @@ where
     backoff: ExponentialBackoff,
     options: SubscriberOptions,
     last_position: Option<(u64, u64)>,
+    /// When the current connection completed its handshake; `None` while
+    /// disconnected.
+    connected_since: Option<Instant>,
 }
 
 impl<F> std::fmt::Debug for WebsocketSubscriber<F>
@@ -132,7 +135,16 @@ where
 
         let uri_redacted = redact_ws_url(&uri.to_string());
         let uri_label = ws_url_endpoint(&uri.to_string());
-        Self { uri, uri_redacted, uri_label, handler, backoff, options, last_position: None }
+        Self {
+            uri,
+            uri_redacted,
+            uri_label,
+            handler,
+            backoff,
+            options,
+            last_position: None,
+            connected_since: None,
+        }
     }
 
     /// Runs the subscriber loop, reconnecting on failure until the token is cancelled.
@@ -162,24 +174,35 @@ where
                                 error = e.to_string()
                             );
                             Metrics::upstream_errors().increment(1);
+                        }
+                    }
 
-                            if let Some(duration) = self.backoff.next_backoff() {
-                                warn!(
-                                    message = "reconnecting",
-                                    uri = %self.uri_redacted,
-                                    seconds = duration.as_secs()
+                    // Every reconnect waits, however the connection ended. The
+                    // wait restarts only after a connection that outlived the
+                    // longest one: an upstream that accepts and then drops
+                    // every connection keeps the wait growing.
+                    let healthy = self
+                        .connected_since
+                        .take()
+                        .is_some_and(|since| since.elapsed() >= self.options.max_backoff_interval);
+                    if healthy {
+                        self.backoff.reset();
+                    }
+                    if let Some(duration) = self.backoff.next_backoff() {
+                        warn!(
+                            message = "reconnecting",
+                            uri = %self.uri_redacted,
+                            seconds = duration.as_secs()
+                        );
+                        select! {
+                            _ = token.cancelled() => {
+                                info!(
+                                    message = "cancelled subscriber during backoff",
+                                    uri = %self.uri_redacted
                                 );
-                                select! {
-                                    _ = token.cancelled() => {
-                                        info!(
-                                            message = "cancelled subscriber during backoff",
-                                            uri = %self.uri_redacted
-                                        );
-                                        return
-                                    }
-                                    _ = tokio::time::sleep(duration) => {}
-                                }
+                                return
                             }
+                            _ = tokio::time::sleep(duration) => {}
                         }
                     }
                 }
@@ -235,7 +258,7 @@ where
         info!(message = "websocket connection established", uri = %self.uri_redacted);
 
         Metrics::upstream_connections().increment(1);
-        self.backoff.reset();
+        self.connected_since = Some(Instant::now());
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -643,9 +666,7 @@ mod tests {
     /// timeout all look alike from here: the connection is accepted, the
     /// handshake completes, and then the stream simply ends. tungstenite
     /// reports that as an error rather than as end-of-stream, so `run` takes
-    /// its `Err` arm and consults the backoff. `run` also has an `Ok(())` arm
-    /// that reconnects without one; this is what holds that arm out of reach of
-    /// the abrupt-close cases it would otherwise cover.
+    /// its `Err` arm. Both arms wait on the backoff before reconnecting.
     #[tokio::test]
     async fn an_upstream_that_ends_the_stream_is_reconnected_on_the_backoff() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -706,6 +727,51 @@ mod tests {
             attempts <= 8,
             "reconnects must be paced by the backoff, got {attempts} in one second"
         );
+    }
+
+    /// The handshake does not restart the backoff: an upstream that accepts
+    /// and drops every connection is retried on a growing wait, not on the
+    /// initial interval each time.
+    #[tokio::test]
+    async fn an_upstream_that_drops_after_the_handshake_does_not_reset_the_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Uri = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let server = {
+            let accepts = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(accept_async(stream).await);
+                }
+            })
+        };
+
+        let options = SubscriberOptions::default()
+            .with_backoff_initial_interval(Duration::from_millis(100))
+            .with_max_backoff_interval(Duration::from_secs(2))
+            .with_ping_interval(Duration::from_secs(30))
+            .with_pong_timeout(Duration::from_secs(30))
+            .with_initial_grace_period(Duration::from_secs(30));
+        let mut subscriber = WebsocketSubscriber::new(uri, |_data: String| {}, options);
+        let shutdown = CancellationToken::new();
+        let subscriber_task = {
+            let token = shutdown.clone();
+            tokio::spawn(async move { subscriber.run(token).await })
+        };
+
+        sleep(Duration::from_secs(2)).await;
+        let attempts = accepts.load(std::sync::atomic::Ordering::SeqCst);
+        shutdown.cancel();
+        server.abort();
+        let _ = timeout(Duration::from_secs(1), subscriber_task).await;
+
+        // Growing by 1.5 from 100ms, each wait within ±50%, at most eight
+        // connections fit into two seconds (six without the jitter). Reset on
+        // every handshake, every wait stays within 50-150ms: thirteen or more.
+        assert!(attempts >= 3, "the premise: it has to be reconnecting, got {attempts}");
+        assert!(attempts <= 9, "the wait must grow, got {attempts} in two seconds");
     }
 
     #[tokio::test]
