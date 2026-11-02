@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::auth::AuthenticationParseError::{
     DuplicateAPIKeyArgument, DuplicateApplicationArgument, MissingAPIKeyArgument,
-    MissingApplicationArgument, NoData, TooManyComponents,
+    MissingApplicationArgument, MissingSeparator, NoData, TooManyComponents,
 };
 
 /// Maps API keys to application names for request authentication.
@@ -14,14 +14,20 @@ pub struct Authentication {
 }
 
 /// Errors that can occur when parsing authentication arguments.
+///
+/// None of them carries a key: they end up in startup logs. An entry the
+/// application name cannot be read from is named by its 1-based position.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthenticationParseError {
     /// No API key arguments were provided.
     NoData(),
-    /// The application name is missing from the argument.
-    MissingApplicationArgument(String),
-    /// The API key is missing from the argument.
-    MissingAPIKeyArgument(String),
+    /// The entry at this position has no `:`, so it is all key or all name.
+    MissingSeparator(usize),
+    /// The entry at this position has nothing before its `:`.
+    MissingApplicationArgument(usize),
+    /// The entry at this position has nothing after its `:`. Not named by its
+    /// application: a key pasted before the `:` would be echoed as one.
+    MissingAPIKeyArgument(usize),
     /// The argument contains more than the expected `app:key` components.
     TooManyComponents(String),
     /// The same application name appears more than once.
@@ -34,8 +40,13 @@ impl std::fmt::Display for AuthenticationParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NoData() => write!(f, "No API Keys Provided"),
-            MissingApplicationArgument(arg) => write!(f, "Missing application argument: [{arg}]"),
-            MissingAPIKeyArgument(app) => write!(f, "Missing API Key argument: [{app}]"),
+            MissingSeparator(entry) => {
+                write!(f, "Entry {entry} is not in the form app:key (no ':')")
+            }
+            MissingApplicationArgument(entry) => {
+                write!(f, "Missing application argument in entry {entry}")
+            }
+            MissingAPIKeyArgument(entry) => write!(f, "Missing API Key argument in entry {entry}"),
             TooManyComponents(app) => write!(f, "Too many components: [{app}]"),
             DuplicateApplicationArgument(app) => {
                 write!(f, "Duplicate application argument: [{app}]")
@@ -58,16 +69,21 @@ impl TryFrom<Vec<String>> for Authentication {
             return Err(NoData());
         }
 
-        for arg in args {
+        for (index, arg) in args.iter().enumerate() {
+            let entry = index + 1;
+            // Checked first: without a `:` the whole entry may be the key.
+            if !arg.contains(':') {
+                return Err(MissingSeparator(entry));
+            }
             let mut parts = arg.split(':');
-            let app = parts.next().ok_or_else(|| MissingApplicationArgument(arg.clone()))?;
+            let app = parts.next().unwrap_or_default();
             if app.is_empty() {
-                return Err(MissingApplicationArgument(arg.clone()));
+                return Err(MissingApplicationArgument(entry));
             }
 
-            let key = parts.next().ok_or_else(|| MissingAPIKeyArgument(app.to_string()))?;
+            let key = parts.next().unwrap_or_default();
             if key.is_empty() {
-                return Err(MissingAPIKeyArgument(app.to_string()));
+                return Err(MissingAPIKeyArgument(entry));
             }
 
             if parts.count() > 0 {
@@ -131,7 +147,7 @@ mod tests {
             "app3:key3".to_string(),
         ]);
         assert!(auth.is_err());
-        assert_eq!(auth.unwrap_err(), MissingApplicationArgument(String::new()));
+        assert_eq!(auth.unwrap_err(), MissingSeparator(2));
 
         let auth = Authentication::try_from(vec![
             "app1:key1".to_string(),
@@ -139,7 +155,7 @@ mod tests {
             "app3:key3".to_string(),
         ]);
         assert!(auth.is_err());
-        assert_eq!(auth.unwrap_err(), MissingAPIKeyArgument("app2".into()));
+        assert_eq!(auth.unwrap_err(), MissingSeparator(2));
 
         let auth = Authentication::try_from(vec![
             "app1:key1".to_string(),
@@ -147,7 +163,7 @@ mod tests {
             "app3:key3".to_string(),
         ]);
         assert!(auth.is_err());
-        assert_eq!(auth.unwrap_err(), MissingApplicationArgument(":".into()));
+        assert_eq!(auth.unwrap_err(), MissingApplicationArgument(2));
 
         let auth = Authentication::try_from(vec![
             "app1:key1".to_string(),
@@ -155,7 +171,7 @@ mod tests {
             "app3:key3".to_string(),
         ]);
         assert!(auth.is_err());
-        assert_eq!(auth.unwrap_err(), MissingAPIKeyArgument("app2".into()));
+        assert_eq!(auth.unwrap_err(), MissingAPIKeyArgument(2));
 
         let auth = Authentication::try_from(vec![
             "app1:key1".to_string(),
@@ -176,5 +192,20 @@ mod tests {
         let auth = Authentication::try_from(vec!["app1:key1".to_string(), "app2:key1".to_string()]);
         assert!(auth.is_err());
         assert_eq!(auth.unwrap_err(), DuplicateAPIKeyArgument("app2".into()));
+    }
+
+    /// A malformed entry is reported without the key it may hold: the message
+    /// goes to startup logs.
+    #[test]
+    fn a_parse_error_never_echoes_the_key() {
+        for (entry, expected) in [
+            (":supersecret", MissingApplicationArgument(1)),
+            ("supersecret", MissingSeparator(1)),
+            ("supersecret:", MissingAPIKeyArgument(1)),
+        ] {
+            let err = Authentication::try_from(vec![entry.to_string()]).unwrap_err();
+            assert_eq!(err, expected, "{entry}");
+            assert!(!err.to_string().contains("supersecret"), "{entry}: {err}");
+        }
     }
 }
