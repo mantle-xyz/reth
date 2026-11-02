@@ -7,7 +7,7 @@
 //! and the payload service builder — only have to hold them, not know how to
 //! build them.
 
-use std::{future::Future, io, pin::Pin, sync::Arc};
+use std::{collections::VecDeque, future::Future, io, pin::Pin, sync::Arc};
 
 use alloy_primitives::B256;
 use mantle_reth_flashblocks_types::FlashblockId;
@@ -28,7 +28,7 @@ pub struct FlashblocksProducer {
     pub cfg: Arc<FlashblockProducerConfig>,
     /// Where finished slices go.
     pub publisher: PublisherHandle,
-    /// The closing slice of the block this producer sealed last.
+    /// The closing slices of the blocks this producer sealed last.
     pub sealed_links: SealedSliceLinks,
 }
 
@@ -43,24 +43,38 @@ pub struct SealedSliceLink {
     pub last_slice_hash: B256,
 }
 
-/// The newest [`SealedSliceLink`], shared between builds.
+/// The newest [`SealedSliceLink`]s, shared between builds, looked up by the
+/// hash of the block they sealed.
 ///
-/// Holds one entry: it is looked up by block hash, so a build on any other
-/// parent finds nothing and names no predecessor.
+/// More than the last one: a rebuild of a height stands on a parent this
+/// producer sealed before the block it replaces, and names that parent's
+/// closing slice like any other build.
 #[derive(Debug, Clone, Default)]
-pub struct SealedSliceLinks(Arc<Mutex<Option<SealedSliceLink>>>);
+pub struct SealedSliceLinks(Arc<Mutex<VecDeque<SealedSliceLink>>>);
 
 impl SealedSliceLinks {
-    /// Remember `link`, replacing the previous one.
+    /// How many sealed blocks are remembered.
+    pub const CAPACITY: usize = 8;
+
+    /// Remember `link`, forgetting the oldest once [`Self::CAPACITY`] are held.
     pub fn record(&self, link: SealedSliceLink) {
-        *self.0.lock() = Some(link);
+        let mut links = self.0.lock();
+        links.retain(|held| held.block_hash != link.block_hash);
+        if links.len() == Self::CAPACITY {
+            links.pop_front();
+        }
+        links.push_back(link);
     }
 
     /// `(position, content hash)` to name as the predecessor of a block built
     /// on `parent_hash`.
     pub fn predecessor_of(&self, parent_hash: B256) -> Option<(FlashblockId, B256)> {
-        let link = (*self.0.lock())?;
-        (link.block_hash == parent_hash).then_some((link.last_slice, link.last_slice_hash))
+        self.0
+            .lock()
+            .iter()
+            .rev()
+            .find(|link| link.block_hash == parent_hash)
+            .map(|link| (link.last_slice, link.last_slice_hash))
     }
 }
 
@@ -150,6 +164,41 @@ mod tests {
 
         assert_eq!(links.predecessor_of(sealed), Some((last, B256::repeat_byte(2))));
         assert_eq!(links.predecessor_of(B256::repeat_byte(3)), None, "another parent gets nothing");
+    }
+
+    fn link(block: u8) -> SealedSliceLink {
+        SealedSliceLink {
+            block_hash: B256::repeat_byte(block),
+            last_slice: FlashblockId { block_number: block.into(), index: 4 },
+            last_slice_hash: B256::repeat_byte(block + 100),
+        }
+    }
+
+    /// A rebuild of height N stands on N-1, sealed before the N it replaces:
+    /// it still finds N-1's closing slice.
+    #[test]
+    fn a_rebuild_finds_the_parent_sealed_before_the_block_it_replaces() {
+        let links = SealedSliceLinks::default();
+        links.record(link(1));
+        links.record(link(2));
+
+        let parent = link(1);
+        assert_eq!(
+            links.predecessor_of(parent.block_hash),
+            Some((parent.last_slice, parent.last_slice_hash))
+        );
+    }
+
+    /// Bounded: the oldest sealed block is forgotten first.
+    #[test]
+    fn sealed_links_forget_the_oldest() {
+        let links = SealedSliceLinks::default();
+        for block in 1..=SealedSliceLinks::CAPACITY as u8 + 1 {
+            links.record(link(block));
+        }
+
+        assert_eq!(links.predecessor_of(link(1).block_hash), None, "evicted");
+        assert!(links.predecessor_of(link(2).block_hash).is_some());
     }
 
     /// Bind on an OS-assigned port so tests never collide.

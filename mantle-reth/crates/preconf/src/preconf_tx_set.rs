@@ -272,6 +272,32 @@ struct PreconfTxSetInner {
 
     /// The registry, for releasing a record from [`Self::unindex`].
     claims: Arc<Commitments>,
+
+    /// [`Self::waiting_usage`] kept as running totals, so the queue gauges can
+    /// follow every change without the scan.
+    waiting: WaitingTotals,
+}
+
+/// Count, bytes and gas of the `Waiting` entries.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WaitingTotals {
+    count: usize,
+    bytes: usize,
+    gas: u64,
+}
+
+impl WaitingTotals {
+    fn add(&mut self, entry: &TxEntry) {
+        self.count += 1;
+        self.bytes += entry.size;
+        self.gas = self.gas.saturating_add(Transaction::gas_limit(entry.tx.as_ref()));
+    }
+
+    fn sub(&mut self, entry: &TxEntry) {
+        self.count = self.count.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(entry.size);
+        self.gas = self.gas.saturating_sub(Transaction::gas_limit(entry.tx.as_ref()));
+    }
 }
 
 impl PreconfTxSetInner {
@@ -312,7 +338,38 @@ impl PreconfTxSetInner {
             entries: HashMap::new(),
             by_sender: HashMap::new(),
             claims,
+            waiting: WaitingTotals::default(),
         }
+    }
+
+    /// Adds `hash`, just moved into `Waiting`, to the running totals.
+    fn entered_waiting(&mut self, hash: &TxHash) {
+        if let Some(entry) = self.entries.get(hash) {
+            self.waiting.add(entry);
+        }
+        self.publish_gauges();
+    }
+
+    /// Takes `hash`, just moved out of `Waiting`, off the running totals.
+    fn left_waiting(&mut self, hash: &TxHash) {
+        if let Some(entry) = self.entries.get(hash) {
+            self.waiting.sub(entry);
+        }
+        self.publish_gauges();
+    }
+
+    /// Publishes the queue gauges. Called after every change to the entries,
+    /// under the lock, so they read the queue as it is and not as the last
+    /// build found it.
+    ///
+    /// `pending`, `bytes_used` and `gas_used` count `Waiting` entries, as the
+    /// ceilings `admit` enforces do; `entries` is every entry, executed ones
+    /// included.
+    fn publish_gauges(&self) {
+        metrics::gauge!("preconf.fifo.pending").set(self.waiting.count as f64);
+        metrics::gauge!("preconf.fifo.entries").set(self.entries.len() as f64);
+        metrics::gauge!("preconf.fifo.bytes_used").set(self.waiting.bytes as f64);
+        metrics::gauge!("preconf.fifo.gas_used").set(self.waiting.gas as f64);
     }
 
     /// Records `hash` as the latest to execute: at the back of
@@ -408,6 +465,10 @@ impl PreconfTxSetInner {
     fn unindex(&mut self, hash: &TxHash, why: Removal) -> Option<TxEntry> {
         let entry = self.entries.remove(hash);
         if let Some(ref e) = entry {
+            if e.status == PreconfStatus::Waiting {
+                self.waiting.sub(e);
+            }
+            self.publish_gauges();
             Self::unindex_sender_nonce(&mut self.by_sender, e.from, e.nonce);
         } else {
             // Slow path — unreachable in nominal operation; only fires when
@@ -771,10 +832,9 @@ impl PreconfTxSet {
         self.accounts.read().next_nonce(sender, chain_nonce)
     }
 
-    /// Sample the queue's occupancy into gauges. Called once per payload build
-    /// job (~per slot) rather than at every fifo mutation — these are sampled
-    /// quantities, so slot-level granularity is enough and keeps the mutation
-    /// paths free of the scan.
+    /// Publishes the queue's occupancy into gauges. Every change to the queue
+    /// publishes them too (`PreconfTxSetInner::publish_gauges`); a build calls
+    /// this as well, so a node with nothing queued still reports its zeros.
     ///
     /// The three queue-wide ceilings `admit` enforces (`max_txs`, `max_size`,
     /// `max_queued_gas`) are reported, because a ceiling without a utilisation
@@ -789,14 +849,14 @@ impl PreconfTxSet {
     /// `preconf.admit.rejected_delegated_total`.
     pub async fn publish_pending_gauge(&self) {
         let inner = self.inner.lock().await;
-        let (pending, bytes, gas) = inner.waiting_usage();
-        let entries = inner.entries.len();
-        drop(inner);
-
-        metrics::gauge!("preconf.fifo.pending").set(pending as f64);
-        metrics::gauge!("preconf.fifo.entries").set(entries as f64);
-        metrics::gauge!("preconf.fifo.bytes_used").set(bytes as f64);
-        metrics::gauge!("preconf.fifo.gas_used").set(gas as f64);
+        // Checked here, once a build, rather than on every change: the scan
+        // would make each removal linear in the queue.
+        debug_assert_eq!(
+            (inner.waiting.count, inner.waiting.bytes, inner.waiting.gas),
+            inner.waiting_usage(),
+            "running totals drifted from the entries"
+        );
+        inner.publish_gauges();
     }
 
     // ============ Admission ============
@@ -961,21 +1021,21 @@ impl PreconfTxSet {
             Some((origin_instant, resp)) => (Some(resp), origin_instant),
             None => (None, Instant::now()),
         };
-        inner.entries.insert(
+        let entry = TxEntry {
             hash,
-            TxEntry {
-                hash,
-                tx,
-                from,
-                nonce,
-                size,
-                inserted_at,
-                status: PreconfStatus::Waiting,
-                source,
-                responder,
-                apply_lock: Arc::new(Mutex::new(())),
-            },
-        );
+            tx,
+            from,
+            nonce,
+            size,
+            inserted_at,
+            status: PreconfStatus::Waiting,
+            source,
+            responder,
+            apply_lock: Arc::new(Mutex::new(())),
+        };
+        inner.waiting.add(&entry);
+        inner.entries.insert(hash, entry);
+        inner.publish_gauges();
         inner.by_sender.entry(from).or_default().insert(nonce, hash);
         inner.order.push_back(hash);
         drop(inner);
@@ -1110,7 +1170,11 @@ impl PreconfTxSet {
             responder,
             apply_lock: Arc::new(Mutex::new(())),
         };
+        if entry.status == PreconfStatus::Waiting {
+            inner.waiting.add(&entry);
+        }
         inner.entries.insert(hash, entry);
+        inner.publish_gauges();
         inner.by_sender.entry(from).or_default().insert(nonce, hash);
         inner.order.push_back(hash);
         // Both have executed: a staged pool transaction just now, a `Replay`
@@ -1478,6 +1542,7 @@ impl PreconfTxSet {
         }
         entry.status = PreconfStatus::Success;
         let ticket = entry.responder.take().map(|responder| SuccessTicket { responder });
+        inner.left_waiting(hash);
         inner.record_executed(*hash);
         Ok(ticket)
     }
@@ -1528,6 +1593,7 @@ impl PreconfTxSet {
             return Err(MarkError::IllegalTransition(entry.status));
         }
         entry.status = PreconfStatus::Success;
+        inner.left_waiting(hash);
         inner.record_executed(*hash);
         Ok(())
     }
@@ -1567,6 +1633,7 @@ impl PreconfTxSet {
         }
         entry.status = PreconfStatus::Waiting;
         entry.source = PreconfSource::Replay;
+        inner.entered_waiting(hash);
         drop(inner);
 
         // The only signal this path emits, and it has to exist: a commitment that
@@ -1668,6 +1735,51 @@ mod admit_tests {
             Signature::test_signature(),
             B256::from([hash_byte; 32]),
         )))
+    }
+
+    /// The queue gauges follow every change, with no build to sample them: a
+    /// stalled chain still shows what is queued.
+    #[test]
+    fn queue_gauges_follow_every_change_without_a_build() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let read = |name: &str| -> (f64, f64, f64) {
+            let rendered = handle.render();
+            let value = |series: &str| {
+                rendered
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{series} ")))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("{series} not exported ({name})"))
+            };
+            (
+                value("preconf_fifo_pending"),
+                value("preconf_fifo_entries"),
+                value("preconf_fifo_gas_used"),
+            )
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let set = PreconfTxSet::new(8);
+                set.push_if_absent(tx_gas(0, 1, 30_000), addr(1), PreconfSource::Replay).await;
+                set.stage_executed(tx_gas(0, 2, 50_000), addr(2)).await;
+                assert_eq!(read("queued"), (1.0, 2.0, 30_000.0), "an executed entry is no backlog");
+
+                set.begin_success(&TxHash::from([1; 32])).await.expect("waiting");
+                assert_eq!(read("executed"), (0.0, 2.0, 0.0));
+
+                set.reset_success_to_waiting(&TxHash::from([1; 32])).await.expect("executed");
+                assert_eq!(read("put back"), (1.0, 2.0, 30_000.0));
+
+                set.drop_landed_claims().await;
+                assert_eq!(read("landed"), (1.0, 1.0, 30_000.0), "the executed one went");
+
+                // The once-a-build publish checks the totals against a scan.
+                set.publish_pending_gauge().await;
+            });
+        });
     }
 
     /// Ceilings high enough to stay out of the way; each case lowers the one
