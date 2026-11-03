@@ -5366,6 +5366,7 @@ dependencies = [
  "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-rpc",
  "reth-rpc-api",
  "reth-tasks",
  "reth-tracing",
