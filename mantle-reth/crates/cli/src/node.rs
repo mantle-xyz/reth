@@ -39,6 +39,7 @@ use reth_optimism_primitives::OpPrimitives;
 use reth_optimism_storage::OpStorage;
 use reth_optimism_txpool::{OpPool, OpPooledTransaction, OpPooledTx};
 use reth_provider::CanonStateSubscriptions;
+use reth_rpc_builder::RethRpcModule;
 use reth_transaction_pool::{
     CoinbaseTipOrdering, EthPoolTransaction, Pool, TransactionValidationTaskExecutor,
     blobstore::DiskFileBlobStore,
@@ -659,14 +660,20 @@ where
                         ctx.registry.eth_handlers().filter.clone(),
                         Arc::clone(&state),
                     );
-                    ctx.modules.replace_configured(eth_api_ext.into_rpc())?;
+                    ctx.modules.add_or_replace_if_module_configured(
+                        RethRpcModule::Eth,
+                        eth_api_ext.into_rpc(),
+                    )?;
 
                     let pubsub = FlashblocksEthPubSub::new(
                         ctx.registry.eth_api().clone(),
                         ctx.node().task_executor().clone(),
                         Arc::clone(&state),
                     );
-                    ctx.modules.replace_configured(pubsub.into_rpc())?;
+                    ctx.modules.add_or_replace_if_module_configured(
+                        RethRpcModule::Eth,
+                        pubsub.into_rpc(),
+                    )?;
 
                     info!(
                         target: "reth::cli",
@@ -687,11 +694,10 @@ where
                 flashblocks_state
                     .map(|state| state as Arc<dyn mantle_reth_flashblocks::PendingStateOverrides>),
             );
-            // `replace_configured`, not `merge_configured`: this module now also serves
-            // `eth_simulateV1`, which the standard `eth_` namespace already registers. Merging a
-            // duplicate method name fails, so remove-then-add to override it. The other methods in
-            // this module are new names and are unaffected by the choice.
-            ctx.modules.replace_configured(mantle_ext.into_rpc())?;
+            // Replace existing methods such as `eth_simulateV1`, but only on
+            // transports that enable the `eth` namespace.
+            ctx.modules
+                .add_or_replace_if_module_configured(RethRpcModule::Eth, mantle_ext.into_rpc())?;
             info!(target: "reth::cli", "Mantle RPC extensions registered");
 
             Ok(())
