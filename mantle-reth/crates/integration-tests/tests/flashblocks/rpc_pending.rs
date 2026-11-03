@@ -2578,3 +2578,88 @@ async fn pending_total_fee_rejects_a_reorg_after_capturing_the_preview() {
         .expect_err("the captured preview's canonical parent was replaced");
     assert_eq!(error.message(), CanonicalChainReorgDetected.to_string());
 }
+
+/// Commits the transaction between the initial canonical lookup and preview resolution.
+async fn assert_canonical_recheck_after_preview_lookup(receipt: bool) {
+    use crate::consumer_helpers::submit_uncommitted_block;
+    use mantle_reth_flashblocks::{FlashblocksAPI, FlashblocksState, PendingBlocks};
+    use reth_transaction_pool::TransactionPool;
+    use std::sync::{Arc, Mutex};
+
+    struct CommittingPreview {
+        state: Arc<FlashblocksState>,
+        with_preview: bool,
+        commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl FlashblocksAPI for CommittingPreview {
+        fn get_pending_blocks(&self) -> arc_swap::Guard<Option<Arc<PendingBlocks>>> {
+            if let Some(commit) = self.commit.lock().unwrap().take() {
+                commit();
+            }
+            if self.with_preview {
+                self.state.get_pending_blocks()
+            } else {
+                arc_swap::Guard::from_inner(None)
+            }
+        }
+        fn subscribe_to_flashblocks(&self) -> tokio::sync::broadcast::Receiver<Arc<PendingBlocks>> {
+            self.state.subscribe_to_flashblocks()
+        }
+    }
+
+    for with_preview in [false, true] {
+        let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+        let raw = signed_call(0, LOGGER, VALUE).await;
+        let hash = keccak256(&raw);
+        if with_preview {
+            harness
+                .send(
+                    FlashblockBuilder::new(1, 0)
+                        .transactions(vec![l1_info_deposit(1), raw.clone()])
+                        .build(),
+                )
+                .await;
+        }
+        node.rpc.inject_tx(raw).await.unwrap();
+        let block_hash = submit_uncommitted_block!(node);
+        // Keep eth_getTransactionByHash from finding the transaction in the pool.
+        node.inner.pool.remove_transactions(vec![hash]);
+        assert!(node.inner.pool.get(&hash).is_none());
+        let eth = node.rpc.inner.eth_api().clone();
+        let filter = node.rpc.inner.eth_handlers().filter.clone();
+        let node = Arc::new(tokio::sync::Mutex::new(node));
+        let commit_node = Arc::clone(&node);
+        let preview = Arc::new(CommittingPreview {
+            state: Arc::clone(harness.state()),
+            with_preview,
+            commit: Mutex::new(Some(Box::new(move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        commit_node.lock().await.sync_to(block_hash).await.unwrap();
+                    })
+                });
+            }))),
+        });
+        let api = mantle_reth_flashblocks::EthApiExt::new(eth, filter, Arc::clone(&preview));
+        let result = if receipt {
+            api.get_transaction_receipt(hash).await
+        } else {
+            api.transaction_by_hash(hash).await
+        };
+        assert!(preview.commit.lock().unwrap().is_none(), "the first canonical lookup must miss");
+        let result =
+            result.unwrap().expect("the second canonical lookup must find the transaction");
+        assert_eq!(result["blockHash"], format!("{block_hash:#x}"));
+        assert_eq!(result["blockNumber"], "0x1");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_lookup_rechecks_canonical_after_the_preview_becomes_unavailable() {
+    assert_canonical_recheck_after_preview_lookup(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_lookup_rechecks_canonical_after_the_preview_becomes_unavailable() {
+    assert_canonical_recheck_after_preview_lookup(false).await;
+}

@@ -5330,6 +5330,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer",
  "alloy-signer-local",
+ "arc-swap",
  "eyre",
  "futures",
  "futures-util",

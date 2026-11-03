@@ -339,7 +339,7 @@ where
         }
 
         let Some((pending, tip)) = self.fresh_pending() else {
-            return Ok(None);
+            return self.canonical_receipt(tx_hash).await;
         };
         if let Some(receipt) = receipt_above_tip(&pending, tip, tx_hash) {
             Metrics::rpc_get_transaction_receipt().increment(1);
@@ -439,7 +439,7 @@ where
         }
 
         let Some((pending, tip)) = self.fresh_pending() else {
-            return Ok(None);
+            return self.canonical_transaction(tx_hash).await;
         };
         if let Some(tx) = pending
             .get_transaction_by_hash(tx_hash)
