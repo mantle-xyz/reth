@@ -5202,6 +5202,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-provider",
  "reth-rpc-api",
+ "reth-rpc-builder",
  "reth-rpc-eth-api",
  "reth-tasks",
  "reth-transaction-pool",
