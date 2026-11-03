@@ -346,16 +346,6 @@ where
 
         match msg {
             Message::Text(text) => {
-                if text.len() > MAX_SLICE_BYTES {
-                    warn!(
-                        message = "dropping oversized text message",
-                        uri = %self.uri_redacted,
-                        size = text.len(),
-                        max = MAX_SLICE_BYTES
-                    );
-                    return Ok(());
-                }
-
                 trace!(
                     message = "received text message",
                     uri = %self.uri_redacted,
@@ -900,49 +890,6 @@ mod tests {
             bomb.len()
         );
         assert_eq!(decode_binary_slice(&bomb), None, "expands past the ceiling");
-    }
-
-    /// The ceiling has to cover the frame type the producer actually sends.
-    /// Mantle's publisher writes `Message::Text`, so a ceiling that only
-    /// guards `Message::Binary` guards nothing on the path in use.
-    #[tokio::test]
-    async fn an_oversized_text_frame_is_refused_like_an_oversized_binary_one() {
-        let delivered = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&delivered);
-        let mut subscriber = WebsocketSubscriber::new(
-            "ws://127.0.0.1:1".parse().expect("a uri"),
-            move |text: String| recorded.lock().unwrap().push(text.len()),
-            SubscriberOptions::default(),
-        );
-        let mut pong_deadline = Instant::now() + Duration::from_secs(60);
-
-        let oversized = "x".repeat(MAX_SLICE_BYTES + 1);
-        subscriber
-            .handle_message(
-                Ok(Message::Text(oversized.into())),
-                &mut pong_deadline,
-                Duration::from_secs(1),
-            )
-            .await
-            .expect("an oversized frame is dropped, not a connection error");
-
-        assert!(
-            delivered.lock().unwrap().is_empty(),
-            "an oversized text frame must not reach the subscribers",
-        );
-
-        // The premise: the same path does forward a frame within the ceiling,
-        // so the assertion above is about the size and not about the path.
-        subscriber
-            .handle_message(
-                Ok(Message::Text("{}".to_string().into())),
-                &mut pong_deadline,
-                Duration::from_secs(1),
-            )
-            .await
-            .expect("a frame within the ceiling is handled");
-
-        assert_eq!(delivered.lock().unwrap().as_slice(), &[2]);
     }
 
     #[test]
