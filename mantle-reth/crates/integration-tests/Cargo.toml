@@ -118,6 +118,7 @@ revm = { workspace = true, features = ["std"] }
 op-revm = { workspace = true, features = ["std"] }
 
 # misc
+arc-swap = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
