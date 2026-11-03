@@ -21,6 +21,9 @@ use tracing::{error, info, trace, warn};
 
 use crate::metrics::Metrics;
 
+/// Total budget for establishing TCP and completing the `WebSocket` handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configuration options for a [`WebsocketSubscriber`].
 #[derive(Debug, Clone)]
 pub struct SubscriberOptions {
@@ -243,17 +246,28 @@ where
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_SLICE_BYTES))
             .max_frame_size(Some(MAX_SLICE_BYTES));
-        let (ws_stream, _) =
-            match connect_async_with_config(&connect_uri, Some(config), false).await {
-                Ok(connection) => {
-                    Metrics::upstream_connection_successes().increment(1);
-                    connection
-                }
-                Err(e) => {
-                    Metrics::upstream_connection_failures().increment(1);
-                    return Err(e);
-                }
-            };
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_async_with_config(&connect_uri, Some(config), false),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream WebSocket connection or handshake timed out",
+            )
+            .into())
+        });
+        let (ws_stream, _) = match connection {
+            Ok(connection) => {
+                Metrics::upstream_connection_successes().increment(1);
+                connection
+            }
+            Err(e) => {
+                Metrics::upstream_connection_failures().increment(1);
+                return Err(e);
+            }
+        };
 
         info!(message = "websocket connection established", uri = %self.uri_redacted);
 
@@ -479,6 +493,39 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_stalled_handshake_is_retried_and_the_next_connection_delivers_a_slice() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let text = r#"{"index":7,"metadata":{"block_number":1}}"#;
+        let server = tokio::spawn(async move {
+            // Keep TCP open without replying to the first upgrade request.
+            let (silent, _) = listener.accept().await.unwrap();
+            let (next, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(next).await.unwrap();
+            ws.send(Message::Text(text.into())).await.unwrap();
+            drop(silent);
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscriber = WebsocketSubscriber::new(
+            uri,
+            move |text| {
+                let _ = tx.send(text);
+            },
+            SubscriberOptions::default(),
+        );
+        let shutdown = CancellationToken::new();
+        let task = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move { subscriber.run(shutdown).await })
+        };
+        let result = timeout(Duration::from_secs(15), rx.recv()).await;
+        shutdown.cancel();
+        server.abort();
+        timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        assert_eq!(result.expect("the stalled handshake must be retried").unwrap(), text);
+    }
 
     struct MockServer {
         addr: SocketAddr,

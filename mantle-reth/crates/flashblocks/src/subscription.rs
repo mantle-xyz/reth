@@ -103,7 +103,19 @@ where
                 let config = WebSocketConfig::default()
                     .max_message_size(Some(MAX_DECOMPRESSED_FLASHBLOCK_BYTES))
                     .max_frame_size(Some(MAX_DECOMPRESSED_FLASHBLOCK_BYTES));
-                match connect_async_with_config(connect_url.as_str(), Some(config), false).await {
+                let connection = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    connect_async_with_config(connect_url.as_str(), Some(config), false),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upstream WebSocket connection or handshake timed out",
+                    )
+                    .into())
+                });
+                match connection {
                     Ok((ws_stream, _)) => {
                         // Not a reset: an upstream that accepts and then drops
                         // every connection would otherwise be retried each second.
@@ -223,6 +235,9 @@ where
         next_backoff(backoff)
     }
 }
+
+/// Total budget for establishing TCP and completing the `WebSocket` handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// First wait between reconnect attempts.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -347,6 +362,34 @@ mod tests {
                 server.abort();
             })
         });
+    }
+
+    #[tokio::test]
+    async fn a_stalled_handshake_is_retried_and_the_next_connection_delivers_a_slice() {
+        struct Receiver(mpsc::UnboundedSender<MantleFlashblockPayload>);
+        impl FlashblocksReceiver for Receiver {
+            fn on_flashblock_received(&self, payload: MantleFlashblockPayload) {
+                let _ = self.0.send(payload);
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let payload = MantleFlashblockPayload { index: 7, ..Default::default() };
+        let json = serde_json::to_string(&payload).unwrap();
+        let server = tokio::spawn(async move {
+            // Keep TCP open without replying to the first upgrade request.
+            let (silent, _) = listener.accept().await.unwrap();
+            let (next, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(next).await.unwrap();
+            ws.send(Message::Text(json.into())).await.unwrap();
+            drop(silent);
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        FlashblocksSubscriber::new(Arc::new(Receiver(tx)), url, Duration::from_secs(2)).start();
+        let result = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        server.abort();
+        assert_eq!(result.expect("the stalled handshake must be retried").unwrap().index, 7);
     }
 
     /// An upstream that completes the handshake and drops at once is retried
