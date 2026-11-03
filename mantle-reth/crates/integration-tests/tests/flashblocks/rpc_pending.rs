@@ -2421,3 +2421,160 @@ async fn mantle_pending_reads_fall_back_to_latest_when_the_preview_is_stale() {
         simulated_gas(BlockNumberOrTag::Latest).await
     );
 }
+
+/// Pause the historical half of a mixed log query while canonical history changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_rejects_a_reorg_during_history_lookup_but_allows_chain_growth() {
+    use crate::consumer_helpers::{
+        commit_submitted_block, mine_canonical_block, submit_uncommitted_block,
+    };
+    use mantle_reth_flashblocks::rpc::CanonicalChainReorgDetected;
+
+    struct QueryRuntime(Option<tokio::runtime::Runtime>);
+    impl Drop for QueryRuntime {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.0.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+
+    for reorg in [false, true] {
+        let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+        let original = submit_uncommitted_block!(node);
+        let replacement = submit_uncommitted_block!(node);
+        commit_submitted_block!(node, original);
+        harness
+            .send(
+                FlashblockBuilder::new(2, 0)
+                    .transactions(vec![l1_info_deposit(2), signed_call(0, LOGGER, VALUE).await])
+                    .build(),
+            )
+            .await;
+
+        // A separate one-thread blocking pool lets the test pause only the log lookup.
+        let runtime = QueryRuntime(Some(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ));
+        let handle = runtime.0.as_ref().unwrap().handle().clone();
+        let spawner = {
+            let _entered = handle.enter();
+            reth_tasks::Runtime::test()
+        };
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let blocker = handle.spawn_blocking(move || {
+            let _ = ready.send(());
+            let _ = blocked.recv();
+        });
+        waiting.await.unwrap();
+        let eth = node.rpc.inner.eth_api().clone();
+        let filter = reth_rpc::eth::EthFilter::new(eth.clone(), Default::default(), spawner);
+        let api = mantle_reth_flashblocks::EthApiExt::new(
+            eth,
+            filter,
+            std::sync::Arc::clone(harness.state()),
+        );
+        let request = Filter::new()
+            .address(LOGGER)
+            .from_block(BlockNumberOrTag::Earliest)
+            .to_block(BlockNumberOrTag::Pending);
+        let query = api.get_logs(request);
+        tokio::pin!(query);
+        assert!(futures::poll!(&mut query).is_pending(), "history lookup must be paused");
+
+        if reorg {
+            commit_submitted_block!(node, replacement);
+        } else {
+            mine_canonical_block!(node);
+        }
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        let result = query.await;
+        if reorg {
+            let error = result.expect_err("old preview and replacement history cannot be merged");
+            assert_eq!(error.message(), CanonicalChainReorgDetected.to_string());
+            assert_eq!(error.data().unwrap().get(), r#"{"kind":"CanonicalChainReorgDetected"}"#);
+        } else {
+            assert_eq!(
+                result.expect("new blocks do not invalidate the captured boundary").len(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_total_fee_rejects_a_reorg_after_capturing_the_preview() {
+    use crate::consumer_helpers::{commit_submitted_block, submit_uncommitted_block};
+    use mantle_reth_flashblocks::{
+        PendingExecutionContext, PendingStateOverrides, rpc::CanonicalChainReorgDetected,
+    };
+    use mantle_reth_rpc_ext::{MantleEthApiExtServer, MantleRpcExt};
+    use reth_provider::BlockNumReader;
+    use std::sync::{Arc, Mutex};
+
+    struct ReorganizingPreview {
+        context: PendingExecutionContext,
+        reorg: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl std::fmt::Debug for ReorganizingPreview {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ReorganizingPreview").finish_non_exhaustive()
+        }
+    }
+    impl PendingStateOverrides for ReorganizingPreview {
+        fn pending_execution_context(
+            &self,
+            _: &dyn Fn() -> Option<(u64, B256)>,
+        ) -> Option<PendingExecutionContext> {
+            if let Some(reorg) = self.reorg.lock().unwrap().take() {
+                reorg();
+            }
+            Some(self.context.clone())
+        }
+    }
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let original = submit_uncommitted_block!(node);
+    let replacement = submit_uncommitted_block!(node);
+    commit_submitted_block!(node, original);
+    harness.send(FlashblockBuilder::new(2, 0).transactions(vec![l1_info_deposit(2)]).build()).await;
+    let context = harness
+        .state()
+        .pending_execution_context(&|| {
+            node.inner.provider.chain_info().ok().map(|head| (head.best_number, head.best_hash))
+        })
+        .unwrap();
+    let provider = node.inner.provider.clone();
+    let eth = Arc::new(node.rpc.inner.eth_api().clone());
+    let node = Arc::new(tokio::sync::Mutex::new(node));
+    let reorg_node = Arc::clone(&node);
+    let preview = ReorganizingPreview {
+        context,
+        reorg: Mutex::new(Some(Box::new(move || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    reorg_node.lock().await.sync_to(replacement).await.unwrap();
+                })
+            });
+        }))),
+    };
+    let api = MantleRpcExt::new(provider, eth, None, None)
+        .with_pending_overrides(Some(Arc::new(preview)));
+    let error = api
+        .estimate_total_fee(
+            alloy_rpc_types_eth::TransactionRequest {
+                to: Some(LOGGER.into()),
+                ..Default::default()
+            },
+            Some(BlockNumberOrTag::Pending.into()),
+        )
+        .await
+        .expect_err("the captured preview's canonical parent was replaced");
+    assert_eq!(error.message(), CanonicalChainReorgDetected.to_string());
+}

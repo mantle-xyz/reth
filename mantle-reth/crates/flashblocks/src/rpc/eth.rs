@@ -60,7 +60,9 @@ use reth_chainspec::ChainSpecProvider;
 use reth_execution_types::BlockReceipts;
 use reth_optimism_forks::OpHardforks;
 use reth_primitives_traits::NodePrimitives;
-use reth_provider::{BlockIdReader, BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions};
+use reth_provider::{
+    BlockHashReader, BlockIdReader, BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions,
+};
 use reth_rpc::eth::EthFilter;
 use reth_rpc_eth_api::{
     EthApiTypes, EthFilterApiServer, FromEthApiError, RpcReceipt,
@@ -73,6 +75,7 @@ use tokio::{
 };
 use tracing::{debug, trace, warn};
 
+use super::{CanonicalChainReorgDetected, CanonicalQueryAnchor};
 use crate::{FlashblocksAPI, PendingBlocks, metrics::Metrics};
 
 /// How long `eth_sendRawTransactionSync` waits: the caller's timeout, cut down
@@ -252,6 +255,7 @@ pub trait EthApiOverride {
     ) -> RpcResult<U256>;
 
     /// Returns logs matching the filter, including pending flashblock logs.
+    /// A canonical reorganization invalidating the captured preview returns a retryable error.
     #[method(name = "getLogs")]
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>>;
 
@@ -590,6 +594,10 @@ where
             return self.eth_filter.logs(filter).await;
         };
         Metrics::rpc_get_logs().increment(1);
+        // `fresh_pending` verified the base of tip + 1 against this canonical block.
+        let tip_hash =
+            pending.block_hash_overrides().get(&tip).copied().ok_or(CanonicalChainReorgDetected)?;
+        let anchor = CanonicalQueryAnchor::new(tip, tip_hash);
 
         let end = pending.latest_block_number();
         let start = match from_block.unwrap_or(BlockNumberOrTag::Latest) {
@@ -613,7 +621,12 @@ where
                 from_block: Some(start.into()),
                 to_block: Some(tip.into()),
             };
-            logs = self.eth_filter.logs(canonical).await?;
+            logs = anchor
+                .run(
+                    |number| self.eth_api.provider().block_hash(number),
+                    self.eth_filter.logs(canonical),
+                )
+                .await?;
         }
         let after = tip.max(start.saturating_sub(1));
         logs.extend(
@@ -622,6 +635,7 @@ where
                 .into_iter()
                 .filter(|log| log.block_number.is_some_and(|n| n > after && n <= end)),
         );
+        anchor.ensure_canonical(|number| self.eth_api.provider().block_hash(number))?;
         Ok(logs)
     }
 
