@@ -19,7 +19,7 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-use alloy_consensus::Header;
+use alloy_consensus::{Header, Sealable};
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, Bloom, Bytes, TxKind, U256};
 use alloy_rpc_types_eth::{
@@ -28,7 +28,9 @@ use alloy_rpc_types_eth::{
 use alloy_serde::JsonStorageKey;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
-use mantle_reth_flashblocks::{Metrics, PendingEthApi, PendingStateOverrides};
+use mantle_reth_flashblocks::{
+    Metrics, PendingEthApi, PendingStateOverrides, rpc::CanonicalQueryAnchor,
+};
 use op_revm::constants::{GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_errors::RethError;
@@ -339,6 +341,7 @@ pub trait MantleEthApiExt {
     /// Only supported on Mantle chains after the Arsia hardfork.
     /// With `pending`, a consumer uses one captured Flashblocks preview for execution
     /// and fee parameters; without a preview it resolves the block through the Eth API.
+    /// A canonical reorganization invalidating the captured block returns a retryable error.
     #[method(name = "estimateTotalFee")]
     async fn estimate_total_fee(
         &self,
@@ -771,17 +774,19 @@ where
         let block_id = block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
         // Capture once: gas execution, base fee, L1 attributes and token ratio must
         // all describe this same published preview, even if a new slice arrives.
+        // The same head validates the preview and guards the subsequent calculation.
+        let head = block_id.is_pending().then(|| canonical_head(self.provider())).flatten();
         let context = block_id
             .is_pending()
             .then(|| {
                 self.pending_overrides.as_ref().and_then(|overlay| {
                     overlay
-                        .pending_execution_context(&|| canonical_head(self.provider()))
+                        .pending_execution_context(&|| head)
                         .inspect(|_| Metrics::rpc_estimate_total_fee().increment(1))
                 })
             })
             .flatten();
-        let (block_id, timestamp, header_base_fee, l1_block_info) = if let Some(context) =
+        let (block_id, timestamp, header_base_fee, l1_block_info, anchor) = if let Some(context) =
             context.as_ref()
         {
             (
@@ -789,6 +794,9 @@ where
                 context.header.timestamp(),
                 context.header.base_fee_per_gas(),
                 None,
+                head.map(|(number, hash)| CanonicalQueryAnchor::new(number, hash)).ok_or_else(
+                    || ErrorObject::owned(-32000, "failed to read canonical head", None::<()>),
+                )?,
             )
         } else if block_id.is_pending() {
             // The provider may not have a pending block. Resolve through the Eth API,
@@ -806,12 +814,21 @@ where
                     .map_err(ErrorObject::from)?
                     .ok_or_else(|| invalid_params_rpc_err("block not found"))?
             };
+            let anchor = if at.is_pending() {
+                CanonicalQueryAnchor::new(
+                    block.header().number().saturating_sub(1),
+                    block.header().parent_hash(),
+                )
+            } else {
+                CanonicalQueryAnchor::new(block.header().number(), block.hash())
+            };
             let at = if at.is_pending() { at } else { block.hash().into() };
             (
                 at,
                 block.header().timestamp(),
                 block.header().base_fee_per_gas(),
                 extract_l1_info(block.body()).ok(),
+                anchor,
             )
         } else {
             let block = self
@@ -821,134 +838,163 @@ where
                     ErrorObject::owned(-32000, format!("failed to get block: {e}"), None::<()>)
                 })?
                 .ok_or_else(|| invalid_params_rpc_err("block not found"))?;
-            // Preserve non-pending block resolution and fee calculation.
-            let at = BlockId::Number(BlockNumberOrTag::Number(block.header().number()));
+            // Keep execution and fee attributes on the same block across reorgs.
+            let hash = block.header().hash_slow();
+            let at = BlockId::from(hash);
             (
                 at,
                 block.header().timestamp(),
                 block.header().base_fee_per_gas(),
                 extract_l1_info(block.body()).ok(),
+                CanonicalQueryAnchor::new(block.header().number(), hash),
             )
         };
-        let chain_spec = self.provider().chain_spec();
+        anchor
+            .run(|number| self.provider().block_hash(number), async {
+                let chain_spec = self.provider().chain_spec();
 
-        if !chain_spec.is_mantle_arsia_active_at_timestamp(timestamp) {
-            return Err(ErrorObject::owned(
-                -32000,
-                "eth_estimateTotalFee is not supported for pre-Arsia blocks",
-                None::<()>,
-            ));
-        }
+                if !chain_spec.is_mantle_arsia_active_at_timestamp(timestamp) {
+                    return Err(ErrorObject::owned(
+                        -32000,
+                        "eth_estimateTotalFee is not supported for pre-Arsia blocks",
+                        None::<()>,
+                    ));
+                }
 
-        let chain_id = chain_spec.chain().id();
-        validate_estimate_total_fee_request(&request, chain_id).map_err(|error| {
-            ErrorObject::owned(
-                -32000,
-                format!("failed to estimate gas: {}", error.message()),
-                None::<()>,
-            )
-        })?;
+                let chain_id = chain_spec.chain().id();
+                validate_estimate_total_fee_request(&request, chain_id).map_err(|error| {
+                    ErrorObject::owned(
+                        -32000,
+                        format!("failed to estimate gas: {}", error.message()),
+                        None::<()>,
+                    )
+                })?;
 
-        let transaction = serde_json::from_value(serde_json::to_value(&request).map_err(|e| {
-            ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
-        })?)
-        .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?;
-        let overrides =
-            context.as_ref().map(|context| context.overrides(None, None)).unwrap_or_default();
-        let pending_api =
-            context.map(|context| PendingEthApi::new(self.eth_api().clone(), context));
-        // Estimate L2 gas through the same execution path as eth_estimateGas(pending).
-        let gas_estimate: U256 = async {
-            if let Some(api) = pending_api.as_ref() {
-                let estimate =
-                    EthCall::estimate_gas_at(api, transaction, block_id, overrides.clone()).await?;
-                api.check_estimate_funds(request.clone(), estimate, overrides.state).await?;
-                Ok(estimate)
-            } else {
-                EthCall::estimate_gas_at(self.eth_api(), transaction, block_id, overrides).await
-            }
-        }
-        .await
-        .map_err(|e| {
-            ErrorObject::owned(-32000, format!("failed to estimate gas: {e}"), None::<()>)
-        })?;
-
-        let base_fee = U256::from(header_base_fee.unwrap_or(0));
-
-        // Get real suggested tip (matches op-geth SuggestGasTipCap)
-        let suggested_tip =
-            EthFees::suggested_priority_fee(self.eth_api()).await.unwrap_or(U256::ZERO);
-
-        let gas_price = estimate_total_fee_gas_price(
-            request.gas_price,
-            request.max_fee_per_gas,
-            request.max_priority_fee_per_gas,
-            base_fee,
-            suggested_tip,
-        );
-        let l2_fee = gas_estimate.saturating_mul(gas_price);
-
-        // Calculate L1 data fee + operator fee from the same state used for execution.
-        let l1_block_info = if let Some(api) = pending_api.as_ref() {
-            Some(api.l1_block_info().await.map_err(ErrorObject::from)?)
-        } else if let Some(mut info) = l1_block_info {
-            info.token_ratio = if block_id.is_pending() {
-                let state =
-                    self.eth_api().state_at_block_id(block_id).await.map_err(ErrorObject::from)?;
-                state
-                    .storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
+                let transaction =
+                    serde_json::from_value(serde_json::to_value(&request).map_err(|e| {
+                        ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
+                    })?)
                     .map_err(|e| {
-                        ErrorObject::owned(
-                            -32000,
-                            format!("failed to read token_ratio: {e}"),
-                            None::<()>,
-                        )
-                    })?
-                    .unwrap_or_default()
-            } else {
-                read_token_ratio(self.provider(), block_id)?
-            };
-            Some(info)
-        } else {
-            None
-        };
-        let (l1_data_fee, operator_fee) = match l1_block_info {
-            Some(l1_block_info) => {
-                // Build a proxy envelope matching geth's CallDefaults + ToTransaction:
-                // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with RPCGasCap,
-                //   which defaults to DefaultMantleBlockGasLimit = 0x4000000000000)
-                // - ChainID = chain config chain ID
-                // - With a baseFee field (including zero) and no gasPrice: EIP-7702 if
-                //   authorizationList is present, otherwise EIP-1559. An explicit gasPrice or
-                //   absent baseFee uses legacy, matching geth's CallDefaults baseFee != nil.
-                let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
-                let tx_envelope =
-                    build_unsigned_tx_envelope(&request, envelope_gas, header_base_fee, chain_id)?;
-                let spec_id =
-                    alloy_op_evm::spec_by_timestamp_after_bedrock(chain_spec.as_ref(), timestamp);
-                let l1_data_fee =
-                    l1_block_info.calculate_tx_l1_cost_for_estimate(&tx_envelope, spec_id, 80);
-
-                // Operator fee: gas * scalar * 100 + constant
-                let operator_fee = {
-                    let scalar = l1_block_info.operator_fee_scalar.unwrap_or(U256::ZERO);
-                    let constant = l1_block_info.operator_fee_constant.unwrap_or(U256::ZERO);
-                    if scalar.is_zero() && constant.is_zero() {
-                        U256::ZERO
+                        ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>)
+                    })?;
+                let overrides = context
+                    .as_ref()
+                    .map(|context| context.overrides(None, None))
+                    .unwrap_or_default();
+                let pending_api =
+                    context.map(|context| PendingEthApi::new(self.eth_api().clone(), context));
+                // Estimate L2 gas through the same execution path as eth_estimateGas(pending).
+                let gas_estimate: U256 = async {
+                    if let Some(api) = pending_api.as_ref() {
+                        let estimate =
+                            EthCall::estimate_gas_at(api, transaction, block_id, overrides.clone())
+                                .await?;
+                        api.check_estimate_funds(request.clone(), estimate, overrides.state)
+                            .await?;
+                        Ok(estimate)
                     } else {
-                        gas_estimate
-                            .saturating_mul(scalar)
-                            .saturating_mul(U256::from(100))
-                            .saturating_add(constant)
+                        EthCall::estimate_gas_at(self.eth_api(), transaction, block_id, overrides)
+                            .await
                     }
+                }
+                .await
+                .map_err(|e| {
+                    ErrorObject::owned(-32000, format!("failed to estimate gas: {e}"), None::<()>)
+                })?;
+
+                let base_fee = U256::from(header_base_fee.unwrap_or(0));
+
+                // Get real suggested tip (matches op-geth SuggestGasTipCap)
+                let suggested_tip =
+                    EthFees::suggested_priority_fee(self.eth_api()).await.unwrap_or(U256::ZERO);
+
+                let gas_price = estimate_total_fee_gas_price(
+                    request.gas_price,
+                    request.max_fee_per_gas,
+                    request.max_priority_fee_per_gas,
+                    base_fee,
+                    suggested_tip,
+                );
+                let l2_fee = gas_estimate.saturating_mul(gas_price);
+
+                // Calculate L1 data fee + operator fee from the same state used for execution.
+                let l1_block_info = if let Some(api) = pending_api.as_ref() {
+                    Some(api.l1_block_info().await.map_err(ErrorObject::from)?)
+                } else if let Some(mut info) = l1_block_info {
+                    info.token_ratio = if block_id.is_pending() {
+                        let state = self
+                            .eth_api()
+                            .state_at_block_id(block_id)
+                            .await
+                            .map_err(ErrorObject::from)?;
+                        state
+                            .storage(GAS_ORACLE_CONTRACT, TOKEN_RATIO_SLOT.into())
+                            .map_err(|e| {
+                                ErrorObject::owned(
+                                    -32000,
+                                    format!("failed to read token_ratio: {e}"),
+                                    None::<()>,
+                                )
+                            })?
+                            .unwrap_or_default()
+                    } else {
+                        read_token_ratio(self.provider(), block_id)?
+                    };
+                    Some(info)
+                } else {
+                    None
+                };
+                let (l1_data_fee, operator_fee) = match l1_block_info {
+                    Some(l1_block_info) => {
+                        // Build a proxy envelope matching geth's CallDefaults + ToTransaction:
+                        // - Gas = GETH_MANTLE_RPC_GAS_CAP (geth's CallDefaults fills Gas with
+                        //   RPCGasCap, which defaults to DefaultMantleBlockGasLimit =
+                        //   0x4000000000000)
+                        // - ChainID = chain config chain ID
+                        // - With a baseFee field (including zero) and no gasPrice: EIP-7702 if
+                        //   authorizationList is present, otherwise EIP-1559. An explicit gasPrice
+                        //   or absent baseFee uses legacy, matching geth's CallDefaults baseFee !=
+                        //   nil.
+                        let envelope_gas = U256::from(capped_gas_for_l1_envelope(request.gas));
+                        let tx_envelope = build_unsigned_tx_envelope(
+                            &request,
+                            envelope_gas,
+                            header_base_fee,
+                            chain_id,
+                        )?;
+                        let spec_id = alloy_op_evm::spec_by_timestamp_after_bedrock(
+                            chain_spec.as_ref(),
+                            timestamp,
+                        );
+                        let l1_data_fee = l1_block_info.calculate_tx_l1_cost_for_estimate(
+                            &tx_envelope,
+                            spec_id,
+                            80,
+                        );
+
+                        // Operator fee: gas * scalar * 100 + constant
+                        let operator_fee = {
+                            let scalar = l1_block_info.operator_fee_scalar.unwrap_or(U256::ZERO);
+                            let constant =
+                                l1_block_info.operator_fee_constant.unwrap_or(U256::ZERO);
+                            if scalar.is_zero() && constant.is_zero() {
+                                U256::ZERO
+                            } else {
+                                gas_estimate
+                                    .saturating_mul(scalar)
+                                    .saturating_mul(U256::from(100))
+                                    .saturating_add(constant)
+                            }
+                        };
+
+                        (l1_data_fee, operator_fee)
+                    }
+                    None => (U256::ZERO, U256::ZERO),
                 };
 
-                (l1_data_fee, operator_fee)
-            }
-            None => (U256::ZERO, U256::ZERO),
-        };
-
-        Ok(l2_fee.saturating_add(l1_data_fee).saturating_add(operator_fee))
+                Ok(l2_fee.saturating_add(l1_data_fee).saturating_add(operator_fee))
+            })
+            .await
     }
 
     async fn simulate_v1(
