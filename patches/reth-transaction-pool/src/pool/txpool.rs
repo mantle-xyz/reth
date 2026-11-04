@@ -28,7 +28,6 @@ use alloy_consensus::constants::{
 use alloy_eips::{
     eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE},
     eip4844::BLOB_TX_MIN_BLOB_GASPRICE,
-    Typed2718,
 };
 #[cfg(test)]
 use alloy_primitives::Address;
@@ -183,34 +182,6 @@ impl<T: TransactionOrdering> TxPool<T> {
         }
 
         last_consecutive_tx.map(|tx| Arc::clone(&tx.transaction))
-    }
-
-    /// Single-scan `(pending_nonce, cumulative_cost)`: the next promotable
-    /// nonce and `Σ cost + extra_balance_cost` over the gapless chain below it.
-    /// Mirrors [`Self::get_highest_consecutive_transaction_by_sender`] (same
-    /// `state_nonce` bump) and [`Self::insert_tx`]'s `ENOUGH_BALANCE` sum.
-    pub(crate) fn get_pending_nonce_and_cumulative_cost(
-        &self,
-        mut on_chain: TransactionId,
-    ) -> (u64, U256) {
-        // ensure this operates on the most recent sender state nonce
-        if let Some(current) = self.all_transactions.sender_info.get(&on_chain.sender) {
-            on_chain.nonce = on_chain.nonce.max(current.state_nonce);
-        }
-
-        let mut next_expected_nonce = on_chain.nonce;
-        let mut cumulative_cost = U256::ZERO;
-        for (id, tx) in self.all().descendant_txs_inclusive(&on_chain) {
-            if next_expected_nonce != id.nonce {
-                break
-            }
-            // Matches `PoolInternalTransaction::next_cumulative_cost`
-            // (`extra_balance_cost` = Mantle L1 + operator fee).
-            cumulative_cost += *tx.transaction.cost() + tx.transaction.extra_balance_cost();
-            next_expected_nonce = id.next_nonce();
-        }
-
-        (next_expected_nonce, cumulative_cost)
     }
 
     /// Returns access to the [`AllTransactions`] container.
@@ -738,6 +709,7 @@ impl<T: TransactionOrdering> TxPool<T> {
 
     /// Update sub-pools size metrics.
     pub(crate) fn update_size_metrics(&self) {
+        self.all_transactions.update_size_metrics();
         let stats = self.size();
         self.metrics.pending_pool_transactions.set(stats.pending as f64);
         self.metrics.pending_pool_size_bytes.set(stats.pending_size as f64);
@@ -752,30 +724,13 @@ impl<T: TransactionOrdering> TxPool<T> {
 
     /// Updates transaction type metrics for the entire pool.
     pub(crate) fn update_transaction_type_metrics(&self) {
-        let mut legacy_count = 0;
-        let mut eip2930_count = 0;
-        let mut eip1559_count = 0;
-        let mut eip4844_count = 0;
-        let mut eip7702_count = 0;
-        let mut other_count = 0;
-
-        for tx in self.all_transactions.transactions_iter() {
-            match tx.transaction.ty() {
-                LEGACY_TX_TYPE_ID => legacy_count += 1,
-                EIP2930_TX_TYPE_ID => eip2930_count += 1,
-                EIP1559_TX_TYPE_ID => eip1559_count += 1,
-                EIP4844_TX_TYPE_ID => eip4844_count += 1,
-                EIP7702_TX_TYPE_ID => eip7702_count += 1,
-                _ => other_count += 1,
-            }
-        }
-
-        self.metrics.total_legacy_transactions.set(legacy_count as f64);
-        self.metrics.total_eip2930_transactions.set(eip2930_count as f64);
-        self.metrics.total_eip1559_transactions.set(eip1559_count as f64);
-        self.metrics.total_eip4844_transactions.set(eip4844_count as f64);
-        self.metrics.total_eip7702_transactions.set(eip7702_count as f64);
-        self.metrics.total_other_transactions.set(other_count as f64);
+        let counts = &self.all_transactions.tx_type_counts;
+        self.metrics.total_legacy_transactions.set(counts.legacy as f64);
+        self.metrics.total_eip2930_transactions.set(counts.eip2930 as f64);
+        self.metrics.total_eip1559_transactions.set(counts.eip1559 as f64);
+        self.metrics.total_eip4844_transactions.set(counts.eip4844 as f64);
+        self.metrics.total_eip7702_transactions.set(counts.eip7702 as f64);
+        self.metrics.total_other_transactions.set(counts.other as f64);
     }
 
     pub(crate) fn add_transaction(
@@ -855,9 +810,6 @@ impl<T: TransactionOrdering> TxPool<T> {
                         queued_reason,
                     }
                 };
-
-                // Update size metrics after adding and potentially moving transactions.
-                self.update_size_metrics();
 
                 Ok(res)
             }
@@ -1444,6 +1396,9 @@ pub(crate) struct AllTransactions<T: PoolTransaction> {
     local_transactions_config: LocalTransactionConfig,
     /// All accounts with a pooled authorization
     auths: FxHashMap<SenderId, B256Set>,
+    /// Number of transactions in the pool by transaction type, tracked incrementally so metrics
+    /// updates don't require iterating the entire pool.
+    tx_type_counts: TxTypeCounts,
     /// All Transactions metrics
     metrics: AllTransactionsMetrics,
 }
@@ -1784,6 +1739,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         let tx = self.by_hash.remove(tx_hash)?;
         let internal = self.txs.remove(&tx.transaction_id)?;
         self.remove_auths(&internal);
+        self.tx_type_counts.dec(internal.transaction.transaction.ty());
         // decrement the counter for the sender.
         self.tx_decr(tx.sender_id());
         Some((tx, internal.subpool))
@@ -1799,6 +1755,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         let internal = self.txs.remove(tx_id)?;
         let tx = self.by_hash.remove(internal.transaction.hash())?;
         self.remove_auths(&internal);
+        self.tx_type_counts.dec(internal.transaction.transaction.ty());
         // decrement the counter for the sender.
         self.tx_decr(tx.sender_id());
         Some((tx, internal.subpool))
@@ -1845,6 +1802,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         // decrement the counter for the sender.
         self.tx_decr(internal.transaction.sender_id());
+        self.tx_type_counts.dec(internal.transaction.transaction.ty());
 
         let result =
             self.by_hash.remove(internal.transaction.hash()).map(|tx| (tx, internal.subpool));
@@ -2092,6 +2050,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             Entry::Vacant(entry) => {
                 // Insert the transaction in both maps
                 self.by_hash.insert(*pool_tx.transaction.hash(), pool_tx.transaction.clone());
+                self.tx_type_counts.inc(pool_tx.transaction.transaction.ty());
                 entry.insert(pool_tx);
             }
             Entry::Occupied(mut entry) => {
@@ -2108,7 +2067,9 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 }
                 let new_hash = *pool_tx.transaction.hash();
                 let new_transaction = pool_tx.transaction.clone();
+                self.tx_type_counts.inc(pool_tx.transaction.transaction.ty());
                 let replaced = entry.insert(pool_tx);
+                self.tx_type_counts.dec(replaced.transaction.transaction.ty());
                 self.by_hash.remove(replaced.transaction.hash());
                 self.by_hash.insert(new_hash, new_transaction);
 
@@ -2198,8 +2159,6 @@ impl<T: PoolTransaction> AllTransactions<T> {
             self.tx_inc(inserted_tx_id.sender);
         }
 
-        self.update_size_metrics();
-
         Ok(InsertOk { transaction, move_to: state.into(), state, replaced_tx, updates })
     }
 
@@ -2247,8 +2206,47 @@ impl<T: PoolTransaction> Default for AllTransactions<T> {
             price_bumps: Default::default(),
             local_transactions_config: Default::default(),
             auths: Default::default(),
+            tx_type_counts: Default::default(),
             metrics: Default::default(),
         }
+    }
+}
+
+/// Number of transactions in the pool grouped by transaction type.
+///
+/// Maintained incrementally on insert/remove so that metrics updates don't require iterating
+/// all transactions.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TxTypeCounts {
+    legacy: u64,
+    eip2930: u64,
+    eip1559: u64,
+    eip4844: u64,
+    eip7702: u64,
+    other: u64,
+}
+
+impl TxTypeCounts {
+    /// Returns a mutable reference to the counter for the given transaction type.
+    const fn counter_mut(&mut self, tx_type: u8) -> &mut u64 {
+        match tx_type {
+            LEGACY_TX_TYPE_ID => &mut self.legacy,
+            EIP2930_TX_TYPE_ID => &mut self.eip2930,
+            EIP1559_TX_TYPE_ID => &mut self.eip1559,
+            EIP4844_TX_TYPE_ID => &mut self.eip4844,
+            EIP7702_TX_TYPE_ID => &mut self.eip7702,
+            _ => &mut self.other,
+        }
+    }
+
+    /// Increments the counter for the given transaction type.
+    const fn inc(&mut self, tx_type: u8) {
+        *self.counter_mut(tx_type) += 1;
+    }
+
+    /// Decrements the counter for the given transaction type.
+    const fn dec(&mut self, tx_type: u8) {
+        *self.counter_mut(tx_type) -= 1;
     }
 }
 
@@ -3760,64 +3758,6 @@ mod tests {
         let next_tx =
             pool.get_highest_consecutive_transaction_by_sender(sender_id.into_transaction_id(5));
         assert_eq!(next_tx.map(|tx| tx.nonce()), Some(9), "Expected nonce 9 for on-chain nonce 8");
-    }
-
-    #[test]
-    fn get_pending_nonce_and_cumulative_cost() {
-        let mut pool = TxPool::new(MockOrdering::default(), PoolConfig::default());
-        let mut f = MockTransactionFactory::default();
-
-        // Gapless [0,1,2], gap at 3, [4,5], gap at 6/7, [8,9].
-        let sender = Address::random();
-        let mut cost_by_nonce: std::collections::HashMap<u64, U256> = Default::default();
-        for nonce in [0u64, 1, 2, 4, 5, 8, 9] {
-            let mut mock_tx = MockTransaction::eip1559();
-            mock_tx.set_sender(sender);
-            mock_tx.set_nonce(nonce);
-
-            let validated = f.validated(mock_tx);
-            // Record the exact per-tx contribution the scan should accumulate.
-            cost_by_nonce
-                .insert(nonce, *validated.cost() + validated.transaction.extra_balance_cost());
-            // Balance is irrelevant here — the method recomputes cost
-            // independent of the sender's balance; use a large value so
-            // insertion never parks on `!ENOUGH_BALANCE`.
-            pool.add_transaction(validated, U256::from(u128::MAX), 0, None).unwrap();
-        }
-
-        let sender_id = f.ids.sender_id(&sender).unwrap();
-
-        // on-chain nonce 0: consecutive chain [0,1,2] stops at the gap (3);
-        // pending nonce is 3, cumulative is cost(0)+cost(1)+cost(2).
-        let (pending, cum) =
-            pool.get_pending_nonce_and_cumulative_cost(sender_id.into_transaction_id(0));
-        assert_eq!(pending, 3, "pending nonce for on-chain 0");
-        assert_eq!(cum, cost_by_nonce[&0] + cost_by_nonce[&1] + cost_by_nonce[&2]);
-
-        // on-chain nonce 4: chain [4,5]; pending 6, cumulative cost(4)+cost(5).
-        let (pending, cum) =
-            pool.get_pending_nonce_and_cumulative_cost(sender_id.into_transaction_id(4));
-        assert_eq!(pending, 6, "pending nonce for on-chain 4");
-        assert_eq!(cum, cost_by_nonce[&4] + cost_by_nonce[&5]);
-
-        // on-chain nonce 3: nothing at nonce 3 (gap) → empty chain; pending
-        // stays 3, cumulative is zero.
-        let (pending, cum) =
-            pool.get_pending_nonce_and_cumulative_cost(sender_id.into_transaction_id(3));
-        assert_eq!(pending, 3, "pending nonce for on-chain 3 (gap)");
-        assert_eq!(cum, U256::ZERO);
-
-        // state_nonce bump: the pool tracks a higher sender nonce (8) than the
-        // caller-supplied on-chain nonce (5), so the walk starts at 8 → chain
-        // [8,9], pending 10, cumulative cost(8)+cost(9). Mirrors the bump in
-        // `get_highest_consecutive_transaction_by_sender`.
-        let mut info = SenderInfo::default();
-        info.update(8, U256::ZERO);
-        pool.all_transactions.sender_info.insert(sender_id, info);
-        let (pending, cum) =
-            pool.get_pending_nonce_and_cumulative_cost(sender_id.into_transaction_id(5));
-        assert_eq!(pending, 10, "pending nonce after state_nonce bump to 8");
-        assert_eq!(cum, cost_by_nonce[&8] + cost_by_nonce[&9]);
     }
 
     #[test]

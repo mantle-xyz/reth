@@ -238,6 +238,19 @@ pub fn from_mantle_genesis(genesis: Genesis) -> OpChainSpec {
         (OpHardfork::Holocene.boxed(), arsia_ts),
         (OpHardfork::Jovian.boxed(), arsia_ts),
         (MantleHardfork::Arsia.boxed(), arsia_ts),
+        // Lagoon is deliberately absent, and adding it is not only a fork
+        // activation. It gates SDM — `sdm_production_enabled` is
+        // `is_sdm_active_at_timestamp(chain_spec) && operator_sdm_opt_in` —
+        // and the operator half is writable at runtime through
+        // `admin_setOperatorSdmOptIn`, whose handler holds only that flag and
+        // the chain spec. It cannot ask whether the flashblocks producer is
+        // running, so it cannot refuse.
+        //
+        // `FlashblockProducerConfig::validate` does refuse that combination,
+        // but only at startup, against the CLI flag. What keeps the runtime
+        // bypass harmless is this list, not that gate. Put Lagoon here and the
+        // bypass goes live with nothing to announce it: gate the runtime path
+        // first.
     ];
 
     let mut time_hardforks = time_hardfork_opts

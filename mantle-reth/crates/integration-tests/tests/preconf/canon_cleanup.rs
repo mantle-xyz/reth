@@ -15,9 +15,12 @@
 //! - `canon_across_sequential_slots_forwards_on_every_new_job` — nonce 0/1/2 across three separate
 //!   slots; each canon runs `sync_fifo_forward_to_head` afresh. Guards against a caching bug that
 //!   would skip forward after the first `PayloadJob`.
+//!
+//! Several tests here raise `preconf_timeout_ms` well above the 1.5s default — they assert
+//! *where* a tx is routed after a canon commit, never how fast.
 
-use super::helpers::{PreconfCfgBuilder, send_preconf};
-use crate::{canonize_built, launch_preconf_node};
+use super::helpers::{PreconfCfgBuilder, send_preconf, wait_fifo_entry};
+use crate::{canonicalize_payload, launch_preconf_node, launch_preconf_node_with_fifo};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -49,7 +52,11 @@ async fn canon_commit_permits_next_nonce_from_same_sender() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(8_000)
+        .build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -86,7 +93,7 @@ async fn canon_commit_permits_next_nonce_from_same_sender() {
     // Commit to canonical: submit the payload, then push forkchoice with
     // head/safe/finalized all pointing at the new block. This is what
     // triggers the canon handler's forward + clean_reclaimable.
-    canonize_built!(node, payload);
+    let _new_head = canonicalize_payload!(node, payload).await;
 
     // Give the canon handler a beat to process the notification.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -141,7 +148,7 @@ async fn canon_commit_permits_next_nonce_from_same_sender() {
 /// nonce in one canon step — not just the single-nonce case covered by
 /// `canon_commit_permits_next_nonce_from_same_sender`.
 ///
-/// Regression guard: an off-by-one in `fifo.forward(sender, max+1)`
+/// Regression guard: an off-by-one in the canon-forward's `max+1`
 /// (e.g. using `min` instead of `max`, or `<=` instead of `<`) would
 /// either leave stale entries or drop the wrong ones, and would only
 /// surface in the multi-nonce case.
@@ -150,9 +157,13 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(8_000)
+        .build();
 
-    let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
+    let (mut node, http, wallet, chain_id, fifo) = launch_preconf_node_with_fifo!(cfg).await;
 
     // ── Slot 1: land nonces 0, 1, 2 in one block, canonicalise ───────
     let tx0 = signed_transfer(chain_id, &wallet, 0).await;
@@ -174,15 +185,17 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
         .payload_id
         .expect("payload_id 1");
 
-    // Serial submit with 30ms gaps preserves nonce order into the pool.
+    // Each nonce waits until the previous one is queued: otherwise it can
+    // reach admission first and be refused as a nonce gap.
     let http_c = http.clone();
     let t0 = tokio::spawn(async move { send_preconf(&http_c, tx0).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_fifo_entry(&fifo, wallet_addr, 0).await;
     let http_c = http.clone();
     let t1 = tokio::spawn(async move { send_preconf(&http_c, tx1).await });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_fifo_entry(&fifo, wallet_addr, 1).await;
     let http_c = http.clone();
     let t2 = tokio::spawn(async move { send_preconf(&http_c, tx2).await });
+    wait_fifo_entry(&fifo, wallet_addr, 2).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let payload_1 = node
@@ -203,8 +216,7 @@ async fn canon_of_multi_nonce_batch_permits_higher_nonce_in_next_slot() {
         assert!(sealed_1.contains(&h), "slot 1 must contain {label}; sealed={sealed_1:?}",);
     }
 
-    canonize_built!(node, payload_1);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _new_head = canonicalize_payload!(node, payload_1).await;
 
     // ── Slot 2: submit nonce=3, must land in block 2 ─────────────────
     let tx3 = signed_transfer(chain_id, &wallet, 3).await;
@@ -325,8 +337,7 @@ async fn canon_does_not_leak_across_senders() {
         payload_1.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
     assert!(sealed_1.contains(&hash_a), "sender A's tx must land in slot 1");
 
-    canonize_built!(node, payload_1);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _new_head = canonicalize_payload!(node, payload_1).await;
 
     // ── Slot 2: sender B submits nonce=0 (their first tx). A's canon
     //    must NOT affect B's fresh submission. ────────────────────────
@@ -408,7 +419,11 @@ async fn canon_across_sequential_slots_forwards_on_every_new_job() {
     let recipient: Address = RECIPIENT.parse().unwrap();
     let wallet_addr = Wallet::default().with_chain_id(1).inner.address();
 
-    let cfg = PreconfCfgBuilder::new().whitelist_from(wallet_addr).whitelist_to(recipient).build();
+    let cfg = PreconfCfgBuilder::new()
+        .whitelist_from(wallet_addr)
+        .whitelist_to(recipient)
+        .preconf_timeout_ms(8_000)
+        .build();
 
     let (mut node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
 
@@ -480,7 +495,6 @@ async fn canon_across_sequential_slots_forwards_on_every_new_job() {
         prior_hashes.push(hash);
 
         // Canonicalise this slot before starting the next.
-        canonize_built!(node, payload);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _new_head = canonicalize_payload!(node, payload).await;
     }
 }

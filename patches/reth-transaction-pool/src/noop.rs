@@ -4,7 +4,7 @@
 //! to be generic over it.
 
 use crate::{
-    blobstore::BlobStoreError,
+    blobstore::{BlobStore, BlobStoreError, NoopBlobStore},
     error::{InvalidPoolTransactionError, PoolError},
     pool::TransactionListenerKind,
     traits::{BestTransactionsAttributes, GetPooledTransactionLimit, NewBlobSidecar},
@@ -257,6 +257,12 @@ impl<T: EthPoolTransaction> TransactionPool for NoopTransactionPool<T> {
     {
     }
 
+    fn retain_contains<A>(&self, _announcement: &mut A)
+    where
+        A: HandleMempoolData,
+    {
+    }
+
     fn get(&self, _tx_hash: &TxHash) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
         None
     }
@@ -308,14 +314,6 @@ impl<T: EthPoolTransaction> TransactionPool for NoopTransactionPool<T> {
         _on_chain_nonce: u64,
     ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
         None
-    }
-
-    fn get_pending_nonce_and_cumulative_cost(
-        &self,
-        _sender: Address,
-        on_chain_nonce: u64,
-    ) -> (u64, U256) {
-        (on_chain_nonce, U256::ZERO)
     }
 
     fn get_transaction_by_sender_and_nonce(
@@ -395,6 +393,17 @@ impl<T: EthPoolTransaction> TransactionPool for NoopTransactionPool<T> {
         _indices_bitarray: B128,
     ) -> Result<Vec<Option<BlobCellsAndProofsV1>>, BlobStoreError> {
         Ok(vec![None; versioned_hashes.len()])
+    }
+
+    fn has_blobs_for_versioned_hashes(
+        &self,
+        versioned_hashes: &[B256],
+    ) -> Result<Vec<bool>, BlobStoreError> {
+        Ok(vec![false; versioned_hashes.len()])
+    }
+
+    fn blob_store(&self) -> Box<dyn BlobStore> {
+        Box::new(NoopBlobStore)
     }
 }
 

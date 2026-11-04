@@ -6,68 +6,53 @@
 //! handler that gets injected into `MantleRpcExt` when this node is acting
 //! as the sequencer with preconf enabled.
 //!
-//! Flow:
+//! What is left here is the wait. Deciding whether a transaction may be
+//! queued — its type, the allowlist, the per-tx gas ceiling, the validator
+//! chain and the queue's own rules — is one call into [`crate::PreconfAdmission`],
+//! and the client's channel goes in under the queue's lock as part of it, so
+//! the builder can never reach an entry with nobody to answer for it.
 //!
-//! 1. Decode + recover the raw transaction.
-//! 2. Whitelist check via [`PreconfConfig::is_preconf_tx`].
-//! 3. Nonce-gap + cumulative-balance pre-checks against a single `latest` snapshot and one pool
-//!    scan (`get_pending_nonce_and_cumulative_cost`).
-//! 4. Attach a oneshot responder to [`PreconfTxSet`] **before** calling
-//!    [`TransactionPool::add_transaction`] — otherwise the listener could push the entry and the
-//!    builder could apply it before the responder is registered, dropping the receipt.
-//! 5. Submit to the pool. The `AlreadyImported` branch is the same-hash retry path — if the fifo
-//!    entry is in `Timeout`, atomically revive it back to `Waiting` and re-notify the builder.
-//! 6. Wait on the responder with [`PreconfConfig::preconf_timeout`]. On elapsed, return `Ok(Timeout
-//!    event)` (op-geth-aligned) and clean the fifo entry (`mark_timeout`), responder
-//!    (`cancel_responder`), **and** the pool. A tx routed to `BaseFee`/`Queued` never produces a
-//!    fifo entry (the listener filters to `SubPool::Pending`), so `mark_timeout` returns `NotFound`
-//!    and its pool-eviction callback never fires — hence the explicit `pool.remove_transactions`
-//!    (else the orphan is mined once eligible) and `cancel_responder` (else it stays stuck in
-//!    `pending_responders`).
+//! That leaves this module one job: **racing the deadline.** `select!` rather
+//! than `timeout`, so the receiver outlives the elapsed branch. On elapse the
+//! per-entry apply lock is taken, which serialises with dispatch's point of no
+//! return; once held, no completion is in flight, so a result dispatch already
+//! sent is in the channel to pick up. Without that the client could be told
+//! `Timeout` for a transaction already committed to the block being built.
+//! Recording the promise is dispatch's, before it sends the receipt.
+//!
+//! No client ever waits on a replaying commitment. `PreconfTxSet::admit`
+//! refuses a resubmit of its hash, and the entry a client waits on is the
+//! `Rpc` entry it was admitted with: that entry only becomes `Replay` through
+//! `reset_success_to_waiting`, after `begin_success` has already taken its
+//! responder. So the deadline only ever ends an `Rpc` entry.
 
 use std::sync::Arc;
 
-use alloy_consensus::Transaction;
 use alloy_primitives::{Bytes, TxKind};
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use mantle_reth_rpc_ext::{
     DynPreconfHandler, PreconfLog, PreconfStatus as WireStatus, PreconfTxEvent, PreconfTxReceipt,
 };
-use reth_rpc_eth_types::utils::recover_raw_transaction;
-use reth_storage_api::{StateProvider, StateProviderFactory};
-use reth_transaction_pool::{
-    PoolPooledTx, PoolTransaction, TransactionOrigin, TransactionPool, error::PoolErrorKind,
-};
 use tokio::sync::oneshot;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::{
-    PreconfConfig, PreconfJournal, PreconfTxSet,
-    journal::JournalEntry,
-    types::{AttachError, PreconfError, PreconfReceipt, PreconfStatus},
+    PreconfConfig, PreconfTxSet,
+    admission::{AdmittedTx, DynAdmission},
+    types::{PreconfError, PreconfReceipt, PreconfStatus},
 };
 
 /// Generic preconf RPC handler. Constructed by the preconf `ServiceBuilder`
 /// once the pool + provider are wired up.
-pub struct PreconfRpcHandler<P, Pr> {
-    pool: P,
-    provider: Pr,
+pub struct PreconfRpcHandler {
+    /// Everything between "bytes arrived" and "queued", in one call.
+    admission: Arc<dyn DynAdmission>,
     fifo: Arc<PreconfTxSet>,
     cfg: Arc<PreconfConfig>,
-    /// Persistence sink (mandatory) — every successful preconf commitment
-    /// is appended to the journal before the `PreconfTxEvent` is returned
-    /// to the client. Append failures are logged but do not block the
-    /// response (best-effort durability; a crash before the next disk
-    /// flush loses at most the most recent commitment).
-    journal: Arc<PreconfJournal>,
 }
 
-// Manual Debug — `P` (TransactionPool) and `Pr` (StateProviderFactory) do
-// not require `Debug`, and propagating that bound to every call-site of
-// `PreconfRpcHandler::new(...)` would be intrusive. The pool/provider have
-// no useful Debug representation here anyway.
-impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
+impl std::fmt::Debug for PreconfRpcHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfRpcHandler")
             .field("cfg", &self.cfg)
@@ -76,144 +61,53 @@ impl<P, Pr> std::fmt::Debug for PreconfRpcHandler<P, Pr> {
     }
 }
 
-impl<P, Pr> PreconfRpcHandler<P, Pr> {
-    /// Construct a handler bound to the given pool + provider + fifo.
-    /// The `journal` is mandatory — every successful commitment is persisted.
+impl PreconfRpcHandler {
+    /// Construct a handler bound to the given admission + fifo.
+    ///
+    /// No state provider and no pool: admission reads what chain state it
+    /// needs, and what is left here is waiting on the client's channel.
     pub const fn new(
-        pool: P,
-        provider: Pr,
+        admission: Arc<dyn DynAdmission>,
         fifo: Arc<PreconfTxSet>,
         cfg: Arc<PreconfConfig>,
-        journal: Arc<PreconfJournal>,
     ) -> Self {
-        Self { pool, provider, fifo, cfg, journal }
+        Self { admission, fifo, cfg }
     }
-}
 
-impl<P, Pr> PreconfRpcHandler<P, Pr>
-where
-    P: TransactionPool + 'static,
-    Pr: StateProviderFactory + 'static,
-{
-    /// Process a single `eth_sendRawTransactionWithPreconf` submission.
-    ///
-    /// See module-level documentation for the step-by-step semantics.
+    /// Process a single `eth_sendRawTransactionWithPreconf` submission:
+    /// admit, then wait out the deadline.
     pub async fn handle_inner(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
-        // Anchor the SLA clock to the moment the request landed in the
-        // handler, before any decode / pool-validator latency. `TxEntry`
-        // eventually carries this instant as `inserted_at`, so the
-        // dispatch deadline gate measures against the client-visible
-        // budget rather than the pool-listener drain time.
+        // Anchor the SLA clock to the moment the request landed, before any
+        // decode or validator latency. `TxEntry` carries this instant as
+        // `inserted_at`, so dispatch's deadline gate measures the budget the
+        // client is actually waiting out.
         let origin_instant = std::time::Instant::now();
 
-        // Step 0 — decode + recover, then convert to the pool's `Transaction`
-        // type. Reading sender/nonce/hash/kind from the pool tx goes through
-        // its `PoolTransaction` + `Transaction` impls and avoids importing
-        // the alloy `RecoveredTx` accessor trait.
-        let recovered =
-            recover_raw_transaction::<PoolPooledTx<P>>(&bytes).map_err(|e| internal_err(&e))?;
-        let pool_tx = <P::Transaction as PoolTransaction>::from_pooled(recovered);
-
-        let sender = pool_tx.sender();
-        let hash = *pool_tx.hash();
-        let nonce = pool_tx.nonce();
-        let to_opt = tx_kind_to_address(pool_tx.kind());
-
-        // Step 1 — whitelist.
-        if !self.cfg.is_preconf_tx(&sender, to_opt.as_ref()) {
-            trace!(target: "mantle::preconf::rpc", ?sender, ?to_opt, ?hash, "non-whitelisted preconf submission");
-            return Err(preconf_error_to_rpc(&PreconfError::NotPreconfEligible));
-        }
-
-        // Step 2 — nonce-gap + balance pre-checks. A tx that is valid per-tx
-        // but parked (nonce gap → `Queued`; cumulative funds short →
-        // `!ENOUGH_BALANCE`) never reaches `Pending`, so it gets no fifo entry
-        // and the client blocks the full timeout. Reject both synchronously.
-        // One snapshot + one scan yield nonce, balance, `pending_nonce`, and
-        // `committed_cost` (Σ over the gapless chain below `pending_nonce`).
-        // Stale (`nonce < on_chain_nonce`) is left to the inner validator.
-        let state = self.provider.latest().map_err(|e| internal_err(&e))?;
-        let on_chain_nonce =
-            state.account_nonce(&sender).map_err(|e| internal_err(&e))?.unwrap_or(0);
-        let on_chain_balance =
-            state.account_balance(&sender).map_err(|e| internal_err(&e))?.unwrap_or_default();
-        let (pending_nonce, committed_cost) =
-            self.pool.get_pending_nonce_and_cumulative_cost(sender, on_chain_nonce);
-        if nonce > pending_nonce {
-            debug!(target: "mantle::preconf::rpc", ?sender, ?nonce, ?pending_nonce, "nonce gap rejected");
-            return Err(preconf_error_to_rpc(&PreconfError::NonceGap {
-                tx_nonce: nonce,
-                pending_nonce,
-            }));
-        }
-
-        // Append case only, and only the *cumulative* shortfall the pool would
-        // silently park: a tx that is individually affordable (so the inner
-        // validator admits it) but whose running total across the sender's
-        // pending chain exceeds the balance (`!ENOUGH_BALANCE` → non-pending).
-        // A tx that alone exceeds the balance, or a replacement
-        // (`nonce < pending_nonce`), is left to the inner validator / pool —
-        // reth already rejects those synchronously. `saturating_add` guards the
-        // `value == U256::MAX` edge. Replacements are left to the pool.
-        if nonce == pending_nonce {
-            let own_cost = pool_tx.cost().saturating_add(pool_tx.extra_balance_cost());
-            let required = committed_cost.saturating_add(own_cost);
-            if own_cost <= on_chain_balance && required > on_chain_balance {
-                debug!(
-                    target: "mantle::preconf::rpc",
-                    ?sender, ?nonce, %required, %on_chain_balance,
-                    "insufficient funds rejected"
-                );
-                return Err(preconf_error_to_rpc(&PreconfError::InsufficientFunds {
-                    balance: on_chain_balance,
-                    required,
-                }));
-            }
-        }
-
-        // Step 3 — attach responder BEFORE pool.add. See module-level docs.
+        // One call decides everything: the type, the allowlist, the per-tx
+        // gas ceiling, the validator chain and the queue's own rules, in that
+        // order, with the client's channel installed under the queue's lock
+        // so the builder cannot reach an entry that has nobody to answer.
+        // Every refusal therefore comes back from this one call as an error,
+        // rather than leaving a parked submission to wait out the deadline.
         let (resp_tx, resp_rx) = oneshot::channel();
-        if let Err(AttachError::AlreadyAttached) =
-            self.fifo.attach_responder(hash, origin_instant, resp_tx).await
-        {
-            return Err(preconf_error_to_rpc(&PreconfError::AlreadyInProgress));
-        }
+        let admitted = self
+            .admission
+            .admit(bytes, origin_instant, resp_tx)
+            .await
+            .map_err(|e| preconf_error_to_rpc(&e))?;
+        let AdmittedTx { hash, .. } = admitted;
 
-        // Step 4 — submit to pool.
-        //
-        // `Ok(_)` and `Err(AlreadyImported)` are both admission successes
-        // and fall through to Step 5. The pool listener will observe
-        // whichever admission path took effect and call
-        // `push_if_absent`, which handles the same-hash retry case
-        // internally: if the fifo entry for this hash is in a
-        // reclaimable terminal state (`Timeout` / `Canceled`), it is
-        // revived to `Waiting` and broadcast so dispatch can pick it up.
-        // Active-state resubmits are rejected earlier at Step 3
-        // (`attach_responder`) — by the time we reach Step 4 we know
-        // the fifo entry is either absent or in a reclaimable state.
-        match self.pool.add_transaction(TransactionOrigin::External, pool_tx).await {
-            Ok(_) => {}
-            Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {}
-            Err(e) => {
-                let err = PreconfError::PoolRejected(format!("{}", e.kind));
-                self.fifo.cancel_responder(&hash, err.clone()).await;
-                return Err(preconf_error_to_rpc(&err));
-            }
-        }
-
-        // Step 5 — await receipt or deadline, with race-safe handling.
+        // Await receipt or deadline, with race-safe handling.
         //
         // We use `tokio::select!` (not `tokio::time::timeout`) so
         // `resp_rx` outlives the deadline. On the deadline branch, we
         // acquire the per-entry `apply_lock` which serializes with
-        // dispatch's "point of no return"; once we hold the lock, the
-        // entry's status is definitive (either `Success`/`Failed`
-        // because dispatch committed and sent the receipt into
-        // `resp_rx`, or `Waiting` because dispatch never ran the
-        // apply). The `try_recv()` on `resp_rx` then reliably picks
-        // up any receipt that dispatch sent — closing the SLA race
-        // where a client could previously see `Timeout` even though
-        // the tx had already been committed to the builder state.
+        // dispatch's "point of no return"; once we hold the lock, any
+        // completion has already answered the channel. The `try_recv()`
+        // on `resp_rx` then reliably picks up whatever dispatch sent —
+        // closing the SLA race where a client would otherwise see
+        // `Timeout` even though the tx had already been committed to
+        // the builder state.
         let preconf_timeout = self.cfg.preconf_timeout;
         let deadline = tokio::time::sleep(preconf_timeout);
         tokio::pin!(deadline);
@@ -228,30 +122,9 @@ where
         };
 
         match recv_result {
-            // Receipt arrived within the deadline. Persist on Success
-            // (best-effort — a crash before flush loses at most this
-            // single record).
-            Some(Ok(Ok(receipt))) => {
-                let event = PreconfTxEvent::from(receipt);
-                // Receipt path ⇒ the tx is on chain (`From` maps it to
-                // Success, or Failed for an EVM revert — a receipt exists
-                // either way), so always journal.
-                let entry = JournalEntry {
-                    hash,
-                    tx_rlp: bytes.clone(),
-                    block_height: event.block_height,
-                    committed_at_ms: now_unix_ms(),
-                };
-                if let Err(e) = self.journal.append_promised(&entry).await {
-                    warn!(
-                        target: "mantle::preconf::rpc",
-                        ?hash,
-                        ?e,
-                        "journal append failed; commitment may be lost on restart"
-                    );
-                }
-                Ok(event)
-            }
+            // Receipt arrived within the deadline; dispatch already recorded
+            // the promise.
+            Some(Ok(Ok(receipt))) => Ok(PreconfTxEvent::from(receipt)),
 
             // Builder signalled an error through the responder. A
             // `Timeout` error is surfaced as an `Ok(Timeout event)`
@@ -259,17 +132,18 @@ where
             // matching the deadline branch's own timeout handling.
             Some(Ok(Err(err))) => {
                 if matches!(err, PreconfError::Timeout { .. }) {
-                    Ok(build_timeout_event(hash, preconf_timeout))
+                    Ok(timeout_reply(hash, preconf_timeout))
                 } else {
                     Err(preconf_error_to_rpc(&err))
                 }
             }
 
-            // Our responder is gone, so we no longer own the slot: `mark_canceled`
-            // / `cancel_responder` here could only ever hit the client holding it
-            // now. Log loudly — no healthy path drops one — and fail only ourselves.
+            // Our responder is gone, so we no longer own the slot: ending the
+            // commitment here could only ever hit the client holding it now.
+            // Log loudly — no healthy path drops one — and fail only ourselves.
             Some(Err(_recv_err)) => {
                 warn!(target: "mantle::preconf::rpc", ?hash, "responder dropped before send");
+                metrics::counter!("preconf.api.no_result_total").increment(1);
                 let err = PreconfError::Internal("responder dropped before send".to_string());
                 Err(preconf_error_to_rpc(&err))
             }
@@ -279,146 +153,120 @@ where
             // resolution.
             None => {
                 debug!(target: "mantle::preconf::rpc", ?hash, ?preconf_timeout, "preconf deadline elapsed; resolving race");
-                metrics::counter!("preconf.api.timeout_total").increment(1);
 
-                // Acquire the per-entry `apply_lock`. If dispatch is
-                // running `apply_fn`, this blocks until it finishes
-                // mark_* + send. If dispatch never started (no active
-                // build, or gates rejected), we get the lock
-                // immediately.
+                // Every completion holds this lock from its decision through
+                // the send, so holding it means none is in flight and **the
+                // channel is the answer**. The entry is read only in the one
+                // case where nothing was sent.
                 //
-                // A `None` from `lock_for_apply` means no fifo entry
-                // for this hash — typically the pool listener routed
-                // the tx to `BaseFee`/`Queued`, so the fifo push never
-                // happened. Treat as a genuine timeout.
+                // `None` means no entry for this hash — still not a special
+                // case, since a removed entry has no completion in flight
+                // either.
                 let apply_guard = self.fifo.lock_for_apply(&hash).await;
 
-                // Under the (possibly-held) lock, read the definitive
-                // final status.
-                let final_status = self.fifo.find_by_hash(&hash).await.map(|e| e.status);
+                let outcome = match resp_rx.try_recv() {
+                    Ok(Ok(receipt)) => Ok(PreconfTxEvent::from(receipt)),
+                    // A `Timeout` is the op-geth-aligned wire shape, never a
+                    // JSON-RPC error — same as the pre-deadline arm above.
+                    Ok(Err(err)) => {
+                        if matches!(err, PreconfError::Timeout { .. }) {
+                            Ok(timeout_reply(hash, preconf_timeout))
+                        } else {
+                            Err(preconf_error_to_rpc(&err))
+                        }
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        self.time_out_unfinished(&hash, preconf_timeout).await
+                    }
+                    // The responder went without a result. That is the
+                    // completion protocol broken, and `Timeout` would be a
+                    // claim we cannot make — it means "this did not execute
+                    // through the preconf path", and we do not know that.
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        warn!(
+                            target: "mantle::preconf::rpc",
+                            ?hash,
+                            "responder closed without a result"
+                        );
+                        metrics::counter!("preconf.api.no_result_total").increment(1);
+                        Err(preconf_error_to_rpc(&PreconfError::Internal(
+                            "responder closed without a result".to_string(),
+                        )))
+                    }
+                };
 
-                match final_status {
-                    Some(PreconfStatus::Success | PreconfStatus::Failed) => {
-                        // Apply committed to builder state between our
-                        // deadline firing and lock acquisition. The
-                        // receipt (or error) is already queued in
-                        // `resp_rx` (dispatch sent it before releasing
-                        // the apply_lock we now hold). Retrieve it
-                        // non-blockingly.
-                        drop(apply_guard);
-                        match resp_rx.try_recv() {
-                            Ok(Ok(receipt)) => {
-                                let event = PreconfTxEvent::from(receipt);
-                                // Receipt path ⇒ on chain (Success or an
-                                // EVM-revert Failed), so always journal.
-                                let entry = JournalEntry {
-                                    hash,
-                                    tx_rlp: bytes.clone(),
-                                    block_height: event.block_height,
-                                    committed_at_ms: now_unix_ms(),
-                                };
-                                if let Err(e) = self.journal.append_promised(&entry).await {
-                                    warn!(
-                                        target: "mantle::preconf::rpc",
-                                        ?hash, ?e,
-                                        "journal append failed; commitment may be lost on restart"
-                                    );
-                                }
-                                Ok(event)
-                            }
-                            Ok(Err(err)) => Err(preconf_error_to_rpc(&err)),
-                            Err(oneshot::error::TryRecvError::Empty) => {
-                                // Status says terminal but resp_rx is
-                                // empty — indicates lock-discipline
-                                // regression in dispatch. Log and
-                                // fall through to Timeout.
-                                warn!(
-                                    target: "mantle::preconf::rpc",
-                                    ?hash, ?final_status,
-                                    "terminal status but resp_rx empty; falling back to Timeout"
-                                );
-                                Ok(build_timeout_event(hash, preconf_timeout))
-                            }
-                            Err(oneshot::error::TryRecvError::Closed) => {
-                                warn!(
-                                    target: "mantle::preconf::rpc",
-                                    ?hash,
-                                    "resp_rx closed by dispatch without send; falling back to Timeout"
-                                );
-                                Ok(build_timeout_event(hash, preconf_timeout))
-                            }
-                        }
-                    }
-                    Some(PreconfStatus::Waiting) | None => {
-                        // Apply never committed. `mark_timeout`'s `Waiting →
-                        // Timeout` CAS evicts the tx from the pool via its
-                        // callback — but a pool-admitted tx with no fifo entry
-                        // (parked in `BaseFee`/`Queued`, so the `Pending`-only
-                        // listener never pushed it) returns `NotFound` and skips
-                        // that callback. Evict it directly, else the orphan
-                        // lingers and is mined once eligible — after the client
-                        // saw `Timeout`.
-                        if self.fifo.mark_timeout(&hash).await.is_err() {
-                            self.pool.remove_transactions(vec![hash]);
-                        }
-                        drop(apply_guard);
-                        self.fifo
-                            .cancel_responder(
-                                &hash,
-                                PreconfError::Timeout {
-                                    timeout_ms: preconf_timeout.as_millis() as u64,
-                                },
-                            )
-                            .await;
-                        Ok(build_timeout_event(hash, preconf_timeout))
-                    }
-                    Some(PreconfStatus::Timeout | PreconfStatus::Canceled) => {
-                        // Some other path beat us (e.g. dispatch's
-                        // deadline gate or block-gas-budget gate
-                        // ran mark_* concurrently). The tx is not on
-                        // chain; return Timeout to the client.
-                        drop(apply_guard);
-                        self.fifo
-                            .cancel_responder(
-                                &hash,
-                                PreconfError::Timeout {
-                                    timeout_ms: preconf_timeout.as_millis() as u64,
-                                },
-                            )
-                            .await;
-                        Ok(build_timeout_event(hash, preconf_timeout))
-                    }
-                }
+                // After the answer, never before: releasing the lock first is
+                // what lets another path observe a finished entry whose result
+                // has not gone out yet.
+                drop(apply_guard);
+                outcome
             }
         }
     }
+
+    /// Nobody completed this commitment, so this client's wait ends here.
+    ///
+    /// Reached only with the entry's `apply_lock` held and an empty channel,
+    /// so no completion is in flight or has run. The two remaining shapes are
+    /// told apart by the entry — the one place in this path that reads it.
+    async fn time_out_unfinished(
+        &self,
+        hash: &alloy_primitives::TxHash,
+        preconf_timeout: std::time::Duration,
+    ) -> RpcResult<PreconfTxEvent> {
+        let entry = self.fifo.find_by_hash(hash).await;
+
+        // Applied, and no receipt reached us. `Timeout` would claim it never
+        // executed, which is the opposite of what the entry says.
+        if entry.as_ref().is_some_and(|e| e.status == PreconfStatus::Success) {
+            warn!(
+                target: "mantle::preconf::rpc",
+                ?hash,
+                "entry is applied but no receipt was sent"
+            );
+            metrics::counter!("preconf.api.no_result_total").increment(1);
+            return Err(preconf_error_to_rpc(&PreconfError::Internal(
+                "entry applied without a receipt".to_string(),
+            )));
+        }
+
+        let timed_out = PreconfError::Timeout { timeout_ms: preconf_timeout.as_millis() as u64 };
+
+        // `Err` means something ended it between the read above and now, and
+        // whatever did answered this client on the way out. Nothing left to do
+        // either way.
+        let _ = self.fifo.complete_failure(hash, timed_out).await;
+        Ok(timeout_reply(*hash, preconf_timeout))
+    }
 }
 
-/// Construct the wire `Timeout` event returned to the client when the
-/// preconf deadline expires without a committed apply.
-fn build_timeout_event(
+/// The `Timeout` answer a client receives, counted once per answer.
+///
+/// `preconf.api.timeout_total` counts what clients were told, whichever path
+/// decided it: the RPC deadline, or dispatch giving up before apply because
+/// the deadline was too close. Counting where the deadline fires instead would
+/// miss the second and count a deadline whose race resolved to a receipt. The
+/// count lives here so that no `Timeout` answer can be built without it.
+fn timeout_reply(
     hash: alloy_primitives::TxHash,
     preconf_timeout: std::time::Duration,
 ) -> PreconfTxEvent {
+    metrics::counter!("preconf.api.timeout_total").increment(1);
     PreconfTxEvent {
         tx_hash: hash,
         status: WireStatus::Timeout,
         reason: format!("preconf timeout after {preconf_timeout:?}"),
         block_height: 0,
-        // No EVM apply happened → wire logs = null (tri-state).
-        receipt: PreconfTxReceipt { logs: None },
+        // No EVM apply happened → every receipt field stays absent, and wire
+        // logs are the tri-state `null`.
+        receipt: PreconfTxReceipt { logs: None, ..Default::default() },
     }
 }
 
 // `DynPreconfHandler` is the dyn-safe trait declared in `rpc-ext`; this is
-// the impl that erases the `<P, Pr>` generics so `MantleRpcExt` can hold an
-// `Option<Arc<dyn DynPreconfHandler>>`.
+// the impl behind the `Arc<dyn DynPreconfHandler>` `MantleRpcExt` holds.
 #[async_trait]
-impl<P, Pr> DynPreconfHandler for PreconfRpcHandler<P, Pr>
-where
-    P: TransactionPool + 'static,
-    Pr: StateProviderFactory + 'static,
-{
+impl DynPreconfHandler for PreconfRpcHandler {
     async fn handle(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
         // Preconf-handling latency, measured around `handle_inner` to cover
         // every early-return path (reject / timeout / success).
@@ -436,31 +284,38 @@ where
 ///
 /// Wire-layer `Success`/`Failed` is derived from `receipt.status: bool`,
 /// which reflects EVM execution outcome (`false` = revert/halt, `true` =
-/// success). Both cases mean the tx **is on chain** — the receipt would
-/// not exist otherwise.
+/// success). Both mean the transaction executed and produced a receipt —
+/// against the payload this build is assembling, which the consensus layer may
+/// still not adopt. The commitment is owed either way: a build whose payload
+/// goes unused hands its entries back for the next one to replay, at a height
+/// this event does not predict.
 ///
-/// Note the semantic mismatch with fifo-layer `PreconfStatus::Failed`,
-/// which signals a builder pre-apply reject (nonce-too-low, block gas
-/// budget, ...) — tx **NOT on chain**. That state never reaches this
-/// conversion; it flows to the client through the `Ok(Ok(Err(err)))`
-/// arm's `PreconfError`, not the receipt path.
-///
-/// `Waiting` / `Timeout` are constructed directly by the RPC handler's
-/// other arms and never routed through this `From` impl. There is no
-/// wire `Canceled` variant — server pre-apply rejections (the block-gas-budget gate gas
-/// budget, admin action) are surfaced as wire `Failed` with the
-/// specific reason in `PreconfTxEvent::reason`; the underlying fifo
-/// `PreconfStatus::Canceled` is an internal-only distinction.
+/// A commitment the builder refused instead (nonce-too-low, block gas budget,
+/// DA budget) never reaches this conversion: there is no receipt, so it leaves
+/// through the handler's `Some(Ok(Err(err)))` arm as a JSON-RPC error, tx
+/// **not on chain**. That is also why no wire `Canceled` variant is needed
+/// here. `Waiting` / `Timeout` are built by the handler's other arms and do not
+/// come through this impl either.
 impl From<PreconfReceipt> for PreconfTxEvent {
     fn from(r: PreconfReceipt) -> Self {
         let status = if r.status { WireStatus::Success } else { WireStatus::Failed };
+        let base = r.log_index_base;
         let logs = r
             .logs
             .into_iter()
-            .map(|log| PreconfLog {
+            .enumerate()
+            .map(|(i, log)| PreconfLog {
                 address: log.address,
                 topics: log.data.topics().to_vec(),
                 data: log.data.data,
+                block_number: Some(r.block_height),
+                block_timestamp: Some(r.block_timestamp),
+                transaction_hash: Some(r.tx_hash),
+                transaction_index: Some(r.tx_index),
+                log_index: Some(base + i as u64),
+                // Nothing here came off a reorged block; the field exists to
+                // match the standard shape, not to carry information.
+                removed: Some(false),
             })
             .collect();
         Self {
@@ -468,10 +323,23 @@ impl From<PreconfReceipt> for PreconfTxEvent {
             status,
             reason: r.reason,
             block_height: r.block_height,
-            // Apply happened (via receipt path) — wrap logs in Some
-            // even when empty, to signal "apply succeeded, no logs
-            // emitted" (distinguished from Timeout's `None`).
-            receipt: PreconfTxReceipt { logs: Some(logs) },
+            receipt: PreconfTxReceipt {
+                // Apply happened (via receipt path) — wrap logs in Some
+                // even when empty, to signal "apply succeeded, no logs
+                // emitted" (distinguished from Timeout's `None`).
+                logs: Some(logs),
+                status: Some(u64::from(r.status)),
+                gas_used: Some(r.gas_used),
+                cumulative_gas_used: Some(r.cumulative_gas_used),
+                transaction_index: Some(r.tx_index),
+                logs_bloom: Some(r.logs_bloom),
+                tx_type: Some(u64::from(r.tx_type)),
+                from: Some(r.from),
+                to: r.to,
+                contract_address: r.contract_address,
+                effective_gas_price: Some(r.effective_gas_price),
+                l1_fields: r.l1_fields,
+            },
         }
     }
 }
@@ -488,31 +356,25 @@ fn preconf_error_to_rpc(err: &PreconfError) -> ErrorObject<'static> {
     ErrorObject::owned(PRECONF_RPC_ERR_CODE, err.to_string(), None::<()>)
 }
 
-fn internal_err<E: std::fmt::Display>(e: &E) -> ErrorObject<'static> {
-    ErrorObject::owned(PRECONF_RPC_ERR_CODE, format!("internal: {e}"), None::<()>)
-}
-
-fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Address> {
+/// A creation has no recipient at all, which is not the same as a call to the
+/// zero address — see `PreconfClassifier::evaluate_whitelist`'s docs for why
+/// only a from-wildcard can authorize one. Shared with the payload builder so
+/// the two ask the allowlist the same question.
+pub(crate) fn tx_kind_to_address(kind: TxKind) -> Option<alloy_primitives::Address> {
     match kind {
         TxKind::Call(addr) => Some(addr),
         TxKind::Create => None,
     }
 }
 
-/// Current wall-clock milliseconds since the Unix epoch. Used to
-/// stamp [`JournalEntry::committed_at_ms`]. Falls back to `0` if the
-/// system clock is set before 1970, which is best treated as
-/// "unset" rather than crashing the RPC path.
-fn now_unix_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, Bytes as PrimBytes, Log, LogData, U256};
+    use alloy_primitives::{Address, B256, Bloom, Bytes as PrimBytes, Log, LogData};
     use mantle_reth_rpc_ext::PreconfStatus as WireStatus;
+    use std::collections::HashSet;
+
+    use crate::{admission::AdmittedTx, classifier::PreconfClassifier};
 
     fn sample_log(addr_byte: u8, topic_byte: u8, data_byte: u8) -> Log {
         let data = LogData::new_unchecked(
@@ -531,6 +393,17 @@ mod tests {
             gas_used: 21_000,
             reason: if success { String::new() } else { "execution reverted".to_string() },
             revert_data: PrimBytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 21_000,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 1_000_000_000,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         }
     }
 
@@ -562,6 +435,17 @@ mod tests {
             gas_used: 0,
             reason: String::new(),
             revert_data: PrimBytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 0,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 0,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         };
         let event: PreconfTxEvent = receipt.into();
         let logs = event.receipt.logs.expect("Some logs");
@@ -582,6 +466,17 @@ mod tests {
             gas_used: 0,
             reason: String::new(),
             revert_data: PrimBytes::new(),
+            tx_index: 0,
+            cumulative_gas_used: 0,
+            logs_bloom: Bloom::default(),
+            log_index_base: 0,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 0,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
         };
         let event: PreconfTxEvent = receipt.into();
         assert_eq!(event.receipt.logs.as_ref().map(|l| l.len()), Some(0));
@@ -613,28 +508,200 @@ mod tests {
         assert!(rpc.message().contains('5') && rpc.message().contains('3'));
     }
 
-    #[test]
-    fn internal_err_prefixes_message() {
-        let inner = "boom";
-        let rpc = internal_err(&inner);
-        assert!(rpc.message().starts_with("internal: "));
-        assert!(rpc.message().ends_with("boom"));
+    // --- what is left of the handler ------------------------------------
+    //
+    // Deciding whether a transaction may be queued moved to `admission`, and
+    // its tests went with it. What stays here is the wait on the client's
+    // channel and the commitment record that goes out with a receipt, so the
+    // harness below needs an admission only to satisfy the type — it is never
+    // called.
+
+    const RECIPIENT: Address = Address::new([0x42; 20]);
+
+    #[derive(Debug)]
+    struct UnusedAdmission;
+
+    #[async_trait]
+    impl DynAdmission for UnusedAdmission {
+        async fn admit(
+            &self,
+            _bytes: Bytes,
+            _origin_instant: std::time::Instant,
+            _responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
+        ) -> Result<AdmittedTx, PreconfError> {
+            unreachable!("these tests do not go through admission")
+        }
     }
 
-    // Full handler-flow tests (mock pool + state provider + builder
-    // fan-in) are deferred to end-to-end coverage — building a
-    // `TransactionPool` impl with the right associated `Pooled` type
-    // that supports `recover_raw_transaction` plus a
-    // `StateProviderFactory` mock is heavyweight scaffolding. The flow
-    // itself is straight-line over public `PreconfTxSet` APIs that
-    // already have unit tests covering attach / cancel / mark_timeout /
-    // recover_from_timeout semantics.
-    //
-    // `U256` is referenced only here so the e2e harness can later
-    // construct receipts with numeric fields without re-touching the
-    // use list.
-    #[allow(dead_code)]
-    fn _u256_marker() -> U256 {
-        U256::ZERO
+    struct Harness {
+        handler: PreconfRpcHandler,
+        fifo: Arc<PreconfTxSet>,
+        sender: Address,
+    }
+
+    fn harness() -> Harness {
+        let sender = Address::from([0x11; 20]);
+        let classifier = Arc::new(PreconfClassifier::new(false));
+        classifier.update_whitelist(
+            [(sender, RECIPIENT)].into_iter().collect(),
+            HashSet::default(),
+            HashSet::default(),
+        );
+
+        let cfg = PreconfConfig {
+            enabled: true,
+            preconf_max_gas_per_tx: 1_000_000,
+            ..Default::default()
+        };
+        let fifo = Arc::new(PreconfTxSet::new(16));
+        let handler =
+            PreconfRpcHandler::new(Arc::new(UnusedAdmission), fifo.clone(), Arc::new(cfg));
+        Harness { handler, fifo, sender }
+    }
+
+    #[derive(Debug)]
+    struct ReceiptAdmission {
+        receipt: PreconfReceipt,
+    }
+
+    #[async_trait]
+    impl DynAdmission for ReceiptAdmission {
+        async fn admit(
+            &self,
+            _bytes: Bytes,
+            _origin_instant: std::time::Instant,
+            responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
+        ) -> Result<AdmittedTx, PreconfError> {
+            responder.send(Ok(self.receipt.clone())).expect("receipt receiver is alive");
+            Ok(AdmittedTx { hash: self.receipt.tx_hash, sender: self.receipt.from, nonce: 0 })
+        }
+    }
+
+    /// This admission deliberately bypasses the real queue's conflict checks.
+    /// It characterizes receipt handling after an injected registry conflict;
+    /// it does not demonstrate that normal admission can reach that state.
+    #[test]
+    fn injected_slot_conflicts_do_not_change_the_returned_receipt() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::seed_preconf_metrics();
+                for success in [true, false] {
+                    for incumbent_promised in [false, true] {
+                        let h = harness();
+                        let receipt = sample_receipt(success);
+                        let hash = receipt.tx_hash;
+                        let incumbent = B256::from([0xbb; 32]);
+                        assert_eq!(
+                            h.fifo.claims().record_announced(incumbent, &h.sender, 0, 41),
+                            Ok(())
+                        );
+                        if incumbent_promised {
+                            assert_eq!(
+                                h.fifo.claims().mark_promised(incumbent, &h.sender, 0, 41),
+                                Ok(())
+                            );
+                        }
+                        let handler = PreconfRpcHandler::new(
+                            Arc::new(ReceiptAdmission { receipt }),
+                            h.fifo.clone(),
+                            h.handler.cfg.clone(),
+                        );
+
+                        let event = handler.handle_inner(Bytes::new()).await.expect("receipt");
+
+                        assert_eq!(event.tx_hash, hash);
+                        assert_eq!(event.block_height, 42);
+                        assert_eq!(
+                            event.status,
+                            if success { WireStatus::Success } else { WireStatus::Failed }
+                        );
+                        assert_eq!(event.receipt.status, Some(u64::from(success)));
+                        assert_eq!(h.fifo.claims().slot_owner(&h.sender, 0), Some(incumbent));
+                        assert_eq!(h.fifo.claims().was_promised(&incumbent), incumbent_promised);
+                    }
+                }
+                let rendered = metrics.render();
+                assert!(
+                    rendered.lines().any(|line| line == "preconf_tx_commitment_broken_total 0"),
+                    "receipt-time conflicts do not increment the broken counter: {rendered}"
+                );
+            });
+        });
+    }
+
+    /// `logIndex` is block-global: the first log of a transaction whose block
+    /// already emitted 5 logs is 5, not 0.
+    #[test]
+    fn from_receipt_numbers_logs_from_the_block_wide_base() {
+        let log = |n: u8| alloy_primitives::Log {
+            address: alloy_primitives::Address::ZERO,
+            data: alloy_primitives::LogData::new_unchecked(
+                vec![alloy_primitives::B256::from([n; 32])],
+                PrimBytes::new(),
+            ),
+        };
+        let event = PreconfTxEvent::from(PreconfReceipt {
+            tx_hash: alloy_primitives::TxHash::from([7u8; 32]),
+            block_height: 500,
+            status: true,
+            logs: vec![log(1), log(2)],
+            gas_used: 48_000,
+            reason: String::new(),
+            revert_data: PrimBytes::new(),
+            tx_index: 3,
+            cumulative_gas_used: 95_000,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            log_index_base: 5,
+            tx_type: 2,
+            from: Address::from([0x11; 20]),
+            to: Some(Address::from([0x42; 20])),
+            contract_address: None,
+            effective_gas_price: 1_000_000_000,
+            block_timestamp: 0,
+            l1_fields: Default::default(),
+        });
+
+        assert_eq!(event.receipt.status, Some(1));
+        assert_eq!(event.receipt.gas_used, Some(48_000));
+        assert_eq!(event.receipt.cumulative_gas_used, Some(95_000));
+        assert_eq!(event.receipt.transaction_index, Some(3));
+
+        let logs = event.receipt.logs.expect("apply happened");
+        assert_eq!(logs[0].log_index, Some(5));
+        assert_eq!(logs[1].log_index, Some(6));
+        for l in &logs {
+            assert_eq!(l.block_number, Some(500));
+            assert_eq!(l.transaction_index, Some(3));
+            assert_eq!(l.transaction_hash, Some(alloy_primitives::B256::from([7u8; 32])));
+            assert_eq!(l.removed, Some(false));
+        }
+    }
+
+    /// A timeout means no EVM apply happened, so nothing but the tri-state
+    /// `logs: null` may appear — the response stays byte-identical to op-geth's.
+    /// Each answer is counted once.
+    #[test]
+    fn timeout_reply_carries_no_receipt_fields_and_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let event = metrics::with_local_recorder(&recorder, || {
+            timeout_reply(
+                alloy_primitives::TxHash::from([1u8; 32]),
+                std::time::Duration::from_millis(500),
+            )
+        });
+        assert!(
+            handle.render().lines().any(|l| l == "preconf_api_timeout_total 1"),
+            "every Timeout answer is counted"
+        );
+        assert!(event.receipt.logs.is_none());
+        assert!(event.receipt.status.is_none());
+        assert!(event.receipt.gas_used.is_none());
+        assert!(event.receipt.cumulative_gas_used.is_none());
+        assert!(event.receipt.transaction_index.is_none());
+        assert!(event.receipt.logs_bloom.is_none());
     }
 }
