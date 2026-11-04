@@ -107,8 +107,9 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
     for h in &sealed0 {
         *counts.entry(*h).or_default() += 1;
     }
-    let mut fn_n = 2u64;
-    for _ in 0..(NUM_COMMITMENTS + 1) {
+    // Slot numbers start at 2 (slot 1 is the reorg rebuild above); walk at most
+    // NUM_COMMITMENTS + 1 further slots waiting for every commitment to reland.
+    for fn_n in 2u64..=(2 + NUM_COMMITMENTS as u64) {
         if hashes.iter().all(|h| counts.contains_key(h)) {
             break;
         }
@@ -117,7 +118,6 @@ async fn multiple_commitments_reland_after_multi_block_reorg() {
             *counts.entry(*x).or_default() += 1;
         }
         head = h;
-        fn_n += 1;
     }
 
     // Primary invariant — must-land: every commitment must come back after the

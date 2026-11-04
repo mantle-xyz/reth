@@ -67,6 +67,15 @@ where
         let start = Instant::now();
         self.metrics.get_proof_requests.increment(1);
 
+        // Bound concurrent historical-proof walks with the eth API's tracing-task permit, as the
+        // stock reth `eth_getProof` and the Mantle `rpc-ext` override both do. Held for the whole
+        // operation. The key count itself is not capped here — that gap is shared with upstream
+        // reth and tracked separately.
+        let _permit =
+            self.state_provider_factory.acquire_tracing_permit().await.map_err(|err| {
+                ErrorObject::owned(-32000, format!("proof permit closed: {err}"), None::<()>)
+            })?;
+
         let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
 
         let result = async {
@@ -78,7 +87,10 @@ where
                 .proof(Default::default(), address, &storage_keys)
                 .map_err(Into::into)?;
 
-            Ok(proof.into_eip1186_response(keys))
+            // [MANTLE] geth returns B256::ZERO for codeHash and storageHash on an account that
+            // does not exist, where reth returns KECCAK_EMPTY / EMPTY_ROOT_HASH. Mantle follows
+            // geth, so the exclusion-proof shape stays the one op-geth clients already parse.
+            Ok(proof.into_eip1186_response_with(keys, true))
         }
         .await;
 

@@ -15,9 +15,6 @@
 //! - **flag on**: the forwarded tx IS retained — queryable locally and reflected in the `pending`
 //!   nonce.
 //!
-//! See `docs/reth_geth_txpool_forwarded_tx_admission.md` in the rde-v3 superproject for the full
-//! investigation.
-//!
 //! Run with:
 //!
 //! ```sh
@@ -84,7 +81,7 @@ async fn signed_tx(chain_id: u64, wallet: &Wallet, nonce: u64) -> (Bytes, B256) 
 
 /// Drives one forwarding node with the given admission flag: submits a forwarded tx and returns
 /// `(getTransactionByHash is present, pending_nonce)` observed on the same node.
-async fn run_case(enable_tx_pool_admission: bool) -> (bool, u64) {
+async fn run_case(retain_forwarded_txs: bool) -> (bool, u64) {
     let chain_spec = mantle_test_chain_spec();
     let chain_id = chain_spec.chain().id();
     let wallet = Wallet::default().with_chain_id(chain_id);
@@ -95,7 +92,7 @@ async fn run_case(enable_tx_pool_admission: bool) -> (bool, u64) {
 
     let node = MantleNode::new(RollupArgs {
         sequencer: Some(sequencer_url),
-        enable_tx_pool_admission,
+        retain_forwarded_txs,
         ..Default::default()
     });
 
