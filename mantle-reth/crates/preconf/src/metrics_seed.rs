@@ -7,9 +7,9 @@
 //! Prometheus until it first fires — exactly when an alert most needs a
 //! stable `0` baseline, and when dashboards would otherwise show "no data"
 //! (indistinguishable from a broken pipeline). [`seed_preconf_metrics`]
-//! registers every metric emitted under either prefix up front, so every
-//! counter and gauge carries a `0` from node start. Histograms are registered
-//! but deliberately not observed, so their `_count` / `_bucket` series still
+//! registers node-wide metrics up front. Subscriber counters and endpoint
+//! gauges are registered by their owners only when those features start. Histograms
+//! are never given synthetic observations, so their `_count` / `_bucket` series still
 //! appear only with the first real observation — see [`HISTOGRAMS`].
 //!
 //! Names MUST match the inline emit sites verbatim (dot-separated) — a mismatch
@@ -125,9 +125,6 @@ const COUNTERS: &[&str] = &[
     "preconf.execute.rejected_base_fee_total",
     "preconf.execute.rejected_other_total",
     // Commitment retention + on-chain allowlist governance.
-    // Shared with `mantle-reth-flashblocks`, which emits the same series under
-    // its own `subscriber` label and cannot seed it — see `PREFIXES`.
-    "mantle.canon.notifications_lagged_total",
     "preconf.canon.reinject_conflict_total",
     "preconf.canon.reorg_drift_total",
     "preconf.tx.announced_dropped_total",
@@ -156,8 +153,6 @@ const COUNTERS: &[&str] = &[
 /// `set(0.0)` here could clobber it back to `0` depending on call ordering; a
 /// zero increment only registers the series, leaving any existing value intact.
 const GAUGES: &[&str] = &[
-    "flashblocks.endpoint_serving",
-    "flashblocks.subscribers",
     "preconf.fifo.pending",
     "preconf.fifo.entries",
     "preconf.fifo.bytes_used",
@@ -195,7 +190,6 @@ const HISTOGRAMS: &[&str] = &[
     "flashblocks.pool_maintenance_duration_ms",
     "flashblocks.pool_maintenance_accounts",
     "flashblocks.best_txs_refresh_duration_ms",
-    "mantle.canon.notification_duration",
     "preconf.api.handle_duration_ms",
     "preconf.build.lock_wait_ms",
     "preconf.build.canon_catchup_wait_ms",
@@ -205,8 +199,26 @@ const HISTOGRAMS: &[&str] = &[
     "preconf.journal.rotate_locked_ms",
 ];
 
-/// Pre-register every metric this crate emits — `preconf.*` and
-/// `flashblocks.*` — so counter and gauge series exist from node start with a
+/// These series belong to running subscribers and endpoints, rather than to
+/// every node with preconf enabled.
+const SUBSCRIBER_COUNTER: &str = "mantle.canon.notifications_lagged_total";
+#[cfg(test)]
+const SUBSCRIBER_DURATION: &str = "mantle.canon.notification_duration";
+const ENDPOINT_GAUGES: &[&str] = &["flashblocks.endpoint_serving", "flashblocks.subscribers"];
+
+/// Seed the exact labelled counter before a subscriber can observe its first gap.
+pub(crate) fn seed_canonical_subscriber_metrics(subscriber: &'static str) {
+    metrics::counter!(SUBSCRIBER_COUNTER, "subscriber" => subscriber).increment(0);
+}
+
+/// Register endpoint gauges when serving starts, after recorder installation.
+pub(crate) fn seed_flashblocks_endpoint_metrics() {
+    for &name in ENDPOINT_GAUGES {
+        metrics::gauge!(name).increment(0.0);
+    }
+}
+
+/// Pre-register the node-wide preconf metrics so counter and gauge series exist with a
 /// `0` baseline instead of appearing only on the first emit. Histograms are
 /// registered without an observation, so theirs still appear on first use.
 ///
@@ -235,6 +247,47 @@ mod tests {
     use super::*;
     use std::{collections::HashSet, fs, path::Path};
 
+    #[test]
+    fn preconf_startup_does_not_publish_inactive_subscriber_or_endpoint_series() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, seed_preconf_metrics);
+        let scrape = handle.render();
+        for name in [
+            "mantle_canon_notifications_lagged_total",
+            "flashblocks_endpoint_serving",
+            "flashblocks_subscribers",
+        ] {
+            assert!(
+                !scrape.lines().any(|line| {
+                    line.starts_with(&format!("{name} ")) || line.starts_with(&format!("{name}{{"))
+                }),
+                "unexpected {name}: {scrape}"
+            );
+        }
+        assert!(scrape.contains("preconf_fifo_pending 0"), "{scrape}");
+    }
+
+    #[test]
+    fn canonical_subscriber_seeds_match_emitted_labels() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            seed_canonical_subscriber_metrics("preconf_canon");
+            seed_canonical_subscriber_metrics("preconf_whitelist");
+        });
+        let scrape = handle.render();
+        for label in ["preconf_canon", "preconf_whitelist"] {
+            assert!(
+                scrape.contains(&format!(
+                    "mantle_canon_notifications_lagged_total{{subscriber=\"{label}\"}} 0"
+                )),
+                "{scrape}"
+            );
+        }
+        assert!(!scrape.contains("mantle_canon_notifications_lagged_total 0"), "{scrape}");
+    }
+
     /// Recursively collect `*.rs` file contents under `dir`.
     fn read_rs_sources(dir: &Path, out: &mut String) {
         for entry in fs::read_dir(dir).expect("read_dir") {
@@ -254,11 +307,8 @@ mod tests {
     /// `mantle.` is the shared namespace for a series more than one crate
     /// emits under one name, so a single alert covers every emitter.
     ///
-    /// `flashblocks.` is shared differently: the producer metrics here and the
-    /// consumer metrics in `mantle-reth-flashblocks` sit in one namespace, but
-    /// only the producer half is seeded. This test reads **this** crate's
-    /// sources, and that crate has no seeding of its own — so a consumer
-    /// metric can be added without anything noticing.
+    /// `flashblocks.` also contains consumer metrics from another crate; this
+    /// scan checks only the producer metrics emitted by this crate.
     const PREFIXES: &[&str] = &["preconf.", "flashblocks.", "mantle."];
 
     /// Extract every name passed to `<macro>!("<prefix>…"` in the source (i.e.
@@ -286,24 +336,8 @@ mod tests {
         names
     }
 
-    /// Every metric emitted anywhere in the crate must appear in the matching
-    /// seed list — otherwise it regresses to lazy registration.
-    ///
-    /// Names are all this compares, because names are all it can read out of
-    /// the source: passing says a series is registered and spelled right, not
-    /// that it reports anything true. Computing a value wrong
-    /// (`increment(superseded - 1)`), counting a gauge the wrong way
-    /// (`decrement` when a subscriber arrives), and deleting the line that
-    /// constructs a `Drop`-guard all leave the whole suite green — the last
-    /// because the macro call stays in the source for this test to find while
-    /// the metric never fires again, and is caught by `-D warnings` on the
-    /// unused binding instead.
-    ///
-    /// Deliberately so: a wrong number bends a chart rather than changing what
-    /// the chain does, and the recorder is process-global, so reading values
-    /// back inside a shared test binary would collide with whatever else is
-    /// running. Names are held here; values by review and by watching a real
-    /// network.
+    /// Check the names registered at node startup or by a feature's owner.
+    /// Runtime tests separately verify values, labels, and feature gating.
     #[test]
     fn seed_lists_cover_every_emitted_metric() {
         let mut src = String::new();
@@ -313,7 +347,17 @@ mod tests {
         for (macro_name, seeded) in
             [("counter", COUNTERS), ("gauge", GAUGES), ("histogram", HISTOGRAMS)]
         {
-            let seeded: HashSet<&str> = seeded.iter().copied().collect();
+            let mut seeded: HashSet<&str> = seeded.iter().copied().collect();
+            match macro_name {
+                "counter" => {
+                    seeded.insert(SUBSCRIBER_COUNTER);
+                }
+                "gauge" => seeded.extend(ENDPOINT_GAUGES.iter().copied()),
+                "histogram" => {
+                    seeded.insert(SUBSCRIBER_DURATION);
+                }
+                _ => unreachable!(),
+            }
             let emitted = emitted_names(&src, macro_name);
             total_found += emitted.len();
             for name in &emitted {

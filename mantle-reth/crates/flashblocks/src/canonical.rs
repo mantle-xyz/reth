@@ -52,6 +52,8 @@ pub async fn forward_canonical_state<N, F>(
     N: NodePrimitives,
     F: FnMut(CanonStateNotification<N>),
 {
+    metrics::counter!("mantle.canon.notifications_lagged_total", "subscriber" => subscriber)
+        .increment(0);
     loop {
         match receiver.recv().await {
             Ok(notification) => {
@@ -148,6 +150,38 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+
+    #[test]
+    fn forwarder_seeds_its_label_before_the_first_notification() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (sender, receiver) = broadcast::channel(2);
+                let forwarder = forward_canonical_state::<OpPrimitives, _>(
+                    "flashblocks_overlay",
+                    receiver,
+                    |_| {},
+                );
+                tokio::pin!(forwarder);
+                assert!(futures::poll!(&mut forwarder).is_pending());
+                let series = concat!(
+                    "mantle_canon_notifications_lagged_total",
+                    r#"{subscriber="flashblocks_overlay"}"#,
+                );
+                let scrape = handle.render();
+                assert!(scrape.contains(&format!("{series} 0")), "{scrape}");
+                for _ in 0..5 {
+                    sender.send(notification()).unwrap();
+                }
+                drop(sender);
+                forwarder.await;
+                let scrape = handle.render();
+                assert!(scrape.contains(&format!("{series} 3")), "{scrape}");
+            })
+        });
+    }
 
     /// A notification carrying nothing: these tests are about the loop, not
     /// about what the loop hands on.

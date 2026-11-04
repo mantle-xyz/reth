@@ -125,6 +125,7 @@ where
     /// terminates (typically at node shutdown, when the provider's
     /// broadcast sender is dropped).
     pub async fn run(self) {
+        crate::metrics_seed::seed_canonical_subscriber_metrics("preconf_canon");
         let mut receiver = self.provider.subscribe_to_canonical_state();
         // Seeded with the head, read after subscribing so no notification
         // falls between the two. Unseeded, the first build after a restart

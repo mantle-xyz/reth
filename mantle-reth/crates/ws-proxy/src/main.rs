@@ -306,9 +306,8 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
         "using upstream URI",
     );
 
-    // `_rec` keeps the channel alive through any moment with no clients, and is
-    // discounted from the connection gauge by `upstream_listener`.
-    let (sender, _rec) = broadcast::channel(args.message_buffer_size);
+    // Retain receivers only for real clients, so channel length measures their backlog.
+    let (sender, _) = broadcast::channel(args.message_buffer_size);
     let listener = upstream_listener(sender.clone(), args.enable_compression);
 
     let token = CancellationToken::new();
@@ -349,10 +348,11 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
                         match ping_sender.send(Message::Ping(vec![].into())) {
                             Ok(_) => {
                                 trace!(target: "ws-proxy", "sent ping to all clients");
-                                Metrics::broadcast_queue_size().set(ping_sender.len() as f64);
+                                Metrics::refresh_broadcast_queue_size(&ping_sender);
                             }
-                            Err(error) => {
-                                error!(target: "ws-proxy", %error, "failed to ping clients");
+                            Err(_) => {
+                                // No clients are currently subscribed.
+                                Metrics::refresh_broadcast_queue_size(&ping_sender);
                             }
                         }
                     }

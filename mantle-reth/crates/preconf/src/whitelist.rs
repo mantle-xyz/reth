@@ -1022,6 +1022,7 @@ pub async fn run_whitelist_watcher<Pr, N>(
     // no polling, only `should_reload` and `retry_pending`, and neither fires
     // for a notification that never arrived. Every gauge keeps reporting the
     // last good read, so a stuck node is indistinguishable from a healthy one.
+    crate::metrics_seed::seed_canonical_subscriber_metrics("preconf_whitelist");
     let mut receiver = provider.subscribe_to_canonical_state();
     info!(target: "mantle::preconf::whitelist", %contract, "whitelist watcher started");
 
@@ -1056,7 +1057,7 @@ pub async fn run_whitelist_watcher<Pr, N>(
                     "mantle.canon.notifications_lagged_total",
                     "subscriber" => "preconf_whitelist",
                 )
-                .increment(1);
+                .increment(skipped);
                 warn!(
                     target: "mantle::preconf::whitelist",
                     skipped,

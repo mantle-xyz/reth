@@ -99,6 +99,11 @@ impl MantleFlashblocksPublisher {
         let slots = Arc::new(Semaphore::new(cfg.max_subscribers));
         let accepting =
             accept_loop(listener, pipe.clone(), Arc::clone(&ring), slots, cancel.child_token());
+        let accepting = async move {
+            // Binding can precede recorder installation; serving starts after it.
+            crate::metrics_seed::seed_flashblocks_endpoint_metrics();
+            accepting.await;
+        };
 
         info!(target: "mantle::preconf::flashblocks", %local_addr, "flashblocks publisher bound");
 
@@ -287,6 +292,28 @@ mod tests {
 
     use super::MantleFlashblocksPublisher;
     use crate::flashblocks::config::FlashblockProducerConfig;
+
+    #[test]
+    fn serving_registers_endpoint_gauges_without_resetting_existing_values() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::seed_preconf_metrics();
+                assert!(!handle.render().contains("flashblocks_endpoint_serving"));
+                let _publisher = publisher(8, 4);
+                tokio::task::yield_now().await;
+                let scrape = handle.render();
+                assert!(scrape.contains("flashblocks_endpoint_serving 0"), "{scrape}");
+                assert!(scrape.contains("flashblocks_subscribers 0"), "{scrape}");
+                metrics::gauge!("flashblocks.subscribers").set(2.0);
+                crate::seed_preconf_metrics();
+                crate::metrics_seed::seed_flashblocks_endpoint_metrics();
+                assert!(handle.render().contains("flashblocks_subscribers 2"));
+            })
+        });
+    }
 
     /// Bind on an OS-assigned port so tests never collide, and drive the
     /// accept loop the way the node wiring will.
