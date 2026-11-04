@@ -144,7 +144,7 @@ where
                 // Dropped notifications cost this handler the two things it
                 // does per notification that have no catch-up pass:
                 // `mark_committed` for the blocks it did not see, and
-                // `observe_reorg` for a reorg it did not see. Both can leave a
+                // `reinject_reverted` for a reorg it did not see. Both can leave a
                 // promised commitment without a record, which a later reorg
                 // then cannot put back. Loud rather than silent, because
                 // nothing downstream can tell this happened.
@@ -170,7 +170,7 @@ where
             // contention is the only plausible way this handler falls behind.
             let started = Instant::now();
             // Reverted chain — withdraw the "seen on chain" observation and
-            // emit the drift signal; see `observe_reorg`.
+            // emit the drift signal; see `reinject_reverted`.
             if let Some(old) = notif.reverted() {
                 let new_chain: HashSet<TxHash> =
                     notif.committed().transaction_hashes().copied().collect();
