@@ -146,13 +146,13 @@ where
         + Send
         + Sync,
 {
-    /// `Unknown` on any miss once the transaction-lookup segment has **ever** been pruned:
-    /// `JournalEntry::block_height` is only a prediction, so "the prune missed it" cannot be
-    /// decided. Pruning is thus incompatible with preconf; until it first runs, a miss reads `No`.
     fn account_nonce(&self, sender: &Address) -> Option<u64> {
         self.0.latest().ok()?.account_nonce(sender).ok().flatten()
     }
 
+    /// `Unknown` on any miss once the transaction-lookup segment has **ever** been pruned:
+    /// `JournalEntry::block_height` is only a prediction, so "the prune missed it" cannot be
+    /// decided. Pruning is thus incompatible with preconf; until it first runs, a miss reads `No`.
     fn commitment_on_chain(&self, hash: &alloy_primitives::TxHash) -> OnChain {
         // `_with_meta` rather than the plain lookup: the caller needs the block
         // number to start the retention clock, and it sits on the same trait, so

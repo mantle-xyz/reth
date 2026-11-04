@@ -135,13 +135,12 @@ where
                         'conn: loop {
                             tokio::select! {
                                 Some(msg) = read.next() => {
-                                    Metrics::upstream_messages().increment(1);
-
                                     match msg {
                                         Ok(msg @ (Message::Binary(_) | Message::Text(_))) => {
                                             let bytes = msg.into_data();
                                             match MantleFlashblockPayload::try_decode_message(bytes.as_ref()) {
                                                 Ok(payload) => {
+                                                    Metrics::upstream_messages().increment(1);
                                                     // Recorded before dispatch so a drop right
                                                     // after resumes past this slice.
                                                     last_position = Some(StreamPosition {
@@ -324,6 +323,7 @@ mod tests {
                     websocket.send(Message::text(json)).await.unwrap();
                     websocket.send(Message::binary(vec![0xff; 32])).await.unwrap();
                     websocket.send(Message::Ping(Default::default())).await.unwrap();
+                    websocket.send(Message::Pong(Default::default())).await.unwrap();
                     websocket.close(None).await.unwrap();
                     let (stream, _) = listener.accept().await.unwrap();
                     let mut uri = String::new();
@@ -356,6 +356,10 @@ mod tests {
                 );
                 assert!(
                     scrape.contains("flashblocks_consumer_upstream_errors_total 0"),
+                    "{scrape}"
+                );
+                assert!(
+                    scrape.contains("flashblocks_consumer_upstream_messages_total 1"),
                     "{scrape}"
                 );
                 assert!(rx.try_recv().is_err(), "malformed data is never delivered");

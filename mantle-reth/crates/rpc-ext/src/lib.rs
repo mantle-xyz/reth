@@ -454,13 +454,13 @@ const MAX_BLOCK_RANGE: u64 = 1000;
 /// which fills `args.Gas` with `RPCGasCap` before `ToTransaction` for L1 cost estimation.
 const GETH_MANTLE_RPC_GAS_CAP: u64 = 0x4000000000000;
 
-/// Caps gas for the L1 cost envelope, matching geth's `CallDefaults` behavior.
 /// The canonical head's number and hash, for checking that a pending preview
 /// still extends it; `None` when it cannot be read.
 fn canonical_head(provider: &impl BlockNumReader) -> Option<(u64, B256)> {
     provider.chain_info().ok().map(|head| (head.best_number, head.best_hash))
 }
 
+/// Caps gas for the L1 cost envelope, matching geth's `CallDefaults` behavior.
 fn capped_gas_for_l1_envelope(request_gas: Option<u64>) -> u64 {
     request_gas.map(|gas| gas.min(GETH_MANTLE_RPC_GAS_CAP)).unwrap_or(GETH_MANTLE_RPC_GAS_CAP)
 }

@@ -5,7 +5,7 @@ use std::time::Instant;
 use axum::extract::ws::Message;
 use futures::{SinkExt, stream::StreamExt};
 use tokio::{
-    sync::broadcast::{Sender, error::RecvError},
+    sync::broadcast::{Receiver, Sender, error::RecvError},
     time::{Duration, interval, timeout},
 };
 use tracing::{debug, info, trace, warn};
@@ -40,6 +40,42 @@ fn should_forward(filter: &FilterType, msg: &Message, compressed: bool) -> bool 
     }
 }
 
+/// Owns a real client's receiver and keeps metrics correct on every exit,
+/// including cancellation of the subscription task.
+struct ClientSubscription {
+    receiver: Option<Receiver<Message>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+    sender: Sender<Message>,
+}
+
+impl ClientSubscription {
+    fn new(sender: Sender<Message>) -> Self {
+        let receiver = Some(sender.subscribe());
+        Metrics::active_connections().increment(1.0);
+        Metrics::new_connections().increment(1);
+        Self { receiver, reader: None, sender }
+    }
+
+    async fn recv(&mut self) -> Result<Message, RecvError> {
+        let result = self.receiver.as_mut().expect("receiver exists until drop").recv().await;
+        Metrics::refresh_broadcast_queue_size(&self.sender);
+        result
+    }
+}
+
+impl Drop for ClientSubscription {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        // Release this receiver before sampling the remaining clients' backlog.
+        drop(self.receiver.take());
+        Metrics::refresh_broadcast_queue_size(&self.sender);
+        Metrics::active_connections().decrement(1.0);
+        Metrics::closed_connections().increment(1);
+    }
+}
+
 /// Manages broadcast subscriptions for connected `WebSocket` clients.
 #[derive(Clone, Debug)]
 pub struct Registry {
@@ -66,8 +102,7 @@ impl Registry {
     pub async fn subscribe(&self, client: ClientConnection) {
         info!(message = "subscribing client", client = client.id());
 
-        let mut receiver = self.sender.subscribe();
-        Metrics::new_connections().increment(1);
+        let mut receiver = ClientSubscription::new(self.sender.clone());
 
         let filter = client.filter.clone();
         let compressed = self.compressed;
@@ -75,7 +110,7 @@ impl Registry {
         let (mut ws_sender, ws_receiver) = client.websocket.split();
 
         let (pong_error_tx, mut pong_error_rx) = tokio::sync::oneshot::channel();
-        let client_reader = self.start_reader(ws_receiver, client_id.clone(), pong_error_tx);
+        receiver.reader = Some(self.start_reader(ws_receiver, client_id.clone(), pong_error_tx));
 
         loop {
             tokio::select! {
@@ -142,9 +177,6 @@ impl Registry {
                 }
             }
         }
-
-        client_reader.abort();
-        Metrics::closed_connections().increment(1);
 
         info!(message = "client disconnected", client = client_id);
     }
@@ -231,6 +263,134 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_metrics_follow_clients_without_upstream_traffic() {
+        use crate::{InMemoryRateLimit, RateLimit};
+        use axum::{Router, extract::WebSocketUpgrade, routing::get};
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use std::sync::Arc;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                Metrics::init();
+                let (sender, _) = tokio::sync::broadcast::channel(4);
+                let registry = Registry::new(sender, false, false, 1000, Duration::from_secs(1));
+                let limiter = Arc::new(InMemoryRateLimit::new(2, 2));
+                let (task_tx, mut tasks) = tokio::sync::mpsc::unbounded_channel();
+                let router = Router::new().route(
+                    "/",
+                    get(move |upgrade: WebSocketUpgrade| {
+                        let registry = registry.clone();
+                        let ticket =
+                            limiter.clone().try_acquire("127.0.0.1".parse().unwrap()).unwrap();
+                        let task_tx = task_tx.clone();
+                        async move {
+                            upgrade.on_upgrade(move |socket| async move {
+                                let client = ClientConnection::new(
+                                    "127.0.0.1".parse().unwrap(),
+                                    ticket,
+                                    socket,
+                                    FilterType::None,
+                                );
+                                task_tx
+                                    .send(tokio::spawn(
+                                        async move { registry.subscribe(client).await },
+                                    ))
+                                    .unwrap();
+                            })
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("ws://{}/", listener.local_addr().unwrap());
+                let server =
+                    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+                for cancel in [false, true] {
+                    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+                    let task = tasks.recv().await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !handle.render().contains("flashblocks_proxy_active_connections 1") {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the connection must be counted without an upstream message");
+                    if cancel {
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                    } else {
+                        socket.close(None).await.unwrap();
+                        tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+                    }
+                    let scrape = handle.render();
+                    assert!(scrape.contains("flashblocks_proxy_active_connections 0"), "{scrape}");
+                }
+                assert!(handle.render().contains("flashblocks_proxy_closed_connections 2"));
+                server.abort();
+            })
+        });
+    }
+
+    #[test]
+    fn backlog_tracks_the_slowest_real_client_and_clears_on_receive_or_drop() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                Metrics::init();
+                let (sender, _) = tokio::sync::broadcast::channel(4);
+                let publish = crate::upstream_listener(sender.clone(), false);
+                let assert_depth = |depth| {
+                    let scrape = handle.render();
+                    assert!(
+                        scrape
+                            .contains(&format!("flashblocks_proxy_broadcast_queue_size {depth}\n")),
+                        "{scrape}"
+                    );
+                };
+                publish("no clients".into());
+                assert_depth(0);
+                let mut fast = ClientSubscription::new(sender.clone());
+                let mut slow = ClientSubscription::new(sender.clone());
+                for _ in 0..3 {
+                    publish("slice".into());
+                }
+                assert_depth(3);
+                for _ in 0..3 {
+                    fast.recv().await.unwrap();
+                }
+                assert_depth(3);
+                slow.recv().await.unwrap();
+                assert_depth(2);
+                drop(slow);
+                assert_depth(0);
+                publish("slice".into());
+                assert_depth(1);
+                fast.recv().await.unwrap();
+                assert_depth(0);
+                drop(fast);
+                publish("no clients".into());
+                assert_depth(0);
+                // The channel remains usable after its last receiver disconnects.
+                let mut later = ClientSubscription::new(sender);
+                publish("new slice".into());
+                assert_eq!(later.recv().await.unwrap(), Message::Binary("new slice".into()));
+                assert_depth(0);
+                for _ in 0..7 {
+                    publish("overflow".into());
+                }
+                assert_depth(4);
+                assert!(matches!(later.recv().await, Err(RecvError::Lagged(3))));
+                drop(later);
+                assert_depth(0);
+            })
+        });
+    }
 
     const WATCHED: &str = "0x4200000000000000000000000000000000000010";
 
