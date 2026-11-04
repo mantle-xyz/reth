@@ -67,6 +67,108 @@ async fn estimate_gas_simple_transfer_via_rpc() {
     .await;
 }
 
+/// The access list and gas quote returned by `eth_createAccessList` must be usable together.
+/// Legacy-style requests used to rerun with the discovered list but retain a Legacy internal
+/// transaction type, omitting its intrinsic cost and warming. Exercise the RPC conversion too:
+/// an explicit type without an initial list can still be inferred as Legacy internally.
+#[tokio::test]
+async fn create_access_list_quote_executes_with_generated_list_via_rpc() {
+    with_mantle_rpc_client(|client| async move {
+        const TARGET: &str = "0x1000000000000000000000000000000000000010";
+        const SLOT_0: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        const SLOT_1: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        const EXPECTED: &str = "0x0000000000000000000000000000000000000000000000000000000000000003";
+
+        // SLOAD(0) + SLOAD(1), returning the sum. Overrides remain local to each RPC request.
+        let overrides = serde_json::json!({ TARGET: {
+            "code": "0x6000546001540160005260206000f3",
+            "state": { SLOT_0: SLOT_1, SLOT_1:
+                "0x0000000000000000000000000000000000000000000000000000000000000002" }
+        }});
+        let base = serde_json::json!({
+            "from": FUNDED, "to": TARGET, "data": "0x", "gas": "0xf4240"
+        });
+        let positive: String = client
+            .request("eth_call", vec![base.clone(), serde_json::json!("latest"), overrides.clone()])
+            .await
+            .expect("two-slot fixture should execute before access-list generation");
+        assert_eq!(positive, EXPECTED);
+
+        let scenarios = [
+            ("implicit_legacy", serde_json::json!({})),
+            ("explicit_type1", serde_json::json!({ "type": "0x1" })),
+            (
+                "type2",
+                serde_json::json!({
+                    "type": "0x2", "maxFeePerGas": "0x3b9aca00",
+                    "maxPriorityFeePerGas": "0x0"
+                }),
+            ),
+            (
+                "initial_access_list",
+                serde_json::json!({ "accessList": [{
+                    "address": TARGET, "storageKeys": [SLOT_0, SLOT_1]
+                }] }),
+            ),
+        ];
+        for (name, fields) in scenarios {
+            let mut request = base.clone();
+            request
+                .as_object_mut()
+                .expect("transaction object")
+                .extend(fields.as_object().expect("scenario fields").clone());
+            let quote: serde_json::Value = client
+                .request(
+                    "eth_createAccessList",
+                    vec![request.clone(), serde_json::json!("latest"), overrides.clone()],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{name}: access-list generation failed: {error}"));
+            assert!(
+                quote.get("error").is_none_or(serde_json::Value::is_null),
+                "{name}: access-list execution failed: {quote}"
+            );
+            let list = quote["accessList"].as_array().expect("generated access list");
+            let target = list
+                .iter()
+                .find(|entry| {
+                    entry["address"]
+                        .as_str()
+                        .is_some_and(|address| address.eq_ignore_ascii_case(TARGET))
+                })
+                .unwrap_or_else(|| panic!("{name}: target missing from generated list: {quote}"));
+            let slots = target["storageKeys"].as_array().expect("target storage keys");
+            for slot in [SLOT_0, SLOT_1] {
+                assert!(
+                    slots.iter().any(|key| key.as_str() == Some(slot)),
+                    "{name}: missing target slot {slot}: {quote}"
+                );
+            }
+
+            let storage_keys: usize = list
+                .iter()
+                .map(|entry| entry["storageKeys"].as_array().expect("storage keys").len())
+                .sum();
+            let intrinsic = U256::from(21_000u64) +
+                U256::from(list.len()) * U256::from(2_400u64) +
+                U256::from(storage_keys) * U256::from(1_900u64);
+            let gas: U256 = serde_json::from_value(quote["gasUsed"].clone()).expect("gas quote");
+            assert!(gas >= intrinsic, "{name}: quote {gas} is below list intrinsic {intrinsic}");
+
+            request["accessList"] = quote["accessList"].clone();
+            request["gas"] = quote["gasUsed"].clone();
+            let result: String = client
+                .request("eth_call", vec![request, serde_json::json!("latest"), overrides.clone()])
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{name}: generated quote/list cannot execute: {error}")
+                });
+            assert_eq!(result, EXPECTED, "{name}: generated quote/list returned the wrong value");
+        }
+    })
+    .await;
+}
+
 /// A value transfer the caller cannot afford is rejected up front with an
 /// "insufficient funds for transfer" error — this is the `value >= balance` pre-check
 /// in the Mantle `estimate_gas_at` override (op-geth `gasestimator.go` clause 6). Like
