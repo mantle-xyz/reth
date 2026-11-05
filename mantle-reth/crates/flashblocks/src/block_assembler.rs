@@ -1,6 +1,7 @@
 //! Block assembly from flashblocks.
 
 use alloy_consensus::{Header, Sealed, proofs};
+use alloy_eips::Encodable2718;
 use alloy_primitives::{B256, Bytes, bytes::BufMut};
 use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
 use alloy_rpc_types_eth::Withdrawal;
@@ -121,6 +122,21 @@ impl BlockAssembler {
         }
         .try_into_block()
         .map_err(|e| ExecutionError::BlockConversion(e.to_string()))?;
+
+        // Envelope conversion decodes exactly, but does not require a canonical encoding.
+        // Keep the original trie bytes consistent with the decoded transaction identities.
+        for (raw, transaction) in flashblocks
+            .iter()
+            .flat_map(|flashblock| &flashblock.diff.transactions)
+            .zip(&block.body.transactions)
+        {
+            if transaction.encoded_2718().as_slice() != raw.as_ref() {
+                return Err(ExecutionError::BlockConversion(
+                    "non-canonical transaction encoding".to_owned(),
+                )
+                .into());
+            }
+        }
 
         // The final hash is not known until the block is sealed by the sequencer.
         let sealed_header = block.header.clone().seal(B256::ZERO);

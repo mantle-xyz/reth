@@ -4,7 +4,10 @@ use std::{fmt::Debug, sync::Arc};
 
 use alloy_consensus::{Block, BlockHeader};
 use alloy_eips::{
-    eip1559::BaseFeeParams, eip2718::Decodable2718, eip4895::Withdrawals, eip7685::Requests,
+    eip1559::BaseFeeParams,
+    eip2718::{Decodable2718, Encodable2718},
+    eip4895::Withdrawals,
+    eip7685::Requests,
 };
 use alloy_primitives::{Address, B64, B256, Bytes, U256, keccak256};
 use alloy_rlp::Encodable;
@@ -28,7 +31,7 @@ use reth_primitives_traits::{
 
 /// Re-export for use in downstream arguments.
 pub use op_alloy_rpc_types_engine::{OpExecutionData, OpPayloadAttributes};
-use reth_optimism_primitives::OpPrimitives;
+use reth_optimism_primitives::{OpPrimitives, decode_2718_canonical};
 use reth_payload_primitives::EngineApiMessageVersion;
 
 /// Newtype wrapper around [`OpExecutionData`] to implement
@@ -209,8 +212,8 @@ impl<T> serde::Serialize for OpPayloadBuilderAttributes<T> {
     }
 }
 
-impl<'de, T: Decodable2718 + Send + Sync + Debug + Unpin + 'static> serde::Deserialize<'de>
-    for OpPayloadBuilderAttributes<T>
+impl<'de, T: Decodable2718 + Encodable2718 + Send + Sync + Debug + Unpin + 'static>
+    serde::Deserialize<'de> for OpPayloadBuilderAttributes<T>
 {
     fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
         // This type is never deserialized in practice; the PayloadAttributes trait bound
@@ -223,7 +226,7 @@ impl<'de, T: Decodable2718 + Send + Sync + Debug + Unpin + 'static> serde::Deser
     }
 }
 
-impl<T: Decodable2718 + Send + Sync + Debug + Clone + Unpin + 'static>
+impl<T: Decodable2718 + Encodable2718 + Send + Sync + Debug + Clone + Unpin + 'static>
     reth_payload_primitives::PayloadAttributes for OpPayloadBuilderAttributes<T>
 {
     fn payload_id(&self, _parent_hash: &B256) -> PayloadId {
@@ -292,7 +295,9 @@ impl<T> OpPayloadBuilderAttributes<T> {
     }
 }
 
-impl<T: Decodable2718 + Send + Sync + Debug + Unpin + 'static> OpPayloadBuilderAttributes<T> {
+impl<T: Decodable2718 + Encodable2718 + Send + Sync + Debug + Unpin + 'static>
+    OpPayloadBuilderAttributes<T>
+{
     /// Creates a new payload builder for the given parent block and the attributes.
     ///
     /// Derives the unique [`PayloadId`] for the given parent and attributes
@@ -307,9 +312,7 @@ impl<T: Decodable2718 + Send + Sync + Debug + Unpin + 'static> OpPayloadBuilderA
             .transactions
             .unwrap_or_default()
             .into_iter()
-            .map(|data| {
-                Decodable2718::decode_2718_exact(data.as_ref()).map(|tx| WithEncoded::new(data, tx))
-            })
+            .map(|data| decode_2718_canonical(data.as_ref()).map(|tx| WithEncoded::new(data, tx)))
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
@@ -341,9 +344,7 @@ impl<T: Decodable2718 + Send + Sync + Debug + Unpin + 'static> OpPayloadBuilderA
             .transactions
             .unwrap_or_default()
             .into_iter()
-            .map(|data| {
-                Decodable2718::decode_2718_exact(data.as_ref()).map(|tx| WithEncoded::new(data, tx))
-            })
+            .map(|data| decode_2718_canonical(data.as_ref()).map(|tx| WithEncoded::new(data, tx)))
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
@@ -705,6 +706,44 @@ mod tests {
     use reth_optimism_primitives::OpTransactionSigned;
     use reth_payload_primitives::EngineApiMessageVersion;
     use std::str::FromStr;
+
+    #[test]
+    fn payload_attributes_reject_a_type_prefixed_legacy_transaction() {
+        use alloy_consensus::{SignableTransaction, TxLegacy};
+        use alloy_primitives::Signature;
+
+        let canonical = TxLegacy::default().into_signed(Signature::test_signature()).encoded_2718();
+        let attributes = |bytes: Vec<u8>| OpPayloadAttributes {
+            transactions: Some(vec![bytes.into()]),
+            ..Default::default()
+        };
+        let decode = |attributes| {
+            OpPayloadBuilderAttributes::<OpTransactionSigned>::try_new(
+                B256::ZERO,
+                attributes,
+                EngineApiMessageVersion::V3 as u8,
+            )
+        };
+        let decode_with_id = |attributes| {
+            OpPayloadBuilderAttributes::<OpTransactionSigned>::from_rpc_attrs(
+                B256::ZERO,
+                PayloadId::default(),
+                attributes,
+            )
+        };
+        assert!(decode(attributes(canonical.clone())).is_ok());
+        assert!(decode_with_id(attributes(canonical.clone())).is_ok());
+        let mut prefixed = vec![0];
+        prefixed.extend_from_slice(&canonical);
+        assert!(
+            decode(attributes(prefixed.clone())).is_err(),
+            "payload attributes must retain the transaction's canonical wire encoding"
+        );
+        assert!(
+            decode_with_id(attributes(prefixed)).is_err(),
+            "precomputed payload IDs must enforce the same encoding requirement"
+        );
+    }
 
     #[test]
     fn test_payload_id_parity_op_geth() {
