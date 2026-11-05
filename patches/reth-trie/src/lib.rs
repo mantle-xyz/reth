@@ -13,6 +13,12 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// This crate is a vendored copy of upstream `reth-trie`, which keeps the `unnameable-types`
+// lint disabled (see reth's root Cargo.toml: `# rust.unnameable-types = "warn"`). Upstream ships
+// `progress::IntermediateRootState` as a `pub` type in a module re-exported only in part, so it
+// is reachable but not nameable. The Mantle workspace enables that lint fork-wide, so allow it
+// here to stay aligned with upstream rather than diverging the vendored source.
+#![allow(unnameable_types)]
 
 /// The implementation of forward-only in-memory cursor.
 pub mod forward_cursor;
