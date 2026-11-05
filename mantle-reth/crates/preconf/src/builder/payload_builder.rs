@@ -94,9 +94,6 @@ use crate::{
 /// Stage 2 — the sequencer transactions (deposits, L1 info, system txs), plus
 /// the whitelist updates any of them carried.
 ///
-/// With `no_tx_pool`, every attribute transaction is mandatory derivation input;
-/// invalid transactions must fail the build instead of being skipped.
-///
 /// **Replicated from `OpPayloadBuilderCtx::execute_sequencer_transactions`**
 /// (`op-reth/crates/payload/src/builder.rs` as of this fork), with
 /// `execute_transaction` → `execute_transaction_with_result_closure` so the
@@ -118,7 +115,6 @@ use crate::{
 /// add-then-remove of the same rule resolve backwards.
 fn execute_sequencer_transactions_watching_whitelist<N, B>(
     sequencer_txs: &[WithEncoded<TxTy<N>>],
-    no_tx_pool: bool,
     builder: &mut B,
     fifo: &PreconfTxSet,
     whitelist_contract: Option<Address>,
@@ -164,7 +160,7 @@ where
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
                     ..
-                })) if !no_tx_pool => {
+                })) => {
                     debug!(
                         target: "mantle::preconf::payload_builder",
                         %error, ?recovered,
@@ -2212,7 +2208,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // function for why the per-transaction execution result is needed here.
         let (mut info, whitelist_deltas) = execute_sequencer_transactions_watching_whitelist::<N, _>(
             ctx.attributes().sequencer_transactions(),
-            ctx.attributes().no_tx_pool(),
             &mut builder,
             &self.fifo,
             crate::whitelist::wants_whitelist(&self.cfg),

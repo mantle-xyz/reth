@@ -999,9 +999,6 @@ where
     /// transaction is appended to `vec` in commit order. `None` skips the
     /// recording. The function never reads or clears the vec; the caller controls
     /// capacity and lifecycle.
-    ///
-    /// With `no_tx_pool`, every attribute transaction is mandatory derivation input;
-    /// invalid transactions must fail the build instead of being skipped.
     pub fn execute_sequencer_transactions(
         &self,
         builder: &mut impl BlockBuilder<Primitives = Evm::Primitives>,
@@ -1038,7 +1035,7 @@ where
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
                     ..
-                })) if !self.attributes().no_tx_pool() => {
+                })) => {
                     trace!(target: "payload_builder", %error, ?sequencer_tx, "Error in sequencer transaction, skipping.");
                     continue;
                 }
