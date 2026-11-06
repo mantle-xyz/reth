@@ -420,6 +420,8 @@ url = "2.5"
 # Uncomment when patches/ crates are populated:
 [patch."https://github.com/paradigmxyz/reth"]
 reth-trie-common = { path = "patches/reth-trie-common" }
+# Backport of paradigmxyz/reth#28264 (trie iterator seek boundary fix); drop once the pinned rev includes it.
+reth-trie = { path = "patches/reth-trie" }
 # reth-rpc = { path = "patches/reth-rpc" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
