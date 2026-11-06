@@ -6,6 +6,14 @@ the block is accepted.
 
 ## Subscriptions
 
+The subscription names `newSubblocks` and `newSubblockTransactions` are aliases
+for `newFlashblocks` and `newFlashblockTransactions`, respectively. Both original
+names remain supported. Aliases use the same parameters and notification formats:
+the block subscription returns complete preview snapshots, while the transaction
+subscription returns transactions added by the latest slice. Transaction
+subscriptions default to hashes; `true` requests full objects with logs and
+receipt fields, and a log filter object selects transactions with matching logs.
+
 `eth_subscribe("newFlashblocks")` returns the latest complete RPC preview block
 after each update. Each notification is a snapshot, not an incremental slice.
 The block hash is zero because the preview has no canonical block hash yet.
