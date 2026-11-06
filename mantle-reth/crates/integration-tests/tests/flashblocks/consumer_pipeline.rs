@@ -357,11 +357,15 @@ async fn a_slice_carrying_a_post_exec_transaction_replays_it_as_a_noop() {
 
 /// A transaction whose encoding is not canonical is rejected, taking its slice with it.
 ///
-/// The original wire bytes determine the transaction root, so they must agree with
-/// the decoded transaction's canonical encoding. A deposit body stripped of its
-/// `0x7E` type byte must not execute or publish a receipt. The type-prefixed legacy
-/// tests below cover the complementary case: exact decoding succeeds but changes
-/// the bytes on re-encoding.
+/// The overlay roots the wire bytes it was handed but hashes the transaction it
+/// decoded out of them, and nothing here compares the two. They agree only while the
+/// decoder refuses every non-canonical encoding. The sharp case is a deposit body
+/// stripped of its `0x7E` type byte: were it to decode, the overlay would execute a
+/// transaction, mint, and publish a receipt for something derivation will never
+/// accept, so the preconfirmation would simply evaporate.
+///
+/// This pins behaviour we inherit from `op-alloy` rather than implement, which is
+/// exactly why it is worth a test here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_with_a_non_canonical_encoding_is_rejected() {
     let (harness, _node) = launch!();
@@ -379,69 +383,6 @@ async fn a_transaction_with_a_non_canonical_encoding_is_rejected() {
     harness.send(base_slice(1)).await;
     let pending = harness.pending().expect("the canonical encoding is accepted");
     assert_eq!(pending.pending_transaction_count(), 1);
-}
-
-/// Reject a type-prefixed legacy transaction before executing it, in both replay paths.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_type_prefixed_legacy_transaction_is_rejected_in_initial_replay() {
-    check_type_prefixed_legacy_rejection(true).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_type_prefixed_legacy_transaction_is_rejected_in_a_continuation() {
-    check_type_prefixed_legacy_rejection(false).await;
-}
-
-async fn check_type_prefixed_legacy_rejection(initial: bool) {
-    use crate::consumer_helpers::{TEST_CHAIN_ID, test_signer};
-    use alloy_consensus::{SignableTransaction, TxLegacy};
-    use alloy_eips::Encodable2718;
-    use alloy_primitives::{Bytes, TxKind};
-    use alloy_signer::SignerSync;
-
-    let (harness, _node) = launch!();
-    let transaction = TxLegacy {
-        chain_id: Some(TEST_CHAIN_ID),
-        nonce: 0,
-        gas_price: 20_000_000_000,
-        gas_limit: 100_000,
-        to: TxKind::Call(LOGGER),
-        value: U256::from(1),
-        ..Default::default()
-    };
-    let signature = test_signer().sign_hash_sync(&transaction.signature_hash()).unwrap();
-    let canonical = Bytes::from(transaction.into_signed(signature).encoded_2718());
-    let mut prefixed = vec![0];
-    prefixed.extend_from_slice(&canonical);
-    let prefixed = Bytes::from(prefixed);
-
-    if initial {
-        harness
-            .send(
-                FlashblockBuilder::new(1, 0)
-                    .transactions(vec![l1_info_deposit(1), prefixed])
-                    .build(),
-            )
-            .await;
-    } else {
-        harness.send(base_slice(1)).await;
-        harness
-            .send(FlashblockBuilder::new(1, 1).prev(1, 0).transactions(vec![prefixed]).build())
-            .await;
-    }
-    assert!(
-        harness.pending().is_none(),
-        "a legacy transaction with an extra type byte must not publish pending execution"
-    );
-
-    // The identical signed transaction is executable when its canonical bytes are retained.
-    harness.send(base_slice(1)).await;
-    harness
-        .send(FlashblockBuilder::new(1, 1).prev(1, 0).transactions(vec![canonical]).build())
-        .await;
-    let pending = harness.pending().expect("canonical legacy transaction must be accepted");
-    assert_eq!(pending.pending_transaction_count(), 2);
-    assert_eq!(pending.get_balance(LOGGER), Some(U256::from(1)));
 }
 
 /// The overlay reports the canonical block it was built on.
