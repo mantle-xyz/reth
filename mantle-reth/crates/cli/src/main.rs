@@ -225,6 +225,7 @@ where
     // extensions itself (see `install_mantle_rpc_extensions`) rather than letting
     // `MantleNode::add_ons` own that slot.
     let sequencer_url = node.op_node.args.sequencer.clone();
+    let sequencer_headers = node.op_node.args.sequencer_headers.clone();
     let preconf = node.preconf.clone();
     let flashblocks_cfg = node.flashblocks.clone();
 
@@ -251,6 +252,7 @@ where
         &args,
         mdbx,
         sequencer_url,
+        sequencer_headers,
         preconf,
         flashblocks_cfg,
     )

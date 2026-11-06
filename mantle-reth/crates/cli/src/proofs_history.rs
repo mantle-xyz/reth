@@ -42,7 +42,7 @@ use tracing::info;
 ///
 /// Both entry points call this; keeping the body in one place is the point of the module.
 macro_rules! install_proofs_history {
-    ($builder:expr, $args:expr, $mdbx:expr, $sequencer_url:expr, $preconf:expr, $flashblocks_cfg:expr) => {{
+    ($builder:expr, $args:expr, $mdbx:expr, $sequencer_url:expr, $sequencer_headers:expr, $preconf:expr, $flashblocks_cfg:expr) => {{
         let storage: OpProofsStorage<Arc<_>> = $mdbx.into();
         let storage_exec = storage.clone();
 
@@ -50,7 +50,7 @@ macro_rules! install_proofs_history {
             *$args;
 
         let sequencer_url = $sequencer_url;
-        let sequencer_headers = $args.sequencer_headers.clone();
+        let sequencer_headers = $sequencer_headers;
         let preconf = $preconf;
         let flashblocks_cfg = $flashblocks_cfg;
 
@@ -116,6 +116,7 @@ pub fn with_proofs_history<T, CB, AO, S>(
     args: &RollupArgs,
     mdbx: Arc<S>,
     sequencer_url: Option<String>,
+    sequencer_headers: Vec<String>,
     preconf: Option<Arc<mantle_reth_preconf::PreconfServiceBuilder>>,
     flashblocks_cfg: Option<mantle_reth_flashblocks::FlashblocksConfig>,
 ) -> NodeBuilderWithComponents<T, CB, AO>
@@ -146,7 +147,15 @@ where
     ErrorObject<'static>: From<<AO::EthApi as reth_rpc_eth_api::EthApiTypes>::Error>,
     S: OpProofsStore + DatabaseMetrics + Send + Sync + 'static,
 {
-    install_proofs_history!(builder, args, mdbx, sequencer_url, preconf, flashblocks_cfg)
+    install_proofs_history!(
+        builder,
+        args,
+        mdbx,
+        sequencer_url,
+        sequencer_headers,
+        preconf,
+        flashblocks_cfg
+    )
 }
 
 /// Same as [`with_proofs_history`], for a builder that already carries a launch context — the
@@ -160,6 +169,7 @@ pub fn with_proofs_history_launch_ctx<T, CB, AO, S>(
     args: &RollupArgs,
     mdbx: Arc<S>,
     sequencer_url: Option<String>,
+    sequencer_headers: Vec<String>,
     preconf: Option<Arc<mantle_reth_preconf::PreconfServiceBuilder>>,
     flashblocks_cfg: Option<mantle_reth_flashblocks::FlashblocksConfig>,
 ) -> WithLaunchContext<NodeBuilderWithComponents<T, CB, AO>>
@@ -190,7 +200,15 @@ where
     ErrorObject<'static>: From<<AO::EthApi as reth_rpc_eth_api::EthApiTypes>::Error>,
     S: OpProofsStore + DatabaseMetrics + Send + Sync + 'static,
 {
-    install_proofs_history!(builder, args, mdbx, sequencer_url, preconf, flashblocks_cfg)
+    install_proofs_history!(
+        builder,
+        args,
+        mdbx,
+        sequencer_url,
+        sequencer_headers,
+        preconf,
+        flashblocks_cfg
+    )
 }
 
 /// Spawns a task that periodically reports metrics for the proofs DB.
