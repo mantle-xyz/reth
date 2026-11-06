@@ -195,6 +195,7 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
                 args,
                 mdbx,
                 node.op_node.args.sequencer.clone(),
+                node.op_node.args.sequencer_headers.clone(),
                 node.preconf.clone(),
                 node.flashblocks.clone(),
             )

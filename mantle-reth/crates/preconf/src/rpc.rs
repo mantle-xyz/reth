@@ -12,22 +12,19 @@
 //! and the client's channel goes in under the queue's lock as part of it, so
 //! the builder can never reach an entry with nobody to answer for it.
 //!
-//! That leaves this module two jobs:
+//! That leaves this module one job: **racing the deadline.** `select!` rather
+//! than `timeout`, so the receiver outlives the elapsed branch. On elapse the
+//! per-entry apply lock is taken, which serialises with dispatch's point of no
+//! return; once held, no completion is in flight, so a result dispatch already
+//! sent is in the channel to pick up. Without that the client could be told
+//! `Timeout` for a transaction already committed to the block being built.
+//! Recording the promise is dispatch's, before it sends the receipt.
 //!
-//! * **Race the deadline.** `select!` rather than `timeout`, so the receiver outlives the elapsed
-//!   branch. On elapse the per-entry apply lock is taken, which serialises with dispatch's point of
-//!   no return; once held, no completion is in flight, so a result dispatch already sent is in the
-//!   channel to pick up. Without that the client could be told `Timeout` for a transaction already
-//!   committed to the block being built.
-//! * **Record the commitment.** Every receipt is recorded, reverts included — a revert is an
-//!   outcome, not a failure to keep the promise.
-//!
-//! Two doors hold a replaying commitment open against a resubmitting client,
-//! both keyed on the entry's source rather than its status — a replaying
-//! commitment sits in the same `Waiting` state a fresh one does.
-//! `PreconfTxSet::admit` refuses the resubmit outright; `time_out_unfinished`
-//! ends only that client's wait and leaves the entry queued. Its receipt went
-//! to an earlier process, so removing the entry would mean it never lands.
+//! No client ever waits on a replaying commitment. `PreconfTxSet::admit`
+//! refuses a resubmit of its hash, and the entry a client waits on is the
+//! `Rpc` entry it was admitted with: that entry only becomes `Replay` through
+//! `reset_success_to_waiting`, after `begin_success` has already taken its
+//! responder. So the deadline only ever ends an `Rpc` entry.
 
 use std::sync::Arc;
 
@@ -43,7 +40,7 @@ use tracing::{debug, warn};
 use crate::{
     PreconfConfig, PreconfTxSet,
     admission::{AdmittedTx, DynAdmission},
-    types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
+    types::{PreconfError, PreconfReceipt, PreconfStatus},
 };
 
 /// Generic preconf RPC handler. Constructed by the preconf `ServiceBuilder`
@@ -77,38 +74,6 @@ impl PreconfRpcHandler {
         Self { admission, fifo, cfg }
     }
 
-    /// Claim the `(sender, nonce)` slot for a commitment whose receipt is going
-    /// out, and record the promise in `Commitments` (`fifo.claims()`).
-    ///
-    /// Why here and not at canonical time:
-    /// [`Commitments::mark_promised`](crate::commitments::Commitments::mark_promised).
-    ///
-    /// **Every receipt counts, not only `Success`.** A `Failed` event on a
-    /// receipt path is an EVM revert that *produced* a receipt; every
-    /// not-on-chain outcome leaves through an `Err(..)` return and never reaches
-    /// here. The receipt goes out before the block is sealed, so a reverted tx is
-    /// owed a replay exactly as a successful one is — and `builder::dispatch`
-    /// agrees, marking the fifo entry `Success` without reading `receipt.status`.
-    /// Pinned by `a_reverted_receipt_is_still_recorded_as_a_commitment`.
-    fn claim_commitment_slot(
-        &self,
-        event: &PreconfTxEvent,
-        hash: alloy_primitives::TxHash,
-        sender: &alloy_primitives::Address,
-        nonce: u64,
-    ) {
-        if let Err(owner) =
-            self.fifo.claims().mark_promised(hash, sender, nonce, event.block_height)
-        {
-            warn!(
-                target: "mantle::preconf::rpc",
-                ?hash, ?owner,
-                "a different tx already owns this (sender, nonce) at receipt time; \
-                 the commitment may not be honoured"
-            );
-        }
-    }
-
     /// Process a single `eth_sendRawTransactionWithPreconf` submission:
     /// admit, then wait out the deadline.
     pub async fn handle_inner(&self, bytes: Bytes) -> RpcResult<PreconfTxEvent> {
@@ -130,7 +95,7 @@ impl PreconfRpcHandler {
             .admit(bytes, origin_instant, resp_tx)
             .await
             .map_err(|e| preconf_error_to_rpc(&e))?;
-        let AdmittedTx { hash, sender, nonce } = admitted;
+        let AdmittedTx { hash, .. } = admitted;
 
         // Await receipt or deadline, with race-safe handling.
         //
@@ -157,13 +122,9 @@ impl PreconfRpcHandler {
         };
 
         match recv_result {
-            // Receipt arrived within the deadline. Every receipt is recorded,
-            // reverts included — see `claim_commitment_slot`.
-            Some(Ok(Ok(receipt))) => {
-                let event = PreconfTxEvent::from(receipt);
-                self.claim_commitment_slot(&event, hash, &sender, nonce);
-                Ok(event)
-            }
+            // Receipt arrived within the deadline; dispatch already recorded
+            // the promise.
+            Some(Ok(Ok(receipt))) => Ok(PreconfTxEvent::from(receipt)),
 
             // Builder signalled an error through the responder. A
             // `Timeout` error is surfaced as an `Ok(Timeout event)`
@@ -171,7 +132,7 @@ impl PreconfRpcHandler {
             // matching the deadline branch's own timeout handling.
             Some(Ok(Err(err))) => {
                 if matches!(err, PreconfError::Timeout { .. }) {
-                    Ok(build_timeout_event(hash, preconf_timeout))
+                    Ok(timeout_reply(hash, preconf_timeout))
                 } else {
                     Err(preconf_error_to_rpc(&err))
                 }
@@ -182,6 +143,7 @@ impl PreconfRpcHandler {
             // Log loudly — no healthy path drops one — and fail only ourselves.
             Some(Err(_recv_err)) => {
                 warn!(target: "mantle::preconf::rpc", ?hash, "responder dropped before send");
+                metrics::counter!("preconf.api.no_result_total").increment(1);
                 let err = PreconfError::Internal("responder dropped before send".to_string());
                 Err(preconf_error_to_rpc(&err))
             }
@@ -191,7 +153,6 @@ impl PreconfRpcHandler {
             // resolution.
             None => {
                 debug!(target: "mantle::preconf::rpc", ?hash, ?preconf_timeout, "preconf deadline elapsed; resolving race");
-                metrics::counter!("preconf.api.timeout_total").increment(1);
 
                 // Every completion holds this lock from its decision through
                 // the send, so holding it means none is in flight and **the
@@ -204,18 +165,12 @@ impl PreconfRpcHandler {
                 let apply_guard = self.fifo.lock_for_apply(&hash).await;
 
                 let outcome = match resp_rx.try_recv() {
-                    // Every receipt is recorded, reverts included — see
-                    // `claim_commitment_slot`.
-                    Ok(Ok(receipt)) => {
-                        let event = PreconfTxEvent::from(receipt);
-                        self.claim_commitment_slot(&event, hash, &sender, nonce);
-                        Ok(event)
-                    }
+                    Ok(Ok(receipt)) => Ok(PreconfTxEvent::from(receipt)),
                     // A `Timeout` is the op-geth-aligned wire shape, never a
                     // JSON-RPC error — same as the pre-deadline arm above.
                     Ok(Err(err)) => {
                         if matches!(err, PreconfError::Timeout { .. }) {
-                            Ok(build_timeout_event(hash, preconf_timeout))
+                            Ok(timeout_reply(hash, preconf_timeout))
                         } else {
                             Err(preconf_error_to_rpc(&err))
                         }
@@ -277,30 +232,26 @@ impl PreconfRpcHandler {
 
         let timed_out = PreconfError::Timeout { timeout_ms: preconf_timeout.as_millis() as u64 };
 
-        // A replaying commitment keeps its place: its receipt went out in an
-        // earlier process and it still has to land, so only this client's wait
-        // is over. Removing the entry would mean it never lands.
-        let replaying = entry.as_ref().is_some_and(|e| e.source == PreconfSource::Replay);
-
-        if replaying {
-            // The commitment outlives this client, so only the wait ends.
-            self.fifo.cancel_responder(hash, timed_out).await;
-        } else {
-            // `Err` means something ended it between the read above and now,
-            // and whatever did answered this client on the way out. Nothing
-            // left to do either way.
-            let _ = self.fifo.complete_failure(hash, timed_out).await;
-        }
-        Ok(build_timeout_event(*hash, preconf_timeout))
+        // `Err` means something ended it between the read above and now, and
+        // whatever did answered this client on the way out. Nothing left to do
+        // either way.
+        let _ = self.fifo.complete_failure(hash, timed_out).await;
+        Ok(timeout_reply(*hash, preconf_timeout))
     }
 }
 
-/// Construct the wire `Timeout` event returned to the client when the
-/// preconf deadline expires without a committed apply.
-fn build_timeout_event(
+/// The `Timeout` answer a client receives, counted once per answer.
+///
+/// `preconf.api.timeout_total` counts what clients were told, whichever path
+/// decided it: the RPC deadline, or dispatch giving up before apply because
+/// the deadline was too close. Counting where the deadline fires instead would
+/// miss the second and count a deadline whose race resolved to a receipt. The
+/// count lives here so that no `Timeout` answer can be built without it.
+fn timeout_reply(
     hash: alloy_primitives::TxHash,
     preconf_timeout: std::time::Duration,
 ) -> PreconfTxEvent {
+    metrics::counter!("preconf.api.timeout_total").increment(1);
     PreconfTxEvent {
         tx_hash: hash,
         status: WireStatus::Timeout,
@@ -669,7 +620,6 @@ mod tests {
                         );
                         assert_eq!(event.receipt.status, Some(u64::from(success)));
                         assert_eq!(h.fifo.claims().slot_owner(&h.sender, 0), Some(incumbent));
-                        assert!(h.fifo.claims().was_promised(&hash));
                         assert_eq!(h.fifo.claims().was_promised(&incumbent), incumbent_promised);
                     }
                 }
@@ -680,49 +630,6 @@ mod tests {
                 );
             });
         });
-    }
-
-    /// An EVM revert that produced a receipt is a commitment like any other —
-    /// see `claim_commitment_slot` for why the gate is not on `Success`.
-    ///
-    /// `builder::dispatch` marks the fifo entry `Success` regardless of
-    /// `receipt.status`, so a gate here would leave the fifo saying "committed"
-    /// about a transaction `Commitments` had never heard of.
-    #[tokio::test]
-    async fn a_reverted_receipt_is_still_recorded_as_a_commitment() {
-        let h = harness();
-        let hash = B256::from([0xab; 32]);
-        let sender = h.sender;
-
-        let event = PreconfTxEvent::from(PreconfReceipt {
-            tx_hash: hash,
-            block_height: 42,
-            status: false, // EVM revert — a receipt exists all the same
-            logs: vec![],
-            gas_used: 21_000,
-            reason: "execution reverted".to_string(),
-            revert_data: PrimBytes::new(),
-            tx_index: 0,
-            cumulative_gas_used: 21_000,
-            logs_bloom: Bloom::default(),
-            log_index_base: 0,
-            tx_type: 2,
-            from: sender,
-            to: Some(RECIPIENT),
-            contract_address: None,
-            effective_gas_price: 1_000_000_000,
-            block_timestamp: 0,
-            l1_fields: Default::default(),
-        });
-        assert_eq!(event.status, WireStatus::Failed, "precondition: this is the reverted arm");
-
-        h.handler.claim_commitment_slot(&event, hash, &sender, 0);
-
-        assert!(
-            h.fifo.claims().is_tracked(&hash),
-            "`Commitments` must know the commitment, or a reorg reinject is \
-             re-gated as a fresh submission and `mark_committed` cannot count it",
-        );
     }
 
     /// `logIndex` is block-global: the first log of a transaction whose block
@@ -775,11 +682,20 @@ mod tests {
 
     /// A timeout means no EVM apply happened, so nothing but the tri-state
     /// `logs: null` may appear — the response stays byte-identical to op-geth's.
+    /// Each answer is counted once.
     #[test]
-    fn timeout_event_carries_no_receipt_fields() {
-        let event = build_timeout_event(
-            alloy_primitives::TxHash::from([1u8; 32]),
-            std::time::Duration::from_millis(500),
+    fn timeout_reply_carries_no_receipt_fields_and_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let event = metrics::with_local_recorder(&recorder, || {
+            timeout_reply(
+                alloy_primitives::TxHash::from([1u8; 32]),
+                std::time::Duration::from_millis(500),
+            )
+        });
+        assert!(
+            handle.render().lines().any(|l| l == "preconf_api_timeout_total 1"),
+            "every Timeout answer is counted"
         );
         assert!(event.receipt.logs.is_none());
         assert!(event.receipt.status.is_none());

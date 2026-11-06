@@ -486,15 +486,15 @@ mod tests {
 ///   mention it as an argument.
 ///
 /// Neither case produces an error on either side, which is why the server
-/// refuses a filter subscription outright unless `--enable-filters` says the
-/// upstream populates those maps: an empty stream is indistinguishable from a
-/// quiet chain.
+/// refuses a filter subscription outright and the proxy refuses to start with
+/// `--enable-filters`: an empty stream is indistinguishable from a quiet chain.
 ///
 /// The tests below populate `metadata.receipts` by hand, so they lock the
 /// matching logic without showing that filtering works end to end. None of
 /// them goes through a producer, so none will notice when a producer starts
-/// filling that map; that is the point at which `--enable-filters` can be
-/// turned on, and the end-to-end check belongs with that change.
+/// filling that map. Lifting the startup refusal also needs [`FilterType::matches`]
+/// to stop running once per client per slice — it decompresses and parses the
+/// whole slice each time — and a cap on addresses and topics per filter.
 #[cfg(test)]
 mod mantle_shape {
     use alloy_consensus::Receipt;

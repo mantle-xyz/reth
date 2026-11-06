@@ -10,17 +10,27 @@
 //! way: the overlay is **dropped, never spliced**. `pending` falls back to
 //! `latest` until the next base slice opens a fresh one, in practice the next
 //! block.
+//! The read path applies the same fallback to an overlay that is still held:
+//! once the canonical tip reaches its latest block, `pending` reads answer from
+//! `latest`.
 //!
 //! Losing the rest of a block is the accepted cost. Serving state no build
 //! produced is not: what the sequencer promises is a prediction of one
 //! particular build, and an overlay assembled from two predicts nothing that
 //! ever ran — while looking, to every caller and every counter, like it did.
 //!
-//! The staleness and anchor checks in [`StateProcessor`], the build check in
-//! [`FlashblockSequenceValidator`] and the eviction in [`FlashblockCache`] are
-//! instances of this one rule rather than separate policies. A recovery that
-//! would shorten the gap is worth adding; one that would narrow it by accepting
-//! slices from a build this node did not follow is not.
+//! The staleness, anchor, parent-hash and predecessor checks in
+//! [`StateProcessor`], the build check in [`FlashblockSequenceValidator`] and
+//! the eviction in [`FlashblockCache`] are instances of this one rule rather
+//! than separate policies. Failures follow it too: a slice or canonical block
+//! the processor fails to process drops the overlay, and a panic also empties
+//! the early-arrival cache before the processor restarts after
+//! [`PROCESSOR_RESTART_DELAY`]. Only slices set aside without being applied
+//! leave the overlay in place: duplicates, superseded slices, `MissingFirstFlashblock`
+//! and `NonConsecutiveBlock`, slices past the leading depth, and slices cached
+//! until their canonical parent lands while there is no overlay to keep. A
+//! recovery that would shorten the gap is worth adding; one that would narrow
+//! it by accepting slices from a build this node did not follow is not.
 //!
 //! # A prefix cannot answer a question about a sealed block
 //!
@@ -49,15 +59,17 @@ mod block_assembler;
 pub use block_assembler::{AssembledBlock, BlockAssembler};
 
 mod canonical;
-pub use canonical::{await_canonical_match, forward_canonical_state};
+pub use canonical::{await_canonical_match, forward_canonical_state, run_canonical_forwarder};
+
+pub use mantle_reth_flashblocks_types::redact_ws_url;
 
 mod cache;
-pub use cache::{DEFAULT_MAX_CACHE_AHEAD_BLOCKS, FlashblockCache};
+pub use cache::{DEFAULT_MAX_CACHE_AHEAD_BLOCKS, FlashblockCache, MAX_CACHE_AHEAD_BLOCKS};
 
 mod config;
 pub use config::{
     DEFAULT_MAX_LEADING_DEPTH, DEFAULT_MAX_TRAILING_DEPTH, DEFAULT_SUBSCRIBER_PING_INTERVAL,
-    FlashblocksConfig,
+    FlashblocksConfig, MAX_SUBSCRIBER_PING_INTERVAL,
 };
 
 mod error;
@@ -69,7 +81,7 @@ mod metrics;
 pub use metrics::Metrics;
 
 mod processor;
-pub use processor::{QueueConsumer, StateProcessor, StateUpdate};
+pub use processor::{PROCESSOR_RESTART_DELAY, QueueConsumer, StateProcessor, StateUpdate};
 
 mod pending_blocks;
 pub use pending_blocks::{PendingBlocks, PendingBlocksBuilder};
@@ -85,7 +97,7 @@ pub use rpc::{
 };
 
 mod state;
-pub use state::FlashblocksState;
+pub use state::{FlashblocksState, MAX_QUEUED_SLICES};
 
 mod state_builder;
 pub use state_builder::{ExecutedPendingTransaction, PendingStateBuilder};
@@ -93,7 +105,7 @@ pub use state_builder::{ExecutedPendingTransaction, PendingStateBuilder};
 mod subscription;
 pub use subscription::FlashblocksSubscriber;
 mod traits;
-pub use traits::{FlashblocksAPI, FlashblocksReceiver, PendingBlocksAPI};
+pub use traits::{FlashblocksAPI, FlashblocksReceiver};
 
 mod validation;
 pub use validation::{

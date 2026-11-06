@@ -4,7 +4,7 @@
 //! `State<DB>` that gets sealed. If a preconf tx's data-availability
 //! footprint would push the block past a configured DA limit, the sealed
 //! block would be DA-invalid and op-node would reject it — silently
-//! breaking the "receipt returned → tx lands" commitment. The builder
+//! dropping a transaction whose receipt has gone out. The builder
 //! therefore runs a DA pre-check (`payload_builder::preconf_da_check`)
 //! before applying, mirroring the pool best-tx path's
 //! `ExecutionInfo::is_tx_over_limits` DA logic.

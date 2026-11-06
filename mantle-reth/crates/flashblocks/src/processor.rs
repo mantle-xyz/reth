@@ -1,12 +1,14 @@
 //! Flashblocks state processor.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
+    future::Future,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alloy_consensus::{
@@ -15,14 +17,18 @@ use alloy_consensus::{
 };
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
 use alloy_network::TransactionResponse;
-use alloy_primitives::{Address, BlockNumber};
+use alloy_primitives::{Address, B256, BlockNumber};
+use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::state::StateOverride;
 use arc_swap::ArcSwapOption;
-use mantle_reth_flashblocks_types::MantleFlashblockPayload;
+use futures::FutureExt;
+use mantle_reth_flashblocks_types::{FlashblockId, MantleFlashblockPayload};
 use op_alloy_consensus::OpTxEnvelope;
+use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
+use op_revm::OpSpecId;
 use rayon::prelude::*;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
-use reth_evm::ConfigureEvm;
+use reth_evm::{ConfigureEvm, EvmEnv};
 use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::OpBlock;
@@ -37,10 +43,12 @@ use crate::{
     AssembledBlock, BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks,
     PendingBlocksBuilder, PendingStateBuilder, ProtocolError, ProviderError, Result,
     StateProcessorError,
+    canonical::panic_message,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, IncomingBuild,
-        ReconciliationStrategy, ReorgDetector, SequenceValidationResult,
+        ReconciliationStrategy, ReorgDetector, SequenceValidationResult, base_links_to_overlay,
+        slice_follows_by_content,
     },
 };
 
@@ -50,6 +58,30 @@ type PendingExecutionDb = State<StateProviderDatabase<StateProviderBox>>;
 struct LivePendingState {
     db: PendingExecutionDb,
     state_overrides: StateOverride,
+}
+
+/// How long the processor waits after a panic before taking updates again.
+pub const PROCESSOR_RESTART_DELAY: Duration = Duration::from_secs(2);
+
+/// Runs `run` until it returns, running it again after each panic.
+///
+/// A panic awaits `on_restart` with the panic's message, then waits `delay`. There is no cap on
+/// restarts. The panicked future is dropped before `on_restart` runs, so any lock it held
+/// is already released.
+pub(crate) async fn supervise<F, Fut, R, RFut>(mut run: F, mut on_restart: R, delay: Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+    R: FnMut(String) -> RFut,
+    RFut: Future<Output = ()>,
+{
+    loop {
+        match AssertUnwindSafe(run()).catch_unwind().await {
+            Ok(()) => return,
+            Err(panic) => on_restart(panic_message(&*panic).to_owned()).await,
+        }
+        tokio::time::sleep(delay).await;
+    }
 }
 
 /// Messages consumed by the state processor.
@@ -68,28 +100,35 @@ pub enum StateUpdate {
     Flashblock(MantleFlashblockPayload, Option<oneshot::Sender<()>>),
 }
 
-/// The consuming end of the update queue, paired with the depth its producers keep.
+/// The consuming end of the update queue, paired with the depth counters its
+/// producers keep (all updates, and slices alone).
 ///
-/// The two travel together: taking an update is what makes the depth drop, so an
-/// owner that held only the receiver could not keep the count honest.
+/// They travel together: taking an update is what makes the counters drop, so an
+/// owner that held only the receiver could not keep them honest.
 #[derive(Debug)]
 pub struct QueueConsumer {
     rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
     depth: Arc<AtomicUsize>,
+    slice_depth: Arc<AtomicUsize>,
 }
 
 impl QueueConsumer {
-    /// Pairs a receiver with the depth counter its senders increment.
+    /// Pairs a receiver with the counters its senders increment: all updates, and
+    /// slices alone.
     pub const fn new(
         rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
         depth: Arc<AtomicUsize>,
+        slice_depth: Arc<AtomicUsize>,
     ) -> Self {
-        Self { rx, depth }
+        Self { rx, depth, slice_depth }
     }
 
     /// Takes the next update, reporting how many remain queued behind it.
     async fn recv(&self) -> Option<(StateUpdate, usize)> {
         let update = self.rx.lock().await.recv().await?;
+        if matches!(update, StateUpdate::Flashblock(..)) {
+            self.slice_depth.fetch_sub(1, Ordering::Relaxed);
+        }
         let waiting = self.depth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
         Some((update, waiting))
     }
@@ -106,6 +145,7 @@ pub struct StateProcessor<Client> {
     sender: Sender<Arc<PendingBlocks>>,
     cache: Arc<Mutex<FlashblockCache>>,
     live_state: StdMutex<Option<LivePendingState>>,
+    base_fee_mismatches: ReportedBaseFeeMismatches,
 }
 
 impl<Client> StateProcessor<Client>
@@ -196,7 +236,25 @@ where
             sender,
             cache: Arc::new(Mutex::new(cache)),
             live_state: StdMutex::new(None),
+            base_fee_mismatches: ReportedBaseFeeMismatches::default(),
         }
+    }
+
+    /// Forgets everything a panicked run may have left half-applied: the
+    /// served preview, the live execution state and the cached slices.
+    ///
+    /// The update being processed when the panic hit is lost; the rest of the
+    /// queue is untouched.
+    pub async fn reset_after_panic(&self, panic: &str) {
+        self.pending_blocks.swap(None);
+        self.clear_live_state();
+        self.cache.lock().await.clear();
+        Metrics::processor_restarts().increment(1);
+        error!(
+            message = "flashblocks state processor panicked; cleared the preview and the slice cache, restarting",
+            panic = %panic,
+            restart_in = ?PROCESSOR_RESTART_DELAY,
+        );
     }
 
     /// Processes updates from the queue until the channel closes.
@@ -212,31 +270,32 @@ where
             match update {
                 StateUpdate::Canonical(block, ack) => {
                     debug!(message = "processing canonical block", block_number = block.number);
-                    match self.process_canonical_block(prev_pending_blocks, &block, tip) {
-                        Ok(new_pending_blocks) => {
-                            self.pending_blocks.swap(new_pending_blocks);
-
-                            let mut cache = self.cache.lock().await;
-                            cache.update_canonical(block.number);
-                            let cached = cache.drain(block.number + 1);
-                            drop(cache);
-
-                            if !cached.is_empty() {
-                                debug!(
-                                    message = "replaying cached flashblocks after canonical block",
-                                    canonical_block = block.number,
-                                    cached_count = cached.len(),
-                                );
-                                for flashblock in cached {
-                                    let fb_prev = self.load_pending_or_drop_stranded(tip);
-                                    self.apply_flashblock(fb_prev, flashblock, tip).await;
-                                }
-                            }
+                    let next = match self.process_canonical_block(prev_pending_blocks, &block, tip)
+                    {
+                        Ok(pending) => pending,
+                        Err(
+                            e @ StateProcessorError::Protocol(ProtocolError::ParentHashMismatch {
+                                ..
+                            }),
+                        ) => {
+                            self.drop_on_parent_hash_mismatch(&e);
+                            None
                         }
                         Err(e) => {
-                            error!(message = "could not process canonical block", error = %e);
+                            Metrics::canonical_reconcile_error().increment(1);
+                            error!(
+                                message = "could not process canonical block; dropping the preview",
+                                error = %e,
+                            );
+                            None
                         }
+                    };
+                    if next.is_none() {
+                        // An empty preview has no live state behind it.
+                        self.clear_live_state();
                     }
+                    self.pending_blocks.swap(next);
+                    self.finish_canonical(block.number, tip).await;
                     if let Some(ack) = ack {
                         let _ = ack.send(());
                     }
@@ -253,6 +312,54 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// Advances the cache to canonical `block_number` and replays the heights
+    /// after it, whether or not reconciliation succeeded. A height is replayed
+    /// once the overlay ends at the one before it: stopping at `block_number + 1`
+    /// strands later heights, and the next live slice then drops the overlay.
+    ///
+    /// A height the overlay already holds is not replayed: it got there live,
+    /// after these slices were cached, so they are an earlier build or slices it
+    /// already has.
+    async fn finish_canonical(&self, block_number: BlockNumber, tip: Option<BlockNumber>) {
+        self.cache.lock().await.update_canonical(block_number);
+
+        let mut next = block_number + 1;
+        loop {
+            // `apply_flashblock` takes this lock again and it is not reentrant.
+            let cached = self.cache.lock().await.drain(next);
+            if cached.is_empty() {
+                return;
+            }
+            let held = self.pending_blocks.load().as_ref().is_some_and(|pb| {
+                (pb.earliest_block_number()..=pb.latest_block_number()).contains(&next)
+            });
+            if held {
+                debug!(
+                    message = "dropping cached flashblocks for a block the overlay already holds",
+                    canonical_block = block_number,
+                    dropped_block = next,
+                    cached_count = cached.len(),
+                );
+            } else {
+                debug!(
+                    message = "replaying cached flashblocks after canonical block",
+                    canonical_block = block_number,
+                    replayed_block = next,
+                    cached_count = cached.len(),
+                );
+                for flashblock in cached {
+                    let prev = self.load_pending_or_drop_stranded(tip);
+                    self.apply_flashblock(prev, flashblock, tip).await;
+                }
+            }
+            if self.pending_blocks.load().as_ref().is_none_or(|pb| pb.latest_block_number() != next)
+            {
+                return;
+            }
+            next += 1;
         }
     }
 
@@ -313,14 +420,39 @@ where
         pending_blocks: &PendingBlocks,
         tip: Option<BlockNumber>,
     ) -> bool {
-        tip.is_none_or(|tip| pending_blocks.latest_block_number() > tip)
+        tip.is_none_or(|tip| pending_blocks.leads(tip))
+    }
+
+    /// Fails when the chain has the parent height under a different hash.
+    ///
+    /// Earlier than `base_is_canonical` and per block: executing on the wrong
+    /// parent is never useful, and only the overlay's earliest block is checked at
+    /// publish. A parent the chain does not have yet, or a provider error, is left
+    /// to the other guards.
+    fn ensure_canonical_parent(&self, block_number: BlockNumber, declared: B256) -> Result<()> {
+        let Some(parent_number) = block_number.checked_sub(1) else { return Ok(()) };
+        match self.client.block_hash(parent_number) {
+            Ok(Some(canonical)) if canonical != declared => {
+                Err(ProtocolError::ParentHashMismatch { block_number, declared, canonical }.into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Drops the overlay after a base payload named a non-canonical parent.
+    fn drop_on_parent_hash_mismatch(&self, error: &StateProcessorError) {
+        Metrics::parent_hash_mismatch().increment(1);
+        warn!(message = "base payload is not built on the canonical parent, dropping the overlay", %error);
+        self.clear_live_state();
+        self.pending_blocks.swap(None);
     }
 
     /// Returns `true` when the snapshot's base block is still the canonical block
     /// at that height.
     ///
-    /// Every other guard here compares heights only, so this is the one that
-    /// catches a reorg or a failover putting a different block at the same height.
+    /// The parent-hash and predecessor checks judge a block before it runs; this
+    /// one catches a snapshot whose base the chain replaced after it was built —
+    /// a reorg or a failover putting a different block at the same height.
     ///
     /// Read on every publish rather than driven by canonical notifications: a head
     /// rollback whose target has left the engine's in-memory tree emits none, and a
@@ -456,9 +588,7 @@ where
             let block_number = flashblock.metadata.block_number;
             let index = flashblock.index;
             let mut cache = self.cache.lock().await;
-            let resumable = index == 0 || cache.has_flashblock(block_number, index - 1);
-            if resumable && cache.is_cacheable(block_number) {
-                cache.insert(flashblock);
+            if cache.is_cacheable(block_number) && cache.insert_resumable(flashblock) {
                 debug!(
                     message = "cached flashblock beyond the overlay leading depth",
                     block_number, index,
@@ -468,8 +598,8 @@ where
             Metrics::leading_depth_exceeded().increment(1);
             warn!(
                 message = "flashblock leads canonical beyond the configured depth, dropping",
-                block_number = flashblock.metadata.block_number,
-                flashblock_index = flashblock.index,
+                block_number,
+                flashblock_index = index,
                 max_leading_depth = self.max_leading_depth,
             );
             return;
@@ -497,10 +627,67 @@ where
             }
             Err(e) => {
                 match e {
+                    StateProcessorError::Protocol(ProtocolError::StalePredecessor) => {
+                        Metrics::stale_predecessor().increment(1);
+                        warn!(
+                            message = "base slice does not link to the overlay; restarting from the canonical parent",
+                            block = %flashblock.metadata.block_number,
+                        );
+                        // Fail closed: the overlay this slice refused to extend is not served.
+                        self.clear_live_state();
+                        self.pending_blocks.swap(None);
+                        // The same path as a fresh start, cached if the parent has not landed.
+                        match self.process_flashblock(None, &flashblock) {
+                            Ok(new_pending_blocks) => {
+                                if let Some(ref pb) = new_pending_blocks {
+                                    _ = self.sender.send(Arc::clone(pb));
+                                }
+                                self.pending_blocks.swap(new_pending_blocks);
+                                Metrics::block_processing_duration().record(start_time.elapsed());
+                            }
+                            Err(StateProcessorError::Provider(
+                                ProviderError::MissingCanonicalHeader { .. },
+                            )) => {
+                                self.cache_or_drop(flashblock, "pending canonical parent").await;
+                            }
+                            Err(
+                                e @ StateProcessorError::Protocol(
+                                    ProtocolError::ParentHashMismatch { .. },
+                                ),
+                            ) => self.drop_on_parent_hash_mismatch(&e),
+                            Err(e) => {
+                                error!(
+                                    message = "could not process flashblock from the canonical parent",
+                                    error = %e,
+                                );
+                                Metrics::block_processing_error().increment(1);
+                            }
+                        }
+                        return;
+                    }
+                    StateProcessorError::Protocol(ProtocolError::ParentHashMismatch { .. }) => {
+                        // Fail closed and do not cache: the parent is canonical already,
+                        // so a replay would hit the same mismatch.
+                        self.drop_on_parent_hash_mismatch(&e);
+                        return;
+                    }
                     StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
                     }) => {
-                        let inserted = self.cache.lock().await.insert(flashblock);
+                        if previous.is_some() {
+                            // With a preview held, only its own anchor can be missing, so
+                            // the preview must not be served any longer.
+                            warn!(
+                                message = "canonical anchor of the overlay is gone, dropping the overlay",
+                                error = %e,
+                            );
+                            Metrics::block_processing_error().increment(1);
+                            self.clear_live_state();
+                            self.pending_blocks.swap(None);
+                            self.cache_or_drop(flashblock, "pending canonical block").await;
+                            return;
+                        }
+                        let inserted = self.cache.lock().await.insert_resumable(flashblock);
                         if inserted {
                             debug!(message = "cached flashblock pending canonical block", error = %e);
                             return;
@@ -512,36 +699,39 @@ where
                         // valid restart point when it carries a base payload, so cache
                         // it instead of dropping it; higher indices are only useful
                         // once their predecessor is cached.
-                        let mut cache = self.cache.lock().await;
-                        let resumable = flashblock.index == 0 ||
-                            cache.has_flashblock(
-                                flashblock.metadata.block_number,
-                                flashblock.index - 1,
-                            );
-                        if resumable {
-                            let block_number = flashblock.metadata.block_number;
-                            let index = flashblock.index;
-                            if cache.insert(flashblock) {
-                                debug!(
-                                    message = "cached flashblock pending its predecessor",
-                                    block_number, index
-                                );
-                            }
-                        }
+                        self.cache_or_drop(flashblock, "pending its predecessor").await;
                         return;
                     }
                     _ => {}
                 }
 
-                if !matches!(
-                    e,
-                    StateProcessorError::Provider(ProviderError::MissingCanonicalHeader { .. })
-                ) {
-                    error!(message = "could not process flashblock", error = %e);
-                    Metrics::block_processing_error().increment(1);
-                }
+                // Fail closed: an overlay that could not take this slice is stale.
+                self.clear_live_state();
+                self.pending_blocks.swap(None);
+                error!(message = "could not process flashblock, dropping the overlay", error = %e);
+                Metrics::block_processing_error().increment(1);
             }
         }
+    }
+
+    /// Caches `flashblock` as a restart point, or, when it cannot be one,
+    /// drops it with a warning and a count rather than without a trace.
+    ///
+    /// Only index 0, or a slice whose predecessor is cached, can be resumed
+    /// from; anything else is lost, along with the preview of its block until
+    /// the canonical chain or a later base slice catches up.
+    async fn cache_or_drop(&self, flashblock: MantleFlashblockPayload, waiting_for: &str) {
+        let block_number = flashblock.metadata.block_number;
+        let index = flashblock.index;
+        if self.cache.lock().await.insert_resumable(flashblock) {
+            debug!(message = "cached flashblock", waiting_for, block_number, index);
+            return;
+        }
+        Metrics::uncached_slice_dropped().increment(1);
+        warn!(
+            message = "flashblock can neither extend the overlay nor be cached, dropping",
+            waiting_for, block_number, index,
+        );
     }
 
     #[instrument(level = "debug", skip_all, fields(block_number = block.number))]
@@ -604,7 +794,7 @@ where
                 Metrics::pending_clear_reorg().increment(1);
 
                 flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
-                self.build_pending_state(None, &flashblocks)
+                self.build_pending_state(None, &flashblocks, false)
             }
             ReconciliationStrategy::DepthLimitExceeded { depth, max_depth } => {
                 debug!(
@@ -614,7 +804,7 @@ where
                 );
 
                 flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
-                self.build_pending_state(None, &flashblocks)
+                self.build_pending_state(None, &flashblocks, false)
             }
             ReconciliationStrategy::Continue => {
                 debug!(
@@ -627,7 +817,7 @@ where
                 );
                 // Deliberately not retained: dropping older flashblocks would lose
                 // the `earliest` block number that the trailing-depth guard measures.
-                self.build_pending_state(prev_pending_blocks, &flashblocks)
+                self.build_pending_state(prev_pending_blocks, &flashblocks, false)
             }
             ReconciliationStrategy::NoPendingState => {
                 debug!(message = "no pending state to update with canonical block, skipping");
@@ -645,12 +835,54 @@ where
             Some(pb) => pb,
             None => {
                 if flashblock.index == 0 {
-                    return self.build_pending_state(None, std::slice::from_ref(flashblock));
+                    return self.build_pending_state(None, std::slice::from_ref(flashblock), true);
                 }
 
                 return Err(StateProcessorError::MissingFirstFlashblock);
             }
         };
+
+        // A base slice whose parent block is in the overlay extends it only when it
+        // names that block's last slice by position and content. Anything else goes
+        // to the canonical parent instead.
+        if flashblock.index == 0 &&
+            let Some(parent_number) = flashblock.metadata.block_number.checked_sub(1) &&
+            let Some(parent_last) = pending_blocks.last_flashblock_of(parent_number) &&
+            !base_links_to_overlay(
+                (
+                    FlashblockId { block_number: parent_number, index: parent_last.index },
+                    parent_last.diff.block_hash,
+                ),
+                flashblock.metadata.prev_flashblock_id,
+                flashblock.metadata.prev_flashblock_hash,
+            )
+        {
+            return Err(ProtocolError::StalePredecessor.into());
+        }
+
+        // The next slice of the tracked build must follow the overlay's latest slice by
+        // content. Only the next one: a duplicate names the slice before the latest,
+        // and gaps and other builds are the validator's to judge.
+        if flashblock.index > 0 &&
+            flashblock.payload_id == pending_blocks.payload_id() &&
+            flashblock.metadata.block_number == pending_blocks.latest_block_number() &&
+            flashblock.index == pending_blocks.latest_flashblock_index().saturating_add(1) &&
+            let Some(latest) =
+                pending_blocks.last_flashblock_of(pending_blocks.latest_block_number()) &&
+            !slice_follows_by_content(
+                latest.diff.block_hash,
+                flashblock.metadata.prev_flashblock_hash,
+            )
+        {
+            Metrics::slice_content_mismatch().increment(1);
+            warn!(
+                message = "slice does not follow the overlay's latest slice by content; dropping the overlay",
+                block = %flashblock.metadata.block_number,
+                index = %flashblock.index,
+            );
+            self.clear_live_state();
+            return Ok(None);
+        }
 
         let incoming_build = if flashblock.payload_id == pending_blocks.payload_id() {
             IncomingBuild::Same
@@ -706,7 +938,7 @@ where
                 flashblocks
                     .retain(|fb| fb.metadata.block_number < flashblock.metadata.block_number);
                 flashblocks.push(flashblock.clone());
-                self.build_pending_state(None, &flashblocks)
+                self.build_pending_state(None, &flashblocks, true)
             }
             SequenceValidationResult::ForeignBuild => {
                 // Its own counter, not `unexpected_block_order`: the stream is
@@ -753,6 +985,16 @@ where
                 self.clear_live_state();
                 Ok(None)
             }
+            // A later block's base naming a slice this overlay never saw: a block
+            // was missed. Unlike a base with no predecessor, the link says the
+            // stream and the overlay disagree, so the overlay is dropped; the
+            // `StalePredecessor` path then keeps the slice as a restart point.
+            SequenceValidationResult::NonSequentialPredecessor { .. }
+                if flashblock.base.is_some() &&
+                    flashblock.metadata.block_number > pending_blocks.latest_block_number() =>
+            {
+                Err(ProtocolError::StalePredecessor.into())
+            }
             SequenceValidationResult::NonSequentialPredecessor { expected, actual } => {
                 Metrics::unexpected_block_order().increment(1);
                 error!(
@@ -792,14 +1034,9 @@ where
         // Taken through a temporary guard: the rebuild in the fallback below writes the
         // live state back, so holding the guard across it deadlocks this thread.
         //
-        // Taken, and on every failure below **not put back**. That is the
-        // point: each fallible step from here owns the `db`, so a failure
-        // leaves it holding half a transaction's writes. Returning that to the
-        // slot would hand the next slice a state no block ever had. The cost
-        // of dropping it is one full rebuild — `build_pending_state` replays
-        // the overlay from the canonical parent, the same path a cold start
-        // takes — and `state_overrides` survives it because replaying the same
-        // slices yields the same values (last writer wins per address/slot).
+        // On every failure below the `db` is **not put back**: it may hold half a
+        // transaction's writes. The caller drops the overlay on failure, so nothing
+        // would read it anyway.
         let live_state = self.lock_live_state().take();
         let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
@@ -810,7 +1047,11 @@ where
             );
             let mut flashblocks = prev_pending_blocks.get_flashblocks();
             flashblocks.push(flashblock.clone());
-            return self.build_pending_state(Some(Arc::clone(prev_pending_blocks)), &flashblocks);
+            return self.build_pending_state(
+                Some(Arc::clone(prev_pending_blocks)),
+                &flashblocks,
+                true,
+            );
         };
 
         let latest_header = prev_pending_blocks.latest_header();
@@ -894,6 +1135,12 @@ where
         }
 
         let latest_block_cumulative_gas_used = pending_state_builder.cumulative_gas_used();
+        check_execution_gas(
+            flashblock.metadata.block_number,
+            flashblock.index,
+            latest_block_cumulative_gas_used,
+            flashblock.diff.gas_used,
+        );
         let latest_block_next_log_index = pending_state_builder.next_log_index();
         let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
         pending_blocks_builder.with_latest_block_context(
@@ -923,18 +1170,14 @@ where
         let Some(base) = flashblock.base.clone() else {
             return Err(StateProcessorError::MissingFirstFlashblock);
         };
+        self.ensure_canonical_parent(base.block_number, base.parent_hash)?;
 
         // Taken through a temporary guard: the rebuild in the fallback below writes the
         // live state back, so holding the guard across it deadlocks this thread.
         //
-        // Taken, and on every failure below **not put back**. That is the
-        // point: each fallible step from here owns the `db`, so a failure
-        // leaves it holding half a transaction's writes. Returning that to the
-        // slot would hand the next slice a state no block ever had. The cost
-        // of dropping it is one full rebuild — `build_pending_state` replays
-        // the overlay from the canonical parent, the same path a cold start
-        // takes — and `state_overrides` survives it because replaying the same
-        // slices yields the same values (last writer wins per address/slot).
+        // On every failure below the `db` is **not put back**: it may hold half a
+        // transaction's writes. The caller drops the overlay on failure, so nothing
+        // would read it anyway.
         let live_state = self.lock_live_state().take();
         let Some(LivePendingState { mut db, state_overrides }) = live_state else {
             warn!(
@@ -945,7 +1188,11 @@ where
             );
             let mut flashblocks = prev_pending_blocks.get_flashblocks();
             flashblocks.push(flashblock.clone());
-            return self.build_pending_state(Some(Arc::clone(prev_pending_blocks)), &flashblocks);
+            return self.build_pending_state(
+                Some(Arc::clone(prev_pending_blocks)),
+                &flashblocks,
+                true,
+            );
         };
 
         let previous_header = prev_pending_blocks.latest_header();
@@ -967,10 +1214,13 @@ where
         db.block_hashes.insert(base.block_number - 1, base.parent_hash);
 
         let evm_config = OpEvmConfig::optimism(self.client.chain_spec());
-        let block_env_attributes = OpNextBlockEnvAttributes::from(base.clone());
-        let evm_env = evm_config
-            .next_evm_env(&previous_header, &block_env_attributes)
-            .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+        let evm_env = next_block_evm_env(
+            &evm_config,
+            &previous_header,
+            &base,
+            flashblock.payload_id,
+            &self.base_fee_mismatches,
+        )?;
         let evm = evm_config.evm_with_env(db, evm_env);
 
         let recovery_start = Instant::now();
@@ -1014,6 +1264,12 @@ where
         }
 
         let latest_block_cumulative_gas_used = pending_state_builder.cumulative_gas_used();
+        check_execution_gas(
+            flashblock.metadata.block_number,
+            flashblock.index,
+            latest_block_cumulative_gas_used,
+            flashblock.diff.gas_used,
+        );
         let latest_block_next_log_index = pending_state_builder.next_log_index();
         let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
         pending_blocks_builder.with_latest_block_context(
@@ -1033,6 +1289,7 @@ where
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblocks: &[MantleFlashblockPayload],
+        compare_reported_gas: bool,
     ) -> Result<Option<Arc<PendingBlocks>>> {
         let mut flashblocks_per_block =
             BTreeMap::<BlockNumber, Vec<MantleFlashblockPayload>>::new();
@@ -1069,9 +1326,12 @@ where
                 pending_blocks.get_state_overrides().unwrap_or_default()
             });
 
+        let last_block_number =
+            *flashblocks_per_block.keys().next_back().unwrap_or(&earliest_block_number);
         let mut total_transaction_count = 0usize;
-        for (_block_number, flashblocks) in flashblocks_per_block {
+        for (block_number, flashblocks) in flashblocks_per_block {
             let assembled = BlockAssembler::assemble(&flashblocks)?;
+            self.ensure_canonical_parent(assembled.base.block_number, assembled.base.parent_hash)?;
             let latest_flashblock_tx_count =
                 flashblocks.last().map(|latest| latest.diff.transactions.len()).unwrap_or_default();
             let latest_block_base = assembled.base.clone();
@@ -1083,14 +1343,16 @@ where
             let latest_block_l1_block_info = l1_block_info.clone();
             let latest_block_transaction_count = assembled.block.body.transactions.len();
 
-            let block_env_attributes = OpNextBlockEnvAttributes::from(assembled.base.clone());
-
             db.block_hashes
                 .insert(latest_block_base.block_number - 1, latest_block_base.parent_hash);
 
-            let evm_env = evm_config
-                .next_evm_env(&last_block_header, &block_env_attributes)
-                .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+            let evm_env = next_block_evm_env(
+                &evm_config,
+                &last_block_header,
+                &assembled.base,
+                flashblocks[0].payload_id,
+                &self.base_fee_mismatches,
+            )?;
             let evm = evm_config.evm_with_env(db, evm_env);
 
             let recovery_start = Instant::now();
@@ -1142,6 +1404,18 @@ where
                 )?;
             }
 
+            if compare_reported_gas &&
+                block_number == last_block_number &&
+                let Some(last) = flashblocks.last()
+            {
+                check_execution_gas(
+                    block_number,
+                    last.index,
+                    pending_state_builder.cumulative_gas_used(),
+                    last.diff.gas_used,
+                );
+            }
+
             let latest_flashblock_tx_start = total_transaction_count
                 .saturating_add(latest_block_transaction_count)
                 .saturating_sub(latest_flashblock_tx_count);
@@ -1163,6 +1437,80 @@ where
     }
 }
 
+/// Counts and warns when the gas the overlay executed for a block differs from
+/// the block-cumulative `gas_used` the slice reported. Never drops the overlay:
+/// it serves the local execution either way.
+fn check_execution_gas(block_number: BlockNumber, index: u64, local: u64, reported: u64) {
+    if local != reported {
+        Metrics::execution_gas_mismatch().increment(1);
+        warn!(
+            message = "executed block gas differs from the gas the slice reported",
+            block = %block_number,
+            index = %index,
+            local_gas_used = local,
+            reported_gas_used = reported,
+        );
+    }
+}
+
+/// Base slices whose basefee mismatch has already been reported.
+///
+/// The overlay executes a block again on every rebuild, so counting each
+/// execution would multiply one mismatch by the blocks the overlay spans. A
+/// rebuild of the same height under a new payload id is a new base slice and is
+/// reported again. Holds more entries than an overlay has blocks.
+#[derive(Debug, Default)]
+struct ReportedBaseFeeMismatches(StdMutex<VecDeque<(BlockNumber, PayloadId)>>);
+
+impl ReportedBaseFeeMismatches {
+    const CAPACITY: usize = 16;
+
+    /// `true` the first time the base slice `(block, payload_id)` is seen.
+    fn first_report(&self, block: BlockNumber, payload_id: PayloadId) -> bool {
+        let mut seen = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seen.contains(&(block, payload_id)) {
+            return false;
+        }
+        if seen.len() == Self::CAPACITY {
+            seen.pop_front();
+        }
+        seen.push_back((block, payload_id));
+        true
+    }
+}
+
+/// The EVM environment for the block `base` opens, on `parent`. The basefee is
+/// the producer's: it is what the sealed header carries, and deriving it from
+/// a parent the overlay assembled would follow any gap in that parent.
+fn next_block_evm_env<ChainSpec>(
+    evm_config: &OpEvmConfig<ChainSpec>,
+    parent: &Header,
+    base: &OpFlashblockPayloadBase,
+    payload_id: PayloadId,
+    reported: &ReportedBaseFeeMismatches,
+) -> Result<EvmEnv<OpSpecId>>
+where
+    ChainSpec: EthChainSpec<Header = Header> + OpHardforks + 'static,
+{
+    let mut evm_env = evm_config
+        .next_evm_env(parent, &OpNextBlockEnvAttributes::from(base.clone()))
+        .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+    let declared: u64 = base.base_fee_per_gas.saturating_to();
+    if evm_env.block_env.basefee != declared {
+        if reported.first_report(base.block_number, payload_id) {
+            Metrics::base_fee_mismatch().increment(1);
+            warn!(
+                message = "derived basefee differs from the base slice; using the base slice's",
+                block = %base.block_number,
+                derived = evm_env.block_env.basefee,
+                declared,
+            );
+        }
+        evm_env.block_env.basefee = declared;
+    }
+    Ok(evm_env)
+}
+
 impl<Client> StateProcessor<Client> {
     fn execute_into_builder<E, ChainSpec>(
         pending_state_builder: &mut PendingStateBuilder<E, ChainSpec>,
@@ -1179,7 +1527,6 @@ impl<Client> StateProcessor<Client> {
         ChainSpec: OpHardforks + EthChainSpec + Clone,
     {
         pending_blocks_builder.with_transaction_sender(tx_hash, sender);
-        pending_blocks_builder.increment_nonce(sender);
 
         let executed_transaction = pending_state_builder
             .execute_transaction(idx, Recovered::new_unchecked(transaction, sender))?;
@@ -1200,5 +1547,85 @@ impl<Client> StateProcessor<Client> {
         pending_blocks_builder.with_transaction_result(tx_hash, executed_transaction.result);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    use super::*;
+
+    const SERIES: &str = "flashblocks_consumer_execution_gas_mismatch_total";
+
+    fn mismatch_count(run: impl FnOnce()) -> Option<String> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, run);
+        handle.render().lines().find(|l| l.starts_with(SERIES)).map(str::to_owned)
+    }
+
+    /// A block the overlay executes again is not reported again; a rebuild of
+    /// the same height under a new payload id is.
+    #[test]
+    fn a_base_fee_mismatch_is_reported_once_per_base_slice() {
+        let reported = ReportedBaseFeeMismatches::default();
+        let (first, rebuild) = (PayloadId::new([1; 8]), PayloadId::new([2; 8]));
+
+        assert!(reported.first_report(7, first));
+        assert!(!reported.first_report(7, first), "re-executed by a rebuild");
+        assert!(!reported.first_report(7, first), "and again");
+        assert!(reported.first_report(7, rebuild), "a new build of the same height");
+        assert!(reported.first_report(8, first), "the next block");
+    }
+
+    /// Bounded: the oldest base slice is forgotten first.
+    #[test]
+    fn reported_base_fee_mismatches_forget_the_oldest() {
+        let reported = ReportedBaseFeeMismatches::default();
+        let id = PayloadId::new([1; 8]);
+        for block in 0..ReportedBaseFeeMismatches::CAPACITY as u64 {
+            assert!(reported.first_report(block, id));
+        }
+
+        assert!(reported.first_report(100, id));
+        assert!(reported.first_report(0, id), "evicted");
+        assert!(!reported.first_report(100, id), "still held");
+    }
+
+    #[test]
+    fn equal_gas_is_not_counted() {
+        assert_eq!(mismatch_count(|| check_execution_gas(7, 2, 21_000, 21_000)), None);
+    }
+
+    #[test]
+    fn differing_gas_is_counted_once() {
+        let line = mismatch_count(|| check_execution_gas(7, 2, 21_000, 42_000));
+        assert_eq!(line.as_deref(), Some(&*format!("{SERIES} 1")));
+    }
+
+    #[tokio::test]
+    async fn supervise_restarts_after_a_panic_and_stops_on_return() {
+        let runs = AtomicUsize::new(0);
+        let restarts = AtomicUsize::new(0);
+
+        supervise(
+            || {
+                let run = runs.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert!(run != 0, "first run panics");
+                }
+            },
+            |panic| {
+                restarts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(panic, "first run panics");
+                async {}
+            },
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
     }
 }

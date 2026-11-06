@@ -53,6 +53,7 @@ macro_rules! flashblock_metrics {
             pub fn init() {
                 $( flashblock_metrics!(@describe $kind $series, $desc); )*
                 $( flashblock_metrics!(@zero $kind $series); )*
+                Self::init_canonical_forwarder_exited();
             }
         }
     };
@@ -93,10 +94,22 @@ flashblock_metrics! {
         "Blocks whose overlay was replaced by a new build of the same height";
     counter   foreign_build_slice                       => "flashblocks.consumer.foreign_build_slice_total",
         "Continuation slices from a build this node never saw the base of";
+    counter   stale_predecessor                         => "flashblocks.consumer.stale_predecessor_total",
+        "Base slices that did not link to the overlay's parent block, restarted from the canonical parent";
+    counter   parent_hash_mismatch                      => "flashblocks.consumer.parent_hash_mismatch_total",
+        "Base payloads whose parent hash differed from the canonical parent, dropping the overlay";
+    counter   slice_content_mismatch                    => "flashblocks.consumer.slice_content_mismatch_total",
+        "Slices that did not follow the overlay's latest slice by content, dropping the overlay";
+    counter   execution_gas_mismatch                    => "flashblocks.consumer.execution_gas_mismatch_total",
+        "Slices whose locally executed block gas differed from the gas the slice reported";
+    counter   base_fee_mismatch                         => "flashblocks.consumer.base_fee_mismatch_total",
+        "Base slices whose basefee differed from the one derived from the parent header, using the slice's";
     histogram flashblocks_in_block                      => "flashblocks.consumer.slices_per_block",
         "Slices the consumer saw for one block (the producer's view is `flashblocks.slices_per_block`)";
     counter   block_processing_error                    => "flashblocks.consumer.block_processing_error_total",
-        "Slices that failed to apply";
+        "Slices that failed to apply, dropping the overlay";
+    counter   canonical_reconcile_error                 => "flashblocks.consumer.canonical_reconcile_error_total",
+        "Canonical blocks the overlay could not be reconciled against, dropping the overlay";
     counter   pending_clear_catchup                     => "flashblocks.consumer.pending_clear_catchup_total",
         "Overlays cleared because the canonical chain caught up with them";
     counter   pending_clear_reorg                       => "flashblocks.consumer.pending_clear_reorg_total",
@@ -109,18 +122,30 @@ flashblock_metrics! {
         "Overlays dropped for being stranded off the canonical chain";
     counter   pending_drop_base_mismatch                => "flashblocks.consumer.pending_drop_base_mismatch_total",
         "Overlays dropped because their base no longer matches the chain";
+    counter   pending_stale_fallback                    => "flashblocks.consumer.pending_stale_fallback_total",
+        "Reads that skipped the overlay because it did not lead the canonical tip, or the tip could not be read";
     gauge     pending_snapshot_fb_index                 => "flashblocks.consumer.pending_snapshot_fb_index",
         "Slice index of the overlay currently served";
     gauge     pending_snapshot_height                   => "flashblocks.consumer.pending_snapshot_height",
         "Block height of the overlay currently served";
     counter   leading_depth_exceeded                    => "flashblocks.consumer.leading_depth_exceeded_total",
         "Slices refused for running too far ahead of the canonical tip";
+    counter   uncached_slice_dropped                    => "flashblocks.consumer.uncached_slices_dropped_total",
+        "Slices that could not extend the overlay or be cached as a restart point, dropped";
     gauge     queue_depth                               => "flashblocks.consumer.queue_depth",
-        "Slices waiting in the state-update queue";
+        "Updates (slices and canonical notifications) waiting in the state-update queue";
+    counter   queue_dropped_slices                      => "flashblocks.consumer.queue_dropped_slices_total",
+        "Slices dropped because the state-update queue already held the maximum";
+    counter   processor_restarts                        => "flashblocks.consumer.processor_restarts_total",
+        "Times the state processor panicked and was restarted with the overlay and cache cleared";
     counter   reconnect_attempts                        => "flashblocks.consumer.reconnect_attempts_total",
         "Reconnections attempted against the upstream";
+    counter   subscription_lagged                       => "flashblocks.consumer.subscription_lagged_total",
+        "Overlay updates eth_subscribe flashblocks subscribers fell too far behind to receive";
+    gauge     subscriptions_active                      => "flashblocks.consumer.subscriptions_active",
+        "Open eth_subscribe flashblocks subscriptions";
     counter   rpc_get_transaction_count                 => "flashblocks.consumer.rpc.get_transaction_count_total",
-        "`eth_getTransactionCount` calls served from the overlay";
+        "`eth_getTransactionCount` calls answered with a leading preview (its nonce, or its parent block's)";
     counter   rpc_get_transaction_receipt               => "flashblocks.consumer.rpc.get_transaction_receipt_total",
         "`eth_getTransactionReceipt` calls served from the overlay";
     counter   rpc_get_transaction_by_hash               => "flashblocks.consumer.rpc.get_transaction_by_hash_total",
@@ -134,21 +159,44 @@ flashblock_metrics! {
     counter   rpc_get_block_by_number                   => "flashblocks.consumer.rpc.get_block_by_number_total",
         "`eth_getBlockByNumber` calls served from the overlay";
     counter   rpc_call                                  => "flashblocks.consumer.rpc.call_total",
-        "`eth_call` calls served from the overlay";
+        "`eth_call` calls served with a pending execution context";
     counter   rpc_estimate_gas                          => "flashblocks.consumer.rpc.estimate_gas_total",
-        "`eth_estimateGas` calls served from the overlay";
+        "`eth_estimateGas` calls served with a pending execution context";
     // Emitted from `mantle-reth-rpc-ext`, not from this crate — `eth_simulateV1`
     // is owned by `MantleEthApiExt`, which injects the pending overrides.
     counter   rpc_simulate_v1                           => "flashblocks.consumer.rpc.simulate_v1_total",
-        "`eth_simulateV1` calls served with pending overrides";
+        "`eth_simulateV1` calls served with a pending execution context";
+    // Emitted from `mantle-reth-rpc-ext`, like `rpc_simulate_v1`.
+    counter   rpc_estimate_total_fee                    => "flashblocks.consumer.rpc.estimate_total_fee_total",
+        "`eth_estimateTotalFee` calls served with a pending execution context";
     counter   rpc_get_logs                              => "flashblocks.consumer.rpc.get_logs_total",
-        "`eth_getLogs` calls served from the overlay";
+        "`eth_getLogs` calls ending at `pending` answered with a leading preview";
     counter   rpc_get_block_transaction_count_by_number => "flashblocks.consumer.rpc.get_block_transaction_count_by_number_total",
         "`eth_getBlockTransactionCountByNumber` calls served from the overlay";
     histogram bundle_state_clone_duration               => "flashblocks.consumer.bundle_state_clone_duration",
         "Time spent cloning the bundle state for one overlay";
     histogram bundle_state_clone_size                   => "flashblocks.consumer.bundle_state_clone_size",
         "Accounts cloned with the bundle state for one overlay";
+}
+
+const CANONICAL_FORWARDER_EXITED: &str = "flashblocks.consumer.canonical_forwarder_exited_total";
+
+impl Metrics {
+    /// Counts one canonical-state forwarder exit; `reason` is `panic` or `closed`.
+    pub(crate) fn canonical_forwarder_exited(reason: &'static str) {
+        metrics::counter!(CANONICAL_FORWARDER_EXITED, "reason" => reason).increment(1);
+    }
+
+    /// Describes and zeroes the labelled series, as [`Metrics::init`] does for the rest.
+    fn init_canonical_forwarder_exited() {
+        metrics::describe_counter!(
+            CANONICAL_FORWARDER_EXITED,
+            "Times the canonical-state forwarder stopped, by reason (panic or closed channel); it is not restarted"
+        );
+        for reason in ["panic", "closed"] {
+            metrics::counter!(CANONICAL_FORWARDER_EXITED, "reason" => reason).absolute(0);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 /// **`Success` is not terminal either**: an entry still in the fifo means
 /// "applied to an in-flight builder whose block was never canon'd" — the
 /// `PayloadJob` prologue's canon-forward (`sync_fifo_forward_to_head` →
-/// `PreconfTxSet::forward`) drops it once the sender's nonce moves past. Stale
+/// `PreconfTxSet::forward_all`) drops it once the sender's nonce moves past. Stale
 /// `Success` entries are reset to `Waiting` and replayed against the new
-/// builder, honouring the SLA "receipt returned → tx must land on chain". The
+/// builder: a receipt has gone out, and the node makes a best effort to land it. The
 /// presence of the entry is the "in-flight, not canon" flag; no separate
 /// variant is needed.
 ///
@@ -56,23 +56,23 @@ pub enum PreconfStatus {
 ///   Covers two triggers:
 ///     - **Startup journal replay** (`restore_preconf_state`) — commitments persisted before a
 ///       crash.
-///     - **Reorg reinject** — the canonical-state handler pushes back every commitment the reverted
-///       chain carried. Whether a hash is one is asked of the claim registry
+///     - **Reorg reinject** — the canonical-state handler puts back every commitment the reverted
+///       chain carried. Only a build on the canonical chain executes it (`ReplayParentCheck` in
+///       `builder::payload_builder`). Whether a hash is one is asked of the claim registry
 ///       (`Commitments::is_tracked`, i.e. "a `Success` receipt for this hash already went out")
 ///       rather than of the journal: the journal's notion of a finished commitment is "canonical
 ///       once", which is exactly what a reorg undoes.
 ///
-///   In both cases the Mantle preconf SLA (*"once a receipt has been returned to the client, the
-///   tx must land on chain"*) requires these entries to **bypass** the deadline and per-block gas
-///   budget gates. They remain subject to the status / dedup gates and the underlying block gas
-///   limit.
+///   In both cases a receipt has gone out, and the node makes a best effort to land the
+///   transaction, so these entries **bypass** the deadline and per-block gas budget gates. They
+///   remain subject to the status / dedup gates and the underlying block gas limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreconfSource {
     /// Live RPC submission — subject to all pre-apply gates.
     Rpc,
     /// Replay of a previously-promised commitment (startup journal
     /// restore or pool reorg reinject). Bypasses deadline and
-    /// gas-budget gates so promised txs are guaranteed to land.
+    /// gas-budget gates, which would otherwise end a promised tx.
     Replay,
 }
 
@@ -237,8 +237,14 @@ pub enum PreconfError {
     /// Distinct from [`Self::BuilderRejected`], which reports the same class of
     /// apply failure on a live RPC submission — one the client is still waiting
     /// on and can simply retry. This one says a promise already made cannot be
-    /// kept. There is no retry: every transient cause is filtered out before
-    /// apply (see `builder::dispatch::apply_one_preconf`).
+    /// kept. There is no retry, and only capacity is checked before apply; an
+    /// EVM rejection that could clear in a later block (base fee, balance,
+    /// nonce ahead of the chain) also ends here. See
+    /// `builder::dispatch::apply_one_preconf`.
+    ///
+    /// Never sent to a client: only a replayed entry ends this way, and nobody
+    /// is waiting on it. The `COMMITMENT BROKEN` log and
+    /// `preconf.tx.commitment_broken_total` are what record the breach.
     #[error(
         "preconf commitment cannot be honored: apply was rejected after the receipt was returned"
     )]
@@ -376,7 +382,7 @@ pub enum PreconfError {
         in_use: u64,
         /// Configured ceiling in `unit`.
         capacity: u64,
-        /// Which ceiling fired — `"entries"` or `"bytes"`.
+        /// Which ceiling fired — `"entries"`, `"bytes"` or `"gas"`.
         unit: &'static str,
     },
     /// The sender already holds its maximum number of in-flight preconf
@@ -388,7 +394,7 @@ pub enum PreconfError {
     /// well; matching it keeps the two channels indistinguishable to a client.
     #[error("txpool is full")]
     AccountSlotsFull {
-        /// Entries this sender currently holds.
+        /// `Waiting` entries this sender currently holds.
         in_use: u64,
         /// Configured per-sender ceiling.
         max: u64,
@@ -426,7 +432,7 @@ pub enum PreconfError {
     /// — down to the wording it refuses with.
     #[error("in-flight transaction limit reached for delegated accounts")]
     DelegatedInflightLimit {
-        /// Entries this sender currently holds.
+        /// `Waiting` entries this sender currently holds.
         in_use: u64,
         /// Configured ceiling for delegated accounts.
         max: u64,

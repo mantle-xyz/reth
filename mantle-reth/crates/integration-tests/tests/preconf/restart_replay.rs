@@ -11,8 +11,9 @@
 //! - `journal_replay_lands_promised_tx_in_next_block` — base case: single entry, restore → apply →
 //!   land.
 //! - `journal_replay_multiple_entries_all_land_in_first_block` — 3 entries from same sender (nonces
-//!   0/1/2) all land in block 1. Guards `restore_preconf_state`'s per-entry loop + nonce-order
-//!   preservation in `replay_fifo_carryover`.
+//!   0/1/2) all land in block 1. Guards `restore_preconf_state`'s per-entry loop.
+//! - `journal_replay_keeps_a_commitment_behind_the_transfer_it_relies_on` — replay keeps file order
+//!   across senders, so a commitment funded by another sender's transfer still lands.
 //! - `journal_replay_across_multiple_senders` — 2 senders, each 1 entry, both land in block 1.
 //!   Guards per-entry independence in restore.
 //! - `empty_journal_file_starts_normally` — journal file exists but is empty. Startup must not
@@ -433,68 +434,50 @@ async fn journal_replay_multiple_entries_all_land_in_first_block() {
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
-/// The same three commitments, written to the journal newest-nonce-first.
+/// A journal in execution order where one sender's commitment relies on
+/// another sender's transaction between two of its own: S1 nonce 0, S2 funds
+/// S1, S1 nonce 1. Nonce 0 leaves S1 too little for nonce 1; the transfer is
+/// what pays for it.
 ///
-/// Nothing sorts between the file and the builder: `restore_preconf_state`
-/// pushes entries into the fifo in file order, and `replay_fifo_carryover`
-/// hands them to dispatch in fifo order. So a file that is out of nonce order
-/// asks the builder to apply nonce 2 while the account is still at 0.
-///
-/// The journal's own writers can produce this. A preconf commitment is
-/// recorded from its apply and a pool transaction from the slice that carries
-/// it, so two transactions from one sender land in the file in the order those
-/// two moments happened to occur — not in nonce order.
-///
-/// All three commitments were promised to a client, so all three must land.
-///
-/// Read the file in that order and only nonce 0 arrives: nonce 2 goes first
-/// against an account still at 0, is rejected as invalid, and lands in `Failed`
-/// — terminal for carryover, revivable only by a same-hash resubmit. Nonce 1
-/// goes the same way, and two commitments a client holds receipts for disappear.
-/// What keeps that from happening is the carryover preamble ordering each
-/// sender's entries by nonce before dispatch sees them.
+/// Replay has to keep that order. Gathering S1's entries by nonce runs nonce 1
+/// ahead of the transfer, against a balance that cannot cover it, and a
+/// commitment a client holds a receipt for is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn journal_replay_out_of_nonce_order_still_lands_every_commitment() {
+async fn journal_replay_keeps_a_commitment_behind_the_transfer_it_relies_on() {
     let recipient: Address = RECIPIENT.parse().unwrap();
-    let chain_id = mantle_test_chain_spec().chain().id();
-    let wallet = Wallet::default().with_chain_id(chain_id);
-    let wallet_addr = wallet.inner.address();
+    let chain_spec = mantle_test_chain_spec();
+    let chain_id = chain_spec.chain().id();
+    let wallets = Wallet::new(2).with_chain_id(chain_id).wallet_gen();
+    let (s1, s2) = (wallets[0].clone(), wallets[1].clone());
+    let s1_addr = s1.address();
+    let balance =
+        chain_spec.genesis().alloc.get(&s1_addr).expect("S1 is funded by genesis").balance;
 
-    let tx0 = signed_transfer(chain_id, &wallet, 0).await;
-    let tx1 = signed_transfer(chain_id, &wallet, 1).await;
-    let tx2 = signed_transfer(chain_id, &wallet, 2).await;
-    let hash0 = keccak256(&tx0);
-    let hash1 = keccak256(&tx1);
-    let hash2 = keccak256(&tx2);
+    // What one transfer reserves for gas: `gas * max_fee`. Nonce 0 leaves half
+    // of that, so nonce 1 fits only once the transfer has paid in.
+    let fee = U256::from(21_000u64) * U256::from(20e9 as u128);
+    let tx0 =
+        signed_value_transfer(chain_id, &s1, 0, recipient, balance - fee - fee / U256::from(2))
+            .await;
+    let funding = signed_value_transfer(chain_id, &s2, 0, s1_addr, fee * U256::from(2)).await;
+    let tx1 = signed_value_transfer(chain_id, &s1, 1, recipient, U256::from(1u64)).await;
+    let hashes = [keccak256(&tx0), keccak256(&funding), keccak256(&tx1)];
 
-    // Reversed: the highest nonce is the first line in the file.
-    let entries = [
-        JournalEntry {
-            hash: hash2,
-            tx_rlp: tx2.clone(),
+    let entries: Vec<JournalEntry> = [&tx0, &funding, &tx1]
+        .into_iter()
+        .zip(hashes)
+        .map(|(tx, hash)| JournalEntry {
+            hash,
+            tx_rlp: tx.clone(),
             block_height: 1,
             committed_at_ms: 0,
             kind: ClaimKind::Promised,
-        },
-        JournalEntry {
-            hash: hash1,
-            tx_rlp: tx1.clone(),
-            block_height: 1,
-            committed_at_ms: 0,
-            kind: ClaimKind::Promised,
-        },
-        JournalEntry {
-            hash: hash0,
-            tx_rlp: tx0.clone(),
-            block_height: 1,
-            committed_at_ms: 0,
-            kind: ClaimKind::Promised,
-        },
-    ];
+        })
+        .collect();
     let (journal_file, journal_dir) = write_journal(&entries);
 
     let cfg = PreconfCfgBuilder::new()
-        .whitelist_from(wallet_addr)
+        .whitelist_from(s1_addr)
         .whitelist_to(recipient)
         .journal_path(journal_file.clone())
         .build();
@@ -526,15 +509,35 @@ async fn journal_replay_out_of_nonce_order_still_lands_every_commitment() {
     let sealed: Vec<alloy_primitives::B256> =
         payload.block().body().transactions().map(|tx| keccak256(tx.encoded_2718())).collect();
 
-    for (label, h) in [("nonce=0", hash0), ("nonce=1", hash1), ("nonce=2", hash2)] {
-        assert!(
-            sealed.contains(&h),
-            "a promised commitment must land whatever order the file held it in; \
-             missing {label}, sealed={sealed:?}",
-        );
+    for (label, h) in
+        [("S1 nonce 0", hashes[0]), ("transfer", hashes[1]), ("S1 nonce 1", hashes[2])]
+    {
+        assert!(sealed.contains(&h), "missing {label}, sealed={sealed:?}");
     }
 
     let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+/// A transfer of `value` to `to`, with the gas terms of [`signed_transfer`].
+async fn signed_value_transfer(
+    chain_id: u64,
+    signer: &alloy_signer_local::PrivateKeySigner,
+    nonce: u64,
+    to: Address,
+    value: U256,
+) -> alloy_primitives::Bytes {
+    let request = TransactionRequest {
+        chain_id: Some(chain_id),
+        nonce: Some(nonce),
+        to: Some(TxKind::Call(to)),
+        gas: Some(21_000),
+        max_fee_per_gas: Some(20e9 as u128),
+        max_priority_fee_per_gas: Some(20e9 as u128),
+        value: Some(value),
+        input: TransactionInput::default(),
+        ..Default::default()
+    };
+    TransactionTestContext::sign_tx(signer.clone(), request).await.encoded_2718().into()
 }
 
 /// Multi-sender journal replay: two independent senders, each with a

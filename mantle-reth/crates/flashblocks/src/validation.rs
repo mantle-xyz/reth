@@ -103,9 +103,9 @@ impl FlashblockSequenceValidator {
 
         // Every other slice of this height from another build. Scoped to the
         // tracked block number on purpose: the *next* block's base is a new
-        // build by definition and belongs on top of the overlay, not in place
-        // of it. Ahead of the link check below, which such a slice passes —
-        // its predecessor is the position the overlay sits at.
+        // build by definition and, once it has linked to the overlay's last
+        // slice, belongs on top of the overlay, not in place of it. Ahead of the link check below,
+        // which such a slice passes — its predecessor is the position the overlay sits at.
         if incoming_block_number == latest_block_number && incoming_build != IncomingBuild::Same {
             return SequenceValidationResult::ForeignBuild;
         }
@@ -115,8 +115,9 @@ impl FlashblockSequenceValidator {
             return SequenceValidationResult::Duplicate;
         }
 
-        // `NO_PREV` means the producer restarted and cannot name a predecessor;
-        // skipping the link check keeps such a stream admissible.
+        // `NO_PREV` names nothing to compare here. A base slice whose parent
+        // is in the overlay is judged by `base_links_to_overlay` instead,
+        // where `NO_PREV` does not link.
         if !incoming_prev_flashblock_id.is_no_prev() &&
             incoming_prev_flashblock_id != latest_flashblock_id
         {
@@ -272,6 +273,23 @@ impl CanonicalBlockReconciler {
 
         ReconciliationStrategy::Continue
     }
+}
+
+/// Whether a base slice for block N may extend the overlay's block N-1.
+/// `parent_last` is the overlay's last slice of N-1 as (position, `diff.block_hash`).
+pub(crate) fn base_links_to_overlay(
+    parent_last: (FlashblockId, B256),
+    prev_id: FlashblockId,
+    prev_hash: B256,
+) -> bool {
+    let (position, content) = parent_last;
+    !prev_id.is_no_prev() && !content.is_zero() && prev_id == position && prev_hash == content
+}
+
+/// Whether a slice at index >= 1 follows the overlay's latest slice by content.
+/// A zero `prev_hash` (a producer that predates the field) is not checked.
+pub(crate) fn slice_follows_by_content(latest_hash: B256, prev_hash: B256) -> bool {
+    prev_hash.is_zero() || prev_hash == latest_hash
 }
 
 #[cfg(test)]
@@ -468,5 +486,34 @@ mod tests {
         let result =
             CanonicalBlockReconciler::reconcile(earliest, latest, canonical, max_depth, reorg);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn a_base_links_only_with_matching_position_and_content() {
+        let at = FlashblockId { block_number: 9, index: 3 };
+        let h = B256::repeat_byte(7);
+        assert!(base_links_to_overlay((at, h), at, h));
+        assert!(!base_links_to_overlay((at, h), at, B256::repeat_byte(8)), "content differs");
+        assert!(
+            !base_links_to_overlay((at, h), FlashblockId { block_number: 9, index: 2 }, h),
+            "position differs"
+        );
+        assert!(
+            !base_links_to_overlay((at, h), FlashblockId::NO_PREV, B256::ZERO),
+            "no predecessor named"
+        );
+        assert!(
+            !base_links_to_overlay((at, h), at, B256::ZERO),
+            "position without content is not enough"
+        );
+        assert!(!base_links_to_overlay((at, B256::ZERO), at, B256::ZERO), "zero never links");
+    }
+
+    #[test]
+    fn a_later_slice_is_checked_by_content_only_when_named() {
+        let h = B256::repeat_byte(7);
+        assert!(slice_follows_by_content(h, h));
+        assert!(!slice_follows_by_content(h, B256::repeat_byte(8)));
+        assert!(slice_follows_by_content(h, B256::ZERO), "older producer: position check alone");
     }
 }

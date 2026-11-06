@@ -41,6 +41,7 @@ use reth_optimism_primitives::OpPrimitives;
 use reth_optimism_storage::OpStorage;
 use reth_optimism_txpool::{OpPool, OpPooledTransaction, OpPooledTx};
 use reth_provider::CanonStateSubscriptions;
+use reth_rpc_builder::RethRpcModule;
 use reth_transaction_pool::{
     CoinbaseTipOrdering, EthPoolTransaction, Pool, TransactionValidationTaskExecutor,
     blobstore::DiskFileBlobStore,
@@ -238,12 +239,10 @@ where
         // Load the on-chain allowlists BEFORE anything can classify a
         // transaction, and start tracking updates.
         //
-        // Ordering is load-bearing twice over. This cannot live in the binary's
-        // `on_node_started` hook, which runs only once the RPC server, payload
-        // builder and consensus engine are up: the record is written at
-        // admission, so anything admitted against empty allowlists would be
-        // refused and never get a second chance. It must also precede journal restore,
-        // which pushes promised envelopes through the validator.
+        // This cannot live in the binary's `on_node_started` hook, which runs
+        // only once the RPC server, payload builder and consensus engine are up:
+        // the record is written at admission, so anything admitted against
+        // empty allowlists would be refused and never get a second chance.
         //
         // Fatal on a code-less address — `build_pool` returns `eyre::Result`, so
         // the launch aborts. An *empty* allowlist is not an error; it is a
@@ -267,12 +266,15 @@ where
             );
         }
 
-        // Run journal restore before any background pool task starts consuming
-        // events. Two ordering constraints:
-        // - Must run before `spawn_maintenance_tasks` (which spawns reth's local-tx backup loader)
-        //   so the loader and the restore path don't race on the pool mutex.
-        // - Must run before admission is reachable so the restore helper's fifo pushes are
-        //   attributed to the restart path, not to a fresh RPC submission.
+        // Restore the journal before anything else can submit transactions:
+        // - before `spawn_maintenance_tasks` (reth's local-tx backup loader), so every restored
+        //   record has claimed its `(sender, nonce)` before a same-nonce transaction can arrive;
+        // - before admission is reachable, so the restored fifo entries are not mistaken for fresh
+        //   RPC submissions.
+        //
+        // Restore decodes the journal straight into the fifo; it does not go
+        // through the pool or its validator. A journal that cannot be read
+        // aborts the launch (see `PreconfServiceBuilder::start`).
         if let Some(svc) = preconf_svc.as_ref() {
             svc.set_admission(Arc::new(PreconfAdmission::new(
                 admission_validator,
@@ -284,14 +286,14 @@ where
 
             use mantle_reth_preconf::{ProviderChainView, RestoreDirect};
             let adapter = RestoreDirect::<T, TxTy<N::Types>>::new();
-            // The provider answers both of restore's chain questions: whether
-            // a commitment's nonce is still its sender's next one, and — only
-            // when it is not — whether the transaction that took it was this
-            // one.
+            // Answers restore's two chain questions: whether an entry's nonce
+            // is still unused, and if not, whether this transaction used it.
             let chain_view = ProviderChainView::new(ctx.provider().clone());
             svc.start(&adapter, &chain_view)
                 .await
-                .map_err(|e| eyre::eyre!("preconf service start: {e:?}"))?;
+                // Display, not Debug: the error's own text names the journal
+                // and the cause, which the variant names do not.
+                .map_err(|e| eyre::eyre!("preconf service start: {e}"))?;
             info!(target: "reth::cli", "Mantle preconf service builder started (restore + wire)");
         }
 
@@ -434,6 +436,9 @@ impl MantleNode {
         // [MANTLE] Clone the node's handle rather than seeding a new one, so the builder and
         // the executor observe the same `admin_setOperatorSdmOptIn` toggle.
         builder_config.operator_sdm_opt_in = self.op_node.operator_sdm_opt_in.clone();
+        // `OpBuilderConfig::new` leaves this unset; without it
+        // `--rollup.max-uncompressed-block-size` never reaches the builder.
+        builder_config.max_uncompressed_block_size = self.op_node.args.max_uncompressed_block_size;
 
         // Slice publishing rides on the preconf handle: `--flashblocks.enable`
         // requires `--preconf.enable`, so there is no path where flashblocks
@@ -511,6 +516,7 @@ where
 
     fn add_ons(&self) -> Self::AddOns {
         let sequencer_url = self.op_node.args.sequencer.clone();
+        let sequencer_headers = self.op_node.args.sequencer_headers.clone();
         let preconf = self.preconf.clone();
         let flashblocks_cfg = self.flashblocks.clone();
         // Historical log and feeHistory ranges are forwarded whole. The history endpoint must
@@ -523,7 +529,13 @@ where
         // A hash the history endpoint reported missing is looked up locally for a minute.
         let mut add_ons: Self::AddOns = self.op_node.add_ons_builder().build();
         add_ons = add_ons.extend_rpc_modules(move |mut ctx| {
-            install_mantle_rpc_extensions(&mut ctx, sequencer_url, preconf, flashblocks_cfg)
+            install_mantle_rpc_extensions(
+                &mut ctx,
+                sequencer_url,
+                sequencer_headers,
+                preconf,
+                flashblocks_cfg,
+            )
         });
         add_ons
     }
@@ -538,6 +550,7 @@ where
 pub(crate) fn install_mantle_rpc_extensions<Node, EthApi>(
     ctx: &mut reth_node_builder::rpc::RpcContext<'_, Node, EthApi>,
     sequencer_url: Option<String>,
+    sequencer_headers: Vec<String>,
     preconf: Option<Arc<PreconfServiceBuilder>>,
     flashblocks_cfg: Option<FlashblocksConfig>,
 ) -> eyre::Result<()>
@@ -552,13 +565,14 @@ where
         reth_chainspec::ChainSpecProvider<ChainSpec: OpHardforks> + reth_provider::BlockReaderIdExt,
     jsonrpsee_types::error::ErrorObject<'static>: From<EthApi::Error>,
 {
-    // Build SequencerClient if a sequencer URL is configured.
-    // SequencerClient::new is async; use block_in_place since we're inside tokio.
+    // Forward the same sequencer headers as the standard OP RPC client.
+    // Client construction is async; this RPC hook runs inside tokio.
     let sequencer_client = sequencer_url
         .map(|url| {
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(reth_optimism_rpc::SequencerClient::new(url))
+                tokio::runtime::Handle::current().block_on(
+                    reth_optimism_rpc::SequencerClient::new_with_headers(url, sequencer_headers),
+                )
             })
         })
         .transpose()
@@ -630,72 +644,77 @@ where
     // reads. Registered before `MantleRpcExt` so the latter can borrow
     // the overlay for `eth_simulateV1`.
     let flashblocks_state = flashblocks_cfg
-                .map(|cfg| -> eyre::Result<Arc<FlashblocksState>> {
-                    let state = Arc::new(FlashblocksState::new(
-                        cfg.max_trailing_depth,
-                        cfg.max_leading_depth,
-                        cfg.max_cache_ahead_blocks,
-                    ));
-                    state.start(ctx.node().provider().clone());
+        .map(|cfg| -> eyre::Result<Arc<FlashblocksState>> {
+            let state = Arc::new(FlashblocksState::new(
+                cfg.max_trailing_depth,
+                cfg.max_leading_depth,
+                cfg.max_cache_ahead_blocks,
+            ));
+            state.start(ctx.node().provider().clone());
 
-                    let mut subscriber = FlashblocksSubscriber::new(
-                        Arc::clone(&state),
-                        cfg.websocket_url.clone(),
-                        cfg.subscriber_ping_interval,
-                    );
-                    subscriber.start();
+            let mut subscriber = FlashblocksSubscriber::new(
+                Arc::clone(&state),
+                cfg.websocket_url.clone(),
+                cfg.subscriber_ping_interval,
+            );
+            subscriber.start();
 
-                    let state_for_canonical = Arc::clone(&state);
-                    tokio::spawn(mantle_reth_flashblocks::forward_canonical_state(
-                        "flashblocks_overlay",
-                        ctx.node().provider().subscribe_to_canonical_state(),
-                        move |notification| {
-                            // `committed()` only, `reverted()` never: on a reorg
-                            // it is the new chain, and the overlay is reconciled
-                            // against each block as it arrives rather than
-                            // rolled back, so the blocks that replace a reverted
-                            // one carry everything the consumer acts on. It
-                            // re-executes for itself, so it needs nothing out of
-                            // the chain that went away.
-                            //
-                            // The cost is that a reorg is inferred, not
-                            // reported: `ReorgDetector::detect` compares the
-                            // overlay's tx list for a height with the canonical
-                            // block's, and `base_is_canonical` checks the hash
-                            // under the overlay's earliest block. A reorg that
-                            // re-seals a tracked height with the same
-                            // transactions and a different header passes
-                            // both, and the overlay keeps publishing on the
-                            // old block's hash until the next `CatchUp`.
-                            // Accepted: an OP sequencer does not re-seal a
-                            // block with identical contents, and the window
-                            // closes at the next canonical block.
-                            for block in notification.committed().blocks_iter() {
-                                // op-reth v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
-                                state_for_canonical
-                                    .on_canonical_block_received(block.as_ref().clone());
-                            }
-                        },
-                    ));
+            let state_for_canonical = Arc::clone(&state);
+            let forwarder = mantle_reth_flashblocks::forward_canonical_state(
+                "flashblocks_overlay",
+                ctx.node().provider().subscribe_to_canonical_state(),
+                move |notification| {
+                    // `committed()` only, `reverted()` never: on a reorg
+                    // it is the new chain, and the overlay is reconciled
+                    // against each block as it arrives rather than
+                    // rolled back, so the blocks that replace a reverted
+                    // one carry everything the consumer acts on. It
+                    // re-executes for itself, so it needs nothing out of
+                    // the chain that went away.
+                    //
+                    // A reorg is therefore inferred, not reported:
+                    // `ReorgDetector::detect` compares the overlay's tx
+                    // list for a height with the canonical block's, and
+                    // a block whose declared parent is no longer the
+                    // canonical one is refused before it runs — which
+                    // also catches a height re-sealed with the same
+                    // transactions and a different header.
+                    for block in notification.committed().blocks_iter() {
+                        // op-reth v2.4.2 yields `&Arc<RecoveredBlock<_>>` here.
+                        state_for_canonical.on_canonical_block_received(block.as_ref().clone());
+                    }
+                },
+            );
+            // Non-critical on purpose: losing the canonical feed
+            // degrades the overlay, it must not stop the node.
+            ctx.node().task_executor().spawn_task(
+                mantle_reth_flashblocks::run_canonical_forwarder("flashblocks_overlay", forwarder),
+            );
 
-                    let eth_api_ext = FlashblocksEthApiExt::new(
-                        ctx.registry.eth_api().clone(),
-                        ctx.registry.eth_handlers().filter.clone(),
-                        Arc::clone(&state),
-                    );
-                    ctx.modules.replace_configured(eth_api_ext.into_rpc())?;
+            let eth_api_ext = FlashblocksEthApiExt::new(
+                ctx.registry.eth_api().clone(),
+                ctx.registry.eth_handlers().filter.clone(),
+                Arc::clone(&state),
+            );
+            ctx.modules
+                .add_or_replace_if_module_configured(RethRpcModule::Eth, eth_api_ext.into_rpc())?;
 
-                    let pubsub = FlashblocksEthPubSub::new(
-                        ctx.registry.eth_api().clone(),
-                        ctx.node().task_executor().clone(),
-                        Arc::clone(&state),
-                    );
-                    ctx.modules.replace_configured(pubsub.into_rpc())?;
+            let pubsub = FlashblocksEthPubSub::new(
+                ctx.registry.eth_api().clone(),
+                ctx.node().task_executor().clone(),
+                Arc::clone(&state),
+            );
+            ctx.modules
+                .add_or_replace_if_module_configured(RethRpcModule::Eth, pubsub.into_rpc())?;
 
-                    info!(target: "reth::cli", url = %cfg.websocket_url, "Mantle flashblock consumer started");
-                    Ok(state)
-                })
-                .transpose()?;
+            info!(
+                target: "reth::cli",
+                url = %mantle_reth_flashblocks::redact_ws_url(cfg.websocket_url.as_str()),
+                "Mantle flashblock consumer started",
+            );
+            Ok(state)
+        })
+        .transpose()?;
 
     let mantle_ext = MantleRpcExt::new(
         ctx.node().provider().clone(),
@@ -707,11 +726,8 @@ where
         flashblocks_state
             .map(|state| state as Arc<dyn mantle_reth_flashblocks::PendingStateOverrides>),
     );
-    // `replace_configured`, not `merge_configured`: this module now also serves
-    // `eth_simulateV1`, which the standard `eth_` namespace already registers. Merging a
-    // duplicate method name fails, so remove-then-add to override it. The other methods in
-    // this module are new names and are unaffected by the choice.
-    ctx.modules.replace_configured(mantle_ext.into_rpc())?;
+    // Override existing methods only on transports that enable the eth namespace.
+    ctx.modules.add_or_replace_if_module_configured(RethRpcModule::Eth, mantle_ext.into_rpc())?;
 
     // A transaction whose trace fails gets `{"error": …}` instead of failing the whole
     // `debug_traceBlock*` call, as on op-geth.

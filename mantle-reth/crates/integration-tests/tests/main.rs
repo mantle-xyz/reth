@@ -19,3 +19,5 @@ mod proofs_history;
 mod simulate;
 mod txpool;
 mod txpool_admission;
+
+mod rpc_namespaces;
