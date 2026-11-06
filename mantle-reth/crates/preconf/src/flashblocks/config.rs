@@ -17,6 +17,10 @@ use crate::PreconfConfig;
 /// Default interval between slices — 200ms.
 pub const DEFAULT_FLASHBLOCK_BLOCK_TIME: Duration = Duration::from_millis(200);
 
+/// Shortest interval between slices accepted — 100ms. Below it the builder
+/// spends the slot publishing slices rather than executing.
+pub const MIN_FLASHBLOCK_BLOCK_TIME: Duration = Duration::from_millis(100);
+
 /// Default margin by which the budgeted slice grid finishes ahead of the
 /// slot deadline — none.
 ///
@@ -61,6 +65,15 @@ pub const DEFAULT_RING_CAPACITY: usize = 32;
 /// Default capacity of the live broadcast channel — 32.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 32;
 
+/// Default number of subscribers the publisher serves at once — 64.
+///
+/// The endpoint is meant for a handful of relays (`mantle-ws-proxy`), not for
+/// the public. Each subscriber holds a socket for as long as it stays, so an
+/// unbounded count lets anyone who can reach the port exhaust the node's file
+/// descriptors, and with them the database and the consensus engine. A
+/// connection over the limit is closed before the `WebSocket` handshake.
+pub const DEFAULT_MAX_SUBSCRIBERS: usize = 64;
+
 /// Default boundaries a pool snapshot waits before it is used — 1.
 ///
 /// A mid-block pool transaction is therefore offered to the builder a slice
@@ -71,7 +84,7 @@ pub const DEFAULT_BEST_TX_LEAD_SLICES: u64 = 1;
 /// Runtime configuration for publishing flashblocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashblockProducerConfig {
-    /// Interval between slices.
+    /// Interval between slices. At least [`MIN_FLASHBLOCK_BLOCK_TIME`].
     pub block_time: Duration,
     /// How far ahead of the slot deadline the budgeted slice grid finishes.
     /// Shifts the tick grid; does not end the build, which runs until
@@ -79,7 +92,8 @@ pub struct FlashblockProducerConfig {
     pub leeway_time: Duration,
     /// Address the publisher binds.
     pub addr: IpAddr,
-    /// Port the publisher binds.
+    /// Port the publisher binds. `0` lets the OS pick (tests use it); the CLI
+    /// refuses it.
     pub port: u16,
     /// Published slices kept for subscribers that reconnect.
     pub ring_capacity: usize,
@@ -87,6 +101,8 @@ pub struct FlashblockProducerConfig {
     pub broadcast_capacity: usize,
     /// Slice boundaries a refreshed pool snapshot waits before it is used.
     pub best_tx_lead_slices: u64,
+    /// Subscribers served at once; see [`DEFAULT_MAX_SUBSCRIBERS`].
+    pub max_subscribers: usize,
 }
 
 impl Default for FlashblockProducerConfig {
@@ -99,6 +115,7 @@ impl Default for FlashblockProducerConfig {
             ring_capacity: DEFAULT_RING_CAPACITY,
             broadcast_capacity: DEFAULT_BROADCAST_CAPACITY,
             best_tx_lead_slices: DEFAULT_BEST_TX_LEAD_SLICES,
+            max_subscribers: DEFAULT_MAX_SUBSCRIBERS,
         }
     }
 }
@@ -106,15 +123,25 @@ impl Default for FlashblockProducerConfig {
 /// Errors surfaced by [`FlashblockProducerConfig::validate`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FlashblockProducerConfigError {
-    /// `block_time == 0`.
-    #[error("flashblocks block_time must be > 0")]
-    InvalidBlockTime,
+    /// `block_time` below [`MIN_FLASHBLOCK_BLOCK_TIME`].
+    #[error("--flashblocks.block-time ({block_time:?}) must be >= {min:?}")]
+    BlockTimeTooShort {
+        /// Configured slice interval.
+        block_time: Duration,
+        /// Shortest accepted interval.
+        min: Duration,
+    },
     /// `broadcast_capacity == 0` — tokio broadcast requires capacity > 0.
     #[error("flashblocks broadcast_capacity must be > 0")]
     InvalidBroadcastCapacity,
+    /// `max_subscribers == 0` would refuse every subscriber, the relay included.
+    #[error("--flashblocks.max-subscribers must be > 0: zero refuses every subscriber")]
+    NoSubscribersAllowed,
     /// A single slice would span more than the whole slot, which leaves the
     /// per-slice budget meaningless.
-    #[error("flashblocks block_time ({block_time:?}) must be <= slot_duration ({slot:?})")]
+    #[error(
+        "--flashblocks.block-time ({block_time:?}) must be <= --preconf.slot-duration-ms ({slot:?})"
+    )]
     BlockTimeExceedsSlot {
         /// Configured slice interval.
         block_time: Duration,
@@ -122,7 +149,9 @@ pub enum FlashblockProducerConfigError {
         slot: Duration,
     },
     /// Leeway at or past a whole slot leaves no time to build in.
-    #[error("flashblocks leeway_time ({leeway:?}) must be < slot_duration ({slot:?})")]
+    #[error(
+        "--flashblocks.leeway-time ({leeway:?}) must be < --preconf.slot-duration-ms ({slot:?})"
+    )]
     LeewayReachesSlot {
         /// Configured leeway.
         leeway: Duration,
@@ -175,7 +204,11 @@ pub enum FlashblockProducerConfigError {
     )]
     SdmNotSupportedWithFlashblocks,
     /// The lead spans the slot, so no refresh ever matures before the seal.
-    #[error("flashblocks best_tx_lead_slices ({lead}) must be < the slices in a slot ({slices})")]
+    #[error(
+        "--flashblocks.best-tx-lead-slices ({lead}) must be less than the slices in a slot \
+         ({slices}: --preconf.slot-duration-ms divided by --flashblocks.block-time); lower \
+         --flashblocks.best-tx-lead-slices or --flashblocks.block-time"
+    )]
     BestTxLeadSpansSlot {
         /// Configured lead, in slice boundaries.
         lead: u64,
@@ -200,11 +233,17 @@ impl FlashblockProducerConfig {
         if sdm_enabled {
             return Err(FlashblockProducerConfigError::SdmNotSupportedWithFlashblocks);
         }
-        if self.block_time.is_zero() {
-            return Err(FlashblockProducerConfigError::InvalidBlockTime);
+        if self.block_time < MIN_FLASHBLOCK_BLOCK_TIME {
+            return Err(FlashblockProducerConfigError::BlockTimeTooShort {
+                block_time: self.block_time,
+                min: MIN_FLASHBLOCK_BLOCK_TIME,
+            });
         }
         if self.broadcast_capacity == 0 {
             return Err(FlashblockProducerConfigError::InvalidBroadcastCapacity);
+        }
+        if self.max_subscribers == 0 {
+            return Err(FlashblockProducerConfigError::NoSubscribersAllowed);
         }
         if self.ring_capacity < self.broadcast_capacity {
             return Err(FlashblockProducerConfigError::RingSmallerThanBroadcast {
@@ -245,8 +284,7 @@ impl FlashblockProducerConfig {
 
 /// Interval the build loop's ticker fires at.
 ///
-/// Without flashblocks the cadence stays exactly what preconf used before,
-/// which keeps turning the feature off a true rollback.
+/// Without flashblocks the cadence stays exactly what preconf used before.
 pub fn tick_interval(
     flashblocks: Option<&FlashblockProducerConfig>,
     preconf_sweep: Duration,
@@ -261,7 +299,10 @@ mod tests {
         time::Duration,
     };
 
-    use super::{FlashblockProducerConfig, FlashblockProducerConfigError, tick_interval};
+    use super::{
+        FlashblockProducerConfig, FlashblockProducerConfigError, MIN_FLASHBLOCK_BLOCK_TIME,
+        tick_interval,
+    };
     use crate::PreconfConfig;
 
     fn preconf_with_slot(slot: Duration) -> PreconfConfig {
@@ -296,13 +337,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_block_time() {
-        let cfg = FlashblockProducerConfig { block_time: Duration::ZERO, ..cfg() };
+    fn validate_rejects_zero_max_subscribers() {
+        let preconf = preconf_with_slot(Duration::from_secs(2));
+        let cfg = FlashblockProducerConfig { max_subscribers: 0, ..cfg() };
 
-        assert!(matches!(
-            cfg.validate(Some(&preconf_with_slot(Duration::from_secs(2))), false),
-            Err(FlashblockProducerConfigError::InvalidBlockTime)
-        ));
+        assert_eq!(
+            cfg.validate(Some(&preconf), false),
+            Err(FlashblockProducerConfigError::NoSubscribersAllowed)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_block_time_below_the_minimum() {
+        let preconf = preconf_with_slot(Duration::from_secs(2));
+        for block_time in [Duration::ZERO, MIN_FLASHBLOCK_BLOCK_TIME - Duration::from_millis(1)] {
+            let cfg = FlashblockProducerConfig { block_time, ..cfg() };
+            assert!(
+                matches!(
+                    cfg.validate(Some(&preconf), false),
+                    Err(FlashblockProducerConfigError::BlockTimeTooShort { .. })
+                ),
+                "{block_time:?}"
+            );
+        }
+        let at_minimum =
+            FlashblockProducerConfig { block_time: MIN_FLASHBLOCK_BLOCK_TIME, ..cfg() };
+        assert!(at_minimum.validate(Some(&preconf), false).is_ok());
     }
 
     #[test]
@@ -389,6 +449,7 @@ mod tests {
             ring_capacity: 64,
             broadcast_capacity: 16,
             best_tx_lead_slices: 2,
+            max_subscribers: 8,
         };
 
         assert_eq!(configured.clone().validate(Some(&preconf), false), Ok(configured));

@@ -20,7 +20,11 @@ use reth_primitives_traits::SignedTransaction;
 pub struct BlockInvariants {
     /// Header fields a consumer needs to reconstruct the block.
     pub base: OpFlashblockPayloadBase,
-    /// Withdrawals for the block, repeated on every slice.
+    /// Withdrawals for the block, repeated in full on every slice — not a delta.
+    ///
+    /// The Mantle consumer concatenates the lists of a block's slices, which is
+    /// correct only while the list is empty, as OP consensus requires. Sending
+    /// a non-empty list means changing one side to match the other.
     pub withdrawals: Vec<Withdrawal>,
     /// Root of those withdrawals.
     pub withdrawals_root: B256,
@@ -58,6 +62,7 @@ pub fn build_flashblock<T: SignedTransaction>(
     payload_id: PayloadId,
     index: u64,
     prev_flashblock_id: FlashblockId,
+    prev_flashblock_hash: B256,
 ) -> MantleFlashblockPayload {
     let transactions = pending.iter().map(|tx| tx.encoded_2718().into()).collect();
 
@@ -92,6 +97,7 @@ pub fn build_flashblock<T: SignedTransaction>(
             // reliable block number a consumer has.
             block_number: invariants.base.block_number,
             prev_flashblock_id,
+            prev_flashblock_hash,
             ..Default::default()
         },
     }
@@ -176,6 +182,7 @@ mod tests {
             PayloadId::new([7u8; 8]),
             index,
             FlashblockId::NO_PREV,
+            B256::ZERO,
         );
         info.advance_publish_cursor();
         payload
@@ -245,6 +252,7 @@ mod tests {
             PayloadId::new([7u8; 8]),
             0,
             FlashblockId::NO_PREV,
+            B256::ZERO,
         );
 
         assert_eq!(dropped.diff.transactions.len(), 1);
@@ -261,6 +269,7 @@ mod tests {
             PayloadId::new([7u8; 8]),
             1,
             FlashblockId::NO_PREV,
+            B256::ZERO,
         );
 
         assert_eq!(payload.diff.gas_used, 63_000);
@@ -321,13 +330,14 @@ mod tests {
             PayloadId::new([7u8; 8]),
             3,
             previous,
+            B256::ZERO,
         );
 
         assert_eq!(payload.metadata.prev_flashblock_id, previous);
     }
 
-    /// After a restart there is no predecessor to point at, and the sentinel
-    /// says so rather than naming a slice that was never published.
+    /// With no sealed predecessor to name, the sentinel says so rather than
+    /// naming a slice that was never published.
     #[test]
     fn a_first_slice_after_a_restart_points_at_no_predecessor() {
         let mut info = Info::default();

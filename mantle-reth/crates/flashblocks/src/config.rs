@@ -23,6 +23,9 @@ use crate::DEFAULT_MAX_CACHE_AHEAD_BLOCKS;
 /// when it is wrong.
 pub const DEFAULT_SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Longest ping interval the CLI accepts — five minutes.
+pub const MAX_SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Default number of canonical blocks the pending overlay may trail behind
 /// before it is rebuilt from canonical state.
 pub const DEFAULT_MAX_TRAILING_DEPTH: u64 = 3;
@@ -32,7 +35,9 @@ pub const DEFAULT_MAX_TRAILING_DEPTH: u64 = 3;
 pub const DEFAULT_MAX_LEADING_DEPTH: u64 = 3;
 
 /// Flashblocks-specific configuration knobs.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows `websocket_url` redacted: it can carry an API key.
+#[derive(Clone)]
 pub struct FlashblocksConfig {
     /// The websocket endpoint that streams flashblock updates.
     pub websocket_url: Url,
@@ -40,10 +45,31 @@ pub struct FlashblocksConfig {
     pub max_trailing_depth: u64,
     /// See [`DEFAULT_MAX_LEADING_DEPTH`].
     pub max_leading_depth: u64,
-    /// See [`DEFAULT_MAX_CACHE_AHEAD_BLOCKS`].
+    /// See [`DEFAULT_MAX_CACHE_AHEAD_BLOCKS`]. The CLI caps it at
+    /// [`MAX_CACHE_AHEAD_BLOCKS`](crate::MAX_CACHE_AHEAD_BLOCKS).
     pub max_cache_ahead_blocks: u64,
-    /// See [`DEFAULT_SUBSCRIBER_PING_INTERVAL`].
+    /// See [`DEFAULT_SUBSCRIBER_PING_INTERVAL`]. Capped at
+    /// [`MAX_SUBSCRIBER_PING_INTERVAL`].
     pub subscriber_ping_interval: Duration,
+}
+
+impl std::fmt::Debug for FlashblocksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            websocket_url,
+            max_trailing_depth,
+            max_leading_depth,
+            max_cache_ahead_blocks,
+            subscriber_ping_interval,
+        } = self;
+        f.debug_struct("FlashblocksConfig")
+            .field("websocket_url", &crate::redact_ws_url(websocket_url.as_str()))
+            .field("max_trailing_depth", max_trailing_depth)
+            .field("max_leading_depth", max_leading_depth)
+            .field("max_cache_ahead_blocks", max_cache_ahead_blocks)
+            .field("subscriber_ping_interval", subscriber_ping_interval)
+            .finish()
+    }
 }
 
 impl FlashblocksConfig {

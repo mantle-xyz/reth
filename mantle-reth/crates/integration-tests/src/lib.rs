@@ -22,6 +22,7 @@ macro_rules! launch_mantle_node {
     (
         $chain_spec:expr, $node:expr, $payload_attributes:expr,persist_each_block = $persist:expr
         $(, rpc_pending_block = $pending_kind:expr)?
+        $(, rpc = $rpc:expr)?
     ) => {{
         async {
             use mantle_reth_cli::node::MantleNode;
@@ -46,6 +47,7 @@ macro_rules! launch_mantle_node {
                     })
                     .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
             $(config.rpc.rpc_pending_block = $pending_kind;)?
+            $(config.rpc = $rpc;)?
             config.network.discovery.discv5_port = Some(0);
             config.network.discovery.discv5_port_ipv6 = Some(0);
             // An isolated single node has no peers to discover, and building

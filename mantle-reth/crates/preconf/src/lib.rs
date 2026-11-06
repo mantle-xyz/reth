@@ -58,7 +58,7 @@ pub use rpc::PreconfRpcHandler;
 pub use service_builder::{PreconfServiceBuilder, PreconfServiceError};
 pub use types::{MarkError, PreconfError, PreconfReceipt, PreconfStatus, PushResult};
 pub use whitelist::{
-    EXPECTED_LAYOUT_VERSION, FROM_WILDCARDS_SLOT, LAYOUT_VERSION_SLOT, PAIRS_SLOT,
+    EXPECTED_LAYOUT_VERSION, FROM_WILDCARDS_SLOT, LAYOUT_VERSION_SLOT, LISTS_HASH_SLOT, PAIRS_SLOT,
     TO_WILDCARDS_SLOT, WHITELIST_UPDATED_TOPIC0, WhitelistError, bootstrap_whitelist,
     has_whitelist_event, reload_whitelist, run_whitelist_watcher, should_reload,
 };

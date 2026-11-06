@@ -50,6 +50,7 @@ macro_rules! install_proofs_history {
             *$args;
 
         let sequencer_url = $sequencer_url;
+        let sequencer_headers = $args.sequencer_headers.clone();
         let preconf = $preconf;
         let flashblocks_cfg = $flashblocks_cfg;
 
@@ -71,6 +72,7 @@ macro_rules! install_proofs_history {
                 crate::node::install_mantle_rpc_extensions(
                     &mut ctx,
                     sequencer_url,
+                    sequencer_headers,
                     preconf,
                     flashblocks_cfg,
                 )?;

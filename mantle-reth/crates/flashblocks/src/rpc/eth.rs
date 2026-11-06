@@ -1,23 +1,33 @@
 //! `eth_` method overrides that serve the `pending` tag from flashblock state.
 //!
 //! `eth_simulateV1` is deliberately absent: it is owned by `MantleEthApiExt`,
-//! which injects pending overrides via [`PendingStateOverrides`].
+//! which injects pending overrides via [`PendingStateOverrides`], and which
+//! gets them only while the preview leads the canonical tip.
 //!
-//! # Four overlay representations, and what is not covered
+//! # Freshness
 //!
-//! The overlay keeps the same execution in four separately maintained shapes on
+//! `pending` reads use the preview only while its latest block is above the
+//! canonical tip; otherwise they take the standard implementation, which
+//! answers from `latest`. Equal counts as stale, and a failed tip read does too.
+//! Lookups by hash accept only preview entries above the tip, and
+//! `eth_getLogs` serves the tip and below from the canonical chain and
+//! the range above it from the preview.
+//!
+//! # Three overlay representations, and what is not covered
+//!
+//! The overlay keeps the same execution in three separately maintained shapes on
 //! [`PendingBlocks`], and each overridden method answers from exactly one:
 //!
 //! | Source | Methods served from it |
 //! |---|---|
-//! | [`BundleState`] | `eth_getCode`, `eth_getStorageAt` |
+//! | [`BundleState`] | `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` |
 //! | `state_overrides` | `eth_call`, `eth_estimateGas`, `eth_simulateV1` |
 //! | `account_balances` | `eth_getBalance` |
-//! | `transaction_count` (a delta added to the canonical count) | `eth_getTransactionCount` |
 //!
-//! Nothing keeps the four in step, so do not assume they agree on a given
-//! account or slot. The bundle is the widest of them — it also carries the
-//! EIP-4788 and EIP-2935 pre-execution writes and the writes of a cached replay.
+//! Nothing keeps the three in step, so do not assume they agree on a given
+//! account or slot. The EIP-4788 and EIP-2935 pre-execution writes are in both
+//! the bundle and `state_overrides`; the bundle additionally carries the writes
+//! of a cached replay.
 //!
 //! Methods that read state but are **not** overridden still resolve `pending`
 //! through reth's own pending block, which this consumer never feeds, so they
@@ -32,53 +42,80 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_consensus::Header;
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{
-    Address, B256, Bytes, TxHash, U256,
-    map::foldhash::{HashSet, HashSetExt},
-};
+use alloy_primitives::{Address, B256, BlockNumber, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::{
-    BlockOverrides, Filter, Log,
+    BlockOverrides, Filter, FilterBlockOption, Log,
     state::{EvmOverrides, StateOverride},
 };
 use alloy_serde::JsonStorageKey;
+use arc_swap::Guard;
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
 };
 use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use op_alloy_network::Optimism;
+use reth_chain_state::CanonStateNotification;
 use reth_chainspec::ChainSpecProvider;
 use reth_execution_types::BlockReceipts;
 use reth_optimism_forks::OpHardforks;
 use reth_primitives_traits::NodePrimitives;
-use reth_provider::{BlockIdReader, BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions};
+use reth_provider::{
+    BlockHashReader, BlockIdReader, BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions,
+};
 use reth_rpc::eth::EthFilter;
 use reth_rpc_eth_api::{
     EthApiTypes, EthFilterApiServer, FromEthApiError, RpcReceipt,
     helpers::{EthBlocks, EthCall, EthState, EthTransactions, FullEthApi, LoadPendingBlock},
 };
 use reth_rpc_eth_types::EthApiError;
-use tokio::{sync::broadcast::error::RecvError, time};
+use tokio::{
+    sync::broadcast::{self, error::RecvError},
+    time,
+};
 use tracing::{debug, trace, warn};
 
-use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
+use super::{CanonicalChainReorgDetected, CanonicalQueryAnchor};
+use crate::{FlashblocksAPI, PendingBlocks, metrics::Metrics};
 
-/// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
-const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
+/// How long `eth_sendRawTransactionSync` waits: the caller's timeout, cut down
+/// to the node's configured one; the configured one when the caller gives none.
+/// `0` means unset. Clamped rather than refused, as op-geth and upstream do.
+fn sync_timeout(requested_ms: Option<u64>, configured: Duration) -> Duration {
+    requested_ms
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .map_or(configured, |requested| requested.min(configured))
+}
 
-/// Supplies one coherent pending execution snapshot to RPC methods owned elsewhere.
+/// Supplies one coherent pending execution snapshot to RPC methods owned elsewhere,
+/// only while the preview extends the canonical head.
 pub trait PendingStateOverrides: std::fmt::Debug + Send + Sync {
-    /// Returns state and execution header from the same published snapshot.
-    fn pending_execution_context(&self) -> Option<super::PendingExecutionContext>;
+    /// Returns state and execution header from the same published snapshot, or
+    /// `None` when there is none or it no longer extends the head (see
+    /// [`PendingBlocks::extends`]). `canonical_head` returns the head's number and
+    /// hash, and is read after the snapshot is loaded; `None` from it counts as
+    /// stale.
+    fn pending_execution_context(
+        &self,
+        canonical_head: &dyn Fn() -> Option<(BlockNumber, B256)>,
+    ) -> Option<super::PendingExecutionContext>;
 }
 
 impl<FB: FlashblocksAPI + std::fmt::Debug + Send + Sync> PendingStateOverrides for FB {
-    fn pending_execution_context(&self) -> Option<super::PendingExecutionContext> {
-        let pending = self.get_pending_blocks();
-        pending
-            .as_ref()
-            .as_ref()
-            .map(|pending| super::PendingExecutionContext::from_pending(pending))
+    fn pending_execution_context(
+        &self,
+        canonical_head: &dyn Fn() -> Option<(BlockNumber, B256)>,
+    ) -> Option<super::PendingExecutionContext> {
+        // Load the preview before reading the head: a head read first can miss a
+        // block that lands before the preview is loaded, letting a stale
+        // preview pass as extending it.
+        let pending = Guard::into_inner(self.get_pending_blocks())?;
+        if !canonical_head().is_some_and(|(tip, tip_hash)| pending.extends(tip, tip_hash)) {
+            Metrics::pending_stale_fallback().increment(1);
+            return None;
+        }
+        Some(super::PendingExecutionContext::from_pending(&pending))
     }
 }
 
@@ -183,7 +220,8 @@ pub trait EthApiOverride {
 
     /// Sends a raw transaction and waits for its receipt from either a
     /// flashblock or a canonical block, whichever answers first, until
-    /// `timeout_ms` elapses.
+    /// `timeout_ms` elapses. A receipt already on the chain or in the preview
+    /// when the transaction is sent is returned at once.
     #[method(name = "sendRawTransactionSync")]
     async fn send_raw_transaction_sync(
         &self,
@@ -217,6 +255,7 @@ pub trait EthApiOverride {
     ) -> RpcResult<U256>;
 
     /// Returns logs matching the filter, including pending flashblock logs.
+    /// A canonical reorganization invalidating the captured preview returns a retryable error.
     #[method(name = "getLogs")]
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>>;
 
@@ -276,13 +315,11 @@ where
     ) -> RpcResult<Option<serde_json::Value>> {
         debug!(message = "rpc::block_by_number", block_number = ?number);
 
-        if number.is_pending() {
+        if number.is_pending() &&
+            let Some((pending, _)) = self.fresh_pending()
+        {
             Metrics::rpc_get_block_by_number().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            if pending_blocks.as_ref().is_some() {
-                return Ok(pending_blocks.get_block(full));
-            }
-            // No overlay: fall through so the standard implementation serves `pending`.
+            return to_value(pending.get_latest_block(full)).map(Some);
         }
 
         let block =
@@ -296,21 +333,21 @@ where
     ) -> RpcResult<Option<serde_json::Value>> {
         debug!(message = "rpc::get_transaction_receipt", tx_hash = %tx_hash);
 
-        // Canonical first: after a canonical commit the pending overlay may not be
-        // cleared yet, and the canonical receipt is the authoritative one.
-        if let Some(canonical_receipt) =
-            EthTransactions::transaction_receipt(&self.eth_api, tx_hash).await?
-        {
-            return to_value(canonical_receipt).map(Some);
+        // Canonical first; the preview only answers for blocks ahead of the tip.
+        if let Some(receipt) = self.canonical_receipt(tx_hash).await? {
+            return Ok(Some(receipt));
         }
 
-        let pending_blocks = self.flashblocks_state.get_pending_blocks();
-        if let Some(fb_receipt) = pending_blocks.get_transaction_receipt(tx_hash) {
+        let Some((pending, tip)) = self.fresh_pending() else {
+            return self.canonical_receipt(tx_hash).await;
+        };
+        if let Some(receipt) = receipt_above_tip(&pending, tip, tx_hash) {
             Metrics::rpc_get_transaction_receipt().increment(1);
-            return Ok(Some(fb_receipt));
+            return to_value(receipt).map(Some);
         }
 
-        Ok(None)
+        // The transaction may have landed between the first lookup and the tip read.
+        self.canonical_receipt(tx_hash).await
     }
 
     async fn get_balance(
@@ -320,12 +357,12 @@ where
     ) -> RpcResult<U256> {
         debug!(message = "rpc::get_balance", address = %address);
         let block_id = block_number.unwrap_or_default();
-        if block_id.is_pending() {
+        if block_id.is_pending() &&
+            let Some((pending, _)) = self.fresh_pending() &&
+            let Some(balance) = pending.get_balance(address)
+        {
             Metrics::rpc_get_balance().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            if let Some(balance) = pending_blocks.get_balance(address) {
-                return Ok(balance);
-            }
+            return Ok(balance);
         }
 
         EthState::balance(&self.eth_api, address, block_number).await.map_err(Into::into)
@@ -334,14 +371,14 @@ where
     async fn get_code(&self, address: Address, block_number: Option<BlockId>) -> RpcResult<Bytes> {
         debug!(message = "rpc::get_code", address = %address);
         let block_id = block_number.unwrap_or_default();
-        if block_id.is_pending() {
+        // Empty bytes are an answer, not a miss; only `None` falls through.
+        // See `PendingBlocks::get_code`.
+        if block_id.is_pending() &&
+            let Some((pending, _)) = self.fresh_pending() &&
+            let Some(code) = pending.get_code(address)
+        {
             Metrics::rpc_get_code().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            // Empty bytes are an answer, not a miss; only `None` falls through.
-            // See `PendingBlocks::get_code`.
-            if let Some(code) = pending_blocks.get_code(address) {
-                return Ok(code);
-            }
+            return Ok(code);
         }
 
         EthState::get_code(&self.eth_api, address, block_number).await.map_err(Into::into)
@@ -355,12 +392,12 @@ where
     ) -> RpcResult<B256> {
         debug!(message = "rpc::storage_at", address = %address, index = %index.as_b256());
         let block_id = block_number.unwrap_or_default();
-        if block_id.is_pending() {
+        if block_id.is_pending() &&
+            let Some((pending, _)) = self.fresh_pending() &&
+            let Some(value) = pending.get_storage_at(address, index.as_b256())
+        {
             Metrics::rpc_get_storage_at().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            if let Some(value) = pending_blocks.get_storage_at(address, index.as_b256()) {
-                return Ok(value);
-            }
+            return Ok(value);
         }
 
         EthState::storage_at(&self.eth_api, address, index, block_number).await.map_err(Into::into)
@@ -376,20 +413,19 @@ where
         let block_id = block_number.unwrap_or_default();
 
         if block_id.is_pending() {
-            Metrics::rpc_get_transaction_count().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            let base = pending_blocks
-                .as_ref()
-                .as_ref()
-                .map(|pending| BlockId::from(pending.parent_hash()))
-                .unwrap_or(BlockId::latest());
-            let fb_count = pending_blocks.get_transaction_count(address);
-
-            let canon_count = EthState::transaction_count(&self.eth_api, address, Some(base))
+            let base = match self.fresh_pending() {
+                Some((pending, _)) => {
+                    Metrics::rpc_get_transaction_count().increment(1);
+                    match pending.get_nonce(address) {
+                        Some(nonce) => return Ok(U256::from(nonce)),
+                        None => BlockId::from(pending.parent_hash()),
+                    }
+                }
+                None => BlockId::latest(),
+            };
+            return EthState::transaction_count(&self.eth_api, address, Some(base))
                 .await
-                .map_err(Into::into)?;
-
-            return Ok(canon_count + fb_count);
+                .map_err(Into::into);
         }
 
         EthState::transaction_count(&self.eth_api, address, block_number).await.map_err(Into::into)
@@ -398,22 +434,23 @@ where
     async fn transaction_by_hash(&self, tx_hash: TxHash) -> RpcResult<Option<serde_json::Value>> {
         debug!(message = "rpc::transaction_by_hash", tx_hash = %tx_hash);
 
-        if let Some(canonical_tx) = EthTransactions::transaction_by_hash(&self.eth_api, tx_hash)
-            .await?
-            .map(|tx| tx.into_transaction(self.eth_api.converter()))
-            .transpose()
-            .map_err(Eth::Error::from)?
+        if let Some(tx) = self.canonical_transaction(tx_hash).await? {
+            return Ok(Some(tx));
+        }
+
+        let Some((pending, tip)) = self.fresh_pending() else {
+            return self.canonical_transaction(tx_hash).await;
+        };
+        if let Some(tx) = pending
+            .get_transaction_by_hash(tx_hash)
+            .filter(|tx| tx.block_number.is_some_and(|number| number > tip))
         {
-            return to_value(canonical_tx).map(Some);
-        }
-
-        let pending_blocks = self.flashblocks_state.get_pending_blocks();
-        if let Some(fb_transaction) = pending_blocks.get_transaction_by_hash(tx_hash) {
             Metrics::rpc_get_transaction_by_hash().increment(1);
-            return Ok(Some(fb_transaction));
+            return to_value(tx).map(Some);
         }
 
-        Ok(None)
+        // The transaction may have landed between the first lookup and the tip read.
+        self.canonical_transaction(tx_hash).await
     }
 
     async fn send_raw_transaction_sync(
@@ -423,44 +460,39 @@ where
     ) -> RpcResult<serde_json::Value> {
         debug!(message = "rpc::send_raw_transaction_sync");
 
-        // `0` means "unset", as it does upstream (`.filter(|ms| *ms > 0)`).
-        // Taken literally it is a `sleep(0)`, which times the caller out
-        // before the transaction could possibly land — an answer that is
-        // always wrong, so there is nothing to preserve in honouring it.
-        //
-        // Refusing an over-long timeout, by contrast, is left alone: upstream
-        // clamps instead, but which of the two is right is a question about
-        // what the client should be told, not a bug. See `API-A`.
-        let timeout_ms = match timeout_ms.filter(|ms| *ms > 0) {
-            Some(ms) if ms > MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS => {
-                return Err(ErrorObjectOwned::owned(
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "time out too long, timeout: {ms} ms, max: {MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS} ms"
-                    ),
-                    None::<()>,
-                ));
-            }
-            Some(ms) => ms,
-            None => MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS,
-        };
+        let timeout = sync_timeout(
+            timeout_ms,
+            EthTransactions::send_raw_transaction_sync_timeout(&self.eth_api),
+        );
+
+        // Subscribed before sending: a receipt published from here on reaches a
+        // waiter, and one published earlier is found by the lookup below.
+        let previews = self.flashblocks_state.subscribe_to_flashblocks();
+        let canonical = self.eth_api.provider().subscribe_to_canonical_state();
 
         let tx_hash = EthTransactions::send_raw_transaction(&self.eth_api, transaction).await?;
 
         debug!(
             message = "rpc::send_raw_transaction_sync::sent_transaction",
             tx_hash = %tx_hash,
-            timeout_ms = timeout_ms,
+            timeout_ms = timeout.as_millis() as u64,
         );
 
-        let timeout = Duration::from_millis(timeout_ms);
-        let receipt = tokio::select! {
-            receipt = self.wait_for_flashblocks_receipt(tx_hash) => receipt,
-            receipt = self.wait_for_canonical_receipt(tx_hash) => receipt,
-            _ = time::sleep(timeout) => None,
-        };
+        // The transaction is already sent; a failed lookup here must not read as a failed send.
+        if let Some(receipt) = self.canonical_receipt(tx_hash).await.ok().flatten() {
+            return Ok(receipt);
+        }
+        if let Some(receipt) = self.fresh_preview_receipt(tx_hash) {
+            return to_value(receipt);
+        }
 
-        match receipt {
+        match first_receipt(
+            self.wait_for_flashblocks_receipt(tx_hash, previews),
+            self.wait_for_canonical_receipt(tx_hash, canonical),
+            timeout,
+        )
+        .await
+        {
             Some(receipt) => to_value(receipt),
             None => Err(EthApiError::TransactionConfirmationTimeout {
                 hash: tx_hash,
@@ -482,15 +514,11 @@ where
         let transaction: op_alloy_rpc_types::OpTransactionRequest = from_value(transaction)?;
         let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
-            Metrics::rpc_call().increment(1);
-            let context = {
-                let pending = self.flashblocks_state.get_pending_blocks();
-                pending
-                    .as_ref()
-                    .as_ref()
-                    .map(|pending| super::PendingExecutionContext::from_pending(pending))
-            };
+            let context = self
+                .fresh_pending()
+                .map(|(pending, _)| super::PendingExecutionContext::from_pending(&pending));
             if let Some(context) = context {
+                Metrics::rpc_call().increment(1);
                 let overrides = context.overrides(state_overrides, block_overrides);
                 let at = context.base_block;
                 let api = super::PendingEthApi::new(self.eth_api.clone(), context);
@@ -520,15 +548,11 @@ where
         let transaction: op_alloy_rpc_types::OpTransactionRequest = from_value(transaction)?;
         let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
-            Metrics::rpc_estimate_gas().increment(1);
-            let context = {
-                let pending = self.flashblocks_state.get_pending_blocks();
-                pending
-                    .as_ref()
-                    .as_ref()
-                    .map(|pending| super::PendingExecutionContext::from_pending(pending))
-            };
+            let context = self
+                .fresh_pending()
+                .map(|(pending, _)| super::PendingExecutionContext::from_pending(&pending));
             if let Some(context) = context {
+                Metrics::rpc_estimate_gas().increment(1);
                 let overrides = context.overrides(overrides, block_overrides);
                 let at = context.base_block;
                 let api = super::PendingEthApi::new(self.eth_api.clone(), context);
@@ -554,33 +578,31 @@ where
         debug!(message = "rpc::get_logs", address = ?filter.address);
 
         let (from_block, to_block) = match &filter.block_option {
-            alloy_rpc_types_eth::FilterBlockOption::Range { from_block, to_block } => {
-                (*from_block, *to_block)
-            }
+            FilterBlockOption::Range { from_block, to_block } => (*from_block, *to_block),
             _ => return self.eth_filter.logs(filter).await,
         };
+        // As in reth: a range starting at `pending` with no end ends at `pending`.
+        let to_block = to_block.or(from_block.filter(BlockNumberOrTag::is_pending));
 
         if !matches!(to_block, Some(BlockNumberOrTag::Pending)) {
             return self.eth_filter.logs(filter).await;
         }
 
-        Metrics::rpc_get_logs().increment(1);
-        let mut all_logs = Vec::new();
-
-        let pending_blocks = self.flashblocks_state.get_pending_blocks();
-        let Some(pending) = pending_blocks.as_ref() else {
-            // Nothing to append, and the range handling below would skip the canonical
-            // query that the standard implementation resolves `pending` to on its own.
+        let Some((pending, tip)) = self.fresh_pending() else {
+            // No preview, or one the chain has caught up with: the standard
+            // implementation resolves `pending` on its own.
             return self.eth_filter.logs(filter).await;
         };
+        Metrics::rpc_get_logs().increment(1);
+        // `fresh_pending` verified the base of tip + 1 against this canonical block.
+        let tip_hash =
+            pending.block_hash_overrides().get(&tip).copied().ok_or(CanonicalChainReorgDetected)?;
+        let anchor = CanonicalQueryAnchor::new(tip, tip_hash);
 
         let end = pending.latest_block_number();
-        let canonical_tip =
-            self.eth_api.provider().best_block_number().map_err(EthApiError::from)?;
-        let start_tag = from_block.unwrap_or(BlockNumberOrTag::Latest);
-        let start = match start_tag {
+        let start = match from_block.unwrap_or(BlockNumberOrTag::Latest) {
             BlockNumberOrTag::Pending => end,
-            BlockNumberOrTag::Latest => canonical_tip,
+            BlockNumberOrTag::Latest => tip,
             tag => self
                 .eth_api
                 .provider()
@@ -588,37 +610,33 @@ where
                 .map_err(EthApiError::from)?
                 .ok_or(EthApiError::HeaderNotFound(tag.into()))?,
         };
-        if start > end {
-            return Ok(Vec::new());
-        }
 
-        let mut fetched_logs = HashSet::new();
-        let historical_end = canonical_tip.min(end);
-        if !start_tag.is_pending() && start <= historical_end {
-            let mut historical_filter = filter.clone();
-            historical_filter.block_option = alloy_rpc_types_eth::FilterBlockOption::Range {
+        // Blocks at or below the tip come from the canonical chain only, blocks
+        // above it from the preview only. The canonical range must end at `tip`:
+        // a later end makes reth reject the query with `BlockRangeExceedsHead`.
+        let mut logs = Vec::new();
+        if start <= tip {
+            let mut canonical = filter.clone();
+            canonical.block_option = FilterBlockOption::Range {
                 from_block: Some(start.into()),
-                to_block: Some(historical_end.into()),
+                to_block: Some(tip.into()),
             };
-
-            let historical_logs = self.eth_filter.logs(historical_filter).await?;
-            for log in &historical_logs {
-                fetched_logs.insert((log.block_number, log.log_index));
-            }
-            all_logs.extend(historical_logs);
+            logs = anchor
+                .run(
+                    |number| self.eth_api.provider().block_hash(number),
+                    self.eth_filter.logs(canonical),
+                )
+                .await?;
         }
-
-        let pending_logs = pending_blocks.get_pending_logs(&filter);
-        all_logs.extend(
-            pending_logs
+        let after = tip.max(start.saturating_sub(1));
+        logs.extend(
+            pending
+                .get_pending_logs(&filter)
                 .into_iter()
-                .filter(|log| {
-                    log.block_number.is_some_and(|number| (start..=end).contains(&number))
-                })
-                .filter(|log| !fetched_logs.contains(&(log.block_number, log.log_index))),
+                .filter(|log| log.block_number.is_some_and(|n| n > after && n <= end)),
         );
-
-        Ok(all_logs)
+        anchor.ensure_canonical(|number| self.eth_api.provider().block_hash(number))?;
+        Ok(logs)
     }
 
     async fn get_block_transaction_count_by_number(
@@ -627,16 +645,12 @@ where
     ) -> RpcResult<Option<U256>> {
         debug!(message = "rpc::get_block_transaction_count_by_number", block_number = ?number);
 
-        if number.is_pending() {
+        if number.is_pending() &&
+            let Some((pending, _)) = self.fresh_pending()
+        {
             Metrics::rpc_get_block_transaction_count_by_number().increment(1);
-            let pending_blocks = self.flashblocks_state.get_pending_blocks();
-            if let Some(count) = pending_blocks
-                .as_ref()
-                .map(|pb| pb.get_transactions_for_block(pb.latest_block_number()).count())
-            {
-                return Ok(Some(U256::from(count)));
-            }
-            // No overlay: fall through so the standard implementation serves `pending`.
+            let count = pending.get_transactions_for_block(pending.latest_block_number()).count();
+            return Ok(Some(U256::from(count)));
         }
 
         EthBlocks::block_transaction_count(&self.eth_api, number.into())
@@ -649,19 +663,74 @@ where
 impl<Eth, FB> EthApiExt<Eth, FB>
 where
     Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
+    Eth::Provider: BlockNumReader,
+    jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
     FB: FlashblocksAPI + Send + Sync + 'static,
 {
-    async fn wait_for_flashblocks_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Optimism>> {
-        let mut receiver = self.flashblocks_state.subscribe_to_flashblocks();
+    /// The published preview and the tip it was checked against, while it still
+    /// extends the chain (see [`PendingBlocks::extends`]). A failed head read
+    /// counts as stale.
+    fn fresh_pending(&self) -> Option<(Arc<PendingBlocks>, BlockNumber)> {
+        // Load the preview before reading the head: a head read first can miss a
+        // block that lands before the preview is loaded, letting a stale
+        // preview pass as extending it.
+        let pending = Guard::into_inner(self.flashblocks_state.get_pending_blocks())?;
+        let head = self.eth_api.provider().chain_info().ok();
+        match head {
+            Some(head) if pending.extends(head.best_number, head.best_hash) => {
+                Some((pending, head.best_number))
+            }
+            _ => {
+                Metrics::pending_stale_fallback().increment(1);
+                None
+            }
+        }
+    }
 
+    /// The preview's receipt for `tx_hash`, if the preview leads the tip and
+    /// holds the transaction in a block above it.
+    fn fresh_preview_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Optimism>> {
+        let (pending, tip) = self.fresh_pending()?;
+        receipt_above_tip(&pending, tip, tx_hash)
+    }
+
+    async fn canonical_receipt(&self, tx_hash: TxHash) -> RpcResult<Option<serde_json::Value>> {
+        match EthTransactions::transaction_receipt(&self.eth_api, tx_hash).await? {
+            Some(receipt) => to_value(receipt).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn canonical_transaction(&self, tx_hash: TxHash) -> RpcResult<Option<serde_json::Value>> {
+        match EthTransactions::transaction_by_hash(&self.eth_api, tx_hash)
+            .await?
+            .map(|tx| tx.into_transaction(self.eth_api.converter()))
+            .transpose()
+            .map_err(Eth::Error::from)?
+        {
+            Some(tx) => to_value(tx).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn wait_for_flashblocks_receipt(
+        &self,
+        tx_hash: TxHash,
+        mut receiver: broadcast::Receiver<Arc<PendingBlocks>>,
+    ) -> Option<RpcReceipt<Optimism>> {
         loop {
             match receiver.recv().await {
-                Ok(pending_state) if pending_state.get_receipt(tx_hash).is_some() => {
-                    debug!(message = "found receipt in flashblock", tx_hash = %tx_hash);
-                    return pending_state.get_receipt(tx_hash).cloned();
-                }
-                Ok(_) => {
-                    trace!(message = "flashblock does not contain receipt", tx_hash = %tx_hash);
+                Ok(pending_state) => {
+                    // The tip is read after the preview arrives, as `fresh_pending` does;
+                    // a failed read counts as stale.
+                    let tip = self.eth_api.provider().best_block_number().ok();
+                    if let Some(receipt) =
+                        tip.and_then(|tip| receipt_above_tip(&pending_state, tip, tx_hash))
+                    {
+                        debug!(message = "found receipt in flashblock", tx_hash = %tx_hash);
+                        return Some(receipt);
+                    }
+                    trace!(message = "flashblock has no receipt above the tip", tx_hash = %tx_hash);
                 }
                 Err(RecvError::Closed) => {
                     debug!(message = "flashblocks receipt queue closed");
@@ -674,9 +743,11 @@ where
         }
     }
 
-    async fn wait_for_canonical_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Optimism>> {
-        let mut receiver = self.eth_api.provider().subscribe_to_canonical_state();
-
+    async fn wait_for_canonical_receipt<N: NodePrimitives>(
+        &self,
+        tx_hash: TxHash,
+        mut receiver: broadcast::Receiver<CanonStateNotification<N>>,
+    ) -> Option<RpcReceipt<Optimism>> {
         crate::await_canonical_match("send_raw_transaction_sync", &mut receiver, |canon_state| {
             names_a_canonical_receipt(&canon_state.block_receipts(), tx_hash)
         })
@@ -687,6 +758,22 @@ where
     }
 }
 
+/// The preview's receipt for `tx_hash`, if it is in a block above `tip`.
+///
+/// A preview leading the tip only guarantees its latest block is ahead; its
+/// earlier blocks may sit at or below the tip and differ from the canonical
+/// block of that height.
+fn receipt_above_tip(
+    pending: &PendingBlocks,
+    tip: BlockNumber,
+    tx_hash: TxHash,
+) -> Option<RpcReceipt<Optimism>> {
+    pending
+        .get_receipt(tx_hash)
+        .filter(|receipt| receipt.inner.block_number.is_some_and(|number| number > tip))
+        .cloned()
+}
+
 /// Whether `receipts` names `tx_hash` in a block that is still canonical.
 ///
 /// `CanonStateNotification::block_receipts` returns the reverted side of a
@@ -695,6 +782,22 @@ fn names_a_canonical_receipt<R>(receipts: &[(BlockReceipts<R>, bool)], tx_hash: 
     receipts.iter().any(|(block_receipt, reverted)| {
         !reverted && block_receipt.tx_receipts.iter().any(|(canonical, _)| *canonical == tx_hash)
     })
+}
+
+/// The first receipt either waiter yields within `timeout`.
+///
+/// A waiter that gives up (`None`: its channel closed, or the lookup after a
+/// match found nothing) drops out rather than ending the wait.
+async fn first_receipt<R>(
+    preview: impl Future<Output = Option<R>>,
+    canonical: impl Future<Output = Option<R>>,
+    timeout: Duration,
+) -> Option<R> {
+    tokio::select! {
+        Some(receipt) = preview => Some(receipt),
+        Some(receipt) = canonical => Some(receipt),
+        () = time::sleep(timeout) => None,
+    }
 }
 
 #[cfg(test)]
@@ -739,5 +842,65 @@ mod canonical_receipt_tests {
         let other = B256::from([8; 32]);
 
         assert!(!names_a_canonical_receipt(&[receipts_naming(other, false)], tx_hash));
+    }
+}
+
+#[cfg(test)]
+mod first_receipt_tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_waiter_that_gives_up_does_not_end_the_wait() {
+        let canonical = async {
+            time::sleep(Duration::from_millis(20)).await;
+            Some(1u8)
+        };
+        assert_eq!(first_receipt(async { None }, canonical, Duration::from_secs(5)).await, Some(1));
+
+        let preview = async {
+            time::sleep(Duration::from_millis(20)).await;
+            Some(2u8)
+        };
+        assert_eq!(first_receipt(preview, async { None }, Duration::from_secs(5)).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn the_wait_times_out_once_both_waiters_give_up() {
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+
+        assert_eq!(first_receipt(async { None::<u8> }, async { None }, timeout).await, None);
+        assert!(started.elapsed() >= timeout, "two waiters giving up must not end the wait early");
+    }
+}
+
+#[cfg(test)]
+mod sync_timeout_tests {
+    use super::*;
+
+    const CONFIGURED: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn no_timeout_waits_the_configured_time() {
+        assert_eq!(sync_timeout(None, CONFIGURED), CONFIGURED);
+    }
+
+    /// `0` means unset, as upstream reads it.
+    #[test]
+    fn a_zero_timeout_waits_the_configured_time() {
+        assert_eq!(sync_timeout(Some(0), CONFIGURED), CONFIGURED);
+    }
+
+    #[test]
+    fn a_shorter_timeout_is_honoured() {
+        assert_eq!(sync_timeout(Some(500), CONFIGURED), Duration::from_millis(500));
+    }
+
+    /// Clamped rather than refused, as op-geth and upstream reth do.
+    #[test]
+    fn a_longer_timeout_is_cut_to_the_configured_time() {
+        assert_eq!(sync_timeout(Some(60_000), CONFIGURED), CONFIGURED);
     }
 }

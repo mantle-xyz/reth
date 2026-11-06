@@ -204,6 +204,56 @@ async fn a_subscriber_sees_the_block_arrive_in_slices() {
     );
 }
 
+/// Each slice names the content hash of the one before it, across a block
+/// boundary too: the next block's opening slice names the closing slice of the
+/// block this node sealed. A node's very first slice names nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slices_name_the_content_hash_of_their_predecessor_across_blocks() {
+    let sender = Wallet::default().inner.address();
+    let cfg = PreconfCfgBuilder::new().whitelist_pair(sender, RECIPIENT).build();
+    let (mut node, _http, _wallet, _chain_id, fb_addr) =
+        crate::launch_flashblocks_node!(cfg, flashblocks_cfg()).await;
+    let mut subscriber = subscribe(fb_addr).await;
+
+    let first_number = node.inner.provider.best_block_number().expect("best block number") + 1;
+    let first = build_one_block!(node, Duration::from_millis(600));
+    crate::canonize_built!(node, first);
+    let _second = build_one_block!(node, Duration::from_millis(600));
+
+    let slices = drain(&mut subscriber, Duration::from_millis(500)).await;
+    let of_block = |number: u64| -> Vec<&MantleFlashblockPayload> {
+        slices.iter().filter(|slice| slice.metadata.block_number == number).collect()
+    };
+    let (one, two) = (of_block(first_number), of_block(first_number + 1));
+    assert!(one.len() >= 2 && two.len() >= 2, "premise: both blocks are sliced");
+
+    assert!(one[0].metadata.prev_flashblock_id.is_no_prev(), "a fresh producer names no slice");
+    assert_eq!(one[0].metadata.prev_flashblock_hash, B256::ZERO, "and no hash");
+
+    for block in [&one, &two] {
+        for pair in block.windows(2) {
+            assert_eq!(
+                pair[1].metadata.prev_flashblock_hash, pair[0].diff.block_hash,
+                "a slice names the content hash of the slice before it",
+            );
+        }
+    }
+
+    let closing = one.last().expect("block one has slices");
+    assert_eq!(
+        two[0].metadata.prev_flashblock_id,
+        mantle_reth_flashblocks_types::FlashblockId {
+            block_number: first_number,
+            index: closing.index
+        },
+        "the next block's opening slice names the closing slice of the block before",
+    );
+    assert_eq!(
+        two[0].metadata.prev_flashblock_hash, closing.diff.block_hash,
+        "and its content hash",
+    );
+}
+
 /// The ticker fires on its own schedule, so a block held open long enough
 /// arrives as more than an opening and a closing slice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -215,6 +265,35 @@ async fn holding_a_block_open_produces_a_slice_per_tick() {
         "six tick intervals should yield more than an opening and a closing slice, got {}",
         slices.len(),
     );
+}
+
+/// While the work at a slice boundary runs, the build loop polls neither the
+/// preconf queue nor cancellation, so it is timed as a whole and in its pool
+/// steps.
+///
+/// Reads the process-wide recorder the node installs, which prefixes every
+/// name with `reth_`. Other tests in this binary only add observations, so
+/// "at least one" holds whatever runs alongside; no other code emits these
+/// names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slice_boundaries_are_timed() {
+    one_sliced_block(Duration::from_millis(600)).await;
+
+    let rendered = reth_node_metrics::recorder::install_prometheus_recorder().handle().render();
+    for histogram in [
+        "reth_flashblocks_slice_boundary_duration_ms",
+        "reth_flashblocks_best_txs_refresh_duration_ms",
+        "reth_flashblocks_pool_maintenance_duration_ms",
+    ] {
+        let count = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{histogram}_count ")))
+            .and_then(|count| count.parse::<u64>().ok());
+        assert!(
+            count.is_some_and(|count| count > 0),
+            "{histogram} must have observations after a sliced block:\n{rendered}",
+        );
+    }
 }
 
 /// The invariant the whole producer rests on: the transactions a subscriber

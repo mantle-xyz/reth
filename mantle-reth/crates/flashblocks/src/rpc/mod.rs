@@ -11,3 +11,6 @@ pub use types::{ExtendedSubscriptionKind, FlashblocksSubscriptionKind, Transacti
 
 mod pending;
 pub use pending::{PendingEthApi, PendingExecutionContext};
+
+mod canonical_query;
+pub use canonical_query::{CanonicalChainReorgDetected, CanonicalQueryAnchor};

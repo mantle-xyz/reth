@@ -1,8 +1,8 @@
 //! Conversions to and from the `op-alloy` flashblock types.
 //!
-//! The two payloads differ only in metadata, and only by the predecessor
-//! pointer: converting upstream drops it, converting back yields the
-//! "no predecessor" sentinel.
+//! The two payloads differ only in metadata, and only by the predecessor's
+//! position and content hash: converting upstream drops both, converting back
+//! yields `NO_PREV` and a zero hash.
 
 use op_alloy_rpc_types_engine::{OpFlashblockPayload, OpFlashblockPayloadMetadata};
 
@@ -26,6 +26,7 @@ impl From<OpFlashblockPayloadMetadata> for MantleFlashblockMetadata {
         Self {
             block_number: value.block_number,
             prev_flashblock_id: FlashblockId::NO_PREV,
+            prev_flashblock_hash: alloy_primitives::B256::ZERO,
             new_account_balances: value.new_account_balances,
             receipts: value.receipts,
         }

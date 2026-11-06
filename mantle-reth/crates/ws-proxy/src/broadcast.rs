@@ -23,16 +23,15 @@ use crate::metrics::Metrics;
 /// the alternative is killing the fan-out for every client over a single
 /// unencodable payload.
 ///
-/// The caller is expected to hold one receiver open for the lifetime of the
-/// channel, otherwise a moment with no clients closes it. That held receiver
-/// is not a client, so it is discounted from the connection gauge.
+/// Only real clients should hold receivers: a retained idle receiver pins the
+/// channel length even after every client has caught up. With no clients,
+/// messages are discarded; a later subscription starts with new messages.
 pub fn upstream_listener(
     sender: Sender<Message>,
     enable_compression: bool,
 ) -> impl Fn(String) + Clone + Send + Sync + 'static {
     move |data: String| {
         trace!(target: "ws-proxy", bytes = data.len(), "received upstream data");
-        Metrics::active_connections().set(sender.receiver_count().saturating_sub(1) as f64);
 
         let message_data = if enable_compression {
             let mut compressed = Vec::new();
@@ -49,10 +48,9 @@ pub fn upstream_listener(
             data.into_bytes()
         };
 
-        match sender.send(message_data.into()) {
-            Ok(_) => Metrics::broadcast_queue_size().set(sender.len() as f64),
-            Err(error) => error!(target: "ws-proxy", %error, "failed to broadcast upstream data"),
-        }
+        // No receivers is normal while no clients are subscribed.
+        let _ = sender.send(message_data.into());
+        Metrics::refresh_broadcast_queue_size(&sender);
     }
 }
 

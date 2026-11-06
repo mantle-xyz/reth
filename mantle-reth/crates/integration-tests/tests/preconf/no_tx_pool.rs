@@ -7,11 +7,10 @@
 //! consensus and cause a safe-head fork.
 //!
 //! This module locks the gate: even a `PreconfSource::Replay` fifo
-//! entry (which normally bypasses deadline / gas-budget gates because
-//! "receipt returned → tx must land") is skipped during a
-//! `no_tx_pool=true` build. The Replay SLA is upheld by delayed
-//! landing on the next `no_tx_pool=false` build, NOT by forcing the
-//! tx into the derivation block.
+//! entry (which normally bypasses deadline / gas-budget gates because its
+//! receipt has gone out) is skipped during a `no_tx_pool=true` build. It
+//! lands later, on the next `no_tx_pool=false` build, NOT by being forced
+//! into the derivation block.
 
 use super::helpers::{PreconfCfgBuilder, mantle_payload_attributes};
 use crate::launch_preconf_node;
@@ -40,7 +39,7 @@ async fn signed_transfer(chain_id: u64, wallet: &Wallet, nonce: u64) -> alloy_pr
 }
 
 /// Replay-sourced fifo entry (journal-restored, promised commitment) is
-/// the **strongest** carrier of the "must-land" SLA — deadline and the block-gas-budget gate
+/// the entry the node tries hardest to land — the deadline and
 /// gas-budget gates both bypass it. Verifying it is NOT applied during
 /// a `no_tx_pool=true` build proves the gate wraps the entire preconf
 /// pipeline (not just the RPC-sourced arm).

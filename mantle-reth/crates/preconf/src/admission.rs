@@ -380,7 +380,7 @@ mod refused_admission_tests {
     //! already gone out.
 
     use super::*;
-    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEip7702};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{B256, U256};
     use alloy_signer::SignerSync;
@@ -412,13 +412,35 @@ mod refused_admission_tests {
         }
     }
 
-    struct Fixture {
-        admission: PreconfAdmission<AlwaysRefuses>,
+    /// Fails the test if asked: whatever it guards must be refused before the
+    /// validator.
+    #[derive(Debug)]
+    struct MustNotValidate;
+
+    impl TransactionValidator for MustNotValidate {
+        type Transaction = OpPooledTransaction;
+        type Block = OpBlock;
+
+        async fn validate_transaction(
+            &self,
+            _origin: TransactionOrigin,
+            _transaction: Self::Transaction,
+        ) -> TransactionValidationOutcome<Self::Transaction> {
+            panic!("the validator must not be reached")
+        }
+    }
+
+    struct Fixture<V = AlwaysRefuses> {
+        admission: PreconfAdmission<V>,
         fifo: Arc<PreconfTxSet>,
         signer: PrivateKeySigner,
     }
 
     fn fixture() -> Fixture {
+        fixture_with(AlwaysRefuses)
+    }
+
+    fn fixture_with<V>(validator: V) -> Fixture<V> {
         let signer =
             PrivateKeySigner::from_bytes(&B256::from([0x11; 32])).expect("valid secp256k1 scalar");
         let classifier = Arc::new(PreconfClassifier::new(false));
@@ -435,7 +457,7 @@ mod refused_admission_tests {
             ..Default::default()
         };
         let admission = PreconfAdmission::new(
-            AlwaysRefuses,
+            validator,
             fifo.clone(),
             classifier.clone(),
             Arc::new(cfg),
@@ -519,15 +541,32 @@ mod refused_admission_tests {
     /// there records nothing.
     #[tokio::test]
     async fn a_type_refused_transaction_records_nothing() {
-        let f = fixture();
-        let (raw, hash) = signed_raw(&f.signer, 0);
+        let f = fixture_with(MustNotValidate);
+        let tx = TxEip7702 {
+            chain_id: 10,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: RECIPIENT,
+            value: U256::from(1u64),
+            ..Default::default()
+        };
+        let signature = f.signer.sign_hash_sync(&tx.signature_hash()).expect("in-memory signer");
+        let signed = tx.into_signed(signature);
+        let hash = *signed.hash();
+        let raw: Bytes = TxEnvelope::Eip7702(signed).encoded_2718().into();
         let (resp, _rx) = oneshot::channel();
 
-        // Same bytes, but presented as a type the path does not take.
-        assert!(!accepts(TxType::Eip7702));
-        f.admission.admit(&raw, std::time::Instant::now(), resp).await.expect_err("refused");
+        let err = f
+            .admission
+            .admit(&raw, std::time::Instant::now(), resp)
+            .await
+            .expect_err("a set-code transaction is refused");
 
+        assert_eq!(err, PreconfError::UnsupportedTxType { ty: TxType::Eip7702 as u8 });
         assert!(!f.fifo.claims().is_tracked(&hash));
+        assert!(!f.fifo.contains(&hash).await);
     }
 }
 

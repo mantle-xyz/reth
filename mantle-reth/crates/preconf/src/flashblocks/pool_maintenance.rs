@@ -65,6 +65,10 @@ where
     Balances: SenderBalances,
     T: SignedTransaction,
 {
+    // Both pool calls take the pool's write lock, and `update_accounts` walks
+    // every transaction in the pool, so this grows with the pool as well as
+    // with the senders below.
+    let started = std::time::Instant::now();
     let executed: Vec<TxHash> = info.pending_prune().iter().map(|tx| *tx.tx_hash()).collect();
     let pruned = executed.len();
     if pruned > 0 {
@@ -98,6 +102,14 @@ where
     if accounts_advanced > 0 {
         pool.update_accounts(changed);
     }
+
+    metrics::histogram!("flashblocks.pool_maintenance_duration_ms")
+        .record(started.elapsed().as_secs_f64() * 1000.0);
+    // Every sender executed so far in the block, not just this slice, so it
+    // grows towards the end of a block.
+    metrics::histogram!("flashblocks.pool_maintenance_accounts").record(accounts_advanced as f64);
+    metrics::counter!("flashblocks.pool_maintenance_balance_unreadable_total")
+        .increment(balances_unavailable as u64);
 
     PoolMaintenance { pruned, accounts_advanced, balances_unavailable }
 }
@@ -335,6 +347,41 @@ mod tests {
 
         assert_eq!(first_pass.pruned, 1);
         assert_eq!(second_pass.pruned, 0, "the second slice executed nothing new");
+    }
+
+    /// Every boundary records how long it took and how many senders it
+    /// re-asserted (one balance read each), and counts the senders it had to
+    /// park because their balance could not be read.
+    #[tokio::test]
+    async fn a_boundary_records_its_duration_its_senders_and_unreadable_balances() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+
+        let pool = testing_pool();
+        let alice = Address::repeat_byte(0xaa);
+        let bob = Address::repeat_byte(0xbb);
+        let alice_first = tx(alice, 0);
+        let bob_first = tx(bob, 0);
+        submit(&pool, alice_first.clone()).await;
+        submit(&pool, bob_first.clone()).await;
+        let mut info = Info::default();
+        note_executed(&mut info, &alice_first);
+        note_executed(&mut info, &bob_first);
+
+        // Only alice's balance is readable.
+        maintain_pool_at_slice_boundary(&pool, &Balances::funded([alice]), &mut info);
+
+        let rendered = handle.render();
+        for line in [
+            "flashblocks_pool_maintenance_duration_ms_count 1",
+            "flashblocks_pool_maintenance_accounts_count 1",
+            "flashblocks_pool_maintenance_accounts_sum 2",
+            "flashblocks_pool_maintenance_balance_unreadable_total 1",
+        ] {
+            assert!(rendered.lines().any(|l| l == line), "expected `{line}`:\n{rendered}");
+        }
     }
 
     /// Nonces accumulate across the block, so a sender executed in an earlier

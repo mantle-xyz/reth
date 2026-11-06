@@ -12,7 +12,8 @@
 //! they are not interchangeable:
 //!
 //! - the **preconf arm** (`apply_preconf_with_da`),
-//! - the **pool arm** (`apply_one_best_tx`, the only one that goes through `record_journalable`),
+//! - the **pool arm** (`apply_one_best_tx`, the only one that holds a journal record as it
+//!   executes),
 //! - **stage 2** (`execute_sequencer_transactions_watching_whitelist`), which on a derivation build
 //!   carries the batched user transactions,
 //! - the **post-execution** refund transaction, which carries no nonce of its own and so is counted
@@ -51,8 +52,8 @@ async fn signed_transfer(
 }
 
 /// **Both arms, one block.** The preconf arm and the pool arm reach the view
-/// through different code — the pool arm alone goes through
-/// `record_journalable` — so covering one says nothing about the other.
+/// through different code — the pool arm alone holds a journal record as it
+/// executes — so covering one says nothing about the other.
 ///
 /// Two senders rather than one: a single sender interleaving the channels is
 /// deferred by a block (`race_pool_arm::one_sender_interleaving_...`), which
@@ -134,7 +135,7 @@ async fn both_arms_advance_the_account_view_in_one_block() {
     assert_eq!(
         fifo.next_nonce(&pool_sender, 0),
         1,
-        "the pool arm must too — it is the one that goes through record_journalable",
+        "the pool arm must too — it is the one that holds a journal record",
     );
 }
 
