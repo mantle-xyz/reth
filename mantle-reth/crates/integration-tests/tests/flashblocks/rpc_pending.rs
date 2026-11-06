@@ -2663,3 +2663,72 @@ async fn receipt_lookup_rechecks_canonical_after_the_preview_becomes_unavailable
 async fn transaction_lookup_rechecks_canonical_after_the_preview_becomes_unavailable() {
     assert_canonical_recheck_after_preview_lookup(false).await;
 }
+
+/// A receipt queued before a same-height reorg must not confirm a transaction
+/// whose preview still names the replaced canonical parent.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_raw_transaction_sync_rejects_a_queued_preview_on_a_replaced_parent() {
+    use crate::consumer_helpers::{commit_submitted_block, submit_uncommitted_block};
+    use mantle_reth_flashblocks::{FlashblocksAPI, PendingBlocks};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::broadcast;
+
+    struct QueuedPreview {
+        updates: broadcast::Sender<Arc<PendingBlocks>>,
+        before_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl FlashblocksAPI for QueuedPreview {
+        fn get_pending_blocks(&self) -> arc_swap::Guard<Option<Arc<PendingBlocks>>> {
+            if let Some(before_wait) = self.before_wait.lock().unwrap().take() {
+                before_wait();
+            }
+            // Force the post-send lookup to miss so only the queued notification
+            // can return the old-fork receipt.
+            arc_swap::Guard::from_inner(None)
+        }
+
+        fn subscribe_to_flashblocks(&self) -> broadcast::Receiver<Arc<PendingBlocks>> {
+            self.updates.subscribe()
+        }
+    }
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let built_on = submit_uncommitted_block!(node);
+    let replacement = submit_uncommitted_block!(node);
+    assert_ne!(built_on, replacement);
+    commit_submitted_block!(node, built_on);
+
+    let raw = signed_call(0, LOGGER, VALUE).await;
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .transactions(vec![l1_info_deposit(2), raw.clone()])
+                .build(),
+        )
+        .await;
+    let old_preview = harness.pending().expect("preview on the original block 1");
+    assert_eq!(old_preview.parent_hash(), built_on);
+    assert!(old_preview.get_receipt(keccak256(&raw)).is_some());
+
+    let eth = node.rpc.inner.eth_api().clone();
+    let filter = node.rpc.inner.eth_handlers().filter.clone();
+    let node = Arc::new(tokio::sync::Mutex::new(node));
+    let (updates, _) = broadcast::channel(2);
+    let queued = updates.clone();
+    let preview = Arc::new(QueuedPreview {
+        updates,
+        before_wait: Mutex::new(Some(Box::new(move || {
+            queued.send(old_preview).expect("sync call subscribed before sending");
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    node.lock().await.sync_to(replacement).await.unwrap();
+                })
+            });
+        }))),
+    });
+    let api = mantle_reth_flashblocks::EthApiExt::new(eth, filter, Arc::clone(&preview));
+    let result = api.send_raw_transaction_sync(raw, Some(500)).await;
+    assert!(preview.before_wait.lock().unwrap().is_none(), "the post-send lookup was reached");
+    let error = result.expect_err("a queued receipt built on the replaced parent cannot confirm");
+    assert!(error.message().contains("wasn't confirmed"), "unexpected error: {error}");
+}
