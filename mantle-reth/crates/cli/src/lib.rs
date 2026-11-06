@@ -1,7 +1,8 @@
 //! Mantle node CLI components.
 //!
-//! Provides [`MantleChainSpecParser`] for `--chain mantle` / `--chain mantle-sepolia` support,
-//! and [`MantleNode`] as the Mantle-specific node implementation with Mantle txpool validation.
+//! Provides [`MantleChainSpecParser`] for `--chain mantle` / `--chain mantle-sepolia` / `--chain
+//! mantle-hoodi` support, and [`MantleNode`] as the Mantle-specific node implementation with Mantle
+//! txpool validation.
 
 mod chainspec;
 pub use chainspec::MantleChainSpecParser;
