@@ -470,6 +470,9 @@ revm-database-interface = { git = "https://github.com/mantle-xyz/revm", branch =
 revm-inspector = { git = "https://github.com/mantle-xyz/revm", branch = "dev/mantle-v1.6.3" }
 revm-context = { git = "https://github.com/mantle-xyz/revm", branch = "dev/mantle-v1.6.3" }
 revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = "dev/mantle-v1.6.3" }
+# alloy-rs/evm#444 (reject a legacy gas price below the base fee) on 0.37.1; drop once a release
+# with it is pinned.
+alloy-evm = { path = "patches/alloy-evm" }
 # revm-inspectors: mantle-xyz/revm-inspectors
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "dev/mantle-v1.7.0" }
 # op-revm moved out of mantle-xyz/revm into the mantle-v2 workspace when upstream
