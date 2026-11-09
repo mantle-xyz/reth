@@ -39,8 +39,8 @@ use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, bytes, hex};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use mantle_reth_preconf::{
-    FROM_WILDCARDS_SLOT, PAIRS_SLOT, TO_WILDCARDS_SLOT, WHITELIST_UPDATED_TOPIC0,
-    bootstrap_whitelist, run_whitelist_watcher,
+    FROM_WILDCARDS_SLOT, LISTS_HASH_SLOT, PAIRS_SLOT, TO_WILDCARDS_SLOT, WHITELIST_UPDATED_TOPIC0,
+    Whitelist, bootstrap_whitelist, run_whitelist_watcher,
 };
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 use reth_provider::BlockNumReader;
@@ -719,4 +719,79 @@ async fn a_governance_deposit_in_this_block_bars_its_own_commitment() {
         classifier.preview_eligibility(&sender, Some(&ALLOWED_TO)),
         "a block-scoped delta must not mutate the classifier's shared allowlist",
     );
+}
+
+// ===== T4: a governance update in the parent block =====
+
+/// **A revocation in block N binds block N+1 even when the watcher has not
+/// caught up.** The watcher refreshes the shared allowlist from the same
+/// forkchoice update that starts N+1's build, so the build can take its snapshot
+/// first. The build compares the contract's `listsHash` at its parent with the
+/// snapshot's and reads the parent's lists when they differ.
+///
+/// "Not caught up" is produced directly: once the watcher has loaded the
+/// revocation, the test puts the pre-revocation lists and hash back. Nothing
+/// reloads them afterwards (no further event, no reorg), so the build sees
+/// exactly a watcher that is one block behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_in_the_parent_binds_the_next_block_before_the_watcher_catches_up() {
+    let sender = wallet_address();
+    let before = B256::repeat_byte(0xa0);
+    let after = B256::repeat_byte(0xa1);
+    let hash_word = |hash: B256| (B256::from(U256::from(LISTS_HASH_SLOT)), hash);
+
+    // Genesis authorizes `sender -> ALLOWED_TO` under `before`. The stub empties
+    // the exact pairs and moves the hash to `after`, as `updatePreconfs` would.
+    let mut seeded = whitelist_storage(&[sender], &[ALLOWED_TO]);
+    seeded.push(hash_word(before));
+    let mut revoked = pair_array_storage(PAIRS_SLOT, &[]);
+    revoked.push(hash_word(after));
+    let code = storage_writer_bytecode(&revoked, WHITELIST_UPDATED_TOPIC0);
+    let spec = mantle_chain_spec_with_account(CHAIN_ID, WL, &code, &seeded);
+
+    let (node, http, wallet, _chain_id, classifier) =
+        launch_preconf_node_with_classifier!(onchain_cfg(), spec).await;
+    assert!(classifier.preview_eligibility(&sender, Some(&ALLOWED_TO)), "precondition");
+
+    // Block N: the revocation, as a deposit addressed at the contract.
+    let gov_from = Address::new([0xd0; 20]);
+    let attrs = l1_attrs_with(0, 1, vec![user_deposit(gov_from, WL, Bytes::new(), 500_000)]);
+    let genesis = node.current_forkchoice_state().expect("forkchoice state").head_block_hash;
+    let payload_id = crate::fcu_v3_start!(node, genesis, attrs);
+    let block_n = crate::get_payload_v5!(node, payload_id);
+    let parent = crate::canonize_built!(node, block_n);
+
+    // Wait for the node's own watcher to load the revocation, so that it cannot
+    // overwrite what is put back below.
+    let mut loaded = false;
+    for _ in 0..POLL_TICKS {
+        if !classifier.preview_eligibility(&sender, Some(&ALLOWED_TO)) {
+            loaded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(loaded, "the watcher never loaded the revocation");
+
+    // The watcher one block behind: the pre-revocation lists, and their hash.
+    let mut stale = Whitelist { lists_hash: before, ..Default::default() };
+    stale.pairs.insert((sender, ALLOWED_TO));
+    classifier.install_whitelist(stale);
+    assert!(classifier.preview_eligibility(&sender, Some(&ALLOWED_TO)), "admitted as stale");
+
+    let preconf_tx = signed_transfer(&wallet, 0, ALLOWED_TO).await;
+    let http_c = http.clone();
+    let rpc_task = tokio::spawn(async move { send_preconf(&http_c, preconf_tx).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Block N+1.
+    let payload_id = crate::fcu_v3_start!(node, parent, l1_attrs_with(1, 1, vec![]));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _ = crate::get_payload_v5!(node, payload_id);
+
+    let err = rpc_task
+        .await
+        .expect("rpc join")
+        .expect_err("a commitment revoked in the parent must be refused");
+    assert!(err.to_string().contains("not preconf eligible"), "got {err}");
 }

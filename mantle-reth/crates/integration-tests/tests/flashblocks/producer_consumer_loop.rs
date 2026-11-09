@@ -96,6 +96,11 @@ impl Tee {
     fn seen(&self) -> Vec<(u64, u64)> {
         self.seen.lock().expect("not poisoned").clone()
     }
+
+    /// Forget what was delivered, so a later wait reads only what follows.
+    fn clear(&self) {
+        self.seen.lock().expect("not poisoned").clear();
+    }
 }
 
 impl FlashblocksReceiver for Tee {
@@ -144,6 +149,20 @@ async fn wait_for_slice(tee: &Tee, slice: (u64, u64)) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the producer never published {slice:?}; delivered: {:?}", tee.seen());
+}
+
+/// Polls until the socket has delivered any slice: the subscription is up.
+///
+/// A first-time subscriber is sent only what is published after it connects,
+/// and `attach_consumer!` returns before the connection is made.
+async fn wait_until_subscribed(tee: &Tee) {
+    for _ in 0..200 {
+        if !tee.seen().is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the consumer never received a slice");
 }
 
 /// What the whole subsystem is for: a transaction the producer sliced is
@@ -214,6 +233,14 @@ async fn the_overlay_survives_a_second_build_of_one_height() {
     let abandoned_deposit = keccak256(crate::helpers::l1_info_deposit(100));
     let rebuilt_deposit = keccak256(crate::helpers::l1_info_deposit(200));
     assert_ne!(abandoned_deposit, rebuilt_deposit);
+
+    // A build nobody checks, sliced until one of its slices gets through. The
+    // first attempt's opening slice has to reach the overlay; published before
+    // the consumer is listening, it would be lost and the test would pass on an
+    // overlay that never held the attempt it is about.
+    let _warm_up = crate::fcu_v3_start!(node, genesis, crate::helpers::l1_attrs(1, 50));
+    wait_until_subscribed(&tee).await;
+    tee.clear();
 
     // First attempt at height 1, sliced and then left behind.
     let _abandoned = crate::fcu_v3_start!(node, genesis, crate::helpers::l1_attrs(1, 100));

@@ -6,12 +6,16 @@ use alloy_consensus::{
     Block, Header, TxReceipt,
     transaction::{Recovered, TransactionMeta},
 };
-use alloy_eips::Encodable2718;
+use alloy_eips::{
+    Encodable2718,
+    eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS},
+    eip4788::BEACON_ROOTS_ADDRESS,
+};
 use alloy_evm::{
     Database as AlloyDatabase,
     block::{StateDB, SystemCaller},
 };
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types_eth::{TransactionTrait, state::StateOverride};
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::{OpTransactionReceipt, Transaction};
@@ -29,10 +33,13 @@ use revm::{
         Block as _,
         result::{ExecutionResult, ResultAndState},
     },
-    state::EvmState,
+    state::{Account, EvmState},
 };
 
 use crate::{ExecutionError, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
+
+/// Length of the EIP-4788 beacon roots ring buffer, hardcoded in the contract.
+const BEACON_ROOTS_HISTORY_BUFFER_LENGTH: u64 = 8191;
 
 /// Result of executing or fetching a cached pending transaction.
 #[derive(Debug, Clone)]
@@ -192,6 +199,36 @@ where
             .apply_beacon_root_contract_call(parent_beacon_block_root, &mut self.evm)
             .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
 
+        // `SystemCaller` commits straight to the database; read the slots back so the
+        // pending overrides carry them too.
+        let number: u64 = self.evm.block().number().saturating_to();
+        let timestamp: u64 = self.evm.block().timestamp().saturating_to();
+        let mut slots = Vec::new();
+        if number != 0 && spec.is_prague_active_at_timestamp(timestamp) {
+            let slot = (number - 1) % HISTORY_SERVE_WINDOW as u64;
+            slots.push((HISTORY_STORAGE_ADDRESS, U256::from(slot)));
+        }
+        if number != 0 && spec.is_cancun_active_at_timestamp(timestamp) {
+            let timestamp_slot = U256::from(timestamp % BEACON_ROOTS_HISTORY_BUFFER_LENGTH);
+            slots.push((BEACON_ROOTS_ADDRESS, timestamp_slot));
+            slots.push((
+                BEACON_ROOTS_ADDRESS,
+                timestamp_slot + U256::from(BEACON_ROOTS_HISTORY_BUFFER_LENGTH),
+            ));
+        }
+        for (address, slot) in slots {
+            let value = self
+                .evm
+                .db_mut()
+                .storage(address, slot)
+                .map_err(|e| ExecutionError::EvmEnv(e.to_string()))?;
+            write_storage_override(
+                &mut self.state_overrides,
+                address,
+                [(B256::from(slot), B256::from(value))],
+            );
+        }
+
         Ok(())
     }
 
@@ -300,9 +337,9 @@ where
             .is_jovian_active_at_timestamp(self.evm.block().timestamp().saturating_to()) &&
             !is_deposit
         {
-            self.jovian_da_footprint_estimation(&transaction)?
+            Some(self.jovian_da_footprint_estimation(&transaction)?)
         } else {
-            0
+            None
         };
 
         let start = Instant::now();
@@ -313,22 +350,7 @@ where
             Ok(ResultAndState { state, result }) => {
                 let gas_used = result.tx_gas_used();
                 for (addr, acc) in &state {
-                    let existing_override = self.state_overrides.entry(*addr).or_default();
-                    existing_override.balance = Some(acc.info.balance);
-                    existing_override.nonce = Some(acc.info.nonce);
-                    // Overrides must carry the unpadded original, for the reason
-                    // `PendingBlocks::get_code` gives.
-                    existing_override.code =
-                        acc.info.code.clone().map(|code| code.original_bytes());
-
-                    let existing =
-                        existing_override.state_diff.get_or_insert_with(Default::default);
-                    let changed_slots = acc
-                        .storage
-                        .iter()
-                        .map(|(&key, slot)| (B256::from(key), B256::from(slot.present_value)));
-
-                    existing.extend(changed_slots);
+                    write_account_override(&mut self.state_overrides, *addr, acc);
                 }
 
                 self.cumulative_gas_used = self
@@ -381,7 +403,11 @@ where
                 .map_err(|e| ExecutionError::RpcReceiptBuild(e.to_string()))?
                 .build();
 
-                op_receipt.inner.blob_gas_used = Some(da_footprint_used);
+                // Only non-deposit transactions after Jovian carry `blob_gas_used`, as in
+                // `OpReceiptBuilder`.
+                if let Some(da_footprint_used) = da_footprint_used {
+                    op_receipt.inner.blob_gas_used = Some(da_footprint_used);
+                }
                 self.next_log_index += receipt.logs().len();
 
                 let (deposit_receipt_version, deposit_nonce) = if is_deposit {
@@ -427,12 +453,65 @@ where
     }
 }
 
+/// Folds one account's post-transaction state into the pending overrides.
+fn write_account_override(overrides: &mut StateOverride, address: Address, account: &Account) {
+    let entry = overrides.entry(address).or_default();
+    if account.is_selfdestructed() {
+        // revm zeroes only the balance here; nonce, code and storage are still
+        // the pre-destruction values and must not reach the overrides.
+        entry.balance = Some(U256::ZERO);
+        entry.nonce = Some(0);
+        entry.code = Some(Bytes::new());
+        entry.state = Some(Default::default());
+        entry.state_diff = None;
+        return;
+    }
+    entry.balance = Some(account.info.balance);
+    entry.nonce = Some(account.info.nonce);
+    // Overrides must carry the unpadded original, for the reason
+    // `PendingBlocks::get_code` gives.
+    let code = account.info.code.clone().map(|code| code.original_bytes());
+    // After a destruction the explicit empty code must survive: dropping it
+    // would let the replaced storage sit under the pre-destruction code.
+    entry.code = match code {
+        Some(code) if !code.is_empty() => Some(code),
+        _ if entry.state.is_some() => Some(Bytes::new()),
+        code => code,
+    };
+    write_storage_override(
+        overrides,
+        address,
+        account
+            .storage
+            .iter()
+            .map(|(&key, slot)| (B256::from(key), B256::from(slot.present_value))),
+    );
+}
+
+/// Writes storage slots into the pending overrides, touching nothing else.
+fn write_storage_override(
+    overrides: &mut StateOverride,
+    address: Address,
+    slots: impl IntoIterator<Item = (B256, B256)>,
+) {
+    let entry = overrides.entry(address).or_default();
+    // A storage replacement must stay the only storage field: alloy-evm rejects
+    // an account carrying both `state` and `state_diff`.
+    match entry.state.as_mut() {
+        Some(state) => state.extend(slots),
+        None => entry.state_diff.get_or_insert_with(Default::default).extend(slots),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_consensus::{Block, BlockBody, Sealed, Signed, transaction::Recovered};
-    use alloy_eips::eip4788::{BEACON_ROOTS_ADDRESS, BEACON_ROOTS_CODE};
+    use alloy_eips::{
+        eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
+        eip4788::{BEACON_ROOTS_ADDRESS, BEACON_ROOTS_CODE},
+    };
     use alloy_op_hardforks::{MANTLE_MAINNET_ARSIA_TIMESTAMP, MANTLE_MAINNET_SKADI_TIMESTAMP};
-    use alloy_primitives::{Address, Signature, TxKind, U256, address, uint};
+    use alloy_primitives::{Address, Bytes, Signature, TxKind, U256, address, bytes, uint};
     use alloy_rpc_types_engine::PayloadId;
     use mantle_reth_chainspec::MANTLE_MAINNET;
     use mantle_reth_flashblocks_types::{MantleFlashblockMetadata, MantleFlashblockPayload};
@@ -443,14 +522,12 @@ mod tests {
     use reth_optimism_evm::OpEvmConfig;
     use reth_revm::State;
     use revm::{
-        database::InMemoryDB,
-        state::{AccountInfo, Bytecode},
+        database::{EmptyDB, InMemoryDB},
+        state::{Account, AccountInfo, Bytecode, EvmStorageSlot},
     };
 
     use super::*;
 
-    /// EIP-4788 ring buffer length, hardcoded in the contract bytecode.
-    const BEACON_ROOTS_HISTORY_BUFFER_LENGTH: u64 = 8191;
     const POST_SKADI_TIMESTAMP: u64 = MANTLE_MAINNET_SKADI_TIMESTAMP + 1;
     const PRE_SKADI_TIMESTAMP: u64 = MANTLE_MAINNET_SKADI_TIMESTAMP - 1;
     const POST_ARSIA_TIMESTAMP: u64 = MANTLE_MAINNET_ARSIA_TIMESTAMP + 1;
@@ -524,6 +601,47 @@ mod tests {
             B256::ZERO,
         ));
         Recovered::new_unchecked(envelope, Address::ZERO)
+    }
+
+    fn legacy_tx(
+        nonce: u64,
+        to: TxKind,
+        gas_limit: u64,
+        value: U256,
+        input: Bytes,
+    ) -> Recovered<OpTxEnvelope> {
+        let tx = alloy_consensus::TxLegacy {
+            chain_id: Some(5000),
+            nonce,
+            gas_price: 1_000_000_000,
+            gas_limit,
+            to,
+            value,
+            input,
+        };
+        let envelope = OpTxEnvelope::Legacy(Signed::new_unchecked(
+            tx,
+            Signature::test_signature(),
+            B256::ZERO,
+        ));
+        Recovered::new_unchecked(envelope, Address::ZERO)
+    }
+
+    /// Init code of a factory: CREATEs a child, then CALLs it. The child's init
+    /// code (`PUSH1 7 PUSH1 1 SSTORE`, then return runtime `30ff`) writes slot 1
+    /// and deploys `ADDRESS SELFDESTRUCT`, so the child destroys itself in the
+    /// transaction that created it.
+    const FACTORY_INIT_CODE: Bytes = bytes!(
+        "6f60076001556130ff6000526002601ef3600052601060106000f060006000600060006000855af1505000"
+    );
+    const DESTROYED_RUNTIME: Bytes = bytes!("30ff");
+
+    fn factory_child() -> Address {
+        Address::ZERO.create(0).create(1)
+    }
+
+    fn create_factory_tx() -> Recovered<OpTxEnvelope> {
+        legacy_tx(0, TxKind::Create, 300_000, U256::ZERO, FACTORY_INIT_CODE)
     }
 
     fn create_deposit_tx(sender: Address) -> Recovered<OpTxEnvelope> {
@@ -614,6 +732,190 @@ mod tests {
         builder.with_transaction_result(tx_hash, executed.result.clone());
         builder.with_execution_time(tx_hash, execution_time_us);
         Arc::new(builder.build().expect("should build cached pending blocks"))
+    }
+
+    #[test]
+    fn an_account_created_and_destroyed_in_one_transaction_is_cleared() {
+        let mut builder = builder_over(
+            chain_spec(),
+            funded_sender_db(Address::ZERO),
+            test_header(POST_SKADI_TIMESTAMP),
+        );
+        let executed = builder.execute_transaction(0, create_factory_tx()).expect("execution");
+        let child = factory_child();
+
+        assert!(executed.result.is_success());
+        let account = &executed.state[&child];
+        assert!(account.is_selfdestructed());
+        assert!(account.is_created_locally());
+        assert_eq!(account.info.nonce, 1);
+        assert_eq!(account.info.code.as_ref().unwrap().original_bytes(), DESTROYED_RUNTIME);
+        assert_eq!(account.storage[&U256::from(1)].present_value, U256::from(7));
+
+        let (_, overrides) = builder.into_db_and_state_overrides();
+        let entry = &overrides[&child];
+        assert_eq!(entry.balance, Some(U256::ZERO));
+        assert_eq!(entry.nonce, Some(0));
+        assert_eq!(entry.code, Some(Bytes::new()));
+        assert_eq!(entry.state, Some(Default::default()));
+        assert_eq!(entry.state_diff, None);
+    }
+
+    #[test]
+    fn an_account_written_after_its_destruction_keeps_one_storage_field() {
+        let db = State::builder().with_database(funded_sender_db(Address::ZERO)).build();
+        let mut builder = builder_over(chain_spec(), db, test_header(POST_SKADI_TIMESTAMP));
+        let child = factory_child();
+        builder.execute_transaction(0, create_factory_tx()).expect("create");
+        builder
+            .execute_transaction(
+                1,
+                legacy_tx(1, TxKind::Call(child), 21_000, U256::from(1), Bytes::new()),
+            )
+            .expect("transfer");
+
+        let (_, overrides) = builder.into_db_and_state_overrides();
+        let entry = &overrides[&child];
+        assert_eq!(entry.balance, Some(U256::from(1)));
+        assert_eq!(entry.nonce, Some(0));
+        assert_eq!(entry.code, Some(Bytes::new()));
+        assert_eq!(entry.state, Some(Default::default()));
+        assert_eq!(entry.state_diff, None);
+
+        let mut db = State::builder().with_database(EmptyDB::default()).build();
+        alloy_evm::overrides::apply_state_overrides(overrides, &mut db)
+            .expect("overrides must be accepted by the evm");
+    }
+
+    #[test]
+    fn storage_written_after_a_destruction_extends_the_replacement() {
+        let child = factory_child();
+        let mut overrides = StateOverride::default();
+
+        let mut destroyed = Account::from(AccountInfo { nonce: 1, ..Default::default() });
+        destroyed.mark_touch();
+        destroyed.mark_created_locally();
+        destroyed.mark_selfdestructed_locally();
+        destroyed.storage.insert(
+            U256::from(1),
+            EvmStorageSlot::new_changed(U256::ZERO, U256::from(7), Default::default()),
+        );
+        write_account_override(&mut overrides, child, &destroyed);
+
+        let mut live = Account::from(AccountInfo { nonce: 1, code: None, ..Default::default() });
+        live.storage.insert(
+            U256::from(2),
+            EvmStorageSlot::new_changed(U256::ZERO, U256::from(9), Default::default()),
+        );
+        write_account_override(&mut overrides, child, &live);
+
+        let entry = &overrides[&child];
+        let expected = [(B256::from(U256::from(2)), B256::from(U256::from(9)))];
+        assert_eq!(entry.state, Some(expected.into_iter().collect()));
+        assert_eq!(entry.state_diff, None);
+        assert_eq!(entry.code, Some(Bytes::new()));
+        assert_eq!(entry.nonce, Some(1));
+    }
+
+    /// EIP-6780: `SELFDESTRUCT` outside the creating transaction only moves the balance; code,
+    /// nonce and storage stay.
+    #[test]
+    fn a_preexisting_contract_that_selfdestructs_keeps_its_code_and_nonce() {
+        let y = address!("0x000000000000000000000000000000000000dead");
+        let mut db = funded_sender_db(Address::ZERO);
+        let code = Bytecode::new_raw(bytes!("6000ff"));
+        db.insert_account_info(
+            y,
+            AccountInfo {
+                balance: U256::from(5),
+                nonce: 1,
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+        db.insert_account_storage(y, U256::from(1), U256::from(7)).unwrap();
+        let mut builder = builder_over(chain_spec(), db, test_header(POST_SKADI_TIMESTAMP));
+        let executed = builder
+            .execute_transaction(
+                0,
+                legacy_tx(0, TxKind::Call(y), 100_000, U256::ZERO, Bytes::new()),
+            )
+            .expect("execution");
+        assert!(!executed.state[&y].is_selfdestructed());
+
+        let (_, overrides) = builder.into_db_and_state_overrides();
+        let entry = &overrides[&y];
+        assert_eq!(entry.balance, Some(U256::ZERO));
+        assert_eq!(entry.nonce, Some(1));
+        assert_eq!(entry.code, Some(bytes!("6000ff")));
+        assert_eq!(entry.state, None);
+    }
+
+    #[test]
+    fn beacon_root_system_call_reaches_the_overrides() {
+        let header = test_header(POST_SKADI_TIMESTAMP);
+        let ts = header.timestamp;
+        let mut builder = builder_over(chain_spec(), make_db_with_beacon_roots_contract(), header);
+        let root = B256::from([0xab; 32]);
+        builder.apply_pre_execution_changes(B256::ZERO, Some(root)).expect("system calls");
+
+        let (_, overrides) = builder.into_db_and_state_overrides();
+        let entry = &overrides[&BEACON_ROOTS_ADDRESS];
+        let slot = ts % BEACON_ROOTS_HISTORY_BUFFER_LENGTH;
+        let diff = entry.state_diff.as_ref().expect("state_diff");
+        assert_eq!(diff[&B256::from(U256::from(slot))], B256::from(U256::from(ts)));
+        assert_eq!(diff[&B256::from(U256::from(slot + BEACON_ROOTS_HISTORY_BUFFER_LENGTH))], root);
+        assert_eq!(entry.balance, None);
+        assert_eq!(entry.nonce, None);
+        assert_eq!(entry.code, None);
+    }
+
+    #[test]
+    fn block_hash_system_call_reaches_the_overrides() {
+        let mut db = State::builder().with_database(InMemoryDB::default()).build();
+        let code = Bytecode::new_raw(HISTORY_STORAGE_CODE.clone());
+        db.insert_account(
+            HISTORY_STORAGE_ADDRESS,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+        let mut header = test_header(POST_SKADI_TIMESTAMP);
+        header.number = 10_000;
+        let mut builder = builder_over(chain_spec(), db, header);
+        let parent_hash = B256::from([0xcd; 32]);
+        builder
+            .apply_pre_execution_changes(parent_hash, Some(B256::from([0xab; 32])))
+            .expect("system calls");
+
+        let (_, overrides) = builder.into_db_and_state_overrides();
+        let entry = &overrides[&HISTORY_STORAGE_ADDRESS];
+        let slot = B256::from(U256::from(9_999 % HISTORY_SERVE_WINDOW as u64));
+        assert_eq!(entry.state_diff.as_ref().expect("state_diff")[&slot], parent_hash);
+        assert_eq!(entry.balance, None);
+        assert_eq!(entry.nonce, None);
+        assert_eq!(entry.code, None);
+    }
+
+    #[test]
+    fn system_call_slots_follow_a_storage_replacement() {
+        let address = Address::repeat_byte(0x11);
+        let mut overrides = StateOverride::default();
+        overrides.entry(address).or_default().state = Some(Default::default());
+
+        write_storage_override(
+            &mut overrides,
+            address,
+            [(B256::repeat_byte(1), B256::repeat_byte(2))],
+        );
+
+        let entry = &overrides[&address];
+        assert_eq!(entry.state.as_ref().unwrap()[&B256::repeat_byte(1)], B256::repeat_byte(2));
+        assert_eq!(entry.state_diff, None);
     }
 
     #[test]
@@ -723,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn flashblock_tx_has_zero_blob_gas_used_when_jovian_inactive() {
+    fn flashblock_tx_has_no_blob_gas_used_when_jovian_inactive() {
         let mut builder = builder_over(
             chain_spec(),
             funded_sender_db(Address::ZERO),
@@ -733,13 +1035,14 @@ mod tests {
             .execute_transaction(0, create_legacy_tx())
             .expect("transaction execution failed");
 
-        let blob_gas_used =
-            result.receipt.inner.blob_gas_used.expect("blob_gas_used should be set");
-        assert_eq!(blob_gas_used, 0, "blob_gas_used should be 0 while Jovian is inactive");
+        assert_eq!(
+            result.receipt.inner.blob_gas_used, None,
+            "blob_gas_used must be None while Jovian is inactive"
+        );
     }
 
     #[test]
-    fn flashblock_deposit_tx_has_zero_blob_gas_used_when_jovian_active() {
+    fn flashblock_deposit_tx_has_no_blob_gas_used_when_jovian_active() {
         let deposit_sender = address!("0x1234567890123456789012345678901234567890");
         let mut db = funded_sender_db(deposit_sender);
         seed_da_footprint_scalar(&mut db, 100);
@@ -749,9 +1052,10 @@ mod tests {
             .execute_transaction(0, create_deposit_tx(deposit_sender))
             .expect("deposit execution failed");
 
-        let blob_gas_used =
-            result.receipt.inner.blob_gas_used.expect("blob_gas_used should be set");
-        assert_eq!(blob_gas_used, 0, "deposit transactions are exempt from the DA footprint");
+        assert_eq!(
+            result.receipt.inner.blob_gas_used, None,
+            "deposit receipts do not carry blob_gas_used, matching OpReceiptBuilder"
+        );
     }
 
     #[test]

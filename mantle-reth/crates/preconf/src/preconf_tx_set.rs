@@ -2,7 +2,8 @@
 //!
 //! ## Responsibilities
 //!
-//! 1. Track in-flight preconf-eligible transactions in FIFO order
+//! 1. Track in-flight preconf-eligible transactions in arrival order, and the order they executed
+//!    in, which is the order a later build replays them in
 //! 2. Notify the builder via [`tokio::sync::broadcast`] (the single fifo event source)
 //! 3. Hold RPC `oneshot::Sender` responders attached by the RPC handler
 //! 4. Survive across slots — entries a build does not apply stay queued, and the next build's
@@ -35,6 +36,7 @@
 //!
 //! builder (sync):  writes AccountView only, never touches `inner`
 //! admit   (async): reads AccountView first, then takes `inner`
+//! dispatch (async): takes an entry's `apply_lock`, then `inner`
 //! forbidden:       taking `inner` while holding the AccountView write lock
 //! ```
 //!
@@ -65,9 +67,9 @@ use parking_lot::RwLock;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot, watch};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -134,8 +136,8 @@ pub struct TxEntry {
     /// Per-entry lock serialising dispatch's completion with the RPC deadline
     /// branch. A completion holds it from the decision through the send, so a
     /// deadline acquiring it afterwards finds the result already in the
-    /// channel. Never held while acquiring `PreconfTxSet::inner` — that
-    /// direction deadlocks.
+    /// channel. Taken before `PreconfTxSet::inner`, never while holding it:
+    /// the order is `apply_lock → inner`, and the reverse deadlocks.
     pub apply_lock: Arc<Mutex<()>>,
 }
 
@@ -184,15 +186,16 @@ pub struct TxEntryView {
 /// known, and the alternative is a setter nobody can see was never called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
-    /// Total entries.
+    /// `Waiting` entries. Every ceiling here counts only those: an executed
+    /// entry is not backlog.
     pub max_txs: usize,
-    /// Total encoded bytes.
+    /// Encoded bytes of the `Waiting` entries.
     pub max_size: usize,
-    /// Entries one sender may hold.
+    /// `Waiting` entries one sender may hold.
     pub max_account_slots: usize,
-    /// Entries a sender with an EIP-7702 delegation may hold.
+    /// `Waiting` entries a sender with an EIP-7702 delegation may hold.
     pub max_inflight_delegated: usize,
-    /// Summed `gas_limit` over every entry.
+    /// Summed `gas_limit` over the `Waiting` entries.
     ///
     /// What this ceiling catches that the other three cannot, and why it is a
     /// multiple of the per-block budget:
@@ -222,11 +225,11 @@ pub struct AdmitRequest {
     pub bytecode_hash: Option<B256>,
 }
 
-/// A receipt owed to a client, held back until the journal has it.
+/// A receipt owed to a client, held back until the journal write is done.
 ///
 /// `#[must_use]`: dropping one leaves a client waiting on a transaction that
 /// did land.
-#[must_use = "a success ticket holds a client's receipt; send it once the journal has the commitment"]
+#[must_use = "a success ticket holds a client's receipt; send it after the journal write"]
 #[derive(Debug)]
 pub struct SuccessTicket {
     responder: oneshot::Sender<Result<PreconfReceipt, PreconfError>>,
@@ -247,6 +250,14 @@ struct PreconfTxSetInner {
     /// worst-case burst is bounded by pool ingestion rate.
     order: VecDeque<TxHash>,
 
+    /// Entries that have executed, in the order they did: what a later build
+    /// replays them in. Not `order`: a commitment is queued on admission and
+    /// executes later, a pool transaction is staged only after it executes.
+    ///
+    /// Executing, again or not, puts an entry at the back; a reorg puts what it
+    /// took back at the front. Removal takes a hash out of both orders.
+    executed_order: VecDeque<TxHash>,
+
     /// Hash → entry. All mutations + lookups go through this.
     entries: HashMap<TxHash, TxEntry>,
 
@@ -261,22 +272,127 @@ struct PreconfTxSetInner {
 
     /// The registry, for releasing a record from [`Self::unindex`].
     claims: Arc<Commitments>,
+
+    /// [`Self::waiting_usage`] kept as running totals, so the queue gauges can
+    /// follow every change without the scan.
+    waiting: WaitingTotals,
+}
+
+/// Count, bytes and gas of the `Waiting` entries.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WaitingTotals {
+    count: usize,
+    bytes: usize,
+    gas: u64,
+}
+
+impl WaitingTotals {
+    fn add(&mut self, entry: &TxEntry) {
+        self.count += 1;
+        self.bytes += entry.size;
+        self.gas = self.gas.saturating_add(Transaction::gas_limit(entry.tx.as_ref()));
+    }
+
+    fn sub(&mut self, entry: &TxEntry) {
+        self.count = self.count.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(entry.size);
+        self.gas = self.gas.saturating_sub(Transaction::gas_limit(entry.tx.as_ref()));
+    }
 }
 
 impl PreconfTxSetInner {
-    fn new(claims: Arc<Commitments>) -> Self {
-        Self { order: VecDeque::new(), entries: HashMap::new(), by_sender: HashMap::new(), claims }
+    /// Entry count, bytes and gas of the `Waiting` entries: what `admit`'s
+    /// queue-wide ceilings measure. A `Success` entry has executed already and
+    /// stays only until the next build confirms it landed, so it is not part of
+    /// the backlog; counting it let one large executed pool transaction fill
+    /// the gas ceiling for the rest of the block.
+    fn waiting_usage(&self) -> (usize, usize, u64) {
+        self.entries.values().filter(|e| e.status == PreconfStatus::Waiting).fold(
+            (0, 0, 0),
+            |(count, bytes, gas), e| {
+                (
+                    count + 1,
+                    bytes + e.size,
+                    gas.saturating_add(Transaction::gas_limit(e.tx.as_ref())),
+                )
+            },
+        )
     }
 
-    /// Removes a hash from all indices (`entries` / `by_sender` / `order`).
-    /// Returns the evicted entry if one existed.
+    /// How many of `sender`'s entries are `Waiting`, for the per-sender
+    /// ceilings. Same reason as [`Self::waiting_usage`].
+    fn waiting_slots_of(&self, sender: &Address) -> usize {
+        self.by_sender.get(sender).map_or(0, |nonces| {
+            nonces
+                .values()
+                .filter(|&hash| {
+                    self.entries.get(hash).is_some_and(|e| e.status == PreconfStatus::Waiting)
+                })
+                .count()
+        })
+    }
+    fn new(claims: Arc<Commitments>) -> Self {
+        Self {
+            order: VecDeque::new(),
+            executed_order: VecDeque::new(),
+            entries: HashMap::new(),
+            by_sender: HashMap::new(),
+            claims,
+            waiting: WaitingTotals::default(),
+        }
+    }
+
+    /// Adds `hash`, just moved into `Waiting`, to the running totals.
+    fn entered_waiting(&mut self, hash: &TxHash) {
+        if let Some(entry) = self.entries.get(hash) {
+            self.waiting.add(entry);
+        }
+        self.publish_gauges();
+    }
+
+    /// Takes `hash`, just moved out of `Waiting`, off the running totals.
+    fn left_waiting(&mut self, hash: &TxHash) {
+        if let Some(entry) = self.entries.get(hash) {
+            self.waiting.sub(entry);
+        }
+        self.publish_gauges();
+    }
+
+    /// Publishes the queue gauges. Called after every change to the entries,
+    /// under the lock, so they read the queue as it is and not as the last
+    /// build found it.
     ///
-    /// Everything except `order` happens in [`Self::unindex`], including the
-    /// defensive fallback for torn index state.
+    /// `pending`, `bytes_used` and `gas_used` count `Waiting` entries, as the
+    /// ceilings `admit` enforces do; `entries` is every entry, executed ones
+    /// included.
+    fn publish_gauges(&self) {
+        metrics::gauge!("preconf.fifo.pending").set(self.waiting.count as f64);
+        metrics::gauge!("preconf.fifo.entries").set(self.entries.len() as f64);
+        metrics::gauge!("preconf.fifo.bytes_used").set(self.waiting.bytes as f64);
+        metrics::gauge!("preconf.fifo.gas_used").set(self.waiting.gas as f64);
+    }
+
+    /// Records `hash` as the latest to execute: at the back of
+    /// `executed_order`, and only once.
+    fn record_executed(&mut self, hash: TxHash) {
+        if let Some(pos) = self.executed_order.iter().position(|h| *h == hash) {
+            self.executed_order.remove(pos);
+        }
+        self.executed_order.push_back(hash);
+    }
+
+    /// Removes a hash from all indices (`entries` / `by_sender` / `order` /
+    /// `executed_order`). Returns the evicted entry if one existed.
+    ///
+    /// Everything except the two orders happens in [`Self::unindex`], including
+    /// the defensive fallback for torn index state.
     fn drop_hash(&mut self, hash: &TxHash, why: Removal) -> Option<TxEntry> {
         let entry = self.unindex(hash, why);
         if let Some(pos) = self.order.iter().position(|h| h == hash) {
             self.order.remove(pos);
+        }
+        if let Some(pos) = self.executed_order.iter().position(|h| h == hash) {
+            self.executed_order.remove(pos);
         }
         Self::report_unanswered(entry.as_ref());
         entry
@@ -319,6 +435,7 @@ impl PreconfTxSetInner {
         }
         let dropping: HashSet<TxHash> = hashes.iter().copied().collect();
         self.order.retain(|hash| !dropping.contains(hash));
+        self.executed_order.retain(|hash| !dropping.contains(hash));
     }
 
     /// Drop one `(sender, nonce)` from the nested index, and the sender with
@@ -348,6 +465,10 @@ impl PreconfTxSetInner {
     fn unindex(&mut self, hash: &TxHash, why: Removal) -> Option<TxEntry> {
         let entry = self.entries.remove(hash);
         if let Some(ref e) = entry {
+            if e.status == PreconfStatus::Waiting {
+                self.waiting.sub(e);
+            }
+            self.publish_gauges();
             Self::unindex_sender_nonce(&mut self.by_sender, e.from, e.nonce);
         } else {
             // Slow path — unreachable in nominal operation; only fires when
@@ -409,9 +530,10 @@ enum Removal {
 ///
 /// The three conditions are each needed. `Replay` alone also covers journal
 /// restore and reorg reinject — real commitments, which hold a `Promised`
-/// claim. A responder alone is absent for a preconfirmation whose receipt has
-/// already gone out, and present for one `reset_success_to_waiting` put back
-/// as `Replay` with its client still waiting.
+/// claim; the claim check is what tells them apart. A missing responder alone
+/// also matches an `Rpc` preconfirmation whose receipt has already gone out.
+/// No production `Replay` entry holds a responder, so that condition only keeps
+/// an entry a client is still waiting on from ever being reported this way.
 ///
 /// `entry` is `None` when the claim outlived its queue entry: a removal
 /// because the nonce moved on (`Removal::Landed`) keeps the record for either
@@ -531,9 +653,9 @@ impl AccountView {
 /// The queue, held by the build that is executing — see
 /// [`PreconfTxSet::lock_for_build`].
 ///
-/// Dropping it clears the sealed-block hash and then hands the queue on, in
-/// that order: the next build reads that hash the moment it takes the queue,
-/// and until this build seals it still names the build before it.
+/// Dropping it clears the sealed-block hash, raising the recorded generation
+/// to this build's, and then hands the queue on, in that order: the next build reads that hash the
+/// moment it takes the queue, and until this build seals it still names the build before it.
 ///
 /// Coupled to the drop because the caller's own exits would skip it — every
 /// `?` between taking the queue and the seal, and an unwind — and those are
@@ -569,7 +691,7 @@ impl Drop for BuildGuard {
     fn drop(&mut self) {
         // Before the mutex goes, or the next build takes the queue and reads
         // the hash this is about to erase.
-        self.claims.clear_sealed();
+        self.claims.clear_sealed(self.generation);
         self.lock.take();
     }
 }
@@ -587,6 +709,11 @@ pub struct PreconfTxSet {
     build_lock: Arc<Mutex<()>>,
 
     notifier: broadcast::Sender<TxHash>,
+
+    /// The tip of the last canonical-state notification the canon handler has
+    /// finished with, requeue of what it reverted included. `None` until the
+    /// handler starts.
+    canon_processed: watch::Sender<Option<B256>>,
 
     /// The claims this node has made, and the nonces they hold.
     ///
@@ -617,15 +744,36 @@ impl PreconfTxSet {
     /// Shared body of both constructors.
     fn with_claims(broadcast_cap: usize, claims: Arc<Commitments>) -> Self {
         let (notifier, _) = broadcast::channel(broadcast_cap);
-        // Register the gauge at 0 so it has a baseline from startup.
-        metrics::gauge!("preconf.fifo.pending").set(0.0);
+        // No gauge baseline here: a node without preconf builds a queue too.
+        // `seed_preconf_metrics` registers them, on preconf nodes only.
         Self {
             inner: Mutex::new(PreconfTxSetInner::new(claims.clone())),
             accounts: RwLock::new(AccountView::default()),
             build_lock: Arc::new(Mutex::new(())),
             notifier,
+            canon_processed: watch::Sender::new(None),
             claims,
         }
+    }
+
+    /// Records that the canon handler is done with the notification whose
+    /// tip is `tip`, everything that notification reverted back in the queue.
+    pub fn note_canon_processed(&self, tip: B256) {
+        self.canon_processed.send_replace(Some(tip));
+    }
+
+    /// Waits, at most `cap`, for the canon handler to finish with the
+    /// notification whose tip is `parent`. `false` on timeout.
+    ///
+    /// The engine sends that notification before it starts the build, but the
+    /// handler reads it asynchronously. A build that replays before then can
+    /// find a requeued transaction's successor in the queue and not the
+    /// transaction itself, and a replay that misses its nonce ends there.
+    pub async fn wait_canon_processed(&self, parent: B256, cap: Duration) -> bool {
+        let mut processed = self.canon_processed.subscribe();
+        tokio::time::timeout(cap, processed.wait_for(|tip| *tip == Some(parent)))
+            .await
+            .is_ok_and(|seen| seen.is_ok())
     }
 
     /// Claimed by a build before it touches the queue, released when it stops
@@ -636,7 +784,8 @@ impl PreconfTxSet {
     ///
     /// Two builds overlap routinely: a superseded job is signalled
     /// asynchronously and keeps running on a thread of its own until its next
-    /// await point.
+    /// await point. One still waiting here when it is abandoned returns as
+    /// soon as it gets the lock, without touching the queue.
     ///
     /// Not held across the seal — the state root is the most expensive step in
     /// a build and touches nothing shared. The wait costs one in-flight
@@ -683,31 +832,31 @@ impl PreconfTxSet {
         self.accounts.read().next_nonce(sender, chain_nonce)
     }
 
-    /// Sample the queue's occupancy into gauges. Called once per payload build
-    /// job (~per slot) rather than at every fifo mutation — these are sampled
-    /// quantities, so slot-level granularity is enough and keeps the mutation
-    /// paths free of the scan.
+    /// Publishes the queue's occupancy into gauges. Every change to the queue
+    /// publishes them too (`PreconfTxSetInner::publish_gauges`); a build calls
+    /// this as well, so a node with nothing queued still reports its zeros.
     ///
     /// The three queue-wide ceilings `admit` enforces (`max_txs`, `max_size`,
     /// `max_queued_gas`) are reported, because a ceiling without a utilisation
     /// reading fails silently: requests start being refused and nothing says
-    /// which limit did it. The two per-sender ceilings — `max_account_slots`
-    /// and `max_inflight_delegated` — have no queue-wide figure to publish, so
+    /// which limit did it. Like the ceilings, they count `Waiting` entries
+    /// only: `pending` against `max_txs`, `bytes_used` and `gas_used` against
+    /// the other two. `entries` is every entry, executed ones included. The
+    /// two per-sender ceilings — `max_account_slots` and
+    /// `max_inflight_delegated` — have no queue-wide figure to publish, so
     /// they show up only once they refuse something, in
     /// `preconf.admit.rejected_account_slots_total` and
     /// `preconf.admit.rejected_delegated_total`.
     pub async fn publish_pending_gauge(&self) {
         let inner = self.inner.lock().await;
-        let pending = inner.entries.values().filter(|e| e.status == PreconfStatus::Waiting).count();
-        let bytes: usize = inner.entries.values().map(|e| e.size).sum();
-        let gas: u64 = inner.entries.values().map(|e| Transaction::gas_limit(e.tx.as_ref())).sum();
-        let entries = inner.entries.len();
-        drop(inner);
-
-        metrics::gauge!("preconf.fifo.pending").set(pending as f64);
-        metrics::gauge!("preconf.fifo.entries").set(entries as f64);
-        metrics::gauge!("preconf.fifo.bytes_used").set(bytes as f64);
-        metrics::gauge!("preconf.fifo.gas_used").set(gas as f64);
+        // Checked here, once a build, rather than on every change: the scan
+        // would make each removal linear in the queue.
+        debug_assert_eq!(
+            (inner.waiting.count, inner.waiting.bytes, inner.waiting.gas),
+            inner.waiting_usage(),
+            "running totals drifted from the entries"
+        );
+        inner.publish_gauges();
     }
 
     // ============ Admission ============
@@ -752,16 +901,17 @@ impl PreconfTxSet {
 
         // ── Capacity ───────────────────────────────────────────────────
         // Refusing rather than evicting: every entry here is a promise
-        // already made, so there is no one to displace.
-        if inner.entries.len() >= capacity.max_txs {
+        // already made, so there is no one to displace. Only `Waiting` entries
+        // count — see `PreconfTxSetInner::waiting_usage`.
+        let (waiting, used_bytes, used_gas) = inner.waiting_usage();
+        if waiting >= capacity.max_txs {
             metrics::counter!("preconf.admit.rejected_entries_total").increment(1);
             return Err(PreconfError::QueueFull {
-                in_use: inner.entries.len() as u64,
+                in_use: waiting as u64,
                 capacity: capacity.max_txs as u64,
                 unit: "entries",
             });
         }
-        let used_bytes: usize = inner.entries.values().map(|e| e.size).sum();
         if used_bytes.saturating_add(size) > capacity.max_size {
             metrics::counter!("preconf.admit.rejected_bytes_total").increment(1);
             return Err(PreconfError::QueueFull {
@@ -770,11 +920,9 @@ impl PreconfTxSet {
                 unit: "bytes",
             });
         }
-        // Counting replayed entries too: a commitment already promised consumes
-        // the same drain rate as anything else, so it really does push what
-        // comes after it out of reach.
-        let used_gas: u64 =
-            inner.entries.values().map(|e| Transaction::gas_limit(e.tx.as_ref())).sum();
+        // Replayed entries count too while they wait: a commitment already
+        // promised consumes the same drain rate as anything else, so it really
+        // does push what comes after it out of reach.
         if used_gas.saturating_add(gas_limit) > capacity.max_queued_gas {
             metrics::counter!("preconf.admit.rejected_gas_total").increment(1);
             return Err(PreconfError::QueueFull {
@@ -786,12 +934,13 @@ impl PreconfTxSet {
 
         let held = inner.by_sender.get(&from);
         let holds_this_nonce = held.is_some_and(|nonces| nonces.contains_key(&nonce));
+        let sender_waiting = inner.waiting_slots_of(&from);
         // A replacement takes a slot rather than adding one, so it is not
         // counted against the ceiling.
-        if !holds_this_nonce && held.is_some_and(|n| n.len() >= capacity.max_account_slots) {
+        if !holds_this_nonce && sender_waiting >= capacity.max_account_slots {
             metrics::counter!("preconf.admit.rejected_account_slots_total").increment(1);
             return Err(PreconfError::AccountSlotsFull {
-                in_use: held.map_or(0, BTreeMap::len) as u64,
+                in_use: sender_waiting as u64,
                 max: capacity.max_account_slots as u64,
             });
         }
@@ -852,9 +1001,10 @@ impl PreconfTxSet {
         // ── Delegated senders ──────────────────────────────────────────
         // A sender with code can change what its queued transactions mean
         // with a single new delegation, so the ordinary pool caps how many it
-        // may have in flight. Same cap here, from the same config.
+        // may have in flight. Same cap here, from the same config. In flight
+        // means not yet executed, so `Waiting` only.
         if bytecode_hash.is_some_and(|code| code != KECCAK256_EMPTY) {
-            let inflight = inner.by_sender.get(&from).map_or(0, BTreeMap::len);
+            let inflight = inner.waiting_slots_of(&from);
             if inflight >= capacity.max_inflight_delegated {
                 metrics::counter!("preconf.admit.rejected_delegated_total").increment(1);
                 return Err(PreconfError::DelegatedInflightLimit {
@@ -871,21 +1021,21 @@ impl PreconfTxSet {
             Some((origin_instant, resp)) => (Some(resp), origin_instant),
             None => (None, Instant::now()),
         };
-        inner.entries.insert(
+        let entry = TxEntry {
             hash,
-            TxEntry {
-                hash,
-                tx,
-                from,
-                nonce,
-                size,
-                inserted_at,
-                status: PreconfStatus::Waiting,
-                source,
-                responder,
-                apply_lock: Arc::new(Mutex::new(())),
-            },
-        );
+            tx,
+            from,
+            nonce,
+            size,
+            inserted_at,
+            status: PreconfStatus::Waiting,
+            source,
+            responder,
+            apply_lock: Arc::new(Mutex::new(())),
+        };
+        inner.waiting.add(&entry);
+        inner.entries.insert(hash, entry);
+        inner.publish_gauges();
         inner.by_sender.entry(from).or_default().insert(nonce, hash);
         inner.order.push_back(hash);
         drop(inner);
@@ -896,11 +1046,14 @@ impl PreconfTxSet {
 
     // ============ Push path ============
 
-    /// Idempotent push.
+    /// Idempotent push, followed by a broadcast for the running build.
     ///
-    /// `from` must be the recovered sender; the callers (journal restore and
-    /// reorg re-injection) have it pre-validated. Hash + nonce are read from
-    /// `tx`.
+    /// `from` must be the recovered sender; the callers (journal restore, reorg
+    /// re-injection) have it pre-validated. Hash + nonce are read from `tx`.
+    ///
+    /// A re-injected commitment is announced to a build that may stand on the
+    /// block the reorg reverted. That build does not execute it: see
+    /// `ReplayParentCheck` in `builder::payload_builder`.
     ///
     /// Returns:
     /// - [`PushResult::Inserted`] — new entry created and broadcast notified.
@@ -913,7 +1066,7 @@ impl PreconfTxSet {
         from: Address,
         source: PreconfSource,
     ) -> PushResult {
-        self.push_with_status(tx, from, source, PreconfStatus::Waiting).await
+        self.push_with_status(tx, from, source, PreconfStatus::Waiting, true).await
     }
 
     /// Stage a transaction this build has **already executed**, so the next one
@@ -923,8 +1076,8 @@ impl PreconfTxSet {
     /// `senders_with_landed_claims` and `drop_landed_claims` select on.
     /// Getting it wrong skips both silently.
     ///
-    /// Sends no broadcast — the notifier means "there is work to dispatch",
-    /// and this has run already.
+    /// Sends no broadcast — the notifier means "there is work for the running
+    /// build", and this has run already.
     ///
     /// **A `Waiting` entry under the same hash is not upgraded** —
     /// `push_with_status` returns `AlreadyExists` and leaves it alone. What
@@ -937,20 +1090,24 @@ impl PreconfTxSet {
     /// as nonce-too-low — the client told its transaction failed while it is
     /// in the block.
     pub async fn stage_executed(&self, tx: Arc<TxEnvelope>, from: Address) -> PushResult {
-        let out =
-            self.push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success).await;
+        let out = self
+            .push_with_status(tx, from, PreconfSource::Replay, PreconfStatus::Success, false)
+            .await;
         if matches!(out, PushResult::Inserted) {
             self.trim_staged().await;
         }
         out
     }
 
+    /// `notify`: send the broadcast for a new `Waiting` entry. A `Success`
+    /// entry never notifies, as it has run already.
     async fn push_with_status(
         &self,
         tx: Arc<TxEnvelope>,
         from: Address,
         source: PreconfSource,
         status: PreconfStatus,
+        notify: bool,
     ) -> PushResult {
         let hash = *tx.tx_hash();
         let nonce = tx.nonce();
@@ -1013,12 +1170,22 @@ impl PreconfTxSet {
             responder,
             apply_lock: Arc::new(Mutex::new(())),
         };
+        if entry.status == PreconfStatus::Waiting {
+            inner.waiting.add(&entry);
+        }
         inner.entries.insert(hash, entry);
+        inner.publish_gauges();
         inner.by_sender.entry(from).or_default().insert(nonce, hash);
         inner.order.push_back(hash);
+        // Both have executed: a staged pool transaction just now, a `Replay`
+        // push earlier (journal restore, in file order; a reorg's put-back,
+        // which `put_reverted_first` then moves to the front).
+        if status == PreconfStatus::Success || source == PreconfSource::Replay {
+            inner.record_executed(hash);
+        }
         drop(inner);
 
-        if status == PreconfStatus::Waiting {
+        if notify && status == PreconfStatus::Waiting {
             let _ = self.notifier.send(hash);
         }
 
@@ -1078,9 +1245,8 @@ impl PreconfTxSet {
         self.inner.lock().await.entries.get(hash).map(|entry| entry.status)
     }
 
-    /// Snapshot of hashes in FIFO order. Used by the payload builder when
-    /// it starts a new job to replay any pending commitments accumulated
-    /// since the previous block.
+    /// Snapshot of hashes in arrival order. The payload builder re-scans it
+    /// after the broadcast reports `Lagged`.
     pub async fn snapshot(&self) -> Vec<TxHash> {
         self.inner.lock().await.order.iter().copied().collect()
     }
@@ -1164,7 +1330,7 @@ impl PreconfTxSet {
     /// One completion cannot avoid the gap: [`Self::begin_success`] takes the
     /// responder, and the receipt only goes out after the journal write, which
     /// is an `await`. Removing the entry during that write leaves the client
-    /// told `Timeout` for a transaction that is in the block and on disk.
+    /// told `Timeout` for a transaction that is already in the block.
     ///
     /// `try_lock`, not `lock`: a held lock means someone is finishing, and they
     /// will — this runs at every build, so leaving the entry for the next one
@@ -1318,10 +1484,9 @@ impl PreconfTxSet {
     // one fans out to every subscriber and is a different cost.
     //
     // The one completion that cannot do this is [`Self::begin_success`]: the
-    // journal must hold the commitment before the client holds the receipt, and
-    // that write is an `await`. It hands back a [`SuccessTicket`] instead, and
-    // the caller's `apply_lock` is what covers the gap — which works only
-    // because nothing removes a `Success` entry while that lock is held.
+    // journal write comes before the receipt, and that write is an `await`. It hands back a
+    // [`SuccessTicket`] instead, and the caller's `apply_lock` is what covers the gap — which
+    // works only because nothing removes a `Success` entry while that lock is held.
 
     /// End a commitment with a reason, and answer the client.
     ///
@@ -1357,14 +1522,18 @@ impl PreconfTxSet {
 
     /// `Waiting → Success`, taking the responder but **not** answering it.
     ///
-    /// The receipt must not go out before the commitment is on disk: a client
-    /// holding a receipt no journal remembers is what a restart must never
-    /// produce. The caller writes the journal between this and
-    /// [`SuccessTicket::send`], holding its `apply_lock` throughout.
+    /// The journal write comes before the receipt, so a restart replays every
+    /// commitment it was able to record. The write is best-effort: flushed, not
+    /// fsynced, and a failed write is logged while the receipt still goes out
+    /// (see [`crate::journal::PreconfJournal::append_batch`]). The caller
+    /// writes the journal between this and [`SuccessTicket::send`], holding its
+    /// `apply_lock` throughout.
     ///
     /// The responder is taken here, not after that write — the write is an
     /// `await`, and a responder left in the entry across it can be taken by a
     /// concurrent removal.
+    ///
+    /// Records the entry as the latest to execute (see `executed_order`).
     pub async fn begin_success(&self, hash: &TxHash) -> Result<Option<SuccessTicket>, MarkError> {
         let mut inner = self.inner.lock().await;
         let entry = inner.entries.get_mut(hash).ok_or(MarkError::NotFound)?;
@@ -1372,7 +1541,33 @@ impl PreconfTxSet {
             return Err(MarkError::IllegalTransition(entry.status));
         }
         entry.status = PreconfStatus::Success;
-        Ok(entry.responder.take().map(|responder| SuccessTicket { responder }))
+        let ticket = entry.responder.take().map(|responder| SuccessTicket { responder });
+        inner.left_waiting(hash);
+        inner.record_executed(*hash);
+        Ok(ticket)
+    }
+
+    /// Puts `hashes` at the front of `executed_order`, in the order given,
+    /// skipping hashes the queue does not hold. For what a reorg took back: it
+    /// executed before anything a build stacked on its block.
+    pub async fn put_reverted_first(&self, hashes: &[TxHash]) {
+        let mut inner = self.inner.lock().await;
+        let moving: Vec<TxHash> =
+            hashes.iter().copied().filter(|h| inner.entries.contains_key(h)).collect();
+        if moving.is_empty() {
+            return;
+        }
+        let set: HashSet<TxHash> = moving.iter().copied().collect();
+        inner.executed_order.retain(|h| !set.contains(h));
+        for hash in moving.into_iter().rev() {
+            inner.executed_order.push_front(hash);
+        }
+    }
+
+    /// The entries that have executed, in the order they did. See the field of
+    /// the same name.
+    pub async fn executed_order(&self) -> Vec<TxHash> {
+        self.inner.lock().await.executed_order.iter().copied().collect()
     }
 
     // ============ Status transitions ============
@@ -1380,16 +1575,16 @@ impl PreconfTxSet {
     /// `Waiting → Success` on its own. **Tests only.**
     ///
     /// Production goes through [`Self::begin_success`], which makes the same
-    /// transition and takes the responder with it. This leaves the responder
-    /// attached — a shape only a test needs.
+    /// transition, records the execution the same way, and takes the responder
+    /// with it. This leaves the responder attached — a shape only a test needs.
     ///
     /// Terminal for the build that set it — nothing moves it again, and
     /// [`Self::forward_all`] is the only path that drops it. The one way out is
     /// [`Self::reset_success_to_waiting`], which the *next* payload job's
     /// carryover preamble uses on a `Success` entry that outlived the block it
     /// was applied to (`replay_fifo_carryover` in `payload_builder`): the client
-    /// already holds a receipt, so the commitment still has to land, in a block
-    /// that will actually commit.
+    /// already holds a receipt, so the node makes a best effort to land it, in a
+    /// block that will actually commit.
     #[cfg(test)]
     pub(crate) async fn mark_succeeded(&self, hash: &TxHash) -> Result<(), MarkError> {
         let mut inner = self.inner.lock().await;
@@ -1398,6 +1593,8 @@ impl PreconfTxSet {
             return Err(MarkError::IllegalTransition(entry.status));
         }
         entry.status = PreconfStatus::Success;
+        inner.left_waiting(hash);
+        inner.record_executed(*hash);
         Ok(())
     }
 
@@ -1409,9 +1606,9 @@ impl PreconfTxSet {
     /// this same payload job (`sync_fifo_forward_to_head` in
     /// `payload_builder`, which runs before the carryover) would have
     /// dropped the entry entirely. On a new payload job start, such
-    /// entries represent commitments the client was already promised;
-    /// the mantle preconf SLA ("receipt returned → tx must land on
-    /// chain") requires re-applying them to the new build.
+    /// entries represent commitments the client was already promised,
+    /// which the node makes a best effort to land, so they are re-applied
+    /// to the new build.
     ///
     /// This API performs two coupled changes atomically under the
     /// fifo lock:
@@ -1436,6 +1633,7 @@ impl PreconfTxSet {
         }
         entry.status = PreconfStatus::Waiting;
         entry.source = PreconfSource::Replay;
+        inner.entered_waiting(hash);
         drop(inner);
 
         // The only signal this path emits, and it has to exist: a commitment that
@@ -1475,23 +1673,6 @@ impl PreconfTxSet {
                 true
             }
             None => false,
-        }
-    }
-
-    /// Answer `hash`'s client with an error and leave the entry where it is.
-    /// No-op if no responder is attached. The send is fire-and-forget — the
-    /// receiver may already have dropped (client gave up).
-    ///
-    /// **Not a completion.** One caller: a replaying commitment whose client
-    /// timed out. The commitment outlives that client and still has to land, so
-    /// the entry stays. Every other failure uses [`Self::complete_failure`].
-    pub async fn cancel_responder(&self, hash: &TxHash, err: PreconfError) {
-        let mut inner = self.inner.lock().await;
-        let responder = inner.entries.get_mut(hash).and_then(|e| e.responder.take());
-        // Under `inner` for the same reason completions are: detaching a
-        // responder and resolving it must not be two observable events.
-        if let Some(r) = responder {
-            let _ = r.send(Err(err));
         }
     }
 
@@ -1554,6 +1735,65 @@ mod admit_tests {
             Signature::test_signature(),
             B256::from([hash_byte; 32]),
         )))
+    }
+
+    /// Building a queue exports nothing: a node without preconf builds one too,
+    /// and must not show `preconf_*` series.
+    #[test]
+    fn an_untouched_queue_exports_no_gauges() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || drop(PreconfTxSet::new(8)));
+
+        let rendered = handle.render();
+        assert!(!rendered.contains("preconf_fifo"), "{rendered}");
+    }
+
+    /// The queue gauges follow every change, with no build to sample them: a
+    /// stalled chain still shows what is queued.
+    #[test]
+    fn queue_gauges_follow_every_change_without_a_build() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let read = |name: &str| -> (f64, f64, f64) {
+            let rendered = handle.render();
+            let value = |series: &str| {
+                rendered
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{series} ")))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("{series} not exported ({name})"))
+            };
+            (
+                value("preconf_fifo_pending"),
+                value("preconf_fifo_entries"),
+                value("preconf_fifo_gas_used"),
+            )
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let set = PreconfTxSet::new(8);
+                set.push_if_absent(tx_gas(0, 1, 30_000), addr(1), PreconfSource::Replay).await;
+                set.stage_executed(tx_gas(0, 2, 50_000), addr(2)).await;
+                assert_eq!(read("queued"), (1.0, 2.0, 30_000.0), "an executed entry is no backlog");
+
+                set.begin_success(&TxHash::from([1; 32])).await.expect("waiting");
+                assert_eq!(read("executed"), (0.0, 2.0, 0.0));
+
+                set.reset_success_to_waiting(&TxHash::from([1; 32])).await.expect("executed");
+                assert_eq!(read("put back"), (1.0, 2.0, 30_000.0));
+
+                set.drop_landed_claims().await;
+                assert_eq!(read("landed"), (1.0, 1.0, 30_000.0), "the executed one went");
+
+                // The once-a-build publish checks the totals against a scan.
+                set.publish_pending_gauge().await;
+            });
+        });
     }
 
     /// Ceilings high enough to stay out of the way; each case lowers the one
@@ -1738,6 +1978,61 @@ mod admit_tests {
             set.inner.lock().await.entries[&hash].responder.is_none(),
             "and the refused request must not have left its channel behind",
         );
+    }
+
+    // ── Executed entries do not count ──────────────────────────────────
+    //
+    // The pool arm stages what it executes as `Success` entries that stay until
+    // the next build. They are not backlog, so no ceiling counts them.
+
+    /// One executed pool transaction, however large, does not fill the queue.
+    #[tokio::test]
+    async fn an_executed_entry_does_not_count_against_the_queue_ceilings() {
+        let set = PreconfTxSet::new(8);
+        let incoming = tx_gas(0, 2, 21_000);
+        let tight = Capacity {
+            max_txs: 1,
+            max_size: incoming.encoded_2718().len(),
+            max_queued_gas: 21_000,
+            ..cap()
+        };
+        set.stage_executed(tx_gas(0, 1, 1_000_000_000), addr(1)).await;
+
+        let out = admit(&set, Req::new(incoming, addr(2)), tight).await;
+
+        assert_eq!(out, Ok(()), "count, bytes and gas all have room for one waiting entry");
+    }
+
+    /// A sender's own executed transactions do not use up its slots, nor its
+    /// in-flight allowance when it has code.
+    #[tokio::test]
+    async fn a_senders_executed_entries_do_not_use_its_slots() {
+        let set = PreconfTxSet::new(8);
+        let one_slot = Capacity { max_account_slots: 1, max_inflight_delegated: 1, ..cap() };
+        set.stage_executed(tx(0, 1, 0), addr(1)).await;
+
+        let out =
+            admit(&set, Req::new(tx(1, 2, 0), addr(1)).chain_nonce(1).delegated(), one_slot).await;
+
+        assert_eq!(out, Ok(()));
+    }
+
+    /// Put back to `Waiting` (an abandoned build's carryover), it counts again.
+    #[tokio::test]
+    async fn an_entry_put_back_to_waiting_counts_again() {
+        let set = PreconfTxSet::new(8);
+        let staged = tx_gas(0, 1, 1_000_000_000);
+        set.stage_executed(staged.clone(), addr(1)).await;
+        set.reset_success_to_waiting(staged.tx_hash()).await.unwrap();
+
+        let out = admit(
+            &set,
+            Req::new(tx_gas(0, 2, 21_000), addr(2)),
+            Capacity { max_queued_gas: 1_000_000_000, ..cap() },
+        )
+        .await;
+
+        assert!(matches!(out, Err(PreconfError::QueueFull { unit: "gas", .. })), "{out:?}");
     }
 
     // ── Base fee ───────────────────────────────────────────────────────
@@ -2024,20 +2319,20 @@ mod admit_tests {
         assert!(set.claims().slot_owner(&alice, 0).is_none(), "the slot comes back with it");
     }
 
-    /// A reorg reinject or a journal restore looks like the staged pool
-    /// transaction above in two of three respects — `Replay`, no responder —
-    /// and is a real commitment. The `Promised` claim is the only thing
-    /// telling them apart, which is why the carve-out checks all three.
+    /// A reorg reinject looks like the staged pool transaction above in two of
+    /// three respects — `Replay`, no responder — and is a real commitment. The
+    /// `Promised` claim is the only thing telling them apart, which is why the
+    /// carve-out checks all three. (A journal restore leaves the same shape;
+    /// see `a_replayed_commitment_refuses_to_take_on_a_client`.)
     #[tokio::test]
     async fn a_reinjected_commitment_is_not_mistaken_for_a_pool_tx() {
         let set = PreconfTxSet::new(8);
         let alice = addr(1);
-        let restored = tx(0, 1, 0);
-        let hash = *restored.tx_hash();
+        let reverted = tx(0, 1, 0);
+        let hash = *reverted.tx_hash();
 
-        // `Replay`, no client parked — the shape `restore_preconf_state` and
-        // the canon handler push.
-        set.push_if_absent(restored, alice, PreconfSource::Replay).await;
+        // Requeued the way the canon handler does after a reorg.
+        set.push_if_absent(reverted, alice, PreconfSource::Replay).await;
         set.claims().mark_promised(hash, &alice, 0, 7).expect("the slot was free");
 
         let out = admit(&set, Req::new(tx(0, 2, 0), alice), cap()).await;
@@ -2309,6 +2604,43 @@ mod tests {
     use alloy_consensus::{Signed, TxEip1559};
     use alloy_primitives::{B256, Bloom, Signature};
 
+    /// A build waiting on its parent goes as soon as the canon handler names it.
+    #[tokio::test]
+    async fn a_build_waits_until_the_canon_handler_has_processed_its_parent() {
+        let set = Arc::new(PreconfTxSet::new(8));
+        let parent = B256::repeat_byte(1);
+        set.note_canon_processed(B256::repeat_byte(9));
+
+        let waiter = {
+            let set = set.clone();
+            tokio::spawn(
+                async move { set.wait_canon_processed(parent, Duration::from_secs(10)).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "not before the handler gets to the parent");
+
+        set.note_canon_processed(parent);
+        assert!(waiter.await.expect("the waiter does not panic"));
+    }
+
+    /// A handler that never reaches the parent costs the build `cap`, not more.
+    #[tokio::test]
+    async fn a_build_gives_up_when_the_canon_handler_never_reaches_its_parent() {
+        let set = PreconfTxSet::new(8);
+        set.note_canon_processed(B256::repeat_byte(9));
+
+        assert!(!set.wait_canon_processed(B256::repeat_byte(1), Duration::from_millis(20)).await);
+    }
+
+    /// Before the handler starts nothing counts as processed.
+    #[tokio::test]
+    async fn nothing_is_processed_before_the_canon_handler_starts() {
+        let set = PreconfTxSet::new(8);
+
+        assert!(!set.wait_canon_processed(B256::ZERO, Duration::from_millis(20)).await);
+    }
+
     fn addr(byte: u8) -> Address {
         Address::from([byte; 20])
     }
@@ -2381,7 +2713,7 @@ mod tests {
     ///
     /// Eviction is a backstop for a chain that has stopped taking what this
     /// node builds. Dropping an announced transaction there costs a resend;
-    /// dropping a promised one breaks the only guarantee the subsystem makes.
+    /// dropping a promised one gives up on a receipt a client already holds.
     #[tokio::test]
     async fn the_staging_cap_evicts_announced_claims_and_never_promised_ones() {
         let set = PreconfTxSet::new(16);
@@ -2548,6 +2880,26 @@ mod tests {
         assert!(!c.parent_is_ours(sealed_by_a), "A's late seal must not stand");
     }
 
+    /// A build that took the queue after A and was then abandoned without sealing
+    /// still outranks A: A's late seal must not make the next build read A's
+    /// parent as "everything in the queue is on chain".
+    #[tokio::test]
+    async fn a_late_seal_is_refused_after_a_newer_build_cleared_without_sealing() {
+        let set = PreconfTxSet::new(16);
+        let sealed_by_a = h(0xaa);
+
+        let a = set.lock_for_build().await;
+        let generation_a = a.generation();
+        drop(a);
+        let b = set.lock_for_build().await; // abandoned: never seals
+        drop(b);
+
+        set.claims().note_sealed(sealed_by_a, generation_a);
+
+        let c = set.lock_for_build().await;
+        assert!(!c.parent_is_ours(sealed_by_a), "A's seal arrived after a newer build");
+    }
+
     /// `unindex` is the point every removal converges on, and it releases the
     /// commitment record only for [`Removal::Ended`]. Asserted on both routes
     /// through it — the single-entry `drop_hash` and the bulk `drop_hashes` —
@@ -2712,7 +3064,7 @@ mod tests {
     /// the journal write — an `await`. If `forward_all` removed the entry
     /// during that window, `lock_for_apply` would hand `rpc`'s deadline branch
     /// a `None`, and with nothing to wait on it would answer `Timeout` for a
-    /// transaction already in the block and on disk.
+    /// transaction already in the block.
     ///
     /// Holding the `apply_lock` is what dispatch does across that whole span,
     /// so holding it here stands in for "a completion is in flight". The entry
@@ -2801,6 +3153,90 @@ mod tests {
             l1_fields: Default::default(),
         });
         assert!(matches!(resp_rx.try_recv(), Ok(Ok(r)) if r.block_height == 7));
+    }
+
+    /// An executed commitment is recorded behind what executed before it, while
+    /// its place in `order` stays where admission put it. A pool transaction
+    /// staged after that place may be one it relied on.
+    #[tokio::test]
+    async fn begin_success_records_the_entry_after_what_executed_before_it() {
+        let set = PreconfTxSet::new(16);
+        let commitment = make_tx(0, 1);
+        let other = make_tx(0, 2);
+        set.push_if_absent(commitment.clone(), addr(1), PreconfSource::Rpc).await;
+        set.push_if_absent(other.clone(), addr(2), PreconfSource::Rpc).await;
+        let funding = make_tx(0, 3);
+        set.stage_executed(funding.clone(), addr(3)).await;
+
+        set.begin_success(commitment.tx_hash()).await.unwrap();
+
+        assert_eq!(
+            set.snapshot().await,
+            vec![*commitment.tx_hash(), *other.tx_hash(), *funding.tx_hash()],
+            "arrival order is untouched",
+        );
+        assert_eq!(set.executed_order().await, vec![*funding.tx_hash(), *commitment.tx_hash()]);
+    }
+
+    /// An entry that executes again is recorded once, at its latest execution.
+    #[tokio::test]
+    async fn an_entry_executed_again_is_recorded_at_its_latest_execution() {
+        let set = PreconfTxSet::new(16);
+        let (first, second) = (make_tx(0, 1), make_tx(0, 2));
+        set.push_if_absent(first.clone(), addr(1), PreconfSource::Rpc).await;
+        set.push_if_absent(second.clone(), addr(2), PreconfSource::Rpc).await;
+        set.begin_success(first.tx_hash()).await.unwrap();
+        set.begin_success(second.tx_hash()).await.unwrap();
+
+        set.reset_success_to_waiting(first.tx_hash()).await.unwrap();
+        set.begin_success(first.tx_hash()).await.unwrap();
+
+        assert_eq!(set.executed_order().await, vec![*second.tx_hash(), *first.tx_hash()]);
+    }
+
+    /// A `Replay` push executed before this process saw it, so it is recorded
+    /// in the order pushed; an `Rpc` push has not executed and is not.
+    #[tokio::test]
+    async fn a_replay_push_is_recorded_as_executed_and_an_rpc_push_is_not() {
+        let set = PreconfTxSet::new(16);
+        for byte in 1..=3u8 {
+            let source = if byte == 2 { PreconfSource::Rpc } else { PreconfSource::Replay };
+            set.push_if_absent(make_tx(0, byte), addr(byte), source).await;
+        }
+
+        assert_eq!(set.executed_order().await, vec![h(1), h(3)]);
+    }
+
+    /// Leaving the queue takes a hash out of `executed_order` too, whether one
+    /// at a time or in a batch.
+    #[tokio::test]
+    async fn removal_takes_the_hash_out_of_the_execution_order() {
+        let set = PreconfTxSet::new(16);
+        for byte in 1..=3u8 {
+            set.push_if_absent(make_tx(0, byte), addr(byte), PreconfSource::Replay).await;
+        }
+
+        let mut inner = set.inner.lock().await;
+        inner.drop_hash(&h(1), Removal::Ended);
+        inner.drop_hashes(&[h(3)], Removal::Ended);
+
+        assert_eq!(inner.executed_order, VecDeque::from([h(2)]));
+    }
+
+    /// `put_reverted_first` puts the given hashes first in `executed_order`, in
+    /// the order given, skips a hash the queue does not hold, and leaves
+    /// `order` alone.
+    #[tokio::test]
+    async fn put_reverted_first_keeps_the_given_order_and_skips_unknown_hashes() {
+        let set = PreconfTxSet::new(16);
+        for byte in 1..=4u8 {
+            set.push_if_absent(make_tx(0, byte), addr(byte), PreconfSource::Replay).await;
+        }
+
+        set.put_reverted_first(&[h(3), h(9), h(4)]).await;
+
+        assert_eq!(set.executed_order().await, vec![h(3), h(4), h(1), h(2)]);
+        assert_eq!(set.snapshot().await, vec![h(1), h(2), h(3), h(4)]);
     }
 
     /// A replayed commitment has no client — its receipt went out in an
@@ -3014,28 +3450,6 @@ mod tests {
     }
 
     // ============ responder lifecycle ============
-
-    #[tokio::test]
-    async fn cancel_responder_sends_error_to_receiver() {
-        let set = PreconfTxSet::new(16);
-        let tx = make_tx(0, 1);
-        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
-        let (s, r) = oneshot::channel();
-        assert!(set.set_responder(*tx.tx_hash(), Instant::now(), s).await);
-
-        set.cancel_responder(tx.tx_hash(), PreconfError::NotPreconfEligible).await;
-        let received = r.await.unwrap();
-        assert_eq!(received, Err(PreconfError::NotPreconfEligible));
-    }
-
-    #[tokio::test]
-    async fn cancel_responder_silently_drops_when_none_attached() {
-        let set = PreconfTxSet::new(16);
-        let tx = make_tx(0, 1);
-        set.push_if_absent(tx.clone(), addr(1), PreconfSource::Rpc).await;
-        // No attach — cancel is a no-op.
-        set.cancel_responder(tx.tx_hash(), PreconfError::NotPreconfEligible).await;
-    }
 
     /// Forward one sender. Production forwards them all at once — see
     /// [`PreconfTxSet::forward_all`] for why there is no such method.
@@ -3554,7 +3968,6 @@ mod proptest_responder_model {
         CompleteFailure(u8),
         MarkSucceeded(u8),
         Take(u8),
-        Cancel(u8),
         Forward(u8),
     }
 
@@ -3568,7 +3981,6 @@ mod proptest_responder_model {
             hb().prop_map(Op::CompleteFailure),
             hb().prop_map(Op::MarkSucceeded),
             hb().prop_map(Op::Take),
-            hb().prop_map(Op::Cancel),
             (0..=HASHES).prop_map(Op::Forward),
         ]
     }
@@ -3649,14 +4061,6 @@ mod proptest_responder_model {
                         assert_value(rx, &format!("step {i}: taken responder delivered"));
                     } else {
                         assert!(r.is_none(), "step {i}: take with no responder must be None");
-                    }
-                }
-                Op::Cancel(b) => {
-                    let b = *b;
-                    set.cancel_responder(&h(b), some_err()).await;
-                    let st = &mut model[b as usize];
-                    if let Some(rx) = st.held.take() {
-                        assert_value(rx, &format!("step {i}: canceled responder got error"));
                     }
                 }
                 Op::Forward(new_nonce) => {

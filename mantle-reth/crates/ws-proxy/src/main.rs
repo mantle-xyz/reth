@@ -85,12 +85,14 @@ struct Args {
 
     /// Honour the address and topic filters on `/ws/{api_key}/filter`.
     ///
-    /// Off by default, because both read `metadata.receipts` and
-    /// `metadata.new_account_balances`, which the Mantle producer leaves empty
-    /// — a filter would silently match nothing rather than filter. With this
-    /// off the route still serves unfiltered subscriptions; one carrying
-    /// filter parameters is refused with `501` and an explanation. Turn it on
-    /// only for an upstream that populates those maps.
+    /// Refused at startup. Both filters read `metadata.receipts` and
+    /// `metadata.new_account_balances`, which the Mantle producer leaves empty,
+    /// so a filter would silently match nothing; and every filtered client
+    /// decompresses and parses every slice on its own, so CPU grows with the
+    /// number of filtered clients. Lifting the refusal needs a producer that
+    /// fills those maps, one parse per slice shared by all clients, and a cap
+    /// on addresses and topics per filter. While off, the route still serves
+    /// unfiltered subscriptions; one carrying filter parameters gets `501`.
     #[arg(long, env, default_value = "false")]
     enable_filters: bool,
 
@@ -106,7 +108,11 @@ struct Args {
     #[arg(long, env, default_value = "")]
     metrics_global_labels: String,
 
-    /// Upper bound on upstream reconnect backoff, in milliseconds.
+    /// Upper bound on upstream reconnect backoff, in milliseconds. Must be
+    /// greater than zero.
+    ///
+    /// Also how long a connection has to stay up before its end restarts the
+    /// backoff: an upstream that drops connections sooner keeps it growing.
     #[arg(long, env, default_value = "20000")]
     subscriber_max_interval_ms: u64,
 
@@ -114,7 +120,8 @@ struct Args {
     #[arg(long, env, default_value = "2000")]
     subscriber_ping_interval_ms: u64,
 
-    /// How long to wait for an upstream pong before declaring the connection dead.
+    /// How long to wait for an upstream pong before declaring the connection
+    /// dead. Must exceed `--subscriber-ping-interval-ms`.
     #[arg(long, env, default_value = "4000")]
     subscriber_pong_timeout_ms: u64,
 
@@ -127,10 +134,12 @@ struct Args {
     client_ping_interval_ms: u64,
 
     /// How long to wait for a client pong before dropping it, in milliseconds.
+    /// With `--client-ping-enabled`, must exceed `--client-ping-interval-ms`.
     #[arg(long, env, default_value = "30000")]
     client_pong_timeout_ms: u64,
 
-    /// Timeout for a single send to a client, in milliseconds.
+    /// Timeout for a single send to a client, in milliseconds. Must be
+    /// greater than zero.
     #[arg(long, env, default_value = "1000")]
     client_send_timeout_ms: u64,
 }
@@ -163,6 +172,61 @@ fn refuse_unusable_args(args: &Args) -> eyre::Result<Vec<String>> {
     }
     if args.subscriber_ping_interval_ms == 0 {
         eyre::bail!("--subscriber-ping-interval-ms must be greater than zero");
+    }
+    // Zero starts and serves, then drops whichever client's socket is not
+    // writable at the instant a slice goes out, with nothing saying why.
+    if args.client_send_timeout_ms == 0 {
+        eyre::bail!(
+            "--client-send-timeout-ms must be greater than zero: a zero timeout drops any client \
+             whose socket is not ready the moment a slice is sent"
+        );
+    }
+    // The three below start, then cycle a connection forever.
+    if args.subscriber_pong_timeout_ms <= args.subscriber_ping_interval_ms {
+        eyre::bail!(
+            "--subscriber-pong-timeout-ms ({}) must be greater than \
+             --subscriber-ping-interval-ms ({}): a pong cannot arrive before the ping it answers, \
+             so the upstream connection would be declared dead and reopened forever",
+            args.subscriber_pong_timeout_ms,
+            args.subscriber_ping_interval_ms,
+        );
+    }
+    if args.subscriber_max_interval_ms == 0 {
+        eyre::bail!(
+            "--subscriber-max-interval-ms must be greater than zero: it caps the reconnect \
+             backoff, so zero reconnects without pause"
+        );
+    }
+    if args.client_ping_enabled && args.client_pong_timeout_ms <= args.client_ping_interval_ms {
+        eyre::bail!(
+            "--client-pong-timeout-ms ({}) must be greater than --client-ping-interval-ms ({}) \
+             when --client-ping-enabled is set: every client would be dropped before its pong \
+             is due",
+            args.client_pong_timeout_ms,
+            args.client_ping_interval_ms,
+        );
+    }
+    if args.enable_filters {
+        eyre::bail!(
+            "--enable-filters is not supported: the Mantle producer leaves the slice metadata \
+             filters read empty, and every filtered client decompresses and parses every slice \
+             on its own, so CPU grows with the number of filtered clients"
+        );
+    }
+    // The two below start and answer `/healthz`, then never serve: no TLS means
+    // any upstream but ws:// reconnects forever, and a zero limit admits no one.
+    if args.upstream_ws.scheme_str() != Some("ws") {
+        eyre::bail!(
+            "--upstream-ws ({}) must be a ws:// URL: this proxy speaks no TLS, so any other \
+             scheme never connects",
+            mantle_reth_flashblocks_types::redact_ws_url(&args.upstream_ws.to_string()),
+        );
+    }
+    if args.instance_connection_limit == 0 {
+        eyre::bail!("--instance-connection-limit must be greater than zero: zero admits no client");
+    }
+    if args.per_ip_connection_limit == 0 {
+        eyre::bail!("--per-ip-connection-limit must be greater than zero: zero admits no client");
     }
 
     // Fail closed. An unauthenticated endpoint is a supported configuration —
@@ -236,11 +300,14 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
         Metrics::init();
     }
 
-    info!(target: "ws-proxy", uri = %args.upstream_ws, "using upstream URI");
+    info!(
+        target: "ws-proxy",
+        uri = %mantle_reth_flashblocks_types::redact_ws_url(&args.upstream_ws.to_string()),
+        "using upstream URI",
+    );
 
-    // `_rec` keeps the channel alive through any moment with no clients, and is
-    // discounted from the connection gauge by `upstream_listener`.
-    let (sender, _rec) = broadcast::channel(args.message_buffer_size);
+    // Retain receivers only for real clients, so channel length measures their backlog.
+    let (sender, _) = broadcast::channel(args.message_buffer_size);
     let listener = upstream_listener(sender.clone(), args.enable_compression);
 
     let token = CancellationToken::new();
@@ -257,7 +324,11 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
         let mut subscriber = WebsocketSubscriber::new(uri.clone(), listener, options);
         let token = token.clone();
         tokio::spawn(async move {
-            info!(target: "ws-proxy", uri = %uri, "starting subscriber");
+            info!(
+                target: "ws-proxy",
+                uri = %mantle_reth_flashblocks_types::redact_ws_url(&uri.to_string()),
+                "starting subscriber",
+            );
             subscriber.run(token).await;
         })
     };
@@ -277,10 +348,11 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
                         match ping_sender.send(Message::Ping(vec![].into())) {
                             Ok(_) => {
                                 trace!(target: "ws-proxy", "sent ping to all clients");
-                                Metrics::broadcast_queue_size().set(ping_sender.len() as f64);
+                                Metrics::refresh_broadcast_queue_size(&ping_sender);
                             }
-                            Err(error) => {
-                                error!(target: "ws-proxy", %error, "failed to ping clients");
+                            Err(_) => {
+                                // No clients are currently subscribed.
+                                Metrics::refresh_broadcast_queue_size(&ping_sender);
                             }
                         }
                     }
@@ -319,18 +391,37 @@ async fn run(args: Args, authentication: Option<Authentication>) -> eyre::Result
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
 
-    tokio::select! {
-        _ = subscriber_task => {
-            info!(target: "ws-proxy", "all subscriber tasks terminated");
+    // Only a signal ends the proxy cleanly. Any task ending first is a failure,
+    // returned so the process exits non-zero and an on-failure supervisor
+    // restarts it.
+    let outcome = tokio::select! {
+        joined = subscriber_task => Err(unexpected_end("subscriber", joined)),
+        () = server_task => Err(eyre::eyre!("server task stopped")),
+        joined = ping_task => Err(unexpected_end("client ping", joined)),
+        _ = interrupt.recv() => {
+            info!(target: "ws-proxy", "interrupted, shutting down");
+            Ok(())
         }
-        _ = server_task => info!(target: "ws-proxy", "server task terminated"),
-        _ = ping_task => info!(target: "ws-proxy", "ping task terminated"),
-        _ = interrupt.recv() => info!(target: "ws-proxy", "interrupted, shutting down"),
-        _ = terminate.recv() => info!(target: "ws-proxy", "terminated, shutting down"),
+        _ = terminate.recv() => {
+            info!(target: "ws-proxy", "terminated, shutting down");
+            Ok(())
+        }
+    };
+    if let Err(error) = &outcome {
+        error!(target: "ws-proxy", %error, "a task ended while the proxy was running; exiting");
     }
 
     token.cancel();
-    Ok(())
+    outcome
+}
+
+/// The error for a spawned task that ended while the proxy was running.
+fn unexpected_end(task: &str, joined: Result<(), tokio::task::JoinError>) -> eyre::Report {
+    match joined {
+        Ok(()) => eyre::eyre!("{task} task stopped"),
+        Err(e) if e.is_panic() => eyre::eyre!("{task} task panicked"),
+        Err(e) => eyre::eyre!("{task} task failed: {e}"),
+    }
 }
 
 /// Parses `label1=value1,label2=value2`, skipping malformed entries with a warning.
@@ -476,16 +567,119 @@ mod tests {
         .expect("4 is the smallest that still ticks");
     }
 
-    /// The three that would fail loudly anyway are refused here too, so the
-    /// message names the flag instead of surfacing as a panic.
+    /// Zero-valued timing flags are refused by name, so the message names the
+    /// flag instead of surfacing as a panic or as clients dropped unexplained.
     #[test]
     fn the_zero_valued_timing_flags_are_refused_by_name() {
-        for flag in
-            ["--message-buffer-size", "--client-ping-interval-ms", "--subscriber-ping-interval-ms"]
-        {
+        for flag in [
+            "--message-buffer-size",
+            "--client-ping-interval-ms",
+            "--subscriber-ping-interval-ms",
+            "--client-send-timeout-ms",
+        ] {
             let err = refuse_unusable_args(&args_with(&["--public-access-enabled", flag, "0"]))
                 .expect_err("zero is not a usable value");
             assert!(err.to_string().contains(flag), "the message must name {flag}: {err}");
         }
+    }
+
+    /// Zero connection limits start and answer `/healthz`, then refuse every
+    /// client; they are refused by name instead.
+    #[test]
+    fn the_zero_connection_limits_are_refused_by_name() {
+        for flag in ["--instance-connection-limit", "--per-ip-connection-limit"] {
+            let err = refuse_unusable_args(&args_with(&["--public-access-enabled", flag, "0"]))
+                .expect_err("zero admits no client");
+            assert!(err.to_string().contains(flag), "the message must name {flag}: {err}");
+        }
+    }
+
+    /// The proxy speaks no TLS, so only a `ws://` upstream can connect; any
+    /// other scheme starts and then reconnects forever.
+    #[test]
+    fn an_upstream_other_than_ws_is_refused() {
+        for upstream in ["wss://sequencer:1111", "http://sequencer:1111"] {
+            let args = Args::try_parse_from([
+                "mantle-ws-proxy",
+                "--upstream-ws",
+                upstream,
+                "--public-access-enabled",
+            ])
+            .expect("the URI parses");
+            let err = refuse_unusable_args(&args).expect_err("cannot connect");
+            assert!(err.to_string().contains("--upstream-ws"), "{upstream}: {err}");
+        }
+        refuse_unusable_args(&args_with(&["--public-access-enabled"])).expect("ws:// is accepted");
+    }
+
+    /// Combinations that start but cycle a connection forever, and the values
+    /// just inside each boundary that do not.
+    #[test]
+    fn contradictory_timing_flags_are_refused_by_name() {
+        let refused = [
+            (
+                &["--subscriber-ping-interval-ms", "2000", "--subscriber-pong-timeout-ms", "2000"]
+                    [..],
+                "--subscriber-pong-timeout-ms",
+            ),
+            (&["--subscriber-max-interval-ms", "0"][..], "--subscriber-max-interval-ms"),
+            (
+                &[
+                    "--client-ping-enabled",
+                    "--client-ping-interval-ms",
+                    "15000",
+                    "--client-pong-timeout-ms",
+                    "15000",
+                ][..],
+                "--client-pong-timeout-ms",
+            ),
+        ];
+        for (flags, named) in refused {
+            let mut argv = vec!["--public-access-enabled"];
+            argv.extend_from_slice(flags);
+            let err = refuse_unusable_args(&args_with(&argv)).expect_err("must not start");
+            assert!(err.to_string().contains(named), "the message must name {named}: {err}");
+        }
+
+        for flags in [
+            &["--subscriber-ping-interval-ms", "2000", "--subscriber-pong-timeout-ms", "2001"][..],
+            &["--subscriber-max-interval-ms", "1"][..],
+            &[
+                "--client-ping-enabled",
+                "--client-ping-interval-ms",
+                "15000",
+                "--client-pong-timeout-ms",
+                "15001",
+            ][..],
+            // Without client pings the pong timeout is not compared.
+            &["--client-ping-interval-ms", "15000", "--client-pong-timeout-ms", "15000"][..],
+        ] {
+            let mut argv = vec!["--public-access-enabled"];
+            argv.extend_from_slice(flags);
+            refuse_unusable_args(&args_with(&argv)).unwrap_or_else(|e| panic!("{flags:?}: {e}"));
+        }
+    }
+
+    /// Filters cost a full decompress and JSON parse per slice per filtered
+    /// client, and match nothing useful against a Mantle producer, so the
+    /// proxy refuses to start with them on.
+    #[test]
+    fn enable_filters_is_refused() {
+        let err =
+            refuse_unusable_args(&args_with(&["--public-access-enabled", "--enable-filters"]))
+                .expect_err("filters must not be switched on");
+        assert!(
+            err.to_string().contains("--enable-filters"),
+            "the message must name the flag: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_ends_is_reported_as_a_failure() {
+        let stopped = unexpected_end("subscriber", tokio::spawn(async {}).await);
+        assert!(stopped.to_string().contains("subscriber task stopped"), "{stopped}");
+
+        let panicked = unexpected_end("client ping", tokio::spawn(async { panic!("boom") }).await);
+        assert!(panicked.to_string().contains("client ping task panicked"), "{panicked}");
     }
 }

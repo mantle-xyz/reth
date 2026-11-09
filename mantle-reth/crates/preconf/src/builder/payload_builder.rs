@@ -13,7 +13,10 @@
 //!
 //! [`OpPayloadBuilderCtx`]: reth_optimism_payload_builder::builder::OpPayloadBuilderCtx
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use alloy_consensus::{
     BlockHeader, Sealable, Transaction, TxEnvelope, TxReceipt, Typed2718, transaction::Recovered,
@@ -68,23 +71,22 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use crate::{
-    PreconfClassifier, PreconfConfig, PreconfTxSet,
+    ClaimKind, PreconfClassifier, PreconfConfig, PreconfTxSet,
     apply::{ApplyError, BuilderRejected, TxFacts, apply_preconf_tx},
     builder::{
         ExecutionInfo,
         best_tx_lead::BestTxLead,
-        cancel::{CancelReason, JobCancel},
+        cancel::{AbandonedBeforeStart, CancelReason, JobCancel},
         dispatch,
         execution_info::{carries_its_senders_nonce, record_executed},
         pacing::{AdmissionPacer, allowances_due, derive_pool_quota_schedule},
     },
     classifier::Whitelist,
     flashblocks::{
-        BlockInvariants, FlashblocksProducer, SenderBalances, SliceHeader, SliceLimits,
-        build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
+        BlockInvariants, FlashblocksProducer, SealedSliceLink, SenderBalances, SliceHeader,
+        SliceLimits, build_flashblock, derive_slice_schedule, maintain_pool_at_slice_boundary,
     },
-    journal::PreconfJournal,
-    preconf_tx_set::TxEntryView,
+    journal::{JournalEntry, PreconfJournal},
     types::{PreconfError, PreconfReceipt, PreconfSource, PreconfStatus},
     whitelist::{WHITELIST_UPDATED_TOPIC0, WhitelistDelta, decode_whitelist_update},
 };
@@ -214,7 +216,7 @@ where
         // derivation build (`no_tx_pool=true`) the batched user transactions
         // arrive this way too, and those it reads outright — which is why this
         // stage is on the funnel at all.
-        record_executed(&mut info, fifo, recovered, false);
+        record_executed(&mut info, fifo, recovered);
     }
 
     Ok((info, deltas))
@@ -284,9 +286,10 @@ pub struct PreconfPayloadBuilder<Pool, Client, Evm> {
     /// preconf transactions and so has nothing to persist — `node.rs` skips
     /// opening a file there because the default config leaves its path unset.
     journal: Option<Arc<PreconfJournal>>,
-    /// Slice publishing, when it is switched on. `None` leaves the build loop
-    /// behaving exactly as it did before slicing existed, which is what makes
-    /// turning flashblocks off a real rollback rather than a second code path.
+    /// Slice publishing, when it is switched on. `None` stops slicing and
+    /// publishing, but executed pool transactions are still staged in the fifo
+    /// and claim their `(sender, nonce)` (see `apply_one_best_tx`), so it is
+    /// not a rollback to the loop as it was before slicing existed.
     flashblocks: Option<FlashblocksProducer>,
 }
 
@@ -498,7 +501,8 @@ fn estimated_tx_da_size(tx: &TxEnvelope) -> u64 {
 /// the execution result (did it succeed once admitted?).
 #[derive(Debug)]
 enum Admission {
-    /// The tx fits the current in-flight block's remaining RLP, DA and gas → dispatch.
+    /// The tx fits the current in-flight block's remaining RLP, DA, gas and uncompressed size
+    /// → dispatch.
     Admit,
     /// The tx fits an *empty* block but not the current one (transient
     /// capacity). Only returned for [`PreconfSource::Replay`]: the entry is
@@ -511,6 +515,9 @@ enum Admission {
     Reject(PreconfError),
     /// RLP packing capacity rejected the tx; the RPC error is unchanged.
     RejectRlp(PreconfError),
+    /// The block's uncompressed-size cap rejected the tx; see
+    /// [`with_uncompressed_cap`].
+    RejectUncompressed(PreconfError),
 }
 
 impl Admission {
@@ -526,6 +533,9 @@ impl Admission {
             }
             Self::RejectRlp(_) => {
                 metrics::counter!("preconf.fifo.block_rlp_rejected_total").increment(1);
+            }
+            Self::RejectUncompressed(_) => {
+                metrics::counter!("preconf.fifo.block_uncompressed_rejected_total").increment(1);
             }
             Self::Admit | Self::Defer => {}
         }
@@ -589,7 +599,8 @@ fn preconf_admission(
     if over_block_da || over_footprint || over_gas {
         // Transient: fits an empty block, but the current block is too full.
         return match source {
-            // Replay is a must-land commitment — keep it Waiting and retry
+            // Replay's receipt has gone out and the node makes a best
+            // effort to land it — keep it Waiting and retry
             // next slot (fresh block DA/gas budget). Handled by the caller as
             // "do not dispatch"; the commitment is never ended.
             PreconfSource::Replay => Admission::Defer,
@@ -641,6 +652,45 @@ fn combined_preconf_admission(
     }
 }
 
+/// Apply the block's uncompressed-size cap (`max_uncompressed_block_size`) on
+/// top of an admission verdict. The pool arm already checks it
+/// (`is_tx_over_limits`); without the same check here, preconf transactions
+/// could push the block past the cap and leave the pool arm refusing everything
+/// after them.
+///
+/// Same classification as the other capacity checks: a transaction over the
+/// cap on its own is rejected; one that only overflows the current block is
+/// deferred if `Replay`, rejected if `Rpc`. An earlier rejection stands.
+fn with_uncompressed_cap(
+    admission: Admission,
+    tx_size: u64,
+    used: u64,
+    limit: Option<u64>,
+    source: PreconfSource,
+) -> Admission {
+    let Some(limit) = limit else { return admission };
+    if !matches!(admission, Admission::Admit | Admission::Defer) {
+        return admission;
+    }
+    if tx_size > limit {
+        return Admission::RejectUncompressed(PreconfError::BuilderRejected(format!(
+            "transaction uncompressed size {tx_size} exceeds block limit {limit}"
+        )));
+    }
+    if used.saturating_add(tx_size) > limit {
+        return match source {
+            PreconfSource::Replay => Admission::Defer,
+            PreconfSource::Rpc => {
+                Admission::RejectUncompressed(PreconfError::BuilderRejected(format!(
+                    "block uncompressed size headroom exhausted: used {used}, need {tx_size}, \
+                     block limit {limit}"
+                )))
+            }
+        };
+    }
+    admission
+}
+
 /// Apply a preconf tx and fold its gas, DA footprint, uncompressed size **and
 /// priority fee** into `info` so the pool best-tx arm (which reads
 /// `info.cumulative_evm_gas_used` / `info.cumulative_da_bytes_used` /
@@ -649,10 +699,10 @@ fn combined_preconf_admission(
 /// budget — and the sealed payload's block value (`total_fees`) includes preconf
 /// revenue, same as pool txs.
 ///
-/// No DA gate here: [`preconf_admission`] already enforces the per-tx / per-block
-/// DA + footprint bounds against the same `info.cumulative_da_bytes_used`
-/// (unchanged in the single-task window between admission and apply), and only
-/// dispatches on `Admit`. A gate here would be dead code.
+/// No capacity gate here: [`preconf_admission`] and [`with_uncompressed_cap`]
+/// already enforce the DA, footprint and uncompressed-size bounds against the
+/// same `info` totals (unchanged in the single-task window between admission
+/// and apply), and only `Admit` dispatches. A gate here would be dead code.
 #[allow(clippy::too_many_arguments)]
 fn apply_preconf_with_da<N, B, ChainSpec>(
     builder: &mut B,
@@ -710,8 +760,9 @@ where
     // advanced the canonical total would be invisible to every later admission
     // check on this block.
     info.accumulate_gas(receipt.gas_used, evm_gas_used);
-    // Likewise for the EIP-7934 uncompressed-size check, which reads
-    // `cumulative_uncompressed_bytes` and would otherwise miss every preconf tx.
+    // Likewise for the uncompressed-size checks — the pool arm's and
+    // `with_uncompressed_cap` — which read `cumulative_uncompressed_bytes` and
+    // would otherwise miss every preconf tx.
     info.cumulative_uncompressed_bytes += recovered.encode_2718_len() as u64;
     // The block's RLP budget, measured in block-body item lengths rather than
     // the 2718 payload the line above counts. `tx_rlp_length` is the same value
@@ -723,7 +774,7 @@ where
     // `alloy_consensus::TxEnvelope`, which has no deposit and no post-exec
     // variant, so that predicate could only ever return `true` for one.
     info.block_size.record_transaction(tx_rlp_length, true);
-    record_executed(info, fifo, recovered, false);
+    record_executed(info, fifo, recovered);
     // Count the preconf tx's priority fee toward `total_fees` (the payload block
     // value), mirroring the pool best-tx path. Without this, `engine_getPayload`'s
     // `blockValue` and `is_better_payload` ignore preconf-sourced revenue.
@@ -750,8 +801,7 @@ where
 ///
 /// [`PreconfSource::Replay`] is exempt — its receipt has already gone out, and a
 /// commitment already acknowledged to a client is owed whatever governance later
-/// decides. Same predicate `rpc.rs`'s deadline branch uses to refuse to time
-/// such an entry out.
+/// decides.
 fn barred_by_allowlist(
     cfg: &PreconfConfig,
     whitelist: &Whitelist,
@@ -769,6 +819,143 @@ fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: Prec
     status == PreconfStatus::Waiting && !loop_state.is_committed(hash)
 }
 
+/// How long a build that replays waits for the canon handler to finish with
+/// its parent's notification before giving up on replaying. Well under a slot:
+/// the handler takes milliseconds per notification.
+const CANON_CATCHUP_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether a build that may take transactions should: replay its carryover,
+/// run the pool and preconf arms, and record its block for `note_sealed`.
+///
+/// No when its parent is not the canonical head. A forkchoice update onto an
+/// ancestor with attributes builds on that ancestor while the head stays where
+/// it was until the rebuilt block is inserted; nothing the reorg reverts has
+/// been requeued yet, so a replay there can miss its nonce, and a replay that
+/// misses ends the transaction for good.
+///
+/// Also no when the parent is not the block the last build sealed and the
+/// canon handler has not finished with the parent's notification within
+/// `cap`: the reorg that made it the head may be reverting transactions the
+/// carryover's successors need.
+///
+/// A build told no carries only its attributes' transactions, and leaves the
+/// queue for the next build on the head.
+async fn replay_ready(
+    fifo: &PreconfTxSet,
+    client: &impl reth_storage_api::BlockNumReader,
+    parent_hash: B256,
+    parent_is_ours: bool,
+    cap: std::time::Duration,
+) -> bool {
+    match client.chain_info() {
+        Ok(info) if info.best_hash == parent_hash => {}
+        Ok(info) => {
+            metrics::counter!("preconf.build.parent_not_canonical_head_total").increment(1);
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                ?parent_hash, head = ?info.best_hash,
+                "build parent is not the canonical head; this block replays nothing \
+                 and takes no pool or preconf transactions",
+            );
+            return false;
+        }
+        Err(err) => {
+            metrics::counter!("preconf.build.canonical_chain_unreadable_total").increment(1);
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                ?parent_hash, ?err,
+                "canonical chain unreadable; this block replays nothing \
+                 and takes no pool or preconf transactions",
+            );
+            return false;
+        }
+    }
+    // Our own block cannot have been reorged into place: nothing to wait for.
+    if parent_is_ours {
+        return true;
+    }
+    let started = std::time::Instant::now();
+    let caught_up = fifo.wait_canon_processed(parent_hash, cap).await;
+    metrics::histogram!("preconf.build.canon_catchup_wait_ms")
+        .record(started.elapsed().as_secs_f64() * 1000.0);
+    if !caught_up {
+        metrics::counter!("preconf.build.canon_catchup_timeout_total").increment(1);
+        warn!(
+            target: "mantle::preconf::payload_builder",
+            ?parent_hash,
+            "canon handler has not processed the parent; this block replays nothing \
+             and takes no pool or preconf transactions",
+        );
+    }
+    caught_up
+}
+
+/// Whether this build may still execute a [`PreconfSource::Replay`] entry: only
+/// while its parent is on the canonical chain.
+///
+/// A replayed commitment was promised on some earlier block. If this build's
+/// parent is a block a reorg has taken back, that block may already hold it,
+/// and executing it again fails nonce-too-low and ends the commitment as
+/// broken. A build on a parent off the canonical chain will not be adopted, so
+/// the check abandons it and leaves the entry for a build on the new chain.
+///
+/// A build replays only when its parent is the canonical head as it starts
+/// (see [`replay_ready`]); this per-entry check covers a head that
+/// moves while the build runs.
+///
+/// Asked after the entry is read from the queue, never before. The engine
+/// updates its in-memory canonical chain before it sends the canonical-state
+/// notification, and the canon handler requeues from that notification, so a
+/// build that has read a requeued entry always sees the chain that reverted
+/// its parent. Asked earlier, the requeue could land between the check and the
+/// read. The lookup must read that in-memory chain (`BlockHashReader` on the
+/// blockchain provider does); a persisted-only view would lag it.
+pub(crate) struct ReplayParentCheck<'a> {
+    parent: B256,
+    canonical_at_parent_height:
+        &'a dyn Fn() -> reth_storage_api::errors::provider::ProviderResult<Option<B256>>,
+    cancel: &'a JobCancel,
+}
+
+impl<'a> ReplayParentCheck<'a> {
+    pub(crate) fn new(
+        parent: B256,
+        canonical_at_parent_height: &'a dyn Fn()
+            -> reth_storage_api::errors::provider::ProviderResult<Option<B256>>,
+        cancel: &'a JobCancel,
+    ) -> Self {
+        Self { parent, canonical_at_parent_height, cancel }
+    }
+
+    /// `true` if the entry may run. A parent off the canonical chain abandons
+    /// the build; an unreadable chain only holds this entry back.
+    fn allows_replay(&self, hash: &TxHash) -> bool {
+        match (self.canonical_at_parent_height)() {
+            Ok(Some(canonical)) if canonical == self.parent => true,
+            Ok(canonical) => {
+                metrics::counter!("preconf.build.stale_parent_abandoned_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, parent = ?self.parent, ?canonical,
+                    "build parent is no longer on the canonical chain; abandoning the build \
+                     before it replays a commitment"
+                );
+                self.cancel.abandon();
+                false
+            }
+            Err(err) => {
+                metrics::counter!("preconf.build.canonical_chain_unreadable_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::dispatch",
+                    ?hash, ?err,
+                    "canonical chain unreadable; holding the replayed commitment for a later build"
+                );
+                false
+            }
+        }
+    }
+}
+
 /// Block-capacity admission + same-sender cascade for a single preconf hash,
 /// run **before** dispatching to [`dispatch::apply_one_preconf`] (which drives
 /// the [`PreconfTxSet`] entry status machine). This is the one funnel all
@@ -777,7 +964,8 @@ fn needs_admission(loop_state: &dispatch::LoopState, hash: &TxHash, status: Prec
 /// "execute an admitted tx + record result".
 ///
 /// Three gates in order — [`barred_by_allowlist`], the same-sender cascade
-/// (Replay only), then [`preconf_admission`]. Each is documented on its own
+/// (Replay only), then block capacity: [`preconf_admission`] (DA and gas), the
+/// RLP budget, and [`with_uncompressed_cap`]. Each is documented on its own
 /// branch in the body.
 ///
 /// The `info` cumulative reads happen *before* the `&mut info` apply closure
@@ -794,6 +982,7 @@ async fn admit_and_dispatch<N, B, ChainSpec>(
     limits: BuildConstraints,
     whitelist: &Whitelist,
     l1_ctx: &mut L1FeeCtx<'_, ChainSpec>,
+    replay_parent: &ReplayParentCheck<'_>,
 ) -> Result<(), PayloadBuilderError>
 where
     N: OpPayloadPrimitives,
@@ -809,9 +998,17 @@ where
     let tx_da = estimated_tx_da_size(&entry.tx);
     let tx_gas = entry.tx.gas_limit();
     let tx_rlp_length = entry.tx.as_ref().length();
+    // The size `apply_preconf_with_da` adds to `cumulative_uncompressed_bytes`.
+    let tx_uncompressed = entry.tx.encode_2718_len() as u64;
     drop(entry);
 
     if !needs_admission(loop_state, &hash, status) {
+        return Ok(());
+    }
+
+    // (0) A replayed commitment runs only on the canonical chain — see
+    // `ReplayParentCheck`. The entry stays `Waiting` for the next build.
+    if source == PreconfSource::Replay && !replay_parent.allows_replay(&hash) {
         return Ok(());
     }
 
@@ -886,6 +1083,13 @@ where
         tx_rlp_length,
         source,
     );
+    let admission = with_uncompressed_cap(
+        admission,
+        tx_uncompressed,
+        info.cumulative_uncompressed_bytes,
+        limits.max_uncompressed_block_size,
+        source,
+    );
     admission.record_rejection_metrics();
     match admission {
         Admission::Admit => {
@@ -917,7 +1121,7 @@ where
                 "replay tx deferred (transient block capacity); keeping Waiting for next slot"
             );
         }
-        Admission::Reject(e) | Admission::RejectRlp(e) => {
+        Admission::Reject(e) | Admission::RejectRlp(e) | Admission::RejectUncompressed(e) => {
             loop_state.block_sender(sender, nonce, dispatch::BlockKind::Reject);
             // Replay carries an earlier public claim. Inspect it before
             // complete_failure releases the claim and its nonce slot.
@@ -965,24 +1169,44 @@ where
 /// the senders alone avoids cloning a view of every entry, and one sweep avoids
 /// re-reading every entry once per sender — quadratic at the volumes
 /// [`PreconfTxSet::forward_all`] describes.
+///
+/// A sender whose nonce cannot be read is left out, so its entries stay until
+/// a later build can read it.
 async fn sync_fifo_forward_to_head<S>(fifo: &PreconfTxSet, state_provider: &S)
 where
     S: reth_storage_api::StateProvider + ?Sized,
 {
-    let heads: HashMap<Address, u64> = fifo
-        .senders()
-        .await
-        .into_iter()
-        .map(|sender| {
-            let nonce = state_provider.account_nonce(&sender).ok().flatten().unwrap_or(0);
-            (sender, nonce)
-        })
-        .collect();
+    let heads =
+        readable_nonces(fifo.senders().await, |sender| state_provider.account_nonce(sender));
     fifo.forward_all(&heads).await;
 }
 
-/// Preamble that walks the fifo snapshot in insertion order and returns the
-/// hashes to (re)dispatch for this build.
+/// Each sender's nonce as `nonce_of` reads it, leaving out any sender whose
+/// read fails rather than treating the failure as nonce 0.
+fn readable_nonces(
+    senders: impl IntoIterator<Item = Address>,
+    nonce_of: impl Fn(&Address) -> reth_storage_api::errors::provider::ProviderResult<Option<u64>>,
+) -> HashMap<Address, u64> {
+    senders
+        .into_iter()
+        .filter_map(|sender| match nonce_of(&sender) {
+            // No account state reads as nonce 0.
+            Ok(nonce) => Some((sender, nonce.unwrap_or(0))),
+            Err(err) => {
+                metrics::counter!("preconf.build.forward_nonce_unreadable_total").increment(1);
+                warn!(
+                    target: "mantle::preconf::payload_builder",
+                    %sender, ?err,
+                    "chain nonce unreadable; keeping this sender's queue entries for the next build",
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Preamble that walks the fifo snapshot and returns the hashes to
+/// (re)dispatch for this build, in the order [`ordered_for_dispatch`] gives.
 ///
 /// Despite the name, this is not only about leftovers: it takes **every**
 /// `Waiting` entry in the snapshot, including one an RPC push queued a moment
@@ -997,8 +1221,8 @@ where
 ///   get timed out by the deadline gate.
 /// - **`Success`** — stale in-flight from a discarded prior job. A canon'd entry would have been
 ///   removed by the immediately-preceding [`sync_fifo_forward_to_head`], so any Success reaching
-///   here is an un-canon'd in-flight (client already got a receipt; must land).
-///   `reset_success_to_waiting` promotes the source to `Replay` so gates bypass and the
+///   here is an un-canon'd in-flight (client already got a receipt; the node makes a best effort to
+///   land it). `reset_success_to_waiting` promotes the source to `Replay` so gates bypass and the
 ///   previously-returned receipt is honored; then the hash is returned for dispatch.
 ///
 /// There is no third case: a commitment that ended is not in the queue to be carried over.
@@ -1011,18 +1235,18 @@ where
 /// types and unit-testable.
 async fn replay_fifo_carryover(fifo: &PreconfTxSet) -> Vec<TxHash> {
     use crate::types::PreconfStatus;
-    let mut carryover: Vec<TxEntryView> = Vec::new();
+    let mut carryover: Vec<TxHash> = Vec::new();
     for view in fifo.entries().await {
         match view.status {
-            PreconfStatus::Waiting => carryover.push(view),
+            PreconfStatus::Waiting => carryover.push(view.hash),
             PreconfStatus::Success => {
                 if fifo.reset_success_to_waiting(&view.hash).await.is_ok() {
-                    carryover.push(view);
+                    carryover.push(view.hash);
                 }
             }
         }
     }
-    ordered_for_dispatch(&carryover)
+    ordered_for_dispatch(&carryover, &fifo.executed_order().await)
 }
 
 /// How many slices were published for a block the seal then failed to produce.
@@ -1038,36 +1262,22 @@ fn count_slices_outliving_their_block(slices: Option<&SliceState>) {
     }
 }
 
-/// Order carried-over commitments: each sender's by nonce, senders in the order
-/// they first appear.
+/// Carried-over entries in dispatch order: those that executed before, in
+/// `executed_order`; then those that never ran, in queue order.
 ///
-/// The fifo records the order commitments were made, and that order decides who
-/// lands when a block fills up — so senders keep it. Sorting by address instead
-/// would hand a standing advantage to whoever holds the lower one.
-///
-/// What the fifo cannot record is that one sender's transactions execute only
-/// in nonce order. Its own order is arrival order, and for entries restored from
-/// the journal that is the order two writers with different latencies happened
-/// to leave them in: a commitment is recorded from its apply, a pool transaction
-/// from the slice that carries it, so one sender's consecutive nonces can land
-/// in the file the wrong way round. Dispatched that way the higher nonce is
-/// rejected as invalid, and for a carried-over entry that rejection is terminal
-/// — a commitment broken with no second attempt.
-///
-/// This is also what orders a recovered pool transaction against a commitment
-/// from the same sender: the unlanded index hands its survivors to the fifo
-/// before the preamble reads it, so by here there is one source, not two.
-fn ordered_for_dispatch(carryover: &[TxEntryView]) -> Vec<TxHash> {
-    let mut first_seen: HashMap<Address, usize> = HashMap::new();
-    let mut ordered: Vec<(usize, u64, TxHash)> = Vec::with_capacity(carryover.len());
-    for (position, view) in carryover.iter().enumerate() {
-        let sender_rank = *first_seen.entry(view.from).or_insert(position);
-        ordered.push((sender_rank, view.nonce, view.hash));
-    }
-    // Stable, so two entries claiming one (sender, nonce) keep the order the
-    // fifo had them in — which of them wins is not this function's to decide.
-    ordered.sort_by_key(|&(sender_rank, nonce, _)| (sender_rank, nonce));
-    ordered.into_iter().map(|(_, _, hash)| hash).collect()
+/// Execution order keeps every dependency between executed entries, across
+/// senders too, which a sort by sender and nonce can break. An entry that
+/// never ran is relied on by nothing that did, but may rely on them, so it
+/// goes last.
+fn ordered_for_dispatch(carryover: &[TxHash], executed_order: &[TxHash]) -> Vec<TxHash> {
+    let carried: HashSet<&TxHash> = carryover.iter().collect();
+    let executed: HashSet<&TxHash> = executed_order.iter().collect();
+    executed_order
+        .iter()
+        .filter(|hash| carried.contains(hash))
+        .chain(carryover.iter().filter(|hash| !executed.contains(hash)))
+        .copied()
+        .collect()
 }
 
 /// Outcome of one iteration of the pool best-tx step inside the
@@ -1094,6 +1304,7 @@ async fn apply_one_best_tx<N, Builder>(
     builder: &mut Builder,
     info: &mut ExecutionInfo<N::SignedTx>,
     fifo: &PreconfTxSet,
+    journal: Option<&PreconfJournal>,
     constraints: &BuildConstraints,
     pacer: &mut AdmissionPacer,
 ) -> Result<BestTxStep, PayloadBuilderError>
@@ -1164,6 +1375,10 @@ where
     let interop = tx.interop_deadline();
     let tx_da_size = tx.estimated_da_size();
     let tx_hash = *tx.hash();
+    // Pool wrappers may override the tip, so read it before unwrapping.
+    let miner_fee = tx.effective_tip_per_gas(constraints.base_fee).expect(
+        "selected pool transaction must have a valid effective miner tip at the block base fee",
+    );
     let tx = tx.into_consensus();
     let tx_uncompressed_size = tx.encode_2718_len() as u64;
 
@@ -1270,23 +1485,34 @@ where
     // Recorded only now: a transaction the executor refused contributes no
     // bytes, while a revert or halt still occupies its RLP item in the block.
     info.block_size.record_transaction(tx_rlp_length, sdm_refund_possible);
-    let miner_fee = tx
-        .effective_tip_per_gas(constraints.base_fee)
-        .expect("fee is always valid; execution succeeded");
     info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
     // The one class of transaction nothing else brings back after a restart.
-    // Only the slice path drains these, so **with slicing off they are marked
-    // and never written** — known, and left that way rather than put a disk
-    // write on the `engine_getPayload` path.
+    // Held, not written: the next write — a commitment's, a slice boundary's,
+    // or the next build's before it replays anything — carries it ahead of
+    // itself, so the file keeps execution order and a commitment that executed
+    // after it finds it first.
+    if let Some(journal) = journal {
+        journal.hold(&JournalEntry::for_executed(
+            tx_hash,
+            recovered.inner(),
+            constraints.predicted_height,
+            ClaimKind::Announced,
+        ));
+    }
     // Staged like a commitment, because by the next slice it is one: executed,
     // announced, and pruned from the pool half a slot before the block could be
     // canonical. `Replay` because no client is waiting; `Announced` because
     // none was told. See `ClaimKind`.
+    //
+    // Staged with slicing off too, where nothing was announced or pruned. Then
+    // a block that is not taken replays it before the pool, and the claim
+    // makes the pool arm skip any other transaction on its `(sender, nonce)`
+    // until the claim is released.
     let signer = recovered.signer();
     let nonce = recovered.nonce();
     let staged: Option<TxEnvelope> =
         crate::admission::op_envelope_to_alloy(OpTxEnvelope::from(recovered.inner().clone()));
-    record_executed(info, fifo, recovered, true);
+    record_executed(info, fifo, recovered);
     if let Some(envelope) = staged {
         let hash = *envelope.tx_hash();
         fifo.stage_executed(Arc::new(envelope), signer).await;
@@ -1464,10 +1690,11 @@ fn block_invariants<B: reth_primitives_traits::Block>(sealed: &SealedBlock<B>) -
 /// Sender balances for pool maintenance, read from the parent state.
 ///
 /// The live mid-block balances are not reachable from here — the block builder
-/// holds the state for the whole build — so a sender who has already spent in
-/// this block reads higher than they now are. Only ever higher, which makes it
-/// a cost rather than a hazard: too much balance admits a transaction that
-/// execution then refuses, too little would withhold a good one.
+/// holds the state for the whole build — so every balance is the parent's. A
+/// sender who has spent in this block reads higher than they now are, which is
+/// a cost rather than a hazard: the pool admits a transaction that execution
+/// then refuses. A sender who has received in this block reads lower, and the
+/// pool parks a transaction that would succeed until this block is canonical.
 ///
 /// Measured: of three transfers spending a third of a balance each, the last
 /// falls short by the gas the first two burned, and the pool — told the parent
@@ -1492,8 +1719,9 @@ impl<P: reth_storage_api::AccountReader + ?Sized> SenderBalances for ProviderBal
 /// Everything slicing carries from one tick to the next.
 ///
 /// Held for the life of one block: the block-level fields a subscriber needs
-/// are established once, and the index and predecessor pointer are what let a
-/// subscriber tell a gap from a fresh start.
+/// are established once, and the index and the predecessor's position and
+/// content hash are what let a subscriber tell whether a slice extends what it
+/// holds.
 struct SliceState {
     producer: FlashblocksProducer,
     /// Post-Jovian DA footprint scalar, or `None` before Jovian.
@@ -1510,6 +1738,14 @@ struct SliceState {
     invariants: Option<BlockInvariants>,
     next_index: u64,
     previous: FlashblockId,
+    /// Content hash of the slice `previous` names; zero when none.
+    previous_hash: B256,
+    /// Position and content hash of the last slice that went out.
+    last_sent: Option<(FlashblockId, B256)>,
+    /// Whether the closing slice went out. Only then does the next block name
+    /// this one: without it the sealed block holds transactions no slice
+    /// described.
+    closing_sent: bool,
 }
 
 impl SliceState {
@@ -1522,24 +1758,18 @@ impl SliceState {
         self.next_index
     }
 
-    fn new(producer: &FlashblocksProducer, da_footprint_gas_scalar: Option<u16>) -> Self {
-        // The predecessor of this block's first slice is the last slice of the
-        // previous block, which a block-scoped builder does not know — so it
-        // comes from what the publisher has actually sent. Only a producer that
-        // has published nothing has no predecessor, and the sentinel is how a
-        // subscriber tells that fresh start from a gap it should go and fill.
-        //
-        // Rebuilding a block points the new first slice at the last slice of
-        // the attempt being replaced. Deliberate: the index restarting at zero
-        // with `base` present is what says a build began again, and claiming no
-        // predecessor at all would say something less true.
-        let previous =
-            producer.publisher.latest_position().map_or(FlashblockId::NO_PREV, |position| {
-                FlashblockId {
-                    block_number: position.block_number,
-                    index: position.flashblock_index,
-                }
-            });
+    fn new(
+        producer: &FlashblocksProducer,
+        parent_hash: B256,
+        da_footprint_gas_scalar: Option<u16>,
+    ) -> Self {
+        // The first slice names the closing slice of the build that sealed the
+        // parent. A parent this node did not seal, or whose closing slice never
+        // went out, gets `NO_PREV` and a zero hash.
+        let (previous, previous_hash) = producer
+            .sealed_links
+            .predecessor_of(parent_hash)
+            .unwrap_or((FlashblockId::NO_PREV, B256::ZERO));
 
         Self {
             producer: producer.clone(),
@@ -1549,15 +1779,25 @@ impl SliceState {
             invariants: None,
             next_index: 0,
             previous,
+            previous_hash,
+            last_sent: None,
+            closing_sent: false,
         }
+    }
+
+    /// The link the next block names, when this block's closing slice went out.
+    fn sealed_link(&self, block_hash: B256) -> Option<SealedSliceLink> {
+        let (last_slice, last_slice_hash) = self.last_sent?;
+        self.closing_sent.then_some(SealedSliceLink { block_hash, last_slice, last_slice_hash })
     }
 
     /// Write this slice's transactions to the journal, then publish it.
     ///
-    /// The order is the whole point. A transaction a subscriber has been shown
-    /// has to land, so it must be on disk before anyone hears about it —
-    /// reversing this leaves a crash window in which a transaction was
-    /// announced but not persisted, which is the case the journal exists for.
+    /// Writing first lets a restart replay what subscribers were shown. For an
+    /// ordinary transaction that is best-effort recovery, not a promise to land
+    /// it: it is written as `ClaimKind::Announced`, and one that cannot be
+    /// replayed is dropped and counted in `preconf.tx.announced_dropped_total`,
+    /// not reported as a broken commitment.
     ///
     /// The write stays outside the cancel gate because it cannot go inside:
     /// [`JobCancel::unless_abandoned`] takes a synchronous closure. The cost is
@@ -1593,16 +1833,12 @@ impl SliceState {
     {
         // Before the publish below, always. See this function's docs.
         if let Some(journal) = journal {
-            let height = ctx.parent().number() + 1;
-            // The apply puts every executed transaction into the fifo as it
-            // runs, so by the time a slice is assembled the index is already
-            // complete. What is left here is the disk write, which is allowed
-            // to fail and retry.
-            let entries = info.take_journal_records(height);
-            // The one part of a slice that touches the disk, and the one that
-            // could put a tick over its interval.
+            // The pool arm holds each transaction's record as it executes, so
+            // what is left here is the disk write, which is allowed to fail and
+            // retry. The one part of a slice that touches the disk, and the one
+            // that could put a tick over its interval.
             let started = std::time::Instant::now();
-            let write = journal.append_batch(&entries).await;
+            let write = journal.flush().await;
             metrics::histogram!("flashblocks.journal_write_duration_ms")
                 .record(started.elapsed().as_secs_f64() * 1000.0);
             if let Err(err) = write {
@@ -1631,8 +1867,9 @@ impl SliceState {
     /// Never fails the build. Publishing a slice is a side channel: a state read
     /// that fell over, or an encoding that did not, costs a slice and leaves its
     /// transactions pending for the next one — whereas failing here would cost
-    /// the slot its block. A subscriber that ends up short is told by
-    /// `prev_flashblock_id` and fills the gap from the canonical chain.
+    /// the slot its block. A subscriber that ends up short is told by the
+    /// predecessor link (`prev_flashblock_id`, `prev_flashblock_hash`) and
+    /// fills the gap from the canonical chain.
     fn publish<N, Evm, ChainSpec, Attrs, B, P>(
         &mut self,
         ctx: &OpPayloadBuilderCtx<Evm, ChainSpec, Attrs>,
@@ -1709,6 +1946,7 @@ impl SliceState {
             ctx.payload_id(),
             self.next_index,
             self.previous,
+            self.previous_hash,
         );
         let block_number = invariants.base.block_number;
 
@@ -1766,7 +2004,11 @@ impl SliceState {
         // subscriber would have no way to notice the hole.
         info.advance_publish_cursor();
 
-        self.previous = FlashblockId { block_number, index: self.next_index };
+        let hash = payload.diff.block_hash;
+        let sent_id = FlashblockId { block_number, index: self.next_index };
+        self.last_sent = Some((sent_id, hash));
+        self.previous = sent_id;
+        self.previous_hash = hash;
         self.next_index += 1;
     }
 }
@@ -1786,7 +2028,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///
     /// 1. **Prelude** — upstream [`OpPayloadBuilderCtx`], parent-block state provider fetched twice
     ///    (owned, to keep the async future `Send`), L1 block contract preloaded into the DB cache.
-    /// 2. **Stage 1** — `apply_pre_execution_changes`.
+    /// 2. **Stage 1** — `apply_pre_execution_changes`, then the build lock
+    ///    ([`PreconfTxSet::lock_for_build`]). A job abandoned while it waited for the lock returns
+    ///    [`AbandonedBeforeStart`] there, having touched nothing shared.
     /// 3. **Stage 2** — `execute_sequencer_transactions_watching_whitelist` (deposits + L1 info +
     ///    system txs, snapshotting any `WhitelistUpdated` delta they emit).
     /// 4. **Stage 3** — unified `select!` loop with four `biased` branches, **in this order**:
@@ -1805,10 +2049,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
     ///    Before the loop, in order: a sweep of what the last build announced and the chain has
     ///    not taken (which also puts those senders' pool nonces back where the chain has them);
     ///    the **index 0 slice** (deposits and system txs only); then the **carryover preamble** —
-    ///    stale in-flight / journal-restored commitments and the unlanded pool transactions the
-    ///    sweep handed to the fifo, all dispatched through [`admit_and_dispatch`]. They bypass the
-    ///    broadcast queue and the pool arm, so they land ahead of concurrently-queued RPC pushes
-    ///    and fresh pool traffic.
+    ///    stale in-flight / journal-restored commitments, commitments a reorg requeued, and the
+    ///    unlanded pool transactions the sweep handed to the fifo, all dispatched through
+    ///    [`admit_and_dispatch`]. They bypass the broadcast queue and the pool arm, so they land
+    ///    ahead of concurrently-queued RPC pushes and fresh pool traffic.
+    ///
+    ///    On every path, a [`PreconfSource::Replay`] entry runs only while this build's parent is
+    ///    on the canonical chain; otherwise the build abandons itself (`ReplayParentCheck`).
     /// 5. **Stage 4** — SDM post-exec refund tx (only when `ctx.sdm_production_enabled()`).
     /// 6. **Stage 5** — `builder.finish` → seal + wrap into `OpBuiltPayload`.
     ///
@@ -1834,6 +2081,8 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 Transaction: reth_optimism_txpool::OpPooledTx<Consensus = N::SignedTx>,
             >,
         Client: reth_storage_api::StateProviderFactory
+            + reth_storage_api::BlockHashReader
+            + reth_storage_api::BlockNumReader
             + reth_chainspec::ChainSpecProvider<ChainSpec: reth_optimism_forks::OpHardforks>,
         <Client as reth_chainspec::ChainSpecProvider>::ChainSpec:
             reth_chainspec::EthChainSpec + reth_optimism_forks::OpHardforks,
@@ -1928,6 +2177,17 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         metrics::histogram!("preconf.build.lock_wait_ms")
             .record(wait_started.elapsed().as_secs_f64() * 1000.0);
 
+        // A job abandoned while it waited for the queue stops here, before it
+        // touches anything the next build relies on. Its parent may be a block a
+        // reorg has just taken back: running on, `drop_landed_claims` would drop
+        // entries as landed in that block, and the forward sweep would judge
+        // nonces against it. Its payload is never asked for.
+        if cancel.is_abandoned() {
+            drop(build_guard);
+            metrics::counter!("preconf.build.abandoned_before_start_total").increment(1);
+            return Err(PayloadBuilderError::other(AbandonedBeforeStart));
+        }
+
         // The previous build's account view ends here. Cleared rather than
         // re-seeded: a build that is cancelled or never sealed must not leave
         // a sender pinned at a nonce the chain will never reach, and a sender
@@ -1972,6 +2232,21 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // build that is superseded or never sealed must not leave its delta
         // visible to the RPC admission path.
         let mut whitelist = self.classifier.whitelist_snapshot();
+        // The shared allowlist may not have caught up with the parent yet: the
+        // watcher refreshes it from the same forkchoice update that started this
+        // build. `listsHash` at the parent says whether it has; if not, the
+        // parent's lists are read here, for this build only. A derivation build
+        // executes no preconf entries and skips this.
+        if !ctx.attributes().no_tx_pool() &&
+            let Some(contract) = crate::whitelist::wants_whitelist(&self.cfg)
+        {
+            whitelist = crate::whitelist::whitelist_for_build(
+                &state_provider_for_finish,
+                contract,
+                whitelist,
+                parent_hash,
+            );
+        }
         if !whitelist_deltas.is_empty() {
             let mut updated = (*whitelist).clone();
             for delta in &whitelist_deltas {
@@ -2047,15 +2322,19 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
 
         let mut loop_state = dispatch::LoopState::new(predicted_height);
 
+        let parent_number = ctx.parent().number();
+        let canonical_at_parent_height =
+            || reth_storage_api::BlockHashReader::block_hash(&self.client, parent_number);
+        let replay_parent =
+            ReplayParentCheck::new(parent_hash, &canonical_at_parent_height, &cancel);
+
         // Adaptive-N pool quota schedule — see `derive_pool_quota_schedule`.
         // SystemTime is read only here for the initial offset; the tokio
         // ticker itself is monotonic.
         let slot_deadline =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(attrs_timestamp);
         // With slicing on, the tick is what publishes, so its cadence is the
-        // slice interval. With it off the cadence is what preconf always used,
-        // which is what keeps turning the feature off a true rollback rather
-        // than a second code path.
+        // slice interval. With it off the cadence is what preconf always used.
         let flashblock_cfg = self.flashblocks.as_ref().map(|producer| producer.cfg.as_ref());
         let tick_interval =
             crate::flashblocks::tick_interval(flashblock_cfg, self.cfg.sweep_interval);
@@ -2153,18 +2432,31 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // from the network consensus and cause a safe-head fork. Gate
         // the entire preconf pipeline on this flag; fifo entries stay
         // put and get dispatched on the next `no_tx_pool=false` build
-        // (their SLA is upheld by delayed landing, NOT by forcing them
+        // (they land later, on a best-effort basis, NOT by being forced
         // into the derivation block).
-        let allow_preconf = !ctx.attributes().no_tx_pool();
+        //
+        // A build `replay_ready` turns down takes the same path. Off, the
+        // block also skips `note_sealed`, so the next build does not drop as
+        // landed the entries this one left alone.
+        let parent_is_ours = build_guard.parent_is_ours(parent_hash);
+        let allow_preconf = !ctx.attributes().no_tx_pool() &&
+            replay_ready(
+                &self.fifo,
+                &self.client,
+                parent_hash,
+                parent_is_ours,
+                CANON_CATCHUP_CAP,
+            )
+            .await;
 
-        // Sample the pending-backlog gauge once per build job (~per slot).
+        // Every queue change publishes the gauges; this covers a node with nothing queued yet.
         self.fifo.publish_pending_gauge().await;
 
         // Did the block the last build produced become this one's parent?
         // Yes: everything it executed is on chain — drop those entries in one
         // pass. No: it may be in no block at all — put back the sender nonces
         // the slice boundaries advanced on its behalf.
-        if build_guard.parent_is_ours(parent_hash) {
+        if parent_is_ours {
             let released = self.fifo.drop_landed_claims().await;
             if released > 0 {
                 debug!(
@@ -2234,7 +2526,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             .flashblocks
             .as_ref()
             .filter(|_| allow_preconf)
-            .map(|producer| SliceState::new(producer, da_footprint_gas_scalar));
+            .map(|producer| SliceState::new(producer, parent_hash, da_footprint_gas_scalar));
 
         // The first slice goes out before any preconf or pool transaction has
         // been applied, so it carries exactly the deposits and system
@@ -2255,6 +2547,20 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 .await;
         }
 
+        // Whatever earlier builds executed and nobody has written yet goes to
+        // the file before this one replays any of it. With slicing on the
+        // first slice above has done it already; with slicing off nothing else
+        // would until a commitment arrived.
+        if let Some(journal) = self.journal.as_deref() &&
+            let Err(err) = journal.flush().await
+        {
+            warn!(
+                target: "mantle::preconf::payload_builder",
+                %err,
+                "journal write before replay failed; the records are held for the next write",
+            );
+        }
+
         // Carryover replay preamble — apply stale in-flight / journal-
         // restored entries directly (see `replay_fifo_carryover`), including
         // the unlanded pool transactions the sweep above just handed over. The
@@ -2262,7 +2568,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // before the select! loop's arms.
         //
         // Skipped entirely when `!allow_preconf` — the fifo entries (including
-        // Replay-sourced ones with `must-land` SLA) remain in the fifo and get
+        // Replay-sourced ones, whose receipts have gone out) remain in the fifo and get
         // dispatched on the next normal-slot build. That is also what keeps a
         // derivation build from replaying anything: it has to execute exactly
         // what its attributes name, or the block it derives will not match the
@@ -2291,6 +2597,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     constraints,
                     &whitelist,
                     &mut l1_ctx,
+                    &replay_parent,
                 )
                 .await?;
             }
@@ -2312,6 +2619,9 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                 // makes a slice the delta since the previous one.
                 _ = flashblock_ticker.tick() => {
                     if let Some(state) = slices.as_mut() {
+                        // The loop polls neither the preconf queue nor
+                        // cancellation until this arm returns.
+                        let boundary_started = std::time::Instant::now();
                         state.journal_and_publish(
                             &ctx,
                             &mut builder,
@@ -2331,10 +2641,15 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                             &ProviderBalances(state_provider_for_finish.as_ref()),
                             &mut info,
                         );
+                        let refresh_started = std::time::Instant::now();
                         let attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
                         best_txs.refresh(BestPayloadTransactions::new(
                             self.pool.best_transactions_with_attributes(attrs).without_updates(),
                         ));
+                        metrics::histogram!("flashblocks.best_txs_refresh_duration_ms")
+                            .record(refresh_started.elapsed().as_secs_f64() * 1000.0);
+                        metrics::histogram!("flashblocks.slice_boundary_duration_ms")
+                            .record(boundary_started.elapsed().as_secs_f64() * 1000.0);
                     }
 
                     if catch_up_budget {
@@ -2358,6 +2673,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                 &mut builder, &mut info, constraints,
                                 &whitelist,
                                 &mut l1_ctx,
+                                &replay_parent,
                             )
                             .await?;
                         }
@@ -2372,12 +2688,18 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                                 "fifo broadcast lagged; reconciling via snapshot"
                             );
                             for hash in self.fifo.snapshot().await {
+                                // Same reason as the carryover loop: the check
+                                // below can abandon the build mid-scan.
+                                if cancel.is_abandoned() {
+                                    break;
+                                }
                                 admit_and_dispatch::<N, _, _>(
                                     &self.fifo, &self.cfg, self.journal.as_deref(), hash,
                                 &mut loop_state,
                                     &mut builder, &mut info, constraints,
                                     &whitelist,
                                     &mut l1_ctx,
+                                    &replay_parent,
                                 )
                                 .await?;
                             }
@@ -2402,6 +2724,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                         &mut builder,
                         &mut info,
                         &self.fifo,
+                        self.journal.as_deref(),
                         &constraints,
                         &mut pool_pacer,
                     )
@@ -2474,7 +2797,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     // The closing slice is published after this stage, so leaving
                     // the transaction out would make the published slices stop
                     // one short of the sealed block.
-                    record_executed(&mut info, &self.fifo, recorded, false);
+                    record_executed(&mut info, &self.fifo, recorded);
                     tx_gas_used
                 })
             })?;
@@ -2491,9 +2814,13 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // its own once the budgeted count is reached, so it has published
         // everything by the time it finalizes. A difference in shape, not in
         // policy.
+        //
+        // Nothing may execute between this slice and `finish`: the next block
+        // names this slice as the sealed block's content.
         if let Some(state) = slices.as_mut() &&
             cancel.reason() == Some(CancelReason::Resolved)
         {
+            let before = state.published_count();
             state
                 .journal_and_publish(
                     &ctx,
@@ -2504,6 +2831,7 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
                     self.journal.as_deref(),
                 )
                 .await;
+            state.closing_sent = state.published_count() > before;
         }
 
         // ── Stage 5: finalize ─────────────────────────────────────────
@@ -2553,6 +2881,11 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
         // safe direction by construction.
         if allow_preconf {
             self.fifo.claims().note_sealed(sealed_block.hash(), build_generation);
+            if let Some(state) = slices.as_ref() &&
+                let Some(link) = state.sealed_link(sealed_block.hash())
+            {
+                state.producer.sealed_links.record(link);
+            }
         }
         debug!(
             target: "mantle::preconf::payload_builder",
@@ -2685,7 +3018,7 @@ mod tests {
     }
 
     /// `replay_fifo_carryover` returns `Waiting` + `Success` hashes (each a
-    /// carryover source) in insertion order. `Success` entries are promoted
+    /// carryover source), executed entries first. `Success` entries are promoted
     /// back to `Waiting` with source `Replay`; `Waiting` entries are left
     /// untouched. Dispatch (admission + apply) is done by the caller.
     #[tokio::test]
@@ -2699,8 +3032,8 @@ mod tests {
 
         let planned = replay_fifo_carryover(&fifo).await;
 
-        // Both, in insertion order.
-        assert_eq!(planned, vec![*t_wait.tx_hash(), *t_succ.tx_hash()]);
+        // Both; the executed one first.
+        assert_eq!(planned, vec![*t_succ.tx_hash(), *t_wait.tx_hash()]);
         // Waiting entry untouched.
         assert_eq!(
             fifo.find_by_hash(t_wait.tx_hash()).await.unwrap().status,
@@ -2726,7 +3059,7 @@ mod tests {
 
         let planned = replay_fifo_carryover(&fifo).await;
 
-        assert_eq!(planned, vec![*t_rpc.tx_hash(), *t_journal.tx_hash()]);
+        assert_eq!(planned, vec![*t_journal.tx_hash(), *t_rpc.tx_hash()]);
         assert_eq!(fifo.find_by_hash(t_rpc.tx_hash()).await.unwrap().source, PreconfSource::Rpc,);
         assert_eq!(
             fifo.find_by_hash(t_journal.tx_hash()).await.unwrap().source,
@@ -2734,87 +3067,64 @@ mod tests {
         );
     }
 
-    /// One sender's carried-over transactions go out in nonce order, whatever
-    /// order the fifo holds them in.
+    /// Executed entries replay in the order they executed: another sender's
+    /// transaction between two of one sender's stays between them. Gathering
+    /// each sender's entries by nonce would put `S1 n1` ahead of the transfer
+    /// that funds it.
+    #[tokio::test]
+    async fn carryover_keeps_executed_entries_in_execution_order() {
+        let fifo = PreconfTxSet::new(16);
+        let s1 = Address::from([1; 20]);
+        let s2 = Address::from([2; 20]);
+        let s1_n0 = tx(0xd0, 0);
+        let funds_s1 = tx(0xd1, 0);
+        let s1_n1 = tx(0xd2, 1);
+        fifo.push_if_absent(s1_n0.clone(), s1, PreconfSource::Replay).await;
+        fifo.push_if_absent(funds_s1.clone(), s2, PreconfSource::Replay).await;
+        fifo.push_if_absent(s1_n1.clone(), s1, PreconfSource::Replay).await;
+
+        let carryover = replay_fifo_carryover(&fifo).await;
+
+        assert_eq!(
+            carryover,
+            vec![*s1_n0.tx_hash(), *funds_s1.tx_hash(), *s1_n1.tx_hash()],
+            "the transfer S1's nonce 1 relies on must still run before it",
+        );
+    }
+
+    /// `Rpc` entries still waiting go after every executed entry, whatever their
+    /// place in the queue, and keep their own order among themselves.
     ///
-    /// They only execute in that order. A higher nonce reaching the builder
-    /// first is rejected as invalid, and for a carried-over entry that rejection
-    /// is terminal — the commitment is broken with no second attempt.
+    /// A reorg puts the same sender's lower nonce back as `Replay`; dispatched
+    /// behind the higher one, the higher one fails.
     #[tokio::test]
-    async fn carryover_orders_one_senders_transactions_by_nonce() {
+    async fn carryover_puts_entries_that_never_ran_after_those_that_did() {
         let fifo = PreconfTxSet::new(16);
-        let sender = Address::from([1; 20]);
-        // Pushed newest-nonce-first, as two writers with different latencies
-        // leave them in the journal.
-        let mut by_nonce = Vec::new();
-        for nonce in [2u64, 1, 0] {
-            let t = tx(0xd0 + nonce as u8, nonce);
-            by_nonce.push((nonce, *t.tx_hash()));
-            fifo.push_if_absent(t, sender, PreconfSource::Replay).await;
-        }
-        by_nonce.sort_by_key(|(nonce, _)| *nonce);
+        let x = Address::from([1; 20]);
+        let y = Address::from([2; 20]);
+        let x_n6 = tx(0xe0, 6);
+        let y_n0 = tx(0xe1, 0);
+        let x_n5 = tx(0xe2, 5);
+        let staged = tx(0xe3, 0);
+        fifo.push_if_absent(x_n6.clone(), x, PreconfSource::Rpc).await;
+        fifo.push_if_absent(y_n0.clone(), y, PreconfSource::Rpc).await;
+        fifo.push_if_absent(x_n5.clone(), x, PreconfSource::Replay).await;
+        // Executed in the build that was dropped, as an `Rpc` entry: what
+        // counts is that it ran, not where it came from.
+        fifo.push_if_absent(staged.clone(), Address::from([3; 20]), PreconfSource::Rpc).await;
+        fifo.mark_succeeded(staged.tx_hash()).await.unwrap();
 
         let carryover = replay_fifo_carryover(&fifo).await;
 
         assert_eq!(
             carryover,
-            by_nonce.iter().map(|(_, hash)| *hash).collect::<Vec<_>>(),
-            "a sender's transactions must reach the builder in nonce order",
+            vec![*x_n5.tx_hash(), *staged.tx_hash(), *x_n6.tx_hash(), *y_n0.tx_hash()],
         );
     }
 
-    /// Senders keep the order they first appear in, which is the order their
-    /// commitments were made — not the order their addresses happen to sort in.
-    ///
-    /// That order decides who lands when a block fills up, so sorting by address
-    /// would hand a standing advantage to whoever holds the lower one.
+    /// Carryover returns executed entries in the order they executed.
     #[tokio::test]
-    async fn carryover_keeps_senders_in_the_order_they_first_appear() {
-        let fifo = PreconfTxSet::new(16);
-        // High address first, so an address sort would swap them.
-        let early = Address::from([0xee; 20]);
-        let late = Address::from([0x11; 20]);
-        let first = tx(0xe0, 0);
-        let second = tx(0xe1, 0);
-        fifo.push_if_absent(first.clone(), early, PreconfSource::Rpc).await;
-        fifo.push_if_absent(second.clone(), late, PreconfSource::Rpc).await;
-
-        let carryover = replay_fifo_carryover(&fifo).await;
-
-        assert_eq!(
-            carryover,
-            vec![*first.tx_hash(), *second.tx_hash()],
-            "the sender that committed first still goes first",
-        );
-    }
-
-    /// Both rules at once: nonces gathered under their sender, senders in the
-    /// order they first appear.
-    #[tokio::test]
-    async fn carryover_gathers_each_senders_nonces_without_reordering_senders() {
-        let fifo = PreconfTxSet::new(16);
-        let a = Address::from([0xaa; 20]);
-        let b = Address::from([0x0b; 20]);
-        let a1 = tx(0xf1, 1);
-        let b0 = tx(0xf2, 0);
-        let a0 = tx(0xf3, 0);
-        fifo.push_if_absent(a1.clone(), a, PreconfSource::Replay).await;
-        fifo.push_if_absent(b0.clone(), b, PreconfSource::Replay).await;
-        fifo.push_if_absent(a0.clone(), a, PreconfSource::Replay).await;
-
-        let carryover = replay_fifo_carryover(&fifo).await;
-
-        assert_eq!(
-            carryover,
-            vec![*a0.tx_hash(), *a1.tx_hash(), *b0.tx_hash()],
-            "sender A appeared first so it stays first, and its nonce 0 precedes its nonce 1",
-        );
-    }
-
-    /// Carryover returns entries in fifo insertion order — critical for SLA
-    /// determinism vs concurrent RPC pushes that might race the preamble.
-    #[tokio::test]
-    async fn replay_fifo_carryover_preserves_fifo_order() {
+    async fn replay_fifo_carryover_preserves_execution_order() {
         let fifo = PreconfTxSet::new(16);
         let mut expected = Vec::new();
         for i in 0..3u8 {
@@ -2825,12 +3135,12 @@ mod tests {
         }
 
         let planned = replay_fifo_carryover(&fifo).await;
-        assert_eq!(planned, expected, "carryover must respect FIFO insertion order");
+        assert_eq!(planned, expected, "carryover must respect execution order");
     }
 
     /// Stale `Success` entries are promoted to `Waiting` + `Replay` so the
     /// downstream dispatch bypasses the RPC-only deadline / gas gates and the
-    /// previously-returned receipt is honored (SLA: must land).
+    /// previously-returned receipt is honored where it can be.
     #[tokio::test]
     async fn replay_fifo_carryover_promotes_success_to_replay() {
         let fifo = PreconfTxSet::new(16);
@@ -2847,11 +3157,145 @@ mod tests {
         assert_eq!(entry.source, PreconfSource::Replay);
     }
 
+    fn chain_with_head(head: B256) -> reth_provider::test_utils::MockEthProvider {
+        let provider = reth_provider::test_utils::MockEthProvider::default();
+        provider.add_header(
+            B256::repeat_byte(0xa0),
+            alloy_consensus::Header { number: 4, ..Default::default() },
+        );
+        provider.add_header(head, alloy_consensus::Header { number: 5, ..Default::default() });
+        provider
+    }
+
+    const LONG: std::time::Duration = std::time::Duration::from_secs(10);
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// A build on an ancestor of the head replays nothing, and does not wait
+    /// to find that out.
+    #[tokio::test]
+    async fn a_build_below_the_head_replays_nothing() {
+        let head = B256::repeat_byte(5);
+        let fifo = PreconfTxSet::new(8);
+        fifo.note_canon_processed(head);
+        let started = std::time::Instant::now();
+
+        let ready =
+            replay_ready(&fifo, &chain_with_head(head), B256::repeat_byte(0xa0), false, LONG).await;
+
+        assert!(!ready);
+        assert!(started.elapsed() < LONG / 2, "turned down without waiting");
+    }
+
+    /// The healthy path: on the block this node just sealed, nothing to wait for.
+    #[tokio::test]
+    async fn a_build_on_our_own_head_replays_without_waiting() {
+        let head = B256::repeat_byte(5);
+        // Unseeded: a wait here would run out the cap and say no.
+        let fifo = PreconfTxSet::new(8);
+
+        assert!(replay_ready(&fifo, &chain_with_head(head), head, true, SHORT).await);
+    }
+
+    /// A head someone else put there replays once the canon handler has
+    /// finished with it, and not before.
+    #[tokio::test]
+    async fn a_build_on_a_head_it_did_not_seal_waits_for_the_canon_handler() {
+        let head = B256::repeat_byte(5);
+        let chain = chain_with_head(head);
+        let fifo = PreconfTxSet::new(8);
+        fifo.note_canon_processed(B256::repeat_byte(0xa0));
+
+        assert!(!replay_ready(&fifo, &chain, head, false, SHORT).await, "handler behind");
+
+        fifo.note_canon_processed(head);
+        assert!(replay_ready(&fifo, &chain, head, false, SHORT).await, "handler caught up");
+    }
+
+    /// Not knowing where the head is, the build replays nothing.
+    #[tokio::test]
+    async fn an_unreadable_head_replays_nothing() {
+        let fifo = PreconfTxSet::new(8);
+        let empty = reth_provider::test_utils::MockEthProvider::default();
+
+        assert!(!replay_ready(&fifo, &empty, B256::repeat_byte(5), true, SHORT).await);
+    }
+
     /// Empty fifo — helper returns an empty list, no error.
     #[tokio::test]
     async fn replay_fifo_carryover_on_empty_fifo_is_noop() {
         let fifo = PreconfTxSet::new(16);
         assert!(replay_fifo_carryover(&fifo).await.is_empty());
+    }
+
+    /// A parent below the head passes this check; `replay_ready` is what keeps
+    /// a build on it from replaying.
+    #[test]
+    fn a_replay_runs_while_the_parent_is_on_the_canonical_chain() {
+        let parent = B256::repeat_byte(1);
+        let cancel = JobCancel::new();
+        let canonical = || Ok(Some(parent));
+
+        let allowed =
+            ReplayParentCheck::new(parent, &canonical, &cancel).allows_replay(&B256::ZERO);
+
+        assert!(allowed);
+        assert_eq!(cancel.reason(), None, "and the build carries on");
+    }
+
+    /// A parent a reorg replaced, or one above a chain that got shorter, will
+    /// not be adopted: the build stops, and the entry is left for a build on
+    /// the new chain.
+    #[test]
+    fn a_parent_off_the_canonical_chain_abandons_the_build_instead_of_replaying() {
+        for canonical_at_height in [Some(B256::repeat_byte(2)), None] {
+            let cancel = JobCancel::new();
+            let canonical = || Ok(canonical_at_height);
+
+            let allowed = ReplayParentCheck::new(B256::repeat_byte(1), &canonical, &cancel)
+                .allows_replay(&B256::ZERO);
+
+            assert!(!allowed, "{canonical_at_height:?}");
+            assert!(cancel.is_abandoned(), "{canonical_at_height:?}");
+        }
+    }
+
+    /// Not knowing the chain is not evidence the build is stale: the entry is
+    /// held back, the build goes on.
+    #[test]
+    fn an_unreadable_chain_holds_the_replay_back_without_abandoning() {
+        let cancel = JobCancel::new();
+        let canonical =
+            || Err(reth_storage_api::errors::provider::ProviderError::BestBlockNotFound);
+
+        let allowed = ReplayParentCheck::new(B256::repeat_byte(1), &canonical, &cancel)
+            .allows_replay(&B256::ZERO);
+
+        assert!(!allowed);
+        assert_eq!(cancel.reason(), None);
+    }
+
+    /// A sender whose nonce cannot be read is left out of the forward sweep,
+    /// instead of being swept as if its nonce were 0; a missing account is
+    /// still nonce 0.
+    #[test]
+    fn an_unreadable_nonce_leaves_its_sender_out_of_the_sweep() {
+        let readable = Address::from([1; 20]);
+        let missing = Address::from([2; 20]);
+        let unreadable = Address::from([3; 20]);
+
+        let heads = readable_nonces([readable, missing, unreadable], |sender| {
+            if *sender == readable {
+                Ok(Some(7))
+            } else if *sender == missing {
+                Ok(None)
+            } else {
+                Err(reth_storage_api::errors::provider::ProviderError::BestBlockNotFound)
+            }
+        });
+
+        assert_eq!(heads.get(&readable), Some(&7));
+        assert_eq!(heads.get(&missing), Some(&0));
+        assert!(!heads.contains_key(&unreadable), "no reading, so no nonce: {heads:?}");
     }
 
     // ============ try_include_post_exec_tx ============
@@ -3014,6 +3458,57 @@ mod tests {
             preconf_admission(100, tx_gas, 0, gas_used, limits, PreconfSource::Rpc),
             Admission::Reject(_)
         ));
+    }
+
+    /// No uncompressed-size cap configured: the verdict passes through.
+    #[test]
+    fn without_an_uncompressed_cap_the_verdict_stands() {
+        let out = with_uncompressed_cap(Admission::Admit, 10_000, 10_000, None, PreconfSource::Rpc);
+        assert!(matches!(out, Admission::Admit));
+    }
+
+    /// A transaction over the cap on its own fits no block: rejected whatever
+    /// its source, even if the other checks only deferred it.
+    #[test]
+    fn a_transaction_over_the_uncompressed_cap_alone_is_rejected() {
+        for (verdict, source) in
+            [(Admission::Admit, PreconfSource::Rpc), (Admission::Defer, PreconfSource::Replay)]
+        {
+            let out = with_uncompressed_cap(verdict, 1_001, 0, Some(1_000), source);
+            assert!(matches!(out, Admission::RejectUncompressed(_)), "{source:?}: {out:?}");
+        }
+    }
+
+    /// Fits an empty block but not this one: `Replay` defers, `Rpc` is refused.
+    /// Exactly at the cap still fits, as in the pool arm's check.
+    #[test]
+    fn overflowing_the_uncompressed_cap_defers_replay_and_rejects_rpc() {
+        let cap = Some(1_000);
+        assert!(matches!(
+            with_uncompressed_cap(Admission::Admit, 200, 900, cap, PreconfSource::Replay),
+            Admission::Defer
+        ));
+        assert!(matches!(
+            with_uncompressed_cap(Admission::Admit, 200, 900, cap, PreconfSource::Rpc),
+            Admission::RejectUncompressed(_)
+        ));
+        assert!(matches!(
+            with_uncompressed_cap(Admission::Admit, 100, 900, cap, PreconfSource::Rpc),
+            Admission::Admit
+        ));
+    }
+
+    /// An earlier rejection is not replaced.
+    #[test]
+    fn an_earlier_rejection_survives_the_uncompressed_cap() {
+        let out = with_uncompressed_cap(
+            Admission::RejectRlp(PreconfError::BuilderRejected("rlp".into())),
+            1_001,
+            0,
+            Some(1_000),
+            PreconfSource::Rpc,
+        );
+        assert!(matches!(out, Admission::RejectRlp(_)), "{out:?}");
     }
 
     /// Boundary: cumulative exactly at the block limit still `Admit`s (gate
@@ -3215,6 +3710,7 @@ mod tests {
                 pairs: HashSet::from_iter([(a(1), a(2))]),
                 from_wildcards: HashSet::default(),
                 to_wildcards: HashSet::default(),
+                lists_hash: B256::ZERO,
             }
         }
 
@@ -3309,5 +3805,317 @@ mod tests {
             !c.whitelist_snapshot().is_eligible(&sender, Some(&to)),
             "while a fresh snapshot sees the revocation"
         );
+    }
+
+    /// A block whose closing slice did not go out leaves no link for the next block.
+    #[tokio::test]
+    async fn a_block_whose_closing_slice_did_not_go_out_leaves_no_link() {
+        use crate::flashblocks::{FlashblocksProducerHandles, config::FlashblockProducerConfig};
+
+        let cfg = FlashblockProducerConfig {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            ..Default::default()
+        };
+        let handles = FlashblocksProducerHandles::bind(cfg).expect("binds");
+        let mut state = SliceState::new(handles.producer(), B256::repeat_byte(1), None);
+        let hash = B256::repeat_byte(9);
+        let last = FlashblockId { block_number: 1, index: 3 };
+        let last_hash = B256::repeat_byte(7);
+
+        state.last_sent = Some((last, last_hash));
+        state.closing_sent = false;
+        assert_eq!(state.sealed_link(hash), None);
+
+        state.closing_sent = true;
+        assert_eq!(
+            state.sealed_link(hash),
+            Some(SealedSliceLink {
+                block_hash: hash,
+                last_slice: last,
+                last_slice_hash: last_hash
+            })
+        );
+
+        state.last_sent = None;
+        assert_eq!(state.sealed_link(hash), None);
+    }
+
+    /// The miner fee a pool transaction contributes to `total_fees` comes from
+    /// the pool wrapper, not from the consensus transaction it unwraps to.
+    mod miner_fee {
+        use super::*;
+        use alloy_consensus::{Header, SignableTransaction, TxEip1559};
+        use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
+        use alloy_primitives::{Bytes, Signature, TxKind};
+        use alloy_rpc_types_eth::erc4337::TransactionConditional;
+        use reth_basic_payload_builder::PayloadConfig;
+        use reth_optimism_chainspec::{OpChainSpec, OpChainSpecBuilder};
+        use reth_optimism_evm::OpEvmConfig;
+        use reth_optimism_payload_builder::OpPayloadBuilderAttributes;
+        use reth_optimism_primitives::{OpPrimitives, OpTransactionSigned};
+        use reth_optimism_txpool::{OpPooledTransaction, conditional::MaybeConditionalTransaction};
+        use reth_payload_util::PayloadTransactionsFixed;
+        use reth_primitives_traits::{InMemorySize, SealedHeader};
+        use reth_revm::{
+            db::{CacheDB, EmptyDB},
+            state::AccountInfo,
+        };
+        use std::borrow::Cow;
+
+        /// Reports a forced priority fee (and so a forced default
+        /// `effective_tip_per_gas`) while `into_consensus()` still hands back
+        /// the unmodified inner transaction — the shape of a wrapper that
+        /// converts a non-native fee denomination into a native-wei tip.
+        #[derive(Debug, Clone)]
+        struct ForcedTipPooledTx {
+            inner: OpPooledTransaction,
+            forced_priority_fee: u128,
+        }
+
+        impl Typed2718 for ForcedTipPooledTx {
+            fn ty(&self) -> u8 {
+                self.inner.ty()
+            }
+        }
+
+        impl InMemorySize for ForcedTipPooledTx {
+            fn size(&self) -> usize {
+                self.inner.size()
+            }
+        }
+
+        impl Transaction for ForcedTipPooledTx {
+            fn chain_id(&self) -> Option<u64> {
+                self.inner.chain_id()
+            }
+            fn nonce(&self) -> u64 {
+                self.inner.nonce()
+            }
+            fn gas_limit(&self) -> u64 {
+                self.inner.gas_limit()
+            }
+            fn gas_price(&self) -> Option<u128> {
+                self.inner.gas_price()
+            }
+            fn max_fee_per_gas(&self) -> u128 {
+                // High enough that the default `effective_tip_per_gas` does not
+                // cap `forced_priority_fee` at `max_fee_per_gas - base_fee`.
+                u128::MAX
+            }
+            fn max_priority_fee_per_gas(&self) -> Option<u128> {
+                Some(self.forced_priority_fee)
+            }
+            fn max_fee_per_blob_gas(&self) -> Option<u128> {
+                self.inner.max_fee_per_blob_gas()
+            }
+            fn priority_fee_or_price(&self) -> u128 {
+                self.inner.priority_fee_or_price()
+            }
+            fn effective_gas_price(&self, base_fee: Option<u64>) -> u128 {
+                self.inner.effective_gas_price(base_fee)
+            }
+            fn is_dynamic_fee(&self) -> bool {
+                self.inner.is_dynamic_fee()
+            }
+            fn kind(&self) -> TxKind {
+                self.inner.kind()
+            }
+            fn is_create(&self) -> bool {
+                self.inner.is_create()
+            }
+            fn value(&self) -> U256 {
+                self.inner.value()
+            }
+            fn input(&self) -> &Bytes {
+                self.inner.input()
+            }
+            fn access_list(&self) -> Option<&AccessList> {
+                self.inner.access_list()
+            }
+            fn blob_versioned_hashes(&self) -> Option<&[B256]> {
+                self.inner.blob_versioned_hashes()
+            }
+            fn authorization_list(&self) -> Option<&[SignedAuthorization]> {
+                self.inner.authorization_list()
+            }
+        }
+
+        impl MaybeConditionalTransaction for ForcedTipPooledTx {
+            fn set_conditional(&mut self, conditional: TransactionConditional) {
+                self.inner.set_conditional(conditional);
+            }
+            fn conditional(&self) -> Option<&TransactionConditional> {
+                self.inner.conditional()
+            }
+        }
+
+        impl MaybeInteropTransaction for ForcedTipPooledTx {
+            fn set_interop_deadline(&self, deadline: u64) {
+                self.inner.set_interop_deadline(deadline);
+            }
+            fn interop_deadline(&self) -> Option<u64> {
+                self.inner.interop_deadline()
+            }
+        }
+
+        impl DataAvailabilitySized for ForcedTipPooledTx {
+            fn estimated_da_size(&self) -> u64 {
+                self.inner.estimated_da_size()
+            }
+        }
+
+        impl PoolTransaction for ForcedTipPooledTx {
+            type TryFromConsensusError =
+                <OpPooledTransaction as PoolTransaction>::TryFromConsensusError;
+            type Consensus = <OpPooledTransaction as PoolTransaction>::Consensus;
+            type Pooled = <OpPooledTransaction as PoolTransaction>::Pooled;
+
+            fn clone_into_consensus(&self) -> Recovered<Self::Consensus> {
+                self.inner.clone_into_consensus()
+            }
+            fn consensus_ref(&self) -> Recovered<&Self::Consensus> {
+                self.inner.consensus_ref()
+            }
+            fn into_consensus(self) -> Recovered<Self::Consensus> {
+                self.inner.into_consensus()
+            }
+            fn into_consensus_with2718(self) -> WithEncoded<Recovered<Self::Consensus>> {
+                self.inner.into_consensus_with2718()
+            }
+            fn from_pooled(_pooled: Recovered<Self::Pooled>) -> Self {
+                unreachable!("the build loop never calls from_pooled on the wrapper")
+            }
+            fn hash(&self) -> &TxHash {
+                self.inner.hash()
+            }
+            fn sender(&self) -> Address {
+                self.inner.sender()
+            }
+            fn sender_ref(&self) -> &Address {
+                self.inner.sender_ref()
+            }
+            fn cost(&self) -> &U256 {
+                self.inner.cost()
+            }
+            fn encoded_length(&self) -> usize {
+                self.inner.encoded_length()
+            }
+        }
+
+        impl OpPooledTx for ForcedTipPooledTx {
+            fn encoded_2718(&self) -> Cow<'_, alloy_primitives::Bytes> {
+                OpPooledTx::encoded_2718(&self.inner)
+            }
+            fn set_extra_balance_cost(&mut self, cost: U256) {
+                self.inner.set_extra_balance_cost(cost);
+            }
+        }
+
+        type TestCtx = OpPayloadBuilderCtx<
+            OpEvmConfig<OpChainSpec, OpPrimitives>,
+            OpChainSpec,
+            OpPayloadBuilderAttributes<OpTransactionSigned>,
+        >;
+
+        fn payload_builder_ctx(gas_limit: u64) -> TestCtx {
+            let chain_spec =
+                Arc::new(OpChainSpecBuilder::optimism_mainnet().regolith_activated().build());
+            let parent = SealedHeader::seal_slow(Header { gas_limit, ..Default::default() });
+            let attributes = OpPayloadBuilderAttributes {
+                timestamp: 1,
+                gas_limit: Some(gas_limit),
+                ..Default::default()
+            };
+            OpPayloadBuilderCtx {
+                evm_config: OpEvmConfig::optimism(chain_spec.clone()),
+                builder_config: OpBuilderConfig::default(),
+                chain_spec,
+                config: PayloadConfig {
+                    parent_header: Arc::new(parent),
+                    parent_block_info: None,
+                    payload_id: attributes.id,
+                    attributes,
+                },
+                cancel: Default::default(),
+                best_payload: None,
+            }
+        }
+
+        /// A plain transfer whose own tip is `natural_priority_fee` wei/gas.
+        fn transfer(signer: Address, natural_priority_fee: u128) -> OpPooledTransaction {
+            let tx: OpTransactionSigned = TxEip1559 {
+                chain_id: 10,
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: natural_priority_fee,
+                max_priority_fee_per_gas: natural_priority_fee,
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                ..Default::default()
+            }
+            .into_signed(Signature::test_signature())
+            .into();
+            let encoded_len = tx.encode_2718_len();
+            OpPooledTransaction::new(Recovered::new_unchecked(tx, signer), encoded_len)
+        }
+
+        #[tokio::test]
+        async fn miner_fee_uses_pool_wrapper_tip() {
+            let gas_limit = 1_000_000;
+            let signer = Address::repeat_byte(0x11);
+            let natural_priority_fee: u128 = 1;
+            let forced_priority_fee: u128 = 1_000_000;
+
+            let ctx = payload_builder_ctx(gas_limit);
+            let mut cache = CacheDB::new(EmptyDB::default());
+            cache.insert_account_info(
+                signer,
+                AccountInfo { balance: U256::MAX, ..Default::default() },
+            );
+            let mut db = State::builder().with_database(cache).with_bundle_update().build();
+            let mut builder = ctx.block_builder(&mut db).expect("block builder can be created");
+            let base_fee = builder.evm_mut().block().basefee();
+
+            let tx = ForcedTipPooledTx {
+                inner: transfer(signer, natural_priority_fee),
+                forced_priority_fee,
+            };
+            let mut best_txs = PayloadTransactionsFixed::new(vec![tx]);
+            let mut info = ExecutionInfo::<OpTransactionSigned>::default();
+            let fifo = PreconfTxSet::new(8);
+            let constraints = BuildConstraints {
+                block_gas_limit: gas_limit,
+                block_da_limit: None,
+                tx_da_limit: None,
+                da_footprint_gas_scalar: None,
+                base_fee,
+                predicted_height: 1,
+                timestamp: 1,
+                max_uncompressed_block_size: None,
+            };
+            let mut pacer = AdmissionPacer::sweeping(gas_limit, gas_limit);
+
+            let step = apply_one_best_tx::<OpPrimitives, _>(
+                &mut best_txs,
+                &mut builder,
+                &mut info,
+                &fifo,
+                None,
+                &constraints,
+                &mut pacer,
+            )
+            .await
+            .expect("the transfer executes");
+            assert!(matches!(step, BestTxStep::Continue));
+            assert_eq!(info.cumulative_gas_used, 21_000, "the transfer was included");
+
+            let gas_used = U256::from(info.cumulative_gas_used);
+            let expected_fees = U256::from(forced_priority_fee) * gas_used;
+            let natural_fees = U256::from(natural_priority_fee) * gas_used;
+            // Both sides: reading the tip after `into_consensus()` would land on
+            // `natural_fees`.
+            assert_eq!(info.total_fees, expected_fees);
+            assert_ne!(info.total_fees, natural_fees);
+        }
     }
 }

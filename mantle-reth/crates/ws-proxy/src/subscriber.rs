@@ -8,7 +8,9 @@ use std::{
 use axum::http::Uri;
 use backoff::{ExponentialBackoff, backoff::Backoff};
 use futures::{SinkExt, StreamExt};
-use mantle_reth_flashblocks_types::MAX_DECOMPRESSED_FLASHBLOCK_BYTES as MAX_SLICE_BYTES;
+use mantle_reth_flashblocks_types::{
+    MAX_DECOMPRESSED_FLASHBLOCK_BYTES as MAX_SLICE_BYTES, redact_ws_url, ws_url_endpoint,
+};
 use tokio::{select, sync::oneshot};
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -18,6 +20,9 @@ use tokio_util::{bytes, sync::CancellationToken};
 use tracing::{error, info, trace, warn};
 
 use crate::metrics::Metrics;
+
+/// Total budget for establishing TCP and completing the `WebSocket` handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration options for a [`WebsocketSubscriber`].
 #[derive(Debug, Clone)]
@@ -92,11 +97,17 @@ where
     F: Fn(String) + Send + Sync + 'static,
 {
     uri: Uri,
+    /// `uri` for logs: the upstream's API key and query hidden.
+    uri_redacted: String,
+    /// `uri`'s `host:port`, for metric labels.
     uri_label: String,
     handler: F,
     backoff: ExponentialBackoff,
     options: SubscriberOptions,
     last_position: Option<(u64, u64)>,
+    /// When the current connection completed its handshake; `None` while
+    /// disconnected.
+    connected_since: Option<Instant>,
 }
 
 impl<F> std::fmt::Debug for WebsocketSubscriber<F>
@@ -105,7 +116,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebsocketSubscriber")
-            .field("uri", &self.uri)
+            .field("uri", &self.uri_redacted)
             .field("options", &self.options)
             .field("last_position", &self.last_position)
             .finish_non_exhaustive()
@@ -125,19 +136,29 @@ where
             ..Default::default()
         };
 
-        let uri_label = uri.to_string();
-        Self { uri, uri_label, handler, backoff, options, last_position: None }
+        let uri_redacted = redact_ws_url(&uri.to_string());
+        let uri_label = ws_url_endpoint(&uri.to_string());
+        Self {
+            uri,
+            uri_redacted,
+            uri_label,
+            handler,
+            backoff,
+            options,
+            last_position: None,
+            connected_since: None,
+        }
     }
 
     /// Runs the subscriber loop, reconnecting on failure until the token is cancelled.
     pub async fn run(&mut self, token: CancellationToken) {
-        info!(message = "starting upstream subscription", uri = %self.uri);
+        info!(message = "starting upstream subscription", uri = %self.uri_redacted);
         loop {
             select! {
                 _ = token.cancelled() => {
                     info!(
                         message = "cancelled upstream subscription",
-                        uri = %self.uri
+                        uri = %self.uri_redacted
                     );
                     return;
                 }
@@ -146,34 +167,45 @@ where
                         Ok(()) => {
                             info!(
                                 message = "upstream connection closed",
-                                uri = %self.uri
+                                uri = %self.uri_redacted
                             );
                         }
                         Err(e) => {
                             error!(
                                 message = "upstream websocket error",
-                                uri = %self.uri,
+                                uri = %self.uri_redacted,
                                 error = e.to_string()
                             );
                             Metrics::upstream_errors().increment(1);
+                        }
+                    }
 
-                            if let Some(duration) = self.backoff.next_backoff() {
-                                warn!(
-                                    message = "reconnecting",
-                                    uri = %self.uri,
-                                    seconds = duration.as_secs()
+                    // Every reconnect waits, however the connection ended. The
+                    // wait restarts only after a connection that outlived the
+                    // longest one: an upstream that accepts and then drops
+                    // every connection keeps the wait growing.
+                    let healthy = self
+                        .connected_since
+                        .take()
+                        .is_some_and(|since| since.elapsed() >= self.options.max_backoff_interval);
+                    if healthy {
+                        self.backoff.reset();
+                    }
+                    if let Some(duration) = self.backoff.next_backoff() {
+                        warn!(
+                            message = "reconnecting",
+                            uri = %self.uri_redacted,
+                            seconds = duration.as_secs()
+                        );
+                        select! {
+                            _ = token.cancelled() => {
+                                info!(
+                                    message = "cancelled subscriber during backoff",
+                                    uri = %self.uri_redacted
                                 );
-                                select! {
-                                    _ = token.cancelled() => {
-                                        info!(
-                                            message = "cancelled subscriber during backoff",
-                                            uri = %self.uri
-                                        );
-                                        return
-                                    }
-                                    _ = tokio::time::sleep(duration) => {}
-                                }
+                                return
                             }
+                            _ = tokio::time::sleep(duration) => {}
                         }
                     }
                 }
@@ -195,14 +227,18 @@ where
         );
 
         with_params.parse().unwrap_or_else(|e| {
-            warn!(error = %e, uri = %with_params, "Failed to parse reconnect URI, falling back to base URI");
+            warn!(error = %e, uri = %self.uri_redacted, "Failed to parse reconnect URI, falling back to base URI");
             self.uri.clone()
         })
     }
 
     async fn connect_and_listen(&mut self) -> Result<(), Error> {
         let connect_uri = self.connect_uri();
-        info!(message = "connecting to websocket", uri = %connect_uri);
+        info!(
+            message = "connecting to websocket",
+            uri = %self.uri_redacted,
+            resume_from = ?self.last_position,
+        );
 
         Metrics::upstream_connection_attempts().increment(1);
 
@@ -210,22 +246,33 @@ where
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_SLICE_BYTES))
             .max_frame_size(Some(MAX_SLICE_BYTES));
-        let (ws_stream, _) =
-            match connect_async_with_config(&connect_uri, Some(config), false).await {
-                Ok(connection) => {
-                    Metrics::upstream_connection_successes().increment(1);
-                    connection
-                }
-                Err(e) => {
-                    Metrics::upstream_connection_failures().increment(1);
-                    return Err(e);
-                }
-            };
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_async_with_config(&connect_uri, Some(config), false),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream WebSocket connection or handshake timed out",
+            )
+            .into())
+        });
+        let (ws_stream, _) = match connection {
+            Ok(connection) => {
+                Metrics::upstream_connection_successes().increment(1);
+                connection
+            }
+            Err(e) => {
+                Metrics::upstream_connection_failures().increment(1);
+                return Err(e);
+            }
+        };
 
-        info!(message = "websocket connection established", uri = %connect_uri);
+        info!(message = "websocket connection established", uri = %self.uri_redacted);
 
         Metrics::upstream_connections().increment(1);
-        self.backoff.reset();
+        self.connected_since = Some(Instant::now());
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -256,7 +303,7 @@ where
                     if Instant::now() >= pong_deadline {
                         error!(
                             message = "pong timeout from upstream",
-                            uri = %self.uri
+                            uri = %self.uri_redacted
                         );
                         break Err(ConnectionClosed);
                     }
@@ -304,7 +351,7 @@ where
             Err(e) => {
                 error!(
                     message = "error receiving message",
-                    uri = %self.uri,
+                    uri = %self.uri_redacted,
                     error = e.to_string()
                 );
                 return Err(e);
@@ -313,41 +360,31 @@ where
 
         match msg {
             Message::Text(text) => {
-                if text.len() > MAX_SLICE_BYTES {
-                    warn!(
-                        message = "dropping oversized text message",
-                        uri = %self.uri,
-                        size = text.len(),
-                        max = MAX_SLICE_BYTES
-                    );
-                    return Ok(());
-                }
-
                 trace!(
                     message = "received text message",
-                    uri = %self.uri,
+                    uri = %self.uri_redacted,
                     payload = text.as_str()
                 );
                 self.deliver(text.to_string());
             }
             Message::Binary(data) => {
-                trace!(message = "received binary message", uri = %self.uri, size = data.len());
+                trace!(message = "received binary message", uri = %self.uri_redacted, size = data.len());
 
                 match decode_binary_slice(&data) {
                     Some(text) => self.deliver(text),
                     None => warn!(
                         message = "dropping undecodable binary message",
-                        uri = %self.uri,
+                        uri = %self.uri_redacted,
                         size = data.len()
                     ),
                 }
             }
             Message::Pong(_) => {
-                trace!(message = "received pong from upstream", uri = %self.uri);
+                trace!(message = "received pong from upstream", uri = %self.uri_redacted);
                 *pong_deadline = Instant::now() + pong_timeout;
             }
             Message::Close(_) => {
-                info!(message = "received close frame from upstream", uri = %self.uri);
+                info!(message = "received close frame from upstream", uri = %self.uri_redacted);
                 return Err(ConnectionClosed);
             }
             _ => {}
@@ -456,6 +493,39 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_stalled_handshake_is_retried_and_the_next_connection_delivers_a_slice() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let text = r#"{"index":7,"metadata":{"block_number":1}}"#;
+        let server = tokio::spawn(async move {
+            // Keep TCP open without replying to the first upgrade request.
+            let (silent, _) = listener.accept().await.unwrap();
+            let (next, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(next).await.unwrap();
+            ws.send(Message::Text(text.into())).await.unwrap();
+            drop(silent);
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscriber = WebsocketSubscriber::new(
+            uri,
+            move |text| {
+                let _ = tx.send(text);
+            },
+            SubscriberOptions::default(),
+        );
+        let shutdown = CancellationToken::new();
+        let task = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move { subscriber.run(shutdown).await })
+        };
+        let result = timeout(Duration::from_secs(15), rx.recv()).await;
+        shutdown.cancel();
+        server.abort();
+        timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        assert_eq!(result.expect("the stalled handshake must be retried").unwrap(), text);
+    }
 
     struct MockServer {
         addr: SocketAddr,
@@ -633,9 +703,7 @@ mod tests {
     /// timeout all look alike from here: the connection is accepted, the
     /// handshake completes, and then the stream simply ends. tungstenite
     /// reports that as an error rather than as end-of-stream, so `run` takes
-    /// its `Err` arm and consults the backoff. `run` also has an `Ok(())` arm
-    /// that reconnects without one; this is what holds that arm out of reach of
-    /// the abrupt-close cases it would otherwise cover.
+    /// its `Err` arm. Both arms wait on the backoff before reconnecting.
     #[tokio::test]
     async fn an_upstream_that_ends_the_stream_is_reconnected_on_the_backoff() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -696,6 +764,51 @@ mod tests {
             attempts <= 8,
             "reconnects must be paced by the backoff, got {attempts} in one second"
         );
+    }
+
+    /// The handshake does not restart the backoff: an upstream that accepts
+    /// and drops every connection is retried on a growing wait, not on the
+    /// initial interval each time.
+    #[tokio::test]
+    async fn an_upstream_that_drops_after_the_handshake_does_not_reset_the_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Uri = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let server = {
+            let accepts = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(accept_async(stream).await);
+                }
+            })
+        };
+
+        let options = SubscriberOptions::default()
+            .with_backoff_initial_interval(Duration::from_millis(100))
+            .with_max_backoff_interval(Duration::from_secs(2))
+            .with_ping_interval(Duration::from_secs(30))
+            .with_pong_timeout(Duration::from_secs(30))
+            .with_initial_grace_period(Duration::from_secs(30));
+        let mut subscriber = WebsocketSubscriber::new(uri, |_data: String| {}, options);
+        let shutdown = CancellationToken::new();
+        let subscriber_task = {
+            let token = shutdown.clone();
+            tokio::spawn(async move { subscriber.run(token).await })
+        };
+
+        sleep(Duration::from_secs(2)).await;
+        let attempts = accepts.load(std::sync::atomic::Ordering::SeqCst);
+        shutdown.cancel();
+        server.abort();
+        let _ = timeout(Duration::from_secs(1), subscriber_task).await;
+
+        // Growing by 1.5 from 100ms, each wait within ±50%, at most eight
+        // connections fit into two seconds (six without the jitter). Reset on
+        // every handshake, every wait stays within 50-150ms: thirteen or more.
+        assert!(attempts >= 3, "the premise: it has to be reconnecting, got {attempts}");
+        assert!(attempts <= 9, "the wait must grow, got {attempts} in two seconds");
     }
 
     #[tokio::test]
@@ -826,49 +939,6 @@ mod tests {
         assert_eq!(decode_binary_slice(&bomb), None, "expands past the ceiling");
     }
 
-    /// The ceiling has to cover the frame type the producer actually sends.
-    /// Mantle's publisher writes `Message::Text`, so a ceiling that only
-    /// guards `Message::Binary` guards nothing on the path in use.
-    #[tokio::test]
-    async fn an_oversized_text_frame_is_refused_like_an_oversized_binary_one() {
-        let delivered = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&delivered);
-        let mut subscriber = WebsocketSubscriber::new(
-            "ws://127.0.0.1:1".parse().expect("a uri"),
-            move |text: String| recorded.lock().unwrap().push(text.len()),
-            SubscriberOptions::default(),
-        );
-        let mut pong_deadline = Instant::now() + Duration::from_secs(60);
-
-        let oversized = "x".repeat(MAX_SLICE_BYTES + 1);
-        subscriber
-            .handle_message(
-                Ok(Message::Text(oversized.into())),
-                &mut pong_deadline,
-                Duration::from_secs(1),
-            )
-            .await
-            .expect("an oversized frame is dropped, not a connection error");
-
-        assert!(
-            delivered.lock().unwrap().is_empty(),
-            "an oversized text frame must not reach the subscribers",
-        );
-
-        // The premise: the same path does forward a frame within the ceiling,
-        // so the assertion above is about the size and not about the path.
-        subscriber
-            .handle_message(
-                Ok(Message::Text("{}".to_string().into())),
-                &mut pong_deadline,
-                Duration::from_secs(1),
-            )
-            .await
-            .expect("a frame within the ceiling is handled");
-
-        assert_eq!(delivered.lock().unwrap().as_slice(), &[2]);
-    }
-
     #[test]
     fn parse_flashblock_position_valid() {
         let payload = r#"{"index":4,"metadata":{"block_number":123},"diff":{}}"#;
@@ -924,5 +994,19 @@ mod tests {
             connect_uri.to_string(),
             "ws://localhost:9999/ws?token=abc&block_number=200&flashblock_index=3"
         );
+    }
+
+    /// The upstream may be another proxy's `/ws/<key>` endpoint: neither the
+    /// key nor a query token may reach a log line or a metric label.
+    #[test]
+    fn the_upstream_key_stays_out_of_logs_and_labels() {
+        let uri: Uri = "ws://proxy:8545/ws/secret-key?token=secret-token".parse().unwrap();
+        let subscriber =
+            WebsocketSubscriber::new(uri, |_: String| {}, SubscriberOptions::default());
+
+        assert_eq!(subscriber.uri_redacted, "ws://proxy:8545/ws/***");
+        assert_eq!(subscriber.uri_label, "proxy:8545");
+        let debug = format!("{subscriber:?}");
+        assert!(!debug.contains("secret"), "{debug}");
     }
 }

@@ -6,11 +6,14 @@
 
 use std::sync::Arc;
 
+use alloy_eips::eip7702::{Authorization, SignedAuthorization};
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, bytes, hex, keccak256};
 use alloy_rpc_types_engine::{PayloadAttributes, PayloadId};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
 use mantle_reth_chainspec::from_mantle_genesis;
 use mantle_reth_flashblocks::{FlashblocksAPI, FlashblocksState, PendingBlocks};
 use mantle_reth_flashblocks_types::{MantleFlashblockMetadata, MantleFlashblockPayload};
@@ -48,9 +51,13 @@ pub struct FlashblockBuilder {
     block_number: u64,
     index: u64,
     parent_hash: B256,
+    parent_beacon_block_root: B256,
     transactions: Vec<Bytes>,
     gas_used: u64,
     prev: mantle_reth_flashblocks_types::FlashblockId,
+    block_hash: Option<B256>,
+    prev_hash: Option<B256>,
+    base_fee: U256,
 }
 
 impl FlashblockBuilder {
@@ -61,15 +68,25 @@ impl FlashblockBuilder {
             block_number,
             index,
             parent_hash: B256::ZERO,
+            parent_beacon_block_root: B256::ZERO,
             transactions: Vec::new(),
             gas_used: 0,
             prev: mantle_reth_flashblocks_types::FlashblockId::NO_PREV,
+            block_hash: None,
+            prev_hash: None,
+            base_fee: U256::ZERO,
         }
     }
 
     /// Sets the parent hash carried by the base payload.
     pub const fn parent_hash(mut self, parent_hash: B256) -> Self {
         self.parent_hash = parent_hash;
+        self
+    }
+
+    /// Sets the parent beacon block root carried by the base payload.
+    pub const fn parent_beacon_block_root(mut self, root: B256) -> Self {
+        self.parent_beacon_block_root = root;
         self
     }
 
@@ -86,9 +103,33 @@ impl FlashblockBuilder {
         self
     }
 
+    /// The `diff.block_hash` a test slice at `(block_number, index)` carries
+    /// unless overridden. Deterministic, so `.prev(b, i)` can name it.
+    pub fn slice_hash(block_number: u64, index: u64) -> B256 {
+        alloy_primitives::keccak256([block_number.to_be_bytes(), index.to_be_bytes()].concat())
+    }
+
+    /// Overrides this slice's `diff.block_hash`.
+    pub const fn block_hash(mut self, block_hash: B256) -> Self {
+        self.block_hash = Some(block_hash);
+        self
+    }
+
+    /// Overrides the predecessor content hash `.prev()` derived.
+    pub const fn prev_hash(mut self, prev_hash: B256) -> Self {
+        self.prev_hash = Some(prev_hash);
+        self
+    }
+
     /// Adds encoded transactions to this slice's delta.
     pub fn transactions(mut self, transactions: Vec<Bytes>) -> Self {
         self.transactions = transactions;
+        self
+    }
+
+    /// Sets the basefee the base payload declares (default zero, what the test chain derives).
+    pub const fn base_fee(mut self, base_fee: U256) -> Self {
+        self.base_fee = base_fee;
         self
     }
 
@@ -104,7 +145,7 @@ impl FlashblockBuilder {
             payload_id: self.payload_id,
             index: self.index,
             base: (self.index == 0).then(|| OpFlashblockPayloadBase {
-                parent_beacon_block_root: B256::ZERO,
+                parent_beacon_block_root: self.parent_beacon_block_root,
                 parent_hash: self.parent_hash,
                 fee_recipient: Address::ZERO,
                 prev_randao: B256::ZERO,
@@ -112,14 +153,16 @@ impl FlashblockBuilder {
                 gas_limit: 30_000_000,
                 timestamp: l2_ts(self.block_number),
                 extra_data: Bytes::default(),
-                base_fee_per_gas: U256::from(1_000_000_000u64),
+                base_fee_per_gas: self.base_fee,
             }),
             diff: OpFlashblockPayloadDelta {
                 state_root: B256::ZERO,
                 receipts_root: B256::ZERO,
                 logs_bloom: Default::default(),
                 gas_used: self.gas_used,
-                block_hash: B256::ZERO,
+                block_hash: self
+                    .block_hash
+                    .unwrap_or_else(|| Self::slice_hash(self.block_number, self.index)),
                 transactions: self.transactions,
                 withdrawals: vec![],
                 withdrawals_root: B256::ZERO,
@@ -129,6 +172,11 @@ impl FlashblockBuilder {
             metadata: MantleFlashblockMetadata {
                 block_number: self.block_number,
                 prev_flashblock_id: self.prev,
+                prev_flashblock_hash: self.prev_hash.unwrap_or(if self.prev.is_no_prev() {
+                    B256::ZERO
+                } else {
+                    Self::slice_hash(self.prev.block_number, self.prev.index)
+                }),
                 ..MantleFlashblockMetadata::default()
             },
         }
@@ -254,7 +302,8 @@ pub fn base_slice_builder(block_number: u64) -> FlashblockBuilder {
     FlashblockBuilder::new(block_number, 0).transactions(vec![l1_info_deposit(block_number)])
 }
 
-/// [`base_slice_builder`] with no predecessor link.
+/// [`base_slice_builder`] with no predecessor link (`NO_PREV`), so it does not
+/// extend an overlay that holds its parent.
 pub fn base_slice(block_number: u64) -> MantleFlashblockPayload {
     base_slice_builder(block_number).build()
 }
@@ -350,6 +399,11 @@ impl<P: reth_provider::BlockHashReader> FlashblocksHarness<P> {
             .expect("canonical block processing should be acknowledged");
     }
 
+    /// Resets the processor as its supervisor does after a panic.
+    pub async fn reset_after_panic(&self) {
+        self.state.reset_processor_after_panic_for_testing("test panic").await;
+    }
+
     /// Current pending snapshot, if any.
     pub fn pending(&self) -> Option<Arc<PendingBlocks>> {
         self.state.get_pending_blocks().clone()
@@ -408,6 +462,11 @@ pub fn test_sender() -> Address {
     Wallet::default().inner.address()
 }
 
+/// Signer of [`test_sender`].
+pub fn test_signer() -> PrivateKeySigner {
+    Wallet::default().inner
+}
+
 /// Signs a contract creation from [`test_sender`] for inclusion in a slice.
 pub async fn signed_deploy(nonce: u64, init_code: Bytes) -> Bytes {
     let request = TransactionRequest {
@@ -432,15 +491,68 @@ pub async fn signed_deploy(nonce: u64, init_code: Bytes) -> Bytes {
 
 /// Signs a call from [`test_sender`] for inclusion in a slice.
 pub async fn signed_call(nonce: u64, to: Address, value: U256) -> Bytes {
+    signed_call_with_fees(nonce, to, value, 20_000_000_000, 20_000_000_000).await
+}
+
+/// [`signed_call`] with explicit fee caps, so the effective gas price can follow the basefee.
+pub async fn signed_call_with_fees(
+    nonce: u64,
+    to: Address,
+    value: U256,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Bytes {
     let request = TransactionRequest {
         chain_id: Some(TEST_CHAIN_ID),
         nonce: Some(nonce),
         to: Some(TxKind::Call(to)),
         gas: Some(100_000),
-        max_fee_per_gas: Some(20_000_000_000),
-        max_priority_fee_per_gas: Some(20_000_000_000),
+        max_fee_per_gas: Some(max_fee_per_gas),
+        max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
         value: Some(value),
         input: TransactionInput::default(),
+        ..Default::default()
+    };
+    TransactionTestContext::sign_tx(
+        Wallet::default().with_chain_id(TEST_CHAIN_ID).inner.clone(),
+        request,
+    )
+    .await
+    .encoded_2718()
+    .into()
+}
+
+/// A second key from the test mnemonic, unfunded in genesis: an EIP-7702
+/// authority that is not the transaction's sender.
+pub fn second_signer() -> PrivateKeySigner {
+    Wallet::new(2).wallet_gen().remove(1)
+}
+
+/// Signs an EIP-7702 authorization delegating `signer`'s account to `delegate`.
+pub fn signed_authorization(
+    signer: &PrivateKeySigner,
+    delegate: Address,
+    nonce: u64,
+) -> SignedAuthorization {
+    let authorization =
+        Authorization { chain_id: U256::from(TEST_CHAIN_ID), address: delegate, nonce };
+    let signature =
+        signer.sign_hash_sync(&authorization.signature_hash()).expect("a local key signs");
+    authorization.into_signed(signature)
+}
+
+/// Signs a type-4 (EIP-7702) call from [`test_sender`] to [`LOGGER`] carrying
+/// `authorizations`.
+pub async fn signed_set_code(nonce: u64, authorizations: Vec<SignedAuthorization>) -> Bytes {
+    let request = TransactionRequest {
+        chain_id: Some(TEST_CHAIN_ID),
+        nonce: Some(nonce),
+        to: Some(TxKind::Call(LOGGER)),
+        gas: Some(200_000),
+        max_fee_per_gas: Some(20_000_000_000),
+        max_priority_fee_per_gas: Some(20_000_000_000),
+        value: Some(U256::ZERO),
+        authorization_list: Some(authorizations),
         ..Default::default()
     };
     TransactionTestContext::sign_tx(
@@ -457,6 +569,28 @@ pub async fn signed_call(nonce: u64, to: Address, value: U256) -> Bytes {
 /// All OP and Mantle forks are active from genesis so slice replay exercises the
 /// same code paths as a live chain.
 pub fn flashblocks_test_chain_spec() -> Arc<OpChainSpec> {
+    Arc::new(from_mantle_genesis(flashblocks_test_genesis()))
+}
+
+/// [`flashblocks_test_chain_spec`] whose genesis lets another node's block 1
+/// import: the expected base fee comes from the parent's Jovian `extra_data`,
+/// which the default genesis lacks. A node skips this check for blocks it built
+/// itself, so only a test with a separate sequencer node needs it.
+pub fn flashblocks_importable_chain_spec() -> Arc<OpChainSpec> {
+    let mut spec = from_mantle_genesis(flashblocks_test_genesis());
+    let mut header = spec.inner.genesis_header.clone_header();
+    // Jovian layout: version 1, denominator, elasticity, minimum base fee.
+    let mut extra_data = vec![1u8];
+    extra_data.extend_from_slice(&50u32.to_be_bytes());
+    extra_data.extend_from_slice(&6u32.to_be_bytes());
+    extra_data.extend_from_slice(&0u64.to_be_bytes());
+    header.extra_data = extra_data.into();
+    header.base_fee_per_gas = Some(0);
+    spec.inner.genesis_header = reth_primitives_traits::SealedHeader::seal_slow(header);
+    Arc::new(spec)
+}
+
+fn flashblocks_test_genesis() -> Genesis {
     let mut genesis: Genesis = serde_json::from_str(
         r#"{
             "config": {
@@ -494,6 +628,16 @@ pub fn flashblocks_test_chain_spec() -> Arc<OpChainSpec> {
         test_sender(),
         GenesisAccount { balance: U256::from(10u64).pow(U256::from(20u64)), ..Default::default() },
     );
+    // The pending block's system call writes the parent beacon root here.
+    genesis.alloc.insert(
+        alloy_eips::eip4788::BEACON_ROOTS_ADDRESS,
+        GenesisAccount {
+            code: Some(alloy_eips::eip4788::BEACON_ROOTS_CODE.clone()),
+            nonce: Some(1),
+            balance: U256::ZERO,
+            ..Default::default()
+        },
+    );
     genesis.alloc.insert(
         LOGGER,
         GenesisAccount { code: Some(bytes!("60006000a04760005260206000f3")), ..Default::default() },
@@ -508,7 +652,7 @@ pub fn flashblocks_test_chain_spec() -> Arc<OpChainSpec> {
             ..Default::default()
         },
     );
-    Arc::new(from_mantle_genesis(genesis))
+    genesis
 }
 
 /// Payload attributes builder for the flashblock suite.

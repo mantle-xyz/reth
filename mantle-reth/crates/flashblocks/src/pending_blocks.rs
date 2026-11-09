@@ -10,7 +10,6 @@ use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::{
     BlockTransactions, Filter, Header as RpcHeader, Log, Withdrawal, state::StateOverride,
 };
-use arc_swap::Guard;
 use imbl::{HashMap, Vector};
 use mantle_reth_flashblocks_types::MantleFlashblockPayload;
 use op_alloy_network::Optimism;
@@ -21,7 +20,7 @@ use reth_revm::db::BundleState;
 use reth_rpc_eth_api::RpcBlock;
 use revm::{context_interface::result::ExecutionResult, state::EvmState};
 
-use crate::{BuildError, PendingBlocksAPI, StateProcessorError, TransactionWithLogs};
+use crate::{BuildError, StateProcessorError, TransactionWithLogs};
 
 /// Builder for [`PendingBlocks`].
 #[derive(Debug)]
@@ -37,7 +36,6 @@ pub struct PendingBlocksBuilder {
 
     transactions: Vector<Transaction>,
     account_balances: HashMap<Address, U256>,
-    transaction_count: HashMap<Address, U256>,
     transaction_receipts: HashMap<B256, OpTransactionReceipt>,
     transactions_by_hash: HashMap<B256, Transaction>,
     transaction_position: HashMap<B256, (BlockNumber, usize)>,
@@ -73,7 +71,6 @@ impl PendingBlocksBuilder {
             latest_block_next_log_index: None,
             transactions: Vector::new(),
             account_balances: HashMap::new(),
-            transaction_count: HashMap::new(),
             transaction_receipts: HashMap::new(),
             transactions_by_hash: HashMap::new(),
             transaction_position: HashMap::new(),
@@ -104,7 +101,6 @@ impl PendingBlocksBuilder {
             latest_block_next_log_index: Some(pending_blocks.latest_block_next_log_index),
             transactions: pending_blocks.transactions.clone(),
             account_balances: pending_blocks.account_balances.clone(),
-            transaction_count: pending_blocks.transaction_count.clone(),
             transaction_receipts: pending_blocks.transaction_receipts.clone(),
             transactions_by_hash: pending_blocks.transactions_by_hash.clone(),
             transaction_position: pending_blocks.transaction_position.clone(),
@@ -199,14 +195,6 @@ impl PendingBlocksBuilder {
     #[inline]
     pub fn with_transaction_sender(&mut self, hash: B256, sender: Address) -> &Self {
         self.transaction_senders.insert(hash, sender);
-        self
-    }
-
-    /// Increments the pending nonce for an account.
-    #[inline]
-    pub fn increment_nonce(&mut self, sender: Address) -> &Self {
-        let current_count = self.transaction_count.get(&sender).copied().unwrap_or(U256::ZERO);
-        _ = self.transaction_count.insert(sender, current_count + U256::from(1));
         self
     }
 
@@ -334,7 +322,6 @@ impl PendingBlocksBuilder {
             flashblocks: self.flashblocks,
             transactions: self.transactions,
             account_balances: self.account_balances,
-            transaction_count: self.transaction_count,
             transaction_receipts: self.transaction_receipts,
             transactions_by_hash: self.transactions_by_hash,
             transaction_position: self.transaction_position,
@@ -353,8 +340,8 @@ impl PendingBlocksBuilder {
 ///
 /// Spans `[earliest_header, latest_header]`, which is usually more than one
 /// block, and the accessors do **not** all honour that span: lookups by hash
-/// (receipts, transactions) and the per-sender counts cover the whole range,
-/// while [`get_latest_block`](Self::get_latest_block) returns only the latest
+/// (receipts, transactions) cover the whole range, while
+/// [`get_latest_block`](Self::get_latest_block) returns only the latest
 /// block's transactions. An indexer written as "fetch the pending block, walk
 /// its transactions" therefore skips every block under the top one. Use the
 /// by-hash accessors, or walk the range explicitly.
@@ -373,7 +360,6 @@ pub struct PendingBlocks {
     transactions: Vector<Transaction>,
 
     account_balances: HashMap<Address, U256>,
-    transaction_count: HashMap<Address, U256>,
     transaction_receipts: HashMap<B256, OpTransactionReceipt>,
     transactions_by_hash: HashMap<B256, Transaction>,
     transaction_position: HashMap<B256, (BlockNumber, usize)>,
@@ -407,6 +393,31 @@ impl PendingBlocks {
     #[inline]
     pub fn latest_block_number(&self) -> BlockNumber {
         self.latest_header.number
+    }
+
+    /// Whether the preview still holds content above the canonical `tip`.
+    ///
+    /// Equal heights count as stale. The earliest block is not consulted: a
+    /// preview may legitimately keep blocks that are already on chain.
+    #[inline]
+    pub fn leads(&self, tip: BlockNumber) -> bool {
+        self.latest_block_number() > tip
+    }
+
+    /// Whether this preview extends the chain whose head is `tip`: it holds
+    /// block `tip + 1`, and that block's base names `tip_hash` as its parent.
+    ///
+    /// Stronger than [`Self::leads`]: a head of the right height but another
+    /// hash is a reorg the consumer has not processed yet, and the preview is
+    /// built on a block the chain no longer has.
+    pub fn extends(&self, tip: BlockNumber, tip_hash: B256) -> bool {
+        let Some(next) = tip.checked_add(1) else { return false };
+        self.flashblocks.iter().any(|slice| {
+            slice
+                .base
+                .as_ref()
+                .is_some_and(|base| base.block_number == next && base.parent_hash == tip_hash)
+        })
     }
 
     /// Returns the canonical block number (the block before pending).
@@ -519,6 +530,14 @@ impl PendingBlocks {
             .collect()
     }
 
+    /// The last slice the overlay holds for `block_number`.
+    pub fn last_flashblock_of(
+        &self,
+        block_number: BlockNumber,
+    ) -> Option<&MantleFlashblockPayload> {
+        self.flashblocks.iter().rev().find(|fb| fb.metadata.block_number == block_number)
+    }
+
     /// Returns the EVM state for a transaction.
     pub fn get_transaction_state(&self, hash: &B256) -> Option<EvmState> {
         self.transaction_state.get(hash).cloned()
@@ -547,8 +566,10 @@ impl PendingBlocks {
     ///
     /// The result is empty either way today — OP consensus requires the block
     /// body's withdrawals list to be empty, so every slice carries an empty
-    /// one and concatenating them changes nothing. The filter is here because
-    /// the unfiltered version is only correct *because of* that rule: the
+    /// one and concatenating them changes nothing. The producer repeats the
+    /// full list on every slice rather than sending a delta, so the
+    /// concatenation itself is also only correct while the list is empty. The filter is here
+    /// because the unfiltered version is only correct *because of* that rule: the
     /// overlay spans more than one block, and the day the rule relaxes this
     /// would start reporting a neighbouring block's withdrawals without
     /// anything failing.
@@ -615,11 +636,6 @@ impl PendingBlocks {
             .and_then(|&(bn, pos)| (bn == block_number).then_some(pos))
     }
 
-    /// Returns the transaction count for an address in pending state.
-    pub fn get_transaction_count(&self, address: Address) -> U256 {
-        self.transaction_count.get(&address).copied().unwrap_or(U256::ZERO)
-    }
-
     /// Returns the balance for an address in pending state.
     pub fn get_balance(&self, address: Address) -> Option<U256> {
         self.account_balances.get(&address).copied()
@@ -676,6 +692,16 @@ impl PendingBlocks {
         // it deployed; a hash it cannot resolve belongs to code that predates
         // this block, which canonical state holds.
         self.bundle_state.bytecode(&info.code_hash).map(|code| code.original_bytes())
+    }
+
+    /// Returns the nonce of `address` in pending state.
+    ///
+    /// `None` means the overlay never touched the account, so the caller must
+    /// fall back to canonical state at [`Self::parent_hash`]. An account the
+    /// overlay destroyed reads `0`, like its code and storage.
+    pub fn get_nonce(&self, address: Address) -> Option<u64> {
+        let account = self.bundle_state.account(&address)?;
+        Some(account.info.as_ref().map_or(0, |info| info.nonce))
     }
 
     /// Returns the state overrides for the pending state.
@@ -795,52 +821,6 @@ impl PendingBlocks {
     pub fn get_latest_flashblock_transaction_hashes(&self) -> Vec<B256> {
         let prev_count = self.previous_flashblocks_tx_count();
         self.transactions.iter().skip(prev_count).map(|tx| tx.tx_hash()).collect()
-    }
-}
-
-impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
-    fn get_canonical_block_number(&self) -> BlockNumberOrTag {
-        self.as_ref().map(|pb| pb.canonical_block_number()).unwrap_or(BlockNumberOrTag::Pending)
-    }
-
-    fn get_transaction_count(&self, address: Address) -> U256 {
-        self.as_ref().map(|pb| pb.get_transaction_count(address)).unwrap_or(U256::ZERO)
-    }
-
-    fn get_block(&self, full: bool) -> Option<serde_json::Value> {
-        self.as_ref().and_then(|pb| serde_json::to_value(pb.get_latest_block(full)).ok())
-    }
-
-    fn get_transaction_receipt(&self, tx_hash: TxHash) -> Option<serde_json::Value> {
-        self.as_ref()
-            .and_then(|pb| pb.get_receipt(tx_hash))
-            .and_then(|receipt| serde_json::to_value(receipt).ok())
-    }
-
-    fn get_transaction_by_hash(&self, tx_hash: TxHash) -> Option<serde_json::Value> {
-        self.as_ref()
-            .and_then(|pb| pb.get_transaction_by_hash(tx_hash))
-            .and_then(|tx| serde_json::to_value(tx).ok())
-    }
-
-    fn get_balance(&self, address: Address) -> Option<U256> {
-        self.as_ref().and_then(|pb| pb.get_balance(address))
-    }
-
-    fn get_code(&self, address: Address) -> Option<Bytes> {
-        self.as_ref().and_then(|pb| pb.get_code(address))
-    }
-
-    fn get_storage_at(&self, address: Address, slot: B256) -> Option<B256> {
-        self.as_ref().and_then(|pb| pb.get_storage_at(address, slot))
-    }
-
-    fn get_state_overrides(&self) -> Option<StateOverride> {
-        self.as_ref().and_then(|pb| pb.get_state_overrides())
-    }
-
-    fn get_pending_logs(&self, filter: &Filter) -> Vec<Log> {
-        self.as_ref().map(|pb| pb.get_pending_logs(filter)).unwrap_or_default()
     }
 }
 
@@ -1164,6 +1144,90 @@ mod tests {
         assert_eq!(pending_blocks.latest_block_transaction_count(), 1);
         assert_eq!(pending_blocks.latest_block_cumulative_gas_used(), 42_000);
         assert_eq!(pending_blocks.latest_block_next_log_index(), 1);
+    }
+
+    #[test]
+    fn leads_only_when_the_latest_block_is_above_the_tip() {
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_flashblocks([test_flashblock_for_block(1), test_flashblock_for_block(2)]);
+        builder.with_header(header_at(1));
+        builder.with_header(header_at(2));
+        let pending_blocks = builder.build().expect("build should succeed");
+
+        assert!(pending_blocks.leads(1));
+        assert!(!pending_blocks.leads(2));
+        assert!(!pending_blocks.leads(3));
+    }
+
+    /// The preview extends the chain only if the block it holds right above
+    /// the head names that head as its parent. A head of the same height but
+    /// another hash is a reorg the consumer has not processed yet.
+    #[test]
+    fn extends_only_the_head_its_next_block_names() {
+        let (one, two, other) = (B256::repeat_byte(1), B256::repeat_byte(2), B256::repeat_byte(9));
+        let on = |block_number, parent_hash| {
+            let mut slice = test_flashblock_for_block(block_number);
+            slice.base.as_mut().expect("a base slice").parent_hash = parent_hash;
+            slice
+        };
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_flashblocks([on(2, one), on(3, two)]);
+        builder.with_header(header_at(2));
+        builder.with_header(header_at(3));
+        let pending = builder.build().expect("build should succeed");
+
+        assert!(pending.extends(1, one), "the head the preview was built on");
+        assert!(!pending.extends(1, other), "same height, another block");
+        assert!(pending.extends(2, two), "its first block is canonical, its second still leads");
+        assert!(!pending.extends(2, other), "the chain took another block 2");
+        assert!(!pending.extends(3, other), "the head has reached the preview's last block");
+        assert!(!pending.extends(0, B256::ZERO), "below the anchor nothing can be confirmed");
+    }
+
+    #[test]
+    fn pending_execution_context_requires_the_preview_to_lead_the_tip() {
+        use crate::PendingStateOverrides;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let mut builder = PendingBlocksBuilder::default();
+        builder.with_flashblocks([test_flashblock_for_block(1), test_flashblock_for_block(2)]);
+        builder.with_header(header_at(1));
+        builder.with_header(header_at(2));
+        let pending = builder.build().expect("build should succeed");
+        let state = crate::FlashblocksState::new(3, 3, 5);
+        state.set_pending_blocks_for_testing(Some(pending));
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            assert!(state.pending_execution_context(&|| Some((1, B256::ZERO))).is_some());
+            assert!(
+                state.pending_execution_context(&|| Some((1, B256::repeat_byte(9)))).is_none(),
+                "another block 1 is stale"
+            );
+            assert!(
+                state.pending_execution_context(&|| Some((2, B256::ZERO))).is_none(),
+                "equal is stale"
+            );
+            assert!(state.pending_execution_context(&|| None).is_none(), "read error is stale");
+
+            // The preview is loaded before the tip is read.
+            assert!(
+                state
+                    .pending_execution_context(&|| {
+                        state.set_pending_blocks_for_testing(None);
+                        Some((1, B256::ZERO))
+                    })
+                    .is_some()
+            );
+            assert!(state.pending_execution_context(&|| Some((0, B256::ZERO))).is_none());
+        });
+
+        assert!(
+            handle.render().contains("flashblocks_consumer_pending_stale_fallback_total 3"),
+            "{}",
+            handle.render()
+        );
     }
 
     #[test]
@@ -1569,6 +1633,46 @@ mod tests {
 
         assert_eq!(
             pending_blocks_with_bundle(bundle).get_code(Address::with_last_byte(0x22)),
+            None,
+        );
+    }
+
+    // ─── pending nonce reads ────────────────────────────────────────────
+
+    /// A nonce the block being built wrote reads back as the absolute value.
+    #[test]
+    fn nonce_written_by_the_overlay_is_served() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_account(
+            address,
+            Some(AccountInfo { nonce: 5, ..AccountInfo::default() }),
+            AccountStatus::Changed,
+        );
+
+        assert_eq!(pending_blocks_with_bundle(bundle).get_nonce(address), Some(5));
+    }
+
+    /// An account the block being built destroyed has nonce zero — falling
+    /// back to canonical would resurrect its old nonce.
+    #[test]
+    fn destroyed_account_has_nonce_zero() {
+        let address = Address::with_last_byte(0x11);
+        let bundle = bundle_with_account(address, None, AccountStatus::Destroyed);
+
+        assert_eq!(pending_blocks_with_bundle(bundle).get_nonce(address), Some(0));
+    }
+
+    /// An address the overlay says nothing about falls back to canonical.
+    #[test]
+    fn nonce_of_an_untouched_account_falls_back_to_canonical() {
+        let bundle = bundle_with_account(
+            Address::with_last_byte(0x11),
+            Some(AccountInfo { nonce: 5, ..AccountInfo::default() }),
+            AccountStatus::Changed,
+        );
+
+        assert_eq!(
+            pending_blocks_with_bundle(bundle).get_nonce(Address::with_last_byte(0x22)),
             None,
         );
     }

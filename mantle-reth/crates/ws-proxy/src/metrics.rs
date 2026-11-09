@@ -54,7 +54,7 @@ macro_rules! proxy_metrics {
                 );
                 metrics::describe_counter!(
                     UPSTREAM_MESSAGES,
-                    "Messages received from upstream, by upstream URI"
+                    "Messages received from upstream, by upstream host:port"
                 );
             }
         }
@@ -92,7 +92,7 @@ proxy_metrics! {
     histogram message_send_duration         => "flashblocks.proxy.message_send_duration",
         "Duration of a single send to one client";
     gauge     broadcast_queue_size          => "flashblocks.proxy.broadcast_queue_size",
-        "Current depth of the broadcast queue";
+        "Largest retained-message backlog among downstream clients";
     counter   new_connections               => "flashblocks.proxy.new_connections",
         "Downstream connections opened";
     counter   closed_connections            => "flashblocks.proxy.closed_connections",
@@ -134,12 +134,21 @@ proxy_metrics! {
 }
 
 impl Metrics {
+    /// Sample and publish channel depth together so a concurrent receive cannot
+    /// publish a newer value and then be overwritten by an older sample.
+    pub fn refresh_broadcast_queue_size(sender: &tokio::sync::broadcast::Sender<crate::Message>) {
+        static SAMPLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _sample = SAMPLE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::broadcast_queue_size().set(sender.len() as f64);
+    }
+
     /// The `flashblocks.proxy.connections_by_app` series, labelled by app name.
     pub fn connections_by_app(app: String) -> Counter {
         metrics::counter!(CONNECTIONS_BY_APP, "app" => app)
     }
 
-    /// The `flashblocks.proxy.upstream_messages` series, labelled by upstream URL.
+    /// The `flashblocks.proxy.upstream_messages` series, labelled by upstream
+    /// `host:port` — never the full URI, which can carry an API key.
     pub fn upstream_messages(upstream: String) -> Counter {
         metrics::counter!(UPSTREAM_MESSAGES, "upstream" => upstream)
     }

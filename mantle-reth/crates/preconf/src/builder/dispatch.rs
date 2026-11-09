@@ -220,12 +220,11 @@ where
     }
 
     // The deadline and per-block gas budget gates below only apply to
-    // RPC-sourced entries. Journal-replayed entries bypass both to
-    // honor the mantle preconf SLA: "once a receipt has been returned
-    // to the client, the tx must land on chain". Rejecting them here
-    // would silently break that commitment. They remain subject to the
-    // status / dedup gates above and to the underlying block gas limit
-    // enforced by the block builder.
+    // RPC-sourced entries. Replayed entries bypass both: a preconf
+    // transaction whose receipt has gone out is one the node makes a best
+    // effort to land, and these gates would end it. They remain subject to
+    // the status / dedup gates above and to the block gas limit enforced by
+    // the block builder.
     let is_rpc = entry.source == PreconfSource::Rpc;
 
     // Pre-apply deadline check — see crate-level docs. `cfg.safety_margin`
@@ -342,7 +341,7 @@ where
             loop_state.record_committed(hash);
             // The claim is made by executing, not below by a client hearing
             // about it — which is what leaves a replay's nonce guarded.
-            // `mark_promised` upgrades the kind when the receipt lands.
+            // `mark_promised` upgrades the kind just before the receipt goes out.
             if let Err(owner) = fifo.claims().record_announced(
                 hash,
                 &entry.from,
@@ -399,8 +398,24 @@ where
                     );
                 }
             }
-            // The journal has it; the client may now have it too.
+            // The receipt goes out whether or not the write above succeeded.
+            //
+            // Promised first, under the `apply_lock`: an executed, unpromised
+            // entry is what `trim_staged` evicts. Every live receipt goes out here.
             if let Some(ticket) = ticket {
+                if let Err(owner) = fifo.claims().mark_promised(
+                    hash,
+                    &entry.from,
+                    entry.nonce,
+                    loop_state.predicted_height,
+                ) {
+                    warn!(
+                        target: "mantle::preconf::dispatch",
+                        ?hash, ?owner, sender = ?entry.from, nonce = entry.nonce,
+                        "a different tx already owns this (sender, nonce) at receipt time; \
+                         the commitment may not be honoured"
+                    );
+                }
                 ticket.send(receipt);
             }
         }
@@ -447,10 +462,13 @@ where
         // The claim for this entry already went out, so reaching here means it
         // cannot be kept — and this is the only moment that is observable.
         //
-        // No retry: every transient cause is filtered before apply (capacity
-        // becomes `Defer`, a blocked predecessor's successor never reaches
-        // here, `Fatal` returns above). What is left is permanent, so the
-        // claim ends on the first failure, releasing the `(sender, nonce)`.
+        // No retry: the claim ends on the first rejection, releasing the
+        // `(sender, nonce)`. Only capacity is checked before apply (a replay
+        // that overflows this block is deferred, one too large for any block
+        // ends there); a blocked predecessor's successor never reaches here,
+        // and `Fatal` returns above. A cause that could clear in a later block
+        // — base fee rose, balance short, nonce ahead of the chain — still
+        // ends the claim here.
         Err(ApplyError::Rejected(rejected)) => {
             // Only a claim a client was handed counts as broken; an announced
             // one has readers that self-correct (see `ClaimKind`). Logging both
@@ -875,6 +893,83 @@ mod tests {
             !fifo.claims().was_promised(&hash),
             "and must not call it promised — no receipt reached anyone",
         );
+    }
+
+    /// A receipt never leaves dispatch ahead of its promise; in that gap
+    /// `trim_staged` could evict the commitment.
+    #[tokio::test]
+    async fn the_promise_is_recorded_before_the_receipt_goes_out() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x41);
+        let hash = *tx.tx_hash();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
+        resp_rx.await.expect("responder closed").expect("synthetic ok");
+
+        // No RPC code ran: dispatch alone recorded it.
+        assert!(fifo.claims().was_promised(&hash), "the client holds a receipt");
+    }
+
+    /// A reverted transaction still has a receipt, so it is still promised —
+    /// as the queue's `Success` says, whatever `receipt.status` is.
+    #[tokio::test]
+    async fn a_reverted_receipt_is_still_promised() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x42);
+        let hash = *tx.tx_hash();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, |tx, h, height| {
+            synthetic_ok(tx, h, height).map(|receipt| PreconfReceipt { status: false, ..receipt })
+        })
+        .await
+        .unwrap();
+        let receipt = resp_rx.await.expect("responder closed").expect("a receipt");
+        assert!(!receipt.status, "precondition: the reverted arm");
+
+        assert!(fifo.claims().was_promised(&hash));
+    }
+
+    /// A slot conflict at receipt time leaves the incumbent owning the nonce,
+    /// but the commitment is still promised and the receipt unchanged.
+    #[tokio::test]
+    async fn a_slot_conflict_at_receipt_time_still_promises() {
+        let fifo = PreconfTxSet::new(8);
+        let cfg = PreconfConfig::default();
+        let tx = make_tx(0x43);
+        let hash = *tx.tx_hash();
+        let nonce = tx.nonce();
+        let incumbent = TxHash::from([0xbb; 32]);
+        assert_eq!(fifo.claims().record_announced(incumbent, &Address::ZERO, nonce, 41), Ok(()));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        assert!(matches!(
+            fifo.push_if_absent(tx, Address::ZERO, PreconfSource::Rpc).await,
+            PushResult::Inserted
+        ));
+        assert!(fifo.set_responder(hash, std::time::Instant::now(), resp_tx).await);
+
+        let mut state = LoopState::new(42);
+        apply_one_preconf(&fifo, &cfg, None, hash, &mut state, synthetic_ok).await.unwrap();
+        let receipt = resp_rx.await.expect("responder closed").expect("a receipt");
+
+        assert_eq!(receipt.tx_hash, hash, "the receipt is the one the apply produced");
+        assert_eq!(fifo.claims().slot_owner(&Address::ZERO, nonce), Some(incumbent));
+        assert!(fifo.claims().was_promised(&hash));
     }
 
     #[tokio::test]
@@ -1418,8 +1513,8 @@ mod tests {
         assert_eq!(entry.status, PreconfStatus::Success);
     }
 
-    // ── Source-differentiated gate tests (mantle preconf SLA: journal
-    //    replay must never silently drop a promised tx). ─────────────
+    // ── Source-differentiated gate tests (these gates never end a
+    //    replayed commitment). ─────────────────────────
 
     /// Journal-replayed entries bypass the pre-apply deadline gate.
     /// Even after the timeout has elapsed since insertion, `apply_fn`

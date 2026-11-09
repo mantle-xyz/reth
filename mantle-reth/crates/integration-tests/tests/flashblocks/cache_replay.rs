@@ -114,3 +114,167 @@ async fn a_parked_slice_is_evicted_when_canonical_passes_it() {
 
     assert!(harness.pending().is_none(), "a slice at or below canonical must not be replayed");
 }
+
+/// Canonical two blocks behind the slices, with no overlay to start from: a
+/// follower catching up after a restart or a dropped overlay.
+///
+/// A second node runs ahead as the sequencer; the follower makes its blocks
+/// canonical only when the test says so. Each round: half of block `k + 2`,
+/// canonical `k`, then the rest of `k + 2`. The overlay must stay on the newest
+/// slice rather than be dropped by `k + 2`'s live slices.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlay_keeps_up_while_canonical_trails_by_two_blocks() {
+    const LAST: u64 = 3;
+
+    let chain_spec = crate::consumer_helpers::flashblocks_importable_chain_spec;
+    let (harness, follower) = launch_flashblocks_consumer!(3, 3, chain_spec());
+    let (mut sequencer, _http, _wallet, _chain_id) =
+        mantle_reth_integration_tests::launch_mantle_node!(
+            chain_spec(),
+            mantle_reth_cli::node::MantleNode::default(),
+            crate::consumer_helpers::flashblocks_payload_attributes
+        )
+        .await;
+
+    let mut hashes = vec![alloy_primitives::B256::ZERO];
+    for _ in 1..=3 {
+        let payload = sequencer.advance_block().await.expect("sequencer block");
+        let status = follower
+            .inner
+            .add_ons_handle
+            .beacon_engine_handle
+            .new_payload(payload.clone().into())
+            .await
+            .expect("follower imports the block");
+        assert!(status.is_valid(), "the follower must accept the sequencer's block: {status:?}");
+        hashes.push(payload.block().hash());
+    }
+
+    let slice = |block: u64, index: u64| {
+        if index == 0 {
+            base_slice_builder(block)
+                .parent_hash(hashes[block as usize - 1])
+                .prev(block - 1, LAST)
+                .build()
+        } else {
+            FlashblockBuilder::new(block, index).prev(block, index - 1).build()
+        }
+    };
+    let position =
+        || harness.pending().map(|p| (p.latest_block_number(), p.latest_flashblock_index()));
+
+    for index in 0..=LAST {
+        harness.send(slice(2, index)).await;
+    }
+    assert!(harness.pending().is_none(), "block 2 waits for canonical block 1");
+
+    let mut trace = Vec::new();
+    for k in 1..=2u64 {
+        harness.send(slice(k + 2, 0)).await;
+        harness.send(slice(k + 2, 1)).await;
+        let block = commit_submitted_block!(follower, hashes[k as usize]);
+        harness.send_canonical(block).await;
+        trace.push((format!("after canonical {k}"), position()));
+
+        harness.send(slice(k + 2, 2)).await;
+        harness.send(slice(k + 2, 3)).await;
+        trace.push((format!("after live ({}, 2..=3)", k + 2), position()));
+    }
+
+    assert_eq!(
+        trace,
+        vec![
+            ("after canonical 1".to_string(), Some((3, 1))),
+            ("after live (3, 2..=3)".to_string(), Some((3, 3))),
+            ("after canonical 2".to_string(), Some((4, 1))),
+            ("after live (4, 2..=3)".to_string(), Some((4, 3))),
+        ]
+    );
+}
+
+/// A whole block missed from the stream: the next block's base names a last
+/// slice the overlay never saw. The overlay is dropped, but the slices are kept
+/// as a restart point and replay once their canonical parent lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn slices_after_a_missed_block_replay_once_their_parent_lands() {
+    const LAST: u64 = 3;
+
+    let chain_spec = crate::consumer_helpers::flashblocks_importable_chain_spec;
+    let (harness, follower) = launch_flashblocks_consumer!(3, 3, chain_spec());
+    let (mut sequencer, _http, _wallet, _chain_id) =
+        mantle_reth_integration_tests::launch_mantle_node!(
+            chain_spec(),
+            mantle_reth_cli::node::MantleNode::default(),
+            crate::consumer_helpers::flashblocks_payload_attributes
+        )
+        .await;
+
+    let mut hashes = vec![alloy_primitives::B256::ZERO];
+    for _ in 1..=3 {
+        let payload = sequencer.advance_block().await.expect("sequencer block");
+        let status = follower
+            .inner
+            .add_ons_handle
+            .beacon_engine_handle
+            .new_payload(payload.clone().into())
+            .await
+            .expect("follower imports the block");
+        assert!(status.is_valid(), "the follower must accept the sequencer's block: {status:?}");
+        hashes.push(payload.block().hash());
+    }
+    let position =
+        || harness.pending().map(|p| (p.latest_block_number(), p.latest_flashblock_index()));
+
+    harness.send(base_slice(1)).await;
+    for index in 1..=LAST {
+        harness.send(FlashblockBuilder::new(1, index).prev(1, index - 1).build()).await;
+    }
+    assert_eq!(position(), Some((1, LAST)));
+
+    // Block 2 never arrives. Block 3 names its last slice.
+    harness.send(base_slice_builder(3).parent_hash(hashes[2]).prev(2, LAST).build()).await;
+    assert!(harness.pending().is_none(), "a base that does not link drops the overlay");
+    for index in 1..=LAST {
+        harness.send(FlashblockBuilder::new(3, index).prev(3, index - 1).build()).await;
+    }
+
+    for hash in &hashes[1..=2] {
+        let block = commit_submitted_block!(follower, *hash);
+        harness.send_canonical(block).await;
+    }
+
+    assert_eq!(position(), Some((3, LAST)), "block 3 replays once block 2 lands");
+}
+
+/// A build cached past the leading depth must not replace the newer build of
+/// the same height that the overlay took live in the meantime.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_build_does_not_replace_the_one_the_overlay_follows() {
+    use alloy_rpc_types_engine::PayloadId;
+    let (abandoned, followed) = (PayloadId::new([1; 8]), PayloadId::new([2; 8]));
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 1);
+    let block_1_hash = submit_uncommitted_block!(node);
+
+    harness.send(base_slice(1)).await;
+    // Two blocks ahead of canonical 0: past the leading depth of 1, so cached.
+    harness
+        .send(
+            base_slice_builder(2)
+                .parent_hash(block_1_hash)
+                .prev(1, 0)
+                .payload_id(abandoned)
+                .build(),
+        )
+        .await;
+
+    let block_1 = commit_submitted_block!(node, block_1_hash);
+    // One ahead of canonical 1 now: the rebuild extends the overlay live.
+    harness.send(base_slice_builder(2).prev(1, 0).payload_id(followed).build()).await;
+    assert_eq!(harness.pending().map(|p| p.payload_id()), Some(followed));
+
+    harness.send_canonical(block_1).await;
+
+    let pending = harness.pending().expect("block 2 is still pending");
+    assert_eq!(pending.latest_block_number(), 2);
+    assert_eq!(pending.payload_id(), followed, "the abandoned build must not come back");
+}

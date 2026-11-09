@@ -37,12 +37,20 @@ the upstream.
 | API-key authentication | `--api-keys app:key,...`, `--public-access-enabled` |
 | Client IP through forwarding proxies | `--ip-addr-http-header`, `--trusted-proxy-cidrs` |
 | Brotli compression downstream | `--enable-compression` |
-| Per-subscriber address/topic filtering ⚠️ **off by default — see below** | `--enable-filters`, query parameters on the subscribe URL |
+| Per-subscriber address/topic filtering ⚠️ **not supported — see below** | `--enable-filters` (refused at startup), query parameters on the subscribe URL |
 | Upstream keepalive and backoff | `--subscriber-ping-interval-ms`, `--subscriber-pong-timeout-ms`, `--subscriber-max-interval-ms` |
 | Downstream keepalive | `--client-ping-enabled`, `--client-ping-interval-ms`, `--client-pong-timeout-ms` |
 
 Run `mantle-ws-proxy --help` for the full list. Every flag also reads from the
 equivalent uppercase environment variable.
+
+The keepalive flags are checked at startup, and a combination that would cycle
+a connection forever is refused: `--subscriber-pong-timeout-ms` must exceed
+`--subscriber-ping-interval-ms`, `--subscriber-max-interval-ms` must be
+non-zero, and with `--client-ping-enabled` the client pong timeout must exceed
+the client ping interval. So is a configuration that starts but never serves:
+`--upstream-ws` must be a `ws://` URL (there is no TLS, see below), and both
+connection limits must be non-zero.
 
 ```bash
 mantle-ws-proxy \
@@ -130,7 +138,7 @@ things follow for configuration:
 
 ## Frame handling
 
-Text frames are forwarded as-is. Binary frames are sniffed — already-JSON, or
+Upstream, text frames are taken as they are. Binary frames are sniffed — already-JSON, or
 brotli to be decompressed — before being placed on the broadcast channel, so a
 compressing upstream works; `decode_binary_slice` in `subscriber.rs` carries the
 sniff rule and the reason dropping binary frames (as Base's proxy does) would
@@ -141,7 +149,13 @@ fails at the transport layer and causes the upstream connection to reconnect.
 A compressed message that fits the transport limit but decompresses beyond
 17 MiB is dropped without reconnecting. Neither path forwards oversized content.
 
-Downstream compression is separate and opt-in via `--enable-compression`.
+Downstream, **every slice goes out as a binary frame**, whatever frame type it
+arrived in. Without `--enable-compression` the frame carries the slice's JSON
+text byte-for-byte as UTF-8; with it, the same JSON brotli-compressed. Clients
+must read binary frames — a browser `WebSocket` hands them over as a `Blob` or
+`ArrayBuffer`, not a string — and, when compression is on, decompress them. The
+flashblocks consumer in `op-reth` accepts either frame type and either encoding,
+so it works behind the proxy with or without compression.
 
 ## The payload is opaque, with one exception
 
@@ -152,7 +166,7 @@ still replay transactions locally rather than believe what arrives here.
 The exception is `FilterType`, which parses the slice as JSON to evaluate a
 subscriber's address and topic filters.
 
-### ⚠️ Filters are off by default, because this upstream cannot feed them
+### ⚠️ Filters are not supported, because this upstream cannot feed them
 
 Both filter kinds read `metadata.receipts` and `metadata.new_account_balances`,
 which the Mantle producer leaves empty on every slice. A topic filter therefore
@@ -164,11 +178,14 @@ Rather than accept a filter and silently return an empty stream,
 `/ws/{api_key}/filter` refuses a subscription carrying filter parameters with
 `501` and an explanation. The same route still serves an **unfiltered**
 subscription, which is what it is without query parameters.
+`flashblocks.proxy.filter_subscriptions_refused` counts subscribers who tried.
 
-`--enable-filters` turns the filtering on for an upstream that does populate
-those maps — a Base-derived one does. The matching logic itself is correct and
-covered; what is missing here is the data. `flashblocks.proxy.filter_subscriptions_refused`
-counts subscribers who tried.
+`--enable-filters` is refused at startup. Besides the missing data, filtering
+runs once per filtered client per slice — a full brotli decompress and JSON
+parse each time — so CPU grows with the number of filtered clients, and
+nothing caps the addresses or topics in one filter. Lifting the refusal needs
+all three fixed: a producer that fills those maps, one parse per slice shared
+by every client, and a per-filter cap.
 
 Which input feeds which filter, and why each spelling of an address behaves the
 way it does, is the module doc on `filter::mantle_shape`.
@@ -207,7 +224,8 @@ Useful first checks:
 
 | Series | Reading |
 |---|---|
-| `flashblocks.proxy.upstream_messages` | **Absent** — not zero — means the upstream has delivered nothing; the proxy sends no subscribe request, it only reads |
+| `flashblocks.proxy.upstream_messages` | **Absent** — not zero — means the upstream has delivered nothing; the proxy sends no subscribe request, it only reads. Counts slices placed on the broadcast channel: text frames within the size limit and binary frames that decode. Pings, pongs, close frames, read errors and dropped frames are not counted. Labelled `upstream=<host:port>`: the path and query, which can carry an API key, are never used in labels or logs |
+| `flashblocks.proxy.connections_by_app` | Upgrade attempts per application, counted once the key is accepted and **before** the rate limits run: an attempt then refused with 429 by `--per-ip-connection-limit` or `--instance-connection-limit` is counted too. It counts attempts, not open connections; use `active_connections` for those |
 | `flashblocks.proxy.upstream_connection_failures` | Growing means the upstream URI or network is wrong |
 | `flashblocks.proxy.active_connections` | Current downstream subscribers |
 | `flashblocks.proxy.lagged_connections` | Subscribers dropped for falling more than `--message-buffer-size` behind |
