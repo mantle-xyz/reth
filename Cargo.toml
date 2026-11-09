@@ -452,6 +452,8 @@ tar = "0.4.44"
 reth-trie = { path = "patches/reth-trie" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
+# Backport reth#27455 (end the syncing subscription on close); drop when the reth pin includes it.
+reth-rpc = { path = "patches/reth-rpc" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,

@@ -10091,7 +10091,6 @@ dependencies = [
 [[package]]
 name = "reth-rpc"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
