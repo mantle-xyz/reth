@@ -723,9 +723,12 @@ where
                 Ok(pending_state) => {
                     // The tip is read after the preview arrives, as `fresh_pending` does;
                     // a failed read counts as stale.
-                    let tip = self.eth_api.provider().best_block_number().ok();
-                    if let Some(receipt) =
-                        tip.and_then(|tip| receipt_above_tip(&pending_state, tip, tx_hash))
+                    let head = self.eth_api.provider().chain_info().ok();
+                    if let Some(receipt) = head
+                        .filter(|head| pending_state.extends(head.best_number, head.best_hash))
+                        .and_then(|head| {
+                            receipt_above_tip(&pending_state, head.best_number, tx_hash)
+                        })
                     {
                         debug!(message = "found receipt in flashblock", tx_hash = %tx_hash);
                         return Some(receipt);
