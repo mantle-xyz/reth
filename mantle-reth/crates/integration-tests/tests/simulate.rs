@@ -1,4 +1,4 @@
-//! `eth_simulateV1` through a booted `MantleNode`, for what it has to answer as op-geth does.
+//! `eth_simulateV1` through a booted `MantleNode`.
 
 use crate::helpers::with_mantle_rpc_client;
 use jsonrpsee::{core::client::ClientT, rpc_params};
@@ -9,10 +9,10 @@ fn quantity(value: &Value) -> u64 {
         .expect("hex quantity")
 }
 
-/// Blocks simulated without a `time` land 12s apart, as op-geth puts them, not the chain's 2s
-/// (the test chain is 5000, Mantle mainnet), and so do the empty blocks a number gap leaves.
+/// Blocks simulated without a `time` land Mantle's 2s block time apart, and so do the empty
+/// blocks a number gap leaves.
 #[tokio::test]
-async fn simulated_blocks_step_twelve_seconds_like_op_geth_via_rpc() {
+async fn simulated_blocks_step_two_seconds_via_rpc() {
     with_mantle_rpc_client(|client| async move {
         let latest: Value = client
             .request("eth_getBlockByNumber", rpc_params!["latest", false])
@@ -37,7 +37,7 @@ async fn simulated_blocks_step_twelve_seconds_like_op_geth_via_rpc() {
             .collect();
         assert_eq!(
             numbers_and_times,
-            (1..=4).map(|i| (number + i, time + 12 * i)).collect::<Vec<_>>()
+            (1..=4).map(|i| (number + i, time + 2 * i)).collect::<Vec<_>>()
         );
     })
     .await;

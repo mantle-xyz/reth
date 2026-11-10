@@ -517,14 +517,12 @@ fn estimate_total_fee_gas_price(
     }
 }
 
-/// A chain id with no block time registered in `alloy-chains`, for which `sanitize_chain` steps
-/// simulated blocks 12s apart: op-geth's `timestampIncrement`, which op-geth applies whatever the
-/// chain.
+/// Mantle mainnet's chain id, which `alloy-chains` registers with a 2s block time, so
+/// `sanitize_chain` steps simulated blocks 2s apart, fillers for number gaps included.
 ///
-/// `sanitize_chain` steps them by the chain's block time otherwise (reth #24388: 2s on Mantle),
-/// where op-geth, and this node before the bump, add 12s. Normalizing against this id gives
-/// op-geth's blocks, fillers for number gaps included, without copying the function.
-const OP_GETH_SIMULATE_CHAIN_ID: u64 = 0;
+/// Used on every Mantle chain rather than the chain's own id: devnets and QA networks carry ids
+/// with no registered block time (12s fallback) or another chain's (1337 is `Dev`, 1s).
+const MANTLE_SIMULATE_CHAIN_ID: u64 = 5000;
 
 /// Returns the 0-based index of the first simulated block that crosses the Arsia activation
 /// boundary, i.e. whose parent is pre-Arsia while the block itself is post-Arsia.
@@ -1046,11 +1044,10 @@ where
         let chain_spec = self.provider().chain_spec();
         // Use the same normalization as execution: chain-specific spacing, explicit
         // timestamps and filler blocks for number gaps all affect the Arsia boundary.
-        // On Mantle the spacing is op-geth's, so that a request answers as it does on
-        // op-geth. A preview parent keeps it too: otherwise the same request would step
-        // 12s or 2s depending on whether a preview happened to be fresh.
+        // On Mantle the spacing is Mantle's 2s block time, with or without a preview
+        // parent, so the same request steps the same way whether a preview is fresh.
         let spacing_chain_id =
-            if chain_spec.is_mantle() { OP_GETH_SIMULATE_CHAIN_ID } else { chain_spec.chain_id() };
+            if chain_spec.is_mantle() { MANTLE_SIMULATE_CHAIN_ID } else { chain_spec.chain_id() };
         payload.block_state_calls = simulate::sanitize_chain(
             payload.block_state_calls,
             &parent,
@@ -2032,19 +2029,19 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        simulate::sanitize_chain(blocks, &parent, OP_GETH_SIMULATE_CHAIN_ID, 256)
+        simulate::sanitize_chain(blocks, &parent, MANTLE_SIMULATE_CHAIN_ID, 256)
             .unwrap()
             .iter()
             .map(|block| block.block_overrides.as_ref().unwrap().time.unwrap())
             .collect()
     }
 
-    /// op-geth steps every simulated block 12s past the one before, whatever the chain's block
-    /// time, and so did this node before reth #24388 tied the step to the chain's.
+    /// Simulated blocks without a `time` step Mantle's 2s block time past the one before.
+    /// Fails if `alloy-chains` changes the block time it registers for Mantle.
     #[test]
-    fn mantle_simulated_timestamps_step_twelve_seconds_like_op_geth() {
-        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![112, 124, 136]);
-        assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![112, 500, 512]);
+    fn mantle_simulated_timestamps_step_two_seconds() {
+        assert_eq!(simulated_block_timestamps(100, &[None, None, None]), vec![102, 104, 106]);
+        assert_eq!(simulated_block_timestamps(100, &[None, Some(500), None]), vec![102, 500, 502]);
     }
 
     #[test]
