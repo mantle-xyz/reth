@@ -445,6 +445,8 @@ tar = "0.4.44"
 
 # ==================== [patch] — reth core minimal patches ====================
 [patch."https://github.com/paradigmxyz/reth"]
+# Backport of paradigmxyz/reth#28264 (trie iterator seek boundary fix); drop once the pinned rev includes it.
+reth-trie = { path = "patches/reth-trie" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
 
