@@ -28,7 +28,7 @@ use reth_rpc_api::DebugApiServer;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
-    FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore,
+    AsEthApiError, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore,
 };
 use reth_rpc_eth_types::{EthApiError, StateCacheDb};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
@@ -209,7 +209,11 @@ where
             .eth_api()
             .recovered_block(block_id)
             .await?
-            .ok_or(EthApiError::HeaderNotFound(block_id))?;
+            .ok_or(EthApiError::TracingBlockNotFound(block_id))?;
+        // Tracing requires the parent state, which does not exist for the genesis block.
+        if block.number() == 0 {
+            return Err(EthApiError::GenesisNotTraceable.into())
+        }
         let evm_env = self.eth_api().evm_env_for_header(block.sealed_block().sealed_header())?;
 
         self.trace_block(block, evm_env, opts).await
@@ -224,7 +228,7 @@ where
         opts: GethDebugTracingOptions,
     ) -> Result<GethTrace, Eth::Error> {
         let (transaction, block) = match self.eth_api().transaction_and_block(tx_hash).await? {
-            None => return Err(EthApiError::TransactionNotFound.into()),
+            None => return Err(EthApiError::TracingTransactionNotFound.into()),
             Some(res) => res,
         };
         let evm_env = self.eth_api().evm_env_for_header(block.sealed_block().sealed_header())?;
@@ -323,6 +327,13 @@ where
                 Ok(trace)
             })
             .await
+            .map_err(|err| match err.as_err() {
+                Some(EthApiError::HeaderNotFound(id)) if *id == at => {
+                    // Unknown blocks use -32000: https://github.com/ethereum/execution-apis/pull/855
+                    EthApiError::TracingBlockNotFound(at).into()
+                }
+                _ => err,
+            })
     }
 
     /// Helper method to execute `debug_trace_call` at a specific transaction index within a block.
@@ -341,7 +352,7 @@ where
             .eth_api()
             .recovered_block(block_id)
             .await?
-            .ok_or(EthApiError::HeaderNotFound(block_id))?;
+            .ok_or(EthApiError::TracingBlockNotFound(block_id))?;
 
         if tx_index >= block.transaction_count() {
             // tx_index out of bounds
@@ -1271,5 +1282,55 @@ impl<B: BlockTrait> BadBlockStore<B> {
 impl<B: BlockTrait> Default for BadBlockStore<B> {
     fn default() -> Self {
         Self::new(64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{eth::helpers::types::EthRpcConverter, EthApi};
+    use reth_chainspec::ChainSpec;
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_provider::test_utils::NoopProvider;
+    use reth_rpc_eth_api::EthApiServer;
+    use reth_transaction_pool::test_utils::testing_pool;
+
+    #[tokio::test]
+    async fn trace_call_out_of_range_block_error() {
+        let eth_api = EthApi::<_, EthRpcConverter<ChainSpec>>::builder(
+            NoopProvider::default(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::mainnet(),
+        )
+        .build();
+        let debug_api = DebugApi::new(
+            eth_api.clone(),
+            BlockingTaskGuard::new(1),
+            &Runtime::test(),
+            futures::stream::empty(),
+        );
+        let block_id = BlockId::number(0xfffffffff);
+        for tx_index in [None, Some(0)] {
+            let mut opts: GethDebugTracingCallOptions =
+                serde_json::from_value(serde_json::json!({ "tracer": "callTracer" })).unwrap();
+            opts.tx_index = tx_index;
+            let err = DebugApiServer::debug_trace_call(
+                &debug_api,
+                Default::default(),
+                Some(block_id),
+                Some(opts),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), -32000);
+            assert!(err.message().contains("not found"));
+        }
+
+        let err = EthApiServer::call(&eth_api, Default::default(), Some(block_id), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), -32001);
     }
 }

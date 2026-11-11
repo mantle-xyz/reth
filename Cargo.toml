@@ -509,6 +509,9 @@ reth-rpc-engine-api = { path = "patches/reth-rpc-engine-api" }
 # Backport reth#26776, #26999, #27106, #27107, #27415, #27462, #27477 (RPC blocking task handling);
 # drop when the reth pin includes them.
 reth-rpc-eth-api = { path = "patches/reth-rpc-eth-api" }
+# Backport reth#26479, #27022, #26767, #27881, #28091, #28243 (RPC error codes and simulate checks);
+# drop when the reth pin includes them.
+reth-rpc-eth-types = { path = "patches/reth-rpc-eth-types" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,
@@ -528,6 +531,9 @@ revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = 
 # alloy-rs/evm#444 (reject a legacy gas price below the base fee) on 0.37.1; drop once a release
 # with it is pinned.
 alloy-evm = { path = "patches/alloy-evm" }
+# alloy-rs/alloy#4434 (JsonStorageKey deserialises like geth) on 2.4.2; drop once a release with it
+# is pinned.
+alloy-serde = { path = "patches/alloy-serde" }
 # revm-inspectors: mantle-xyz/revm-inspectors
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "dev/mantle-v1.7.0" }
 # op-revm moved out of mantle-xyz/revm into the mantle-v2 workspace when upstream
