@@ -360,6 +360,11 @@ impl OpHardforks for OpChainSpec {
     fn is_mantle_arsia_active_at_timestamp(&self, timestamp: u64) -> bool {
         self.fork(alloy_op_hardforks::MantleHardfork::Arsia).active_at_timestamp(timestamp)
     }
+
+    fn is_mantle_hoodi_bvm_upgrade_active_at_timestamp(&self, timestamp: u64) -> bool {
+        self.fork(alloy_op_hardforks::MantleHardfork::HoodiBvmUpgrade)
+            .active_at_timestamp(timestamp)
+    }
 }
 
 /// OP Mainnet's genesis is the Bedrock transition block (105235063), whose state was imported

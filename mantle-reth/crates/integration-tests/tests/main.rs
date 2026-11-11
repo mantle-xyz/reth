@@ -13,6 +13,7 @@ mod gas_estimation;
 mod gas_limit;
 mod get_proof;
 mod historical_rpc;
+mod hoodi_bvm_upgrade;
 mod payload_block_size;
 mod preconf_forwarding;
 mod proofs_history;

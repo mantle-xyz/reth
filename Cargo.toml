@@ -276,21 +276,21 @@ alloy-evm = { version = "0.37.0", default-features = false }
 
 # ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
 
 # ==================== OP-REVM (Mantle fork: mantle-xyz/revm, same repo as revm) ====================
-op-revm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
+op-revm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
 
 # ==================== OP-ALLOY (Mantle: mantle-xyz/mantle-v2) ====================
 # TODO: Switch to tag once mantle-v2 Rust crates are tagged
-op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
-op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207", default-features = false }
+op-alloy = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
+op-alloy-provider = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216", default-features = false }
 op-alloy-flz = { version = "0.13.1", default-features = false }
 
 # ==================== ALLOY ====================
@@ -472,13 +472,13 @@ revm-context-interface = { git = "https://github.com/mantle-xyz/revm", branch = 
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", branch = "dev/mantle-v1.7.0" }
 # op-revm moved out of mantle-xyz/revm into the mantle-v2 workspace when upstream
 # bluealloy dropped crates/op-revm after revm v107.
-op-revm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
+op-revm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
 # alloy-op-evm / alloy-op-hardforks: mantle-xyz/mantle-v2 (Mantle version)
-alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
-alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
+alloy-op-evm = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
+alloy-op-hardforks = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
 # op-alloy: mantle-xyz/mantle-v2 (Mantle version)
-op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
-op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
-op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
-op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
-op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "f0e315dd85726b77aa0a32b5f0d399909f615207" }
+op-alloy-consensus = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
+op-alloy-network = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
+op-alloy-rpc-types = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
+op-alloy-rpc-types-engine = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
+op-alloy-rpc-jsonrpsee = { git = "https://github.com/mantle-xyz/mantle-v2", rev = "1e94ee0294d9971948a8f45e6a6579357af53216" }
