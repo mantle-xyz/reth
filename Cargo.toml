@@ -475,9 +475,19 @@ tar = "0.4.44"
 reth-trie = { path = "patches/reth-trie" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
+# Backports reth#27131, #27223, #27229, #27676, #27678, #27719, #27981, #27984, #28053, #28064 and
+# #28067 (storage, static files, init-state, unwind); drop when the reth pin includes them.
+reth-nippy-jar = { path = "patches/reth-nippy-jar" }
+reth-db = { path = "patches/reth-db" }
+reth-db-api = { path = "patches/reth-db-api" }
+reth-db-common = { path = "patches/reth-db-common" }
+reth-storage-api = { path = "patches/reth-storage-api" }
+reth-stages = { path = "patches/reth-stages" }
+reth-stages-api = { path = "patches/reth-stages-api" }
+reth-cli-commands = { path = "patches/reth-cli-commands" }
 # Backport reth#27455 (end the syncing subscription on close); drop when the reth pin includes it.
 reth-rpc = { path = "patches/reth-rpc" }
-# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #27805 (tasks), #27218 (node builder); drop when the reth pin includes them.
+# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #27805 (tasks), #27218, #28067 (node builder); drop when the reth pin includes them.
 reth-engine-tree = { path = "patches/reth-engine-tree" }
 reth-engine-primitives = { path = "patches/reth-engine-primitives" }
 reth-chain-state = { path = "patches/reth-chain-state" }
