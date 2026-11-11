@@ -497,7 +497,7 @@ reth-stages-api = { path = "patches/reth-stages-api" }
 reth-cli-commands = { path = "patches/reth-cli-commands" }
 # Backport reth#27455 (end the syncing subscription on close); drop when the reth pin includes it.
 reth-rpc = { path = "patches/reth-rpc" }
-# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #26421 (its sparse_trie caller), #27805 (tasks), #27218, #28067 (node builder); drop when the reth pin includes them.
+# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #26421 (its sparse_trie caller), #27805, #27462 (tasks), #27218, #28067 (node builder); drop when the reth pin includes them.
 reth-engine-tree = { path = "patches/reth-engine-tree" }
 reth-engine-primitives = { path = "patches/reth-engine-primitives" }
 reth-chain-state = { path = "patches/reth-chain-state" }
@@ -506,6 +506,9 @@ reth-tasks = { path = "patches/reth-tasks" }
 reth-payload-builder = { path = "patches/reth-payload-builder" }
 reth-payload-primitives = { path = "patches/reth-payload-primitives" }
 reth-rpc-engine-api = { path = "patches/reth-rpc-engine-api" }
+# Backport reth#26776, #26999, #27106, #27107, #27415, #27462, #27477 (RPC blocking task handling);
+# drop when the reth pin includes them.
+reth-rpc-eth-api = { path = "patches/reth-rpc-eth-api" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Task management [MANTLE PATCH: backport reth#27805 at aef8d3ef]"
+description = "Task management [MANTLE PATCH: backport reth#27805, reth#27462 at aef8d3ef]"
 
 [lints]
 workspace = true
@@ -14,7 +14,7 @@ workspace = true
 [dependencies]
 # async
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread"] }
-tracing-futures.workspace = true
+tracing-futures = "0.2"
 futures-util = { workspace = true, features = ["std"] }
 
 # metrics
@@ -22,15 +22,15 @@ reth-metrics.workspace = true
 metrics.workspace = true
 
 # misc
-dashmap.workspace = true
+dashmap = "6.2"
 parking_lot.workspace = true
-thread-priority.workspace = true
+thread-priority = "3.0.0"
 tracing.workspace = true
 thiserror.workspace = true
 
 # feature `rayon`
 rayon = { workspace = true, optional = true }
-crossbeam-utils = { workspace = true, optional = true }
+crossbeam-utils = { version = "0.8", optional = true }
 pin-project = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
