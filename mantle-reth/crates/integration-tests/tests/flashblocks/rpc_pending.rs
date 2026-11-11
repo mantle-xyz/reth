@@ -25,6 +25,7 @@ macro_rules! eth_api {
             $node.rpc.inner.eth_api().clone(),
             $node.rpc.inner.eth_handlers().filter.clone(),
             std::sync::Arc::clone($harness.state()),
+            Some(reth_rpc_eth_types::EthConfig::default().max_logs_per_response),
         )
     };
 }
@@ -1417,6 +1418,115 @@ async fn get_logs_resolves_latest_and_takes_settled_blocks_from_canonical() {
     );
 }
 
+/// The response limit covers canonical and preview logs together.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_limits_the_combined_canonical_and_pending_response() {
+    use crate::consumer_helpers::mine_canonical_block;
+
+    let (harness, mut node) = launch_flashblocks_consumer!(3, 3);
+    let eth = node.rpc.inner.eth_api().clone();
+    let filter = reth_rpc::eth::EthFilter::new(
+        eth.clone(),
+        reth_rpc_eth_types::EthFilterConfig::default().max_logs_per_response(2),
+        reth_tasks::Runtime::test(),
+    );
+    let api = mantle_reth_flashblocks::EthApiExt::new(
+        eth,
+        filter,
+        std::sync::Arc::clone(harness.state()),
+        Some(2),
+    );
+    for number in 1..=3 {
+        let raw = signed_call(number - 1, LOGGER, VALUE).await;
+        harness
+            .send(
+                FlashblockBuilder::new(number, 0)
+                    .prev(number - 1, 0)
+                    .transactions(vec![l1_info_deposit(number), raw.clone()])
+                    .build(),
+            )
+            .await;
+        if number < 3 {
+            node.rpc.inject_tx(raw).await.expect("canonical call");
+            let block = mine_canonical_block!(node);
+            assert_eq!(block.number, number);
+        }
+    }
+
+    let query = Filter::new().address(LOGGER).from_block(1).to_block(BlockNumberOrTag::Pending);
+    let error = api.get_logs(query.clone()).await.expect_err("three logs exceed the limit of two");
+    assert_eq!(error.code(), -32602);
+    assert!(error.message().contains("range 1-2"), "{error}");
+    let logs = api
+        .get_logs(query.clone().from_block(2))
+        .await
+        .expect("combined response exactly at the limit");
+    assert_eq!(logs.len(), 2);
+    let logs = api.get_logs(query.to_block(2)).await.expect("suggested range fits");
+    assert_eq!(logs.len(), 2);
+}
+
+/// Preview-only ranges obey the limit while single-block queries remain complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_limits_preview_ranges_but_preserves_the_single_block_exception() {
+    let (harness, node) = launch_flashblocks_consumer!(3, 3);
+    harness
+        .send(
+            FlashblockBuilder::new(1, 0)
+                .transactions(vec![l1_info_deposit(1), signed_call(0, LOGGER, VALUE).await])
+                .build(),
+        )
+        .await;
+    harness
+        .send(
+            FlashblockBuilder::new(2, 0)
+                .prev(1, 0)
+                .transactions(vec![
+                    l1_info_deposit(2),
+                    signed_call(1, LOGGER, VALUE).await,
+                    signed_call(2, LOGGER, VALUE).await,
+                ])
+                .build(),
+        )
+        .await;
+    assert_eq!(harness.pending().expect("two-block overlay").latest_block_number(), 2);
+
+    let query = Filter::new().address(LOGGER).from_block(1).to_block(BlockNumberOrTag::Pending);
+    for limit in [Some(1), Some(2), Some(3), None] {
+        let eth = node.rpc.inner.eth_api().clone();
+        let filter = reth_rpc::eth::EthFilter::new(
+            eth.clone(),
+            reth_rpc_eth_types::EthFilterConfig {
+                max_logs_per_response: limit,
+                ..Default::default()
+            },
+            reth_tasks::Runtime::test(),
+        );
+        let api = mantle_reth_flashblocks::EthApiExt::new(
+            eth,
+            filter,
+            std::sync::Arc::clone(harness.state()),
+            limit,
+        );
+        let result = api.get_logs(query.clone()).await;
+        if matches!(limit, Some(1 | 2)) {
+            let error = result.expect_err("three logs exceed the limit");
+            assert_eq!(error.code(), -32602);
+            assert!(error.message().contains("canonical confirmation"), "{error}");
+        } else {
+            assert_eq!(result.expect("at or below the limit").len(), 3);
+        }
+        let filtered = api.get_logs(query.clone().address(SETTER)).await.expect("no matching logs");
+        assert!(filtered.is_empty());
+
+        let logs = api
+            .get_logs(query.clone().from_block(BlockNumberOrTag::Pending))
+            .await
+            .expect("one preview block is always returned in full");
+        assert_eq!(logs.len(), 2);
+    }
+}
+
 /// A preview the chain has passed no longer shapes `eth_getLogs`: the range is
 /// answered from the canonical chain alone.
 #[tokio::test(flavor = "multi_thread")]
@@ -2479,6 +2589,7 @@ async fn get_logs_rejects_a_reorg_during_history_lookup_but_allows_chain_growth(
             eth,
             filter,
             std::sync::Arc::clone(harness.state()),
+            None,
         );
         let request = Filter::new()
             .address(LOGGER)
@@ -2640,7 +2751,7 @@ async fn assert_canonical_recheck_after_preview_lookup(receipt: bool) {
                 });
             }))),
         });
-        let api = mantle_reth_flashblocks::EthApiExt::new(eth, filter, Arc::clone(&preview));
+        let api = mantle_reth_flashblocks::EthApiExt::new(eth, filter, Arc::clone(&preview), None);
         let result = if receipt {
             api.get_transaction_receipt(hash).await
         } else {
@@ -2726,7 +2837,7 @@ async fn send_raw_transaction_sync_rejects_a_queued_preview_on_a_replaced_parent
             });
         }))),
     });
-    let api = mantle_reth_flashblocks::EthApiExt::new(eth, filter, Arc::clone(&preview));
+    let api = mantle_reth_flashblocks::EthApiExt::new(eth, filter, Arc::clone(&preview), None);
     let result = api.send_raw_transaction_sync(raw, Some(500)).await;
     assert!(preview.before_wait.lock().unwrap().is_none(), "the post-send lookup was reached");
     let error = result.expect_err("a queued receipt built on the replaced parent cannot confirm");
