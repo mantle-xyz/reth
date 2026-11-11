@@ -619,6 +619,7 @@ fn flashblocks_test_genesis() -> Genesis {
             },
             "alloc": {},
             "gasLimit": "0x1c9c380",
+            "baseFeePerGas": "0x0",
             "difficulty": "0x0",
             "timestamp": "0x0"
         }"#,

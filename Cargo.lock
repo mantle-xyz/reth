@@ -269,8 +269,6 @@ dependencies = [
 [[package]]
 name = "alloy-evm"
 version = "0.37.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acde665074b478c97047dc2a461b4916cac77922d690e5b7415d1941ae7ff7bf"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -10091,7 +10089,6 @@ dependencies = [
 [[package]]
 name = "reth-rpc"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
