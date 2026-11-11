@@ -1,16 +1,17 @@
-use mantle_reth_chainspec::{MANTLE_MAINNET, MANTLE_SEPOLIA, from_mantle_genesis};
+use mantle_reth_chainspec::{MANTLE_HOODI, MANTLE_MAINNET, MANTLE_SEPOLIA, from_mantle_genesis};
 use reth_cli::chainspec::{ChainSpecParser, parse_genesis};
 use reth_optimism_chainspec::OpChainSpec;
 use std::sync::Arc;
 
 // `mantle` is the canonical mainnet name and stays first so it remains the default.
 // `mantle-mainnet` is a backwards-compatible alias for the pre-elysium chain name.
-const MANTLE_SUPPORTED_CHAINS: &[&str] = &["mantle", "mantle-mainnet", "mantle-sepolia"];
+const MANTLE_SUPPORTED_CHAINS: &[&str] =
+    &["mantle", "mantle-mainnet", "mantle-sepolia", "mantle-hoodi"];
 
 /// Mantle chain specification parser.
 ///
-/// Supports `--chain mantle` (alias `mantle-mainnet`), `--chain mantle-sepolia`, and JSON
-/// genesis files.
+/// Supports `--chain mantle` (alias `mantle-mainnet`), `--chain mantle-sepolia`,
+/// `--chain mantle-hoodi`, and JSON genesis files.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct MantleChainSpecParser;
@@ -24,6 +25,7 @@ impl ChainSpecParser for MantleChainSpecParser {
         match s {
             "mantle" | "mantle-mainnet" => Ok(MANTLE_MAINNET.clone()),
             "mantle-sepolia" => Ok(MANTLE_SEPOLIA.clone()),
+            "mantle-hoodi" => Ok(MANTLE_HOODI.clone()),
             _ => {
                 let genesis = parse_genesis(s)?;
                 Ok(Arc::new(from_mantle_genesis(genesis)))
@@ -53,6 +55,12 @@ mod tests {
     fn parse_mantle_sepolia() {
         let spec = MantleChainSpecParser::parse("mantle-sepolia").unwrap();
         assert_eq!(spec.chain.id(), 5003);
+    }
+
+    #[test]
+    fn parse_mantle_hoodi() {
+        let spec = MantleChainSpecParser::parse("mantle-hoodi").unwrap();
+        assert_eq!(spec.chain.id(), 50002);
     }
 
     #[test]
