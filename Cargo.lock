@@ -382,7 +382,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-evm"
 version = "0.32.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -399,7 +399,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-hardforks"
 version = "0.5.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-chains",
  "alloy-hardforks",
@@ -6215,7 +6215,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "op-alloy"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "op-alloy-consensus",
  "op-alloy-network",
@@ -6227,7 +6227,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-consensus"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6257,7 +6257,7 @@ checksum = "a79f352fc3893dcd670172e615afef993a41798a1d3fc0db88a3e60ef2e70ecc"
 [[package]]
 name = "op-alloy-network"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -6270,7 +6270,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-provider"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -6284,7 +6284,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-jsonrpsee"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-primitives",
  "jsonrpsee",
@@ -6293,7 +6293,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6314,7 +6314,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types-engine"
 version = "2.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6393,7 +6393,7 @@ dependencies = [
 [[package]]
 name = "op-revm"
 version = "20.0.0"
-source = "git+https://github.com/mantle-xyz/mantle-v2?rev=f0e315dd85726b77aa0a32b5f0d399909f615207#f0e315dd85726b77aa0a32b5f0d399909f615207"
+source = "git+https://github.com/mantle-xyz/mantle-v2?rev=1e94ee0294d9971948a8f45e6a6579357af53216#1e94ee0294d9971948a8f45e6a6579357af53216"
 dependencies = [
  "alloy-sol-types",
  "auto_impl",
