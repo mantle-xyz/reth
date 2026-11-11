@@ -154,6 +154,7 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
 {
     reth_tracing::init_test_tracing();
 
+    let genesis_hash = chain_spec.genesis_hash();
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
         .with_unused_ports()
         .with_datadir_args(DatadirArgs {
@@ -189,7 +190,7 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
             // The ExEx refuses to start against an unseeded sidecar (and takes the node down with
             // it), so mirror what `op-reth op-proofs init` does before launch. At this point the
             // chain is still at genesis, so the seed is the genesis state.
-            seed_proofs_sidecar(&db_for_seed, mdbx.clone());
+            seed_proofs_sidecar(&db_for_seed, mdbx.clone(), genesis_hash);
             with_proofs_history(
                 builder,
                 args,
@@ -249,13 +250,14 @@ where
 fn seed_proofs_sidecar(
     db: &Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>,
     storage: Arc<MdbxProofsStorageV2>,
+    genesis_hash: B256,
 ) {
     use reth_db::Database;
     use reth_optimism_trie::{InitializationJob, RethTrieStorageLayout};
 
     let tx = db.tx().expect("open main-db read tx");
-    // Genesis: block 0, and the sidecar only needs a consistent anchor to start from.
+    // Genesis: block 0. The ExEx checks the anchor against reth's canonical chain at startup.
     InitializationJob::new(storage, tx, RethTrieStorageLayout::Legacy)
-        .run(0, Default::default())
+        .run(0, genesis_hash)
         .expect("seed proofs sidecar");
 }

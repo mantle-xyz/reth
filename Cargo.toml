@@ -65,6 +65,9 @@ members = [
 
   # Keep the vendored trie regression in the workspace test gate.
   "patches/reth-trie/",
+  "patches/reth-trie-common/",
+  "patches/reth-trie-sparse/",
+  "patches/reth-exex/",
 
   # Optimism ecosystem crates (from mantle-xyz/mantle-v2, git dependency)
   # (no longer workspace members — referenced via git dep)
@@ -473,6 +476,13 @@ tar = "0.4.44"
 [patch."https://github.com/paradigmxyz/reth"]
 # Backport reth#28264 against this line's aef8d3ef dependency.
 reth-trie = { path = "patches/reth-trie" }
+# Backport reth#26357 #26421 #26471 #26842 #26843 #27651 (proof_v2 and its sparse-trie caller); drop when the reth pin includes them.
+reth-trie-common = { path = "patches/reth-trie-common" }
+reth-trie-sparse = { path = "patches/reth-trie-sparse" }
+# Backport reth#27252 (state root task: delete touched EIP-161-empty accounts), reth#26421 (proof task); drop when the reth pin includes them.
+reth-trie-parallel = { path = "patches/reth-trie-parallel" }
+# Backport reth#26819 (sparse ExEx WAL file IDs); drop when the reth pin includes it.
+reth-exex = { path = "patches/reth-exex" }
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
 # Backports reth#27131, #27223, #27229, #27676, #27678, #27719, #27981, #27984, #28053, #28064 and
@@ -487,7 +497,7 @@ reth-stages-api = { path = "patches/reth-stages-api" }
 reth-cli-commands = { path = "patches/reth-cli-commands" }
 # Backport reth#27455 (end the syncing subscription on close); drop when the reth pin includes it.
 reth-rpc = { path = "patches/reth-rpc" }
-# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #27805 (tasks), #27218, #28067 (node builder); drop when the reth pin includes them.
+# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #26421 (its sparse_trie caller), #27805 (tasks), #27218, #28067 (node builder); drop when the reth pin includes them.
 reth-engine-tree = { path = "patches/reth-engine-tree" }
 reth-engine-primitives = { path = "patches/reth-engine-primitives" }
 reth-chain-state = { path = "patches/reth-chain-state" }

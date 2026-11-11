@@ -13,7 +13,8 @@ use crossbeam_channel::{Sender, bounded};
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
 use reth_provider::{
-    BlockHashReader, BlockReader, DatabaseProviderFactory, StateProviderFactory, StateReader,
+    BlockHashReader, BlockReader, DatabaseProviderFactory, StageCheckpointReader,
+    StateProviderFactory, StateReader,
 };
 use reth_trie_common::{HashedPostStateSorted, updates::TrieUpdatesSorted};
 use std::{panic, sync::Arc, thread};
@@ -41,6 +42,7 @@ impl<Block: reth_primitives_traits::Block + Send + 'static> EngineHandle<Block> 
         Evm: ConfigureEvm<Primitives: NodePrimitives<Block = Block>> + 'static,
         Provider: BlockHashReader
             + StateReader
+            + StageCheckpointReader
             + DatabaseProviderFactory
             + StateProviderFactory
             + BlockReader<Block = Block>
@@ -71,6 +73,7 @@ impl<Block: reth_primitives_traits::Block + Send + 'static> EngineHandle<Block> 
         Evm: ConfigureEvm<Primitives: NodePrimitives<Block = Block>> + 'static,
         Provider: BlockHashReader
             + StateReader
+            + StageCheckpointReader
             + DatabaseProviderFactory
             + StateProviderFactory
             + BlockReader<Block = Block>
