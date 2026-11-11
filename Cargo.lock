@@ -7579,7 +7579,6 @@ dependencies = [
 [[package]]
 name = "reth-chain-state"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8180,7 +8179,6 @@ dependencies = [
 [[package]]
 name = "reth-engine-primitives"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8207,7 +8205,6 @@ dependencies = [
 [[package]]
 name = "reth-engine-tree"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
@@ -8988,7 +8985,6 @@ dependencies = [
 [[package]]
 name = "reth-node-builder"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9872,7 +9868,6 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -9908,7 +9903,6 @@ dependencies = [
 [[package]]
 name = "reth-payload-primitives"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -10258,7 +10252,6 @@ dependencies = [
 [[package]]
 name = "reth-rpc-engine-api"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -10603,7 +10596,6 @@ dependencies = [
 [[package]]
 name = "reth-tasks"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "crossbeam-utils",
  "dashmap",

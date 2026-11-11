@@ -401,7 +401,7 @@ fn convert_build_args<N: OpPayloadPrimitives>(
     let payload_id = config.payload_id;
     let builder_attrs =
         OpPayloadBuilderAttributes::from_rpc_attrs(parent_hash, payload_id, config.attributes.0)
-            .map_err(PayloadBuilderError::other)?;
+            .map_err(PayloadBuilderError::invalid_attributes)?;
     Ok(BuildArguments {
         config: PayloadConfig {
             parent_header: config.parent_header,

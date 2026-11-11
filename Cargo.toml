@@ -143,6 +143,29 @@ imbl = "7"
 rustc-hash = { version = "2.0", default-features = false }
 smallvec = "1"
 
+# Transitive deps pulled in by the vendored engine/payload/tasks patches (versions match
+# paradigmxyz/reth rev aef8d3ef). Remove with the [patch] entries.
+crossbeam-utils = "0.8"
+dashmap = "6.2"
+fdlimit = "0.3.0"
+indexmap = "2"
+moka = "0.12"
+reth-config = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
+reth-consensus-debug-client = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-engine-tree = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-engine-util = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-exex-types = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-invalid-block-hooks = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-node-ethstats = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-rpc-layer = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-stages-api = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
+thread-priority = "3.0.0"
+tracing-futures = "0.2"
+
 # ==================== OP-RETH INTERNAL CRATES ====================
 op-reth = { path = "op-reth/bin/" }
 op-version = { path = "op-version/" }
@@ -454,6 +477,15 @@ reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
 # Backport reth#27455 (end the syncing subscription on close); drop when the reth pin includes it.
 reth-rpc = { path = "patches/reth-rpc" }
+# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #27805 (tasks), #27218 (node builder); drop when the reth pin includes them.
+reth-engine-tree = { path = "patches/reth-engine-tree" }
+reth-engine-primitives = { path = "patches/reth-engine-primitives" }
+reth-chain-state = { path = "patches/reth-chain-state" }
+reth-node-builder = { path = "patches/reth-node-builder" }
+reth-tasks = { path = "patches/reth-tasks" }
+reth-payload-builder = { path = "patches/reth-payload-builder" }
+reth-payload-primitives = { path = "patches/reth-payload-primitives" }
+reth-rpc-engine-api = { path = "patches/reth-rpc-engine-api" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,
