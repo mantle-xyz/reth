@@ -23,6 +23,9 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Vendored copy of upstream `reth-rpc`: upstream leaves `unnameable_types` off, the Mantle
+// workspace denies it, so allow it here instead of changing the vendored source.
+#![allow(unnameable_types)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 mod admin;
