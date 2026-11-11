@@ -659,6 +659,7 @@ where
                         ctx.registry.eth_api().clone(),
                         ctx.registry.eth_handlers().filter.clone(),
                         Arc::clone(&state),
+                        Some(ctx.config().rpc.rpc_max_logs_per_response.unwrap_or_max() as usize),
                     );
                     ctx.modules.add_or_replace_if_module_configured(
                         RethRpcModule::Eth,
