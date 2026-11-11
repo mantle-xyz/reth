@@ -165,7 +165,8 @@ async fn pending_execution_uses_the_overlay_block_environment() {
     let state = probe_override(
         "0x43600052426020524560405241606052446080524860a052600143034060c05260e06000f3",
     );
-    let request = serde_json::json!({ "from": test_sender(), "to": LOGGER, "gasPrice": "0x1" });
+    // A nonzero legacy gas price keeps BASEFEE; it may not be below the base fee (123).
+    let request = serde_json::json!({ "from": test_sender(), "to": LOGGER, "gasPrice": "0x7b" });
     let result = api
         .call(request.clone(), Some(BlockNumberOrTag::Pending.into()), Some(state.clone()), None)
         .await
@@ -361,19 +362,23 @@ async fn pending_total_fee_uses_preview_code_and_block_environment() {
     let request = serde_json::json!({
         "from": test_sender(), "to": test_sender().create(0), "gasPrice": "0x1"
     });
+    // A legacy gas price may not be below the preview's base fee (123).
+    let pending_request = serde_json::json!({
+        "from": test_sender(), "to": test_sender().create(0), "gasPrice": "0x7b"
+    });
     let gas = eth_api!(node, harness)
-        .estimate_gas(request.clone(), Some(BlockNumberOrTag::Pending.into()), None, None)
+        .estimate_gas(pending_request.clone(), Some(BlockNumberOrTag::Pending.into()), None, None)
         .await
         .expect("existing pending gas estimator");
     assert!(gas > U256::from(21_000), "the deployed contract must actually run");
     assert_eq!(
         api.estimate_total_fee(
-            serde_json::from_value(request.clone()).unwrap(),
+            serde_json::from_value(pending_request).unwrap(),
             Some(BlockNumberOrTag::Pending.into()),
         )
         .await
         .expect("total fee at preview state and NUMBER"),
-        gas
+        gas * U256::from(123)
     );
     let dynamic_fee = serde_json::json!({
         "from": test_sender(), "to": test_sender().create(0),
