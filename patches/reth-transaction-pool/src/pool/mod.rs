@@ -742,7 +742,7 @@ where
     ///
     /// Performs blob storage operations and sends all notifications. This should be called
     /// after the pool write lock has been released to avoid blocking pool operations.
-    fn on_added_transaction(&self, meta: AddedTransactionMeta<T::Transaction>) {
+    fn on_added_transaction(&self, mut meta: AddedTransactionMeta<T::Transaction>) {
         // Handle blob sidecar storage and notifications for EIP-4844 transactions
         if let Some(sidecar) = meta.blob_sidecar {
             let hash = *meta.added.hash();
@@ -764,6 +764,13 @@ where
         // Notify pending transaction listeners
         if let Some(pending) = meta.added.as_pending() {
             self.on_new_pending_transaction(pending);
+        }
+
+        // A parked insertion can promote older transactions when validation observes newer
+        // account state. Notify those promotions independently of the inserted transaction.
+        let promoted = meta.added.take_parked_promoted();
+        if !promoted.is_empty() {
+            self.notify_on_transaction_updates(promoted, Vec::new());
         }
 
         // Notify event listeners
@@ -1459,6 +1466,12 @@ pub enum AddedTransaction<T: PoolTransaction> {
         subpool: SubPool,
         /// The specific reason why the transaction is queued (if applicable).
         queued_reason: Option<QueuedReason>,
+        /// Existing transactions promoted to pending by this insertion.
+        ///
+        /// Validation can observe newer account state before pool maintenance applies it.
+        /// Insertion rechecks the sender's transactions against that state, so lower-nonce
+        /// transactions can become pending while the inserted transaction remains parked.
+        promoted: Vec<Arc<ValidPoolTransaction<T>>>,
     },
 }
 
@@ -1476,6 +1489,17 @@ impl<T: PoolTransaction> AddedTransaction<T> {
         match self {
             Self::Pending(tx) => tx.replaced.as_ref(),
             Self::Parked { replaced, .. } => replaced.as_ref(),
+        }
+    }
+
+    /// Takes promotions caused by a parked insertion for separate notification.
+    ///
+    /// Call before notifying listeners about the inserted transaction. This drains only the
+    /// parked promotions; subsequent parked event conversion handles the inserted transaction.
+    pub(crate) fn take_parked_promoted(&mut self) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        match self {
+            Self::Parked { promoted, .. } => std::mem::take(promoted),
+            Self::Pending(_) => Vec::new(),
         }
     }
 
@@ -1668,13 +1692,59 @@ mod tests {
     use crate::{
         blobstore::{BlobStore, InMemoryBlobStore},
         identifier::SenderId,
-        test_utils::{MockTransaction, TestPoolBuilder},
+        test_utils::{testing_pool, MockTransaction, TestPool, TestPoolBuilder},
         validate::ValidTransaction,
-        BlockInfo, PoolConfig, SubPoolLimit, TransactionOrigin, TransactionValidationOutcome, U256,
+        BlockInfo, PoolConfig, SubPoolLimit, TransactionListenerKind, TransactionOrigin,
+        TransactionPool, TransactionValidationOutcome, U256,
     };
     use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant};
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, B256};
     use std::{fs, path::PathBuf};
+
+    /// Inserts a transaction with an explicit validator snapshot, without running maintenance.
+    fn insert_with_state_nonce(pool: &TestPool, nonce: u64, state_nonce: u64) {
+        let transaction = MockTransaction::eip1559()
+            .with_sender(Address::with_last_byte(1))
+            .with_nonce(nonce)
+            .with_hash(B256::from([nonce as u8; 32]));
+        pool.pool
+            .add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::MAX,
+                    state_nonce,
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(transaction),
+                    propagate: true,
+                    authorities: None,
+                }],
+            )
+            .pop()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn queued_insertion_notifies_older_promotions() {
+        let test_pool = testing_pool();
+        let sender = Address::with_last_byte(1);
+        let mut pending = test_pool.pool.add_pending_listener(TransactionListenerKind::All);
+        // Missing nonce 0 keeps both transactions queued.
+        insert_with_state_nonce(&test_pool, 1, 0);
+        insert_with_state_nonce(&test_pool, 2, 0);
+        assert!(test_pool.get_pending_transactions_by_sender(sender).is_empty());
+        assert!(pending.try_recv().is_err());
+
+        // A newer validation result says nonce 0 is mined: 1 and 2 become pending while
+        // inserting 4 stays queued.
+        insert_with_state_nonce(&test_pool, 4, 1);
+        assert_eq!(test_pool.get_pending_transactions_by_sender(sender).len(), 2);
+        assert_eq!(test_pool.get_queued_transactions_by_sender(sender).len(), 1);
+        let mut received = vec![pending.try_recv().unwrap(), pending.try_recv().unwrap()];
+        received.sort_unstable();
+        assert_eq!(received, [B256::from([1; 32]), B256::from([2; 32])]);
+        assert!(pending.try_recv().is_err());
+    }
 
     #[test]
     fn test_discard_blobs_on_blob_tx_eviction() {
