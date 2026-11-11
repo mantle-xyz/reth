@@ -36,6 +36,8 @@ pub(crate) struct MantleGenesisInfo {
     pub mantle_skadi_time: Option<u64>,
     pub mantle_limb_time: Option<u64>,
     pub mantle_arsia_time: Option<u64>,
+    /// Mantle Hoodi only: activation time of the `HoodiBvmUpgrade` irregular state transition.
+    pub mantle_hoodi_bvm_upgrade_time: Option<u64>,
 }
 
 #[cfg(feature = "serde")]
@@ -52,10 +54,19 @@ impl TryFrom<&OtherFields> for MantleGenesisInfo {
     type Error = serde_json::Error;
 
     fn try_from(others: &OtherFields) -> Result<Self, Self::Error> {
-        let mantle_skadi_time = others.get_deserialized("mantleSkadiTime").transpose()?;
-        let mantle_limb_time = others.get_deserialized("mantleLimbTime").transpose()?;
-        let mantle_arsia_time = others.get_deserialized("mantleArsiaTime").transpose()?;
-        Ok(Self { mantle_skadi_time, mantle_limb_time, mantle_arsia_time })
+        // A `null` time reads as unset, as with the `serde` feature and op-geth's `*uint64`.
+        let time =
+            |key| others.get_deserialized::<Option<u64>>(key).transpose().map(Option::flatten);
+        let mantle_skadi_time = time("mantleSkadiTime")?;
+        let mantle_limb_time = time("mantleLimbTime")?;
+        let mantle_arsia_time = time("mantleArsiaTime")?;
+        let mantle_hoodi_bvm_upgrade_time = time("mantleHoodiBvmUpgradeTime")?;
+        Ok(Self {
+            mantle_skadi_time,
+            mantle_limb_time,
+            mantle_arsia_time,
+            mantle_hoodi_bvm_upgrade_time,
+        })
     }
 }
 
@@ -119,6 +130,10 @@ pub(crate) fn configure_mantle_genesis(
     if let Some(arsia_time) = mantle_genesis_info.mantle_arsia_time {
         extra_fields.insert("mantleArsiaTime".to_owned(), serde_json::json!(arsia_time));
     }
+    if let Some(upgrade_time) = mantle_genesis_info.mantle_hoodi_bvm_upgrade_time {
+        extra_fields
+            .insert("mantleHoodiBvmUpgradeTime".to_owned(), serde_json::json!(upgrade_time));
+    }
 
     genesis.config.extra_fields =
         serde_json::Value::Object(extra_fields).try_into().unwrap_or_default();
@@ -135,6 +150,7 @@ mod tests {
             mantle_skadi_time: Some(10),
             mantle_limb_time: Some(20),
             mantle_arsia_time: None,
+            mantle_hoodi_bvm_upgrade_time: None,
         };
 
         configure_mantle_genesis(&mut genesis, mantle_genesis_info);
@@ -146,5 +162,28 @@ mod tests {
         assert_eq!(genesis.config.extra_fields.get("bedrockBlock"), Some(&serde_json::json!(0)));
         assert_eq!(genesis.config.extra_fields.get("regolithTime"), Some(&serde_json::json!(0)));
         assert_eq!(genesis.config.extra_fields.get("mantleArsiaTime"), None);
+    }
+
+    /// A `null` fork time reads as unset and does not drop the other fork times, with and
+    /// without the `serde` feature.
+    #[test]
+    fn null_fork_time_reads_as_unset() {
+        let others: OtherFields = serde_json::from_value(serde_json::json!({
+            "mantleSkadiTime": 10,
+            "mantleLimbTime": 20,
+            "mantleArsiaTime": 30,
+            "mantleHoodiBvmUpgradeTime": null,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            MantleGenesisInfo::try_from(&others).unwrap(),
+            MantleGenesisInfo {
+                mantle_skadi_time: Some(10),
+                mantle_limb_time: Some(20),
+                mantle_arsia_time: Some(30),
+                mantle_hoodi_bvm_upgrade_time: None,
+            }
+        );
     }
 }
