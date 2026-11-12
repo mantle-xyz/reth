@@ -3927,6 +3927,11 @@ impl<TX: DbTxMut, N: NodeTypes> MetadataWriter for DatabaseProvider<TX, N> {
     fn write_metadata(&self, key: &str, value: Vec<u8>) -> ProviderResult<()> {
         self.tx.put::<tables::Metadata>(key.to_string(), value).map_err(Into::into)
     }
+
+    fn delete_metadata(&self, key: &str) -> ProviderResult<()> {
+        self.tx.delete::<tables::Metadata>(key.to_string(), None)?;
+        Ok(())
+    }
 }
 
 impl<TX: Send, N: NodeTypes> StorageSettingsCache for DatabaseProvider<TX, N> {

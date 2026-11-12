@@ -69,16 +69,17 @@ use reth_node_metrics::{
 };
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
-    BalConfig, BalStoreHandle, BlockHashReader, BlockNumReader, InMemoryBalStore, ProviderError,
-    ProviderFactory, ProviderResult, RocksDBProviderFactory, StageCheckpointReader,
+    BalConfig, BalStoreHandle, BlockHashReader, BlockNumReader, InMemoryBalStore, MetadataProvider,
+    ProviderError, ProviderFactory, ProviderResult, RocksDBProviderFactory, StageCheckpointReader,
     StaticFileProviderBuilder, StaticFileProviderFactory, StorageSettingsCache,
 };
 use reth_prune::{PruneMode, PruneModes, PrunerBuilder};
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_layer::JwtSecret;
 use reth_stages::{
-    sets::DefaultStages, stages::EraImportSource, MetricEvent, PipelineBuilder, PipelineTarget,
-    StageId, StageSet,
+    sets::DefaultStages,
+    stages::{EraImportSource, EraStage},
+    MetricEvent, PipelineBuilder, PipelineTarget, StageId, StageSet,
 };
 use reth_static_file::{blocks_per_file_for_prune_distance, StaticFileProducer, StaticFileSegment};
 use reth_tasks::TaskExecutor;
@@ -540,6 +541,50 @@ where
         .with_changeset_cache(changeset_cache)
         .with_bal_store(bal_store);
 
+        let build_unwind_pipeline = || {
+            let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
+
+            // Builds an unwind-only pipeline
+            PipelineBuilder::default()
+                .add_stages(
+                    DefaultStages::new(
+                        factory.clone(),
+                        tip_rx,
+                        Arc::new(NoopConsensus::default()),
+                        NoopHeaderDownloader::default(),
+                        NoopBodiesDownloader::default(),
+                        NoopEvmConfig::<Evm>::default(),
+                        self.toml_config().stages.clone(),
+                        self.prune_modes(),
+                        None,
+                    )
+                    .builder()
+                    // Recovery only moves the ERA checkpoint; it does not need an import source.
+                    .add_before(
+                        EraStage::new(None::<EraImportSource>, self.toml_config().stages.etl.clone()),
+                        StageId::Headers,
+                    )
+                    .disable_all(disabled_stages),
+                )
+                .build(
+                    factory.clone(),
+                    StaticFileProducer::new(factory.clone(), self.prune_modes()),
+                )
+        };
+
+        // Finish an interrupted unwind before trusting any checkpoint or consistency check.
+        if factory.provider()?.pipeline_unwind()?.is_some() {
+            info!(target: "reth::cli", "Resuming interrupted pipeline unwind.");
+            let mut pipeline = build_unwind_pipeline();
+            let (tx, rx) = oneshot::channel();
+            self.task_executor().spawn_critical_blocking_task("pipeline task", async move {
+                let _ = tx.send(pipeline.resume_unwind());
+            });
+            rx.await?.inspect_err(|err| {
+                error!(target: "reth::cli", %err, "failed to resume interrupted unwind")
+            })?;
+        }
+
         // Check consistency between the database and static files, returning
         // the unwind targets for each storage layer if inconsistencies are
         // found.
@@ -567,29 +612,7 @@ where
 
             info!(target: "reth::cli", %unwind_target, %inconsistency_source, "Executing unwind after consistency check.");
 
-            let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
-
-            // Builds an unwind-only pipeline
-            let pipeline = PipelineBuilder::default()
-                .add_stages(
-                    DefaultStages::new(
-                        factory.clone(),
-                        tip_rx,
-                        Arc::new(NoopConsensus::default()),
-                        NoopHeaderDownloader::default(),
-                        NoopBodiesDownloader::default(),
-                        NoopEvmConfig::<Evm>::default(),
-                        self.toml_config().stages.clone(),
-                        self.prune_modes(),
-                        None,
-                    )
-                    .builder()
-                    .disable_all(disabled_stages),
-                )
-                .build(
-                    factory.clone(),
-                    StaticFileProducer::new(factory.clone(), self.prune_modes()),
-                );
+            let pipeline = build_unwind_pipeline();
 
             // Unwinds to block
             let (tx, rx) = oneshot::channel();

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth storage provider. [MANTLE PATCH: hashed-snapshot exec-read fallback]"
+description = "Reth storage provider. [MANTLE PATCH: hashed-snapshot exec-read fallback; backport reth#27131, #27223, #27229, #27678, #28064, #28053, #28067 at aef8d3ef]"
 
 [lints]
 workspace = true
