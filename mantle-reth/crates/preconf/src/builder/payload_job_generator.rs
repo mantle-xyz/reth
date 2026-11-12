@@ -207,7 +207,7 @@ where
         let attributes_for_job = rpc_attrs.clone();
         let builder_attrs =
             OpPayloadBuilderAttributes::<TxTy<N>>::from_rpc_attrs(parent_hash, id, rpc_attrs.0)
-                .map_err(PayloadBuilderError::other)?;
+                .map_err(PayloadBuilderError::invalid_attributes)?;
 
         let config = PayloadConfig::new(Arc::new(parent_header), builder_attrs, id);
         let args: BuildArguments<OpPayloadBuilderAttributes<TxTy<N>>, OpBuiltPayload<N>> =
