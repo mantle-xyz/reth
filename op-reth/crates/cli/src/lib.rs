@@ -14,6 +14,8 @@ pub mod app;
 pub mod chainspec;
 /// Optimism CLI commands.
 pub mod commands;
+/// Optimism CLI metrics.
+pub mod metrics;
 /// Module with a codec for reading and encoding receipts in files.
 ///
 /// Enables decoding and encoding `OpGethReceipt` type. See <https://github.com/testinprod-io/op-geth/pull/1>.
@@ -146,7 +148,7 @@ mod test {
     use crate::{Cli, chainspec::OpChainSpecParser, commands::Commands};
     use clap::Parser;
     use reth_cli_commands::{NodeCommand, node::NoArgs};
-    use reth_optimism_chainspec::{BASE_MAINNET, OP_DEV};
+    use reth_optimism_chainspec::{OP_DEV, OP_MAINNET};
     use reth_optimism_node::args::RollupArgs;
 
     #[test]
@@ -173,9 +175,9 @@ mod test {
             "op-reth",
             "node",
             "--chain",
-            "base",
+            "op-mainnet",
             "--datadir",
-            "/mnt/datadirs/base",
+            "/mnt/datadirs/optimism",
             "--instance",
             "2",
             "--http",
@@ -187,7 +189,7 @@ mod test {
             "--http.api",
             "admin,debug,eth,net,trace,txpool,web3,rpc,reth,ots",
             "--rollup.sequencer-http",
-            "https://mainnet-sequencer.base.org",
+            "https://mainnet-sequencer.optimism.io",
             "--rpc-max-tracing-requests",
             "1000000",
             "--rpc.gascap",
@@ -207,64 +209,9 @@ mod test {
 
         match cmd.command {
             Commands::Node(command) => {
-                assert_eq!(command.chain.as_ref(), BASE_MAINNET.as_ref());
+                assert_eq!(command.chain.as_ref(), OP_MAINNET.as_ref());
             }
             _ => panic!("unexpected command"),
         }
-    }
-
-    /// The `debug` RPC namespace gates whether the runtime-reloadable log filter layer is
-    /// installed (backing `debug_verbosity` / `debug_vmodule`). Guards the wiring in
-    /// `CliApp::init_tracing`, which previously hardcoded `false`.
-    ///
-    /// Note: `is_namespace_enabled` treats IPC (on by default) as exposing every namespace, so
-    /// the negative case must also pass `--ipcdisable`.
-    #[test]
-    fn debug_namespace_gates_log_reload() {
-        // `debug` present in --http.api -> reload enabled
-        let with_debug = Cli::<OpChainSpecParser, RollupArgs>::parse_from([
-            "op-reth",
-            "node",
-            "--http",
-            "--http.api",
-            "eth,debug,net",
-        ]);
-        assert!(with_debug.command.debug_namespace_enabled());
-
-        // `debug` present in --ws.api -> reload enabled
-        let with_debug_ws = Cli::<OpChainSpecParser, RollupArgs>::parse_from([
-            "op-reth",
-            "node",
-            "--ws",
-            "--ws.api",
-            "eth,debug",
-        ]);
-        assert!(with_debug_ws.command.debug_namespace_enabled());
-
-        // no `debug` on http/ws AND IPC disabled -> reload disabled
-        let without_debug = Cli::<OpChainSpecParser, RollupArgs>::parse_from([
-            "op-reth",
-            "node",
-            "--http",
-            "--http.api",
-            "eth,net",
-            "--ipcdisable",
-        ]);
-        assert!(!without_debug.command.debug_namespace_enabled());
-
-        // IPC left enabled (default) exposes all namespaces -> reload enabled even without
-        // `debug` in the http api
-        let ipc_default = Cli::<OpChainSpecParser, RollupArgs>::parse_from([
-            "op-reth",
-            "node",
-            "--http",
-            "--http.api",
-            "eth,net",
-        ]);
-        assert!(ipc_default.command.debug_namespace_enabled());
-
-        // non-node command -> reload disabled
-        let non_node = Cli::<OpChainSpecParser, RollupArgs>::parse_from(["op-reth", "config"]);
-        assert!(!non_node.command.debug_namespace_enabled());
     }
 }

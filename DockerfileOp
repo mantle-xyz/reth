@@ -32,11 +32,14 @@ ENV RUSTFLAGS="$RUSTFLAGS"
 ARG FEATURES="jemalloc asm-keccak min-debug-logs"
 ENV FEATURES=$FEATURES
 
+ARG VERSION
+ARG GIT_COMMIT
+
 COPY . .
 
 # NOTE: this must stay a SINGLE physical line — the pipeline injects a RUN before
 # the line containing the build command, which would split a `\`-continued RUN.
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/app/target cargo build --profile $BUILD_PROFILE --features "$FEATURES" --bin op-reth --manifest-path /app/mantle-reth/crates/cli/Cargo.toml && cp /app/target/$BUILD_PROFILE/op-reth /app/op-reth
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/app/target MANTLE_BUILD_REF="$VERSION" MANTLE_BUILD_SHA="$GIT_COMMIT" cargo build --profile $BUILD_PROFILE --features "$FEATURES" --bin op-reth --manifest-path /app/mantle-reth/crates/cli/Cargo.toml && cp /app/target/$BUILD_PROFILE/op-reth /app/op-reth
 
 FROM ubuntu:24.04 AS runtime
 

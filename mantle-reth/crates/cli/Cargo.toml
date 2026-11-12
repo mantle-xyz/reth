@@ -28,6 +28,7 @@ reth-db.workspace = true
 reth-db-api.workspace = true
 reth-tasks.workspace = true
 reth-rpc-api.workspace = true
+reth-rpc-builder.workspace = true
 reth-rpc-eth-api.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
@@ -49,6 +50,7 @@ reth-optimism-txpool.workspace = true
 
 # mantle-reth
 mantle-reth-chainspec = { path = "../chainspec" }
+mantle-reth-flashblocks = { path = "../flashblocks" }
 mantle-reth-preconf = { path = "../preconf" }
 mantle-reth-rpc-ext = { path = "../rpc-ext" }
 
@@ -67,6 +69,8 @@ clap = { workspace = true, features = ["derive", "env"] }
 metrics.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+tokio-stream.workspace = true
+url.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

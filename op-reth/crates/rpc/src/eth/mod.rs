@@ -37,8 +37,8 @@ use reth_rpc_eth_api::{
     EthApiTypes, FromEvmError, FullEthApiServer, RpcConvert, RpcConverter, RpcNodeCore,
     RpcNodeCoreExt, RpcTypes,
     helpers::{
-        EthApiSpec, EthFees, EthState, LoadFee, LoadPendingBlock, LoadState, SpawnBlocking, Trace,
-        bal::GetBlockAccessList, pending_block::BuildPendingEnv,
+        EthApiSpec, EthFees, EthState, EthSubscriptions, LoadFee, LoadPendingBlock, LoadState,
+        SpawnBlocking, Trace, bal::GetBlockAccessList, pending_block::BuildPendingEnv,
     },
 };
 use reth_rpc_eth_types::{
@@ -93,14 +93,14 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
         sequencer_client: Option<SequencerClient>,
         min_suggested_priority_fee: U256,
         flashblocks: Option<FlashblocksListeners<N::Primitives>>,
-        enable_tx_pool_admission: bool,
+        retain_forwarded_txs: bool,
     ) -> Self {
         let inner = Arc::new(OpEthApiInner {
             eth_api,
             sequencer_client,
             min_suggested_priority_fee,
             flashblocks,
-            enable_tx_pool_admission,
+            retain_forwarded_txs,
         });
         Self { inner }
     }
@@ -380,6 +380,13 @@ where
 {
 }
 
+impl<N, Rpc> EthSubscriptions for OpEthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
+{
+}
+
 impl<N, Rpc> Trace for OpEthApi<N, Rpc>
 where
     N: RpcNodeCore,
@@ -417,10 +424,8 @@ pub struct OpEthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     ///
     /// If set, provides receivers for pending blocks, flashblock sequences, and build status.
     flashblocks: Option<FlashblocksListeners<N::Primitives>>,
-    /// Whether RPC-submitted txs are retained in the local pool after being forwarded to a
-    /// sequencer. Off by default for forwarding nodes; mirrors op-geth's
-    /// `--rollup.enabletxpooladmission`. Consulted in `send_transaction`.
-    enable_tx_pool_admission: bool,
+    /// Whether to retain forwarded transactions in the local pool.
+    retain_forwarded_txs: bool,
 }
 
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for OpEthApiInner<N, Rpc> {
@@ -440,9 +445,10 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApiInner<N, Rpc> {
         self.sequencer_client.as_ref()
     }
 
-    /// Whether RPC-submitted txs are retained in the local pool after forwarding to a sequencer.
-    const fn tx_pool_admission_enabled(&self) -> bool {
-        self.enable_tx_pool_admission
+    /// Returns whether transactions in the local pool are retained after
+    /// forwarding them to the configured sequencer if it exists.
+    const fn retain_forwarded_txs(&self) -> bool {
+        self.retain_forwarded_txs
     }
 }
 
@@ -478,11 +484,9 @@ pub struct OpEthApiBuilder<NetworkT = Optimism> {
     /// `newPayload` and `forkchoiceUpdated` calls, advancing the canonical chain state.
     /// Requires `flashblocks_url` to be set.
     flashblock_consensus: bool,
-    /// Whether SDM is explicitly enabled for integration tests.
-    sdm_enabled: bool,
-    /// Retain RPC-submitted txs in the local pool even when forwarded to a sequencer. Off by
-    /// default for forwarding nodes; mirrors op-geth's `--rollup.enabletxpooladmission`.
-    enable_tx_pool_admission: bool,
+    /// Whether to retain forwarded transactions in the local pool after
+    /// forwarding to the configured sequencer if it exists.
+    retain_forwarded_txs: bool,
     /// Marker for network types.
     _nt: PhantomData<NetworkT>,
 }
@@ -495,8 +499,7 @@ impl<NetworkT> Default for OpEthApiBuilder<NetworkT> {
             min_suggested_priority_fee: 1_000_000,
             flashblocks_url: None,
             flashblock_consensus: false,
-            sdm_enabled: false,
-            enable_tx_pool_admission: false,
+            retain_forwarded_txs: false,
             _nt: PhantomData,
         }
     }
@@ -511,8 +514,7 @@ impl<NetworkT> OpEthApiBuilder<NetworkT> {
             min_suggested_priority_fee: 1_000_000,
             flashblocks_url: None,
             flashblock_consensus: false,
-            sdm_enabled: false,
-            enable_tx_pool_admission: false,
+            retain_forwarded_txs: false,
             _nt: PhantomData,
         }
     }
@@ -547,18 +549,10 @@ impl<NetworkT> OpEthApiBuilder<NetworkT> {
         self
     }
 
-    /// Configure the temporary SDM integration-test override.
-    #[must_use]
-    pub const fn with_sdm_enabled(mut self, sdm_enabled: bool) -> Self {
-        self.sdm_enabled = sdm_enabled;
-        self
-    }
-
-    /// Retain RPC-submitted txs in the local pool even when they are forwarded to a sequencer.
-    /// Off by default for forwarding nodes; mirrors op-geth's `--rollup.enabletxpooladmission`.
-    #[must_use]
-    pub const fn with_tx_pool_admission(mut self, enable_tx_pool_admission: bool) -> Self {
-        self.enable_tx_pool_admission = enable_tx_pool_admission;
+    /// Whether to retain forwarded transactions in the local pool after
+    /// forwarding to the configured sequencer if it exists.
+    pub const fn with_retain_forwarded_txs(mut self, retain_forwarded_txs: bool) -> Self {
+        self.retain_forwarded_txs = retain_forwarded_txs;
         self
     }
 }
@@ -596,16 +590,13 @@ where
             min_suggested_priority_fee,
             flashblocks_url,
             flashblock_consensus,
-            sdm_enabled,
-            enable_tx_pool_admission,
+            retain_forwarded_txs,
             ..
         } = self;
-        let rpc_converter = RpcConverter::new(
-            OpReceiptConverter::new(ctx.components.provider().clone())
-                .with_sdm_enabled(sdm_enabled),
-        )
-        .with_mapper(OpTxInfoMapper::new(ctx.components.provider().clone()))
-        .with_tx_env_converter(reth_optimism_evm::tx::OpTxEnvConverter);
+        let rpc_converter =
+            RpcConverter::new(OpReceiptConverter::new(ctx.components.provider().clone()))
+                .with_mapper(OpTxInfoMapper::new(ctx.components.provider().clone()))
+                .with_tx_env_converter(reth_optimism_evm::tx::OpTxEnvConverter);
 
         let sequencer_client = if let Some(url) = sequencer_url {
             Some(
@@ -662,7 +653,7 @@ where
             sequencer_client,
             U256::from(min_suggested_priority_fee),
             flashblocks,
-            enable_tx_pool_admission,
+            retain_forwarded_txs,
         ))
     }
 }

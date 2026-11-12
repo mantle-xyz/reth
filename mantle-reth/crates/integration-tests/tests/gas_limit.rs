@@ -57,8 +57,11 @@ async fn txpool_reserves_l1_info_gas_overhead() {
             datadir: reth_db::test_utils::tempdir_path().into(),
             ..Default::default()
         });
-    config.network.discovery.discv5_port = 0;
-    config.network.discovery.discv5_port_ipv6 = 0;
+    config.network.discovery.discv5_port = Some(0);
+    config.network.discovery.discv5_port_ipv6 = Some(0);
+    // Off for the reason `launch_mantle_node!` spells out: building the DNS
+    // resolver can fail on the host's nameserver list and sink the launch.
+    config.network.discovery.disable_dns_discovery = true;
 
     let db = create_test_rw_db_with_path(
         config

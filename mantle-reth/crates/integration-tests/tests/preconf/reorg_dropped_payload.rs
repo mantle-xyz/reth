@@ -97,7 +97,12 @@ async fn dropped_payload_relands_via_carryover_in_fresh_build() {
     fcu_v3_commit!(node, head2);
 
     let ev = rpc.await.expect("rpc join").expect("preconf submission must not error");
-    assert_eq!(ev.status, PreconfStatus::Success, "must-land commitment; reason={:?}", ev.reason);
+    assert_eq!(
+        ev.status,
+        PreconfStatus::Success,
+        "the preconf must succeed; reason={:?}",
+        ev.reason
+    );
 
     // The commitment re-lands via carryover in the fresh build#2 — proving the
     // superseded build#1 neither stole it nor left it stranded.
