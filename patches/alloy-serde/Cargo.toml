@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.94.1"
 name = "alloy-serde"
-version = "2.4.2"
+version = "2.5.0"
 authors = ["Alloy Contributors"]
 build = false
 exclude = [
@@ -26,7 +26,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Alloy serde helpers [MANTLE PATCH: alloy-rs/alloy#4434 on 2.4.2]"
+description = "Alloy serde helpers [MANTLE PATCH: alloy-rs/alloy#4434 on 2.5.0]"
 homepage = "https://github.com/alloy-rs/alloy"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

@@ -808,6 +808,7 @@ impl<T: TransactionOrdering> TxPool<T> {
                         subpool: move_to,
                         replaced,
                         queued_reason,
+                        promoted,
                     }
                 };
 

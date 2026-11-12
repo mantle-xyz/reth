@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth node builder [MANTLE PATCH: backport reth#27218, reth#28067 at aef8d3ef]"
+description = "Reth node builder [MANTLE PATCH: backport reth#27218, reth#28067, reth#26734 at aef8d3ef]"
 readme = "README.md"
 
 [lints]

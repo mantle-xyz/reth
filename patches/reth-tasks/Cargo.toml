@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Task management [MANTLE PATCH: backport reth#27805, reth#27462 at aef8d3ef]"
+description = "Task management [MANTLE PATCH: backport reth#27805, reth#27462, reth#27313 at aef8d3ef]"
 
 [lints]
 workspace = true
@@ -24,8 +24,8 @@ metrics.workspace = true
 # misc
 dashmap = "6.2"
 parking_lot.workspace = true
-thread-priority = "3.0.0"
-tracing.workspace = true
+thread-priority.workspace = true
+tracing = { workspace = true, features = ["attributes"] }
 thiserror.workspace = true
 
 # feature `rayon`

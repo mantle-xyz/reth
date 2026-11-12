@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Transaction pool implementation. [MANTLE PATCH: PoolTransaction::extra_balance_cost hook]"
+description = "Transaction pool implementation. [MANTLE PATCH: PoolTransaction::extra_balance_cost hook; backport reth#27015, #27259, #27869 at aef8d3ef]"
 
 [lints]
 workspace = true
