@@ -1,0 +1,76 @@
+[package]
+name = "reth-rpc-eth-types"
+version = "2.4.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Types supporting implementation of 'eth' namespace RPC server API [MANTLE PATCH: backport reth#26479, #27022, #26767, #27881, #28091, #28243 at aef8d3ef]"
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-chainspec.workspace = true
+reth-chain-state.workspace = true
+reth-errors.workspace = true
+reth-evm.workspace = true
+reth-execution-types.workspace = true
+reth-metrics.workspace = true
+reth-ethereum-primitives = { workspace = true, features = ["rpc"] }
+reth-primitives-traits = { workspace = true, features = ["rpc-compat"] }
+reth-storage-api.workspace = true
+reth-revm.workspace = true
+reth-rpc-server-types.workspace = true
+reth-rpc-convert.workspace = true
+reth-tasks.workspace = true
+reth-transaction-pool.workspace = true
+reth-trie.workspace = true
+
+# ethereum
+alloy-chains.workspace = true
+alloy-eip7928.workspace = true
+alloy-eips.workspace = true
+alloy-evm = { workspace = true, features = ["overrides", "call-util"] }
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-sol-types.workspace = true
+alloy-transport.workspace = true
+alloy-rpc-client = { workspace = true, features = ["reqwest"] }
+alloy-rpc-types-eth.workspace = true
+alloy-network.workspace = true
+alloy-serde.workspace = true
+revm.workspace = true
+revm-inspectors.workspace = true
+
+# rpc
+jsonrpsee-core.workspace = true
+jsonrpsee-types.workspace = true
+
+# async
+futures.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+
+# metrics
+metrics.workspace = true
+
+# misc
+serde = { workspace = true, features = ["derive"] }
+url = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+derive_more.workspace = true
+schnellru.workspace = true
+rand.workspace = true
+tracing.workspace = true
+itertools = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+reth-db-models = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
+reth-storage-api = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+
+[features]
+js-tracer = ["revm-inspectors/js-tracer"]

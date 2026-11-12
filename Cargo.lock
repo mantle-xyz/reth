@@ -727,8 +727,6 @@ dependencies = [
 [[package]]
 name = "alloy-serde"
 version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc142e40df0c3eb5983b1637a68ab33471d8d22b8f402c9ed8260411a4e89d86"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -10331,7 +10329,6 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-types"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
