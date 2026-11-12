@@ -468,16 +468,22 @@ fn write_account_override(overrides: &mut StateOverride, address: Address, accou
     }
     entry.balance = Some(account.info.balance);
     entry.nonce = Some(account.info.nonce);
-    // Overrides must carry the unpadded original, for the reason
-    // `PendingBlocks::get_code` gives.
-    let code = account.info.code.clone().map(|code| code.original_bytes());
-    // After a destruction the explicit empty code must survive: dropping it
-    // would let the replaced storage sit under the pre-destruction code.
-    entry.code = match code {
-        Some(code) if !code.is_empty() => Some(code),
-        _ if entry.state.is_some() => Some(Bytes::new()),
-        code => code,
-    };
+    // Only code this transaction changed goes in. Every pending call hashes and
+    // analyses each override's code, so carrying merely-called contracts makes a
+    // call's cost grow with the bytecode the overlay touched. Unchanged code is
+    // read from the canonical parent, or kept from an earlier transaction's write.
+    if account.info.code_hash != account.original_info().code_hash {
+        // Overrides must carry the unpadded original, for the reason
+        // `PendingBlocks::get_code` gives.
+        let code = account.info.code.clone().map(|code| code.original_bytes());
+        // After a destruction the explicit empty code must survive: dropping it
+        // would let the replaced storage sit under the pre-destruction code.
+        entry.code = match code {
+            Some(code) if !code.is_empty() => Some(code),
+            _ if entry.state.is_some() => Some(Bytes::new()),
+            code => code,
+        };
+    }
     write_storage_override(
         overrides,
         address,
@@ -818,7 +824,7 @@ mod tests {
     }
 
     /// EIP-6780: `SELFDESTRUCT` outside the creating transaction only moves the balance; code,
-    /// nonce and storage stay.
+    /// nonce and storage stay. The code is unchanged, so the override leaves it to canonical.
     #[test]
     fn a_preexisting_contract_that_selfdestructs_keeps_its_code_and_nonce() {
         let y = address!("0x000000000000000000000000000000000000dead");
@@ -848,8 +854,85 @@ mod tests {
         let entry = &overrides[&y];
         assert_eq!(entry.balance, Some(U256::ZERO));
         assert_eq!(entry.nonce, Some(1));
-        assert_eq!(entry.code, Some(bytes!("6000ff")));
+        assert_eq!(entry.code, None);
         assert_eq!(entry.state, None);
+    }
+
+    /// Init code that deploys [`DEPLOYED_RUNTIME`]: `CODECOPY` the two bytes after
+    /// the 12-byte prefix and `RETURN` them.
+    const DEPLOYING_INIT_CODE: Bytes = bytes!("6002600c60003960026000f36001");
+    const DEPLOYED_RUNTIME: Bytes = bytes!("6001");
+
+    #[test]
+    fn a_called_contract_whose_code_is_unchanged_carries_no_code() {
+        let contract = address!("0x000000000000000000000000000000000000c0de");
+        let mut db = funded_sender_db(Address::ZERO);
+        let code = Bytecode::new_raw(DEPLOYED_RUNTIME);
+        db.insert_account_info(
+            contract,
+            AccountInfo { code_hash: code.hash_slow(), code: Some(code), ..Default::default() },
+        );
+        let mut builder = builder_over(chain_spec(), db, test_header(POST_SKADI_TIMESTAMP));
+        builder
+            .execute_transaction(
+                0,
+                legacy_tx(0, TxKind::Call(contract), 100_000, U256::from(1), Bytes::new()),
+            )
+            .expect("call");
+
+        let (_, overrides) = builder.into_db_and_state_overrides();
+        let entry = &overrides[&contract];
+        assert_eq!(entry.balance, Some(U256::from(1)));
+        assert_eq!(entry.code, None);
+    }
+
+    /// A later call that leaves the code alone must not drop what the deployment wrote.
+    #[test]
+    fn a_contract_deployed_by_the_overlay_keeps_its_code_through_later_calls() {
+        let db = State::builder().with_database(funded_sender_db(Address::ZERO)).build();
+        let mut builder = builder_over(chain_spec(), db, test_header(POST_SKADI_TIMESTAMP));
+        let deployed = Address::ZERO.create(0);
+        let created = builder
+            .execute_transaction(
+                0,
+                legacy_tx(0, TxKind::Create, 200_000, U256::ZERO, DEPLOYING_INIT_CODE),
+            )
+            .expect("create");
+        assert!(created.result.is_success());
+        builder
+            .execute_transaction(
+                1,
+                legacy_tx(1, TxKind::Call(deployed), 100_000, U256::from(1), Bytes::new()),
+            )
+            .expect("call");
+
+        let (_, overrides) = builder.into_db_and_state_overrides();
+        assert_eq!(overrides[&deployed].code, Some(DEPLOYED_RUNTIME));
+
+        let mut db = State::builder().with_database(EmptyDB::default()).build();
+        alloy_evm::overrides::apply_state_overrides(overrides, &mut db)
+            .expect("overrides must be accepted by the evm");
+        let info = db.basic(deployed).unwrap().expect("the deployment reaches the db");
+        assert_eq!(info.code.expect("code").original_bytes(), DEPLOYED_RUNTIME);
+    }
+
+    /// EIP-7702 changes an account's code without creating it.
+    #[test]
+    fn a_delegation_set_on_an_existing_account_carries_its_code() {
+        let authority = address!("0x00000000000000000000000000000000000a0a0a");
+        let delegate = address!("0x00000000000000000000000000000000000d0d0d");
+        let mut account =
+            Account::from(AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() });
+        let delegation = Bytecode::new_eip7702(delegate);
+        account.info.code_hash = delegation.hash_slow();
+        account.info.code = Some(delegation.clone());
+        account.info.nonce = 2;
+        account.mark_touch();
+
+        let mut overrides = StateOverride::default();
+        write_account_override(&mut overrides, authority, &account);
+
+        assert_eq!(overrides[&authority].code, Some(delegation.original_bytes()));
     }
 
     #[test]
