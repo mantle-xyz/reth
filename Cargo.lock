@@ -8602,21 +8602,24 @@ dependencies = [
 [[package]]
 name = "reth-exex"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-genesis",
  "alloy-primitives",
  "eyre",
  "futures",
  "itertools 0.14.0",
  "metrics",
  "parking_lot",
+ "rand 0.9.4",
  "reth-chain-state",
  "reth-chainspec",
  "reth-config",
+ "reth-db-common",
  "reth-ethereum-primitives",
  "reth-evm",
+ "reth-evm-ethereum",
  "reth-exex-types",
  "reth-fs-util",
  "reth-metrics",
@@ -8629,8 +8632,12 @@ dependencies = [
  "reth-revm",
  "reth-stages-api",
  "reth-tasks",
+ "reth-testing-utils",
  "reth-tracing",
+ "reth-trie-common",
  "rmp-serde",
+ "secp256k1 0.30.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -9800,6 +9807,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
+ "reth-stages-types",
  "reth-storage-errors",
  "reth-tasks",
  "reth-trie",
@@ -10748,9 +10756,10 @@ dependencies = [
 [[package]]
 name = "reth-trie-common"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-eth",
@@ -10758,17 +10767,21 @@ dependencies = [
  "alloy-trie",
  "arbitrary",
  "arrayvec",
+ "bincode 1.3.3",
  "bytes",
  "derive_more",
  "hash-db",
  "itertools 0.14.0",
  "nybbles",
  "plain_hasher",
+ "proptest",
+ "proptest-arbitrary-interop",
  "rayon",
  "reth-codecs",
  "reth-primitives-traits",
  "revm",
  "serde",
+ "serde_json",
  "serde_with",
 ]
 
@@ -10794,7 +10807,6 @@ dependencies = [
 [[package]]
 name = "reth-trie-parallel"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -10818,16 +10830,25 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse"
 version = "2.4.0"
-source = "git+https://github.com/paradigmxyz/reth?rev=aef8d3ef92117f91455e16969f0adf5bf7c6e9e1#aef8d3ef92117f91455e16969f0adf5bf7c6e9e1"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-trie",
+ "arbitrary",
  "either",
+ "itertools 0.14.0",
  "metrics",
+ "pretty_assertions",
+ "proptest",
+ "proptest-arbitrary-interop",
+ "rand 0.8.6",
+ "rand 0.9.4",
  "rayon",
  "reth-execution-errors",
  "reth-metrics",
  "reth-primitives-traits",
+ "reth-tracing",
+ "reth-trie",
  "reth-trie-common",
  "serde",
  "serde_json",

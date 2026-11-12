@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "[MANTLE PATCH: backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 at aef8d3ef]"
+description = "[MANTLE PATCH: backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015, reth#26421 at aef8d3ef]"
 
 [lints]
 workspace = true

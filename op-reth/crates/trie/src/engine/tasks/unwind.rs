@@ -5,7 +5,8 @@ use crossbeam_channel::Sender;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::BlockTy;
 use reth_provider::{
-    BlockHashReader, BlockReader, DatabaseProviderFactory, StateProviderFactory, StateReader,
+    BlockHashReader, BlockReader, DatabaseProviderFactory, StageCheckpointReader,
+    StateProviderFactory, StateReader,
 };
 use tracing::{debug, info};
 
@@ -20,6 +21,7 @@ impl UnwindTask {
         Evm: ConfigureEvm,
         Provider: BlockHashReader
             + StateReader
+            + StageCheckpointReader
             + DatabaseProviderFactory
             + StateProviderFactory
             + BlockReader<Block = BlockTy<Evm::Primitives>>
@@ -39,6 +41,7 @@ where
     Evm: ConfigureEvm,
     Provider: BlockHashReader
         + StateReader
+        + StageCheckpointReader
         + DatabaseProviderFactory
         + StateProviderFactory
         + BlockReader<Block = BlockTy<Evm::Primitives>>

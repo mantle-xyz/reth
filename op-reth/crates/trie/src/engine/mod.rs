@@ -66,6 +66,7 @@ impl<Block: reth_primitives_traits::Block> EngineAction<Block> {
             >,
         Provider: reth_provider::BlockHashReader
             + reth_provider::StateReader
+            + reth_provider::StageCheckpointReader
             + reth_provider::DatabaseProviderFactory
             + reth_provider::StateProviderFactory
             + reth_provider::BlockReader<Block = Block>

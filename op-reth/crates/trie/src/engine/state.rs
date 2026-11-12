@@ -14,7 +14,8 @@ use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, bounded};
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::BlockTy;
 use reth_provider::{
-    BlockHashReader, BlockReader, DatabaseProviderFactory, StateProviderFactory, StateReader,
+    BlockHashReader, BlockReader, DatabaseProviderFactory, StageCheckpointReader,
+    StateProviderFactory, StateReader,
 };
 use std::time::Duration;
 #[cfg(feature = "metrics")]
@@ -173,6 +174,7 @@ where
     Evm: ConfigureEvm,
     Provider: BlockHashReader
         + StateReader
+        + StageCheckpointReader
         + DatabaseProviderFactory
         + StateProviderFactory
         + BlockReader<Block = BlockTy<Evm::Primitives>>
