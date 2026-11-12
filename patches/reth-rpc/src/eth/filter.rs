@@ -641,12 +641,30 @@ where
             return Err(EthFilterError::QueryExceedsMaxBlocks(max_blocks_per_filter))
         }
 
-        let (tx, rx) = oneshot::channel();
+        // The scan occupies a blocking thread until it completes, so it shares the budget for
+        // blocking IO requests with `eth_call` and friends instead of pinning an unbounded number
+        // of pool threads.
+        let permit = self
+            .eth_api
+            .acquire_owned_blocking_io()
+            .await
+            .map_err(|_| EthFilterError::InternalError)?;
+
+        let (mut tx, rx) = oneshot::channel();
         let this = self.clone();
         self.task_spawner.spawn_blocking_task(async move {
-            let res =
-                this.get_logs_in_block_range_inner(&filter, from_block, to_block, limits).await;
-            let _ = tx.send(res);
+            let _permit = permit;
+            let fut = this.get_logs_in_block_range_inner(&filter, from_block, to_block, limits);
+            tokio::pin!(fut);
+            let res = tokio::select! {
+                // Range scans perform blocking reads before their first yield.
+                biased;
+                _ = tx.closed() => None,
+                res = &mut fut => Some(res),
+            };
+            if let Some(res) = res {
+                let _ = tx.send(res);
+            }
         });
 
         rx.await.map_err(|_| EthFilterError::InternalError)?
@@ -2003,5 +2021,35 @@ mod tests {
         // Each block hash should be the hash of its own header, not derived from any other header
         assert_eq!(logs[0].block_hash, Some(expected_hashes[0])); // block 100
         assert_eq!(logs[1].block_hash, Some(expected_hashes[2])); // block 102
+    }
+
+    #[tokio::test]
+    async fn test_range_scan_waits_for_blocking_io_permit() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+
+        let provider = MockEthProvider::default();
+        provider.add_header(FixedBytes::random(), alloy_consensus::Header::default());
+        let eth_api = build_test_eth_api(provider);
+
+        // take every permit so the scan has to wait for one
+        let guard = eth_api.blocking_io_task_guard().clone();
+        let permits =
+            guard.clone().acquire_many_owned(guard.available_permits() as u32).await.unwrap();
+
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let scan = eth_filter.inner.clone().get_logs_in_block_range(
+            Filter::default(),
+            0,
+            0,
+            QueryLimits::default(),
+        );
+        tokio::pin!(scan);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut scan).await.is_err(),
+            "scan must wait for a blocking IO permit"
+        );
+
+        drop(permits);
+        assert!(scan.await.unwrap().is_empty());
     }
 }

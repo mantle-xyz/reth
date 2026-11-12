@@ -566,9 +566,9 @@ where
         // (rpc-eth-api/src/helpers/state.rs) — re-sync on upstream bump. Sole divergence:
         // the geth-parity conversion below.
         //
-        // `let _permit` (not `let _`): the tracing permit (`--rpc.max-tracing-requests`) is
-        // the only concurrency bound on proof generation, held for the whole operation.
-        let _permit = self
+        // The tracing permit (`--rpc.max-tracing-requests`) is the only concurrency bound on
+        // proof generation; it moves into the blocking task so it outlives a dropped request.
+        let permit = self
             .eth_api()
             .acquire_owned_tracing()
             .await
@@ -584,8 +584,8 @@ where
             .map_err(ErrorObject::from)?;
 
         self.eth_api()
-            .spawn_blocking_io_fut(async move |eth_api| {
-                let state = eth_api.state_at_block_id(block_id).await?;
+            .spawn_blocking_io_with_state(block_id, move |_, state| {
+                let _permit = permit;
                 let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
                 let proof: AccountProof = state
                     .proof(Default::default(), address, &storage_keys)
