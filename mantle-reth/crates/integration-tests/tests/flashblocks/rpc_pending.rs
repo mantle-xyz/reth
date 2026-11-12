@@ -1657,6 +1657,10 @@ async fn call_at_pending_executes_against_the_overlay_state() {
 
     overlay_with_user_call!(harness);
 
+    // The overlay left `LOGGER`'s code alone, so the call runs canonical code.
+    let overrides = harness.pending().expect("overlay").get_state_overrides().expect("overrides");
+    assert_eq!(overrides[&LOGGER].code, None, "unchanged code must not ride in the overrides");
+
     // `LOGGER` returns its own balance, which only the overlay has credited.
     let request = serde_json::json!({ "to": format!("{LOGGER:#x}") });
 
