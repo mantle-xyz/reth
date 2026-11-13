@@ -50,7 +50,7 @@ macro_rules! proxy_metrics {
 
                 metrics::describe_counter!(
                     CONNECTIONS_BY_APP,
-                    "Downstream connections opened, by authenticated application"
+                    "Authenticated WebSocket upgrade attempts by application, including attempts subsequently rejected by connection limits"
                 );
                 metrics::describe_counter!(
                     UPSTREAM_MESSAGES,
