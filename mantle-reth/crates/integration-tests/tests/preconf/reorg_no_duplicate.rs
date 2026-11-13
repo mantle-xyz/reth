@@ -59,14 +59,16 @@ async fn relanded_commitment_not_duplicated_and_sender_continues() {
     assert_eq!(ev.status, PreconfStatus::Success);
     assert!(sealed_commit.contains(&hash));
 
-    // Reorg → rebuild at the same height (n=1) against a NEW L1 origin (200);
-    // the commitment re-lands.
-    let (mut head, sealed_re) = reorg_to!(node, base, n = 1, l1 = 200);
+    // Reorg → rebuild at the same height (n=1) against a NEW L1 origin (200).
+    // Its parent is not the head yet, so it carries only its deposit; the
+    // commitment re-lands in the block on top of it.
+    let (rebuilt, sealed_rebuilt) = reorg_to!(node, base, n = 1, l1 = 200);
     assert_eq!(
-        sealed_re[0],
-        keccak256(l1_info_deposit(200)),
-        "reorg rebuild's tx[0] must be the L1-origin-200 deposit (a real reorg)",
+        sealed_rebuilt,
+        vec![keccak256(l1_info_deposit(200))],
+        "the rebuild must carry only the L1-origin-200 deposit (a real reorg)",
     );
+    let (mut head, sealed_re) = op_node_slot_l1!(node, on = rebuilt, n = 2, l1 = 201);
     assert!(sealed_re.contains(&hash), "commitment must re-land; sealed={sealed_re:?}");
 
     // Keep building with the SAME sender's next nonces. The original hash must
@@ -77,7 +79,7 @@ async fn relanded_commitment_not_duplicated_and_sender_continues() {
         let hashn = keccak256(&txn);
         let http_c = http.clone();
         let rpc = tokio::spawn(async move { send_preconf(&http_c, txn).await });
-        let (h, sealed) = op_node_slot_l1!(node, on = head, n = 1 + nonce, l1 = 200 + nonce);
+        let (h, sealed) = op_node_slot_l1!(node, on = head, n = 2 + nonce, l1 = 201 + nonce);
         let ev = rpc.await.expect("rpc join").expect("preconf submission");
         assert_eq!(ev.status, PreconfStatus::Success, "nonce {nonce} must succeed");
         assert!(sealed.contains(&hashn), "nonce {nonce} tx must land; sealed={sealed:?}");

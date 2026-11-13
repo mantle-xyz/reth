@@ -4,7 +4,7 @@ use crate::{
     hashed_cursor::HashedCursorFactory, prefix_set::PrefixSet, proof_v2::ProofCalculator,
     trie_cursor::TrieCursorFactory,
 };
-use alloy_primitives::{map::B256Map, B256, U256};
+use alloy_primitives::{B256, U256, map::B256Map};
 use alloy_rlp::Encodable;
 use reth_execution_errors::trie::StateProofError;
 use reth_primitives_traits::Account;

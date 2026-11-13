@@ -1,5 +1,5 @@
 use crate::{
-    hashed_cursor::HashedCursor, trie_cursor::TrieCursor, walker::TrieWalker, Nibbles, TrieType,
+    Nibbles, TrieType, hashed_cursor::HashedCursor, trie_cursor::TrieCursor, walker::TrieWalker,
 };
 use alloy_primitives::B256;
 use alloy_trie::proof::AddedRemovedKeys;
@@ -94,6 +94,7 @@ where
     }
 
     /// Creates a new [`TrieNodeIter`].
+    #[allow(clippy::missing_const_for_fn)]
     fn new(walker: TrieWalker<C, K>, hashed_cursor: H, trie_type: TrieType) -> Self {
         Self {
             walker,
@@ -217,7 +218,7 @@ where
                             *key,
                             self.walker.hash().unwrap(),
                             self.walker.children_are_in_trie(),
-                        ))))
+                        ))));
                     }
                 }
             }
@@ -227,7 +228,7 @@ where
                 // Check if the walker's key is less than the key of the current hashed entry
                 if self.walker.key().is_some_and(|key| key < &Nibbles::unpack(hashed_key)) {
                     self.should_check_walker_key = false;
-                    continue
+                    continue;
                 }
 
                 // Set the next hashed entry as a leaf node and return
@@ -236,7 +237,7 @@ where
 
                 #[cfg(feature = "metrics")]
                 self.metrics.inc_leaf_nodes_returned();
-                return Ok(Some(TrieElement::Leaf(hashed_key, value)))
+                return Ok(Some(TrieElement::Leaf(hashed_key, value)));
             }
 
             // Handle seeking and advancing based on the previous hashed key
@@ -290,7 +291,7 @@ where
                         );
 
                         self.should_check_walker_key = false;
-                        continue
+                        continue;
                     }
 
                     self.current_hashed_entry = self.seek_hashed_entry(seek_key)?;
@@ -304,35 +305,30 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{TrieElement, TrieNodeIter};
     use crate::{
         hashed_cursor::{
-            mock::MockHashedCursorFactory,
-            noop::{NoopHashedCursor, NoopHashedCursorFactory},
-            HashedCursorFactory, HashedPostStateCursor, HashedPostStateCursorFactory,
+            HashedCursorFactory, HashedPostStateCursor, mock::MockHashedCursorFactory,
+            noop::NoopHashedCursor,
         },
         mock::{KeyVisit, KeyVisitType},
         trie_cursor::{
-            mock::MockTrieCursorFactory,
-            noop::{NoopAccountTrieCursor, NoopTrieCursorFactory},
-            InMemoryTrieCursorFactory, TrieCursorFactory,
+            TrieCursorFactory, mock::MockTrieCursorFactory, noop::NoopAccountTrieCursor,
         },
         walker::TrieWalker,
-        StateRoot,
     };
     use alloy_primitives::{
         b256,
         map::{B256Map, HashMap},
-        B256, U256,
     };
     use alloy_trie::{
-        BranchNodeCompact, HashBuilder, Nibbles, TrieAccount, TrieMask, EMPTY_ROOT_HASH,
+        BranchNodeCompact, EMPTY_ROOT_HASH, HashBuilder, Nibbles, TrieAccount, TrieMask,
     };
     use itertools::Itertools;
     use reth_primitives_traits::Account;
     use reth_trie_common::{
-        prefix_set::PrefixSetMut, updates::TrieUpdates, BranchNode, HashedPostState, HashedStorage,
-        LeafNode, RlpNode,
+        BranchNode, HashedPostState, LeafNode, RlpNode, prefix_set::PrefixSetMut,
+        updates::TrieUpdates,
     };
     use std::collections::BTreeMap;
 
@@ -384,6 +380,14 @@ mod tests {
 
     #[test]
     fn inserted_leaf_before_deeper_stored_branch_is_included() {
+        use crate::{
+            StateRoot,
+            hashed_cursor::{HashedPostStateCursorFactory, noop::NoopHashedCursorFactory},
+            trie_cursor::{InMemoryTrieCursorFactory, noop::NoopTrieCursorFactory},
+        };
+        use alloy_primitives::{B256, U256};
+        use reth_trie_common::HashedStorage;
+
         fn slot(prefix: &[u8]) -> B256 {
             let mut bytes = [0; 32];
             bytes[..prefix.len()].copy_from_slice(prefix);
@@ -402,13 +406,12 @@ mod tests {
             slot(&[0x10, 0xa1]),
         ];
         let inserted = slot(&[0x10, 0x00]);
-        let old_state =
-            HashedPostState::default().with_accounts([(address, Some(account()))]).with_storages([
-                (
-                    address,
-                    HashedStorage::from_iter(false, old_slots.map(|slot| (slot, U256::from(1)))),
-                ),
-            ]);
+        let old_state = HashedPostState::default()
+            .with_accounts([(address, Some(account()))])
+            .with_storages([(
+                address,
+                HashedStorage::from_iter(false, old_slots.map(|slot| (slot, U256::from(1)))),
+            )]);
         let old_sorted = old_state.clone().into_sorted();
         let (old_root, old_updates) = StateRoot::new(
             NoopTrieCursorFactory::default(),
@@ -427,12 +430,10 @@ mod tests {
                     old_slots.into_iter().chain([inserted]).map(|slot| (slot, U256::from(1))),
                 ),
             )]);
-        let delta = HashedPostState::default()
-            .with_accounts([(address, Some(account()))])
-            .with_storages([(
-                address,
-                HashedStorage::from_iter(false, [(inserted, U256::from(1))]),
-            )]);
+        let delta =
+            HashedPostState::default().with_accounts([(address, Some(account()))]).with_storages([
+                (address, HashedStorage::from_iter(false, [(inserted, U256::from(1))])),
+            ]);
         let new_sorted = new_state.clone().into_sorted();
         let rebuilt_root = StateRoot::new(
             NoopTrieCursorFactory::default(),

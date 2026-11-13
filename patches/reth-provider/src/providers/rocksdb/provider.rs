@@ -8,6 +8,7 @@ use alloy_primitives::{
 use itertools::Itertools;
 use metrics::Label;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use reth_chain_state::ExecutedBlock;
 use reth_db_api::{
     database_metrics::DatabaseMetrics,
@@ -27,8 +28,8 @@ use reth_storage_errors::{
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, CompactionPri, DBCompressionType,
     DBRawIteratorWithThreadMode, IteratorMode, OptimisticTransactionDB,
-    OptimisticTransactionOptions, Options, SnapshotWithThreadMode, Transaction,
-    WriteBatchWithTransaction, WriteOptions, DB,
+    OptimisticTransactionOptions, Options, ReadOptions, SnapshotWithThreadMode, Transaction,
+    WriteBatchWithTransaction, WriteBufferManager, WriteOptions, DB,
 };
 use std::{
     collections::BTreeMap,
@@ -133,17 +134,24 @@ const DEFAULT_BYTES_PER_SYNC: u64 = 1_048_576;
 /// to 64 MB default, with negligible impact on mean throughput.
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 128 << 20;
 
+/// Default total `RocksDB` memtable memory budget across column families (4 GiB).
+///
+/// This is a soft limit; with write stalls enabled, `RocksDB` waits for flushes once
+/// memtable arena usage exceeds the budget.
+const DEFAULT_WRITE_BUFFER_MANAGER_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
 /// Default buffer capacity for compression in batches.
 /// 4 KiB matches common block/page sizes and comfortably holds typical history values,
 /// reducing the first few reallocations without over-allocating.
 const DEFAULT_COMPRESS_BUF_CAPACITY: usize = 4096;
 
-/// Default auto-commit threshold for batch writes (4 GiB).
+/// Default auto-commit threshold for batch writes (512 MiB).
 ///
 /// When a batch exceeds this size, it is automatically committed to prevent OOM
-/// during large bulk writes. The consistency check on startup heals any crash
-/// that occurs between auto-commits.
-const DEFAULT_AUTO_COMMIT_THRESHOLD: usize = 4 * 1024 * 1024 * 1024;
+/// during large bulk writes. Keep this below the `RocksDB` write buffer manager
+/// budget so stalls can recover without waiting on a single large flush.
+/// The consistency check on startup heals any crash that occurs between auto-commits.
+const DEFAULT_AUTO_COMMIT_THRESHOLD: usize = 512 * 1024 * 1024;
 
 /// Builder for [`RocksDBProvider`].
 pub struct RocksDBBuilder {
@@ -207,6 +215,9 @@ impl RocksDBBuilder {
         options.create_missing_column_families(true);
         options.set_max_background_jobs(DEFAULT_MAX_BACKGROUND_JOBS);
         options.set_bytes_per_sync(DEFAULT_BYTES_PER_SYNC);
+        let write_buffer_manager =
+            WriteBufferManager::new_write_buffer_manager(DEFAULT_WRITE_BUFFER_MANAGER_SIZE, true);
+        options.set_write_buffer_manager(&write_buffer_manager);
 
         options.set_bottommost_compression_type(DBCompressionType::Zstd);
         options.set_bottommost_zstd_max_train_bytes(0, true);
@@ -526,6 +537,35 @@ impl RocksDBProviderInner {
         match self {
             Self::ReadWrite { db, .. } => RocksDBRawIterEnum::ReadWrite(db.raw_iterator_cf(cf)),
             Self::Secondary { db, .. } => RocksDBRawIterEnum::ReadOnly(db.raw_iterator_cf(cf)),
+        }
+    }
+
+    /// Returns a forward iterator over a column family over the keys in `[from, last]`.
+    ///
+    /// The bound matters when the range is followed by many deleted keys: an unbounded iterator
+    /// that runs out of live keys in the range skips every tombstone after it until it finds the
+    /// next live key, whereas a bounded one stops at the bound.
+    fn iterator_cf_inclusive_range(
+        &self,
+        cf: &rocksdb::ColumnFamily,
+        from: &[u8],
+        last: &[u8],
+    ) -> RocksDBIterEnum<'_> {
+        // The smallest key greater than `last` is `last` followed by a zero byte.
+        let mut upper_bound = Vec::with_capacity(last.len() + 1);
+        upper_bound.extend_from_slice(last);
+        upper_bound.push(0);
+
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_upper_bound(upper_bound);
+        let mode = IteratorMode::From(from, rocksdb::Direction::Forward);
+        match self {
+            Self::ReadWrite { db, .. } => {
+                RocksDBIterEnum::ReadWrite(db.iterator_cf_opt(cf, opts, mode))
+            }
+            Self::Secondary { db, .. } => {
+                RocksDBIterEnum::ReadOnly(db.iterator_cf_opt(cf, opts, mode))
+            }
         }
     }
 
@@ -1107,11 +1147,13 @@ impl RocksDBProvider {
         // ShardedKey is (address, highest_block_number) so this positions us at the beginning.
         let start_key = ShardedKey::new(address, 0u64);
         let start_bytes = start_key.encode();
+        // The sentinel shard is the last possible key for this address.
+        let last_bytes = ShardedKey::new(address, u64::MAX).encode();
 
-        // Create a forward iterator starting from our seek position.
-        let iter = self
-            .0
-            .iterator_cf(cf, IteratorMode::From(start_bytes.as_ref(), rocksdb::Direction::Forward));
+        // Create a forward iterator over this address's shards only, so an address without live
+        // shards does not scan the tombstones of the addresses after it.
+        let iter =
+            self.0.iterator_cf_inclusive_range(cf, start_bytes.as_ref(), last_bytes.as_ref());
 
         let mut result = Vec::new();
         for item in iter {
@@ -1157,10 +1199,11 @@ impl RocksDBProvider {
 
         let start_key = StorageShardedKey::new(address, storage_key, 0u64);
         let start_bytes = start_key.encode();
+        let last_bytes = StorageShardedKey::new(address, storage_key, u64::MAX).encode();
 
-        let iter = self
-            .0
-            .iterator_cf(cf, IteratorMode::From(start_bytes.as_ref(), rocksdb::Direction::Forward));
+        // Bounded to this slot's shards, see `account_history_shards`.
+        let iter =
+            self.0.iterator_cf_inclusive_range(cf, start_bytes.as_ref(), last_bytes.as_ref());
 
         let mut result = Vec::new();
         for item in iter {
@@ -1421,7 +1464,6 @@ impl RocksDBProvider {
         blocks: &[ExecutedBlock<N>],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
-        let mut batch = self.batch();
         let mut storage_history: BTreeMap<(Address, B256), Vec<u64>> = BTreeMap::new();
 
         for (block_idx, block) in blocks.iter().enumerate() {
@@ -1443,12 +1485,68 @@ impl RocksDBProvider {
             }
         }
 
-        // Write storage history using proper shard append logic
-        for ((address, slot), indices) in storage_history {
-            batch.append_storage_history_shard(address, slot, indices)?;
+        let shard_puts = storage_history
+            .into_par_iter()
+            .map(|((address, slot), indices)| {
+                self.storage_history_shards_to_put(address, slot, indices)
+            })
+            .collect::<ProviderResult<Vec<_>>>()?;
+
+        let mut batch = self.batch();
+        for shards in shard_puts {
+            for (key, shard) in shards {
+                batch.put::<tables::StoragesHistory>(key, &shard)?;
+            }
         }
         ctx.pending_batches.lock().push(batch.into_inner());
         Ok(())
+    }
+
+    /// Prepares storage history shard writes by reading the current last shard and appending
+    /// indices.
+    fn storage_history_shards_to_put(
+        &self,
+        address: Address,
+        storage_key: B256,
+        indices: Vec<u64>,
+    ) -> ProviderResult<Vec<(StorageShardedKey, BlockNumberList)>> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug_assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "indices must be strictly increasing: {:?}",
+            indices
+        );
+
+        let last_key = StorageShardedKey::last(address, storage_key);
+        let last_shard_opt = self.get::<tables::StoragesHistory>(last_key.clone())?;
+        let mut last_shard = last_shard_opt.unwrap_or_else(BlockNumberList::empty);
+
+        last_shard.append(indices).map_err(ProviderError::other)?;
+
+        if last_shard.len() <= NUM_OF_INDICES_IN_SHARD as u64 {
+            return Ok(vec![(last_key, last_shard)]);
+        }
+
+        let chunks = last_shard.iter().chunks(NUM_OF_INDICES_IN_SHARD);
+        let mut chunks_peekable = chunks.into_iter().peekable();
+        let mut shards = Vec::new();
+
+        while let Some(chunk) = chunks_peekable.next() {
+            let shard = BlockNumberList::new_pre_sorted(chunk);
+            let highest_block_number = if chunks_peekable.peek().is_some() {
+                shard.iter().next_back().expect("`chunks` does not return empty list")
+            } else {
+                u64::MAX
+            };
+
+            shards
+                .push((StorageShardedKey::new(address, storage_key, highest_block_number), shard));
+        }
+
+        Ok(shards)
     }
 }
 
@@ -1899,44 +1997,10 @@ impl<'a> RocksDBBatch<'a> {
     ) -> ProviderResult<()> {
         let indices: Vec<u64> = indices.into_iter().collect();
 
-        if indices.is_empty() {
-            return Ok(());
-        }
-
-        debug_assert!(
-            indices.windows(2).all(|w| w[0] < w[1]),
-            "indices must be strictly increasing: {:?}",
-            indices
-        );
-
-        let last_key = StorageShardedKey::last(address, storage_key);
-        let last_shard_opt = self.provider.get::<tables::StoragesHistory>(last_key.clone())?;
-        let mut last_shard = last_shard_opt.unwrap_or_else(BlockNumberList::empty);
-
-        last_shard.append(indices).map_err(ProviderError::other)?;
-
-        // Fast path: all indices fit in one shard
-        if last_shard.len() <= NUM_OF_INDICES_IN_SHARD as u64 {
-            self.put::<tables::StoragesHistory>(last_key, &last_shard)?;
-            return Ok(());
-        }
-
-        // Slow path: rechunk into multiple shards
-        let chunks = last_shard.iter().chunks(NUM_OF_INDICES_IN_SHARD);
-        let mut chunks_peekable = chunks.into_iter().peekable();
-
-        while let Some(chunk) = chunks_peekable.next() {
-            let shard = BlockNumberList::new_pre_sorted(chunk);
-            let highest_block_number = if chunks_peekable.peek().is_some() {
-                shard.iter().next_back().expect("`chunks` does not return empty list")
-            } else {
-                u64::MAX
-            };
-
-            self.put::<tables::StoragesHistory>(
-                StorageShardedKey::new(address, storage_key, highest_block_number),
-                &shard,
-            )?;
+        for (key, shard) in
+            self.provider.storage_history_shards_to_put(address, storage_key, indices)?
+        {
+            self.put::<tables::StoragesHistory>(key, &shard)?;
         }
 
         Ok(())
@@ -2769,7 +2833,86 @@ mod tests {
         table::Table,
         tables,
     };
+    use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
     use tempfile::TempDir;
+
+    /// Number of deleted keys `RocksDB` skipped on this thread while running `f`.
+    fn deleted_keys_skipped<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut ctx = PerfContext::default();
+        ctx.reset();
+        let result = f();
+        let skipped = ctx.metric(PerfMetric::InternalDeleteSkippedCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        (result, skipped)
+    }
+
+    fn address_at(i: u64) -> Address {
+        let mut bytes = [0u8; 20];
+        bytes[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(bytes)
+    }
+
+    /// Looking up the shards of an address whose history was already removed must not scan the
+    /// deleted history of every address after it. This happens when an unwind (or the startup
+    /// heal) removes the history of a large state import: each address's shards are looked up
+    /// in turn, so an unbounded scan makes the whole unwind quadratic in the number of accounts.
+    #[test]
+    fn test_history_shards_lookup_skips_only_own_deleted_keys() {
+        const ADDRESSES: u64 = 5_000;
+
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+        let storage_key = B256::with_last_byte(1);
+        let list = BlockNumberList::new_pre_sorted([1]);
+
+        // History for many addresses, then a live address after all of them.
+        let mut batch = provider.batch();
+        for i in 0..ADDRESSES {
+            let address = address_at(i);
+            batch
+                .put::<tables::AccountsHistory>(ShardedKey::new(address, u64::MAX), &list)
+                .unwrap();
+            batch
+                .put::<tables::StoragesHistory>(
+                    StorageShardedKey::new(address, storage_key, u64::MAX),
+                    &list,
+                )
+                .unwrap();
+        }
+        let live = Address::repeat_byte(0xff);
+        batch.put::<tables::AccountsHistory>(ShardedKey::new(live, u64::MAX), &list).unwrap();
+        batch
+            .put::<tables::StoragesHistory>(
+                StorageShardedKey::new(live, storage_key, u64::MAX),
+                &list,
+            )
+            .unwrap();
+        batch.commit().unwrap();
+
+        // Remove the history of all but the live address, as an unwind would.
+        let mut batch = provider.batch();
+        for i in 0..ADDRESSES {
+            batch.clear_account_history(address_at(i)).unwrap();
+            batch.clear_storage_history(address_at(i), storage_key).unwrap();
+        }
+        batch.commit().unwrap();
+
+        let (shards, skipped) =
+            deleted_keys_skipped(|| provider.account_history_shards(address_at(0)));
+        assert!(shards.unwrap().is_empty());
+        assert!(skipped <= 1, "account lookup skipped {skipped} deleted keys");
+
+        let (shards, skipped) =
+            deleted_keys_skipped(|| provider.storage_history_shards(address_at(0), storage_key));
+        assert!(shards.unwrap().is_empty());
+        assert!(skipped <= 1, "storage lookup skipped {skipped} deleted keys");
+
+        // The live address after the deleted range is still found.
+        assert_eq!(provider.account_history_shards(live).unwrap().len(), 1);
+        assert_eq!(provider.storage_history_shards(live, storage_key).unwrap().len(), 1);
+    }
+
 
     #[test]
     fn test_with_default_tables_registers_required_column_families() {

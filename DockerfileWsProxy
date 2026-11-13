@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1
+# Single-stage build of the mantle-ws-proxy binary, shipped as its own image.
+#
+# Separate from `DockerfileOp` because the proxy is deployed on its own: it is a
+# stateless relay between one flashblocks producer and many subscribers, scaled
+# and restarted independently of any node.
+#
+# Mirrors `DockerfileOp` deliberately — same builder image, same cache mounts —
+# except that both bases are pinned and the runtime is distroless (see each
+# FROM). Two conventions carried over from it, both load-bearing:
+#
+#  1. Keep the literal build-command string out of comments: the mantle-config
+#     pipeline injects a JFrog config RUN before any line matching it, and an
+#     occurrence in a comment above FROM would produce "no build stage".
+#  2. The compile step must stay a SINGLE physical line, for the same reason —
+#     the injected RUN would otherwise split a `\`-continued command.
+#
+# Unlike `DockerfileOp` this installs no libclang-dev/pkg-config: the proxy's
+# dependency graph is pure Rust (no bindgen, no *-sys crates). Verify with
+# `cargo tree -p mantle-reth-ws-proxy -e normal` before adding any.
+#
+# The whole tree is copied rather than using cargo-chef: the workspace has a
+# local [patch] path dependency (patches/reth-trie-common) that chef's cook step
+# cannot resolve from recipe.json alone.
+# Pinned to Debian 13 by digest: the runtime below must have a glibc at least as
+# new as this one, so the two move together. The Rust version comes from
+# `rust-toolchain.toml`, not from this image.
+FROM lukemathwalker/cargo-chef:latest-rust-1-trixie@sha256:5650c1203a4f2497c6268427c034efcb98f38ecbab86061b3d78d128aba43a1b AS builder
+WORKDIR /app
+
+LABEL org.opencontainers.image.source=https://github.com/mantle-xyz/reth
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+ARG BUILD_PROFILE=release
+ENV BUILD_PROFILE=$BUILD_PROFILE
+
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS="$RUSTFLAGS"
+
+ARG VERSION
+ARG GIT_COMMIT
+
+COPY . .
+
+# NOTE: this must stay a SINGLE physical line — see convention 2 above.
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/app/target MANTLE_BUILD_REF="$VERSION" MANTLE_BUILD_SHA="$GIT_COMMIT" cargo build --profile $BUILD_PROFILE --bin mantle-ws-proxy --manifest-path /app/mantle-reth/crates/ws-proxy/Cargo.toml && cp /app/target/$BUILD_PROFILE/mantle-ws-proxy /app/mantle-ws-proxy
+
+# Distroless: glibc and the C runtime the binary links against, and nothing
+# else — no shell, no package manager. Debian 13, matching the builder: a
+# runtime with an older glibc can refuse the binary at startup. Pinned by
+# digest. The `nonroot` variant runs as uid 65532.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS runtime
+
+# Nothing is added to the base image, and that is deliberate:
+#
+#  - No TLS: `tokio-tungstenite` is pulled in with default features only, so
+#    neither the upstream connection nor the downstream listener can use
+#    `wss://` — both ends must be plaintext `ws://` on a trusted network. The
+#    front layer that terminates TLS is expected to bound connections before
+#    the websocket upgrade (header read timeout, open-connection cap): the
+#    proxy's own limits apply only to requests it has finished parsing.
+#  - No init shim: the binary installs SIGINT/SIGTERM handlers itself
+#    (`main.rs`), so it shuts down cleanly as PID 1, and it spawns no child
+#    processes, so there are no zombies to reap.
+#  - No HEALTHCHECK: there is no shell to run one. Probe `GET /healthz` on the
+#    subscriber port from the orchestrator instead (it answers 200 while the
+#    process serves).
+
+WORKDIR /app
+COPY --from=builder --chmod=0755 /app/mantle-ws-proxy /usr/local/bin/
+
+# Downstream subscribers, then the Prometheus endpoint. Both are the binary's
+# own defaults (`--listen-addr`, `--metrics-addr`); every flag also reads an
+# environment variable of the same name upper-cased, which is how this image is
+# meant to be configured.
+#
+# Two flags have no default and the container will not start without one of
+# each: `UPSTREAM_WS` (one URI, not a list), and either `API_KEYS` or
+# `PUBLIC_ACCESS_ENABLED=true` — the endpoint refuses to come up
+# unauthenticated unless that is said out loud. Deliberate: the payload is the
+# preconfirmation stream, and this image speaks no TLS (see the runtime notes
+# above), so the surrounding network is the only access control there is.
+EXPOSE 8545 9000
+
+ENTRYPOINT ["/usr/local/bin/mantle-ws-proxy"]

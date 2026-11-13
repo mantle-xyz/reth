@@ -19,12 +19,12 @@
 //! And returns `TrieUpdatesSorted` containing the old node values.
 
 use crate::trie_cursor::TrieCursorIter;
-use alloy_primitives::{map::B256Map, B256};
-use itertools::{merge_join_by, EitherOrBoth};
+use alloy_primitives::{B256, map::B256Map};
+use itertools::{EitherOrBoth, merge_join_by};
 use reth_storage_errors::db::DatabaseError;
 use reth_trie_common::{
-    updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
     BranchNodeCompact, Nibbles,
+    updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
 };
 use std::cmp::Ordering;
 

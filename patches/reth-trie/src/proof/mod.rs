@@ -1,4 +1,5 @@
 use crate::{
+    HashBuilder, Nibbles, TRIE_ACCOUNT_RLP_MAX_SIZE,
     hashed_cursor::{
         HashedCursorFactory, HashedCursorMetricsCache, HashedStorageCursor,
         InstrumentedHashedCursor,
@@ -8,19 +9,17 @@ use crate::{
     proof_v2::{self, SyncAccountValueEncoder},
     trie_cursor::{InstrumentedTrieCursor, TrieCursorFactory, TrieCursorMetricsCache},
     walker::TrieWalker,
-    HashBuilder, Nibbles, TRIE_ACCOUNT_RLP_MAX_SIZE,
 };
 use alloy_primitives::{
-    keccak256,
+    Address, B256, keccak256,
     map::{B256Map, B256Set, HashSet},
-    Address, B256,
 };
 use alloy_rlp::{BufMut, Encodable};
 use alloy_trie::proof::AddedRemovedKeys;
 use reth_execution_errors::trie::StateProofError;
 use reth_trie_common::{
-    proof::ProofRetainer, AccountProof, BranchNodeMasks, BranchNodeMasksMap, DecodedMultiProofV2,
-    MultiProof, MultiProofTargets, MultiProofTargetsV2, StorageMultiProof,
+    AccountProof, BranchNodeMasks, BranchNodeMasksMap, DecodedMultiProofV2, MultiProof,
+    MultiProofTargets, MultiProofTargetsV2, StorageMultiProof, proof::ProofRetainer,
 };
 
 /// A struct for generating merkle proofs.
@@ -435,7 +434,7 @@ where
 
         // short circuit on empty storage
         if hashed_storage_cursor.is_storage_empty()? {
-            return Ok(StorageMultiProof::empty())
+            return Ok(StorageMultiProof::empty());
         }
 
         let mut discard_trie_cursor_metrics = TrieCursorMetricsCache::default();

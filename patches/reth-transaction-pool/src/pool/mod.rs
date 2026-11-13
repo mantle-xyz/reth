@@ -90,7 +90,7 @@ use crate::{
 
 use alloy_primitives::{
     map::{AddressSet, HashSet},
-    Address, TxHash, B256, U256,
+    Address, TxHash, B256,
 };
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use reth_eth_wire_types::HandleMempoolData;
@@ -383,8 +383,13 @@ where
         &self,
         max: usize,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let mut out = Vec::new();
-        self.append_pooled_transactions_max(max, &mut out);
+        if max == 0 {
+            return Vec::new()
+        }
+
+        let pool = self.get_pool_data();
+        let mut out = Vec::with_capacity(max.min(pool.all().len()));
+        out.extend(pool.all().transactions_iter().filter(|tx| tx.propagate).take(max).cloned());
         out
     }
 
@@ -459,13 +464,13 @@ where
         if max == 0 {
             return Vec::new();
         }
-        self.get_pool_data()
-            .all()
-            .transactions_iter()
-            .filter(|tx| tx.propagate)
-            .take(max)
-            .map(|tx| *tx.hash())
-            .collect()
+
+        let pool = self.get_pool_data();
+        let mut out = Vec::with_capacity(max.min(pool.all().len()));
+        out.extend(
+            pool.all().transactions_iter().filter(|tx| tx.propagate).take(max).map(|tx| *tx.hash()),
+        );
+        out
     }
 
     /// Converts the internally tracked transaction to the pooled format.
@@ -691,7 +696,9 @@ where
 
             // Enforce the pool size limits if at least one transaction was added successfully
             let discarded = if results.iter().any(Result::is_ok) {
-                pool.discard_worst()
+                let discarded = pool.discard_worst();
+                pool.update_size_metrics();
+                discarded
             } else {
                 Default::default()
             };
@@ -708,14 +715,20 @@ where
             self.delete_discarded_blobs(discarded.iter());
             self.with_event_listener(|listener| listener.discarded_many(&discarded));
 
-            let discarded_hashes =
-                discarded.into_iter().map(|tx| *tx.hash()).collect::<HashSet<_>>();
+            // Linear search avoids allocating a hash set for small eviction batches.
+            const MAX_LINEAR_SEARCH_DISCARDS: usize = 4;
+            let discarded_hashes = (discarded.len() > MAX_LINEAR_SEARCH_DISCARDS)
+                .then(|| discarded.iter().map(|tx| *tx.hash()).collect::<HashSet<_>>());
+            let is_discarded = |hash: &TxHash| match &discarded_hashes {
+                Some(hashes) => hashes.contains(hash),
+                None => discarded.iter().any(|tx| tx.hash() == hash),
+            };
 
             // A newly added transaction may be immediately discarded, so we need to
             // adjust the result here
             for res in &mut results {
                 if let Ok(AddedTransactionOutcome { hash, .. }) = res &&
-                    discarded_hashes.contains(hash)
+                    is_discarded(hash)
                 {
                     *res = Err(PoolError::new(*hash, PoolErrorKind::DiscardedOnInsert))
                 }
@@ -729,7 +742,7 @@ where
     ///
     /// Performs blob storage operations and sends all notifications. This should be called
     /// after the pool write lock has been released to avoid blocking pool operations.
-    fn on_added_transaction(&self, meta: AddedTransactionMeta<T::Transaction>) {
+    fn on_added_transaction(&self, mut meta: AddedTransactionMeta<T::Transaction>) {
         // Handle blob sidecar storage and notifications for EIP-4844 transactions
         if let Some(sidecar) = meta.blob_sidecar {
             let hash = *meta.added.hash();
@@ -751,6 +764,13 @@ where
         // Notify pending transaction listeners
         if let Some(pending) = meta.added.as_pending() {
             self.on_new_pending_transaction(pending);
+        }
+
+        // A parked insertion can promote older transactions when validation observes newer
+        // account state. Notify those promotions independently of the inserted transaction.
+        let promoted = meta.added.take_parked_promoted();
+        if !promoted.is_empty() {
+            self.notify_on_transaction_updates(promoted, Vec::new());
         }
 
         // Notify event listeners
@@ -1113,7 +1133,7 @@ where
         self.pool.write().prune_transactions(hashes)
     }
 
-    /// Removes and returns all transactions that are present in the pool.
+    /// Retains only transactions that are not present in the pool.
     pub fn retain_unknown<A>(&self, announcement: &mut A)
     where
         A: HandleMempoolData,
@@ -1123,6 +1143,18 @@ where
         }
         let pool = self.get_pool_data();
         announcement.retain_by_hash(|tx| !pool.contains(tx))
+    }
+
+    /// Retains only transactions that are present in the pool.
+    pub fn retain_contains<A>(&self, announcement: &mut A)
+    where
+        A: HandleMempoolData,
+    {
+        if announcement.is_empty() {
+            return
+        }
+        let pool = self.get_pool_data();
+        announcement.retain_by_hash(|tx| pool.contains(tx))
     }
 
     /// Returns the transaction by hash.
@@ -1194,22 +1226,6 @@ where
         self.get_pool_data().get_highest_consecutive_transaction_by_sender(
             sender_id.into_transaction_id(on_chain_nonce),
         )
-    }
-
-    /// Single-scan `(pending_nonce, cumulative_cost)`; `(on_chain_nonce,
-    /// U256::ZERO)` when the sender has no pooled txs. See
-    /// [`TxPool::get_pending_nonce_and_cumulative_cost`].
-    pub fn get_pending_nonce_and_cumulative_cost(
-        &self,
-        sender: Address,
-        on_chain_nonce: u64,
-    ) -> (u64, U256) {
-        match self.sender_id(&sender) {
-            Some(sender_id) => self.get_pool_data().get_pending_nonce_and_cumulative_cost(
-                sender_id.into_transaction_id(on_chain_nonce),
-            ),
-            None => (on_chain_nonce, U256::ZERO),
-        }
     }
 
     /// Returns the transaction given a [`TransactionId`]
@@ -1450,6 +1466,12 @@ pub enum AddedTransaction<T: PoolTransaction> {
         subpool: SubPool,
         /// The specific reason why the transaction is queued (if applicable).
         queued_reason: Option<QueuedReason>,
+        /// Existing transactions promoted to pending by this insertion.
+        ///
+        /// Validation can observe newer account state before pool maintenance applies it.
+        /// Insertion rechecks the sender's transactions against that state, so lower-nonce
+        /// transactions can become pending while the inserted transaction remains parked.
+        promoted: Vec<Arc<ValidPoolTransaction<T>>>,
     },
 }
 
@@ -1467,6 +1489,17 @@ impl<T: PoolTransaction> AddedTransaction<T> {
         match self {
             Self::Pending(tx) => tx.replaced.as_ref(),
             Self::Parked { replaced, .. } => replaced.as_ref(),
+        }
+    }
+
+    /// Takes promotions caused by a parked insertion for separate notification.
+    ///
+    /// Call before notifying listeners about the inserted transaction. This drains only the
+    /// parked promotions; subsequent parked event conversion handles the inserted transaction.
+    pub(crate) fn take_parked_promoted(&mut self) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        match self {
+            Self::Parked { promoted, .. } => std::mem::take(promoted),
+            Self::Pending(_) => Vec::new(),
         }
     }
 
@@ -1659,13 +1692,59 @@ mod tests {
     use crate::{
         blobstore::{BlobStore, InMemoryBlobStore},
         identifier::SenderId,
-        test_utils::{MockTransaction, TestPoolBuilder},
+        test_utils::{testing_pool, MockTransaction, TestPool, TestPoolBuilder},
         validate::ValidTransaction,
-        BlockInfo, PoolConfig, SubPoolLimit, TransactionOrigin, TransactionValidationOutcome, U256,
+        BlockInfo, PoolConfig, SubPoolLimit, TransactionListenerKind, TransactionOrigin,
+        TransactionPool, TransactionValidationOutcome, U256,
     };
     use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant};
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, B256};
     use std::{fs, path::PathBuf};
+
+    /// Inserts a transaction with an explicit validator snapshot, without running maintenance.
+    fn insert_with_state_nonce(pool: &TestPool, nonce: u64, state_nonce: u64) {
+        let transaction = MockTransaction::eip1559()
+            .with_sender(Address::with_last_byte(1))
+            .with_nonce(nonce)
+            .with_hash(B256::from([nonce as u8; 32]));
+        pool.pool
+            .add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::MAX,
+                    state_nonce,
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(transaction),
+                    propagate: true,
+                    authorities: None,
+                }],
+            )
+            .pop()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn queued_insertion_notifies_older_promotions() {
+        let test_pool = testing_pool();
+        let sender = Address::with_last_byte(1);
+        let mut pending = test_pool.pool.add_pending_listener(TransactionListenerKind::All);
+        // Missing nonce 0 keeps both transactions queued.
+        insert_with_state_nonce(&test_pool, 1, 0);
+        insert_with_state_nonce(&test_pool, 2, 0);
+        assert!(test_pool.get_pending_transactions_by_sender(sender).is_empty());
+        assert!(pending.try_recv().is_err());
+
+        // A newer validation result says nonce 0 is mined: 1 and 2 become pending while
+        // inserting 4 stays queued.
+        insert_with_state_nonce(&test_pool, 4, 1);
+        assert_eq!(test_pool.get_pending_transactions_by_sender(sender).len(), 2);
+        assert_eq!(test_pool.get_queued_transactions_by_sender(sender).len(), 1);
+        let mut received = vec![pending.try_recv().unwrap(), pending.try_recv().unwrap()];
+        received.sort_unstable();
+        assert_eq!(received, [B256::from([1; 32]), B256::from([2; 32])]);
+        assert!(pending.try_recv().is_err());
+    }
 
     #[test]
     fn test_discard_blobs_on_blob_tx_eviction() {

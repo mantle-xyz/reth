@@ -2,7 +2,7 @@
 
 use crate::Nibbles;
 use alloy_primitives::map::HashMap;
-use alloy_trie::{nodes::TrieNode, TrieMask};
+use alloy_trie::{TrieMask, nodes::TrieNode};
 
 /// Branch node masks containing `hash_mask` and `tree_mask`.
 ///

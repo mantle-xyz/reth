@@ -79,11 +79,7 @@ enum DbCursorState {
 
 impl DbCursorState {
     const fn new(cursor_wiped: bool) -> Self {
-        if cursor_wiped {
-            Self::Wiped
-        } else {
-            Self::NeedsPosition
-        }
+        if cursor_wiped { Self::Wiped } else { Self::NeedsPosition }
     }
 
     const fn entry(&self) -> Option<&(Nibbles, BranchNodeCompact)> {
@@ -233,7 +229,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                 {
                     // If overlay returns a node prior to the DB's node, or the DB is exhausted,
                     // then we return the overlay's node.
-                    return Ok(Some((mem_key, node)))
+                    return Ok(Some((mem_key, node)));
                 }
                 // All other cases:
                 // - mem_key > db_key
@@ -270,7 +266,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
             let entry = entry_inner.clone().map(|node| (key, node));
             self.set_last_key(&entry);
-            return Ok(entry)
+            return Ok(entry);
         }
 
         self.cursor_seek(key)?;
@@ -293,8 +289,29 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+        let mem_entry = self.in_memory_cursor.seek(&key);
+
+        if let Some((mem_key, Some(node))) = mem_entry &&
+            *mem_key == key
+        {
+            #[cfg(debug_assertions)]
+            {
+                self.seeked = true;
+            }
+
+            // An exact overlay hit is the first logical entry at or after `key`, so the DB cursor
+            // can stay lazy until a later operation needs it.
+            if matches!(&self.db_cursor_state, DbCursorState::Positioned((db_key, _)) if db_key < &key)
+            {
+                self.db_cursor_state = DbCursorState::NeedsPosition;
+            }
+
+            let entry = Some((key, node.clone()));
+            self.set_last_key(&entry);
+            return Ok(entry);
+        }
+
         self.cursor_seek(key)?;
-        self.in_memory_cursor.seek(&key);
 
         #[cfg(debug_assertions)]
         {
@@ -603,6 +620,97 @@ mod tests {
     }
 
     #[test]
+    fn test_seek_overlay_exact_hit_does_not_touch_db_until_next() {
+        let db_nodes = vec![
+            (Nibbles::from_nibbles([0x2]), BranchNodeCompact::new(0b0010, 0b0010, 0, vec![], None)),
+            (Nibbles::from_nibbles([0x3]), BranchNodeCompact::new(0b0011, 0b0011, 0, vec![], None)),
+        ];
+
+        let in_memory_nodes = vec![(
+            Nibbles::from_nibbles([0x2]),
+            Some(BranchNodeCompact::new(0b1111, 0b1111, 0, vec![], None)),
+        )];
+
+        let db_nodes_map: BTreeMap<Nibbles, BranchNodeCompact> = db_nodes.into_iter().collect();
+        let db_nodes_arc = Arc::new(db_nodes_map);
+        let visited_keys = Arc::new(Mutex::new(Vec::new()));
+        let mock_cursor = MockTrieCursor::new(db_nodes_arc, visited_keys.clone());
+
+        let trie_updates = TrieUpdatesSorted::new(in_memory_nodes, Default::default());
+        let mut cursor = InMemoryTrieCursor::new_account(mock_cursor, &trie_updates);
+
+        let result = cursor.seek(Nibbles::from_nibbles([0x2])).unwrap();
+        assert_eq!(
+            result,
+            Some((
+                Nibbles::from_nibbles([0x2]),
+                BranchNodeCompact::new(0b1111, 0b1111, 0, vec![], None)
+            ))
+        );
+        assert!(visited_keys.lock().is_empty(), "exact overlay hit should not touch the DB cursor");
+
+        let result = cursor.next().unwrap();
+        assert_eq!(
+            result,
+            Some((
+                Nibbles::from_nibbles([0x3]),
+                BranchNodeCompact::new(0b0011, 0b0011, 0, vec![], None)
+            ))
+        );
+        assert!(!visited_keys.lock().is_empty(), "next should lazily position the DB cursor");
+    }
+
+    #[test]
+    fn test_seek_overlay_exact_hit_repositions_stale_db_on_next() {
+        let db_nodes = vec![
+            (Nibbles::from_nibbles([0x1]), BranchNodeCompact::new(0b0001, 0b0001, 0, vec![], None)),
+            (Nibbles::from_nibbles([0x3]), BranchNodeCompact::new(0b0011, 0b0011, 0, vec![], None)),
+        ];
+
+        let in_memory_nodes = vec![(
+            Nibbles::from_nibbles([0x2]),
+            Some(BranchNodeCompact::new(0b0010, 0b0010, 0, vec![], None)),
+        )];
+
+        let db_nodes_map: BTreeMap<Nibbles, BranchNodeCompact> = db_nodes.into_iter().collect();
+        let db_nodes_arc = Arc::new(db_nodes_map);
+        let visited_keys = Arc::new(Mutex::new(Vec::new()));
+        let mock_cursor = MockTrieCursor::new(db_nodes_arc, visited_keys.clone());
+
+        let trie_updates = TrieUpdatesSorted::new(in_memory_nodes, Default::default());
+        let mut cursor = InMemoryTrieCursor::new_account(mock_cursor, &trie_updates);
+
+        let result = cursor.seek(Nibbles::from_nibbles([0x1])).unwrap();
+        assert_eq!(
+            result,
+            Some((
+                Nibbles::from_nibbles([0x1]),
+                BranchNodeCompact::new(0b0001, 0b0001, 0, vec![], None)
+            ))
+        );
+        assert_eq!(visited_keys.lock().len(), 1);
+
+        let result = cursor.seek(Nibbles::from_nibbles([0x2])).unwrap();
+        assert_eq!(
+            result,
+            Some((
+                Nibbles::from_nibbles([0x2]),
+                BranchNodeCompact::new(0b0010, 0b0010, 0, vec![], None)
+            ))
+        );
+        assert_eq!(visited_keys.lock().len(), 1, "exact overlay hit should not seek the DB");
+
+        let result = cursor.next().unwrap();
+        assert_eq!(
+            result,
+            Some((
+                Nibbles::from_nibbles([0x3]),
+                BranchNodeCompact::new(0b0011, 0b0011, 0, vec![], None)
+            ))
+        );
+    }
+
+    #[test]
     fn test_multiple_consecutive_deletes() {
         let db_nodes: Vec<(Nibbles, BranchNodeCompact)> = (1..=10)
             .map(|i| {
@@ -833,8 +941,8 @@ mod tests {
         }
 
         /// Generate a sorted vector of (Nibbles, Option<BranchNodeCompact>) entries
-        fn sorted_in_memory_nodes_strategy(
-        ) -> impl Strategy<Value = Vec<(Nibbles, Option<BranchNodeCompact>)>> {
+        fn sorted_in_memory_nodes_strategy()
+        -> impl Strategy<Value = Vec<(Nibbles, Option<BranchNodeCompact>)>> {
             prop::collection::vec(
                 (
                     prop::collection::vec(any::<u8>(), 0..2),

@@ -53,17 +53,17 @@ pub fn storage_root_prehashed<I: IntoIterator<Item = (B256, U256)>>(storage: I) 
 // ---------------------------------------------------------------------------
 
 use crate::{
+    StorageRoot,
     hashed_cursor::{
-        mock::MockHashedCursorFactory, HashedCursorFactory, HashedPostStateCursorFactory,
+        HashedCursorFactory, HashedPostStateCursorFactory, mock::MockHashedCursorFactory,
     },
     proof_v2::StorageProofCalculator,
-    trie_cursor::{mock::MockTrieCursorFactory, TrieCursorFactory},
-    StorageRoot,
+    trie_cursor::{TrieCursorFactory, mock::MockTrieCursorFactory},
 };
 use alloy_primitives::map::HashSet;
 use reth_trie_common::{
-    prefix_set::PrefixSetMut, updates::StorageTrieUpdates, BranchNodeCompact,
-    HashedPostStateSorted, HashedStorage, Nibbles, ProofTrieNodeV2, ProofV2Target,
+    BranchNodeCompact, HashedPostStateSorted, HashedStorage, Nibbles, ProofTrieNodeV2,
+    ProofV2Target, prefix_set::PrefixSetMut, updates::StorageTrieUpdates,
 };
 use std::{collections::BTreeMap, iter::once};
 

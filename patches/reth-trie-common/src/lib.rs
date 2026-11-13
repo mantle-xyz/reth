@@ -7,6 +7,8 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Vendored upstream code; upstream keeps the `unnameable-types` lint off.
+#![allow(unnameable_types)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -15,8 +17,8 @@ mod execution_witness;
 pub use execution_witness::ExecutionWitnessMode;
 
 /// Lazy initialization wrapper for trie data.
-mod lazy;
-pub use lazy::{LazyTrieData, SortedTrieData};
+mod trie_data;
+pub use trie_data::{ComputedTrieData, LazyTrieData, SortedTrieData};
 
 /// In-memory hashed state.
 mod hashed_state;
@@ -38,15 +40,17 @@ pub use account::TrieAccount;
 
 /// V2 proof targets and chunking.
 pub mod target_v2;
-pub use target_v2::{ChunkedMultiProofTargetsV2, MultiProofTargetsV2, ProofV2Target};
+pub use target_v2::{
+    ChunkedMultiProofTargetsV2, MultiProofTargetsV2, ProofV2Target, ProofV2TargetParent,
+};
 
 mod key;
 pub use key::{KeccakKeyHasher, KeyHasher};
 
 mod nibbles;
 pub use nibbles::{
-    depth_first_cmp, Nibbles, PackedStoredNibbles, PackedStoredNibblesSubKey, StoredNibbles,
-    StoredNibblesSubKey,
+    Nibbles, PackedStoredNibbles, PackedStoredNibblesSubKey, StoredNibbles, StoredNibblesSubKey,
+    depth_first_cmp,
 };
 
 mod storage;
@@ -99,5 +103,5 @@ pub mod serde_bincode_compat {
 
 /// Re-export
 pub use alloy_trie::{
-    nodes::*, proof, BranchNodeCompact, HashBuilder, TrieMask, TrieMaskIter, EMPTY_ROOT_HASH,
+    BranchNodeCompact, EMPTY_ROOT_HASH, HashBuilder, TrieMask, TrieMaskIter, nodes::*, proof,
 };

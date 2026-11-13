@@ -1,18 +1,17 @@
 use crate::{
+    TRIE_ACCOUNT_RLP_MAX_SIZE,
     hashed_cursor::{HashedCursor, HashedCursorFactory},
     prefix_set::TriePrefixSetsMut,
     proof::Proof,
     proof_v2,
     trie_cursor::TrieCursorFactory,
-    TRIE_ACCOUNT_RLP_MAX_SIZE,
 };
 use alloy_primitives::{
-    keccak256,
+    B256, Bytes, U256, keccak256,
     map::{B256Map, HashMap},
-    Bytes, B256, U256,
 };
-use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
-use alloy_trie::{nodes::BranchNodeRef, EMPTY_ROOT_HASH};
+use alloy_rlp::{EMPTY_STRING_CODE, Encodable};
+use alloy_trie::{EMPTY_ROOT_HASH, nodes::BranchNodeRef};
 use reth_execution_errors::{SparseStateTrieErrorKind, StateProofError, TrieWitnessError};
 use reth_trie_common::{
     DecodedMultiProofV2, ExecutionWitnessMode, HashedPostState, MultiProofTargetsV2, ProofV2Target,
@@ -115,7 +114,7 @@ where
     ) -> Result<B256Map<Bytes>, TrieWitnessError> {
         let is_state_empty = state.is_empty();
         if is_state_empty && !self.always_include_root_node {
-            return Ok(Default::default())
+            return Ok(Default::default());
         }
 
         // Expand wiped storages into explicit zero-value entries for every existing slot,
@@ -148,7 +147,7 @@ where
             } else {
                 (EMPTY_ROOT_HASH, Bytes::from([EMPTY_STRING_CODE]))
             };
-            return Ok(B256Map::from_iter([(root_hash, root_node)]))
+            return Ok(B256Map::from_iter([(root_hash, root_node)]));
         }
 
         // Record all nodes from multiproof in the witness.
@@ -200,12 +199,12 @@ where
                         .storage_trie_mut(&hashed_address)
                         .expect("storage trie was revealed from multiproof");
                     storage_trie
-                        .update_leaves(slot_updates, |key, min_len| {
+                        .update_leaves(slot_updates, |key, parent| {
                             targets
                                 .storage_targets
                                 .entry(hashed_address)
                                 .or_default()
-                                .push(ProofV2Target::new(key).with_min_len(min_len));
+                                .push(ProofV2Target::new(key).with_parent(parent));
                         })
                         .map_err(|err| {
                             SparseStateTrieErrorKind::SparseStorageTrie(
@@ -283,8 +282,8 @@ where
 
                 sparse_trie
                     .trie_mut()
-                    .update_leaves(account_updates, |key, min_len| {
-                        targets.account_targets.push(ProofV2Target::new(key).with_min_len(min_len));
+                    .update_leaves(account_updates, |key, parent| {
+                        targets.account_targets.push(ProofV2Target::new(key).with_parent(parent));
                     })
                     .map_err(SparseStateTrieErrorKind::from)?;
 
