@@ -71,24 +71,26 @@ async fn next_item(subscription: &mut Subscription<serde_json::Value>) -> serde_
         .expect("the notification should deserialize")
 }
 
-/// `newFlashblocks` carries the whole pending block on every slice.
+/// `newFlashblocks` and its `newSubblocks` alias carry the whole pending block on every slice.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblocks_carries_the_pending_block() {
-    let (harness, node) = launch_flashblocks_consumer!(3, 3);
-    let (client, _handle) = pubsub_client!(node, harness);
+    for kind in ["newFlashblocks", "newSubblocks"] {
+        let (harness, node) = launch_flashblocks_consumer!(3, 3);
+        let (client, _handle) = pubsub_client!(node, harness);
 
-    let mut subscription: Subscription<serde_json::Value> = client
-        .subscribe("eth_subscribe", rpc_params!["newFlashblocks"], "eth_unsubscribe")
-        .await
-        .expect("subscribe");
+        let mut subscription: Subscription<serde_json::Value> = client
+            .subscribe("eth_subscribe", rpc_params![kind], "eth_unsubscribe")
+            .await
+            .expect("subscribe");
 
-    let tx_hash = announce_slice!(harness);
+        let tx_hash = announce_slice!(harness);
 
-    let block = next_item(&mut subscription).await;
-    assert_eq!(block["number"], "0x1");
-    let transactions = block["transactions"].as_array().expect("full transactions");
-    assert_eq!(transactions.len(), 2);
-    assert_eq!(transactions[1]["hash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
+        let block = next_item(&mut subscription).await;
+        assert_eq!(block["number"], "0x1");
+        let transactions = block["transactions"].as_array().expect("full transactions");
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[1]["hash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
+    }
 }
 
 /// `pendingLogs` yields the latest slice's logs matching the filter.
@@ -172,70 +174,68 @@ async fn pending_logs_accepts_omitted_null_and_empty_filters() {
     }
 }
 
-/// `newFlashblockTransactions` defaults to hashes only.
+/// Both transaction subscription names default to hashes only.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblock_transactions_defaults_to_hashes() {
-    let (harness, node) = launch_flashblocks_consumer!(3, 3);
-    let (client, _handle) = pubsub_client!(node, harness);
+    for kind in ["newFlashblockTransactions", "newSubblockTransactions"] {
+        let (harness, node) = launch_flashblocks_consumer!(3, 3);
+        let (client, _handle) = pubsub_client!(node, harness);
 
-    let mut subscription: Subscription<serde_json::Value> = client
-        .subscribe("eth_subscribe", rpc_params!["newFlashblockTransactions"], "eth_unsubscribe")
-        .await
-        .expect("subscribe");
+        let mut subscription: Subscription<serde_json::Value> = client
+            .subscribe("eth_subscribe", rpc_params![kind], "eth_unsubscribe")
+            .await
+            .expect("subscribe");
 
-    announce_slice!(harness);
+        announce_slice!(harness);
 
-    // The L1-attributes deposit leads the slice, so it is the first hash out.
-    let hash = next_item(&mut subscription).await;
-    assert!(hash.is_string(), "expected a bare hash, got {hash}");
+        // The L1-attributes deposit leads the slice, so it is the first hash out.
+        let hash = next_item(&mut subscription).await;
+        assert!(hash.is_string(), "expected a bare hash, got {hash}");
+    }
 }
 
-/// `newFlashblockTransactions` with `true` yields full transactions with logs.
+/// Both transaction subscription names with `true` yield full transactions with logs.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblock_transactions_with_true_yields_full_objects() {
-    let (harness, node) = launch_flashblocks_consumer!(3, 3);
-    let (client, _handle) = pubsub_client!(node, harness);
+    for kind in ["newFlashblockTransactions", "newSubblockTransactions"] {
+        let (harness, node) = launch_flashblocks_consumer!(3, 3);
+        let (client, _handle) = pubsub_client!(node, harness);
 
-    let mut subscription: Subscription<serde_json::Value> = client
-        .subscribe(
-            "eth_subscribe",
-            rpc_params!["newFlashblockTransactions", true],
-            "eth_unsubscribe",
-        )
-        .await
-        .expect("subscribe");
+        let mut subscription: Subscription<serde_json::Value> = client
+            .subscribe("eth_subscribe", rpc_params![kind, true], "eth_unsubscribe")
+            .await
+            .expect("subscribe");
 
-    announce_slice!(harness);
+        announce_slice!(harness);
 
-    let transaction = next_item(&mut subscription).await;
-    assert!(transaction["logs"].is_array(), "expected a full object, got {transaction}");
-    assert_eq!(transaction["status"], "0x1");
-    assert!(transaction["gasUsed"].is_string());
+        let transaction = next_item(&mut subscription).await;
+        assert!(transaction["logs"].is_array(), "expected a full object, got {transaction}");
+        assert_eq!(transaction["status"], "0x1");
+        assert!(transaction["gasUsed"].is_string());
+    }
 }
 
-/// `newFlashblockTransactions` with a log filter selects only matching transactions.
+/// Both transaction subscription names with a log filter select only matching transactions.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_flashblock_transactions_with_a_filter_selects_matching_transactions() {
-    let (harness, node) = launch_flashblocks_consumer!(3, 3);
-    let (client, _handle) = pubsub_client!(node, harness);
+    for kind in ["newFlashblockTransactions", "newSubblockTransactions"] {
+        let (harness, node) = launch_flashblocks_consumer!(3, 3);
+        let (client, _handle) = pubsub_client!(node, harness);
 
-    let filter = serde_json::json!({ "address": format!("{LOGGER:#x}") });
-    let mut subscription: Subscription<serde_json::Value> = client
-        .subscribe(
-            "eth_subscribe",
-            rpc_params!["newFlashblockTransactions", filter],
-            "eth_unsubscribe",
-        )
-        .await
-        .expect("subscribe");
+        let filter = serde_json::json!({ "address": format!("{LOGGER:#x}") });
+        let mut subscription: Subscription<serde_json::Value> = client
+            .subscribe("eth_subscribe", rpc_params![kind, filter], "eth_unsubscribe")
+            .await
+            .expect("subscribe");
 
-    let tx_hash = announce_slice!(harness);
+        let tx_hash = announce_slice!(harness);
 
-    // Only the user call emits a log at `LOGGER`; the deposit is filtered out.
-    let transaction = next_item(&mut subscription).await;
-    assert_eq!(transaction["hash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
-    assert_eq!(transaction["from"].as_str().expect("sender"), format!("{:#x}", test_sender()));
-    assert_eq!(transaction["logs"].as_array().expect("logs").len(), 1);
+        // Only the user call emits a log at `LOGGER`; the deposit is filtered out.
+        let transaction = next_item(&mut subscription).await;
+        assert_eq!(transaction["hash"].as_str().expect("hash"), format!("{tx_hash:#x}"));
+        assert_eq!(transaction["from"].as_str().expect("sender"), format!("{:#x}", test_sender()));
+        assert_eq!(transaction["logs"].as_array().expect("logs").len(), 1);
+    }
 }
 
 /// Standard kinds are delegated to reth's own pubsub implementation.
