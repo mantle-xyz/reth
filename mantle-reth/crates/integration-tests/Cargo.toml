@@ -84,6 +84,7 @@ reth-tasks = { workspace = true }
 reth-transaction-pool = { workspace = true }
 reth-rpc-api = { workspace = true }
 reth-rpc = { workspace = true }
+reth-rpc-eth-types = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-consensus = { workspace = true }
 reth-tracing = { workspace = true }

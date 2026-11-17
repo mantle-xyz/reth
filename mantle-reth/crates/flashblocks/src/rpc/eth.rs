@@ -63,7 +63,7 @@ use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
     BlockHashReader, BlockIdReader, BlockNumReader, BlockReaderIdExt, CanonStateSubscriptions,
 };
-use reth_rpc::eth::EthFilter;
+use reth_rpc::eth::{EthFilter, filter::EthFilterError};
 use reth_rpc_eth_api::{
     EthApiTypes, EthFilterApiServer, FromEthApiError, RpcReceipt,
     helpers::{EthBlocks, EthCall, EthState, EthTransactions, FullEthApi, LoadPendingBlock},
@@ -273,12 +273,21 @@ pub struct EthApiExt<Eth: EthApiTypes, FB> {
     eth_api: Eth,
     eth_filter: EthFilter<Eth>,
     flashblocks_state: Arc<FB>,
+    max_logs_per_response: Option<usize>,
 }
 
 impl<Eth: EthApiTypes, FB> EthApiExt<Eth, FB> {
-    /// Creates a new extended Eth API instance with flashblocks support.
-    pub const fn new(eth_api: Eth, eth_filter: EthFilter<Eth>, flashblocks_state: Arc<FB>) -> Self {
-        Self { eth_api, eth_filter, flashblocks_state }
+    /// Creates an extended Eth API with flashblock support.
+    ///
+    /// `max_logs_per_response` must match `eth_filter`'s configuration; `None`
+    /// disables the limit. Single-block queries always return all matching logs.
+    pub const fn new(
+        eth_api: Eth,
+        eth_filter: EthFilter<Eth>,
+        flashblocks_state: Arc<FB>,
+        max_logs_per_response: Option<usize>,
+    ) -> Self {
+        Self { eth_api, eth_filter, flashblocks_state, max_logs_per_response }
     }
 }
 
@@ -636,6 +645,32 @@ where
                 .filter(|log| log.block_number.is_some_and(|n| n > after && n <= end)),
         );
         anchor.ensure_canonical(|number| self.eth_api.provider().block_hash(number))?;
+        // Apply reth's single-block exception to the complete range, not to
+        // its canonical and preview portions independently.
+        if start < end &&
+            let Some(max_logs) = self.max_logs_per_response &&
+            logs.len() > max_logs
+        {
+            let overflow_block = logs[max_logs].block_number.unwrap_or(end);
+            let retry_to = overflow_block.saturating_sub(1).max(start);
+            if retry_to <= tip {
+                return Err(EthFilterError::QueryExceedsMaxResults {
+                    max_logs,
+                    from_block: start,
+                    to_block: retry_to,
+                }
+                .into());
+            }
+            // Numeric end blocks above the canonical tip are not queryable
+            // here: only `toBlock: pending` includes the preview.
+            return Err(ErrorObjectOwned::owned(
+                INVALID_PARAMS_CODE,
+                format!(
+                    "query exceeds max results {max_logs}, narrow the range or add address/topics filters, or wait for canonical confirmation"
+                ),
+                None::<()>,
+            ));
+        }
         Ok(logs)
     }
 
@@ -723,9 +758,12 @@ where
                 Ok(pending_state) => {
                     // The tip is read after the preview arrives, as `fresh_pending` does;
                     // a failed read counts as stale.
-                    let tip = self.eth_api.provider().best_block_number().ok();
-                    if let Some(receipt) =
-                        tip.and_then(|tip| receipt_above_tip(&pending_state, tip, tx_hash))
+                    let head = self.eth_api.provider().chain_info().ok();
+                    if let Some(receipt) = head
+                        .filter(|head| pending_state.extends(head.best_number, head.best_hash))
+                        .and_then(|head| {
+                            receipt_above_tip(&pending_state, head.best_number, tx_hash)
+                        })
                     {
                         debug!(message = "found receipt in flashblock", tx_hash = %tx_hash);
                         return Some(receipt);

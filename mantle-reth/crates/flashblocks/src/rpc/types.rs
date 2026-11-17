@@ -51,11 +51,12 @@ pub enum ExtendedSubscriptionKind {
 /// Flashblocks-specific subscription types.
 ///
 /// The variant names determine the wire values via `rename_all = "camelCase"` and
-/// must not be changed.
+/// must not be changed. Subblocks names are accepted as deserialization aliases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FlashblocksSubscriptionKind {
     /// Fires each time a new flashblock is processed, carrying the pending block state.
+    #[serde(alias = "newSubblocks")]
     NewFlashblocks,
     /// Logs from pending flashblock state matching the filter.
     PendingLogs,
@@ -63,6 +64,7 @@ pub enum FlashblocksSubscriptionKind {
     ///
     /// Accepts `true` for full objects with logs, `false` (default) for hashes only,
     /// or a log filter object to select transactions with at least one matching log.
+    #[serde(alias = "newSubblockTransactions")]
     NewFlashblockTransactions,
 }
 
@@ -216,6 +218,25 @@ mod tests {
         assert_eq!(decoded, ExtendedSubscriptionKind::Flashblocks(kind));
         assert!(decoded.is_flashblocks());
         assert_eq!(decoded.as_standard(), None);
+    }
+
+    /// Subblocks names resolve to the existing handlers without changing legacy serialization.
+    #[rstest::rstest]
+    #[case("newSubblocks", FlashblocksSubscriptionKind::NewFlashblocks, "newFlashblocks")]
+    #[case(
+        "newSubblockTransactions",
+        FlashblocksSubscriptionKind::NewFlashblockTransactions,
+        "newFlashblockTransactions"
+    )]
+    fn subblocks_aliases_resolve_to_existing_subscription_kinds(
+        #[case] alias: &str,
+        #[case] kind: FlashblocksSubscriptionKind,
+        #[case] legacy_name: &str,
+    ) {
+        let decoded: ExtendedSubscriptionKind =
+            serde_json::from_value(serde_json::Value::from(alias)).expect("valid alias");
+        assert_eq!(decoded, ExtendedSubscriptionKind::Flashblocks(kind));
+        assert_eq!(serde_json::to_value(decoded).expect("serialization"), legacy_name);
     }
 
     /// The untagged enum must keep resolving standard kinds, otherwise a delegated
