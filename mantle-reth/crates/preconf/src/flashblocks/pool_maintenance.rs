@@ -40,12 +40,16 @@ pub struct PoolMaintenance {
 ///
 /// Two steps, and the order is not interchangeable:
 ///
-/// 1. Prune what ran. Pruning means "mined", so the sender's later transactions keep their nonce
-///    prerequisite satisfied and stay packable. Removing them instead would park everything behind
-///    a nonce gap.
-/// 2. Correct the sender nonces, for every sender executed this block rather than only this slice.
-///    Pruning drops the pool's record of a sender once nothing of theirs remains, so a nonce
-///    written before the prune goes with it.
+/// 1. Remove what ran, temporarily parking its descendants. This prevents a higher nonce from
+///    remaining pending while a stale lower nonce is removed later: the pool's candidate index only
+///    advances to the immediate successor when removing its head.
+/// 2. Correct the sender nonces and balances, promoting their eligible successors in nonce order.
+///    Cover every sender executed this block rather than only this slice. Removal drops the
+///    sender's record once nothing of theirs remains, so account updates must follow removal.
+///
+/// Removal emits discarded notifications for the executed transactions. Unlike pruning them as
+/// mined, it also parks descendants before deletion; the account update restores eligibility
+/// before the caller creates its next iterator.
 ///
 /// Step 2 runs even when the slice executed nothing. Admitting a transaction
 /// overwrites its sender's record with the nonce the validator saw, which
@@ -72,7 +76,7 @@ where
     let executed: Vec<TxHash> = info.pending_prune().iter().map(|tx| *tx.tx_hash()).collect();
     let pruned = executed.len();
     if pruned > 0 {
-        pool.prune_transactions(executed);
+        pool.remove_transactions(executed);
         info.advance_prune_cursor();
     }
 
@@ -168,7 +172,7 @@ mod tests {
             input: Default::default(),
         };
         let signature = Signature::new(U256::from(1), U256::from(1), false);
-        let envelope = OpTxEnvelope::Legacy(Signed::new_unhashed(inner, signature));
+        let envelope = OpTxEnvelope::Legacy(Signed::new_unchecked(inner, signature, *tx.hash()));
         info.record(Recovered::new_unchecked(envelope, tx.sender()));
     }
 
@@ -188,11 +192,64 @@ mod tests {
         pool.queued_transactions().iter().any(|tx| *tx.hash() == hash)
     }
 
-    /// The block is not sealed, so nothing tells the pool those transactions
-    /// were mined. Pruning says it for us, and unlike removing them it leaves
-    /// the sender's later transactions packable.
+    /// A new build can execute a successor before the pool receives its
+    /// parent's canonical notification. Slice maintenance must still retain
+    /// the lowest unexecuted transaction as the sender's candidate.
     #[tokio::test]
-    async fn pruning_leaves_the_successors_of_an_executed_transaction_packable() {
+    async fn a_delayed_parent_notification_does_not_strand_pending_successors() {
+        let pool = testing_pool();
+        let alice = Address::repeat_byte(0xaa);
+        let transactions: Vec<_> = (0..7).map(|nonce| tx(alice, nonce)).collect();
+        let mut hashes = Vec::new();
+        for transaction in &transactions[..6] {
+            hashes.push(submit(&pool, transaction.clone()).await);
+        }
+
+        // Nonce 0 is already in the parent, but its pool notification is late.
+        // The current build skips it as nonce-too-low and executes nonce 1.
+        let mut info = Info::default();
+        note_executed(&mut info, &transactions[1]);
+        let outcome = maintain_pool_at_slice_boundary(&pool, &Balances::funded([alice]), &mut info);
+        assert_eq!(outcome.pruned, 1);
+        assert!(!is_pending(&pool, hashes[0]));
+        assert!(!is_pending(&pool, hashes[1]));
+        for hash in &hashes[2..] {
+            assert!(is_pending(&pool, *hash));
+        }
+
+        let new_arrival = submit(&pool, transactions[6].clone()).await;
+        assert!(is_queued(&pool, new_arrival));
+        maintain_pool_at_slice_boundary(&pool, &Balances::funded([alice]), &mut info);
+        assert!(is_pending(&pool, new_arrival));
+        let selected = pool.best_transactions().next().expect("pending transactions exist");
+        assert_eq!(
+            *selected.transaction.get_nonce(),
+            2,
+            "nonces 2 through 5 remain pending and must precede the new arrival at nonce 6",
+        );
+
+        // Once nonce 1 lands, later account notifications and empty builds
+        // must still choose nonce 2 without requiring another submission.
+        for _ in 0..3 {
+            pool.update_accounts(vec![ChangedAccount {
+                address: alice,
+                nonce: 2,
+                balance: U256::from(u128::MAX),
+            }]);
+            maintain_pool_at_slice_boundary(
+                &pool,
+                &Balances::funded([alice]),
+                &mut Info::default(),
+            );
+            let next = pool.best_transactions().next().expect("pending transactions exist");
+            assert_eq!(*next.transaction.get_nonce(), 2);
+        }
+    }
+
+    /// Removing executed transactions parks their successors, and the following
+    /// account update must make those successors packable before returning.
+    #[tokio::test]
+    async fn maintenance_restores_the_successors_of_an_executed_transaction() {
         let pool = testing_pool();
         let alice = Address::repeat_byte(0xaa);
         let first = tx(alice, 0);
@@ -208,11 +265,10 @@ mod tests {
         assert!(is_pending(&pool, third));
     }
 
-    /// The contrast that makes the choice of `prune` load-bearing: removing
-    /// the same transaction parks everything behind it, because to the pool a
-    /// removal leaves a nonce gap.
+    /// Removal alone parks successors, so maintenance must follow it with an
+    /// account update before taking the next best-transaction iterator.
     #[tokio::test]
-    async fn removing_the_same_transaction_would_park_its_successors() {
+    async fn removal_without_an_account_update_parks_successors() {
         let pool = testing_pool();
         let alice = Address::repeat_byte(0xaa);
         let first = tx(alice, 0);
@@ -273,11 +329,11 @@ mod tests {
         assert!(is_pending(&pool, second));
     }
 
-    /// Pruning clears the pool's record of a sender once nothing of theirs is
+    /// Removal clears the pool's record of a sender once nothing of theirs is
     /// left, so advancing the nonce first writes it somewhere that is about to
     /// be discarded.
     #[tokio::test]
-    async fn advancing_the_nonce_before_pruning_loses_it() {
+    async fn advancing_the_nonce_before_removal_loses_it() {
         let pool = testing_pool();
         let alice = Address::repeat_byte(0xaa);
         let first = tx(alice, 0);
@@ -289,11 +345,11 @@ mod tests {
             nonce: 1,
             balance: U256::from(u128::MAX),
         }]);
-        pool.prune_transactions(vec![*first.hash()]);
+        pool.remove_transactions(vec![*first.hash()]);
 
         let second = submit(&pool, tx(alice, 1)).await;
 
-        assert!(is_queued(&pool, second), "the nonce written before the prune did not survive it",);
+        assert!(is_queued(&pool, second), "the nonce written before removal did not survive it",);
     }
 
     /// A balance that cannot be read must not be guessed upwards: parking the
@@ -330,7 +386,7 @@ mod tests {
     }
 
     /// Maintenance covers what the last slice executed, so running it twice
-    /// must not re-prune what the pool has already been told about.
+    /// must not remove the same executed transactions again.
     #[tokio::test]
     async fn maintenance_covers_each_transaction_once() {
         let pool = testing_pool();

@@ -1010,3 +1010,62 @@ async fn a_resume_from_before_the_archive_replays_the_whole_window() {
         "everything the archive still holds is replayed, oldest first",
     );
 }
+
+/// Ordinary submissions must keep making progress across slice and block boundaries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn ordinary_continuous_senders_remain_packable_across_blocks() {
+    use alloy_primitives::U256;
+    let cfg = PreconfCfgBuilder::new().build();
+    let fb =
+        FlashblockProducerConfig { block_time: Duration::from_millis(200), ..flashblocks_cfg() };
+    let (mut node, http, _wallet, chain_id, _fb_addr) =
+        crate::launch_flashblocks_node!(cfg, fb).await;
+    let signers = Wallet::new(6).with_chain_id(chain_id).wallet_gen();
+    let signers = &signers[1..6];
+    let mut submissions = Vec::new();
+    for (index, signer) in signers.iter().enumerate() {
+        let mut raws = Vec::new();
+        for nonce in 0..220u64 {
+            let recipient = signers[(index + 1 + nonce as usize % 4) % 5].address();
+            let request = TransactionRequest {
+                chain_id: Some(chain_id),
+                nonce: Some(nonce),
+                to: Some(TxKind::Call(recipient)),
+                value: Some(U256::from(1 + nonce % 1000)),
+                gas: Some(21_000),
+                max_fee_per_gas: Some(20_000_000_000),
+                max_priority_fee_per_gas: Some(1_000_000_000),
+                ..Default::default()
+            };
+            let raw: Bytes = TransactionTestContext::sign_tx(signer.clone(), request)
+                .await
+                .encoded_2718()
+                .into();
+            raws.push(raw);
+        }
+        let http = http.clone();
+        submissions.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut hashes = Vec::new();
+            for raw in raws {
+                interval.tick().await;
+                hashes.push(crate::helpers::send_normal(&http, raw).await.expect("ordinary RPC"));
+            }
+            hashes
+        }));
+    }
+    let mut sealed = std::collections::HashSet::new();
+    for block in 0..14 {
+        // Vary the phase of resolution relative to the 100 ms arrival/tick grid.
+        let payload = build_one_block!(node, Duration::from_millis(1713 + block % 4 * 47));
+        sealed.extend(payload.block().body().transactions().map(|tx| tx.tx_hash()));
+        crate::canonize_built!(node, payload);
+        eprintln!("continuous ordinary submissions: block {block}, {} sealed", sealed.len());
+    }
+    for submission in submissions {
+        for hash in submission.await.expect("sender task") {
+            assert!(sealed.contains(&hash), "accepted ordinary transaction stranded: {hash}");
+        }
+    }
+    assert_eq!(sealed.len(), 1100);
+}
