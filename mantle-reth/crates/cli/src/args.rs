@@ -79,6 +79,7 @@ impl MantleArgs {
     /// permitted but unusual, and `main` warns about it.
     ///
     /// Preconf is validated first: the publisher's checks read its slot duration.
+    /// Neither consumer may be combined with local retention of forwarded transactions.
     ///
     /// # Errors
     /// See [`MantleArgsError`].
@@ -98,6 +99,11 @@ impl MantleArgs {
             .transpose()?;
         let consumer =
             self.flashblocks_consumer.into_config(self.rollup.flashblocks_url.as_ref())?;
+        if self.rollup.retain_forwarded_txs &&
+            (consumer.is_some() || self.rollup.flashblocks_url.is_some())
+        {
+            return Err(MantleArgsError::LocalRetentionWithConsumer);
+        }
 
         Ok(MantleConfigs { preconf, publisher, consumer })
     }
@@ -145,6 +151,15 @@ pub enum MantleArgsError {
     /// The consumer was enabled in a combination that cannot work.
     #[error(transparent)]
     Consumer(#[from] FlashblocksConsumerArgsError),
+
+    /// Local transaction retention conflicts with consumer-backed pending state.
+    #[error(
+        "--rollup.retain-forwarded-txs is mutually exclusive with --flashblocks.websocket-url \
+         (alias --subblocks.websocket-url) and --flashblocks-url (alias --websocket-url): \
+         locally retained transactions may not appear in consumed flashblocks, producing \
+         inconsistent pending responses; disable local retention when using a consumer"
+    )]
+    LocalRetentionWithConsumer,
 }
 
 /// Flashblock consumer CLI flags.
@@ -167,6 +182,7 @@ pub struct FlashblocksConsumerArgs {
     ///
     /// Every flag in this group also answers to a `--subblocks.` prefix, the
     /// name Optimism's documentation now uses for the same thing.
+    /// Cannot be combined with `--rollup.retain-forwarded-txs`.
     #[arg(long = "flashblocks.websocket-url", alias = "subblocks.websocket-url")]
     pub websocket_url: Option<Url>,
 
@@ -1062,6 +1078,63 @@ mod tests {
         assert_eq!(cfg.max_trailing_depth, 7);
         assert_eq!(cfg.max_leading_depth, 9);
         assert_eq!(cfg.max_cache_ahead_blocks, 11);
+    }
+
+    #[test]
+    fn consumers_reject_local_transaction_retention_at_startup() {
+        for flag in [
+            "--flashblocks.websocket-url",
+            "--subblocks.websocket-url",
+            "--flashblocks-url",
+            "--websocket-url",
+        ] {
+            for forwarding in [false, true] {
+                let mut argv = vec![flag, "ws://sequencer:1111", "--rollup.retain-forwarded-txs"];
+                if forwarding {
+                    argv.extend(["--rollup.sequencer", "http://sequencer:8545"]);
+                }
+                let error = parse_mantle(&argv)
+                    .into_configs()
+                    .expect_err("consumer state and local transaction retention must be exclusive")
+                    .to_string();
+                assert!(error.contains("--rollup.retain-forwarded-txs"), "{error}");
+                assert!(error.contains(flag), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn consumers_without_local_transaction_retention_remain_valid() {
+        for flag in [
+            "--flashblocks.websocket-url",
+            "--subblocks.websocket-url",
+            "--flashblocks-url",
+            "--websocket-url",
+        ] {
+            let configs = parse_mantle(&[
+                flag,
+                "ws://sequencer:1111",
+                "--rollup.sequencer",
+                "http://sequencer:8545",
+            ])
+            .into_configs()
+            .expect("forwarding without local retention is compatible with consumer state");
+            assert_eq!(configs.consumer.is_some(), flag.contains(".websocket-url"));
+        }
+    }
+
+    #[test]
+    fn local_transaction_retention_without_a_consumer_remains_valid() {
+        for forwarding in [false, true] {
+            let mut argv = vec!["--rollup.retain-forwarded-txs"];
+            if forwarding {
+                argv.extend(["--rollup.sequencer", "http://sequencer:8545"]);
+            }
+            let configs = parse_mantle(&argv)
+                .into_configs()
+                .expect("local retention without a consumer remains supported");
+            assert!(configs.consumer.is_none());
+        }
     }
 
     #[test]
