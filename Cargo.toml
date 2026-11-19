@@ -63,11 +63,13 @@ members = [
   "mantle-reth/crates/preconf/",
   "mantle-reth/crates/ws-proxy/",
 
-  # Keep the vendored trie regression in the workspace test gate.
+  # Run regression tests for these backports in workspace CI.
   "patches/reth-trie/",
   "patches/reth-trie-common/",
   "patches/reth-trie-sparse/",
   "patches/reth-exex/",
+  "patches/reth-tasks/",
+  "patches/reth-cli-runner/",
 
   # Optimism ecosystem crates (from mantle-xyz/mantle-v2, git dependency)
   # (no longer workspace members — referenced via git dep)

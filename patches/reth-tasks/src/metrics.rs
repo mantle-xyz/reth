@@ -3,8 +3,8 @@
 use core::fmt;
 
 use reth_metrics::{
-    metrics::{Counter, Histogram},
     Metrics,
+    metrics::{Counter, Histogram},
 };
 use std::time::Duration;
 

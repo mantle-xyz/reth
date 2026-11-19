@@ -5,17 +5,17 @@ use std::{
     any::Any,
     cell::RefCell,
     future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
     },
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
     thread,
     time::Instant,
 };
-use tokio::sync::{oneshot, AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, oneshot};
 
 /// RPC Tracing call guard semaphore.
 ///

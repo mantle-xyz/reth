@@ -7,21 +7,21 @@
 //! - [`BlockingTaskGuard`] for rate-limiting expensive operations (with `rayon` feature)
 
 #[cfg(feature = "rayon")]
-use crate::pool::{build_pool_with_panic_handler, BlockingTaskGuard, BlockingTaskPool, WorkerPool};
+use crate::pool::{BlockingTaskGuard, BlockingTaskPool, WorkerPool, build_pool_with_panic_handler};
 use crate::{
+    PanickedTaskError, TaskEvent, TaskManager,
     metrics::{IncCounterOnDrop, TaskExecutorMetrics},
     shutdown::{GracefulShutdown, GracefulShutdownGuard, Shutdown},
     worker_map::WorkerMap,
-    PanickedTaskError, TaskEvent, TaskManager,
 };
-use futures_util::{future::select, Future, FutureExt, TryFutureExt};
+use futures_util::{Future, FutureExt, TryFutureExt, future::select};
 #[cfg(feature = "rayon")]
 use std::{num::NonZeroUsize, thread::available_parallelism};
 use std::{
     pin::pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -597,7 +597,7 @@ impl Runtime {
             })
             .is_some()
         {
-            return true
+            return true;
         }
 
         if let Some(func) = func.lock().take() {

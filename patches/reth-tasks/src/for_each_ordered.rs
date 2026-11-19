@@ -111,7 +111,7 @@ where
     I::Item: Send,
     F: FnMut(I::Item),
 {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let n = iter.len();
     if n == 0 {
@@ -166,8 +166,8 @@ mod tests {
     use super::*;
     use rayon::prelude::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Barrier,
+        atomic::{AtomicUsize, Ordering},
     };
 
     #[test]
