@@ -168,7 +168,7 @@ mod tests {
             input: Default::default(),
         };
         let signature = Signature::new(U256::from(1), U256::from(1), false);
-        let envelope = OpTxEnvelope::Legacy(Signed::new_unhashed(inner, signature));
+        let envelope = OpTxEnvelope::Legacy(Signed::new_unchecked(inner, signature, *tx.hash()));
         info.record(Recovered::new_unchecked(envelope, tx.sender()));
     }
 
@@ -186,6 +186,89 @@ mod tests {
 
     fn is_queued(pool: &TestPool, hash: TxHash) -> bool {
         pool.queued_transactions().iter().any(|tx| *tx.hash() == hash)
+    }
+
+    /// Pruning a mined prefix must not let a later arrival overtake the lowest
+    /// pending nonce, even if the mined hashes were supplied out of order.
+    #[tokio::test]
+    async fn pruning_a_prefix_out_of_order_keeps_the_lowest_successor_packable() {
+        let pool = testing_pool();
+        let alice = Address::repeat_byte(0xaa);
+        let first = submit(&pool, tx(alice, 0)).await;
+        let second = submit(&pool, tx(alice, 1)).await;
+        let third = submit(&pool, tx(alice, 2)).await;
+        pool.prune_transactions(vec![second, first]);
+        pool.update_accounts(vec![ChangedAccount {
+            address: alice,
+            nonce: 2,
+            balance: U256::from(u128::MAX),
+        }]);
+        let fourth = submit(&pool, tx(alice, 3)).await;
+        assert!(is_queued(&pool, fourth));
+        pool.update_accounts(vec![ChangedAccount {
+            address: alice,
+            nonce: 2,
+            balance: U256::from(u128::MAX),
+        }]);
+
+        assert!(is_pending(&pool, third));
+        assert!(is_pending(&pool, fourth));
+        let selected = pool.best_transactions().next().expect("pending successor exists");
+        assert_eq!(*selected.hash(), third, "the higher nonce must wait for its predecessor");
+    }
+
+    /// A new build can execute a successor before the pool receives its
+    /// parent's canonical notification. Slice maintenance must still retain
+    /// the lowest unexecuted transaction as the sender's candidate.
+    #[tokio::test]
+    async fn a_delayed_parent_notification_does_not_strand_pending_successors() {
+        let pool = testing_pool();
+        let alice = Address::repeat_byte(0xaa);
+        let transactions: Vec<_> = (0..7).map(|nonce| tx(alice, nonce)).collect();
+        let mut hashes = Vec::new();
+        for transaction in &transactions[..6] {
+            hashes.push(submit(&pool, transaction.clone()).await);
+        }
+
+        // Nonce 0 is already in the parent, but its pool notification is late.
+        // The current build skips it as nonce-too-low and executes nonce 1.
+        let mut info = Info::default();
+        note_executed(&mut info, &transactions[1]);
+        let outcome = maintain_pool_at_slice_boundary(&pool, &Balances::funded([alice]), &mut info);
+        assert_eq!(outcome.pruned, 1);
+        assert!(!is_pending(&pool, hashes[0]));
+        assert!(!is_pending(&pool, hashes[1]));
+        for hash in &hashes[2..] {
+            assert!(is_pending(&pool, *hash));
+        }
+
+        let new_arrival = submit(&pool, transactions[6].clone()).await;
+        assert!(is_queued(&pool, new_arrival));
+        maintain_pool_at_slice_boundary(&pool, &Balances::funded([alice]), &mut info);
+        assert!(is_pending(&pool, new_arrival));
+        let selected = pool.best_transactions().next().expect("pending transactions exist");
+        assert_eq!(
+            *selected.transaction.get_nonce(),
+            2,
+            "nonces 2 through 5 remain pending and must precede the new arrival at nonce 6",
+        );
+
+        // Once nonce 1 lands, later account notifications and empty builds
+        // must still choose nonce 2 without requiring another submission.
+        for _ in 0..3 {
+            pool.update_accounts(vec![ChangedAccount {
+                address: alice,
+                nonce: 2,
+                balance: U256::from(u128::MAX),
+            }]);
+            maintain_pool_at_slice_boundary(
+                &pool,
+                &Balances::funded([alice]),
+                &mut Info::default(),
+            );
+            let next = pool.best_transactions().next().expect("pending transactions exist");
+            assert_eq!(*next.transaction.get_nonce(), 2);
+        }
     }
 
     /// The block is not sealed, so nothing tells the pool those transactions
