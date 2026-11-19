@@ -131,7 +131,8 @@ lint: fmt clippy
 
 # PR-tier tests: every test that runs in well under a minute — workspace unit tests
 # plus ALL Mantle integration suites (offline `replay`/`token_ratio_midblock` and the
-# node-spawning `it` harness, incl. the estimate_total_fee token_ratio regression).
+# node-spawning `it` harness, incl. the estimate_total_fee token_ratio regression),
+# and the vendored sparse trie's integration tests.
 #
 # `--lib --bins`, not `--lib`: `--lib` never compiles a crate's `main.rs`, so a bin
 # crate's own `mod tests` (ws-proxy's startup-argument checks live there) would run
@@ -161,6 +162,7 @@ test-ci:
   cargo test --workspace --lib --bins
   cargo test -p mantle-reth-cli --test build_version
   cargo nextest run -p mantle-reth-integration-tests --tests
+  cargo test -p reth-trie-sparse --test '*'
   cargo test --doc --workspace
 
 # Run the full local test suite (examples + benches + all features)
