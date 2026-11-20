@@ -28,10 +28,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
       - uses: extractions/setup-just@v2
       - run: just test
       - run: just test-doc
+      # Quarantined with `#[ignore]` because they fail under the parallel suite's
+      # load, not on their own: serially they pass. Nothing else runs ignored
+      # tests, so this is the one place they still gate anything.
+      - run: just test-quarantined

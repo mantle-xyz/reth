@@ -1,0 +1,61 @@
+//! Loads a receipt from database. Helper trait for `eth_` block and transaction RPC methods, that
+//! loads receipt data w.r.t. network.
+
+use std::sync::Arc;
+
+use crate::{EthApiTypes, RpcNodeCoreExt, RpcReceipt};
+use alloy_consensus::{transaction::TransactionMeta, TxReceipt};
+use futures::Future;
+use reth_primitives_traits::Recovered;
+use reth_rpc_convert::{transaction::ConvertReceiptInput, RpcConvert};
+use reth_rpc_eth_types::{
+    error::FromEthApiError, utils::calculate_gas_used_and_next_log_index, EthApiError,
+};
+use reth_storage_api::{ProviderReceipt, ProviderTx};
+
+/// Assembles transaction receipt data w.r.t to network.
+///
+/// Behaviour shared by several `eth_` RPC methods, not exclusive to `eth_` receipts RPC methods.
+pub trait LoadReceipt:
+    EthApiTypes<RpcConvert: RpcConvert<Primitives = Self::Primitives>> + RpcNodeCoreExt + Send + Sync
+{
+    /// Helper method for `eth_getBlockReceipts` and `eth_getTransactionReceipt`.
+    ///
+    /// If `all_receipts` is `Some`, skips the cache lookup for receipts entirely.
+    fn build_transaction_receipt(
+        &self,
+        tx: Recovered<ProviderTx<Self::Provider>>,
+        meta: TransactionMeta,
+        receipt: ProviderReceipt<Self::Provider>,
+        all_receipts: Option<Arc<Vec<ProviderReceipt<Self::Provider>>>>,
+    ) -> impl Future<Output = Result<RpcReceipt<Self::NetworkTypes>, Self::Error>> + Send {
+        async move {
+            let hash = meta.block_hash;
+            // Use pre-fetched receipts if available, otherwise fetch from cache.
+            let all_receipts = match all_receipts {
+                Some(receipts) => receipts,
+                None => self
+                    .cache()
+                    .get_receipts(hash)
+                    .await
+                    .map_err(Self::Error::from_eth_err)?
+                    .ok_or(EthApiError::HeaderNotFound(hash.into()))?,
+            };
+
+            let (gas_used, next_log_index) =
+                calculate_gas_used_and_next_log_index(meta.index, &all_receipts);
+
+            Ok(self
+                .converter()
+                .convert_receipts(vec![ConvertReceiptInput {
+                    tx: tx.as_recovered_ref(),
+                    gas_used: receipt.cumulative_gas_used() - gas_used,
+                    receipt,
+                    next_log_index,
+                    meta,
+                }])?
+                .pop()
+                .unwrap())
+        }
+    }
+}

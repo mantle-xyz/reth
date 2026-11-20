@@ -1,0 +1,22 @@
+[package]
+name = "reth-cli-runner"
+version = "2.4.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Commonly used utilities for running reth CLI [MANTLE PATCH: backport reth#27313 at aef8d3ef]"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-tasks.workspace = true
+
+# async
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+
+# misc
+tracing.workspace = true

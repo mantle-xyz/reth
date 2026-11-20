@@ -69,4 +69,11 @@ env.passthrough = [
 ]
 
 [build.env]
-passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE", "BINDGEN_EXTRA_CLANG_ARGS", "LIBCLANG_PATH"]
+passthrough = [
+    "JEMALLOC_SYS_WITH_LG_PAGE",
+    "BINDGEN_EXTRA_CLANG_ARGS",
+    "LIBCLANG_PATH",
+    # Read by mantle-reth/crates/cli/build.rs, which cannot run git inside the container.
+    "MANTLE_BUILD_REF",
+    "MANTLE_BUILD_SHA",
+]

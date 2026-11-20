@@ -9,7 +9,7 @@
 //!
 //! - [`payload_builder`] — the fork itself: struct + `async build_payload` (deposits → sequencer
 //!   txs → preconf select! loop → SDM post-exec → finalize).
-//! - [`dispatch`] — the select! loop's per-event fifo state machine (`apply_one_preconf`) plus the
+//! - `dispatch` — the select! loop's per-event fifo state machine (`apply_one_preconf`) plus the
 //!   same-sender cascade state (`LoopState`), separated so the state-machine invariants are
 //!   unit-testable without standing up the full EVM stack. Block-capacity admission
 //!   (`preconf_admission` / `admit_and_dispatch`) lives in [`payload_builder`] where the block
@@ -20,14 +20,22 @@
 //!   [`PayloadJobGenerator`](reth_payload_builder::PayloadJobGenerator) trait.
 //! - [`cancel`] — `JobCancel`, the async-aware cancel signal shared between the job and the spawned
 //!   build task.
+//! - [`execution_info`] — what the loop has executed so far, and how much of it has already been
+//!   published as a flashblock.
+//! - `pacing` — how fast the loop may admit pool transactions: the adaptive-N schedule and the
+//!   sweep / per-slice budgets behind one enum. Pure arithmetic, no reth types.
 
+mod best_tx_lead;
 pub mod cancel;
 pub(crate) mod dispatch;
+pub mod execution_info;
+mod pacing;
 pub mod payload_builder;
 pub mod payload_job;
 pub mod payload_job_generator;
 
 pub use cancel::JobCancel;
+pub use execution_info::ExecutionInfo;
 pub use payload_builder::PreconfPayloadBuilder;
 pub use payload_job::{PreconfPayloadJob, ResolvePayloadFuture};
 pub use payload_job_generator::PreconfPayloadJobGenerator;

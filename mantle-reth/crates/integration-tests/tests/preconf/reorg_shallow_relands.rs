@@ -1,8 +1,12 @@
-//! A preconf must-land commitment survives a 1-block shallow reorg.
+//! A preconf commitment survives a 1-block shallow reorg.
 //!
-//! A preconf tx that returns `success` is a must-land promise. If the unsafe
+//! The node makes a best effort to land a preconf tx that returned `success`. If the unsafe
 //! block carrying it is reverted, the commitment must re-land on the new
 //! canonical chain (same hash, exactly once).
+//!
+//! The rebuild itself carries only its deposit: its parent is not the head yet,
+//! and a build on such a parent replays nothing. The commitment re-lands in the
+//! block built on the rebuild.
 //!
 //! ── How the reorg is driven ──────────────────────────────────────────────
 //! In production a reorg reaches reth as an `engine_forkchoiceUpdatedV3` whose
@@ -52,7 +56,9 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     let cfg = PreconfCfgBuilder::new()
         .whitelist_from(sender)
         .whitelist_to(recipient)
-        .journal_path(fresh_journal("shallow")) // journal ON — so the reverted commitment can be replayed
+        // The journal is mandatory; re-landing does not read it (the canon
+        // handler requeues the commitment from the reverted block itself).
+        .journal_path(fresh_journal("shallow"))
         .build();
 
     let (node, http, wallet, chain_id) = launch_preconf_node!(cfg).await;
@@ -72,7 +78,12 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
     // L1-attributes deposit; the preconf lands right after it.
     let (_commit_head, sealed_commit) = op_node_slot_l1!(node, on = base, n = 1, l1 = 100);
     let ev = rpc.await.expect("rpc join").expect("preconf submission must not error");
-    assert_eq!(ev.status, PreconfStatus::Success, "must-land commitment; reason={:?}", ev.reason);
+    assert_eq!(
+        ev.status,
+        PreconfStatus::Success,
+        "the preconf must succeed; reason={:?}",
+        ev.reason
+    );
     assert!(
         sealed_commit.contains(&hash),
         "committed tx must land in the commitment block; sealed={sealed_commit:?}",
@@ -85,31 +96,36 @@ async fn preconf_commitment_relands_after_shallow_reorg() {
 
     // ── Reorg: rebuild at the SAME height (n=1 → SAME timestamp) but a DIFFERENT
     //    L1 origin (200). This reverts the commitment block and re-derives it
-    //    against a new L1 origin — exactly what an L1 reorg does. The commitment
-    //    must re-land via the preconf carryover / journal-replay path.
-    let (relanded_head, sealed_relanded) = reorg_to!(node, base, n = 1, l1 = 200);
-    assert!(
-        sealed_relanded.contains(&hash),
-        "committed tx must RE-LAND after the reorg; sealed={sealed_relanded:?}",
+    //    against a new L1 origin — exactly what an L1 reorg does. The rebuild
+    //    stands on a parent that is not the head yet, so it carries only its
+    //    deposit.
+    let (rebuilt_head, sealed_rebuilt) = reorg_to!(node, base, n = 1, l1 = 200);
+    assert_eq!(
+        sealed_rebuilt,
+        vec![keccak256(l1_info_deposit(200))],
+        "the rebuild must carry only the L1-origin-200 deposit",
     );
 
     // Reorg-happened guard (faithful — NOT a timestamp artifact): the rebuilt
     // block references the NEW L1 origin, so its tx[0] differs from the reverted
     // block's. This proves the commitment block was genuinely reverted and
     // rebuilt against a different L1 origin, not left canonical.
-    assert_eq!(
-        sealed_relanded[0],
-        keccak256(l1_info_deposit(200)),
-        "reorg rebuild's tx[0] must be the L1-origin-200 deposit",
-    );
     assert_ne!(
-        sealed_relanded[0], sealed_commit[0],
+        sealed_rebuilt[0], sealed_commit[0],
         "reorg must change the L1 origin (tx[0]) — otherwise no real reorg happened",
     );
 
-    // No resurrection/duplicate: a following block (n=2) must not re-include the
+    // The block on the rebuild replays the commitment.
+    let (relanded_head, sealed_relanded) =
+        op_node_slot_l1!(node, on = rebuilt_head, n = 2, l1 = 201);
+    assert!(
+        sealed_relanded.contains(&hash),
+        "committed tx must RE-LAND after the reorg; sealed={sealed_relanded:?}",
+    );
+
+    // No resurrection/duplicate: a following block (n=3) must not re-include the
     // now-committed tx.
-    let (_next_head, sealed_next) = op_node_slot_l1!(node, on = relanded_head, n = 2, l1 = 201);
+    let (_next_head, sealed_next) = op_node_slot_l1!(node, on = relanded_head, n = 3, l1 = 202);
     assert!(
         !sealed_next.contains(&hash),
         "commitment must not be duplicated into a later block; sealed={sealed_next:?}",

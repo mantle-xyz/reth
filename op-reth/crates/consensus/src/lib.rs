@@ -15,9 +15,11 @@ use alloc::{format, sync::Arc};
 use alloy_consensus::{
     BlockHeader as _, EMPTY_OMMER_ROOT_HASH, constants::MAXIMUM_EXTRA_DATA_SIZE,
 };
-use alloy_primitives::B64;
+use alloy_primitives::{B64, B256};
 use core::fmt::Debug;
-use op_alloy_consensus::{decode_holocene_extra_data, decode_jovian_extra_data};
+use op_alloy_consensus::{
+    EIP1559ParamError, decode_eip_1559_params, decode_holocene_extra_data, decode_jovian_extra_data,
+};
 use reth_chainspec::EthChainSpec;
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_consensus_common::validation::{
@@ -50,53 +52,38 @@ where
     H: BlockHeader,
     ChainSpec: EthChainSpec<Header = H> + OpHardforks,
 {
-    if chain_spec.is_jovian_active_at_timestamp(header.timestamp()) {
-        decode_jovian_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
+    let jovian = chain_spec.is_jovian_active_at_timestamp(header.timestamp());
+    let (expected_len, version) = if jovian {
+        (17, 1)
     } else if chain_spec.is_holocene_active_at_timestamp(header.timestamp()) {
-        decode_holocene_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
-    } else if header.hash() != chain_spec.genesis_hash() && !header.extra_data().is_empty() {
-        return Err(ConsensusError::msg("extraData must be empty before Holocene"));
-    }
-
-    Ok(())
-}
-
-// The pinned op-alloy decoder predates upstream zero-parameter validation. Keep this separate from
-// the upstream validator so it can be removed when the dependency is updated.
-fn validate_pinned_op_alloy_extra_data_params<H, ChainSpec>(
-    header: &SealedHeader<H>,
-    chain_spec: &ChainSpec,
-) -> Result<(), ConsensusError>
-where
-    H: BlockHeader,
-    ChainSpec: EthChainSpec<Header = H> + OpHardforks,
-{
-    let (elasticity, denominator) = if chain_spec.is_jovian_active_at_timestamp(header.timestamp())
-    {
-        let (elasticity, denominator, _) =
-            decode_jovian_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
-        (elasticity, denominator)
-    } else if chain_spec.is_holocene_active_at_timestamp(header.timestamp()) {
-        decode_holocene_extra_data(header.extra_data()).map_err(ConsensusError::other)?
+        (9, 0)
     } else {
+        if header.hash() != chain_spec.genesis_hash() && !header.extra_data().is_empty() {
+            return Err(ConsensusError::msg("extraData must be empty before Holocene"));
+        }
         return Ok(());
     };
 
     if chain_spec.is_mantle() {
+        let extra_data = header.extra_data();
+        if extra_data.len() != expected_len {
+            return Err(ConsensusError::other(EIP1559ParamError::InvalidExtraDataLength));
+        }
+        if extra_data[0] != version {
+            return Err(ConsensusError::other(EIP1559ParamError::InvalidVersion(extra_data[0])));
+        }
+
+        // Mantle op-geth accepts zero elasticity; the OP decoder rejects it before returning.
+        let (elasticity, denominator) = decode_eip_1559_params(B64::from_slice(&extra_data[1..9]));
         if elasticity != 0 && denominator == 0 {
             return Err(ConsensusError::msg(
                 "holocene params cannot have a 0 denominator unless elasticity is also 0",
             ));
         }
+    } else if jovian {
+        decode_jovian_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
     } else {
-        if denominator == 0 {
-            return Err(ConsensusError::msg(
-                "EIP1559 extraData must encode a non-zero denominator",
-            ));
-        }
-        if elasticity == 0 {
-            return Err(ConsensusError::msg("EIP1559 extraData must encode a non-zero elasticity"));
-        }
+        decode_holocene_extra_data(header.extra_data()).map_err(ConsensusError::other)?;
     }
 
     Ok(())
@@ -141,6 +128,7 @@ where
         block: &RecoveredBlock<N::Block>,
         result: &BlockExecutionResult<N::Receipt>,
         receipt_root_bloom: Option<ReceiptRootBloom>,
+        _block_access_list_hash: Option<B256>,
     ) -> Result<(), ConsensusError> {
         // [MANTLE] The streaming receipt root task does not strip deposit_nonce /
         // deposit_receipt_version, so its pre-computed root is wrong for Mantle.
@@ -264,7 +252,6 @@ where
         // validate header extra data for all networks post merge
         validate_header_extra_data(header, self.max_extra_data_size)?;
         validate_op_header_extra_data(sealed_header, &self.chain_spec)?;
-        validate_pinned_op_alloy_extra_data_params(sealed_header, &self.chain_spec)?;
         validate_header_gas(header)?;
         validate_header_base_fee(header, &self.chain_spec)
     }
@@ -487,7 +474,8 @@ mod tests {
             Bytes::from(vec![1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
             Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
         ] {
-            assert!(consensus.validate_header(&arsia_header(compatible)).is_ok());
+            let result = consensus.validate_header(&arsia_header(compatible));
+            assert!(result.is_ok(), "{result:?}");
         }
 
         let invalid = Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1]);
@@ -679,6 +667,7 @@ mod tests {
             &block,
             &result,
             None,
+            None,
         );
 
         // validate blob, it should pass blob gas used validation
@@ -748,6 +737,7 @@ mod tests {
             &beacon_consensus,
             &block,
             &result,
+            None,
             None,
         );
 
@@ -1130,6 +1120,8 @@ mod tests {
                 &block,
                 &result,
                 Some((unstripped_root, bloom)),
+                // EIP-7928 block access list hash; not exercised by this Mantle test.
+                None,
             );
         assert!(post_exec.is_ok(), "Mantle should ignore pre-computed receipt root: {post_exec:?}");
 
@@ -1142,6 +1134,8 @@ mod tests {
                 &block,
                 &result,
                 Some((unstripped_root, bloom)),
+                // EIP-7928 block access list hash; not exercised by this Mantle test.
+                None,
             );
         assert!(
             post_exec_op.is_err(),

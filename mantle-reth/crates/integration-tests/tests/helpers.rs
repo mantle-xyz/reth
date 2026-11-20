@@ -44,6 +44,7 @@ pub(crate) fn mantle_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
+            target_gas_limit: None,
             slot_number: None,
         },
         transactions: None,
@@ -126,17 +127,46 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
     F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    with_configured_mantle_node_rpc_opts(
+        node,
+        chain_spec,
+        attributes_generator,
+        tree_config,
+        proofs_history,
+        RpcServerArgs::default().with_unused_ports().with_http(),
+        test,
+    )
+    .await;
+}
+
+/// Launches a real Mantle node with custom HTTP/WS RPC configuration.
+pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
+    node: MantleNode,
+    chain_spec: Arc<OpChainSpec>,
+    attributes_generator: fn(u64) -> OpPayloadAttrs,
+    tree_config: TreeConfig,
+    proofs_history: Option<(RollupArgs, PathBuf)>,
+    rpc: RpcServerArgs,
+    test: F,
+) where
+    F: FnOnce(NodeHelperType<MantleNode>, HttpClient) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     reth_tracing::init_test_tracing();
 
+    let genesis_hash = chain_spec.genesis_hash();
     let mut config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec)
         .with_unused_ports()
         .with_datadir_args(DatadirArgs {
             datadir: reth_db::test_utils::tempdir_path().into(),
             ..Default::default()
         })
-        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    config.network.discovery.discv5_port = 0;
-    config.network.discovery.discv5_port_ipv6 = 0;
+        .with_rpc(rpc);
+    config.network.discovery.discv5_port = Some(0);
+    config.network.discovery.discv5_port_ipv6 = Some(0);
+    // Off for the reason `launch_mantle_node!` spells out: building the DNS
+    // resolver can fail on the host's nameserver list and sink the launch.
+    config.network.discovery.disable_dns_discovery = true;
 
     let db = create_test_rw_db_with_path(
         config
@@ -160,8 +190,16 @@ pub(crate) async fn with_configured_mantle_node_opts<F, Fut>(
             // The ExEx refuses to start against an unseeded sidecar (and takes the node down with
             // it), so mirror what `op-reth op-proofs init` does before launch. At this point the
             // chain is still at genesis, so the seed is the genesis state.
-            seed_proofs_sidecar(&db_for_seed, mdbx.clone());
-            with_proofs_history(builder, args, mdbx)
+            seed_proofs_sidecar(&db_for_seed, mdbx.clone(), genesis_hash);
+            with_proofs_history(
+                builder,
+                args,
+                mdbx,
+                node.op_node.args.sequencer.clone(),
+                node.op_node.args.sequencer_headers.clone(),
+                node.preconf.clone(),
+                node.flashblocks.clone(),
+            )
         }
         None => builder,
     };
@@ -212,13 +250,14 @@ where
 fn seed_proofs_sidecar(
     db: &Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>,
     storage: Arc<MdbxProofsStorageV2>,
+    genesis_hash: B256,
 ) {
     use reth_db::Database;
     use reth_optimism_trie::{InitializationJob, RethTrieStorageLayout};
 
     let tx = db.tx().expect("open main-db read tx");
-    // Genesis: block 0, and the sidecar only needs a consistent anchor to start from.
+    // Genesis: block 0. The ExEx checks the anchor against reth's canonical chain at startup.
     InitializationJob::new(storage, tx, RethTrieStorageLayout::Legacy)
-        .run(0, Default::default())
+        .run(0, genesis_hash)
         .expect("seed proofs sidecar");
 }
