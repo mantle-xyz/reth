@@ -1069,3 +1069,112 @@ async fn ordinary_continuous_senders_remain_packable_across_blocks() {
     }
     assert_eq!(sealed.len(), 1100);
 }
+
+/// A client that resends everything from the pending nonce up keeps its
+/// account moving.
+///
+/// The pending nonce falls back to the parent's once a slice executes a
+/// transaction, so such a client resends nonces the block already holds, and
+/// the pool admits them. The canonical notification later prunes the mined
+/// transactions above them before discarding them; the sender must still be
+/// packable from its next nonce afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_client_resending_from_the_pending_nonce_is_not_stranded() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+
+    use alloy_primitives::U256;
+    use reth_provider::StateProviderFactory;
+
+    let cfg = PreconfCfgBuilder::new().build();
+    let fb =
+        FlashblockProducerConfig { block_time: Duration::from_millis(200), ..flashblocks_cfg() };
+    let (mut node, http, _wallet, chain_id, _fb_addr) =
+        crate::launch_flashblocks_node!(cfg, fb).await;
+    let signer = Wallet::new(2).with_chain_id(chain_id).wallet_gen()[1].clone();
+    let sender = signer.address();
+
+    // Resends differ in value and gas but not in fees, so the pool refuses
+    // them as underpriced while the original is still there.
+    let sign = move |nonce: u64, value: u64, gas: u64| {
+        let signer = signer.clone();
+        async move {
+            let request = TransactionRequest {
+                chain_id: Some(chain_id),
+                nonce: Some(nonce),
+                to: Some(TxKind::Call(sender)),
+                value: Some(U256::from(value)),
+                gas: Some(gas),
+                max_fee_per_gas: Some(20_000_000_000),
+                max_priority_fee_per_gas: Some(19_000_000_000),
+                ..Default::default()
+            };
+            let raw: Bytes =
+                TransactionTestContext::sign_tx(signer, request).await.encoded_2718().into();
+            raw
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let originals = {
+        let (http, stop, sent, sign) = (http.clone(), stop.clone(), sent.clone(), sign.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            while !stop.load(Ordering::SeqCst) {
+                interval.tick().await;
+                let nonce = sent.load(Ordering::SeqCst);
+                crate::helpers::send_normal(&http, sign(nonce, 1, 21_000).await)
+                    .await
+                    .expect("an original is accepted");
+                sent.store(nonce + 1, Ordering::SeqCst);
+            }
+        })
+    };
+    let resends = {
+        let (http, stop, sent) = (http.clone(), stop.clone(), sent.clone());
+        tokio::spawn(async move {
+            let mut round = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let pending: U256 = http
+                    .request("eth_getTransactionCount", (sender, "pending"))
+                    .await
+                    .expect("pending nonce");
+                for nonce in pending.to::<u64>()..sent.load(Ordering::SeqCst) {
+                    // Refusals are expected; only the admitted ones matter.
+                    let _ =
+                        crate::helpers::send_normal(&http, sign(nonce, 100 + round, 100_000).await)
+                            .await;
+                }
+                round += 1;
+            }
+        })
+    };
+
+    for _ in 0..10 {
+        let payload = build_one_block!(node, Duration::from_millis(1000));
+        crate::canonize_built!(node, payload);
+    }
+    stop.store(true, Ordering::SeqCst);
+    originals.await.expect("sender task");
+    resends.await.expect("resend task");
+    // Lets the last originals land.
+    for _ in 0..2 {
+        let payload = build_one_block!(node, Duration::from_millis(1000));
+        crate::canonize_built!(node, payload);
+    }
+
+    let sent = sent.load(Ordering::SeqCst);
+    let landed = node
+        .inner
+        .provider
+        .latest()
+        .expect("latest state")
+        .account_nonce(&sender)
+        .expect("nonce readable")
+        .unwrap_or(0);
+    assert_eq!(landed, sent, "the sender is stranded at nonce {landed} with {sent} sent");
+}
