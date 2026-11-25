@@ -24,7 +24,6 @@ reth-storage-errors.workspace = true
 reth-trie-common.workspace = true
 
 # op-reth
-op-alloy-consensus.workspace = true
 reth-optimism-forks.workspace = true
 reth-optimism-primitives.workspace = true
 
