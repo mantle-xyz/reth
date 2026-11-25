@@ -1,13 +1,12 @@
 [package]
 name = "reth-node-builder"
-version = "2.4.0"
+version = "2.6.0"
+description = "[MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth node builder [MANTLE PATCH: backport reth#27218, reth#28067, reth#26734 at aef8d3ef]"
-readme = "README.md"
 
 [lints]
 workspace = true
@@ -16,8 +15,8 @@ workspace = true
 ## reth
 reth-chain-state.workspace = true
 reth-chainspec.workspace = true
-reth-config = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
-reth-consensus-debug-client = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-config.workspace = true
+reth-consensus-debug-client.workspace = true
 reth-consensus.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true
@@ -25,14 +24,14 @@ reth-db-common.workspace = true
 reth-downloaders.workspace = true
 reth-engine-local.workspace = true
 reth-engine-primitives.workspace = true
-reth-engine-tree = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
-reth-engine-util = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-engine-tree.workspace = true
+reth-engine-util.workspace = true
 reth-evm.workspace = true
 reth-exex.workspace = true
 reth-fs-util.workspace = true
-reth-invalid-block-hooks = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-invalid-block-hooks.workspace = true
 reth-network-api.workspace = true
-reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-network-p2p.workspace = true
 reth-network.workspace = true
 reth-node-api.workspace = true
 reth-node-core.workspace = true
@@ -47,16 +46,16 @@ reth-rpc-api.workspace = true
 reth-rpc-builder.workspace = true
 reth-rpc-engine-api.workspace = true
 reth-rpc-eth-types.workspace = true
-reth-rpc-layer = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-rpc-layer.workspace = true
 reth-stages.workspace = true
 reth-static-file.workspace = true
+reth-storage-overlay = { workspace = true, features = ["rayon"] }
 reth-tasks = { workspace = true, features = ["rayon"] }
 reth-tokio-util.workspace = true
 reth-tracing = { workspace = true, features = ["std"] }
 reth-transaction-pool.workspace = true
-reth-trie-db = { workspace = true, features = ["metrics"] }
 reth-basic-payload-builder.workspace = true
-reth-node-ethstats = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-node-ethstats.workspace = true
 
 ## ethereum
 alloy-consensus.workspace = true
@@ -72,14 +71,14 @@ tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thre
 tokio-stream.workspace = true
 
 ## crypto
-secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "std", "recovery"] }
+secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"] }
 
 ## misc
 aquamarine.workspace = true
 eyre.workspace = true
 parking_lot.workspace = true
 jsonrpsee.workspace = true
-fdlimit = "0.3.0"
+fdlimit.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
 
@@ -116,7 +115,6 @@ test-utils = [
     "reth-db-api/test-utils",
     "reth-provider/test-utils",
     "reth-transaction-pool/test-utils",
-    "reth-trie-db/test-utils",
     "reth-evm-ethereum/test-utils",
     "reth-node-ethereum/test-utils",
     "reth-primitives-traits/test-utils",

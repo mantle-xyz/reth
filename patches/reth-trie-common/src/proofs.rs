@@ -1,17 +1,20 @@
 //! Merkle trie proofs.
 
-use crate::{BranchNodeMasks, BranchNodeMasksMap, Nibbles, ProofTrieNodeV2, TrieAccount};
+use crate::{
+    BranchNodeMasks, BranchNodeMasksMap, Nibbles, ProofTrieNodeV2, TrieAccount, TrieNodeV2,
+};
 use alloc::{borrow::Cow, collections::VecDeque, vec::Vec};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{
-    Address, B256, Bytes, U256, keccak256,
-    map::{B256Map, B256Set, hash_map},
+    keccak256,
+    map::{hash_map, B256Map, B256Set},
+    Address, Bytes, B256, U256,
 };
-use alloy_rlp::{Decodable, EMPTY_STRING_CODE, encode_fixed_size};
+use alloy_rlp::{encode_fixed_size, Decodable, Encodable, EMPTY_STRING_CODE};
 use alloy_trie::{
+    nodes::{BranchNodeRef, TrieNode},
+    proof::{verify_proof, DecodedProofNodes, ProofNodes, ProofVerificationError},
     EMPTY_ROOT_HASH,
-    nodes::TrieNode,
-    proof::{DecodedProofNodes, ProofNodes, ProofVerificationError, verify_proof},
 };
 use derive_more::{Deref, DerefMut, IntoIterator};
 use itertools::Itertools;
@@ -164,7 +167,11 @@ impl Iterator for ChunkedMultiProofTargets {
             },
         );
 
-        if chunk.is_empty() { None } else { Some(chunk) }
+        if chunk.is_empty() {
+            None
+        } else {
+            Some(chunk)
+        }
     }
 }
 
@@ -243,7 +250,7 @@ impl MultiProof {
                     balance: account.balance,
                     nonce: account.nonce,
                     bytecode_hash: (account.code_hash != KECCAK_EMPTY).then_some(account.code_hash),
-                });
+                })
             }
             None
         };
@@ -372,7 +379,7 @@ impl DecodedMultiProof {
                     balance: account.balance,
                     nonce: account.nonce,
                     bytecode_hash: (account.code_hash != KECCAK_EMPTY).then_some(account.code_hash),
-                });
+                })
             }
             None
         };
@@ -461,6 +468,62 @@ impl DecodedMultiProofV2 {
         self.account_proofs.is_empty() && self.storage_proofs.is_empty()
     }
 
+    /// Construct an account proof from the V2 multiproof.
+    pub fn account_proof(
+        &self,
+        address: Address,
+        slots: &[B256],
+    ) -> Result<AccountProof, alloy_rlp::Error> {
+        let hashed_address = keccak256(address);
+        let nibbles = Nibbles::unpack(hashed_address);
+        let account_nodes = matching_v2_proof_nodes(&self.account_proofs, &nibbles);
+
+        let (info, storage_root) = 'account: {
+            if let Some(ProofTrieNodeV2 { node: TrieNodeV2::Leaf(leaf), .. }) =
+                account_nodes.clone().last() &&
+                nibbles.ends_with(&leaf.key)
+            {
+                let account = TrieAccount::decode(&mut &leaf.value[..])?;
+                break 'account (
+                    Some(Account {
+                        balance: account.balance,
+                        nonce: account.nonce,
+                        bytecode_hash: (account.code_hash != KECCAK_EMPTY)
+                            .then_some(account.code_hash),
+                    }),
+                    account.storage_root,
+                )
+            }
+            (None, EMPTY_ROOT_HASH)
+        };
+
+        let proof = encode_v2_proof_nodes(account_nodes);
+        let storage_nodes = self.storage_proofs.get(&hashed_address);
+        let mut storage_proofs = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let nibbles = Nibbles::unpack(keccak256(slot));
+            let nodes =
+                storage_nodes.iter().flat_map(|nodes| matching_v2_proof_nodes(nodes, &nibbles));
+            let value = 'value: {
+                if let Some(ProofTrieNodeV2 { node: TrieNodeV2::Leaf(leaf), .. }) =
+                    nodes.clone().last() &&
+                    nibbles.ends_with(&leaf.key)
+                {
+                    break 'value U256::decode(&mut &leaf.value[..])?
+                }
+                U256::ZERO
+            };
+            storage_proofs.push(StorageProof {
+                key: *slot,
+                nibbles,
+                value,
+                proof: encode_v2_proof_nodes(nodes),
+            });
+        }
+
+        Ok(AccountProof { address, info, proof, storage_root, storage_proofs })
+    }
+
     /// Builds a `DecodedMultiProofV2` from a flat witness map (hash → RLP-encoded trie node).
     ///
     /// This performs a BFS traversal starting from `state_root`, decoding each witness entry
@@ -526,12 +589,12 @@ impl DecodedMultiProofV2 {
             }
         }
 
-        account_nodes.sort_by(|(a, _, _), (b, _, _)| b.cmp(a));
+        account_nodes.sort_by(|(a, _, _), (b, _, _)| crate::depth_first_cmp(a, b));
         let account_proofs = ProofTrieNodeV2::from_sorted_trie_nodes(account_nodes);
 
         let mut storage_proofs = B256Map::default();
         for (account, mut nodes) in storage_nodes {
-            nodes.sort_by(|(a, _, _), (b, _, _)| b.cmp(a));
+            nodes.sort_by(|(a, _, _), (b, _, _)| crate::depth_first_cmp(a, b));
             storage_proofs.insert(account, ProofTrieNodeV2::from_sorted_trie_nodes(nodes));
         }
 
@@ -554,6 +617,36 @@ impl DecodedMultiProofV2 {
             }
         }
     }
+}
+
+/// Returns proof nodes matching `path` in root-to-leaf order.
+fn matching_v2_proof_nodes<'a>(
+    nodes: &'a [ProofTrieNodeV2],
+    path: &'a Nibbles,
+) -> impl Iterator<Item = &'a ProofTrieNodeV2> + Clone {
+    nodes.iter().rev().filter(move |node| path.starts_with(&node.path))
+}
+
+/// Encodes V2 proof nodes as standard MPT proof nodes.
+///
+/// V2 combines an extension and its child branch in one node. Both nodes need to be emitted for
+/// consumers that reconstruct a sparse trie from the returned proof.
+fn encode_v2_proof_nodes<'a>(nodes: impl Iterator<Item = &'a ProofTrieNodeV2>) -> Vec<Bytes> {
+    let mut proof = Vec::new();
+    for proof_node in nodes {
+        let mut encoded = Vec::new();
+        proof_node.node.encode(&mut encoded);
+        proof.push(Bytes::from(encoded));
+
+        if let TrieNodeV2::Branch(branch) = &proof_node.node &&
+            !branch.key.is_empty()
+        {
+            let mut encoded = Vec::new();
+            BranchNodeRef::new(&branch.stack, branch.state_mask).encode(&mut encoded);
+            proof.push(Bytes::from(encoded));
+        }
+    }
+    proof
 }
 
 impl From<DecodedMultiProof> for DecodedMultiProofV2 {
@@ -628,7 +721,7 @@ impl StorageMultiProof {
                 let TrieNode::Leaf(leaf) = TrieNode::decode(&mut &last[..])? &&
                 nibbles.ends_with(&leaf.key)
             {
-                break 'value U256::decode(&mut &leaf.value[..])?;
+                break 'value U256::decode(&mut &leaf.value[..])?
             }
             U256::ZERO
         };
@@ -677,7 +770,7 @@ impl DecodedStorageMultiProof {
             if let Some(TrieNode::Leaf(leaf)) = proof.last() &&
                 nibbles.ends_with(&leaf.key)
             {
-                break 'value U256::decode(&mut &leaf.value[..])?;
+                break 'value U256::decode(&mut &leaf.value[..])?
             }
             U256::ZERO
         };
@@ -726,7 +819,11 @@ pub struct AccountProof {
 /// the response boundary, leaving the underlying proof construction unchanged.
 #[cfg(feature = "eip1186")]
 fn normalize_eip1186_empty_trie_proof(proof: Vec<Bytes>) -> Vec<Bytes> {
-    if proof.len() == 1 && proof[0].as_ref() == [EMPTY_STRING_CODE] { Vec::new() } else { proof }
+    if proof.len() == 1 && proof[0].as_ref() == [EMPTY_STRING_CODE] {
+        Vec::new()
+    } else {
+        proof
+    }
 }
 
 #[cfg(feature = "eip1186")]
@@ -777,8 +874,10 @@ impl AccountProof {
             storage_proof: self
                 .storage_proofs
                 .into_iter()
-                .zip(slots)
-                .map(|(proof, slot)| proof.into_eip1186_proof(slot))
+                .filter_map(|proof| {
+                    let input_slot = slots.iter().find(|s| s.as_b256() == proof.key)?;
+                    Some(proof.into_eip1186_proof(*input_slot))
+                })
                 .collect(),
         }
     }
@@ -1025,7 +1124,7 @@ impl DecodedStorageProof {
 /// for compatibility with `triehash` crate.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod triehash {
-    use alloy_primitives::{B256, keccak256};
+    use alloy_primitives::{keccak256, B256};
     use alloy_rlp::RlpEncodable;
     use hash_db::Hasher;
     use plain_hasher::PlainHasher;
@@ -1051,6 +1150,96 @@ pub mod triehash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_trie::{
+        nodes::{BranchNode, LeafNode, RlpNode},
+        TrieMask,
+    };
+
+    #[test]
+    fn v2_account_proof_expands_extension_branch() {
+        let branch =
+            BranchNode::new(vec![RlpNode::word_rlp(&B256::repeat_byte(0x11))], TrieMask::from(1));
+        let branch_rlp = alloy_rlp::encode(&branch);
+        let combined = TrieNodeV2::Branch(crate::BranchNodeV2::new(
+            Nibbles::from_nibbles([0xa, 0xb]),
+            branch.stack,
+            branch.state_mask,
+            Some(RlpNode::from_rlp(&branch_rlp)),
+        ));
+        let extension_rlp = alloy_rlp::encode(&combined);
+        let multiproof = DecodedMultiProofV2 {
+            account_proofs: vec![ProofTrieNodeV2 {
+                path: Nibbles::default(),
+                node: combined,
+                masks: None,
+            }],
+            ..Default::default()
+        };
+
+        let proof = multiproof.account_proof(Address::ZERO, &[]).unwrap();
+
+        assert_eq!(proof.proof, vec![Bytes::from(extension_rlp), Bytes::from(branch_rlp)]);
+        assert!(proof.info.is_none());
+    }
+
+    #[test]
+    fn witness_nodes_are_depth_first_ordered() {
+        fn insert_node(witness: &mut B256Map<Bytes>, node: impl alloy_rlp::Encodable) -> RlpNode {
+            let encoded = alloy_rlp::encode(node);
+            witness.insert(keccak256(&encoded), encoded.clone().into());
+            RlpNode::from_rlp(&encoded)
+        }
+
+        let mut witness = B256Map::default();
+        let leaf_key = Nibbles::from_nibbles([0; 63]);
+
+        let storage_leaf_0 = insert_node(
+            &mut witness,
+            LeafNode::new(leaf_key, encode_fixed_size(&U256::from(1)).to_vec()),
+        );
+        let storage_leaf_1 = insert_node(
+            &mut witness,
+            LeafNode::new(leaf_key, encode_fixed_size(&U256::from(2)).to_vec()),
+        );
+        let storage_root = insert_node(
+            &mut witness,
+            BranchNode::new(vec![storage_leaf_0, storage_leaf_1], TrieMask::new(0b11)),
+        );
+
+        let account_leaf_0 = insert_node(
+            &mut witness,
+            LeafNode::new(
+                leaf_key,
+                alloy_rlp::encode(TrieAccount {
+                    storage_root: storage_root.as_hash().expect("storage root is hashed"),
+                    ..Default::default()
+                }),
+            ),
+        );
+        let account_leaf_1 = insert_node(
+            &mut witness,
+            LeafNode::new(leaf_key, alloy_rlp::encode(TrieAccount::default())),
+        );
+        let state_root = insert_node(
+            &mut witness,
+            BranchNode::new(vec![account_leaf_0, account_leaf_1], TrieMask::new(0b11)),
+        )
+        .as_hash()
+        .expect("state root is hashed");
+
+        let proof = DecodedMultiProofV2::from_witness(state_root, &witness).unwrap();
+        let expected_paths =
+            [Nibbles::from_nibbles([0]), Nibbles::from_nibbles([1]), Nibbles::default()];
+
+        assert_eq!(
+            proof.account_proofs.iter().map(|node| node.path).collect::<Vec<_>>(),
+            expected_paths
+        );
+        assert_eq!(
+            proof.storage_proofs[&B256::ZERO].iter().map(|node| node.path).collect::<Vec<_>>(),
+            expected_paths
+        );
+    }
 
     #[test]
     fn test_multiproof_extend_account_proofs() {
@@ -1435,7 +1624,7 @@ mod tests {
             proof: multi.clone(),
             storage_root: EMPTY_ROOT_HASH,
             storage_proofs: vec![
-                StorageProof::new(B256::with_last_byte(1)).with_proof(single_non_sentinel.clone()),
+                StorageProof::new(B256::with_last_byte(1)).with_proof(single_non_sentinel.clone())
             ],
         };
 
@@ -1445,21 +1634,5 @@ mod tests {
 
         assert_eq!(resp.account_proof, multi);
         assert_eq!(resp.storage_proof[0].proof, single_non_sentinel);
-    }
-
-    #[cfg(feature = "eip1186")]
-    #[test]
-    fn eip1186_response_keeps_key_of_each_requested_slot() {
-        let slot = B256::with_last_byte(1);
-        let keys = vec![
-            alloy_serde::JsonStorageKey::Number(U256::from(1)),
-            alloy_serde::JsonStorageKey::Hash(slot),
-        ];
-        let mut account = AccountProof::new(Address::ZERO);
-        account.storage_proofs = vec![StorageProof::new(slot); 2];
-
-        let resp = account.into_eip1186_response(keys.clone());
-
-        assert_eq!(resp.storage_proof.iter().map(|p| p.key).collect::<Vec<_>>(), keys);
     }
 }

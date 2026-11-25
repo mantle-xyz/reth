@@ -76,7 +76,7 @@ impl<RF: DeferredValueEncoder> ProofTrieBranchChild<RF> {
             }
             Self::RlpNode { node, short_key, hash_mask_bit, .. } => {
                 if short_key.is_empty() {
-                    return Ok((node, None));
+                    return Ok((node, None))
                 }
 
                 // Only branch hashes sourced from a cached hash mask can have an external short
@@ -118,7 +118,7 @@ impl<RF: DeferredValueEncoder> ProofTrieBranchChild<RF> {
             Self::RlpNode { .. } => {
                 return Err(StateProofError::TrieInconsistency(
                     "cannot convert RLP node to proof node".to_string(),
-                ));
+                ))
             }
         };
 

@@ -55,7 +55,7 @@ impl<K: Ord, V> ForwardInMemoryCursor<'_, K, V> {
     /// provided key. This method advances the cursor forward.
     pub fn seek(&mut self, key: &K) -> Option<&(K, V)> {
         if self.current().is_some_and(|(k, _)| k >= key) {
-            return self.current();
+            return self.current()
         }
 
         self.advance_while(|k| k < key)
@@ -65,7 +65,7 @@ impl<K: Ord, V> ForwardInMemoryCursor<'_, K, V> {
     /// key. This method advances the cursor forward.
     pub fn first_after(&mut self, key: &K) -> Option<&(K, V)> {
         if self.current().is_some_and(|(k, _)| k > key) {
-            return self.current();
+            return self.current()
         }
 
         self.advance_while(|k| k <= key)

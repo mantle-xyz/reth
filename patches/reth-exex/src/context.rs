@@ -7,7 +7,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_provider::BlockReader;
 use reth_tasks::TaskExecutor;
 use std::fmt::Debug;
-use tokio::sync::mpsc::{UnboundedSender, error::SendError};
+use tokio::sync::mpsc::{error::SendError, UnboundedSender};
 
 /// Captures the context that an `ExEx` has access to.
 ///
@@ -117,6 +117,12 @@ where
     /// with the provided head.
     pub fn set_notifications_with_head(&mut self, head: ExExHead) {
         self.notifications.set_with_head(head);
+    }
+
+    /// As [`set_notifications_with_head`](Self::set_notifications_with_head), but backfills up to
+    /// the node's current canonical head rather than the head captured at launch.
+    pub fn catch_up_notifications_with_head(&mut self, head: ExExHead) -> eyre::Result<()> {
+        self.notifications.catch_up_with_head(head)
     }
 
     /// Sends an [`ExExEvent::FinishedHeight`] to the ExEx task manager letting it know that this

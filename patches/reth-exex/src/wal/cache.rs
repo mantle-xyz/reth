@@ -5,7 +5,7 @@ use std::{
 
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{B256, BlockNumber, map::FbHashMap};
+use alloy_primitives::{map::FbHashMap, BlockNumber, B256};
 use reth_exex_types::ExExNotification;
 use reth_node_api::NodePrimitives;
 
@@ -59,7 +59,7 @@ impl BlockCache {
                 debug_assert_eq!(popped_block, block);
                 file_ids.insert(file_id);
             } else {
-                break;
+                break
             }
         }
 

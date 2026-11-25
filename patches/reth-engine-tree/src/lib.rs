@@ -90,8 +90,6 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// Vendored upstream code; upstream keeps the `unnameable-types` lint off.
-#![allow(unnameable_types)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 /// Support for backfill sync mode.

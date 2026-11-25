@@ -58,7 +58,9 @@ pub trait LoadPendingBlock:
     fn pending_env_builder(&self) -> &dyn PendingEnvBuilder<Self::Evm>;
 
     /// Returns the pending block kind
-    fn pending_block_kind(&self) -> PendingBlockKind;
+    fn pending_block_kind(&self) -> PendingBlockKind {
+        self.eth_api_settings().pending_block_kind
+    }
 
     /// Configures the [`PendingBlockEnv`] for the pending block
     ///
@@ -108,8 +110,6 @@ pub trait LoadPendingBlock:
     }
 
     /// Returns a [`StateProviderBox`] on a mem-pool built pending block overlaying latest.
-    ///
-    /// The default opens the provider state on a blocking task, so await it outside one.
     fn local_pending_state(
         &self,
     ) -> impl Future<Output = Result<Option<StateProviderBox>, Self::Error>> + Send
@@ -121,17 +121,14 @@ pub trait LoadPendingBlock:
                 return Ok(None);
             };
 
-            self.spawn_blocking_io(move |this| {
-                let latest_historical = this
-                    .provider()
-                    .history_by_block_hash(pending_block.block().parent_hash())
-                    .map_err(Self::Error::from_eth_err)?;
+            let latest_historical = self
+                .provider()
+                .history_by_block_hash(pending_block.block().parent_hash())
+                .map_err(Self::Error::from_eth_err)?;
 
-                let state = BlockState::from(pending_block);
+            let state = BlockState::from(pending_block);
 
-                Ok(Some(Box::new(state.state_provider(latest_historical)) as StateProviderBox))
-            })
-            .await
+            Ok(Some(Box::new(state.state_provider(latest_historical)) as StateProviderBox))
         }
     }
 

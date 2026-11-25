@@ -1,12 +1,12 @@
 [package]
 name = "reth-transaction-pool"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Transaction pool implementation. [MANTLE PATCH: PoolTransaction::extra_balance_cost hook; backport reth#27015, #27259, #27869 at aef8d3ef]"
+description = "Transaction pool implementation [MANTLE PATCH: PoolTransaction::extra_balance_cost hook, pruned-gap pending fix (#267); vendored from ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true

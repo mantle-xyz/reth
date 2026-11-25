@@ -1,12 +1,12 @@
 [package]
 name = "reth-rpc-eth-api"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth RPC 'eth' namespace API [MANTLE PATCH: backport reth#26776, #26999, #27106, #27107, #27415, #27462, #27477 at aef8d3ef]"
+description = "Reth RPC 'eth' namespace API [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
@@ -58,7 +58,7 @@ tokio.workspace = true
 
 # misc
 auto_impl.workspace = true
-dyn-clone = "1.0.17"
+dyn-clone = { version = "1.0.17" }
 serde_json.workspace = true
 tracing.workspace = true
 

@@ -14,8 +14,8 @@ pub use error::{WalError, WalResult};
 use std::{
     path::Path,
     sync::{
-        Arc,
         atomic::{AtomicU32, Ordering},
+        Arc,
     },
 };
 
@@ -170,7 +170,7 @@ where
         // Remove notifications from the storage.
         if file_ids.is_empty() {
             debug!(target: "exex::wal", "No notifications were finalized from the storage");
-            return Ok(());
+            return Ok(())
         }
 
         let (removed_notifications, removed_size) = self.storage.remove_notifications(file_ids)?;
@@ -222,7 +222,7 @@ where
     ) -> WalResult<Option<ExExNotification<N>>> {
         let Some(file_id) = self.wal.block_cache().get_file_id_by_committed_block_hash(block_hash)
         else {
-            return Ok(None);
+            return Ok(None)
         };
 
         self.wal
@@ -234,14 +234,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::wal::{Wal, cache::CachedBlock, error::WalResult};
+    use crate::wal::{cache::CachedBlock, error::WalResult, Wal};
     use alloy_primitives::B256;
     use itertools::Itertools;
     use reth_ethereum_primitives::EthPrimitives;
     use reth_exex_types::ExExNotification;
     use reth_provider::Chain;
     use reth_testing_utils::generators::{
-        self, BlockParams, BlockRangeParams, random_block, random_block_range,
+        self, random_block, random_block_range, BlockParams, BlockRangeParams,
     };
     use std::{collections::BTreeMap, sync::Arc};
 

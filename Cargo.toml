@@ -521,6 +521,10 @@ reth-rpc-eth-types = { path = "patches/reth-rpc-eth-types" }
 reth-cli-runner = { path = "patches/reth-cli-runner" }
 # Backport reth#26734 (refresh storage metrics in the background); drop when the reth pin includes it.
 reth-node-metrics = { path = "patches/reth-node-metrics" }
+# Vendored for backports that touch them (reth#27614, #27651, #28249; reth#27716; reth#28370).
+reth-storage-overlay = { path = "patches/reth-storage-overlay" }
+reth-rpc-server-types = { path = "patches/reth-rpc-server-types" }
+reth-static-file-types = { path = "patches/reth-static-file-types" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,
@@ -537,12 +541,9 @@ revm-database-interface = { git = "https://github.com/mantle-xyz/revm", tag = "v
 revm-inspector = { git = "https://github.com/mantle-xyz/revm", tag = "v119-mantle.1" }
 revm-context = { git = "https://github.com/mantle-xyz/revm", tag = "v119-mantle.1" }
 revm-context-interface = { git = "https://github.com/mantle-xyz/revm", tag = "v119-mantle.1" }
-# alloy-rs/evm#444 (reject a legacy gas price below the base fee) on 0.37.1; drop once a release
+# alloy-rs/evm#444 (reject a legacy gas price below the base fee) on 0.39.0; drop once a release
 # with it is pinned.
 alloy-evm = { path = "patches/alloy-evm" }
-# alloy-rs/alloy#4434 (JsonStorageKey deserialises like geth) on 2.5.0; drop once a release with it
-# is pinned.
-alloy-serde = { path = "patches/alloy-serde" }
 # revm-inspectors: mantle-xyz/revm-inspectors
 revm-inspectors = { git = "https://github.com/mantle-xyz/revm-inspectors", tag = "v0.43.0-mantle.2" }
 # op-revm moved out of mantle-xyz/revm into the mantle-v2 workspace when upstream

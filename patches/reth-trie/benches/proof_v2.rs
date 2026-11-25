@@ -1,15 +1,15 @@
 #![allow(missing_docs, unreachable_pub)]
 use alloy_primitives::{
-    B256, U256,
     map::{B256Map, B256Set},
+    B256, U256,
 };
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
 use reth_trie::{
-    hashed_cursor::{HashedCursorFactory, mock::MockHashedCursorFactory},
+    hashed_cursor::{mock::MockHashedCursorFactory, HashedCursorFactory},
     proof::StorageProof,
     proof_v2::StorageProofCalculator,
-    trie_cursor::{TrieCursorFactory, mock::MockTrieCursorFactory},
+    trie_cursor::{mock::MockTrieCursorFactory, TrieCursorFactory},
 };
 use reth_trie_common::{HashedPostState, HashedStorage};
 
@@ -43,10 +43,8 @@ fn generate_test_data(
 
     // Create HashedPostState with single account's storage
     let mut storages = B256Map::default();
-    let hashed_storage = HashedStorage {
-        wiped: false,
-        storage: storage_map.iter().map(|(k, v)| (*k, *v)).collect(),
-    };
+    let hashed_storage =
+        HashedStorage { storage: storage_map.iter().map(|(k, v)| (*k, *v)).collect() };
     storages.insert(hashed_address, hashed_storage);
 
     let hashed_post_state = HashedPostState { accounts: B256Map::default(), storages };
@@ -84,7 +82,7 @@ fn generate_test_data(
 fn create_cursor_factories(
     post_state: &HashedPostState,
 ) -> (MockTrieCursorFactory, MockHashedCursorFactory) {
-    use reth_trie::{StateRoot, updates::StorageTrieUpdates};
+    use reth_trie::{updates::StorageTrieUpdates, StateRoot};
 
     // Create empty trie cursor factory to serve as the initial state for StateRoot
     // Ensure that there's a storage trie dataset for every storage account

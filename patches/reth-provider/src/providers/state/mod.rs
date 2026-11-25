@@ -1,7 +1,6 @@
 //! [`StateProvider`](crate::StateProvider) implementations
 pub(crate) mod historical;
 pub(crate) mod latest;
-pub(crate) mod overlay;
 
 use crate::ProviderResult;
 use reth_db_api::{tables, transaction::DbTx};

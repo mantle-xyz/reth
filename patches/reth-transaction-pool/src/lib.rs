@@ -71,7 +71,7 @@
 //!   activation)
 //! - **Size**: Input data ≤ 128KB (default)
 //! - **Gas**: Limit ≤ block gas limit
-//! - **Fees**: Priority fee ≤ max fee; local tx fee cap; external minimum priority fee
+//! - **Fees**: Priority fee ≤ max fee; local tx fee cap; minimum priority fee
 //! - **Chain ID**: Must match current chain
 //! - **Intrinsic Gas**: Sufficient for data and access lists
 //! - **Blobs** (EIP-4844): Valid count, KZG proofs
@@ -275,14 +275,6 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-// This crate is a near-verbatim vendored copy of upstream `reth-transaction-pool`, which
-// keeps the `unnameable-types` lint disabled (see reth's root Cargo.toml:
-// `# rust.unnameable-types = "warn"`). Upstream ships several `pub` types in private
-// modules that are reachable through the public API but not nameable (e.g.
-// `pool::update::UpdateOutcome`, `validate::task::ValidationJobSender`). The Mantle
-// workspace enables that lint fork-wide, so allow it here to stay aligned with upstream
-// rather than diverging the vendored source.
-#![allow(unnameable_types)]
 
 pub use imbl::OrdMap;
 
@@ -313,9 +305,9 @@ pub use crate::{
 use crate::{identifier::TransactionId, pool::PoolInner};
 use alloy_eips::{
     eip4844::{BlobAndProofV1, BlobAndProofV2, BlobCellsAndProofsV1},
-    eip7594::BlobTransactionSidecarVariant,
+    eip7594::{BlobCellMask, BlobTransactionSidecarVariant},
 };
-use alloy_primitives::{map::AddressSet, Address, TxHash, B128, B256, U256};
+use alloy_primitives::{map::AddressSet, Address, TxHash, B256, U256};
 use aquamarine as _;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_eth_wire_types::HandleMempoolData;
@@ -649,6 +641,13 @@ where
         self.pool.all_transactions()
     }
 
+    fn all_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> AllPoolTransactions<Self::Transaction> {
+        self.pool.all_transactions_by_sender(sender)
+    }
+
     fn all_transaction_hashes(&self) -> Vec<TxHash> {
         self.pool.all_transaction_hashes()
     }
@@ -825,9 +824,9 @@ where
     fn get_blobs_for_versioned_hashes_v4(
         &self,
         versioned_hashes: &[B256],
-        indices_bitarray: B128,
+        cell_mask: BlobCellMask,
     ) -> Result<Vec<Option<BlobCellsAndProofsV1>>, BlobStoreError> {
-        self.pool.blob_store().get_by_versioned_hashes_v4(versioned_hashes, indices_bitarray)
+        self.pool.blob_store().get_by_versioned_hashes_v4(versioned_hashes, cell_mask)
     }
 
     fn has_blobs_for_versioned_hashes(

@@ -9,8 +9,8 @@ use dashmap::DashMap;
 use std::{
     panic::AssertUnwindSafe,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
     thread,
     time::Instant,
@@ -103,7 +103,7 @@ impl WorkerThread {
 
         if self.tx.send(task).is_err() {
             self.pending.fetch_sub(1, Ordering::AcqRel);
-            return None;
+            return None
         }
 
         Some(result_rx)
@@ -193,11 +193,7 @@ impl Drop for WorkerMap {
         for (_, mut w) in std::mem::take(&mut self.workers) {
             // Drop sender so the thread's recv loop exits, then join.
             drop(w.tx);
-            // A task can own the last reference to this map and drop it on its own worker, which
-            // cannot join itself. That thread exits on its own once the task returns.
-            if let Some(handle) = w.handle.take() &&
-                handle.thread().id() != thread::current().id()
-            {
+            if let Some(handle) = w.handle.take() {
                 let _ = handle.join();
             }
         }
@@ -243,8 +239,8 @@ mod tests {
     #[tokio::test]
     async fn worker_map_sequential_execution() {
         use std::sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         };
 
         let map = WorkerMap::new();
@@ -295,34 +291,7 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(first.unwrap().await.unwrap(), 1);
 
-        // The worker sends the result before decrementing its pending count.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Some(third) = map.try_spawn_on("busy-worker", || 3) {
-                    break third.await.unwrap();
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("worker should accept and complete the next task");
-        assert_eq!(result, 3);
-    }
-
-    #[test]
-    fn worker_map_last_owner_dropped_on_worker() {
-        let map = Arc::new(WorkerMap::new());
-        let owner = Arc::clone(&map);
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-
-        let done = map.spawn_on("last-owner", move || {
-            release_rx.recv().unwrap();
-            // Drops the last reference to the map on the worker it would join.
-            drop(owner);
-        });
-
-        drop(map);
-        release_tx.send(()).unwrap();
-        done.blocking_recv().expect("dropping the map on its own worker should not panic");
+        let third = map.try_spawn_on("busy-worker", || 3).expect("worker should be idle");
+        assert_eq!(third.await.unwrap(), 3);
     }
 }

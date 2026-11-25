@@ -1,6 +1,6 @@
 //! Metrics for the sparse state trie
 
-use reth_metrics::{Metrics, metrics::Histogram};
+use reth_metrics::{metrics::Histogram, Metrics};
 
 /// Metrics for the sparse state trie
 #[derive(Default, Debug)]

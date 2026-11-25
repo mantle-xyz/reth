@@ -1,12 +1,12 @@
 [package]
 name = "reth-stages-api"
-version = "2.4.0"
+version = "2.6.0"
+description = "[MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Staged sync pipeline API [MANTLE PATCH: backport reth#28067 at aef8d3ef]"
 
 [lints]
 workspace = true
@@ -17,7 +17,7 @@ reth-codecs.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-static-file.workspace = true
-reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-network-p2p.workspace = true
 reth-tokio-util.workspace = true
 reth-consensus.workspace = true
 reth-prune.workspace = true

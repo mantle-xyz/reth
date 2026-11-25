@@ -12,25 +12,24 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use crate::shutdown::{Shutdown, Signal, signal};
+use crate::shutdown::{signal, Shutdown, Signal};
 use std::{
     any::Any,
     fmt::{Display, Formatter},
     pin::Pin,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
-    task::{Context, Poll, ready},
+    task::{ready, Context, Poll},
     thread,
 };
 use tokio::{
     runtime::Handle,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
 use tracing::debug;
 
-pub mod cancel;
 pub mod lazy;
 pub mod metrics;
 pub mod runtime;
@@ -41,7 +40,7 @@ pub(crate) mod worker_map;
 #[cfg(feature = "rayon")]
 pub mod pool;
 #[cfg(feature = "rayon")]
-pub use pool::{Worker, WorkerPool, build_pool_with_panic_handler};
+pub use pool::{build_pool_with_panic_handler, Worker, WorkerPool};
 
 /// Lock-free ordered parallel iterator extension trait.
 #[cfg(feature = "rayon")]
@@ -49,7 +48,6 @@ pub mod for_each_ordered;
 #[cfg(feature = "rayon")]
 pub use for_each_ordered::ForEachOrdered;
 
-pub use cancel::CancelOnDrop;
 pub use lazy::LazyHandle;
 #[cfg(feature = "rayon")]
 pub use runtime::RayonConfig;

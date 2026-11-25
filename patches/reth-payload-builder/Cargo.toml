@@ -1,12 +1,12 @@
 [package]
 name = "reth-payload-builder"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "reth payload builder [MANTLE PATCH: backport reth#28015 at aef8d3ef]"
+description = "reth payload builder [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true

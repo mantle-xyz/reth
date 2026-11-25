@@ -1,9 +1,9 @@
 use crate::value_encoder::ValueEncoderStats;
-use reth_metrics::{Metrics, metrics::Histogram};
+use reth_metrics::{metrics::Histogram, Metrics};
 use reth_trie::{
-    TrieType,
     hashed_cursor::{HashedCursorMetrics, HashedCursorMetricsCache},
     trie_cursor::{TrieCursorMetrics, TrieCursorMetricsCache},
+    TrieType,
 };
 use std::time::Duration;
 

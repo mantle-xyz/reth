@@ -1,12 +1,12 @@
 [package]
 name = "reth-trie-sparse"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Sparse MPT implementation [MANTLE PATCH: backport reth#26421 at aef8d3ef]"
+description = "Sparse MPT implementation [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
@@ -25,8 +25,6 @@ alloy-primitives.workspace = true
 # misc
 either = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"], optional = true }
-serde_json = { workspace = true, optional = true }
 smallvec = { workspace = true, optional = true }
 slotmap = { version = "1", optional = true }
 strum = { workspace = true, features = ["derive"] }
@@ -43,8 +41,8 @@ reth-tracing.workspace = true
 
 arbitrary.workspace = true
 alloy-rlp.workspace = true
-itertools = "0.14"
-pretty_assertions = "1.4"
+itertools.workspace = true
+pretty_assertions = { version = "1.4" }
 proptest-arbitrary-interop.workspace = true
 proptest.workspace = true
 rand.workspace = true
@@ -67,14 +65,11 @@ std = [
     "reth-primitives-traits/rayon",
     "reth-trie-common/std",
     "tracing/std",
-    "serde?/std",
-    "serde_json?/std",
     "strum/std",
     "reth-tracing/std",
     "either/std",
 ]
 metrics = ["dep:reth-metrics", "dep:metrics", "std"]
-trie-debug = ["std", "dep:serde", "dep:serde_json", "alloy-primitives/serde", "alloy-trie/serde"]
 test-utils = [
     "std",
     "reth-primitives-traits/test-utils",

@@ -14,8 +14,6 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// Vendored upstream code; the workspace lint would otherwise flag its public-in-private types.
-#![allow(unnameable_types)]
 
 mod implementation;
 pub mod lockfile;

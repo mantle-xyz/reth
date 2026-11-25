@@ -9,10 +9,9 @@
 
 use crate::error::StateRootTaskError;
 use alloy_evm::block::OnStateHook;
-use alloy_primitives::{B256, keccak256, map::B256Map};
+use alloy_primitives::{keccak256, map::B256Map, B256};
 use reth_trie::{
-    HashedPostState, HashedStorage, MultiProofTargetsV2, ProofV2Target,
-    prefix_set::TriePrefixSetsMut, updates::TrieUpdates,
+    updates::TrieUpdates, HashedPostState, HashedStorage, MultiProofTargetsV2, ProofV2Target,
 };
 use revm::state::EvmState;
 use std::{fmt, sync::Arc};
@@ -44,12 +43,6 @@ pub struct StateRootComputeOutcome {
     pub trie_updates: Arc<TrieUpdates>,
     /// Hashed post state produced while computing the state root.
     pub hashed_state: Arc<HashedPostState>,
-    /// Changed trie node base paths retained while computing the root.
-    pub changed_paths: Option<Arc<TriePrefixSetsMut>>,
-    /// Debug recorders taken from the sparse tries, keyed by `None` for account trie
-    /// and `Some(address)` for storage tries.
-    #[cfg(feature = "trie-debug")]
-    pub debug_recorders: Vec<(Option<B256>, reth_trie_sparse::debug_recorder::TrieDebugRecorder)>,
 }
 
 /// Handle to a background sparse trie state root computation.
@@ -526,12 +519,10 @@ pub fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
                 .map(|(slot, value)| (keccak256(B256::from(slot)), value.present_value))
                 .peekable();
 
-            if destroyed {
-                hashed_state.storages.insert(hashed_address, HashedStorage::new(true));
-            } else if changed_storage_iter.peek().is_some() {
+            if !destroyed && changed_storage_iter.peek().is_some() {
                 hashed_state
                     .storages
-                    .insert(hashed_address, HashedStorage::from_iter(false, changed_storage_iter));
+                    .insert(hashed_address, HashedStorage::from_iter(changed_storage_iter));
             }
         }
     }
@@ -543,11 +534,54 @@ pub fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
-    use revm::state::{Account, TransactionId};
+    use revm::state::{Account, EvmStorageSlot, TransactionId};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
+
+    #[test]
+    fn created_selfdestruct_does_not_emit_storage() {
+        let address = Address::repeat_byte(0x01);
+        let mut account = Account::new_not_existing(TransactionId::ZERO);
+        account.mark_touch();
+        assert!(account.mark_created_locally());
+        assert!(account.mark_selfdestructed_locally());
+        account.info.nonce = 1;
+        account.storage.insert(
+            U256::from(1),
+            EvmStorageSlot::new_changed(U256::ZERO, U256::from(2), TransactionId::ZERO),
+        );
+
+        let hashed_state =
+            evm_state_to_hashed_post_state(EvmState::from_iter([(address, account)]));
+        let hashed_address = keccak256(address);
+
+        assert_eq!(hashed_state.accounts.get(&hashed_address), Some(&None));
+        assert!(!hashed_state.storages.contains_key(&hashed_address));
+    }
+
+    #[test]
+    fn existing_selfdestruct_does_not_emit_storage() {
+        let address = Address::repeat_byte(0x02);
+        let mut account = Account::default();
+        account.info.nonce = 1;
+        account.set_current_info_as_original();
+        account.mark_touch();
+        assert!(account.mark_selfdestructed_locally());
+        account.selfdestruct();
+        account.storage.insert(
+            U256::from(1),
+            EvmStorageSlot::new_changed(U256::ZERO, U256::from(2), TransactionId::ZERO),
+        );
+
+        let hashed_state =
+            evm_state_to_hashed_post_state(EvmState::from_iter([(address, account)]));
+        let hashed_address = keccak256(address);
+
+        assert_eq!(hashed_state.accounts.get(&hashed_address), Some(&None));
+        assert!(!hashed_state.storages.contains_key(&hashed_address));
+    }
 
     /// An account drained to zero balance, with nonce 0 and no code, is EIP-161-empty and
     /// canonical execution deletes it. Asserts the converter reports the deletion as `None`,
@@ -603,9 +637,9 @@ mod tests {
     #[test]
     fn matches_bundle_state_for_emptied_account() {
         use revm::{
-            DatabaseCommit,
-            database::{State, states::bundle_state::BundleRetention},
+            database::{states::bundle_state::BundleRetention, State},
             state::AccountInfo,
+            DatabaseCommit,
         };
 
         let address = Address::repeat_byte(0x07);
@@ -639,8 +673,8 @@ mod tests {
     #[test]
     fn created_empty_account_matches_bundle_state() {
         use revm::{
+            database::{states::bundle_state::BundleRetention, State},
             DatabaseCommit,
-            database::{State, states::bundle_state::BundleRetention},
         };
 
         let address = Address::repeat_byte(0x08);
@@ -673,8 +707,8 @@ mod tests {
     #[test]
     fn touched_never_existing_account_matches_bundle_state() {
         use revm::{
+            database::{states::bundle_state::BundleRetention, State},
             DatabaseCommit,
-            database::{State, states::bundle_state::BundleRetention},
         };
 
         let address = Address::repeat_byte(0x09);
@@ -703,9 +737,9 @@ mod tests {
     #[test]
     fn touched_unchanged_account_matches_bundle_state() {
         use revm::{
-            DatabaseCommit,
-            database::{State, states::bundle_state::BundleRetention},
+            database::{states::bundle_state::BundleRetention, State},
             state::AccountInfo,
+            DatabaseCommit,
         };
 
         let address = Address::repeat_byte(0x0a);
@@ -884,9 +918,6 @@ mod tests {
                 state_root: B256::repeat_byte(0x42),
                 trie_updates: Arc::new(TrieUpdates::default()),
                 hashed_state: Arc::new(HashedPostState::default()),
-                changed_paths: None,
-                #[cfg(feature = "trie-debug")]
-                debug_recorders: Vec::new(),
             }))
             .unwrap();
         let outcome = handle.state_root().expect("outcome is delivered");

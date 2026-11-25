@@ -22,7 +22,10 @@ use alloy_eips::{eip4895::Withdrawal, eip7685::Requests, Encodable2718};
 use alloy_hardforks::EthereumHardfork;
 use alloy_primitives::{Bytes, Log, B256};
 use revm::{
-    context::Block, context_interface::result::ResultAndState, database::DatabaseCommitExt,
+    context::Block,
+    context_interface::{result::ResultAndState, Cfg},
+    database::DatabaseCommitExt,
+    primitives::hardfork::SpecId,
     DatabaseCommit, Inspector,
 };
 
@@ -73,6 +76,16 @@ pub struct EthBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     /// Blob gas used by the block.
     /// Before cancun activation, this is always 0.
     pub blob_gas_used: u64,
+
+    /// Skips the Amsterdam block state-gas capacity check
+    /// (execution-specs `check_block_gas_capacity`, state dimension).
+    ///
+    /// Chain variants without a block-level state-gas budget (e.g. chains that
+    /// admit transactions by execution gas only) can set this to admit
+    /// transactions whose full gas limit exceeds
+    /// `block_gas_limit - block_state_gas_used`. Has no effect before
+    /// Amsterdam. Defaults to `false` (check enforced).
+    pub skip_state_gas_capacity_check: bool,
 }
 
 /// The result of executing an Ethereum transaction.
@@ -123,7 +136,15 @@ where
             system_caller: SystemCaller::new(spec.clone()),
             spec,
             receipt_builder,
+            skip_state_gas_capacity_check: false,
         }
+    }
+
+    /// Configures whether the Amsterdam block state-gas capacity check is
+    /// skipped. See [`Self::skip_state_gas_capacity_check`].
+    pub const fn with_skip_state_gas_capacity_check(mut self, skip: bool) -> Self {
+        self.skip_state_gas_capacity_check = skip;
+        self
     }
 
     /// Reserves capacity for at least `tx_count` additional receipts.
@@ -144,7 +165,11 @@ where
 
 impl<E, Spec, R> BlockExecutor for EthBlockExecutor<'_, E, Spec, R>
 where
-    E: Evm<DB: StateDB, Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>>,
+    E: Evm<
+        DB: StateDB,
+        Spec: Into<SpecId> + Clone,
+        Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
+    >,
     Spec: EthExecutorSpec,
     R: ReceiptBuilder<Transaction: Transaction + Encodable2718, Receipt: TxReceipt<Log = Log>>,
     <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
@@ -184,10 +209,7 @@ where
 
         // Use regular part of transaction gas limit to check if it fits inside available block
         // space.
-        let mut max_tx_gas_usage = tx.tx().gas_limit();
-        if let Some(tx_gas_limit_cap) = self.evm.cfg_env().tx_gas_limit_cap {
-            max_tx_gas_usage = min(max_tx_gas_usage, tx_gas_limit_cap);
-        }
+        let max_tx_gas_usage = min(tx.tx().gas_limit(), self.evm.cfg_env().tx_gas_limit_cap());
 
         if max_tx_gas_usage > block_available_gas {
             return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
@@ -195,6 +217,21 @@ where
                 block_available_gas,
             }
             .into());
+        }
+
+        // Amsterdam+: the state-gas dimension has its own budget of `block_gas_limit`
+        // (execution-specs `check_block_gas_capacity`). Unlike the execution dimension,
+        // the transaction's full gas limit counts against it — state gas is drawn from
+        // the reservoir above `tx_gas_limit_cap`, so the cap does not bound it.
+        if self.evm.cfg_env().enable_amsterdam_eip8037 && !self.skip_state_gas_capacity_check {
+            let state_gas_available = self.evm.block().gas_limit() - self.block_state_gas_used;
+            if tx.tx().gas_limit() > state_gas_available {
+                return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                    transaction_gas_limit: tx.tx().gas_limit(),
+                    block_available_gas: state_gas_available,
+                }
+                .into());
+            }
         }
 
         // Execute transaction and return the result
@@ -371,7 +408,10 @@ impl<R, Spec, EvmF> BlockExecutorFactory for EthBlockExecutorFactory<R, Spec, Ev
 where
     R: ReceiptBuilder<Transaction: Transaction + Encodable2718, Receipt: TxReceipt<Log = Log>>,
     Spec: EthExecutorSpec,
-    EvmF: EvmFactory<Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>>,
+    EvmF: EvmFactory<
+        Spec: Into<SpecId> + Clone,
+        Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
+    >,
     <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
     Self: 'static,
 {

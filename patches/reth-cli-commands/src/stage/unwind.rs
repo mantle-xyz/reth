@@ -18,8 +18,8 @@ use reth_exex::ExExManagerHandle;
 use reth_provider::{providers::ProviderNodeTypes, BlockNumReader, ProviderFactory};
 use reth_stages::{
     sets::{DefaultStages, OfflineStages},
-    stages::{EraImportSource, EraStage, ExecutionStage},
-    ExecutionStageThresholds, Pipeline, StageId, StageSet,
+    stages::ExecutionStage,
+    ExecutionStageThresholds, Pipeline, StageSet,
 };
 use reth_static_file::StaticFileProducer;
 use std::sync::Arc;
@@ -115,11 +115,6 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                     prune_modes.clone(),
                     None,
                 )
-                .builder()
-                .add_before(
-                    EraStage::new(None::<EraImportSource>, stage_conf.etl.clone()),
-                    StageId::Headers,
-                )
                 .set(ExecutionStage::new(
                     evm_config,
                     Arc::new(NoopConsensus::default()),
@@ -183,7 +178,7 @@ impl Subcommands {
         if target > last {
             eyre::bail!(
                 "Target block number {target} is higher than the latest block number {last}"
-            )
+            );
         }
         Ok(target)
     }

@@ -1,18 +1,16 @@
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockNumber, B256};
 use alloy_rlp::Decodable;
-use eyre::WrapErr;
 use reth_codecs::Compact;
-use reth_fs_util::FsPathError;
 use reth_node_builder::NodePrimitives;
 use reth_primitives_traits::{SealedBlock, SealedHeader, SealedHeaderFor};
 use reth_provider::{
-    providers::StaticFileProvider, BlockWriter, ProviderError, ProviderResult,
-    StageCheckpointWriter, StaticFileProviderFactory, StaticFileWriter,
+    providers::StaticFileProvider, BlockWriter, ProviderResult, StageCheckpointWriter,
+    StaticFileProviderFactory, StaticFileWriter,
 };
 use reth_stages::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
-use std::{io::ErrorKind, path::Path};
+use std::path::Path;
 use tracing::info;
 
 /// Reads the header RLP from a file and returns the Header.
@@ -22,18 +20,15 @@ pub(crate) fn read_header_from_file<H>(path: &Path) -> Result<H, eyre::Error>
 where
     H: Decodable,
 {
-    let buf = match reth_fs_util::read_to_string(path) {
-        Ok(content) => alloy_primitives::hex::decode(content.trim())
-            .wrap_err_with(|| format!("failed to hex-decode header file {}", path.display()))?,
-        // Non-UTF-8 content is raw RLP bytes.
-        Err(FsPathError::Read { source, .. }) if source.kind() == ErrorKind::InvalidData => {
-            reth_fs_util::read(path)?
-        }
-        Err(err) => return Err(err.into()),
+    let buf = if let Ok(content) = reth_fs_util::read_to_string(path) {
+        alloy_primitives::hex::decode(content.trim())?
+    } else {
+        // If UTF-8 decoding fails, read as raw bytes
+        reth_fs_util::read(path)?
     };
 
-    H::decode(&mut &buf[..])
-        .wrap_err_with(|| format!("failed to RLP-decode header file {}", path.display()))
+    let header = H::decode(&mut &buf[..])?;
+    Ok(header)
 }
 
 /// Creates a dummy chain (with no transactions) up to the last EVM block and appends the
@@ -121,8 +116,6 @@ where
 {
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let mut handles = Vec::new();
-
     // Spawn jobs for incrementing the block end range of transactions, receipts, and senders.
     for segment in [
         StaticFileSegment::Transactions,
@@ -140,7 +133,7 @@ where
             StaticFileSegment::TransactionSenders => "init-state-senders",
             _ => "init-state-segment",
         };
-        let handle = reth_tasks::spawn_os_thread(thread_name, move || {
+        reth_tasks::spawn_os_thread(thread_name, move || {
             let result = provider.latest_writer(segment).and_then(|mut writer| {
                 for block_num in 1..=target_height {
                     writer.increment_block(block_num)?;
@@ -148,15 +141,13 @@ where
                 Ok(())
             });
 
-            // The receiver is gone if it already returned an earlier error.
-            let _ = tx_clone.send(result);
+            tx_clone.send(result).unwrap();
         });
-        handles.push((thread_name, handle));
     }
 
     // Spawn job for appending empty headers
     let provider = sf_provider.clone();
-    let handle = reth_tasks::spawn_os_thread("init-state-headers", move || {
+    reth_tasks::spawn_os_thread("init-state-headers", move || {
         let result = provider.latest_writer(StaticFileSegment::Headers).and_then(|mut writer| {
             for block_num in 1..=target_height {
                 // TODO: should we fill with real parent_hash?
@@ -166,24 +157,14 @@ where
             Ok(())
         });
 
-        let _ = tx.send(result);
+        tx.send(result).unwrap();
     });
-    handles.push(("init-state-headers", handle));
 
     // Catches any StaticFileWriter error.
     while let Ok(append_result) = rx.recv() {
         if let Err(err) = append_result {
             tracing::error!(target: "reth::cli", "Error appending dummy chain: {err}");
             return Err(err)
-        }
-    }
-
-    // A panicked worker drops its sender without reporting a result.
-    for (name, handle) in handles {
-        if handle.join().is_err() {
-            let err = std::io::Error::other(format!("init-state worker {name} panicked"));
-            tracing::error!(target: "reth::cli", "Error appending dummy chain: {err}");
-            return Err(ProviderError::other(err))
         }
     }
 

@@ -23,7 +23,7 @@ use reth_primitives_traits::{
     BlockBody as _, BlockTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader,
 };
 use reth_rpc_convert::{RpcBlock, RpcConvert, RpcTxReq};
-use reth_rpc_server_types::result::{block_id_to_str, rpc_err};
+use reth_rpc_server_types::result::rpc_err;
 use reth_storage_api::{noop::NoopProvider, StateProvider};
 use revm::{
     context::Block,
@@ -61,7 +61,7 @@ pub enum EthSimulateError {
     #[error("Client adjustable limit reached")]
     GasLimitReached,
     /// Base block for the simulation was not found.
-    #[error("block not found: {}", block_id_to_str(*block))]
+    #[error("block not found: {block}")]
     BlockNotFound {
         /// The block id that was requested.
         block: BlockId,
@@ -447,16 +447,12 @@ where
         Address::ZERO
     };
 
-    let state_nonce = db.basic(from).map_err(Into::into)?.map(|acc| acc.nonce).unwrap_or_default();
     if tx.as_ref().nonce().is_none() {
-        tx.as_mut().set_nonce(state_nonce);
+        tx.as_mut().set_nonce(
+            db.basic(from).map_err(Into::into)?.map(|acc| acc.nonce).unwrap_or_default(),
+        );
     }
-    // EIP-2681 applies in both modes. Check it here because revm checks the fee cap first.
-    if state_nonce == u64::MAX && (disable_nonce_check || tx.as_ref().nonce() == Some(u64::MAX)) {
-        return Err(EthApiError::other(EthSimulateError::NonceMaxValue))
-    }
-    // revm rejects a tx nonce of u64::MAX even with the nonce check disabled. The state nonce is
-    // below the limit here, so only the tx object changes.
+    // eth_simulateV1 validation-off mode behaves like eth_call; avoid revm's max-nonce guard.
     if disable_nonce_check && tx.as_ref().nonce() == Some(u64::MAX) {
         tx.as_mut().set_nonce(0);
     }

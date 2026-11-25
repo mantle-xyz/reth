@@ -1,6 +1,6 @@
 use super::{
-    ArenaSparseNode, ArenaSparseNodeBranchChild, ArenaSparseNodeState, Index, NodeArena,
     branch_child_idx::{BranchChildIdx, BranchChildIter},
+    ArenaSparseNode, ArenaSparseNodeBranchChild, ArenaSparseNodeState, Index, NodeArena,
 };
 use alloc::vec::Vec;
 use reth_trie_common::Nibbles;
@@ -135,8 +135,7 @@ impl ArenaCursor {
                 ArenaSparseNode::Leaf { state, .. } => matches!(state, ArenaSparseNodeState::Dirty),
                 ArenaSparseNode::Subtrie(s) => {
                     let root = &s.arena[s.root];
-                    matches!(root, ArenaSparseNode::EmptyRoot) ||
-                        matches!(root.state_ref(), Some(ArenaSparseNodeState::Dirty))
+                    matches!(root.state_ref(), Some(ArenaSparseNodeState::Dirty))
                 }
                 _ => false,
             });
@@ -310,7 +309,7 @@ impl ArenaCursor {
             let head_idx = head.index;
 
             let head_branch = match &arena[head_idx] {
-                ArenaSparseNode::EmptyRoot => {
+                ArenaSparseNode::EmptyRoot { .. } => {
                     return SeekResult::EmptyRoot;
                 }
                 ArenaSparseNode::Leaf { key, .. } => {

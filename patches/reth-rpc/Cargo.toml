@@ -1,12 +1,12 @@
 [package]
 name = "reth-rpc"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth RPC implementation [MANTLE PATCH: backport reth#27455 at aef8d3ef]"
+description = "Reth RPC implementation [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
@@ -35,10 +35,9 @@ reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-rpc-eth-types.workspace = true
 reth-rpc-server-types.workspace = true
-reth-network-types = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-network-types = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 reth-consensus.workspace = true
 reth-consensus-common.workspace = true
-reth-ethereum-primitives.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-node-api.workspace = true
 reth-payload-primitives.workspace = true
@@ -82,21 +81,24 @@ pin-project.workspace = true
 parking_lot.workspace = true
 
 # misc
-dyn-clone = "1.0.17"
+dyn-clone = { version = "1.0.17" }
 tracing.workspace = true
-tracing-futures = "0.2"
+tracing-futures.workspace = true
 futures.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
-itertools = { version = "0.14", default-features = false }
+itertools.workspace = true
 
 [dev-dependencies]
 reth-testing-utils.workspace = true
+reth-ethereum-primitives.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-db-api.workspace = true
+reth-db-common.workspace = true
+reth-storage-overlay.workspace = true
 
 rand.workspace = true
 

@@ -5,7 +5,7 @@ use super::{EthApiSpec, LoadBlock, LoadPendingBlock, SpawnBlocking};
 use crate::{EthApiTypes, FromEthApiError, RpcNodeCore, RpcNodeCoreExt};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_eips::BlockId;
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rpc_types_eth::{Account, AccountInfo, EIP1186AccountProofResponse};
 use alloy_serde::JsonStorageKey;
 use futures::Future;
@@ -22,12 +22,15 @@ use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, StateProvider, StateProviderBox, StateProviderFactory,
 };
 use reth_transaction_pool::TransactionPool;
+use reth_trie_common::{MultiProofTargetsV2, ProofV2Target};
 use std::{collections::HashMap, sync::Arc};
 
 /// Helper methods for `eth_` methods relating to state (accounts).
 pub trait EthState: LoadState + SpawnBlocking {
     /// Returns the maximum number of blocks into the past for generating state proofs.
-    fn max_proof_window(&self) -> u64;
+    fn max_proof_window(&self) -> u64 {
+        self.eth_api_settings().eth_proof_window
+    }
 
     /// Validates that the given block is within the configured proof window.
     ///
@@ -76,8 +79,10 @@ pub trait EthState: LoadState + SpawnBlocking {
         address: Address,
         block_id: Option<BlockId>,
     ) -> impl Future<Output = Result<U256, Self::Error>> + Send {
-        self.spawn_blocking_io_with_state(block_id.unwrap_or_default(), move |_, state| {
-            Ok(state
+        self.spawn_blocking_io_fut(async move |this| {
+            Ok(this
+                .state_at_block_id_or_latest(block_id)
+                .await?
                 .account_balance(&address)
                 .map_err(Self::Error::from_eth_err)?
                 .unwrap_or_default())
@@ -91,9 +96,10 @@ pub trait EthState: LoadState + SpawnBlocking {
         index: JsonStorageKey,
         block_id: Option<BlockId>,
     ) -> impl Future<Output = Result<B256, Self::Error>> + Send {
-        self.spawn_blocking_io_with_state(block_id.unwrap_or_default(), move |_, state| {
+        self.spawn_blocking_io_fut(async move |this| {
             Ok(B256::new(
-                state
+                this.state_at_block_id_or_latest(block_id)
+                    .await?
                     .storage(address, index.as_b256())
                     .map_err(Self::Error::from_eth_err)?
                     .unwrap_or_default()
@@ -126,7 +132,9 @@ pub trait EthState: LoadState + SpawnBlocking {
                 )));
             }
 
-            self.spawn_blocking_io_with_state(block_id.unwrap_or_default(), move |_, state| {
+            self.spawn_blocking_io_fut(async move |this| {
+                let state = this.state_at_block_id_or_latest(block_id).await?;
+
                 let mut result = HashMap::with_capacity(requests.len());
                 for (address, slots) in requests {
                     let mut values = Vec::with_capacity(slots.len());
@@ -169,13 +177,73 @@ pub trait EthState: LoadState + SpawnBlocking {
             let block_id = block_id.unwrap_or_default();
             self.ensure_within_proof_window(block_id)?;
 
-            self.spawn_blocking_io_with_state(block_id, move |_, state| {
+            self.spawn_blocking_io_fut(move |this| async move {
                 let _permit = permit;
+                let state = this.state_at_block_id(block_id).await?;
                 let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
                 let proof = state
                     .proof(Default::default(), address, &storage_keys)
                     .map_err(Self::Error::from_eth_err)?;
-                Ok(proof.into_eip1186_response_with(keys, true))
+                Ok(proof.into_eip1186_response(keys))
+            })
+            .await
+        })
+    }
+
+    /// Returns account and storage proofs for multiple targets at the given block number.
+    fn get_multi_proof(
+        &self,
+        targets: Vec<(Address, Vec<B256>)>,
+        block_id: Option<BlockId>,
+    ) -> Result<
+        impl Future<Output = Result<Vec<EIP1186AccountProofResponse>, Self::Error>> + Send,
+        Self::Error,
+    >
+    where
+        Self: EthApiSpec,
+    {
+        Ok(async move {
+            let permit = self
+                .acquire_owned_tracing()
+                .await
+                .map_err(RethError::other)
+                .map_err(EthApiError::Internal)?;
+
+            let block_id = block_id.unwrap_or_default();
+            self.ensure_within_proof_window(block_id)?;
+
+            self.spawn_blocking_io_fut(move |this| async move {
+                let _permit = permit;
+                let state = this.state_at_block_id(block_id).await?;
+                let mut proof_targets = MultiProofTargetsV2::default();
+                proof_targets.account_targets.reserve(targets.len());
+                proof_targets.storage_targets.reserve(targets.len());
+                for (address, slots) in &targets {
+                    let hashed_address = keccak256(address);
+                    proof_targets.account_targets.push(ProofV2Target::new(hashed_address));
+                    proof_targets
+                        .storage_targets
+                        .entry(hashed_address)
+                        .or_default()
+                        .extend(slots.iter().map(|slot| ProofV2Target::new(keccak256(slot))));
+                }
+
+                let multiproof = state
+                    .multiproof_v2(Default::default(), proof_targets)
+                    .map_err(Self::Error::from_eth_err)?;
+
+                targets
+                    .into_iter()
+                    .map(|(address, slots)| {
+                        let proof = multiproof
+                            .account_proof(address, &slots)
+                            .map_err(RethError::other)
+                            .map_err(Self::Error::from_eth_err)?;
+                        let storage_keys =
+                            slots.into_iter().map(JsonStorageKey::from).collect::<Vec<_>>();
+                        Ok(proof.into_eip1186_response(storage_keys))
+                    })
+                    .collect::<Result<Vec<_>, Self::Error>>()
             })
             .await
         })
@@ -193,7 +261,8 @@ pub trait EthState: LoadState + SpawnBlocking {
         async move {
             self.ensure_within_proof_window(block_id)?;
 
-            self.spawn_blocking_io_with_state(block_id, move |_, state| {
+            self.spawn_blocking_io_fut(async move |this| {
+                let state = this.state_at_block_id(block_id).await?;
                 let account = state.basic_account(&address).map_err(Self::Error::from_eth_err)?;
                 let Some(account) = account else { return Ok(None) };
 
@@ -219,7 +288,8 @@ pub trait EthState: LoadState + SpawnBlocking {
         address: Address,
         block_id: BlockId,
     ) -> impl Future<Output = Result<AccountInfo, Self::Error>> + Send {
-        self.spawn_blocking_io_with_state(block_id, move |_, state| {
+        self.spawn_blocking_io_fut(async move |this| {
+            let state = this.state_at_block_id(block_id).await?;
             let account = state
                 .basic_account(&address)
                 .map_err(Self::Error::from_eth_err)?
@@ -257,15 +327,10 @@ pub trait LoadState:
         self.provider().history_by_block_hash(block_hash).map_err(Self::Error::from_eth_err)
     }
 
-    /// Returns the state at the given [`BlockId`], preferring locally built state for `pending`.
+    /// Returns the state at the given [`BlockId`] enum.
     ///
-    /// If local pending state is unavailable or fails to build, falls back to the provider's
-    /// pending state. Other block IDs resolve only canonical state. See
-    /// <https://github.com/paradigmxyz/reth/issues/4515>.
-    ///
-    /// Pending block construction may spawn blocking work, so await this outside a blocking task.
-    /// The fallback provider lookup is synchronous on the calling task; RPC handlers should use
-    /// [`Self::spawn_blocking_io_with_state`] to keep that read on the blocking pool.
+    /// Note: if not [`BlockNumberOrTag::Pending`](alloy_eips::BlockNumberOrTag) then this
+    /// will only return canonical state. See also <https://github.com/paradigmxyz/reth/issues/4515>
     fn state_at_block_id(
         &self,
         at: BlockId,
@@ -308,39 +373,7 @@ pub trait LoadState:
         }
     }
 
-    /// Executes `f` with the state at the given [`BlockId`] on a blocking IO task.
-    ///
-    /// Resolves the pending state before occupying a blocking thread, since building a pending
-    /// block may need a blocking thread of its own.
-    fn spawn_blocking_io_with_state<F, R>(
-        &self,
-        at: BlockId,
-        f: F,
-    ) -> impl Future<Output = Result<R, Self::Error>> + Send
-    where
-        Self: SpawnBlocking,
-        F: FnOnce(Self, StateProviderBox) -> Result<R, Self::Error> + Send + 'static,
-        R: Send + 'static,
-    {
-        async move {
-            let pending =
-                if at.is_pending() { self.local_pending_state().await.ok().flatten() } else { None };
-
-            self.spawn_blocking_io(move |this| {
-                let state = match pending {
-                    Some(state) => state,
-                    None if at.is_latest() => this.latest_state()?,
-                    None => {
-                        this.provider().state_by_block_id(at).map_err(Self::Error::from_eth_err)?
-                    }
-                };
-                f(this, state)
-            })
-            .await
-        }
-    }
-
-    /// Returns the revm evm env for the given sealed header.
+    /// Returns the EVM environment for the given sealed header.
     fn evm_env_for_header(
         &self,
         header: &SealedHeaderFor<Self::Primitives>,
@@ -351,7 +384,7 @@ pub trait LoadState:
             .map_err(Self::Error::from_eth_err)
     }
 
-    /// Returns the revm evm env for the requested [`BlockId`]
+    /// Returns the EVM environment for the requested [`BlockId`]
     ///
     /// If the [`BlockId`] this will return the [`BlockId`] of the block the env was configured
     /// for.
@@ -383,7 +416,8 @@ pub trait LoadState:
         }
     }
 
-    /// Returns the recovered block, revm evm env, and state block id for the requested [`BlockId`].
+    /// Returns the recovered block, EVM environment, and state block id for the requested
+    /// [`BlockId`].
     ///
     /// For pending blocks, this preserves the state id returned by [`Self::evm_env_at`], which can
     /// be the pending tag for an actual pending block or the latest block hash when the pending env
@@ -477,15 +511,16 @@ pub trait LoadState:
     where
         Self: SpawnBlocking,
     {
-        let at = block_id.unwrap_or_default();
-        self.spawn_blocking_io_with_state(at, move |this, state| {
+        self.spawn_blocking_io_fut(async move |this| {
             // first fetch the on chain nonce of the account
-            let on_chain_account_nonce = state
+            let on_chain_account_nonce = this
+                .state_at_block_id_or_latest(block_id)
+                .await?
                 .account_nonce(&address)
                 .map_err(Self::Error::from_eth_err)?
                 .unwrap_or_default();
 
-            if at.is_pending() {
+            if block_id == Some(BlockId::pending()) {
                 // for pending tag we need to find the highest nonce of txn in the pending state.
                 if let Some(highest_pool_tx) = this
                     .pool()
@@ -522,8 +557,10 @@ pub trait LoadState:
     where
         Self: SpawnBlocking,
     {
-        self.spawn_blocking_io_with_state(block_id.unwrap_or_default(), move |_, state| {
-            Ok(state
+        self.spawn_blocking_io_fut(async move |this| {
+            Ok(this
+                .state_at_block_id_or_latest(block_id)
+                .await?
                 .account_code(&address)
                 .map_err(Self::Error::from_eth_err)?
                 .unwrap_or_default()

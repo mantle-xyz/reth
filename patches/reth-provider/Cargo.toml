@@ -1,12 +1,12 @@
 [package]
 name = "reth-provider"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth storage provider. [MANTLE PATCH: hashed-snapshot exec-read fallback; backport reth#27131, #27223, #27229, #27678, #28064, #28053, #28067 at aef8d3ef]"
+description = "Reth storage provider. [MANTLE PATCH: hashed-snapshot exec-read fallback; vendored from ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
@@ -20,6 +20,7 @@ reth-primitives-traits = { workspace = true, features = ["reth-codec", "secp256k
 reth-errors.workspace = true
 reth-storage-errors.workspace = true
 reth-storage-api = { workspace = true, features = ["std", "db-api"] }
+reth-storage-overlay.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true
 reth-prune-types.workspace = true
@@ -67,6 +68,9 @@ reth-ethereum-engine-primitives = { workspace = true, optional = true }
 rayon.workspace = true
 
 rocksdb.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 reth-db = { workspace = true, features = ["test-utils"] }

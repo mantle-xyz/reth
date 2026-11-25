@@ -1,12 +1,12 @@
 use crate::{
     ArenaParallelSparseTrie, LeafUpdate, SparseTrie as SparseTrieTrait, SparseTrieUpdates,
+    TrieNodeEpoch,
 };
 use alloc::{borrow::Cow, boxed::Box};
-use alloy_primitives::{B256, map::B256Map};
+use alloy_primitives::{map::B256Map, B256};
 use reth_execution_errors::{SparseTrieErrorKind, SparseTrieResult};
 use reth_trie_common::{
     BranchNodeMasks, Nibbles, ProofTrieNodeV2, ProofV2TargetParent, RlpNode, TrieMask, TrieNodeV2,
-    prefix_set::PrefixSetMut,
 };
 
 /// A sparse trie that is either in a "blind" state (no nodes are revealed, root node hash is
@@ -56,8 +56,7 @@ impl<T: SparseTrieTrait + Default> RevealableSparseTrie<T> {
     /// If the trie is blinded, its root node is replaced with `root`.
     ///
     /// The `masks` are used to determine how the node's children are stored.
-    /// The retention flags control whether trie updates and changed node base paths
-    /// should be tracked.
+    /// The retention flag controls whether trie updates should be tracked.
     ///
     /// # Returns
     ///
@@ -67,7 +66,6 @@ impl<T: SparseTrieTrait + Default> RevealableSparseTrie<T> {
         root: TrieNodeV2,
         masks: Option<BranchNodeMasks>,
         retain_updates: bool,
-        retain_changed_paths: bool,
     ) -> SparseTrieResult<&mut T> {
         // if `Blind`, we initialize the revealed trie with the given root node, using a
         // pre-allocated trie if available.
@@ -79,7 +77,6 @@ impl<T: SparseTrieTrait + Default> RevealableSparseTrie<T> {
             };
 
             revealed_trie.set_root(root, masks, retain_updates)?;
-            revealed_trie.set_changed_paths(retain_changed_paths);
             *self = Self::Revealed(revealed_trie);
         }
 
@@ -94,15 +91,9 @@ impl<T: SparseTrieTrait + Default> RevealableSparseTrie<T> {
         &mut self,
         nodes: &mut [ProofTrieNodeV2],
         retain_updates: bool,
-        retain_changed_paths: bool,
     ) -> SparseTrieResult<()> {
         let trie = if let Some(root_node) = nodes.iter().find(|n| n.path.is_empty()) {
-            self.reveal_root(
-                root_node.node.clone(),
-                root_node.masks,
-                retain_updates,
-                retain_changed_paths,
-            )?
+            self.reveal_root(root_node.node.clone(), root_node.masks, retain_updates)?
         } else {
             self.as_revealed_mut().ok_or(SparseTrieErrorKind::Blind)?
         };
@@ -150,24 +141,22 @@ impl<T: SparseTrieTrait> RevealableSparseTrie<T> {
     ///
     /// Returns `None` if the trie is blinded.
     pub const fn as_revealed_ref(&self) -> Option<&T> {
-        if let Self::Revealed(revealed) = self { Some(revealed) } else { None }
+        if let Self::Revealed(revealed) = self {
+            Some(revealed)
+        } else {
+            None
+        }
     }
 
     /// Returns a mutable reference to the underlying revealed sparse trie.
     ///
     /// Returns `None` if the trie is blinded.
     pub fn as_revealed_mut(&mut self) -> Option<&mut T> {
-        if let Self::Revealed(revealed) = self { Some(revealed) } else { None }
-    }
-
-    /// Wipes the trie by removing all nodes and values,
-    /// and resetting the trie to only contain an empty root node.
-    ///
-    /// Note: This method will error if the trie is blinded.
-    pub fn wipe(&mut self) -> SparseTrieResult<()> {
-        let revealed = self.as_revealed_mut().ok_or(SparseTrieErrorKind::Blind)?;
-        revealed.wipe();
-        Ok(())
+        if let Self::Revealed(revealed) = self {
+            Some(revealed)
+        } else {
+            None
+        }
     }
 
     /// Calculates the root hash of the trie.
@@ -180,8 +169,8 @@ impl<T: SparseTrieTrait> RevealableSparseTrie<T> {
     ///
     /// - `Some(B256)` with the calculated root hash if the trie is revealed.
     /// - `None` if the trie is still blind.
-    pub fn root(&mut self) -> Option<B256> {
-        Some(self.as_revealed_mut()?.root())
+    pub fn root(&mut self, new_epoch: TrieNodeEpoch) -> Option<B256> {
+        Some(self.as_revealed_mut()?.root(new_epoch))
     }
 
     /// Returns true if the root node is cached and does not need any recomputation.
@@ -201,26 +190,12 @@ impl<T: SparseTrieTrait> RevealableSparseTrie<T> {
     ///  - The trie root hash (`B256`).
     ///  - A [`SparseTrieUpdates`] structure containing information about updated nodes.
     ///  - `None` if the trie is still blind.
-    pub fn root_with_updates(&mut self) -> Option<(B256, SparseTrieUpdates)> {
+    pub fn root_with_updates(
+        &mut self,
+        new_epoch: TrieNodeEpoch,
+    ) -> Option<(B256, SparseTrieUpdates)> {
         let revealed = self.as_revealed_mut()?;
-        Some((revealed.root(), revealed.take_updates()))
-    }
-
-    /// Configures a revealed or retained cleared trie to collect changed node base paths.
-    pub fn set_changed_paths(&mut self, retain_changed_paths: bool) {
-        match self {
-            Self::Revealed(trie) | Self::Blind(Some(trie)) => {
-                trie.set_changed_paths(retain_changed_paths);
-            }
-            Self::Blind(None) => {}
-        }
-    }
-
-    /// Takes changed node base paths from the revealed trie.
-    ///
-    /// Returns `None` if the trie is still blind.
-    pub fn take_changed_paths(&mut self) -> Option<PrefixSetMut> {
-        Some(self.as_revealed_mut()?.take_changed_paths())
+        Some((revealed.root(new_epoch), revealed.take_updates()))
     }
 
     /// Clears this trie, setting it to a blind state.
@@ -425,19 +400,6 @@ impl SparseNode {
         self.set_state(state);
         self
     }
-
-    /// Returns the memory size of this node in bytes.
-    pub const fn memory_size(&self) -> usize {
-        match self {
-            Self::Empty => core::mem::size_of::<Self>(),
-            Self::Branch { .. } => {
-                core::mem::size_of::<Self>() + core::mem::size_of::<[B256; 16]>()
-            }
-            Self::Leaf { key, .. } | Self::Extension { key, .. } => {
-                core::mem::size_of::<Self>() + key.len()
-            }
-        }
-    }
 }
 
 /// Tracks the current state of a node in the trie, specifically regarding whether it's been updated
@@ -498,24 +460,15 @@ pub struct RlpNodeStackItem {
 }
 
 impl SparseTrieUpdates {
-    /// Create new wiped sparse trie updates.
-    pub fn wiped() -> Self {
-        Self { wiped: true, ..Default::default() }
-    }
-
     /// Clears the updates, but keeps the backing data structures allocated.
-    ///
-    /// Sets `wiped` to `false`.
     pub fn clear(&mut self) {
         self.updated_nodes.clear();
         self.removed_nodes.clear();
-        self.wiped = false;
     }
 
     /// Extends the updates with another set of updates.
     pub fn extend(&mut self, other: Self) {
         self.updated_nodes.extend(other.updated_nodes);
         self.removed_nodes.extend(other.removed_nodes);
-        self.wiped |= other.wiped;
     }
 }

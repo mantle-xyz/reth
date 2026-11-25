@@ -1,5 +1,5 @@
 use crate::{
-    ExExEvent, ExExNotification, ExExNotifications, FinishedExExHeight, WalHandle, wal::Wal,
+    wal::Wal, ExExEvent, ExExNotification, ExExNotifications, FinishedExExHeight, WalHandle,
 };
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumHash;
@@ -9,7 +9,7 @@ use metrics::Gauge;
 use reth_chain_state::ForkChoiceStream;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;
-use reth_metrics::{Metrics, metrics::Counter};
+use reth_metrics::{metrics::Counter, Metrics};
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::HeaderProvider;
@@ -17,17 +17,17 @@ use reth_tracing::tracing::{debug, warn};
 use std::{
     collections::VecDeque,
     fmt::Debug,
-    future::{Future, poll_fn},
+    future::{poll_fn, Future},
     ops::Not,
     pin::Pin,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
-    task::{Context, Poll, ready},
+    task::{ready, Context, Poll},
 };
 use tokio::sync::{
-    mpsc::{self, UnboundedReceiver, UnboundedSender, error::SendError},
+    mpsc::{self, error::SendError, UnboundedReceiver, UnboundedSender},
     watch,
 };
 use tokio_util::sync::{PollSendError, PollSender, ReusableBoxFuture};
@@ -149,7 +149,7 @@ impl<N: NodePrimitives> ExExHandle<N> {
                         );
 
                         self.next_notification_id = notification_id + 1;
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(Ok(()))
                     }
                 }
                 // Do not handle [ExExNotification::ChainReorged] and
@@ -499,9 +499,9 @@ where
                 }
 
                 this.push_notification(notification);
-                continue;
+                continue
             }
-            break;
+            break
         }
         let buffer_full = this.buffer.len() >= this.max_capacity;
 
@@ -520,7 +520,7 @@ where
                 let Poll::Ready(Err(err)) = exex.send(cx, notification)
             {
                 // The channel was closed, which is irrecoverable for the manager
-                return Poll::Ready(Err(err.into()));
+                return Poll::Ready(Err(err.into()))
             }
             min_id = min_id.min(exex.next_notification_id);
             this.exex_handles.push(exex);
@@ -687,10 +687,10 @@ mod tests {
     use reth_evm_ethereum::EthEvmConfig;
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::{
-        BlockReader, BlockWriter, Chain, DBProvider, DatabaseProviderFactory, TransactionVariant,
-        providers::BlockchainProvider, test_utils::create_test_provider_factory,
+        providers::BlockchainProvider, test_utils::create_test_provider_factory, BlockReader,
+        BlockWriter, Chain, DBProvider, DatabaseProviderFactory, TransactionVariant,
     };
-    use reth_testing_utils::generators::{self, BlockParams, random_block};
+    use reth_testing_utils::generators::{self, random_block, BlockParams};
 
     fn empty_finalized_header_stream() -> ForkChoiceStream<SealedHeader> {
         let (tx, rx) = watch::channel(None);
@@ -732,17 +732,13 @@ mod tests {
             wal.handle(),
         );
 
-        assert!(
-            !ExExManager::new((), vec![], 0, wal.clone(), empty_finalized_header_stream())
-                .handle
-                .has_exexs()
-        );
+        assert!(!ExExManager::new((), vec![], 0, wal.clone(), empty_finalized_header_stream())
+            .handle
+            .has_exexs());
 
-        assert!(
-            ExExManager::new((), vec![exex_handle_1], 0, wal, empty_finalized_header_stream())
-                .handle
-                .has_exexs()
-        );
+        assert!(ExExManager::new((), vec![exex_handle_1], 0, wal, empty_finalized_header_stream())
+            .handle
+            .has_exexs());
     }
 
     #[tokio::test]
@@ -758,17 +754,19 @@ mod tests {
             wal.handle(),
         );
 
-        assert!(
-            !ExExManager::new((), vec![], 0, wal.clone(), empty_finalized_header_stream())
-                .handle
-                .has_capacity()
-        );
+        assert!(!ExExManager::new((), vec![], 0, wal.clone(), empty_finalized_header_stream())
+            .handle
+            .has_capacity());
 
-        assert!(
-            ExExManager::new((), vec![exex_handle_1], 10, wal, empty_finalized_header_stream())
-                .handle
-                .has_capacity()
-        );
+        assert!(ExExManager::new(
+            (),
+            vec![exex_handle_1],
+            10,
+            wal,
+            empty_finalized_header_stream()
+        )
+        .handle
+        .has_capacity());
     }
 
     #[test]

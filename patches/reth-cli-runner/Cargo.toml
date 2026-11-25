@@ -1,12 +1,12 @@
 [package]
 name = "reth-cli-runner"
-version = "2.4.0"
+version = "2.6.0"
+description = "[MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Commonly used utilities for running reth CLI [MANTLE PATCH: backport reth#27313 at aef8d3ef]"
 
 [lints]
 workspace = true

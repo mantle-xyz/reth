@@ -1,12 +1,12 @@
 [package]
 name = "reth-rpc-eth-types"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Types supporting implementation of 'eth' namespace RPC server API [MANTLE PATCH: backport reth#26479, #27022, #26767, #27881, #28091, #28243 at aef8d3ef]"
+description = "Types supporting implementation of 'eth' namespace RPC server API [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
@@ -26,7 +26,6 @@ reth-rpc-server-types.workspace = true
 reth-rpc-convert.workspace = true
 reth-tasks.workspace = true
 reth-transaction-pool.workspace = true
-reth-trie.workspace = true
 
 # ethereum
 alloy-chains.workspace = true
@@ -52,7 +51,7 @@ jsonrpsee-types.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+reqwest.workspace = true
 
 # metrics
 metrics.workspace = true
@@ -65,10 +64,10 @@ derive_more.workspace = true
 schnellru.workspace = true
 rand.workspace = true
 tracing.workspace = true
-itertools = { version = "0.14", default-features = false }
+itertools.workspace = true
 
 [dev-dependencies]
-reth-db-models = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
+reth-db-models = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1", default-features = false }
 reth-storage-api = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 

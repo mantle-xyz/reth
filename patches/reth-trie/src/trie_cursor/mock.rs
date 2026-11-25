@@ -4,10 +4,10 @@ use tracing::instrument;
 
 use super::{TrieCursor, TrieCursorFactory, TrieStorageCursor};
 use crate::{
-    BranchNodeCompact, Nibbles,
     mock::{KeyVisit, KeyVisitType},
+    BranchNodeCompact, Nibbles,
 };
-use alloy_primitives::{B256, map::B256Map};
+use alloy_primitives::{map::B256Map, B256};
 use reth_storage_errors::db::DatabaseError;
 use reth_trie_common::updates::TrieUpdates;
 
