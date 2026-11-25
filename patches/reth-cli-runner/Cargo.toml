@@ -19,4 +19,4 @@ reth-tasks.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 
 # misc
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }

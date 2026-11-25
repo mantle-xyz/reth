@@ -37,7 +37,7 @@ alloy-evm = { workspace = true, features = ["overrides", "call-util"] }
 alloy-rlp.workspace = true
 alloy-serde.workspace = true
 alloy-eips.workspace = true
-alloy-eip7928 = { workspace = true, features = ["rlp"] }
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-dyn-abi = { workspace = true, features = ["eip712"] }
 alloy-json-rpc.workspace = true
 alloy-network.workspace = true
@@ -60,7 +60,7 @@ tokio.workspace = true
 auto_impl.workspace = true
 dyn-clone = { version = "1.0.17" }
 serde_json.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 
 [features]
 js-tracer = ["revm-inspectors/js-tracer", "reth-rpc-eth-types/js-tracer"]

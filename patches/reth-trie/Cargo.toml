@@ -31,7 +31,7 @@ alloy-trie.workspace = true
 revm.workspace = true
 
 # tracing
-tracing = { workspace = true, features = ["attributes"] }
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 
 # misc
 auto_impl.workspace = true
@@ -39,7 +39,7 @@ itertools.workspace = true
 
 # `metrics` feature
 reth-metrics = { workspace = true, optional = true }
-metrics = { workspace = true, optional = true }
+metrics = { version = "0.24.0", optional = true }
 
 # `test-utils` feature
 triehash = { version = "0.8", optional = true }
@@ -48,7 +48,7 @@ parking_lot = { workspace = true, optional = true }
 [dev-dependencies]
 # reth
 reth-primitives-traits = { workspace = true, features = ["test-utils"] }
-reth-tracing.workspace = true
+reth-tracing = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 reth-trie-common = { workspace = true, features = ["test-utils", "arbitrary"] }
 
 # trie
@@ -56,7 +56,7 @@ triehash = { version = "0.8" }
 
 # misc
 assert_matches.workspace = true
-criterion.workspace = true
+criterion = { package = "codspeed-criterion-compat", version = "4.3" }
 parking_lot.workspace = true
 pretty_assertions = { version = "1.4" }
 proptest-arbitrary-interop.workspace = true

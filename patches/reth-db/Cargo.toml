@@ -17,8 +17,8 @@ reth-db-api.workspace = true
 reth-fs-util.workspace = true
 reth-storage-errors.workspace = true
 reth-nippy-jar.workspace = true
-reth-tracing.workspace = true
-tracing.workspace = true
+reth-tracing = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 reth-static-file-types.workspace = true
 reth-primitives-traits = { workspace = true, optional = true, features = ["quanta"] }
 
@@ -31,13 +31,13 @@ eyre = { workspace = true, optional = true }
 
 # metrics
 reth-metrics = { workspace = true, optional = true }
-metrics = { workspace = true, optional = true }
+metrics = { version = "0.24.0", optional = true }
 
 # misc
 page_size = { version = "0.6.0", optional = true }
 thiserror.workspace = true
 tempfile = { workspace = true, optional = true }
-derive_more.workspace = true
+derive_more = { version = "2", default-features = false, features = ["full"] }
 rustc-hash = { workspace = true, optional = true, features = ["std"] }
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 parking_lot = { workspace = true, optional = true }

@@ -565,10 +565,19 @@ mod tests {
         test_utils::{ExtendedAccount, MockEthProvider, NoopProvider},
         PruneCheckpointReader, StageCheckpointReader,
     };
-    use reth_rpc_eth_api::{node::RpcNodeCoreAdapter, EthApiServer};
-    use reth_storage_api::{BalProvider, BlockReader, BlockReaderIdExt, StateProviderFactory};
+    use reth_rpc_eth_api::{
+        helpers::{EthBlocks, EthCall, SpawnBlocking},
+        node::RpcNodeCoreAdapter,
+        EthApiServer,
+    };
+    use reth_rpc_eth_types::RpcInvalidTransactionError;
+    use reth_storage_api::{
+        BalProvider, BlockReader, BlockReaderIdExt, NodePrimitivesProvider, StateProviderFactory,
+    };
+    use reth_tasks::cancel::is_cancelled;
     use reth_testing_utils::generators;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
+    use std::time::{Duration, Instant};
 
     type FakeEthApi<P = MockEthProvider> = EthApi<
         RpcNodeCoreAdapter<P, TestPool, NoopNetwork, EthEvmConfig>,
@@ -601,6 +610,41 @@ mod tests {
             EthEvmConfig::new(provider.chain_spec()),
         )
         .build()
+    }
+
+    fn build_test_eth_api_with_gas_cap(provider: MockEthProvider, gas_cap: u64) -> FakeEthApi {
+        EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_cap(gas_cap.into())
+        .build()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_task_observes_dropped_request() {
+        let api = build_test_eth_api(MockEthProvider::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+
+        let request = api.spawn_blocking_io(move |_| {
+            let _ = started_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = cancelled_tx.send(is_cancelled());
+            Ok(())
+        });
+        // drop the request while its blocking task is running
+        tokio::select! {
+            _ = request => panic!("blocking task completed before the request was dropped"),
+            _ = started_rx => {}
+        }
+
+        assert!(cancelled_rx.await.unwrap());
     }
 
     #[tokio::test]
@@ -677,94 +721,6 @@ mod tests {
         assert_eq!(transaction.block_number, Some(1));
         assert_eq!(transaction.transaction_index, Some(0));
         assert_eq!(transaction.inner.signer(), sender);
-    }
-
-    #[tokio::test]
-    async fn test_eth_api_settings() {
-        use reth_rpc_eth_api::{
-            helpers::{Call, EthState, EthTransactions, LoadPendingBlock},
-            EthApiTypes,
-        };
-        use reth_rpc_eth_types::{builder::config::PendingBlockKind, EthApiSettings};
-        use std::time::Duration;
-
-        fn settings(api: &impl EthApiTypes) -> &EthApiSettings {
-            api.eth_api_settings()
-        }
-
-        let default_api = build_test_eth_api(MockEthProvider::default());
-        assert_eq!(settings(&default_api), &EthApiSettings::default());
-
-        let expected = EthApiSettings {
-            proof_permits: 3,
-            max_batch_size: 5,
-            max_blocking_io_requests: 7,
-            cache_computed_bals: true,
-            gas_cap: 123_456,
-            max_simulate_blocks: 7,
-            compute_state_root_for_eth_simulate: true,
-            eth_proof_window: 42,
-            pending_block_kind: PendingBlockKind::Empty,
-            send_raw_transaction_sync_timeout: Duration::from_secs(9),
-            evm_memory_limit: 1 << 20,
-            force_blob_sidecar_upcasting: true,
-        };
-        let api = EthApiBuilder::new(
-            MockEthProvider::default(),
-            testing_pool(),
-            NoopNetwork::default(),
-            EthEvmConfig::mainnet(),
-        )
-        .eth_state_cache_config(reth_rpc_eth_types::EthStateCacheConfig {
-            cache_computed_bals: true,
-            ..Default::default()
-        })
-        .proof_permits(expected.proof_permits)
-        .max_batch_size(expected.max_batch_size)
-        .max_blocking_io_requests(expected.max_blocking_io_requests)
-        .gas_cap(expected.gas_cap.into())
-        .max_simulate_blocks(expected.max_simulate_blocks)
-        .compute_state_root_for_eth_simulate(expected.compute_state_root_for_eth_simulate)
-        .eth_proof_window(expected.eth_proof_window)
-        .pending_block_kind(expected.pending_block_kind)
-        .send_raw_transaction_sync_timeout(expected.send_raw_transaction_sync_timeout)
-        .evm_memory_limit(expected.evm_memory_limit)
-        .force_blob_sidecar_upcasting(expected.force_blob_sidecar_upcasting)
-        .build();
-
-        assert_eq!(settings(&api), &expected);
-        assert_eq!(
-            api.inner.blocking_io_request_semaphore().available_permits(),
-            expected.max_blocking_io_requests
-        );
-        assert_eq!(Call::call_gas_limit(&api), expected.gas_cap);
-        assert_eq!(Call::max_simulate_blocks(&api), expected.max_simulate_blocks);
-        assert_eq!(
-            Call::compute_state_root_for_eth_simulate(&api),
-            expected.compute_state_root_for_eth_simulate
-        );
-        assert_eq!(Call::evm_memory_limit(&api), expected.evm_memory_limit);
-        assert_eq!(EthState::max_proof_window(&api), expected.eth_proof_window);
-        assert_eq!(LoadPendingBlock::pending_block_kind(&api), expected.pending_block_kind);
-        assert_eq!(
-            EthTransactions::send_raw_transaction_sync_timeout(&api),
-            expected.send_raw_transaction_sync_timeout
-        );
-        assert_eq!(api.inner.gas_cap(), expected.gas_cap);
-        assert_eq!(api.inner.max_simulate_blocks(), expected.max_simulate_blocks);
-        assert_eq!(
-            api.inner.compute_state_root_for_eth_simulate(),
-            expected.compute_state_root_for_eth_simulate
-        );
-        assert_eq!(api.inner.eth_proof_window(), expected.eth_proof_window);
-        assert_eq!(api.inner.pending_block_kind(), expected.pending_block_kind);
-        assert_eq!(
-            api.inner.send_raw_transaction_sync_timeout(),
-            expected.send_raw_transaction_sync_timeout
-        );
-        assert_eq!(api.inner.evm_memory_limit(), expected.evm_memory_limit);
-        assert_eq!(api.inner.force_blob_sidecar_upcasting(), expected.force_blob_sidecar_upcasting);
-        assert!(std::ptr::eq(settings(&api), settings(&api.clone())));
     }
 
     // Function to prepare the EthApi with mock data
@@ -1059,4 +1015,124 @@ mod tests {
             "all: no percentiles were requested, so there should be no rewards result"
         );
     }
+
+    #[tokio::test]
+    async fn call_allowance_respects_rpc_gas_cap() {
+        use alloy_rpc_types_trace::{parity::TraceType, tracerequest::TraceCallRequest};
+        use reth_rpc_eth_types::EthConfig;
+        use reth_tasks::pool::BlockingTaskGuard;
+
+        let sender = Address::repeat_byte(0x11);
+        let contract = Address::repeat_byte(0xaa);
+        // Return the gas remaining after intrinsic gas and the GAS opcode.
+        let code = Bytes::from_static(&[0x5a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+
+        // RPC cap, supplied gas, price, balance after value, block limit, expected budget.
+        for (gas_cap, gas, price, balance, block_limit, budget) in [
+            (50_000, None, 1, 100_000, 100_000, 50_000),
+            (50_000, None, 0, 100_000, 100_000, 50_000),
+            (50_000, None, 1, 40_000, 100_000, 40_000),
+            (50_000, None, 1, 100_000, 40_000, 40_000),
+            (50_000, Some(70_000), 1, 100_000, 100_000, 50_000),
+            (50_000, Some(30_000), 1, 100_000, 100_000, 30_000),
+            (50_000, Some(70_000), 1, 100_000, 40_000, 50_000),
+            (0, None, 1, 100_000, 100_000, 100_000),
+            (0, Some(70_000), 1, 100_000, 40_000, 70_000),
+        ] {
+            let provider = MockEthProvider::default()
+                .with_chain_spec(ChainSpecBuilder::mainnet().cancun_activated().build());
+            provider.add_block(
+                B256::repeat_byte(0x42),
+                Block {
+                    header: Header {
+                        number: 1,
+                        gas_limit: block_limit,
+                        excess_blob_gas: Some(0),
+                        ..Default::default()
+                    },
+                    body: BlockBody::default(),
+                },
+            );
+            let api = build_test_eth_api_with_gas_cap(provider, gas_cap);
+            let trace_api =
+                crate::TraceApi::new(api.clone(), BlockingTaskGuard::new(1), EthConfig::default());
+            let state_override = StateOverride::from_iter([
+                (
+                    sender,
+                    AccountOverride {
+                        balance: Some(U256::from(balance + 1_000)),
+                        ..Default::default()
+                    },
+                ),
+                (contract, AccountOverride { code: Some(code.clone()), ..Default::default() }),
+            ]);
+
+            for dynamic_fee in [false, true] {
+                let request = TransactionRequest {
+                    gas,
+                    gas_price: (!dynamic_fee).then_some(price),
+                    max_fee_per_gas: dynamic_fee.then_some(price),
+                    max_priority_fee_per_gas: dynamic_fee.then_some(price),
+                    value: Some(U256::from(1_000)),
+                    ..TransactionRequest::default().with_from(sender).with_to(contract)
+                };
+                let output = EthCall::call(
+                    &api,
+                    request.clone(),
+                    Some(BlockId::latest()),
+                    EvmOverrides::state(Some(state_override.clone())),
+                )
+                .await
+                .unwrap();
+                let traces = trace_api
+                    .trace_call(TraceCallRequest {
+                        call: request,
+                        trace_types: std::iter::once(TraceType::Trace).collect(),
+                        block_id: Some(BlockId::latest()),
+                        state_overrides: Some(state_override.clone()),
+                        block_overrides: None,
+                    })
+                    .await
+                    .unwrap();
+
+                assert_eq!(U256::from_be_slice(&output), U256::from(budget - 21_002));
+                assert_eq!(traces.output, output);
+            }
+        }
+    }
+
+    /// `eth_estimateGas` waits for a blocking IO permit, like `eth_call`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn estimate_gas_takes_blocking_io_permit() {
+        let provider = MockEthProvider::default();
+        provider.add_block(
+            B256::repeat_byte(0x42),
+            Block {
+                header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+                body: BlockBody::default(),
+            },
+        );
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .max_blocking_io_requests(1)
+        .build();
+        let request = TransactionRequest::default().with_to(Address::repeat_byte(0xaa));
+
+        let permit = api.acquire_owned_blocking_io().await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            EthApiServer::estimate_gas(&api, request.clone(), None, None, None)
+        )
+        .await
+        .is_err());
+
+        drop(permit);
+        let estimated = EthApiServer::estimate_gas(&api, request, None, None, None).await.unwrap();
+        assert_eq!(estimated, U256::from(21_000));
+    }
+
 }

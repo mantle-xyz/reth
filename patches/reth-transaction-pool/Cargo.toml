@@ -41,12 +41,12 @@ tokio-stream.workspace = true
 
 # metrics
 reth-metrics.workspace = true
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
 aquamarine.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 rustc-hash.workspace = true
 schnellru.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -64,7 +64,7 @@ proptest-arbitrary-interop = { workspace = true, optional = true }
 
 [dev-dependencies]
 reth-provider = { workspace = true, features = ["test-utils"] }
-reth-tracing.workspace = true
+reth-tracing = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 alloy-primitives = { workspace = true, features = ["rand"] }
 paste.workspace = true
 rand.workspace = true
@@ -74,7 +74,7 @@ assert_matches.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures.workspace = true
-criterion.workspace = true
+criterion = { package = "codspeed-criterion-compat", version = "4.3" }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 
 [features]

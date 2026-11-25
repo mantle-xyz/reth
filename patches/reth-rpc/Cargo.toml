@@ -48,7 +48,7 @@ alloy-evm = { workspace = true, features = ["overrides"] }
 alloy-consensus.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local = { workspace = true, features = ["mnemonic"] }
-alloy-eip7928 = { workspace = true, features = ["rlp"] }
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-eips = { workspace = true, features = ["kzg"] }
 alloy-dyn-abi.workspace = true
 alloy-genesis.workspace = true
@@ -82,13 +82,13 @@ parking_lot.workspace = true
 
 # misc
 dyn-clone = { version = "1.0.17" }
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 tracing-futures.workspace = true
 futures.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-derive_more.workspace = true
+derive_more = { version = "2", default-features = false, features = ["full"] }
 itertools.workspace = true
 
 [dev-dependencies]

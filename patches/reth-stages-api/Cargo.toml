@@ -31,7 +31,7 @@ alloy-eips.workspace = true
 
 # metrics
 reth-metrics.workspace = true
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # async
 tokio = { workspace = true, features = ["sync"] }
@@ -40,7 +40,7 @@ futures-util.workspace = true
 # misc
 aquamarine.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 auto_impl.workspace = true
 
 [dev-dependencies]

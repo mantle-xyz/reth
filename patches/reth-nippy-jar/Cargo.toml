@@ -23,13 +23,13 @@ zstd = { workspace = true, features = ["experimental", "zdict_builder"] }
 lz4_flex.workspace = true
 
 memmap2 = { version = "0.9.11" }
-bincode.workspace = true
+bincode = { version = "1.3" }
 smallvec.workspace = true
 serde = { workspace = true, features = ["derive"] }
-tracing.workspace = true
-anyhow.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
+anyhow = { version = "1.0" }
 thiserror.workspace = true
-derive_more.workspace = true
+derive_more = { version = "2", default-features = false, features = ["full"] }
 
 [dev-dependencies]
 rand = { workspace = true, features = ["small_rng"] }

@@ -25,6 +25,7 @@ use reth_primitives_traits::{
 use reth_rpc_convert::{RpcBlock, RpcConvert, RpcTxReq};
 use reth_rpc_server_types::result::rpc_err;
 use reth_storage_api::{noop::NoopProvider, StateProvider};
+use reth_tasks::cancel::is_cancelled;
 use revm::{
     context::Block,
     context_interface::result::ExecutionResult,
@@ -329,6 +330,9 @@ where
     S: BlockBuilder<Executor: BlockExecutor<Evm: Evm<DB: Database<Error: Into<EthApiError>>>>>,
     T: RpcConvert<Primitives = S::Primitives>,
 {
+    if is_cancelled() {
+        return Err(EthApiError::InternalEthError)
+    }
     builder.apply_pre_execution_changes()?;
 
     let mut results = Vec::with_capacity(calls.len());
@@ -339,6 +343,9 @@ where
     let is_amsterdam = builder.evm().cfg_env().enable_amsterdam_eip8037;
     let tx_gas_limit_cap = builder.evm().cfg_env().tx_gas_limit_cap.unwrap_or(u64::MAX);
     for mut call in calls {
+        if is_cancelled() {
+            return Err(EthApiError::InternalEthError)
+        }
         let block_gas_remaining = if is_amsterdam {
             block_gas_limit
                 .saturating_sub(block_regular_gas_used)
@@ -447,12 +454,16 @@ where
         Address::ZERO
     };
 
+    let state_nonce = db.basic(from).map_err(Into::into)?.map(|acc| acc.nonce).unwrap_or_default();
     if tx.as_ref().nonce().is_none() {
-        tx.as_mut().set_nonce(
-            db.basic(from).map_err(Into::into)?.map(|acc| acc.nonce).unwrap_or_default(),
-        );
+        tx.as_mut().set_nonce(state_nonce);
     }
-    // eth_simulateV1 validation-off mode behaves like eth_call; avoid revm's max-nonce guard.
+    // EIP-2681 applies in both modes. Check it here because revm checks the fee cap first.
+    if state_nonce == u64::MAX && (disable_nonce_check || tx.as_ref().nonce() == Some(u64::MAX)) {
+        return Err(EthApiError::other(EthSimulateError::NonceMaxValue))
+    }
+    // revm rejects a tx nonce of u64::MAX even with the nonce check disabled. The state nonce is
+    // below the limit here, so only the tx object changes.
     if disable_nonce_check && tx.as_ref().nonce() == Some(u64::MAX) {
         tx.as_mut().set_nonce(0);
     }

@@ -33,11 +33,11 @@ roaring = { version = "0.11.3" }
 serde = { workspace = true, default-features = false }
 
 # metrics
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
 arrayvec = { version = "0.7.6", default-features = false }
-derive_more.workspace = true
+derive_more = { version = "2", default-features = false, features = ["full"] }
 bytes.workspace = true
 
 # arbitrary utils

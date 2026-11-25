@@ -36,7 +36,7 @@ reth-static-file-types = { workspace = true, features = ["std"] }
 reth-fs-util.workspace = true
 
 # ethereum
-alloy-eip7928.workspace = true
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
@@ -45,11 +45,11 @@ alloy-consensus.workspace = true
 revm.workspace = true
 
 # tracing
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 
 # metrics
 reth-metrics.workspace = true
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
 itertools.workspace = true
@@ -80,7 +80,7 @@ reth-trie = { workspace = true, features = ["test-utils"] }
 reth-testing-utils.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-primitives.workspace = true
-reth-tracing.workspace = true
+reth-tracing = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 
 tempfile.workspace = true
 assert_matches.workspace = true

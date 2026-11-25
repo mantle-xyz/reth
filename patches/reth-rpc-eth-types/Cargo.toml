@@ -29,7 +29,7 @@ reth-transaction-pool.workspace = true
 
 # ethereum
 alloy-chains.workspace = true
-alloy-eip7928.workspace = true
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-eips.workspace = true
 alloy-evm = { workspace = true, features = ["overrides", "call-util"] }
 alloy-primitives.workspace = true
@@ -51,19 +51,19 @@ jsonrpsee-types.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-reqwest.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 
 # metrics
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
 serde = { workspace = true, features = ["derive"] }
 url = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
-derive_more.workspace = true
+derive_more = { version = "2", default-features = false, features = ["full"] }
 schnellru.workspace = true
 rand.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 itertools.workspace = true
 
 [dev-dependencies]

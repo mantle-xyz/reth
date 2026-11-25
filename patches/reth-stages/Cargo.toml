@@ -45,7 +45,7 @@ reth-trie-db = { workspace = true, features = ["metrics"] }
 
 reth-testing-utils = { workspace = true, optional = true }
 
-alloy-eip7928.workspace = true
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
@@ -55,7 +55,7 @@ tokio = { workspace = true, features = ["sync"] }
 futures-util.workspace = true
 
 # observability
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 
 # misc
 thiserror.workspace = true
@@ -64,7 +64,7 @@ rayon.workspace = true
 page_size = { version = "0.6.0" }
 num-traits = { version = "0.2.15" }
 tempfile = { workspace = true, optional = true }
-reqwest.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 eyre.workspace = true
 
 [dev-dependencies]
@@ -89,7 +89,7 @@ alloy-genesis.workspace = true
 alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["getrandom", "rand"] }
 reth-db-common.workspace = true
-reth-tracing.workspace = true
+reth-tracing = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 assert_matches.workspace = true

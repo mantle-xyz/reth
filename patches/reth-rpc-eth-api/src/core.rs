@@ -785,6 +785,7 @@ where
         request: RpcTxReq<T::NetworkTypes>,
     ) -> RpcResult<FillTransaction<TxTy<T::Primitives>>> {
         trace!(target: "rpc::eth", ?request, "Serving eth_fillTransaction");
+        let _permit = self.acquire_owned_blocking_io().await;
         Ok(EthTransactions::fill_transaction(self, request).await?)
     }
 
@@ -819,6 +820,7 @@ where
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<U256> {
         trace!(target: "rpc::eth", ?request, ?block_number, "Serving eth_estimateGas");
+        let _permit = self.acquire_owned_blocking_io().await;
         Ok(EthCall::estimate_gas_at(
             self,
             request,

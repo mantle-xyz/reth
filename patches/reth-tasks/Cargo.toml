@@ -19,13 +19,13 @@ futures-util = { workspace = true, features = ["std"] }
 
 # metrics
 reth-metrics.workspace = true
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
 dashmap.workspace = true
 parking_lot.workspace = true
 thread-priority.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 thiserror.workspace = true
 
 # feature `rayon`

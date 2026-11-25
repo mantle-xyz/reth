@@ -33,12 +33,12 @@ alloy-eips.workspace = true
 alloy-primitives.workspace = true
 
 # metrics
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
 parking_lot.workspace = true
 rayon = { workspace = true, optional = true }
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 revm.workspace = true
 
 [dev-dependencies]

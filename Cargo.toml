@@ -64,8 +64,6 @@ members = [
   # Run regression tests for these backports in workspace CI.
   "patches/reth-trie/",
   "patches/reth-trie-common/",
-  "patches/reth-trie-sparse/",
-  "patches/reth-exex/",
   "patches/reth-tasks/",
   "patches/reth-cli-runner/",
 
@@ -481,11 +479,8 @@ tar = "0.4.44"
 reth-trie = { path = "patches/reth-trie" }
 # Backport reth#26357 #26421 #26471 #26842 #26843 #27651 (proof_v2 and its sparse-trie caller); drop when the reth pin includes them.
 reth-trie-common = { path = "patches/reth-trie-common" }
-reth-trie-sparse = { path = "patches/reth-trie-sparse" }
 # Backport reth#27252 (state root task: delete touched EIP-161-empty accounts), reth#26421 (proof task); drop when the reth pin includes them.
-reth-trie-parallel = { path = "patches/reth-trie-parallel" }
 # Backport reth#26819 (sparse ExEx WAL file IDs); drop when the reth pin includes it.
-reth-exex = { path = "patches/reth-exex" }
 # Backport reth#27015, #27259, #27869; drop when the reth pin includes them.
 reth-transaction-pool = { path = "patches/reth-transaction-pool" }
 reth-provider = { path = "patches/reth-provider" }
@@ -503,13 +498,8 @@ reth-cli-commands = { path = "patches/reth-cli-commands" }
 reth-rpc = { path = "patches/reth-rpc" }
 # Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #26421 (its sparse_trie caller), #27805, #27462, #27313 (tasks), #27218, #28067, #26734 (node builder); drop when the reth pin includes them.
 reth-engine-tree = { path = "patches/reth-engine-tree" }
-reth-engine-primitives = { path = "patches/reth-engine-primitives" }
-reth-chain-state = { path = "patches/reth-chain-state" }
 reth-node-builder = { path = "patches/reth-node-builder" }
 reth-tasks = { path = "patches/reth-tasks" }
-reth-payload-builder = { path = "patches/reth-payload-builder" }
-reth-payload-primitives = { path = "patches/reth-payload-primitives" }
-reth-rpc-engine-api = { path = "patches/reth-rpc-engine-api" }
 # Backport reth#26776, #26999, #27106, #27107, #27415, #27462, #27477 (RPC blocking task handling);
 # drop when the reth pin includes them.
 reth-rpc-eth-api = { path = "patches/reth-rpc-eth-api" }
@@ -519,7 +509,6 @@ reth-rpc-eth-types = { path = "patches/reth-rpc-eth-types" }
 # Backport reth#27313 (shut down the owned runtime despite live clones); drop when the reth pin includes it.
 reth-cli-runner = { path = "patches/reth-cli-runner" }
 # Backport reth#26734 (refresh storage metrics in the background); drop when the reth pin includes it.
-reth-node-metrics = { path = "patches/reth-node-metrics" }
 # Vendored for backports that touch them (reth#27614, #27651, #28249; reth#27716; reth#28370).
 reth-storage-overlay = { path = "patches/reth-storage-overlay" }
 reth-rpc-server-types = { path = "patches/reth-rpc-server-types" }
