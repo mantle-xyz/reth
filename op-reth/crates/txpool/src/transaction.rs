@@ -62,8 +62,9 @@ pub struct OpPooledTransaction<
 impl<Cons: SignedTransaction, Pooled> OpPooledTransaction<Cons, Pooled> {
     /// Create new instance of [Self].
     pub fn new(transaction: Recovered<Cons>, encoded_length: usize) -> Self {
+        let inner = EthPooledTransaction::new(transaction, encoded_length);
         Self {
-            inner: EthPooledTransaction::new(transaction, encoded_length),
+            inner,
             estimated_tx_compressed_size: Default::default(),
             conditional: None,
             interop: Arc::new(AtomicU64::new(NO_INTEROP_TX)),
@@ -300,8 +301,8 @@ where
     }
 }
 
-/// Helper trait to provide payload builder with access to conditionals and encoded bytes of
-/// transaction.
+/// OP-specific pool transaction behaviour: gives the payload builder access to conditionals and
+/// encoded bytes, and lets the validator reserve the OP fees in [`PoolTransaction::cost`].
 pub trait OpPooledTx:
     MaybeConditionalTransaction + MaybeInteropTransaction + PoolTransaction + DataAvailabilitySized
 {

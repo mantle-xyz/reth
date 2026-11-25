@@ -315,15 +315,17 @@ impl<T: Decodable2718 + Encodable2718 + Send + Sync + Debug + Unpin + 'static>
     /// Creates a new payload builder from RPC attributes with a pre-computed payload ID.
     ///
     /// This is used when the payload ID has already been computed (e.g., by the payload service)
-    /// and we just need to decode the transaction bytes.
+    /// and we just need to decode the transaction bytes. A post-exec transaction that fails
+    /// structural validation is logged and counted before the decode.
     pub fn from_rpc_attrs(
         parent: B256,
         id: PayloadId,
         attributes: OpPayloadAttributes,
     ) -> Result<Self, alloy_rlp::Error> {
-        let transactions = attributes
-            .transactions
-            .unwrap_or_default()
+        let encoded_transactions = attributes.transactions.unwrap_or_default();
+        reth_optimism_evm::validate_post_exec_attributes(&encoded_transactions, parent)
+            .map_err(|error| alloy_rlp::Error::Custom(error.as_reason()))?;
+        let transactions = encoded_transactions
             .into_iter()
             .map(|data| decode_2718_canonical(data.as_ref()).map(|tx| WithEncoded::new(data, tx)))
             .collect::<Result<_, _>>()?;
@@ -447,10 +449,13 @@ impl<N: NodePrimitives> BuiltPayload for OpBuiltPayload<N> {
     }
 }
 
-// Counterpart to `OpPayloadTypes::block_to_payload`. The two are intentionally
-// parallel: this path receives the BAL via the payload's own field once OP
-// gains BAL support, while `block_to_payload` receives it as a separate arg.
-// See the comment on `OpPayloadTypes::block_to_payload` in `lib.rs`.
+/// UPSTREAM-MIRROR(copy): reth@rev:8d359d0
+/// `reth_ethereum_engine_primitives::EthBuiltPayload::into_execution_data`
+///
+/// Counterpart to `OpPayloadTypes::block_to_payload`; the two conversion paths are kept
+/// parallel. Upstream also threads the built payload's requests and block access list into
+/// the sidecar; OP execution data carries neither today, so this path discards them.
+/// Re-check when upstream changes the sidecar or OP execution data gains BAL support.
 impl<T, N> From<OpBuiltPayload<N>> for OpExecData
 where
     T: SignedTransaction,
@@ -677,13 +682,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OpPayloadAttributes;
+    use crate::{
+        OpPayloadAttributes,
+        sdm_metrics::test_support::{FAILURES, RESULTS, recorder, series},
+    };
     use alloy_consensus::BlockBody;
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{FixedBytes, TxKind, address, b256, bytes};
     use alloy_rlp::Decodable;
     use alloy_rpc_types_engine::PayloadAttributes;
-    use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
+    use op_alloy_consensus::{OpTxEnvelope, PostExecPayloadValidationError, TxDeposit};
     use reth_optimism_primitives::OpTransactionSigned;
     use reth_payload_primitives::EngineApiMessageVersion;
     use std::str::FromStr;
@@ -820,16 +828,17 @@ mod tests {
         assert_eq!(extra_data.unwrap_err(), EIP1559ParamError::MinBaseFeeNotSet);
     }
 
-    /// A transaction that decodes but does not re-encode to the same bytes (here: a legacy
-    /// transaction carrying a `0x00` type tag) must be rejected, not silently canonicalised.
+    /// A legacy transaction with a `0x00` type tag decodes but does not re-encode to the same
+    /// bytes. It must be rejected, not silently canonicalised.
     #[test]
     fn try_new_rejects_non_canonical_transaction_encoding() {
         use alloy_consensus::SignableTransaction;
+        use alloy_eips::eip2718::Encodable2718;
         let legacy = alloy_consensus::TxLegacy {
             chain_id: Some(10),
             nonce: 1,
-            gas_price: 2,
             gas_limit: 21_000,
+            gas_price: 2,
             to: Address::ZERO.into(),
             value: Default::default(),
             input: Default::default(),
@@ -838,24 +847,8 @@ mod tests {
         .encoded_2718();
         let mut tagged = vec![0x00];
         tagged.extend_from_slice(&legacy);
-        let bare = Bytes::from(tagged);
 
-        let attrs = OpPayloadAttributes {
-            payload_attributes: PayloadAttributes {
-                timestamp: 1,
-                prev_randao: B256::ZERO,
-                suggested_fee_recipient: Address::ZERO,
-                withdrawals: Some(vec![]),
-                parent_beacon_block_root: Some(B256::ZERO),
-                slot_number: None,
-                target_gas_limit: None,
-            },
-            transactions: Some(vec![bare]),
-            no_tx_pool: Some(true),
-            gas_limit: Some(30_000_000),
-            eip_1559_params: None,
-            min_base_fee: None,
-        };
+        let attrs = attrs_with_transactions(vec![tagged.into()]);
         OpPayloadBuilderAttributes::<OpTransactionSigned>::try_new(B256::ZERO, attrs.clone(), 3)
             .unwrap_err();
         OpPayloadBuilderAttributes::<OpTransactionSigned>::from_rpc_attrs(
@@ -977,5 +970,78 @@ mod tests {
             .expect("newPayload must decode a deposit with ethTxValue > u128::MAX");
 
         assert_eq!(decoded_eth_tx_value(&decoded.body.transactions[0]), Some(eth_tx_value));
+    /// Derived-block attributes (`no_tx_pool`) carrying exactly `transactions`.
+    fn attrs_with_transactions(transactions: Vec<Bytes>) -> OpPayloadAttributes {
+        OpPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                parent_beacon_block_root: Some(B256::ZERO),
+                prev_randao: B256::ZERO,
+                slot_number: None,
+                suggested_fee_recipient: Address::ZERO,
+                target_gas_limit: None,
+                timestamp: 1,
+                withdrawals: Some(vec![]),
+            },
+            eip_1559_params: None,
+            gas_limit: Some(30_000_000),
+            min_base_fee: None,
+            no_tx_pool: Some(true),
+            transactions: Some(transactions),
+        }
+    }
+
+    /// Attributes whose only transaction is a post-exec tx carrying `entries` refund entries.
+    fn attrs_with_post_exec(entries: usize) -> OpPayloadAttributes {
+        use alloy_eips::eip2718::Encodable2718;
+        use op_alloy_consensus::{SDMGasEntry, build_post_exec_tx};
+        let tx = build_post_exec_tx(
+            1,
+            (0..entries).map(|index| SDMGasEntry { index: index as u64, gas_refund: 1 }).collect(),
+        )
+        .encoded_2718();
+        attrs_with_transactions(vec![tx.into()])
+    }
+
+    /// Converts `attrs` against a recorder private to the test, returning the result alongside
+    /// the rendered exposition.
+    fn convert(
+        attrs: OpPayloadAttributes,
+    ) -> (Result<OpPayloadBuilderAttributes<OpTransactionSigned>, alloy_rlp::Error>, String) {
+        use reth_metrics::metrics::with_local_recorder;
+        let (recorder, handle) = recorder();
+        let result = with_local_recorder(&recorder, || {
+            OpPayloadBuilderAttributes::from_rpc_attrs(B256::ZERO, PayloadId::new([0; 8]), attrs)
+        });
+        (result, handle.render())
+    }
+
+    /// A post-exec rejection on the attributes path must reach the same counters as the Engine
+    /// API preflight: the failed rule and a failed validation.
+    #[test]
+    fn rejected_attributes_count_the_failure() {
+        let (result, exposition) = convert(attrs_with_post_exec(2));
+
+        assert!(result.is_err(), "two refund entries with no preceding transactions must reject");
+        assert_eq!(
+            series(&exposition, FAILURES, "reason", "too_many_gas_refund_entries"),
+            Some(1.0),
+            "{exposition}"
+        );
+        assert_eq!(series(&exposition, RESULTS, "result", "fail"), Some(1.0), "{exposition}");
+    }
+
+    /// Accepted attributes count nothing at this stage: like the Engine API preflight, a pass is
+    /// not yet a validated post-exec transaction — the import path counts that.
+    #[test]
+    fn accepted_attributes_count_nothing() {
+        let (result, exposition) = convert(attrs_with_post_exec(0));
+
+        assert!(result.is_ok(), "a post-exec transaction with no entries is structurally valid");
+        for reason in PostExecPayloadValidationError::ALL_REASONS {
+            let failures = series(&exposition, FAILURES, "reason", reason).unwrap_or(0.0);
+            assert_eq!(failures, 0.0, "{reason}: {exposition}");
+        }
+        let fail = series(&exposition, RESULTS, "result", "fail").unwrap_or(0.0);
+        assert_eq!(fail, 0.0, "the attributes path must not count a pass: {exposition}");
     }
 }

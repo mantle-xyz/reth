@@ -1,6 +1,9 @@
 //! Historical proofs RPC server implementation.
 
-use crate::{metrics::EthApiExtMetrics, state::OpStateProviderFactory};
+use crate::{
+    metrics::EthApiExtMetrics,
+    state::{OpStateProviderFactory, ensure_within_proofs_window},
+};
 use alloy_eips::BlockId;
 use alloy_primitives::Address;
 use alloy_rpc_types_eth::EIP1186AccountProofResponse;
@@ -9,13 +12,21 @@ use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee_core::RpcResult;
 use jsonrpsee_types::error::ErrorObject;
+use reth_errors::RethError;
 use reth_optimism_trie::{OpProofsStorage, OpProofsStore};
 use reth_provider::StateProofProvider;
 use reth_rpc_api::eth::helpers::FullEthApi;
 use reth_rpc_eth_api::FromEthApiError;
 use reth_rpc_eth_types::EthApiError;
-use std::time::Instant;
 
+/// The `eth_` proof methods served from the historical proofs storage.
+///
+/// UPSTREAM-MIRROR(set): reth@rev:8d359d0 `reth_rpc_eth_api::EthApi`
+///
+/// Re-declares the proof methods that are answered from historical proofs rather than live state.
+/// A proof method added to upstream's `EthApi` produces no diff here, so diff the two method sets
+/// on each bump: every new one must either be declared here or dropped from the served surface in
+/// `reth_optimism_node::node`, so that a proofs-history node never answers it from live state.
 #[cfg_attr(not(test), rpc(server, namespace = "eth"))]
 #[cfg_attr(test, rpc(server, client, namespace = "eth"))]
 pub trait EthApiOverride {
@@ -49,33 +60,39 @@ where
         Self { eth_api, preimage_store, metrics: EthApiExtMetrics::default() }
     }
 
-    /// Computes the proof on the blocking IO pool so the trie walk does not run on an async
-    /// worker thread.
+    /// UPSTREAM-MIRROR(copy): reth@rev:8d359d0
+    /// `reth_rpc_eth_api::helpers::state::EthState::get_proof`
+    ///
+    /// Uses the OP proofs-history state provider while preserving upstream permit and blocking-task
+    /// behavior. Upstream's `ensure_within_proof_window` bounds the distance from the tip by
+    /// `max_proof_window`; a proofs-history node instead serves its proofs storage window. Unlike
+    /// upstream, which takes the permit first and then checks its window, this checks the window
+    /// before taking the permit, so out-of-window requests never wait for one.
     async fn get_proof_inner(
         &self,
         address: Address,
         keys: Vec<JsonStorageKey>,
-        block_number: Option<BlockId>,
+        block_id: BlockId,
     ) -> Result<EIP1186AccountProofResponse, Eth::Error> {
-        // Bound concurrent historical-proof walks with the eth API's tracing-task permit, as the
-        // stock reth `eth_getProof` and the Mantle `rpc-ext` override both do. The key count
-        // itself is not capped here — that gap is shared with upstream reth and tracked
-        // separately.
+        ensure_within_proofs_window(&self.eth_api, &self.preimage_store, block_id)
+            .map_err(Eth::Error::from_eth_err)?;
+
         let permit = self
             .eth_api
             .acquire_owned_tracing()
             .await
-            .map_err(|_| Eth::Error::from_eth_err(EthApiError::InternalEthError))?;
+            .map_err(RethError::other)
+            .map_err(EthApiError::Internal)?;
         let preimage_store = self.preimage_store.clone();
 
         self.eth_api
             .spawn_blocking_io_fut(move |eth_api| async move {
-                // Hold the permit for the full lifetime of the blocking task, including after
-                // the requesting future is cancelled.
+                // Hold the proof permit for the full lifetime of the blocking task, including
+                // after the requesting future is cancelled.
                 let _permit = permit;
                 let state_provider_factory = OpStateProviderFactory::new(eth_api, preimage_store);
                 let state = state_provider_factory
-                    .state_provider(block_number)
+                    .state_provider(block_id)
                     .await
                     .map_err(Eth::Error::from_eth_err)?;
                 let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
@@ -106,19 +123,9 @@ where
         keys: Vec<JsonStorageKey>,
         block_number: Option<BlockId>,
     ) -> RpcResult<EIP1186AccountProofResponse> {
-        let start = Instant::now();
-        self.metrics.get_proof_requests.increment(1);
-
-        let result = self.get_proof_inner(address, keys, block_number).await.map_err(Into::into);
-
-        match &result {
-            Ok(_) => {
-                self.metrics.get_proof_latency.record(start.elapsed().as_secs_f64());
-                self.metrics.get_proof_successful_responses.increment(1);
-            }
-            Err(_) => self.metrics.get_proof_failures.increment(1),
-        }
-
-        result
+        self.metrics
+            .record_get_proof(self.get_proof_inner(address, keys, block_number.unwrap_or_default()))
+            .await
+            .map_err(Into::into)
     }
 }

@@ -1,13 +1,13 @@
 use super::super::state::EngineState;
-use crate::{BlockStateDiff, OpProofsStore, engine::EngineError};
+use crate::{
+    BlockStateDiff, OpProofsStore,
+    engine::{CanonicalInMemoryStateProvider, EngineError},
+};
 use alloy_eips::eip1898::BlockWithParent;
 use crossbeam_channel::Sender;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::BlockTy;
-use reth_provider::{
-    BlockHashReader, BlockReader, DatabaseProviderFactory, StageCheckpointReader,
-    StateProviderFactory, StateReader,
-};
+use reth_provider::{BlockHashReader, BlockReader, DatabaseProviderFactory, StageCheckpointReader};
 use reth_trie_common::{HashedPostStateSorted, updates::TrieUpdatesSorted};
 use std::{sync::Arc, time::Instant};
 use tracing::{debug, info};
@@ -23,10 +23,9 @@ impl ReorgTask {
     where
         Evm: ConfigureEvm,
         Provider: BlockHashReader
-            + StateReader
+            + CanonicalInMemoryStateProvider
             + StageCheckpointReader
             + DatabaseProviderFactory
-            + StateProviderFactory
             + BlockReader<Block = BlockTy<Evm::Primitives>>
             + Clone
             + 'static,
@@ -43,10 +42,9 @@ fn run<Evm, Provider, Store>(
 where
     Evm: ConfigureEvm,
     Provider: BlockHashReader
-        + StateReader
+        + CanonicalInMemoryStateProvider
         + StageCheckpointReader
         + DatabaseProviderFactory
-        + StateProviderFactory
         + BlockReader<Block = BlockTy<Evm::Primitives>>
         + Clone
         + 'static,

@@ -15,8 +15,8 @@ use reth_execution_types::Chain;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::{FullNodeComponents, NodePrimitives, NodeTypes};
 use reth_optimism_trie::{
-    OpProofStoragePruner, OpProofsProviderRO, OpProofsProviderRw, OpProofsStore, ProofWindowRange,
-    engine::EngineHandle, proof::DatabaseStateRoot,
+    CanonicalInMemoryStateProvider, OpProofStoragePruner, OpProofsProviderRO, OpProofsProviderRw,
+    OpProofsStore, ProofWindowRange, engine::EngineHandle, proof::DatabaseStateRoot,
 };
 use reth_provider::{BlockHashReader, BlockNumReader, HeaderProvider};
 use reth_trie::{
@@ -42,8 +42,7 @@ const DEFAULT_VERIFICATION_INTERVAL: u64 = 0;
 const REAL_TIME_BLOCKS_THRESHOLD: u64 = 64;
 
 /// Command that (re-)initializes the proofs storage.
-const PROOFS_INIT_COMMAND: &str =
-    "op-reth initialize-op-proofs --proofs-history.storage-path <PATH>";
+const PROOFS_INIT_COMMAND: &str = "op-reth proofs init --proofs-history.storage-path <PATH>";
 
 /// Builder for [`OpProofsExEx`].
 #[derive(Debug)]
@@ -108,21 +107,20 @@ where
 ///
 /// The following example shows how to install the ExEx with either in-memory or persistent storage.
 /// This can be used when launching an OP-Reth node via a binary.
-/// We are currently using it in optimism/bin/src/main.rs.
 ///
 /// ```
 /// use futures_util::FutureExt;
 /// use reth_db::test_utils::create_test_rw_db;
 /// use reth_node_api::NodeTypesWithDBAdapter;
 /// use reth_node_builder::{NodeBuilder, NodeConfig};
-/// use reth_optimism_chainspec::OP_MAINNET;
+/// use reth_optimism_chainspec::OP_DEV;
 /// use reth_optimism_exex::OpProofsExEx;
-/// use reth_optimism_node::{args::RollupArgs, OpNode};
-/// use reth_optimism_trie::{db::MdbxProofsStorageV2, InMemoryProofsStorage, OpProofsStorage};
+/// use reth_optimism_node::{OpNode, args::RollupArgs};
+/// use reth_optimism_trie::{InMemoryProofsStorage, OpProofsStorage, db::MdbxProofsStorage};
 /// use reth_provider::providers::BlockchainProvider;
 /// use std::{sync::Arc, time::Duration};
 ///
-/// let config = NodeConfig::new(OP_MAINNET.clone());
+/// let config = NodeConfig::new(OP_DEV.clone());
 /// let db = create_test_rw_db();
 /// let args = RollupArgs::default();
 /// let op_node = OpNode::new(args);
@@ -135,8 +133,8 @@ where
 /// # let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 /// # let storage_path = temp_dir.path().join("proofs_storage");
 ///
-/// # let storage: OpProofsStorage<Arc<MdbxProofsStorageV2>> = Arc::new(
-/// #    MdbxProofsStorageV2::new(&storage_path).expect("Failed to create MdbxProofsStorageV2"),
+/// # let storage: OpProofsStorage<Arc<MdbxProofsStorage>> = Arc::new(
+/// #    MdbxProofsStorage::new(&storage_path).expect("Failed to create MdbxProofsStorage"),
 /// # ).into();
 ///
 /// let storage_exec = storage.clone();
@@ -201,6 +199,7 @@ where
 impl<Node, Storage, Primitives> OpProofsExEx<Node, Storage>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = Primitives>>,
+    Node::Provider: CanonicalInMemoryStateProvider,
     Primitives: NodePrimitives,
     Primitives::Block: Clone,
     Storage: OpProofsStore + Clone + 'static,
@@ -422,10 +421,23 @@ where
                     (**trie_updates).clone(),
                     (**hashed_state).clone(),
                 )?;
-            } else {
+            } else if let Err(err) = engine_handle.execute_block(block) {
                 // Slow path: execute the block in full (no trie data, or verification interval
-                // hit).
-                engine_handle.execute_block(block)?;
+                // hit). Execution reads bytecode reth has not persisted from reth's in-memory
+                // chain, so a block from a fork reth has since left can fail. Leave that block to
+                // the sync loop, which executes reth's canonical block at this height.
+                if self.ctx.provider().block_hash(block_number)? == Some(block.hash()) {
+                    return Err(err.into());
+                }
+                debug!(
+                    target: "optimism::exex",
+                    block_number,
+                    block_hash = ?block.hash(),
+                    %err,
+                    "Block left reth's chain during proofs execution; syncing to reth's chain",
+                );
+                engine_handle.sync_to(new.tip().number())?;
+                return Ok(());
             }
         }
 
@@ -513,7 +525,7 @@ mod tests {
     use reth_exex_test_utils::{TestExExContext, TestExExHandle};
     use reth_optimism_trie::{
         BlockStateDiff, InMemoryProofsStorage, OpProofsInitProvider, OpProofsProviderRO,
-        OpProofsProviderRw, OpProofsStore, db::MdbxProofsStorageV2, engine::EngineHandle,
+        OpProofsProviderRw, OpProofsStore, db::MdbxProofsStorage, engine::EngineHandle,
     };
     use reth_primitives_traits::{Account, RecoveredBlock, SealedBlock, SealedHeader};
     use reth_provider::{BlockWriter, CanonChainTracker};
@@ -571,11 +583,26 @@ mod tests {
             trie_data.insert(n, data);
         }
 
+        mk_chain(blocks, from, trie_data)
+    }
+
+    fn mk_chain_without_updates(
+        from: u64,
+        to: u64,
+    ) -> Chain<reth_ethereum_primitives::EthPrimitives> {
+        mk_chain((from..=to).map(mk_block).collect(), from, BTreeMap::new())
+    }
+
+    fn mk_chain(
+        blocks: Vec<RecoveredBlock<Block>>,
+        first_block: u64,
+        trie_data: BTreeMap<u64, LazyTrieData>,
+    ) -> Chain<reth_ethereum_primitives::EthPrimitives> {
         let execution_outcome: ExecutionOutcome<Receipt> = ExecutionOutcome {
             bundle: Default::default(),
             receipts: Vec::new(),
             requests: Vec::new(),
-            first_block: from,
+            first_block,
         };
 
         Chain::new(blocks, execution_outcome, trie_data)
@@ -671,7 +698,7 @@ mod tests {
     async fn handle_notification_chain_committed() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -709,7 +736,7 @@ mod tests {
     async fn handle_notification_chain_committed_skips_already_processed() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -759,7 +786,7 @@ mod tests {
     async fn handle_notification_chain_reorged() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -815,7 +842,7 @@ mod tests {
     async fn handle_notification_chain_reorged_skips_beyond_stored_blocks() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -874,7 +901,7 @@ mod tests {
     async fn handle_notification_chain_reverted() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -930,7 +957,7 @@ mod tests {
     async fn handle_notification_chain_reverted_skips_beyond_stored_blocks() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -986,7 +1013,7 @@ mod tests {
     async fn ensure_initialized_errors_on_storage_not_initialized() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         let (ctx, _handle) =
             reth_exex_test_utils::test_exex_context().await.expect("exex test context");
@@ -999,7 +1026,7 @@ mod tests {
     async fn ensure_initialized_errors_when_prune_exceeds_threshold() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -1024,7 +1051,7 @@ mod tests {
     async fn ensure_initialized_succeeds() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
@@ -1039,7 +1066,7 @@ mod tests {
     async fn handle_notification_errors_on_empty_storage() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         let (ctx, _handle) =
             reth_exex_test_utils::test_exex_context().await.expect("exex test context");
@@ -1065,6 +1092,181 @@ mod tests {
         assert_eq!(err.to_string(), "No blocks found");
     }
 
+    #[tokio::test]
+    async fn handle_notification_schedules_execution_on_gap_without_trie_data() {
+        let dir = tempdir_path();
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
+        init_storage(store.clone());
+
+        let (ctx, _handle) =
+            reth_exex_test_utils::test_exex_context().await.expect("exex test context");
+        let pruner = OpProofStoragePruner::new(store.clone(), ctx.components.provider.clone(), 20);
+        let engine_handle = EngineHandle::spawn_with_thresholds(
+            ctx.components.components.evm_config.clone(),
+            ctx.components.provider.clone(),
+            store.clone(),
+            pruner,
+            1,
+            2,
+        );
+        let exex = build_test_exex(ctx, store.clone());
+
+        // Without pre-computed trie data this notification needs EVM execution. The proofs DB
+        // is still at genesis, so blocks 1..4 must be indexed before executing this range. The
+        // engine schedules catch-up; the empty test provider has no blocks to replay.
+        let notif =
+            ExExNotification::ChainCommitted { new: Arc::new(mk_chain_without_updates(5, 10)) };
+        exex.handle_notification(notif, &engine_handle)
+            .expect("missing predecessor blocks should schedule catch-up");
+
+        engine_handle.flush();
+        let latest =
+            store.provider_ro().expect("provider ro").get_latest_block().expect("get").number;
+        assert_eq!(latest, 0);
+    }
+
+    /// Returns block 1 sealed with `state_root`, built on the genesis block the tests' proofs store
+    /// is initialized with.
+    fn block_one_with_state_root(state_root: B256) -> RecoveredBlock<Block> {
+        let header = alloy_consensus::Header {
+            number: 1,
+            parent_hash: hash_for_num(0),
+            state_root,
+            ..Default::default()
+        };
+        reth_primitives_traits::SealedBlock::seal_slow(Block { header, body: Default::default() })
+            .try_recover()
+            .expect("empty block")
+    }
+
+    /// Makes `block` reth's canonical block at its height.
+    fn make_canonical(
+        handle: &reth_exex_test_utils::TestExExHandle,
+        provider: &impl reth_provider::CanonChainTracker<Header = alloy_consensus::Header>,
+        block: &RecoveredBlock<Block>,
+    ) {
+        use reth_provider::BlockWriter;
+
+        let rw = handle.provider_factory.provider_rw().expect("provider rw");
+        rw.insert_block(block).expect("insert block");
+        rw.commit().expect("commit");
+        provider.set_canonical_head(block.clone_sealed_header());
+    }
+
+    #[tokio::test]
+    async fn handle_notification_hands_block_reth_replaced_to_sync_loop() {
+        use reth_optimism_trie::engine::EngineError;
+        use std::time::{Duration, Instant};
+
+        let dir = tempdir_path();
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
+        init_storage(store.clone());
+
+        let (ctx, handle) =
+            reth_exex_test_utils::test_exex_context().await.expect("exex test context");
+        let provider = ctx.components.provider.clone();
+        let pruner = OpProofStoragePruner::new(store.clone(), provider.clone(), 20);
+        // The test context's EVM config is a no-op that cannot execute blocks.
+        let engine_handle = EngineHandle::spawn_with_thresholds(
+            reth_evm_ethereum::EthEvmConfig::mainnet(),
+            provider.clone(),
+            store.clone(),
+            pruner,
+            1,
+            2,
+        );
+        let exex = build_test_exex(ctx, store.clone());
+
+        // The notification's block 1 builds on the proofs tip, but its header's state root is not
+        // the one execution produces, so its execution fails.
+        let err = engine_handle.execute_block(&mk_block(1)).expect_err("state root should differ");
+        let EngineError::StateRootMismatch { current_state_hash, .. } = err else {
+            panic!("expected a state root mismatch, got {err}");
+        };
+
+        // reth's canonical block 1 has the state root execution produces, standing in for the
+        // block that replaced the notification's block in a reorg.
+        let canonical = block_one_with_state_root(current_state_hash);
+        make_canonical(&handle, &provider, &canonical);
+
+        let notif =
+            ExExNotification::ChainCommitted { new: Arc::new(mk_chain_without_updates(1, 1)) };
+        exex.handle_notification(notif, &engine_handle)
+            .expect("a failed block reth has replaced should not stop the ExEx");
+
+        // Only the sync loop can index reth's block 1: the ExEx stopped at the failed block.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let latest = store.provider_ro().expect("provider ro").get_latest_block().expect("get");
+            if latest.number == 1 {
+                assert_eq!(latest.hash, canonical.hash());
+                break;
+            }
+            assert!(Instant::now() < deadline, "sync loop did not index reth's block 1");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_notification_propagates_failed_execution_of_canonical_block() {
+        assert_failure_of_canonical_block_stops_exex(0, false).await;
+    }
+
+    #[tokio::test]
+    async fn handle_notification_propagates_failed_verification_of_canonical_block() {
+        assert_failure_of_canonical_block_stops_exex(1, true).await;
+    }
+
+    /// Asserts that the ExEx stops when reth's canonical block 1 fails proofs execution, both on
+    /// the execution path and at the verification interval.
+    async fn assert_failure_of_canonical_block_stops_exex(
+        verification_interval: u64,
+        with_trie_data: bool,
+    ) {
+        let dir = tempdir_path();
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
+        init_storage(store.clone());
+
+        let (ctx, handle) =
+            reth_exex_test_utils::test_exex_context().await.expect("exex test context");
+        let provider = ctx.components.provider.clone();
+        let pruner = OpProofStoragePruner::new(store.clone(), provider.clone(), 20);
+        // The test context's EVM config is a no-op that cannot execute blocks.
+        let engine_handle = EngineHandle::spawn_with_thresholds(
+            reth_evm_ethereum::EthEvmConfig::mainnet(),
+            provider.clone(),
+            store.clone(),
+            pruner,
+            1,
+            2,
+        );
+        let exex = OpProofsExEx::builder(ctx, store.clone())
+            .with_proofs_history_window(20)
+            .with_verification_interval(verification_interval)
+            .build();
+
+        // reth's canonical block 1 is the notification's block, whose header's state root is not
+        // the one execution produces. Executing it again would fail the same way, so the failure
+        // stops the ExEx.
+        let block = mk_block(1);
+        make_canonical(&handle, &provider, &block);
+        let chain = if with_trie_data {
+            mk_chain_with_updates(1, 1, None)
+        } else {
+            mk_chain_without_updates(1, 1)
+        };
+        let notif = ExExNotification::ChainCommitted { new: Arc::new(chain) };
+        let err = exex
+            .handle_notification(notif, &engine_handle)
+            .expect_err("a failed block reth still has should stop the ExEx");
+        assert!(err.to_string().contains("State root mismatch for block 1"), "{err:#}");
+
+        engine_handle.flush();
+        let latest =
+            store.provider_ro().expect("provider ro").get_latest_block().expect("get").number;
+        assert_eq!(latest, 0);
+    }
+
     /// Runs each startup reconciliation scenario against both proofs storage backends.
     macro_rules! reconcile_tests {
         ($($scenario:ident),* $(,)?) => {
@@ -1074,7 +1276,7 @@ mod tests {
                     #[tokio::test]
                     async fn $scenario() {
                         let dir = tempdir_path();
-                        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+                        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
                         super::$scenario(store).await;
                     }
                 )*
@@ -1249,7 +1451,7 @@ mod tests {
     async fn handle_notification_schedules_async_on_gap() {
         // MDBX proofs storage
         let dir = tempdir_path();
-        let store = Arc::new(MdbxProofsStorageV2::new(dir.as_path()).expect("env"));
+        let store = Arc::new(MdbxProofsStorage::new(dir.as_path()).expect("env"));
 
         init_storage(store.clone());
 
