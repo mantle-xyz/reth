@@ -1164,7 +1164,13 @@ where
             .prewarm_bals
             .map(|count| (count, node.provider().canonical_state_stream()));
 
-        let eth_config = config.rpc.eth_config().max_batch_size(config.txpool.max_batch_size());
+        // reth#28510 also bounds multi-block eth_getLogs by the response size limit; upstream
+        // sets it in reth-rpc-builder's `eth_config`, which is not vendored here.
+        let eth_config = config
+            .rpc
+            .eth_config()
+            .max_batch_size(config.txpool.max_batch_size())
+            .max_response_size(config.rpc.rpc_max_response_size_bytes() as usize);
         let ctx = EthApiCtx {
             components: &node,
             config: eth_config,

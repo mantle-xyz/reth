@@ -473,46 +473,54 @@ libc = "0.2"
 rustls = { version = "0.23", default-features = false }
 tar = "0.4.44"
 
-# ==================== [patch] — reth core minimal patches ====================
+# ==================== [patch] — reth core: backports and Mantle changes ====================
+# Each crate is ethereum-optimism/reth op-v2.6.0-1 plus the upstream fixes listed (backport ledger
+# reth-v1.8.0-backports.md) and the Mantle changes noted; drop a crate once the pin includes them.
 [patch."https://github.com/ethereum-optimism/reth"]
-# Backport reth#28264 against this line's aef8d3ef dependency.
-reth-trie = { path = "patches/reth-trie" }
-# Backport reth#26357 #26421 #26471 #26842 #26843 #27651 (proof_v2 and its sparse-trie caller); drop when the reth pin includes them.
-reth-trie-common = { path = "patches/reth-trie-common" }
-# Backport reth#27252 (state root task: delete touched EIP-161-empty accounts), reth#26421 (proof task); drop when the reth pin includes them.
-# Backport reth#26819 (sparse ExEx WAL file IDs); drop when the reth pin includes it.
-# Backport reth#27015, #27259, #27869; drop when the reth pin includes them.
-reth-transaction-pool = { path = "patches/reth-transaction-pool" }
-reth-provider = { path = "patches/reth-provider" }
-# Backports reth#27131, #27223, #27229, #27676, #27678, #27719, #27981, #27984, #28053, #28064 and
-# #28067 (storage, static files, init-state, unwind); drop when the reth pin includes them.
-reth-nippy-jar = { path = "patches/reth-nippy-jar" }
-reth-db = { path = "patches/reth-db" }
-reth-db-api = { path = "patches/reth-db-api" }
-reth-db-common = { path = "patches/reth-db-common" }
-reth-storage-api = { path = "patches/reth-storage-api" }
-reth-stages = { path = "patches/reth-stages" }
-reth-stages-api = { path = "patches/reth-stages-api" }
+# reth#27981 #27984 #28067 #28269
 reth-cli-commands = { path = "patches/reth-cli-commands" }
-# Backport reth#27455 (end the syncing subscription on close); drop when the reth pin includes it.
-reth-rpc = { path = "patches/reth-rpc" }
-# Backport reth#26703 #26901 #26983 #27092 #27247 #27429 #27909 #28015 (engine tree), #26421 (its sparse_trie caller), #27805, #27462, #27313 (tasks), #27218, #28067, #26734 (node builder); drop when the reth pin includes them.
-reth-engine-tree = { path = "patches/reth-engine-tree" }
-reth-node-builder = { path = "patches/reth-node-builder" }
-reth-tasks = { path = "patches/reth-tasks" }
-# Backport reth#26776, #26999, #27106, #27107, #27415, #27462, #27477 (RPC blocking task handling);
-# drop when the reth pin includes them.
-reth-rpc-eth-api = { path = "patches/reth-rpc-eth-api" }
-# Backport reth#26479, #27022, #26767, #27881, #28091, #28243 (RPC error codes and simulate checks);
-# drop when the reth pin includes them.
-reth-rpc-eth-types = { path = "patches/reth-rpc-eth-types" }
-# Backport reth#27313 (shut down the owned runtime despite live clones); drop when the reth pin includes it.
+# reth#27313
 reth-cli-runner = { path = "patches/reth-cli-runner" }
-# Backport reth#26734 (refresh storage metrics in the background); drop when the reth pin includes it.
-# Vendored for backports that touch them (reth#27614, #27651, #28249; reth#27716; reth#28370).
-reth-storage-overlay = { path = "patches/reth-storage-overlay" }
+# reth#28064 #28405
+reth-db = { path = "patches/reth-db" }
+# reth#28067
+reth-db-api = { path = "patches/reth-db-api" }
+# reth#28053
+reth-db-common = { path = "patches/reth-db-common" }
+# reth#27909
+reth-engine-tree = { path = "patches/reth-engine-tree" }
+# reth#27678 #27719 #28370 #28405 #28468
+reth-nippy-jar = { path = "patches/reth-nippy-jar" }
+# reth#28067 #28510
+reth-node-builder = { path = "patches/reth-node-builder" }
+# reth#27229 #27678 #28053 #28064 #28067 #28370 #28405 #28481; Mantle: hashed-only snapshot exec-read fallback
+reth-provider = { path = "patches/reth-provider" }
+# reth#27415 #27455 #27462 #27586 #27716 #28510 #28616 #28690
+reth-rpc = { path = "patches/reth-rpc" }
+# reth#27415 #27462 #27477 #27586 #27716 #28091 #28510 #28690
+reth-rpc-eth-api = { path = "patches/reth-rpc-eth-api" }
+# reth#27881 #28091 #28243 #28312 #28390 #28510
+reth-rpc-eth-types = { path = "patches/reth-rpc-eth-types" }
+# reth#27716
 reth-rpc-server-types = { path = "patches/reth-rpc-server-types" }
+# reth#27676 #28067
+reth-stages = { path = "patches/reth-stages" }
+# reth#28067
+reth-stages-api = { path = "patches/reth-stages-api" }
+# reth#28370
 reth-static-file-types = { path = "patches/reth-static-file-types" }
+# reth#28067
+reth-storage-api = { path = "patches/reth-storage-api" }
+# reth#27614 #27651 #28249
+reth-storage-overlay = { path = "patches/reth-storage-overlay" }
+# reth#27313 #27462 #27466 #27805; Mantle: worker-idle test fix
+reth-tasks = { path = "patches/reth-tasks" }
+# reth#27869 #28358; Mantle: PoolTransaction::extra_balance_cost hook, pruned-gap pending fix (#267)
+reth-transaction-pool = { path = "patches/reth-transaction-pool" }
+# reth#27651 #28264
+reth-trie = { path = "patches/reth-trie" }
+# reth#28091
+reth-trie-common = { path = "patches/reth-trie-common" }
 
 # ==================== [patch.crates-io] — Force all deps to use our git versions ====================
 # Without this, paradigmxyz/reth uses crates.io revm while we use git revm,

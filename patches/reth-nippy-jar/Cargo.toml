@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Immutable data store format [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
+description = "Immutable data store format [MANTLE PATCH: backport reth#27678, reth#27719, reth#28370, reth#28405, reth#28468 on ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true

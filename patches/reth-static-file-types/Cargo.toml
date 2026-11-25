@@ -6,7 +6,7 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Commonly used types for static file usage in reth. [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
+description = "Commonly used types for static file usage in reth. [MANTLE PATCH: backport reth#28370 on ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true

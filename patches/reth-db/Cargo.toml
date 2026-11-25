@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Database primitives used in reth. [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
+description = "Database primitives used in reth. [MANTLE PATCH: backport reth#28064, reth#28405 on ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true

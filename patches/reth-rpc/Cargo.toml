@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth RPC implementation [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
+description = "Reth RPC implementation [MANTLE PATCH: backport reth#27415, reth#27455, reth#27462, reth#27586, reth#27716, reth#28510, reth#28616, reth#28690 on ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true

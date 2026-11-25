@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Transaction pool implementation [MANTLE PATCH: PoolTransaction::extra_balance_cost hook, pruned-gap pending fix (#267); vendored from ethereum-optimism/reth op-v2.6.0-1]"
+description = "Transaction pool implementation [MANTLE PATCH: backport reth#27869, reth#28358 on ethereum-optimism/reth op-v2.6.0-1; Mantle: PoolTransaction::extra_balance_cost hook, pruned-gap pending fix (#267)]"
 
 [lints]
 workspace = true

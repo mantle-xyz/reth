@@ -2208,7 +2208,7 @@ mod tests {
             ResponsePayload::success(vec![widest]),
             usize::MAX,
         );
-        assert!(response.into_json().len() <= max);
+        assert!(response.into_json().get().len() <= max);
     }
 
     #[tokio::test]

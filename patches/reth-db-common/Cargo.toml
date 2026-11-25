@@ -1,7 +1,7 @@
 [package]
 name = "reth-db-common"
 version = "2.6.0"
-description = "[MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
+description = "[MANTLE PATCH: backport reth#28053 on ethereum-optimism/reth op-v2.6.0-1]"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

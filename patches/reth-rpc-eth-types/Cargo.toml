@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Types supporting implementation of 'eth' namespace RPC server API [MANTLE PATCH: vendored from ethereum-optimism/reth op-v2.6.0-1]"
+description = "Types supporting implementation of 'eth' namespace RPC server API [MANTLE PATCH: backport reth#27881, reth#28091, reth#28243, reth#28312, reth#28390, reth#28510 on ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
