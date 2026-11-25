@@ -315,17 +315,20 @@ impl<T: TransactionOrdering> PendingPool<T> {
         &mut self,
         id: &TransactionId,
     ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
+        let tx = self.by_id.remove(id)?;
         if let Some(lowest) = self.independent_transactions.get(&id.sender) &&
             lowest.transaction.nonce() == id.nonce
         {
-            self.independent_transactions.remove(&id.sender);
-            // mark the next as independent if it exists
-            if let Some(unlocked) = self.get(&id.descendant()) {
-                self.independent_transactions.insert(id.sender, unlocked.clone());
+            // A mined descendant may have been pruned before this stale
+            // ancestor. The next pending transaction need not be nonce + 1.
+            let next = self.by_id.range(id.sender.range()).next().map(|(_, tx)| tx.clone());
+            if let Some(next) = next {
+                self.independent_transactions.insert(id.sender, next);
+            } else {
+                self.independent_transactions.remove(&id.sender);
             }
         }
 
-        let tx = self.by_id.remove(id)?;
         self.size_of -= tx.transaction.size();
 
         match self.highest_nonces.entry(id.sender) {
