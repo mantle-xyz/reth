@@ -1769,7 +1769,8 @@ mod tests {
 
     #[test]
     fn only_recovers_authorities_for_matching_chain_id() {
-        let validator = EthTransactionValidatorBuilder::new(mock_provider(), test_evm_config())
+        let provider = MockEthProvider::default().with_genesis_block();
+        let validator = EthTransactionValidatorBuilder::new(provider, test_evm_config())
             .build(InMemoryBlobStore::default());
         let auth = |chain_id, address| {
             Authorization { chain_id, address, nonce: 0 }.into_signed(Signature::test_signature())
