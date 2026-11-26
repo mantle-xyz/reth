@@ -30,7 +30,7 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
         proofs_history: true,
         history: ProofsHistoryStorageArgs {
             storage_path: Some(sidecar_path.clone()),
-            storage_version: ProofsStorageVersion::V2,
+            storage_version: Some(ProofsStorageVersion::V2),
         },
         ..Default::default()
     };
@@ -110,7 +110,7 @@ async fn proofs_history_keeps_mantle_rpc_extensions() {
         proofs_history: true,
         history: ProofsHistoryStorageArgs {
             storage_path: Some(sidecar_path.clone()),
-            storage_version: ProofsStorageVersion::V2,
+            storage_version: Some(ProofsStorageVersion::V2),
         },
         ..Default::default()
     };

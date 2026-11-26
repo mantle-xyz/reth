@@ -23,7 +23,9 @@ use reth_rpc_eth_api::{
         estimate::EstimateCall, pending_block::PendingEnvBuilder,
     },
 };
-use reth_rpc_eth_types::{EthStateCache, PendingBlock, builder::config::PendingBlockKind};
+use reth_rpc_eth_types::{
+    EthApiSettings, EthStateCache, PendingBlock, builder::config::PendingBlockKind,
+};
 use reth_tasks::{
     Runtime,
     pool::{BlockingTaskGuard, BlockingTaskPool},
@@ -250,6 +252,9 @@ impl<Eth: EthApiTypes> EthApiTypes for PendingEthApi<Eth> {
     type Error = Eth::Error;
     type NetworkTypes = Eth::NetworkTypes;
     type RpcConvert = Eth::RpcConvert;
+    fn eth_api_settings(&self) -> &EthApiSettings {
+        self.inner.eth_api_settings()
+    }
     fn converter(&self) -> &Self::RpcConvert {
         self.inner.converter()
     }

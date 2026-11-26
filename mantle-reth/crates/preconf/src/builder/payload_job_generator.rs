@@ -183,8 +183,11 @@ where
         input: BuildNewPayload<<Self::Job as reth_payload_builder::PayloadJob>::PayloadAttributes>,
         id: PayloadId,
     ) -> Result<Self::Job, PayloadBuilderError> {
-        let BuildNewPayload { attributes: rpc_attrs, parent_hash, cache, state_root_handle } =
-            input;
+        let BuildNewPayload { attributes: rpc_attrs, parent_hash, mut resources } = input;
+        let cache = resources.take_execution_cache();
+        let state_root_handle = resources.take_state_root_handle();
+        // The build runs detached from the job, so it holds the engine's leases until it exits.
+        let leases = resources.take_leases();
 
         // Look up parent header — mirrors Base's pattern. Genesis edge
         // case (parent_hash zero) intentionally surfaces as
@@ -296,6 +299,7 @@ where
             let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 rt.block_on(builder_clone.build_payload(args, cancel_for_build))
             }));
+            drop(leases);
 
             match build_result {
                 Ok(Ok(payload)) => {

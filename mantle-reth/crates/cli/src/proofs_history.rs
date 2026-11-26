@@ -124,6 +124,7 @@ where
     T: FullNodeTypes<
             Types: NodeTypes<Primitives = OpPrimitives, ChainSpec: reth_optimism_forks::OpHardforks>,
         >,
+    T::Provider: reth_optimism_trie::CanonicalInMemoryStateProvider,
     CB: NodeComponentsBuilder<T>,
     <CB::Components as reth_node_builder::components::NodeComponents<T>>::Evm:
         reth_optimism_evm::ConfigurePostExecEvm<Primitives = OpPrimitives>,
@@ -177,6 +178,7 @@ where
     T: FullNodeTypes<
             Types: NodeTypes<Primitives = OpPrimitives, ChainSpec: reth_optimism_forks::OpHardforks>,
         >,
+    T::Provider: reth_optimism_trie::CanonicalInMemoryStateProvider,
     CB: NodeComponentsBuilder<T>,
     <CB::Components as reth_node_builder::components::NodeComponents<T>>::Evm:
         reth_optimism_evm::ConfigurePostExecEvm<Primitives = OpPrimitives>,

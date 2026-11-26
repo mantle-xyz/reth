@@ -94,7 +94,9 @@ async fn test_debug_trace_block_with_post_exec_tx() -> eyre::Result<()> {
         value: U256::ZERO,
         gas_limit: 21_000,
         is_system_transaction: false,
+        eth_value: U256::ZERO,
         input: Bytes::new(),
+        eth_tx_value: None,
     };
     let transactions = vec![
         OpTxEnvelope::Deposit(deposit.seal_slow()),

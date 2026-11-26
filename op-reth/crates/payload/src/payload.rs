@@ -970,6 +970,8 @@ mod tests {
             .expect("newPayload must decode a deposit with ethTxValue > u128::MAX");
 
         assert_eq!(decoded_eth_tx_value(&decoded.body.transactions[0]), Some(eth_tx_value));
+    }
+
     /// Derived-block attributes (`no_tx_pool`) carrying exactly `transactions`.
     fn attrs_with_transactions(transactions: Vec<Bytes>) -> OpPayloadAttributes {
         OpPayloadAttributes {

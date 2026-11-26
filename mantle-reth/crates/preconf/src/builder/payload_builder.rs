@@ -2902,7 +2902,6 @@ impl<Pool, Client, Evm> PreconfPayloadBuilder<Pool, Client, Evm> {
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
-            changed_paths: None,
         };
 
         Ok(OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed)))

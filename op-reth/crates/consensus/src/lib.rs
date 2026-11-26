@@ -69,7 +69,9 @@ where
         (9, 0)
     } else {
         if !header.extra_data().is_empty() &&
-            !chain_spec.op_fork_activation(OpHardfork::Bedrock).transitions_at_block(header.number())
+            !chain_spec
+                .op_fork_activation(OpHardfork::Bedrock)
+                .transitions_at_block(header.number())
         {
             return Err(ConsensusError::msg("extraData must be empty before Holocene"));
         }
@@ -1135,7 +1137,7 @@ mod tests {
     /// re-computes the correct root via `verify_receipts_optimism`.
     #[test]
     fn mantle_ignores_precomputed_receipt_root() {
-        use crate::proof::calculate_receipt_root_no_memo_optimism;
+        use crate::proof::calculate_receipt_root_optimism;
         use mantle_reth_chainspec::MANTLE_MAINNET;
         use op_alloy_consensus::OpDepositReceipt;
 
@@ -1158,8 +1160,8 @@ mod tests {
         let bloom = deposit_receipt.bloom();
 
         // Root WITH Mantle strip (correct canonical root)
-        let mantle_root = calculate_receipt_root_no_memo_optimism(
-            std::slice::from_ref(&deposit_receipt),
+        let mantle_root = calculate_receipt_root_optimism(
+            std::slice::from_ref(&deposit_receipt.with_bloom_ref()),
             MANTLE_MAINNET.as_ref(),
             u64::MAX,
         );
@@ -1232,7 +1234,7 @@ mod tests {
 
     #[test]
     fn mantle_skadi_without_arsia_strips_deposit_fields() {
-        use crate::proof::calculate_receipt_root_no_memo_optimism;
+        use crate::proof::calculate_receipt_root_optimism;
         use alloy_hardforks::ForkCondition;
         use alloy_op_hardforks::{MantleHardfork, OpHardfork};
         use op_alloy_consensus::OpDepositReceipt;
@@ -1272,8 +1274,8 @@ mod tests {
         let unstripped_root =
             proofs::calculate_receipt_root(std::slice::from_ref(&deposit_receipt.with_bloom_ref()));
 
-        let mantle_root = calculate_receipt_root_no_memo_optimism(
-            std::slice::from_ref(&deposit_receipt),
+        let mantle_root = calculate_receipt_root_optimism(
+            std::slice::from_ref(&deposit_receipt.with_bloom_ref()),
             skadi_only_spec.as_ref(),
             1,
         );

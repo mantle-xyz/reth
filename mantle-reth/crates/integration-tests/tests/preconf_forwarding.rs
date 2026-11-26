@@ -211,7 +211,7 @@ async fn preconf_forward_sends_configured_sequencer_headers() {
                     proofs_history: true,
                     history: ProofsHistoryStorageArgs {
                         storage_path: Some(path.clone()),
-                        storage_version: ProofsStorageVersion::V2,
+                        storage_version: Some(ProofsStorageVersion::V2),
                     },
                     ..Default::default()
                 },

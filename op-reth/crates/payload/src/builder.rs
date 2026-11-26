@@ -533,7 +533,7 @@ impl<Txs> OpBuilder<'_, Txs> {
             let block_number = builder.evm_mut().block().number().saturating_to();
             let entries = builder.executor_mut().take_post_exec_entries();
             let refund_gas = total_gas_refund(&entries);
-            try_include_post_exec_tx(block_number, entries, |tx| {
+            try_include_post_exec_tx::<N::SignedTx, _>(block_number, entries, |tx| {
                 let tx_rlp_length = tx.length();
                 builder
                     .execute_transaction(tx)

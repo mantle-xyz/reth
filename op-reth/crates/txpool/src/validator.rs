@@ -564,6 +564,8 @@ mod tests {
         let mut l1_block_info = L1BlockInfo {
             l1_base_fee: U256::from(1_000_000_000_000u64),
             l1_base_fee_scalar: U256::from(1_000_000),
+            // [MANTLE] The L1 fee is scaled by the MNT/ETH token ratio; 0 would zero it out.
+            token_ratio: U256::from(1),
             ..Default::default()
         };
         let l1_fee =
