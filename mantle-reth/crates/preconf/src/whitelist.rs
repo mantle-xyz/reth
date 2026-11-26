@@ -60,7 +60,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     classifier::{PreconfClassifier, Whitelist},
@@ -322,8 +322,12 @@ pub enum WhitelistError {
     /// The contract at `whitelist_contract` declares a storage layout this binary
     /// cannot read.
     ///
-    /// Fatal for the same reason [`Self::ContractHasNoCode`] is, and it settles
-    /// what that check cannot: whether the deployed contract is a
+    /// Checked on every full read, because the contract sits behind a proxy and
+    /// an upgrade can change its layout without changing its address. Fatal at
+    /// cold start, for the same reason [`Self::ContractHasNoCode`] is; at reload
+    /// and at the start of a build the read is refused and the previous lists
+    /// stay in force, counted in `preconf.whitelist.layout_mismatch_total`. It
+    /// settles what the has-code check cannot: whether the deployed contract is a
     /// `PreconfWhitelist` at the layout these slot constants describe. A skew is
     /// silent and actively wrong rather than merely stale.
     ///
@@ -772,11 +776,38 @@ fn read_all_within(
     contract: Address,
     budget: &mut ReadBudget,
 ) -> Result<Whitelist, WhitelistError> {
+    check_layout_version(state, contract)?;
     let pairs = read_preconf_pairs_within(state, contract, PAIRS_SLOT, budget)?;
     let from_wildcards = read_preconf_set_within(state, contract, FROM_WILDCARDS_SLOT, budget)?;
     let to_wildcards = read_preconf_set_within(state, contract, TO_WILDCARDS_SLOT, budget)?;
     let lists_hash = read_lists_hash(state, contract)?;
     Ok(Whitelist { pairs, from_wildcards, to_wildcards, lists_hash })
+}
+
+/// Refuses a contract whose declared layout is not the one the slot constants
+/// describe.
+///
+/// Part of every full read, not only the cold start: the contract sits behind a
+/// proxy, so an upgrade can move the slots under a running node while the
+/// configured address stays the same. Reading the lists from the old slots would
+/// install whatever happens to be there, so the read stops here and the caller
+/// keeps the lists it already has.
+fn check_layout_version(state: &StateProviderBox, contract: Address) -> Result<(), WhitelistError> {
+    let found = state
+        .storage(contract, B256::from(U256::from(LAYOUT_VERSION_SLOT)))?
+        .unwrap_or_default()
+        .saturating_to::<u64>();
+    if found != EXPECTED_LAYOUT_VERSION {
+        // Its own counter: unlike a transient read failure, retrying cannot clear
+        // it. Only a binary built for the new layout can.
+        metrics::counter!("preconf.whitelist.layout_mismatch_total").increment(1);
+        return Err(WhitelistError::LayoutVersionMismatch {
+            contract,
+            expected: EXPECTED_LAYOUT_VERSION,
+            found,
+        });
+    }
+    Ok(())
 }
 
 /// The contract's `listsHash` in `state`.
@@ -858,29 +889,23 @@ fn shared_lists_are_current<P: WhitelistState>(
 ///
 /// The has-code check is deliberately fatal — see
 /// [`WhitelistError::ContractHasNoCode`] for why the split between "this node's
-/// configuration" and "governance's policy" falls where it does. It and the
-/// layout-version check both run **once**, because both answers are fixed for
-/// this process's lifetime: deployed code does not disappear (post-Cancun
-/// `selfdestruct` no longer clears it), and a different layout means a redeploy,
-/// which means a new `--preconf.whitelist-contract`. The watcher repeats
-/// neither.
+/// configuration" and "governance's policy" falls where it does. It runs
+/// **once**: deployed code does not disappear (post-Cancun `selfdestruct` no
+/// longer clears it), and the watcher does not repeat it.
 ///
-/// **Both of those hold only because the contract cannot sit behind a proxy**,
-/// and that is a property of the contract rather than an assumption made here:
-/// `PreconfWhitelist.sol` writes `layoutVersion` in its **constructor**, with
-/// no `initialize()`. Deployed behind a proxy, the proxy's own storage would
-/// read `layoutVersion = 0` and `authorizedL1 = 0` — `onlyL1Gov` would be
-/// permanently unsatisfiable, and this bootstrap would refuse to start with
-/// `LayoutVersionMismatch { found: 0 }`. So a proxy upgrade cannot silently
-/// change the layout under a running node; it cannot be deployed at all.
-/// Reading the version once is sound for that reason, not by assumption.
+/// The layout-version check is not a cold-start check. `PreconfWhitelist.sol`
+/// is deployed behind a `Proxy` and writes `layoutVersion` in `initialize`, so
+/// an upgrade can change the layout while the configured address stays the
+/// same. [`read_all`] therefore checks the version on every read — here, in
+/// [`reload_whitelist`] and in [`whitelist_for_build`]. Only the consequence
+/// differs: here it aborts the launch, there the previous lists stay in force.
 ///
-/// It is not the only fatal check. `build_pool` (`mantle-reth-cli`) propagates
-/// every `Err` from here, so a [`WhitelistError::LayoutVersionMismatch`] or a
-/// failed read of the three lists aborts the launch just as hard. That is the
+/// `build_pool` (`mantle-reth-cli`) propagates every `Err` from here, so a
+/// [`WhitelistError::LayoutVersionMismatch`] or a failed read of the three
+/// lists aborts the launch just as hard as the has-code check. That is the
 /// cold-start side of the split every read error takes: at reload the same
-/// failure only warns and the previous lists stay in force. What is *not* fatal,
-/// at either end, is an empty allowlist.
+/// failure only warns and the previous lists stay in force. What is *not*
+/// fatal, at either end, is an empty allowlist.
 pub fn bootstrap_whitelist<P: WhitelistState>(
     provider: &P,
     cfg: &PreconfConfig,
@@ -912,19 +937,7 @@ pub fn bootstrap_whitelist<P: WhitelistState>(
         return Err(WhitelistError::ContractHasNoCode(contract));
     }
 
-    // Checked once, like the has-code check above.
-    let found = state
-        .storage(contract, B256::from(U256::from(LAYOUT_VERSION_SLOT)))?
-        .unwrap_or_default()
-        .saturating_to::<u64>();
-    if found != EXPECTED_LAYOUT_VERSION {
-        return Err(WhitelistError::LayoutVersionMismatch {
-            contract,
-            expected: EXPECTED_LAYOUT_VERSION,
-            found,
-        });
-    }
-
+    // `read_all` checks the layout version before any list.
     let whitelist = read_all(&state, contract)?;
     let (pair_len, from_len, to_len) = apply_whitelist(classifier, contract, whitelist);
 
@@ -1099,12 +1112,24 @@ pub async fn run_whitelist_watcher<Pr, N>(
             Err(err) => {
                 consecutive_failures += 1;
                 retry_pending = true;
-                warn!(
-                    target: "mantle::preconf::whitelist",
-                    %err, %contract, reverted,
-                    consecutive_failures,
-                    "whitelist refresh failed; keeping previous allowlists, retrying every block",
-                );
+                if matches!(err, WhitelistError::LayoutVersionMismatch { .. }) {
+                    // Retrying reads the same slot; only a binary built for the
+                    // new layout clears this, so it needs an operator.
+                    error!(
+                        target: "mantle::preconf::whitelist",
+                        %err, %contract, reverted,
+                        consecutive_failures,
+                        "whitelist contract changed its storage layout; keeping previous \
+                         allowlists until this node runs a matching binary",
+                    );
+                } else {
+                    warn!(
+                        target: "mantle::preconf::whitelist",
+                        %err, %contract, reverted,
+                        consecutive_failures,
+                        "whitelist refresh failed; keeping previous allowlists, retrying every block",
+                    );
+                }
             }
         }
         metrics::gauge!("preconf.whitelist.consecutive_reload_failures")
@@ -1586,22 +1611,71 @@ mod tests {
         );
     }
 
-    /// The marker is checked **once**, at cold start, exactly like the has-code
-    /// check — see [`bootstrap_whitelist`]. A reload must therefore load lists
-    /// from a contract whose layout it never re-validates.
+    /// A proxy upgrade can change the layout under a running node, so a reload
+    /// checks the version again — and, refusing, keeps the lists it has rather
+    /// than installing what the old slots now hold.
     #[test]
-    fn reload_does_not_recheck_the_layout_version() {
+    fn reload_refuses_a_changed_layout_and_keeps_the_previous_lists() {
+        // The new layout's storage happens to hold a well-formed pair where the
+        // old one kept its pairs: without the check it would be installed.
         let provider = provider_with_slots(
-            &[(addr(1), addr(2))],
+            &[(addr(7), addr(8))],
             &[],
             &[],
             true,
-            &[(LAYOUT_VERSION_SLOT, U256::ZERO)],
+            &[(LAYOUT_VERSION_SLOT, U256::from(4))],
         );
         let (cfg, c) = onchain_pair();
+        c.update_whitelist(
+            HashSet::from_iter([(addr(1), addr(2))]),
+            HashSet::default(),
+            HashSet::default(),
+        );
 
-        reload_whitelist(&provider, &cfg, &c).expect("reload must not re-validate the layout");
-        assert_eq!(c.whitelist_counts(), (1, 0, 0));
+        let mut result = None;
+        let scrape = scrape_after(|| result = Some(reload_whitelist(&provider, &cfg, &c)));
+
+        let err = result.unwrap().unwrap_err();
+        assert!(
+            matches!(err, WhitelistError::LayoutVersionMismatch { found: 4, .. }),
+            "got {err:?}",
+        );
+        assert!(c.preview_eligibility(&addr(1), Some(&addr(2))), "previous lists stay in force");
+        assert!(!c.preview_eligibility(&addr(7), Some(&addr(8))), "new storage is not installed");
+        assert!(scrape.contains("preconf_whitelist_layout_mismatch_total 1\n"), "{scrape}");
+        assert!(scrape.contains("preconf_whitelist_reload_failed 1\n"), "{scrape}");
+        assert!(!scrape.contains("preconf_whitelist_reload_ok"), "{scrape}");
+    }
+
+    /// The same at the start of a build: `listsHash` moved, so the lists are
+    /// re-read, and the changed layout makes the build keep the shared snapshot.
+    #[test]
+    fn a_build_whose_parent_changed_layout_keeps_the_shared_snapshot() {
+        let provider = provider_with_slots(
+            &[(addr(7), addr(8))],
+            &[],
+            &[],
+            true,
+            &[
+                (LISTS_HASH_SLOT, B256::repeat_byte(0x43).into()),
+                (LAYOUT_VERSION_SLOT, U256::from(4)),
+            ],
+        );
+        let state = provider.latest_state().unwrap();
+        let snapshot = Arc::new(Whitelist {
+            pairs: HashSet::from_iter([(addr(5), addr(6))]),
+            lists_hash: B256::repeat_byte(0x42),
+            ..Default::default()
+        });
+
+        let mut used = None;
+        let scrape = scrape_after(|| {
+            used = Some(whitelist_for_build(&state, WL, snapshot.clone(), B256::ZERO));
+        });
+
+        assert!(Arc::ptr_eq(&used.unwrap(), &snapshot));
+        assert!(scrape.contains("preconf_whitelist_layout_mismatch_total 1\n"), "{scrape}");
+        assert!(scrape.contains("preconf_whitelist_build_reread_failed_total 1\n"), "{scrape}");
     }
 
     #[test]
