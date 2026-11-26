@@ -554,6 +554,8 @@ where
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<U256> {
         debug!(message = "rpc::estimate_gas", block_number = ?block_number);
+        // reth#28690: hold a blocking IO permit like the standard eth_estimateGas handler.
+        let _permit = self.eth_api.acquire_owned_blocking_io().await;
         let transaction: op_alloy_rpc_types::OpTransactionRequest = from_value(transaction)?;
         let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {

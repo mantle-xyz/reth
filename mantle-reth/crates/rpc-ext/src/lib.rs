@@ -47,7 +47,7 @@ use reth_rpc_eth_api::{
     helpers::{EthApiSpec, EthCall, EthFees, EthState},
 };
 use reth_rpc_eth_types::{EthApiError, simulate};
-use reth_rpc_server_types::result::invalid_params_rpc_err;
+use reth_rpc_server_types::{constants::DEFAULT_MAX_PROOF_SLOTS, result::invalid_params_rpc_err};
 use reth_storage_api::{
     BlockIdReader, BlockNumReader, BlockReaderIdExt, StateProofProvider, StateProviderBox,
     StateProviderFactory, errors::ProviderResult,
@@ -566,6 +566,16 @@ where
         // (rpc-eth-api/src/helpers/state.rs) — re-sync on upstream bump. Sole divergence:
         // the geth-parity conversion below.
         //
+        // reth#27716: cap the key count before taking a proof permit.
+        if keys.len() > DEFAULT_MAX_PROOF_SLOTS {
+            return Err(ErrorObject::from(<EthApi as EthApiTypes>::Error::from_eth_err(
+                EthApiError::InvalidParams(format!(
+                    "storage key count {} exceeds limit {DEFAULT_MAX_PROOF_SLOTS}",
+                    keys.len(),
+                )),
+            )));
+        }
+
         // The tracing permit (`--rpc.max-tracing-requests`) is the only concurrency bound on
         // proof generation; it moves into the blocking task so it outlives a dropped request.
         let permit = self
@@ -643,6 +653,8 @@ where
         block_number: Option<BlockId>,
     ) -> RpcResult<U256> {
         validate_estimate_total_fee_blob_fields(&request)?;
+        // reth#28690: hold a blocking IO permit like eth_estimateGas.
+        let _permit = self.eth_api().acquire_owned_blocking_io().await;
 
         let block_id = block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
         // Capture once: gas execution, base fee, L1 attributes and token ratio must

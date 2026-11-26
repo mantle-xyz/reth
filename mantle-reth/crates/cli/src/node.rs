@@ -749,13 +749,15 @@ where
     ctx.modules.add_or_replace_if_module_configured(RethRpcModule::Eth, mantle_ext.into_rpc())?;
 
     // A transaction whose trace fails gets `{"error": …}` instead of failing the whole
-    // `debug_traceBlock*` call, as on op-geth.
+    // `debug_traceBlock*` call, as on op-geth. Only on transports that enable the debug
+    // namespace: `replace_configured` would add these methods to every transport.
     let debug_trace = MantleDebugTrace::new(
         ctx.registry.debug_api(),
         ctx.registry.eth_api().clone(),
         ctx.config().rpc.rpc_max_tracing_requests,
     );
-    ctx.modules.replace_configured(debug_trace.into_rpc())?;
+    ctx.modules
+        .add_or_replace_if_module_configured(RethRpcModule::Debug, debug_trace.into_rpc())?;
     info!(target: "reth::cli", "Mantle RPC extensions registered");
 
     Ok(())
