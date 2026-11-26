@@ -94,6 +94,10 @@ const COUNTERS: &[&str] = &[
     "preconf.whitelist.build_reread_total",
     // That check or read failed; the build used the shared allowlist.
     "preconf.whitelist.build_reread_failed_total",
+    // The whitelist contract declares a storage layout this binary cannot read,
+    // found at reload or at the start of a build; the previous allowlist stays
+    // in force. Steady state is 0; any increase needs a matching binary.
+    "preconf.whitelist.layout_mismatch_total",
     // A build that found its parent no longer on the canonical chain when
     // about to replay a commitment, and abandoned itself. Steady state is 0; it
     // moves with reorgs.
