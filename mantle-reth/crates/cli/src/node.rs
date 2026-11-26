@@ -8,6 +8,7 @@
 //! overrides that answer the `pending` tag from flashblock state.
 
 use crate::txpool::MantleTransactionValidator;
+use alloy_consensus::BlockHeader;
 use mantle_reth_flashblocks::{
     EthApiExt as FlashblocksEthApiExt, EthApiOverrideServer as _,
     EthPubSub as FlashblocksEthPubSub, EthPubSubApiServer as _, FlashblocksConfig,
@@ -40,7 +41,7 @@ use reth_optimism_payload_builder::config::{OpBuilderConfig, OpDAConfig, OpGasLi
 use reth_optimism_primitives::OpPrimitives;
 use reth_optimism_storage::OpStorage;
 use reth_optimism_txpool::{OpPool, OpPooledTransaction, OpPooledTx};
-use reth_provider::CanonStateSubscriptions;
+use reth_provider::{BlockReaderIdExt, CanonStateSubscriptions};
 use reth_rpc_builder::RethRpcModule;
 use reth_transaction_pool::{
     CoinbaseTipOrdering, EthPoolTransaction, Pool, TransactionValidationTaskExecutor,
@@ -87,6 +88,8 @@ pub type MantleTransactionPool<Client, S, Evm, T = OpPooledTransaction> = OpPool
 pub struct MantlePoolBuilder<T = OpPooledTransaction> {
     pool_config_overrides: PoolBuilderConfigOverrides,
     enable_tx_conditional: bool,
+    /// The operator's gas limit, shared with the payload builder.
+    gas_limit_config: OpGasLimitConfig,
     /// Optional preconfirmation wiring. `None` ⇒ preconf disabled and the pool
     /// is built exactly as upstream builds it. `Some(_)` ⇒ the journal restore
     /// that runs once the pool is up is driven by the provided `cfg` / `fifo`.
@@ -121,6 +124,7 @@ impl<T> Default for MantlePoolBuilder<T> {
         Self {
             pool_config_overrides: Default::default(),
             enable_tx_conditional: false,
+            gas_limit_config: OpGasLimitConfig::default(),
             preconf: None,
             _pd: core::marker::PhantomData,
         }
@@ -131,6 +135,12 @@ impl<T> MantlePoolBuilder<T> {
     /// Sets the `enable_tx_conditional` flag.
     pub fn with_enable_tx_conditional(mut self, enable_tx_conditional: bool) -> Self {
         self.enable_tx_conditional = enable_tx_conditional;
+        self
+    }
+
+    /// Shares the operator's gas limit with the pool's validator.
+    pub fn with_gas_limit_config(mut self, gas_limit_config: OpGasLimitConfig) -> Self {
+        self.gas_limit_config = gas_limit_config;
         self
     }
 
@@ -194,8 +204,14 @@ where
                     (Arc::new(cfg), classifier, fifo, None)
                 }
             };
+        // Reth's validator assumes a 30M block gas limit until it sees its first canonical update.
+        // Start it with the chain's limit.
+        let latest_header =
+            ctx.provider().latest_header()?.ok_or_else(|| eyre::eyre!("no latest header"))?;
+        let gas_limit_config = self.gas_limit_config.clone();
         let validator =
             TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
+                .set_block_gas_limit(latest_header.gas_limit())
                 .no_eip4844()
                 .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
                 .kzg_settings(ctx.kzg_settings()?)
@@ -210,7 +226,8 @@ where
                 .build_with_tasks(ctx.task_executor().clone(), blob_store.clone())
                 .map(move |validator| {
                     let op_validator = reth_optimism_txpool::OpTransactionValidator::new(validator)
-                        .require_l1_data_gas_fee(!ctx.config().dev.dev);
+                        .require_l1_data_gas_fee(!ctx.config().dev.dev)
+                        .with_gas_limit_config(gas_limit_config.clone());
                     // Enforce `--rpc.txfeecap` for all RPC-submitted txs (op-geth parity);
                     // see MantleTransactionValidator docs for why this can't live in the
                     // inner (upstream) validator. Same config source as `set_tx_fee_cap` above.
@@ -413,8 +430,9 @@ impl MantleNode {
         // Hand the pool builder the preconf handles it needs to run the journal
         // restore once the pool is up. Otherwise it stays in its default
         // pass-through state.
-        let mut pool_builder =
-            MantlePoolBuilder::default().with_enable_tx_conditional(args.enable_tx_conditional);
+        let mut pool_builder = MantlePoolBuilder::default()
+            .with_enable_tx_conditional(args.enable_tx_conditional)
+            .with_gas_limit_config(self.op_node.gas_limit_config.clone());
         if let Some(p) = &self.preconf {
             pool_builder = pool_builder.with_preconf(
                 p.cfg().clone(),

@@ -16,7 +16,7 @@ const L1_BLOCK_ISTHMUS_SELECTOR: [u8; 4] = hex!("098999be");
 
 /// The function selector of the "setL1BlockValuesJovian" function in the `L1Block` contract.
 /// This is the first 4 bytes of `keccak256("setL1BlockValuesJovian()")`.
-const L1_BLOCK_JOVIAN_SELECTOR: [u8; 4] = hex!("3db6be2b");
+pub const L1_BLOCK_JOVIAN_SELECTOR: [u8; 4] = hex!("3db6be2b");
 
 /// [MANTLE] The function selector of the `setL1BlockValuesArsia()` function.
 /// Same calldata layout as Jovian, different selector.
