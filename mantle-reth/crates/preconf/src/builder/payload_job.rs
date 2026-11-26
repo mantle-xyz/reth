@@ -70,7 +70,8 @@ impl<Attrs, Payload> PreconfPayloadJob<Attrs, Payload> {
     /// Construct a new job bound to a spawned build task.
     ///
     /// Typically called from
-    /// [`PreconfPayloadJobGenerator::new_payload_job`](crate::builder::payload_job_generator::PreconfPayloadJobGenerator::new_payload_job)
+    /// `PreconfPayloadJobGenerator`'s
+    /// [`new_payload_job`](reth_payload_builder::PayloadJobGenerator::new_payload_job)
     /// after spawning the build future. Tests can call this directly
     /// to inject a pre-filled `watch::Receiver`.
     pub fn new(
@@ -102,7 +103,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreconfPayloadJob")
             .field("attributes", &self.attributes)
-            .field("cancelled", &self.cancel.is_cancelled())
+            .field("cancel", &self.cancel.reason())
             .finish_non_exhaustive()
     }
 }
@@ -125,15 +126,19 @@ where
 // receiver has already been dropped alongside the job (see
 // `payload_job_generator.rs::new_payload_job` for the send-fail log).
 //
-// Idempotent with respect to `resolve_kind`'s own `cancel.signal()` —
-// `JobCancel::signal` is a single `watch::Sender::send(true)` and a
-// second call is a no-op. It is also complementary to the generator's
+// Idempotent with respect to `resolve_kind`'s own `cancel.resolve()` — both
+// write through one `watch::Sender<Option<CancelReason>>`, and the first reason
+// recorded is the one that sticks. It is also complementary to the generator's
 // `ensure_only_one_payload` (see `payload_job_generator.rs`), which cancels the
 // *previous* job when a *new* one is spawned: Drop covers the eviction path,
 // `ensure_only_one_payload` the supersede path; both funnel to the same signal.
 impl<Attrs, Payload> Drop for PreconfPayloadJob<Attrs, Payload> {
     fn drop(&mut self) {
-        self.cancel.signal();
+        // `abandon`, not `resolve`: reaching here says the job is going away,
+        // not what became of its payload. A job whose payload *was* asked for
+        // has already recorded that, and the first reason is the one that
+        // sticks — so this only decides the case where nobody asked.
+        self.cancel.abandon();
     }
 }
 
@@ -182,7 +187,7 @@ where
         // arm inside `build_payload` will break out of its loop, run
         // SDM post-exec + finalize, and then `payload_rx` will receive
         // the final payload.
-        self.cancel.signal();
+        self.cancel.resolve();
         let fut = ResolvePayloadFuture::new(self.payload_rx.clone());
         (fut, KeepPayloadJobAlive::No)
     }
@@ -192,30 +197,23 @@ where
 
 /// Future returned by [`PreconfPayloadJob::resolve_kind`].
 ///
-/// Waits for the spawned build task to **finish** (sender drops on
-/// task exit), then returns whatever the watch channel last held
+/// Waits for the spawned build task to **finish** (sender drops on task exit,
+/// success or failure), then returns whatever the watch channel last held
 /// — `Some(payload)` → `Ok`, `None` → `MissingPayload`.
 ///
 /// ## Why "wait for sender drop" rather than "return first `Some`"
 ///
-/// The pre-flashblock model only sent **once** (final payload), so
-/// "return first `Some`" was almost-always equivalent. But it has
-/// two latent issues:
+/// The channel carries a single value: `payload_job_generator` sends the
+/// finished `OpBuiltPayload` once and drops the sender without sending on
+/// every other exit. Flashblock slices do not pass through it —
+/// `SliceState::publish` hands those to `producer.publisher`.
 ///
-/// 1. **Race window** in the single-set case: if the receiver polls before the spawned task sends,
-///    then sees `None`, then polls again right after the send but before the task exits, the "first
-///    `Some`" returns immediately. That's fine for single-set but **wrong for flashblocks**, where
-///    the sender will set intermediate flashblock payloads — "first `Some`" would return a
-///    mid-build snapshot instead of the final block.
-/// 2. **Semantic mismatch**: `resolve_kind` is called when the CL asks for the *finished* payload.
-///    We should wait for the build to actually complete (sender drop), not opportunistically grab
-///    whatever's in the cell.
+/// Even so, the condition to wait on is the build task exiting, not a value
+/// appearing in the cell: `resolve_kind` is called when the consensus layer
+/// asks for the *finished* payload, and "first `Some`" would race the task
+/// between its send and its exit.
 ///
-/// New semantic (forward-compatible with flashblocks): loop on
-/// `changed().await` until it returns `Err` (sender dropped → build
-/// task exited), then read the final value from `borrow()`.
-///
-/// `resolve_kind` calls `self.cancel.signal()` before constructing
+/// `resolve_kind` calls `self.cancel.resolve()` before constructing
 /// this future, so the build task is already wrapping up — the
 /// `changed()` loop typically resolves within a few hundred μs.
 ///
@@ -235,22 +233,16 @@ where
     // Send`.
     Payload: Clone + Send + Sync + 'static,
 {
-    /// Build a future that resolves when the build task drops its
-    /// `watch::Sender` (task exit, success or failure). Returns the
-    /// last value written to the channel, or `MissingPayload` if
-    /// nothing was ever written.
+    /// Build a future over `payload_rx` that yields the channel's last value,
+    /// or `MissingPayload` if nothing was ever written. See
+    /// [`ResolvePayloadFuture`] for when it resolves and why.
     pub fn new(mut payload_rx: watch::Receiver<Option<Payload>>) -> Self {
         let fut = async move {
-            // Drain `changed()` notifications until the sender drops.
-            // Intermediate `Ok(())` results signal that the watch
-            // value was updated — for the single-set model that's the
-            // final payload; for future flashblocks each `Ok(())`
-            // signals an intermediate flashblock. Either way we keep
-            // waiting for the sender to actually drop (i.e. the build
-            // task to exit) before reading the latest value.
+            // `changed()` yields `Ok` per send and `Err` once the sender
+            // is gone, so looping until it errors parks here until the
+            // build task exits.
             while payload_rx.changed().await.is_ok() {
-                // No-op: value was updated, but build task may still
-                // emit more (flashblocks) or be finishing finalize.
+                // No-op: the value is read once the sender is gone.
             }
             // Sender dropped — read whatever's in the cell.
             payload_rx.borrow().clone().ok_or(PayloadBuilderError::MissingPayload)
@@ -294,7 +286,7 @@ mod tests {
         let handle = tokio::spawn(async {});
         let job = PreconfPayloadJob::new((), rx, cancel.clone(), handle);
 
-        cancel.signal();
+        cancel.abandon();
         // Should resolve immediately
         timeout(Duration::from_millis(50), job)
             .await
@@ -318,7 +310,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!task.is_finished(), "job must still be pending before cancel");
 
-        cancel.signal();
+        cancel.abandon();
         timeout(Duration::from_millis(500), task)
             .await
             .expect("cancel must wake the parked job future via its waker")
@@ -339,17 +331,17 @@ mod tests {
         let handle = tokio::spawn(async {});
         let job = PreconfPayloadJob::new((), rx, cancel, handle);
 
-        assert!(!cancel_observer.is_cancelled(), "cancel starts clear");
+        assert!(cancel_observer.reason().is_none(), "cancel starts clear");
         drop(job);
         assert!(
-            cancel_observer.is_cancelled(),
+            cancel_observer.reason().is_some(),
             "drop must signal cancel so the build task can exit its select! loop"
         );
     }
 
     /// Drop after cancel has already been signalled (either by
     /// `resolve_kind` or an external caller) is a no-op —
-    /// `JobCancel::signal` is idempotent. Locks the invariant so the
+    /// `JobCancel::abandon` is idempotent. Locks the invariant so the
     /// Drop-triggered cancel can't accidentally regress state when it
     /// races with a resolve_kind-triggered cancel.
     #[tokio::test]
@@ -361,14 +353,14 @@ mod tests {
         let job = PreconfPayloadJob::new((), rx, cancel.clone(), handle);
 
         // Simulate `resolve_kind`'s cancel firing before drop.
-        cancel.signal();
-        assert!(cancel_observer.is_cancelled(), "explicit signal marks cancel");
+        cancel.abandon();
+        assert!(cancel_observer.reason().is_some(), "explicit signal marks cancel");
 
         // Dropping the (already-cancelled) job must not panic or
         // otherwise regress state — cancel stays observably cancelled.
         drop(job);
         assert!(
-            cancel_observer.is_cancelled(),
+            cancel_observer.reason().is_some(),
             "drop is idempotent — cancel remains set after redundant signal"
         );
     }

@@ -3,10 +3,10 @@
 use crate::BranchNodeMasks;
 use alloc::vec::Vec;
 use alloy_primitives::hex;
-use alloy_rlp::{bytes, Decodable, Encodable, EMPTY_STRING_CODE};
+use alloy_rlp::{Decodable, EMPTY_STRING_CODE, Encodable, bytes};
 use alloy_trie::{
-    nodes::{BranchNodeRef, ExtensionNode, ExtensionNodeRef, LeafNode, RlpNode, TrieNode},
     Nibbles, TrieMask,
+    nodes::{BranchNodeRef, ExtensionNode, ExtensionNodeRef, LeafNode, RlpNode, TrieNode},
 };
 use core::fmt;
 
@@ -221,5 +221,18 @@ impl Encodable for BranchNodeV2 {
             .expect("branch_rlp_node must always be present for extension nodes");
 
         ExtensionNodeRef::new(&self.key, branch_rlp_node.as_slice()).encode(out);
+    }
+
+    fn length(&self) -> usize {
+        if self.key.is_empty() {
+            return BranchNodeRef::new(&self.stack, self.state_mask).length();
+        }
+
+        let branch_rlp_node = self
+            .branch_rlp_node
+            .as_ref()
+            .expect("branch_rlp_node must always be present for extension nodes");
+
+        ExtensionNodeRef::new(&self.key, branch_rlp_node.as_slice()).length()
     }
 }

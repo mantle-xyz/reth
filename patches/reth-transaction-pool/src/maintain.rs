@@ -380,14 +380,17 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                 changed_accounts.extend(new_changed_accounts.into_iter().map(|entry| entry.0));
 
                 // all transactions mined in the new chain
-                let new_mined_transactions: HashSet<_> = new_blocks.transaction_hashes().collect();
+                let mined_transactions = new_blocks.transaction_hashes_vec();
+                let new_mined_transactions =
+                    mined_transactions.iter().copied().collect::<HashSet<_>>();
 
                 // update the pool then re-inject the pruned transactions
                 // find all transactions that were mined in the old chain but not in the new chain
                 let pruned_old_transactions = old_blocks
-                    .transactions_ecrecovered()
-                    .filter(|tx| !new_mined_transactions.contains(tx.tx_hash()))
-                    .filter_map(|tx| {
+                    .transactions_with_sender()
+                    .filter(|(_, tx)| !new_mined_transactions.contains(tx.tx_hash()))
+                    .filter_map(|(signer, tx)| {
+                        let tx = tx.clone().with_signer(*signer);
                         if tx.is_eip4844() {
                             // reorged blobs no longer include the blob, which is necessary for
                             // validating the transaction. Even though the transaction could have
@@ -416,7 +419,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                     pending_block_blob_fee,
                     changed_accounts,
                     // all transactions mined in the new chain need to be removed from the pool
-                    mined_transactions: new_blocks.transaction_hashes().collect(),
+                    mined_transactions,
                     update_kind: PoolUpdateKind::Reorg,
                 };
                 pool.on_canonical_state_change(update);
@@ -483,7 +486,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                     changed_accounts.push(acc);
                 }
 
-                let mined_transactions = blocks.transaction_hashes().collect();
+                let mined_transactions = blocks.transaction_hashes_vec();
 
                 // check if the range of the commit is canonical with the pool's block
                 if first_block.parent_hash() != pool_info.last_seen_block_hash {
@@ -856,7 +859,7 @@ mod tests {
         blobstore::InMemoryBlobStore, validate::EthTransactionValidatorBuilder,
         CoinbaseTipOrdering, EthPooledTransaction, Pool, TransactionOrigin,
     };
-    use alloy_eips::eip2718::Decodable2718;
+    use alloy_eips::{eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M, eip2718::Decodable2718};
     use alloy_primitives::{hex, U256};
     use reth_ethereum_primitives::PooledTransactionVariant;
     use reth_evm_ethereum::EthEvmConfig;
@@ -890,6 +893,7 @@ mod tests {
         provider.add_account(sender, ExtendedAccount::new(42, U256::MAX));
         let blob_store = InMemoryBlobStore::default();
         let validator = EthTransactionValidatorBuilder::new(provider, EthEvmConfig::mainnet())
+            .set_block_gas_limit(ETHEREUM_BLOCK_GAS_LIMIT_30M)
             .build(blob_store.clone());
 
         let txpool = Pool::new(

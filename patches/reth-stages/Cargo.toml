@@ -1,0 +1,122 @@
+[package]
+name = "reth-stages"
+version = "2.4.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Staged syncing primitives used in reth. [MANTLE PATCH: backport reth#27676, #28067 at aef8d3ef]"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-codecs.workspace = true
+reth-config = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
+reth-consensus.workspace = true
+reth-db.workspace = true
+reth-db-api.workspace = true
+reth-etl = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-evm = { workspace = true, features = ["metrics"] }
+reth-era-downloader = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-era-utils = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-era = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-exex.workspace = true
+reth-fs-util.workspace = true
+reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-execution-types.workspace = true
+reth-ethereum-primitives = { workspace = true, optional = true }
+reth-prune.workspace = true
+reth-prune-types.workspace = true
+reth-storage-api.workspace = true
+reth-storage-errors.workspace = true
+reth-revm.workspace = true
+reth-stages-api = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-static-file-types.workspace = true
+reth-tasks.workspace = true
+reth-trie = { workspace = true, features = ["metrics"] }
+reth-trie-db = { workspace = true, features = ["metrics"] }
+
+reth-testing-utils = { workspace = true, optional = true }
+
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+
+# async
+tokio = { workspace = true, features = ["sync"] }
+futures-util.workspace = true
+
+# observability
+tracing.workspace = true
+
+# misc
+thiserror.workspace = true
+itertools = { version = "0.14", default-features = false }
+rayon.workspace = true
+page_size = "0.6.0"
+num-traits = "0.2.15"
+tempfile = { workspace = true, optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+eyre.workspace = true
+
+[dev-dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-db = { workspace = true, features = ["test-utils", "mdbx"] }
+reth-ethereum-primitives = { workspace = true, features = ["test-utils"] }
+reth-ethereum-consensus.workspace = true
+reth-evm-ethereum.workspace = true
+reth-consensus = { workspace = true, features = ["test-utils"] }
+reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", features = ["test-utils"] }
+reth-downloaders = { workspace = true, features = ["file-client"] }
+reth-static-file.workspace = true
+reth-stages-api = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", features = ["test-utils"] }
+reth-storage-api.workspace = true
+reth-testing-utils.workspace = true
+reth-trie = { workspace = true, features = ["test-utils"] }
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-network-peers.workspace = true
+
+alloy-genesis.workspace = true
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["getrandom", "rand"] }
+reth-db-common.workspace = true
+reth-tracing.workspace = true
+
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+assert_matches.workspace = true
+rand.workspace = true
+paste.workspace = true
+tempfile.workspace = true
+
+[features]
+test-utils = [
+    "reth-network-p2p/test-utils",
+    "reth-db/test-utils",
+    "reth-provider/test-utils",
+    "reth-stages-api/test-utils",
+    "dep:reth-testing-utils",
+    "dep:tempfile",
+    "reth-chainspec/test-utils",
+    "reth-consensus/test-utils",
+    "reth-evm/test-utils",
+    "reth-downloaders/test-utils",
+    "reth-primitives-traits/test-utils",
+    "reth-revm/test-utils",
+    "reth-codecs/test-utils",
+    "reth-db-api/test-utils",
+    "reth-trie-db/test-utils",
+    "reth-trie/test-utils",
+    "reth-prune-types/test-utils",
+    "dep:reth-ethereum-primitives",
+    "reth-ethereum-primitives?/test-utils",
+    "reth-evm-ethereum/test-utils",
+    "reth-tasks/test-utils",
+]

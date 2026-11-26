@@ -1,12 +1,12 @@
 [package]
 name = "reth-trie"
-version = "2.2.0"
+version = "2.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Merkle trie implementation [MANTLE PATCH: backport paradigmxyz/reth#28264 trie iterator seek boundary fix]"
+description = "Merkle trie implementation [MANTLE PATCH: backport reth#28264 at aef8d3ef]"
 
 [lints]
 workspace = true
@@ -17,10 +17,8 @@ reth-execution-errors.workspace = true
 reth-primitives-traits = { workspace = true, features = ["std"] }
 reth-stages-types.workspace = true
 reth-storage-errors.workspace = true
-reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false, features = ["std"] }
 reth-trie-common = { workspace = true, features = ["rayon"] }
-
-revm-database.workspace = true
 
 # alloy
 alloy-eips.workspace = true
@@ -34,7 +32,7 @@ tracing = { workspace = true, features = ["attributes"] }
 
 # misc
 auto_impl.workspace = true
-itertools = { version = "0.14", default-features = false }
+itertools.workspace = true
 
 # `metrics` feature
 reth-metrics = { workspace = true, optional = true }
@@ -47,17 +45,15 @@ parking_lot = { workspace = true, optional = true }
 [dev-dependencies]
 # reth
 reth-primitives-traits = { workspace = true, features = ["test-utils"] }
-reth-tracing.workspace = true
+reth-tracing = { workspace = true, features = ["std"] }
 reth-trie-common = { workspace = true, features = ["test-utils", "arbitrary"] }
-
-# revm
-revm-state.workspace = true
 
 # trie
 triehash = "0.8"
 
 # misc
 assert_matches.workspace = true
+criterion.workspace = true
 parking_lot.workspace = true
 pretty_assertions = "1.4"
 proptest-arbitrary-interop.workspace = true
@@ -78,9 +74,7 @@ serde = [
     "alloy-trie/serde",
     "alloy-eips/serde",
     "reth-trie-common/serde",
-    "revm-database/serde",
     "reth-stages-types/serde",
-    "revm-state/serde",
     "parking_lot/serde",
     "rand/serde",
 ]
@@ -98,3 +92,7 @@ serde-bincode-compat = [
     "reth-trie-common/serde-bincode-compat",
 ]
 
+[[bench]]
+name = "proof_v2"
+required-features = ["test-utils"]
+harness = false
