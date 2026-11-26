@@ -12,21 +12,21 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use crate::shutdown::{signal, Shutdown, Signal};
+use crate::shutdown::{Shutdown, Signal, signal};
 use std::{
     any::Any,
     fmt::{Display, Formatter},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
     thread,
 };
 use tokio::{
     runtime::Handle,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tracing::debug;
 
@@ -41,7 +41,7 @@ pub(crate) mod worker_map;
 #[cfg(feature = "rayon")]
 pub mod pool;
 #[cfg(feature = "rayon")]
-pub use pool::{build_pool_with_panic_handler, Worker, WorkerPool};
+pub use pool::{Worker, WorkerPool, build_pool_with_panic_handler};
 
 /// Lock-free ordered parallel iterator extension trait.
 #[cfg(feature = "rayon")]

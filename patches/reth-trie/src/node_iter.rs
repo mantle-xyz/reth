@@ -1,5 +1,5 @@
 use crate::{
-    hashed_cursor::HashedCursor, trie_cursor::TrieCursor, walker::TrieWalker, Nibbles, TrieType,
+    Nibbles, TrieType, hashed_cursor::HashedCursor, trie_cursor::TrieCursor, walker::TrieWalker,
 };
 use alloy_primitives::B256;
 use alloy_trie::proof::AddedRemovedKeys;
@@ -218,7 +218,7 @@ where
                             *key,
                             self.walker.hash().unwrap(),
                             self.walker.children_are_in_trie(),
-                        ))))
+                        ))));
                     }
                 }
             }
@@ -228,7 +228,7 @@ where
                 // Check if the walker's key is less than the key of the current hashed entry
                 if self.walker.key().is_some_and(|key| key < &Nibbles::unpack(hashed_key)) {
                     self.should_check_walker_key = false;
-                    continue
+                    continue;
                 }
 
                 // Set the next hashed entry as a leaf node and return
@@ -237,7 +237,7 @@ where
 
                 #[cfg(feature = "metrics")]
                 self.metrics.inc_leaf_nodes_returned();
-                return Ok(Some(TrieElement::Leaf(hashed_key, value)))
+                return Ok(Some(TrieElement::Leaf(hashed_key, value)));
             }
 
             // Handle seeking and advancing based on the previous hashed key
@@ -291,7 +291,7 @@ where
                         );
 
                         self.should_check_walker_key = false;
-                        continue
+                        continue;
                     }
 
                     self.current_hashed_entry = self.seek_hashed_entry(seek_key)?;
@@ -307,33 +307,32 @@ where
 mod tests {
     use super::*;
     use crate::{
+        StateRoot,
         hashed_cursor::{
+            HashedCursorFactory, HashedPostStateCursor, HashedPostStateCursorFactory,
             mock::MockHashedCursorFactory,
             noop::{NoopHashedCursor, NoopHashedCursorFactory},
-            HashedCursorFactory, HashedPostStateCursor, HashedPostStateCursorFactory,
         },
         mock::{KeyVisit, KeyVisitType},
         trie_cursor::{
+            InMemoryTrieCursorFactory, TrieCursorFactory,
             mock::MockTrieCursorFactory,
             noop::{NoopAccountTrieCursor, NoopTrieCursorFactory},
-            InMemoryTrieCursorFactory, TrieCursorFactory,
         },
         walker::TrieWalker,
-        StateRoot,
     };
     use alloy_primitives::{
-        b256,
+        B256, U256, b256,
         map::{B256Map, HashMap},
-        B256, U256,
     };
     use alloy_trie::{
-        BranchNodeCompact, HashBuilder, Nibbles, TrieAccount, TrieMask, EMPTY_ROOT_HASH,
+        BranchNodeCompact, EMPTY_ROOT_HASH, HashBuilder, Nibbles, TrieAccount, TrieMask,
     };
     use itertools::Itertools;
     use reth_primitives_traits::Account;
     use reth_trie_common::{
-        prefix_set::PrefixSetMut, updates::TrieUpdates, BranchNode, HashedPostState, HashedStorage,
-        LeafNode, RlpNode,
+        BranchNode, HashedPostState, HashedStorage, LeafNode, RlpNode, prefix_set::PrefixSetMut,
+        updates::TrieUpdates,
     };
     use std::collections::BTreeMap;
 

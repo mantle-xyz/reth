@@ -1,4 +1,4 @@
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use reth_primitives_traits::Account;
 use reth_storage_errors::db::DatabaseError;
 use reth_trie_common::HashedPostState;

@@ -1,14 +1,13 @@
 use crate::{
-    hashed_cursor::HashedCursorFactory, prefix_set::TriePrefixSetsMut, proof::Proof, proof_v2,
-    trie_cursor::TrieCursorFactory, TRIE_ACCOUNT_RLP_MAX_SIZE,
+    TRIE_ACCOUNT_RLP_MAX_SIZE, hashed_cursor::HashedCursorFactory, prefix_set::TriePrefixSetsMut,
+    proof::Proof, proof_v2, trie_cursor::TrieCursorFactory,
 };
 use alloy_primitives::{
-    keccak256,
+    B256, Bytes, keccak256,
     map::{B256Map, HashMap},
-    Bytes, B256,
 };
-use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
-use alloy_trie::{nodes::BranchNodeRef, EMPTY_ROOT_HASH};
+use alloy_rlp::{EMPTY_STRING_CODE, Encodable};
+use alloy_trie::{EMPTY_ROOT_HASH, nodes::BranchNodeRef};
 use reth_execution_errors::{SparseStateTrieErrorKind, StateProofError, TrieWitnessError};
 use reth_trie_common::{
     DecodedMultiProofV2, ExecutionWitnessMode, HashedPostState, MultiProofTargetsV2, ProofV2Target,
@@ -108,7 +107,7 @@ where
     pub fn compute(mut self, state: HashedPostState) -> Result<B256Map<Bytes>, TrieWitnessError> {
         let is_state_empty = state.is_empty();
         if is_state_empty && !self.always_include_root_node {
-            return Ok(Default::default())
+            return Ok(Default::default());
         }
 
         let proof_targets = if is_state_empty {
@@ -137,7 +136,7 @@ where
             } else {
                 (EMPTY_ROOT_HASH, Bytes::from([EMPTY_STRING_CODE]))
             };
-            return Ok(B256Map::from_iter([(root_hash, root_node)]))
+            return Ok(B256Map::from_iter([(root_hash, root_node)]));
         }
 
         // Record all nodes from multiproof in the witness.

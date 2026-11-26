@@ -1,4 +1,5 @@
 use crate::{
+    HashBuilder, Nibbles, TRIE_ACCOUNT_RLP_MAX_SIZE,
     hashed_cursor::{HashedCursor, HashedCursorFactory, HashedStorageCursor},
     node_iter::{TrieElement, TrieNodeIter},
     prefix_set::{PrefixSet, TriePrefixSets},
@@ -10,15 +11,14 @@ use crate::{
     trie_cursor::{TrieCursor, TrieCursorFactory, TrieCursorIter, TrieStorageCursor},
     updates::{StorageTrieUpdates, TrieUpdates},
     walker::TrieWalker,
-    HashBuilder, Nibbles, TRIE_ACCOUNT_RLP_MAX_SIZE,
 };
 use alloy_consensus::EMPTY_ROOT_HASH;
-use alloy_primitives::{keccak256, map::B256Map, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256, map::B256Map};
 use alloy_rlp::{BufMut, Encodable};
 use alloy_trie::proof::AddedRemovedKeys;
 use reth_execution_errors::{StateRootError, StorageRootError};
 use reth_primitives_traits::Account;
-use tracing::{debug, instrument, trace, Span};
+use tracing::{Span, debug, instrument, trace};
 
 /// The default updates after which root algorithms should return intermediate progress rather than
 /// finishing the computation.
@@ -260,7 +260,7 @@ where
                         hash_builder,
                         account_root_state.last_hashed_key,
                         Some(storage_state),
-                    ))
+                    ));
                 }
             }
 
@@ -335,7 +335,7 @@ where
                             hash_builder,
                             hashed_address,
                             Some(storage_state),
-                        ))
+                        ));
                     }
 
                     // decide if we need to return intermediate progress
@@ -347,7 +347,7 @@ where
                             hash_builder,
                             hashed_address,
                             None,
-                        ))
+                        ));
                     }
                 }
             }
@@ -802,7 +802,7 @@ where
                 EMPTY_ROOT_HASH,
                 0,
                 StorageTrieUpdates::default(),
-            ))
+            ));
         }
 
         trie_cursor.set_hashed_address(hashed_address);
@@ -868,7 +868,7 @@ where
                             Box::new(state),
                             hashed_entries_walked,
                             trie_updates,
-                        ))
+                        ));
                     }
                 }
             }

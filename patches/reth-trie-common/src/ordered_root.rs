@@ -39,7 +39,7 @@
 //! let root = builder.finalize();
 //! ```
 
-use crate::{HashBuilder, Nibbles, EMPTY_ROOT_HASH};
+use crate::{EMPTY_ROOT_HASH, HashBuilder, Nibbles};
 use alloc::vec::Vec;
 use alloy_primitives::B256;
 
@@ -262,8 +262,8 @@ mod tests {
     mod arbitrary_consensus_roots {
         use super::*;
         use alloy_consensus::{
-            proofs::{calculate_receipt_root, calculate_transaction_root},
             EthereumReceipt, ReceiptWithBloom, Signed, TxLegacy,
+            proofs::{calculate_receipt_root, calculate_transaction_root},
         };
         use alloy_eips::eip2718::Encodable2718;
         use alloy_primitives::Signature;

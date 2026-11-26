@@ -4,8 +4,8 @@
 //! trie-related data containing sorted hashed state and trie updates.
 
 use crate::{
-    updates::{TrieUpdates, TrieUpdatesSorted},
     HashedPostState, HashedPostStateSorted,
+    updates::{TrieUpdates, TrieUpdatesSorted},
 };
 use alloc::sync::Arc;
 use core::fmt;
@@ -271,7 +271,7 @@ mod tests {
     use crate::HashedStorage;
 
     use super::*;
-    use alloy_primitives::{map::B256Map, B256, U256};
+    use alloy_primitives::{B256, U256, map::B256Map};
     use reth_primitives_traits::Account;
     use std::{
         thread,

@@ -9,8 +9,8 @@ use dashmap::DashMap;
 use std::{
     panic::AssertUnwindSafe,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::Instant,
@@ -103,7 +103,7 @@ impl WorkerThread {
 
         if self.tx.send(task).is_err() {
             self.pending.fetch_sub(1, Ordering::AcqRel);
-            return None
+            return None;
         }
 
         Some(result_rx)
@@ -243,8 +243,8 @@ mod tests {
     #[tokio::test]
     async fn worker_map_sequential_execution() {
         use std::sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         };
 
         let map = WorkerMap::new();

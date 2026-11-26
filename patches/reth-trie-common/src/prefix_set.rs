@@ -1,8 +1,8 @@
 use crate::Nibbles;
 use alloc::{sync::Arc, vec::Vec};
 use alloy_primitives::{
-    map::{B256Map, B256Set},
     B256,
+    map::{B256Map, B256Set},
 };
 use core::ops::Range;
 
@@ -99,7 +99,7 @@ pub struct TriePrefixSets {
 /// # Examples
 ///
 /// ```
-/// use reth_trie_common::{prefix_set::PrefixSetMut, Nibbles};
+/// use reth_trie_common::{Nibbles, prefix_set::PrefixSetMut};
 ///
 /// let mut prefix_set_mut = PrefixSetMut::default();
 /// prefix_set_mut.insert(Nibbles::from_nibbles_unchecked(&[0xa, 0xb]));
@@ -280,7 +280,7 @@ impl PrefixSet {
     #[inline]
     pub fn contains(&mut self, prefix: &Nibbles) -> bool {
         if self.all {
-            return true
+            return true;
         }
 
         let keys = self.keys.as_deref().map(Vec::as_slice).unwrap_or_default();
@@ -291,12 +291,12 @@ impl PrefixSet {
         for (idx, key) in keys[self.index..].iter().enumerate() {
             if key.starts_with(prefix) {
                 self.index += idx;
-                return true
+                return true;
             }
 
             if key > prefix {
                 self.index += idx;
-                return false
+                return false;
             }
         }
 
@@ -311,7 +311,7 @@ impl PrefixSet {
     #[inline]
     pub fn contains_range(&mut self, range: Range<&Nibbles>) -> bool {
         if self.all {
-            return true
+            return true;
         }
 
         let keys = self.keys.as_deref().map(Vec::as_slice).unwrap_or_default();
@@ -322,12 +322,12 @@ impl PrefixSet {
         for (idx, key) in keys[self.index..].iter().enumerate() {
             if key >= range.start && key < range.end {
                 self.index += idx;
-                return true
+                return true;
             }
 
             if key >= range.end {
                 self.index += idx;
-                return false
+                return false;
             }
         }
 
@@ -338,7 +338,7 @@ impl PrefixSet {
     #[inline]
     pub fn contains_from(&mut self, start: &Nibbles) -> bool {
         if self.all {
-            return true
+            return true;
         }
 
         let keys = self.keys.as_deref().map(Vec::as_slice).unwrap_or_default();
@@ -349,7 +349,7 @@ impl PrefixSet {
         for (idx, key) in keys[self.index..].iter().enumerate() {
             if key >= start {
                 self.index += idx;
-                return true
+                return true;
             }
         }
 

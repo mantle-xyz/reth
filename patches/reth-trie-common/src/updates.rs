@@ -1,14 +1,14 @@
 use crate::{
-    utils::{extend_sorted_vec, kway_merge_disjoint_sorted, kway_merge_sorted},
     BranchNodeCompact, HashBuilder, Nibbles,
+    utils::{extend_sorted_vec, kway_merge_disjoint_sorted, kway_merge_sorted},
 };
 use alloc::{
     collections::{btree_map::BTreeMap, btree_set::BTreeSet},
     vec::Vec,
 };
 use alloy_primitives::{
+    B256, FixedBytes,
     map::{B256Map, HashMap, HashSet},
-    FixedBytes, B256,
 };
 
 /// The aggregation of trie updates.
@@ -389,7 +389,7 @@ mod serde_nibbles_set {
         vec::Vec,
     };
     use alloy_primitives::map::HashSet;
-    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 
     pub(super) fn serialize<S>(map: &HashSet<Nibbles>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -431,9 +431,9 @@ mod serde_nibbles_map {
     use alloy_primitives::{hex, map::HashMap};
     use core::marker::PhantomData;
     use serde::{
+        Deserialize, Deserializer, Serialize, Serializer,
         de::{Error, MapAccess, Visitor},
         ser::SerializeMap,
-        Deserialize, Deserializer, Serialize, Serializer,
     };
 
     pub(super) fn serialize<S, T>(
@@ -1271,8 +1271,8 @@ pub mod serde_bincode_compat {
     use alloy_primitives::map::{B256Map, HashMap, HashSet};
     use core::fmt;
     use serde::{
-        de::{Error as _, SeqAccess, Visitor},
         Deserialize, Deserializer, Serialize, Serializer,
+        de::{Error as _, SeqAccess, Visitor},
     };
     use serde_with::{DeserializeAs, SerializeAs};
 
@@ -1564,11 +1564,10 @@ pub mod serde_bincode_compat {
     #[cfg(test)]
     mod tests {
         use crate::{
-            serde_bincode_compat,
+            BranchNodeCompact, Nibbles, serde_bincode_compat,
             updates::{
                 StorageTrieUpdates, StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted,
             },
-            BranchNodeCompact, Nibbles,
         };
         use alloy_primitives::B256;
         use serde::{Deserialize, Serialize};

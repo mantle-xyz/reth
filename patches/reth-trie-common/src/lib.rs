@@ -47,8 +47,8 @@ pub use key::{KeccakKeyHasher, KeyHasher};
 
 mod nibbles;
 pub use nibbles::{
-    depth_first_cmp, Nibbles, PackedStoredNibbles, PackedStoredNibblesSubKey, StoredNibbles,
-    StoredNibblesSubKey,
+    Nibbles, PackedStoredNibbles, PackedStoredNibblesSubKey, StoredNibbles, StoredNibblesSubKey,
+    depth_first_cmp,
 };
 
 mod storage;
@@ -102,5 +102,5 @@ pub mod serde_bincode_compat {
 
 /// Re-export
 pub use alloy_trie::{
-    nodes::*, proof, BranchNodeCompact, HashBuilder, TrieMask, TrieMaskIter, EMPTY_ROOT_HASH,
+    BranchNodeCompact, EMPTY_ROOT_HASH, HashBuilder, TrieMask, TrieMaskIter, nodes::*, proof,
 };

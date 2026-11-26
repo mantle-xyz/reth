@@ -1,15 +1,15 @@
 #![allow(missing_docs, unreachable_pub)]
 use alloy_primitives::{
-    map::{B256Map, B256Set},
     B256, U256,
+    map::{B256Map, B256Set},
 };
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
 use reth_trie::{
-    hashed_cursor::{mock::MockHashedCursorFactory, HashedCursorFactory},
+    hashed_cursor::{HashedCursorFactory, mock::MockHashedCursorFactory},
     proof::StorageProof,
     proof_v2::StorageProofCalculator,
-    trie_cursor::{mock::MockTrieCursorFactory, TrieCursorFactory},
+    trie_cursor::{TrieCursorFactory, mock::MockTrieCursorFactory},
 };
 use reth_trie_common::{HashedPostState, HashedStorage};
 
@@ -82,7 +82,7 @@ fn generate_test_data(
 fn create_cursor_factories(
     post_state: &HashedPostState,
 ) -> (MockTrieCursorFactory, MockHashedCursorFactory) {
-    use reth_trie::{updates::StorageTrieUpdates, StateRoot};
+    use reth_trie::{StateRoot, updates::StorageTrieUpdates};
 
     // Create empty trie cursor factory to serve as the initial state for StateRoot
     // Ensure that there's a storage trie dataset for every storage account

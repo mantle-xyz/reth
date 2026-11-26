@@ -221,7 +221,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                 {
                     // If overlay returns a node prior to the DB's node, or the DB is exhausted,
                     // then we return the overlay's node.
-                    return Ok(Some((mem_key, node)))
+                    return Ok(Some((mem_key, node)));
                 }
                 // All other cases:
                 // - mem_key > db_key
@@ -262,7 +262,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
             let entry = entry_inner.clone().map(|node| (key, node));
             self.set_last_key(&entry);
-            return Ok(entry)
+            return Ok(entry);
         }
 
         self.cursor_seek(key)?;
@@ -308,7 +308,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
             let entry = Some((key, node.clone()));
             self.set_last_key(&entry);
-            return Ok(entry)
+            return Ok(entry);
         }
 
         self.cursor_seek(key)?;
@@ -940,8 +940,8 @@ mod tests {
         }
 
         /// Generate a sorted vector of (Nibbles, Option<BranchNodeCompact>) entries
-        fn sorted_in_memory_nodes_strategy(
-        ) -> impl Strategy<Value = Vec<(Nibbles, Option<BranchNodeCompact>)>> {
+        fn sorted_in_memory_nodes_strategy()
+        -> impl Strategy<Value = Vec<(Nibbles, Option<BranchNodeCompact>)>> {
             prop::collection::vec(
                 (
                     prop::collection::vec(any::<u8>(), 0..2),

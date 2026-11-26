@@ -19,11 +19,11 @@
 //! And returns `TrieUpdatesSorted` containing the old node values.
 
 use crate::trie_cursor::{TrieCursor, TrieCursorFactory, TrieStorageCursor};
-use alloy_primitives::{map::B256Map, B256};
+use alloy_primitives::{B256, map::B256Map};
 use reth_storage_errors::db::DatabaseError;
 use reth_trie_common::{
-    updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
     BranchNodeCompact, Nibbles,
+    updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
 };
 
 /// Result type for changeset operations.

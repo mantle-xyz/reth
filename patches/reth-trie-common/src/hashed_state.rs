@@ -1,13 +1,12 @@
 use crate::{
+    KeyHasher, MultiProofTargets, Nibbles,
     prefix_set::{PrefixSetMut, TriePrefixSetsMut},
     utils::{extend_sorted_vec, kway_merge_disjoint_sorted, kway_merge_sorted},
-    KeyHasher, MultiProofTargets, Nibbles,
 };
 use alloc::{borrow::Cow, vec::Vec};
 use alloy_primitives::{
-    keccak256,
-    map::{hash_map, B256Map, HashMap, HashSet},
-    Address, B256, U256,
+    Address, B256, U256, keccak256,
+    map::{B256Map, HashMap, HashSet, hash_map},
 };
 use itertools::Itertools;
 #[cfg(feature = "rayon")]
@@ -811,11 +810,7 @@ impl Iterator for ChunkedHashedPostState {
             current_size += 1;
         }
 
-        if chunk.is_empty() {
-            None
-        } else {
-            Some(chunk)
-        }
+        if chunk.is_empty() { None } else { Some(chunk) }
     }
 }
 
@@ -825,7 +820,7 @@ mod tests {
     use crate::KeccakKeyHasher;
     use alloy_primitives::Bytes;
     use revm::{
-        database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues},
+        database::{AccountStatus, StorageWithOriginalValues, states::StorageSlot},
         state::{AccountInfo, Bytecode},
     };
 
@@ -1601,11 +1596,11 @@ mod tests {
 pub mod serde_bincode_compat {
     use super::Account;
     use alloc::{borrow::Cow, vec::Vec};
-    use alloy_primitives::{map::B256Map, B256, U256};
+    use alloy_primitives::{B256, U256, map::B256Map};
     use core::fmt;
     use serde::{
-        de::{Error as _, SeqAccess, Visitor},
         Deserialize, Deserializer, Serialize, Serializer,
+        de::{Error as _, SeqAccess, Visitor},
     };
     use serde_with::{DeserializeAs, SerializeAs};
 
@@ -1613,7 +1608,7 @@ pub mod serde_bincode_compat {
     ///
     /// Intended to use with the [`serde_with::serde_as`] macro in the following way:
     /// ```rust
-    /// use reth_trie_common::{serde_bincode_compat, HashedPostState};
+    /// use reth_trie_common::{HashedPostState, serde_bincode_compat};
     /// use serde::{Deserialize, Serialize};
     /// use serde_with::serde_as;
     ///
@@ -1673,7 +1668,7 @@ pub mod serde_bincode_compat {
     ///
     /// Intended to use with the [`serde_with::serde_as`] macro in the following way:
     /// ```rust
-    /// use reth_trie_common::{serde_bincode_compat, HashedStorage};
+    /// use reth_trie_common::{HashedStorage, serde_bincode_compat};
     /// use serde::{Deserialize, Serialize};
     /// use serde_with::serde_as;
     ///
@@ -1723,7 +1718,7 @@ pub mod serde_bincode_compat {
     ///
     /// Intended to use with the [`serde_with::serde_as`] macro in the following way:
     /// ```rust
-    /// use reth_trie_common::{serde_bincode_compat, HashedPostStateSorted};
+    /// use reth_trie_common::{HashedPostStateSorted, serde_bincode_compat};
     /// use serde::{Deserialize, Serialize};
     /// use serde_with::serde_as;
     ///
@@ -1783,7 +1778,7 @@ pub mod serde_bincode_compat {
     ///
     /// Intended to use with the [`serde_with::serde_as`] macro in the following way:
     /// ```rust
-    /// use reth_trie_common::{serde_bincode_compat, HashedStorageSorted};
+    /// use reth_trie_common::{HashedStorageSorted, serde_bincode_compat};
     /// use serde::{Deserialize, Serialize};
     /// use serde_with::serde_as;
     ///
@@ -1819,7 +1814,7 @@ pub mod serde_bincode_compat {
                 {
                     let len = seq.size_hint().unwrap_or_default();
                     if !matches!(len, 1 | 2) {
-                        return Err(A::Error::invalid_length(len, &self))
+                        return Err(A::Error::invalid_length(len, &self));
                     }
 
                     let storage_slots =

@@ -5,17 +5,17 @@ use std::{
     any::Any,
     cell::RefCell,
     future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
     },
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
     thread,
     time::Instant,
 };
-use tokio::sync::{oneshot, AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, oneshot};
 
 /// RPC Tracing call guard semaphore.
 ///
@@ -313,7 +313,7 @@ impl WorkerPool {
     pub fn spawn_and_wait<R: Send + 'static>(&self, f: impl FnOnce() -> R + Send + 'static) -> R {
         let pool = self.pool();
         if pool.current_thread_index().is_some() {
-            return f()
+            return f();
         }
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);

@@ -9,15 +9,15 @@
 
 use crate::{
     hashed_cursor::{HashedCursor, HashedStorageCursor},
-    trie_cursor::{depth_first, TrieCursor, TrieStorageCursor},
+    trie_cursor::{TrieCursor, TrieStorageCursor, depth_first},
 };
-use alloy_primitives::{keccak256, B256, U256};
+use alloy_primitives::{B256, U256, keccak256};
 use alloy_rlp::Encodable;
 use alloy_trie::{BranchNodeCompact, TrieMask};
 use reth_execution_errors::trie::StateProofError;
 use reth_trie_common::{
-    prefix_set::PrefixSet, BranchNodeMasks, BranchNodeRef, BranchNodeV2, Nibbles, ProofTrieNodeV2,
-    ProofV2Target, RlpNode, TrieNodeV2,
+    BranchNodeMasks, BranchNodeRef, BranchNodeV2, Nibbles, ProofTrieNodeV2, ProofV2Target, RlpNode,
+    TrieNodeV2, prefix_set::PrefixSet,
 };
 use std::{cmp::Ordering, sync::Arc};
 use tracing::{error, instrument, trace};
@@ -236,7 +236,7 @@ where
                         targets
                             .rev_iter()
                             .take_while(|target| target.key_nibbles.starts_with(path))
-                            .any(is_below_parent))
+                            .any(is_below_parent));
             }
 
             // If the path isn't in the current range then iterate forward until it is (or until
@@ -247,7 +247,7 @@ where
                 (lower, upper) = targets.next();
                 trace!(target: TRACE_TARGET, target = ?lower, "upper target <= path, next target");
             } else {
-                return false
+                return false;
             }
         }
     }
@@ -268,7 +268,7 @@ where
         // An already encoded child only needs an extension if it has been rebased upward.
         if matches!(&child, ProofTrieBranchChild::RlpNode { .. }) {
             self.rlp_encode_buf.clear();
-            return child.into_rlp(&mut self.rlp_encode_buf).map(|(node, _)| node)
+            return child.into_rlp(&mut self.rlp_encode_buf).map(|(node, _)| node);
         }
 
         trace!(target: TRACE_TARGET, ?child_path, "Retaining child");
@@ -344,7 +344,7 @@ where
     ) -> Result<(), StateProofError> {
         if matches!(self.child_stack.last(), Some(ProofTrieBranchChild::RlpNode { .. })) {
             trace!(target: TRACE_TARGET, "Last child already committed, leaving stack unchanged");
-            return Ok(())
+            return Ok(());
         }
 
         let Some(child_path) = self.last_child_path() else { return Ok(()) };
@@ -397,17 +397,19 @@ where
                 None if self.child_stack.is_empty() => {
                     // The first child is the root and already has the correct short key.
                     self.child_stack.push(child);
-                    return Ok(())
+                    return Ok(());
                 }
                 None => {
                     // Split the existing root child from the new child by their common prefix.
                     debug_assert_eq!(self.child_stack.len(), 1);
-                    debug_assert!(!self
-                        .child_stack
-                        .last()
-                        .expect("already checked for emptiness")
-                        .short_key()
-                        .is_empty());
+                    debug_assert!(
+                        !self
+                            .child_stack
+                            .last()
+                            .expect("already checked for emptiness")
+                            .short_key()
+                            .is_empty()
+                    );
                     self.push_new_branch(path)
                 }
                 Some(state_mask) => {
@@ -418,7 +420,7 @@ where
                     // children, so finish it and try again with its parent.
                     if common_prefix_len < self.branch_path.len() {
                         self.pop_branch(targets)?;
-                        continue
+                        continue;
                     }
 
                     // If this nibble is already occupied, split the existing child from the new
@@ -448,7 +450,7 @@ where
 
             // The parent now contains this child at `nibble`.
             self.child_stack.push(child);
-            return Ok(())
+            return Ok(());
         }
     }
 
@@ -694,7 +696,7 @@ where
                 if !self.prefix_set.contains(&child_path) {
                     unchanged_children += 1;
                     if unchanged_children > 1 {
-                        break
+                        break;
                     }
                 }
             }
@@ -732,7 +734,7 @@ where
         // If the `uncalculated_lower_bound` is None it indicates that there can be no more
         // leaf data, so similarly there can be no more cached branch data.
         let Some(uncalculated_lower_bound) = uncalculated_lower_bound else {
-            return Ok(PopCachedBranchOutcome::Exhausted)
+            return Ok(PopCachedBranchOutcome::Exhausted);
         };
 
         // Use the branch on top of the stack unless a previously calculated range has already
@@ -744,7 +746,7 @@ where
                 .is_some_and(|upper_bound| upper_bound <= *uncalculated_lower_bound)
             {
                 trace!(target: TRACE_TARGET, cached_path=?cached.0, ?uncalculated_lower_bound, "Skipping covered cached branch");
-                continue
+                continue;
             }
             return Ok(PopCachedBranchOutcome::Popped(cached));
         }
@@ -756,7 +758,7 @@ where
         // If [`TrieCursorState::path`] returns None it means that the cursor has been
         // exhausted, so there can be no more cached data.
         let Some(mut trie_cursor_path) = trie_cursor_state.path() else {
-            return Ok(PopCachedBranchOutcome::Exhausted)
+            return Ok(PopCachedBranchOutcome::Exhausted);
         };
 
         // If the trie cursor is seeked to a branch whose leaves have already been processed
@@ -772,14 +774,14 @@ where
             if let Some(new_trie_cursor_path) = trie_cursor_state.path() {
                 trie_cursor_path = new_trie_cursor_path
             } else {
-                return Ok(PopCachedBranchOutcome::Exhausted)
+                return Ok(PopCachedBranchOutcome::Exhausted);
             };
         }
 
         // If the trie cursor has reached the end of the traversal range then we consider cached
         // data to be exhausted. The cursor itself remains positioned for reuse by a later range.
         if traversal_upper_bound.is_some_and(|upper_bound| trie_cursor_path >= upper_bound) {
-            return Ok(PopCachedBranchOutcome::Exhausted)
+            return Ok(PopCachedBranchOutcome::Exhausted);
         }
 
         // At this point we can be sure that the cursor is in an `Available` state. We know for
@@ -830,7 +832,7 @@ where
             let uncalculated_lower_bound = uncalculated_lower_bound?;
 
             if upper_bound.as_ref().is_some_and(|upper| uncalculated_lower_bound >= upper) {
-                return None
+                return None;
             }
 
             match upper_bound {
@@ -851,7 +853,7 @@ where
                 let Some(range) =
                     dirty_range(&mut self.prefix_set, self.branch_path.next_without_prefix())
             {
-                return Ok(Some(range))
+                return Ok(Some(range));
             }
 
             let branch = self.branch_stack.last().expect("branch_stack cannot be empty");
@@ -879,7 +881,7 @@ where
                 Some(upper_bound.unwrap_or(*next_path).min(*next_path)),
             )
         {
-            return Ok(Some(range))
+            return Ok(Some(range));
         }
 
         Ok(None)
@@ -981,7 +983,7 @@ where
                 (uncalculated_lower_bound.as_ref(), traversal_upper_bound) &&
                 lower_bound >= upper_bound
             {
-                return Ok(None)
+                return Ok(None);
             }
 
             // Pop the currently cached branch node.
@@ -1004,7 +1006,7 @@ where
                         self.commit_branches(targets, &lower, None)?;
                         return Ok(Some((lower, traversal_upper_bound.copied())));
                     }
-                    return Ok(None)
+                    return Ok(None);
                 }
                 PopCachedBranchOutcome::CalculateLeaves(range) => {
                     self.commit_branches(targets, &range.0, None)?;
@@ -1030,7 +1032,7 @@ where
                 self.commit_branches(targets, &cached_path, Some(uncalculated_lower_bound_ref))?
             {
                 self.cached_branch_stack.push((cached_path, cached_branch));
-                return Ok(Some(range))
+                return Ok(Some(range));
             }
 
             // Since we've popped all constructed branches which don't contain `cached_path`, the
@@ -1047,7 +1049,7 @@ where
                 self.prefix_set.contains_range(uncalculated_lower_bound_ref..&cached_path)
             {
                 self.cached_branch_stack.push((cached_path, cached_branch));
-                return Ok(Some((*uncalculated_lower_bound_ref, Some(cached_path))))
+                return Ok(Some((*uncalculated_lower_bound_ref, Some(cached_path))));
             }
 
             let child_nibble = Self::next_uncached_child_nibble(
@@ -1072,7 +1074,7 @@ where
                 // can be returned from this method to be the next possible prefix, if any.
                 uncalculated_lower_bound = cached_path.next_without_prefix();
 
-                continue
+                continue;
             };
 
             let mut child_path = cached_path;
@@ -1135,7 +1137,7 @@ where
                         // bit was just set is completely processed.
                         uncalculated_lower_bound = child_path.next_without_prefix();
 
-                        continue
+                        continue;
                     }
                 }
             }
@@ -1357,7 +1359,7 @@ where
             }
 
             self.retained_proofs.push(root_node);
-            return Ok(())
+            return Ok(());
         };
 
         // If there's no root node then the subtrie has no keys, return nothing.
@@ -1368,7 +1370,7 @@ where
         // An exact match reconstructed the already-revealed parent; its targeted children were
         // retained while that parent branch was popped.
         if root_full_path == parent_prefix {
-            return Ok(())
+            return Ok(());
         }
 
         // At this point we have a "root" node which the calculator has based at 0x (empty path),
@@ -1380,7 +1382,7 @@ where
             return Err(StateProofError::TrieInconsistency(format!(
                 "local root path {root_full_path:?} does not start with parent prefix \
                  {parent_prefix:?}",
-            )))
+            )));
         }
 
         // Keep the parent branch's child nibble in the proof path so the local root attaches
@@ -1394,7 +1396,7 @@ where
             .iter()
             .any(|target| target.key_nibbles.starts_with(&child_path))
         {
-            return Ok(())
+            return Ok(());
         }
 
         // Retain the requested child with only the path below its parent edge in the short key.
@@ -1426,7 +1428,7 @@ where
         // If there are no targets then nothing could be returned, return early.
         if targets.is_empty() {
             trace!(target: TRACE_TARGET, "Empty targets, returning");
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
 
         // Initialize the variables which track the state of the two cursors. Both indicate the
@@ -1581,7 +1583,8 @@ where
         // The root node is at the empty path. Since there is no parent and targets is empty, there
         // should be no other retained proofs.
         debug_assert_eq!(
-            proofs.len(), 1,
+            proofs.len(),
+            1,
             "prefix is empty, parent path is None, and targets is empty, so there must be only the root node"
         );
 
@@ -1631,7 +1634,7 @@ where
                 }]
             } else {
                 Vec::new()
-            })
+            });
         }
 
         // Don't call `set_hashed_address` on the trie cursor until after the previous shortcut has
@@ -1659,7 +1662,7 @@ where
                 path: Nibbles::default(),
                 node: TrieNodeV2::EmptyRoot,
                 masks: None,
-            })
+            });
         }
 
         // Don't call `set_hashed_address` on the trie cursor until after the previous shortcut has
@@ -1865,13 +1868,13 @@ mod tests {
     use super::*;
     use crate::{
         hashed_cursor::{
-            mock::MockHashedCursorFactory, noop::NoopHashedCursor, HashedCursorFactory,
-            HashedPostStateCursor,
+            HashedCursorFactory, HashedPostStateCursor, mock::MockHashedCursorFactory,
+            noop::NoopHashedCursor,
         },
         proof::StorageProof as LegacyStorageProof,
         test_utils::TrieTestHarness,
         trie_cursor::{
-            depth_first, noop::NoopStorageTrieCursor, InMemoryTrieCursor, TrieCursorFactory,
+            InMemoryTrieCursor, TrieCursorFactory, depth_first, noop::NoopStorageTrieCursor,
         },
     };
     use alloy_primitives::map::B256Set;
@@ -1879,10 +1882,10 @@ mod tests {
     use alloy_trie::proof::AddedRemovedKeys;
     use itertools::Itertools;
     use reth_trie_common::{
+        EMPTY_ROOT_HASH, HashedPostState, HashedStorage, ProofTrieNode, ProofV2TargetParent,
+        TrieNode,
         prefix_set::{PrefixSet, PrefixSetMut},
         updates::TrieUpdatesSorted,
-        HashedPostState, HashedStorage, ProofTrieNode, ProofV2TargetParent, TrieNode,
-        EMPTY_ROOT_HASH,
     };
     use std::collections::BTreeMap;
 
@@ -1910,11 +1913,11 @@ mod tests {
         target: &ProofV2Target,
     ) -> Option<ProofTrieNodeV2> {
         let Some(parent_path_len) = target.parent.path_len() else {
-            return target.key_nibbles.starts_with(&node.path).then(|| node.clone())
+            return target.key_nibbles.starts_with(&node.path).then(|| node.clone());
         };
 
         if node.path.len() > parent_path_len {
-            return target.key_nibbles.starts_with(&node.path).then(|| node.clone())
+            return target.key_nibbles.starts_with(&node.path).then(|| node.clone());
         }
 
         let logical_path = match &node.node {
@@ -1924,12 +1927,12 @@ mod tests {
         };
         let child_path_len = parent_path_len + 1;
         if logical_path.len() < child_path_len {
-            return None
+            return None;
         }
 
         let child_path = logical_path.slice(0..child_path_len);
         if !target.key_nibbles.starts_with(&child_path) {
-            return None
+            return None;
         }
 
         let trim_len = child_path_len - node.path.len();
@@ -1962,7 +1965,7 @@ mod tests {
         projected.sort_unstable_by(|a, b| depth_first::cmp(&a.path, &b.path));
         projected.dedup_by(|a, b| {
             if a.path != b.path {
-                return false
+                return false;
             }
             assert_eq!(a, b, "target projections disagree at path {:?}", a.path);
             true
@@ -2916,10 +2919,12 @@ mod tests {
 
         // Returning from 0x040 to cached parent 0x04 must not scan all leaves up to 0x05.
         let clean_key = B256::right_padding_from(&[0x04, 0x88]);
-        assert!(!hashed_factory
-            .visited_storage_keys(harness.hashed_address())
-            .iter()
-            .any(|visit| visit.visited_key == Some(clean_key)));
+        assert!(
+            !hashed_factory
+                .visited_storage_keys(harness.hashed_address())
+                .iter()
+                .any(|visit| visit.visited_key == Some(clean_key))
+        );
     }
 
     #[test]
@@ -3229,7 +3234,7 @@ mod tests {
         let key_a0 = B256::right_padding_from(&[0x6a, 0x80]); // nibbles: 6,a,8,0,...
         let key_a1 = B256::right_padding_from(&[0x6a, 0x81]); // nibbles: 6,a,8,1,...
         let key_c = B256::right_padding_from(&[0x6a, 0x30]); // nibbles: 6,a,3,0,... (BEFORE
-                                                             // [6,a,8])
+        // [6,a,8])
         let key_d = B256::right_padding_from(&[0x6b, 0x00]); // nibbles: 6,b,0,0,...
         let key_e = B256::right_padding_from(&[0x6c, 0x00]); // nibbles: 6,c,0,0,...
 

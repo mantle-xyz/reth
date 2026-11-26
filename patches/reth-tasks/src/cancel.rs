@@ -3,8 +3,8 @@
 use std::{
     cell::RefCell,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 

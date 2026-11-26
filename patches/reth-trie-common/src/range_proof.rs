@@ -7,7 +7,7 @@
 
 use crate::{HashBuilder, Nibbles, RlpNode, TrieNode};
 use alloc::vec::Vec;
-use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
+use alloy_primitives::{B256, Bytes, keccak256, map::B256Map};
 use alloy_rlp::Decodable;
 
 const KEY_NIBBLES: usize = B256::len_bytes() * 2;
@@ -42,7 +42,7 @@ impl<'a> RangeProofVerifier<'a> {
 
         let got = self.frontier.root()?;
         if got != root {
-            return Err(RangeProofError::RootMismatch { expected: root, got })
+            return Err(RangeProofError::RootMismatch { expected: root, got });
         }
         Ok(self.next.as_ref().map(TriePath::lowest_key))
     }
@@ -108,7 +108,7 @@ impl<'a> RangeProofVerifier<'a> {
     ) -> Result<(), RangeProofError> {
         if let Some(hash) = reference.as_hash() {
             self.frontier.push_subtree(prefix, hash);
-            return Ok(())
+            return Ok(());
         }
         self.add_outside_node(TrieNode::decode(&mut reference.as_slice())?, prefix)
     }
@@ -162,7 +162,7 @@ impl ProofRange {
     // Classifies a subtree prefix to avoid resolving subtries that cannot cross a boundary.
     fn subtree_relation(&self, prefix: &Nibbles) -> Result<SubtreeRelation, RangeProofError> {
         if prefix.len() > KEY_NIBBLES {
-            return Err(RangeProofError::PathTooLong { path: *prefix })
+            return Err(RangeProofError::PathTooLong { path: *prefix });
         }
         let left = self.left.slice(..prefix.len());
         let right = self.right.slice(..prefix.len());
@@ -227,7 +227,7 @@ impl<'a> ProofNodes<'a> {
     // Resolves inline references directly and requires proof backing for hashed references.
     fn resolve(&self, path: Nibbles, reference: &RlpNode) -> Result<TrieNode, RangeProofError> {
         let Some(hash) = reference.as_hash() else {
-            return Ok(TrieNode::decode(&mut reference.as_slice())?)
+            return Ok(TrieNode::decode(&mut reference.as_slice())?);
         };
         let node = self.0.get(&hash).ok_or(RangeProofError::MissingProofNode { path })?;
         Ok(TrieNode::decode(&mut &node[..])?)
@@ -251,13 +251,13 @@ impl ProofFrontier {
         for (key, value) in leaves {
             let value = value.into();
             if key < origin {
-                return Err(RangeProofError::LeafBeforeOrigin { key, origin })
+                return Err(RangeProofError::LeafBeforeOrigin { key, origin });
             }
             if previous.is_some_and(|previous| key <= previous) {
-                return Err(RangeProofError::NonMonotonicLeaves)
+                return Err(RangeProofError::NonMonotonicLeaves);
             }
             if value.is_empty() {
-                return Err(RangeProofError::EmptyLeafValue { key })
+                return Err(RangeProofError::EmptyLeafValue { key });
             }
             previous = Some(key);
             frontier.push_leaf(Nibbles::unpack(key), value);
@@ -289,7 +289,7 @@ impl ProofFrontier {
         for entry in self.0 {
             let path = entry.path();
             if previous.is_some_and(|previous| path <= previous) {
-                return Err(RangeProofError::DuplicateFrontierPath { path })
+                return Err(RangeProofError::DuplicateFrontierPath { path });
             }
             previous = Some(path);
             match entry {
@@ -406,9 +406,9 @@ where
     if proof.is_empty() {
         let got = frontier.root()?;
         if got != root {
-            return Err(RangeProofError::RootMismatch { expected: root, got })
+            return Err(RangeProofError::RootMismatch { expected: root, got });
         }
-        return Ok(None)
+        return Ok(None);
     }
 
     RangeProofVerifier::new(origin, last_key.unwrap_or(limit), proof, frontier).verify(root)
@@ -442,7 +442,7 @@ impl TriePath for Nibbles {
     // Descends an extension while rejecting empty keys that could recurse without consuming space.
     fn descend_extension(self, key: &Nibbles) -> Result<Self, RangeProofError> {
         if key.is_empty() {
-            return Err(RangeProofError::EmptyExtensionKey { path: self })
+            return Err(RangeProofError::EmptyExtensionKey { path: self });
         }
         self.join_checked(key)
     }
@@ -450,7 +450,7 @@ impl TriePath for Nibbles {
     // Descends one branch nibble while rejecting nodes below the fixed hashed-key depth.
     fn descend_child(self, nibble: u8) -> Result<Self, RangeProofError> {
         if self.len() >= KEY_NIBBLES {
-            return Err(RangeProofError::PathTooLong { path: self })
+            return Err(RangeProofError::PathTooLong { path: self });
         }
         let mut path = self;
         path.push(nibble);
@@ -461,7 +461,7 @@ impl TriePath for Nibbles {
     fn descend_leaf(self, key: &Nibbles) -> Result<Self, RangeProofError> {
         let path = self.join_checked(key)?;
         if path.len() != KEY_NIBBLES {
-            return Err(RangeProofError::InvalidLeafPath { path })
+            return Err(RangeProofError::InvalidLeafPath { path });
         }
         Ok(path)
     }
@@ -469,7 +469,7 @@ impl TriePath for Nibbles {
     // Joins path segments while rejecting proof nodes that exceed the fixed hashed-key depth.
     fn join_checked(self, key: &Nibbles) -> Result<Self, RangeProofError> {
         if self.len() + key.len() > KEY_NIBBLES {
-            return Err(RangeProofError::PathTooLong { path: self })
+            return Err(RangeProofError::PathTooLong { path: self });
         }
         Ok(self.join(key))
     }
@@ -478,7 +478,7 @@ impl TriePath for Nibbles {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{proof::ProofRetainer, BranchNode, ExtensionNode, TrieMask, EMPTY_ROOT_HASH};
+    use crate::{BranchNode, EMPTY_ROOT_HASH, ExtensionNode, TrieMask, proof::ProofRetainer};
     use alloc::{vec, vec::Vec};
 
     const MAX_HASH: B256 = B256::new([0xff; B256::len_bytes()]);

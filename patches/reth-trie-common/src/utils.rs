@@ -57,7 +57,7 @@ where
         .filter_map(move |(_, key, value)| {
             while let Some((right_key, _)) = right_entries.peek().copied() {
                 if right_key >= key {
-                    break
+                    break;
                 }
                 right_entries.next();
             }
@@ -66,7 +66,7 @@ where
             let mut has_equal_mask = false;
             while let Some((right_key, right_value)) = right_entries.peek().copied() {
                 if right_key != key {
-                    break
+                    break;
                 }
 
                 has_mask = true;
@@ -77,7 +77,7 @@ where
             }
 
             if has_mask && !has_equal_mask {
-                return None
+                return None;
             }
 
             Some((key.clone(), value.clone()))
