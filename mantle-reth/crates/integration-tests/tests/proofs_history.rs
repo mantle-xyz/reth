@@ -10,11 +10,16 @@
 
 use crate::helpers::{
     mantle_payload_attributes, mantle_test_chain_spec, with_configured_mantle_node_opts,
+    with_configured_mantle_node_rpc_opts,
 };
 use alloy_primitives::Address;
-use jsonrpsee::{core::client::ClientT, rpc_params};
+use jsonrpsee::{
+    core::client::{ClientT, Error as ClientError},
+    rpc_params,
+};
 use mantle_reth_cli::node::MantleNode;
 use reth_node_api::TreeConfig;
+use reth_node_core::args::RpcServerArgs;
 use reth_optimism_node::args::{ProofsHistoryStorageArgs, ProofsStorageVersion, RollupArgs};
 use serde_json::Value;
 
@@ -35,13 +40,25 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
         ..Default::default()
     };
 
-    with_configured_mantle_node_opts(
+    // As on the proof nodes since v1.7.0: debug on HTTP, only eth on WS. Different modules need
+    // their own WS port.
+    let ws_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut rpc = RpcServerArgs::default()
+        .with_unused_ports()
+        .with_http()
+        .with_http_api("eth,net,web3,debug".parse().unwrap())
+        .with_ws()
+        .with_ws_api("eth".parse().unwrap());
+    rpc.ws_port = ws_port.local_addr().unwrap().port();
+    drop(ws_port);
+    with_configured_mantle_node_rpc_opts(
         MantleNode::default(),
         mantle_test_chain_spec(),
         mantle_payload_attributes,
         TreeConfig::default(),
         Some((args, sidecar_path)),
-        async |_node, client| {
+        rpc,
+        async |node, client| {
             // 1. The debug override is installed. Without the wiring this is `Method not found` —
             //    which is exactly how the silent no-op presented in production.
             let status: Value = client
@@ -82,6 +99,17 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
                     "below-window eth_getProof must fail, not fall back to the native path"
                 );
             }
+
+            // 4. The debug overrides are not served on a transport without the debug namespace.
+            let ws = node.inner.rpc_server_handle().ws_client().await.expect("ws client");
+            let error = ws
+                .request::<Value, _>("debug_proofsSyncStatus", rpc_params![])
+                .await
+                .expect_err("debug is not enabled on WS");
+            assert!(
+                matches!(&error, ClientError::Call(error) if error.code() == -32601),
+                "debug_proofsSyncStatus must not be registered on WS: {error:?}"
+            );
         },
     )
     .await;
@@ -99,8 +127,6 @@ async fn proofs_history_wiring_serves_sidecar_rpc() {
 /// but a registered method never returns `-32601`.
 #[tokio::test]
 async fn proofs_history_keeps_mantle_rpc_extensions() {
-    use jsonrpsee::core::ClientError;
-
     const METHOD_NOT_FOUND: i32 = -32601;
 
     let sidecar = tempfile::tempdir().expect("tempdir");
