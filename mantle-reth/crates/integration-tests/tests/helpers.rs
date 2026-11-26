@@ -14,7 +14,7 @@ use reth_node_builder::{EngineNodeLauncher, Node, NodeBuilder, NodeConfig};
 use reth_node_core::args::{DatadirArgs, RpcServerArgs};
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_node::{args::RollupArgs, payload::OpPayloadAttrs};
-use reth_optimism_trie::db::MdbxProofsStorageV2;
+use reth_optimism_trie::db::MdbxProofsStorage;
 use reth_provider::providers::BlockchainProvider;
 use reth_tasks::Runtime;
 use std::{path::PathBuf, sync::Arc};
@@ -186,7 +186,7 @@ pub(crate) async fn with_configured_mantle_node_rpc_opts<F, Fut>(
     let builder = match &proofs_history {
         Some((args, path)) => {
             let mdbx =
-                Arc::new(MdbxProofsStorageV2::new(path).expect("failed to open proofs sidecar"));
+                Arc::new(MdbxProofsStorage::new(path).expect("failed to open proofs sidecar"));
             // The ExEx refuses to start against an unseeded sidecar (and takes the node down with
             // it), so mirror what `op-reth op-proofs init` does before launch. At this point the
             // chain is still at genesis, so the seed is the genesis state.
@@ -249,7 +249,7 @@ where
 /// proofs-history have to do this before launch.
 fn seed_proofs_sidecar(
     db: &Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>,
-    storage: Arc<MdbxProofsStorageV2>,
+    storage: Arc<MdbxProofsStorage>,
     genesis_hash: B256,
 ) {
     use reth_db::Database;

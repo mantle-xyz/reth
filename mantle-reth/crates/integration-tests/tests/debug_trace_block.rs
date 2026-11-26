@@ -2,14 +2,23 @@
 //! transaction alone and traces the rest of the block, as op-geth does. Upstream reth fails the
 //! whole call instead.
 
-use crate::helpers::{mantle_payload_attributes, mantle_test_chain_spec, with_mantle_node};
+use crate::helpers::{
+    mantle_payload_attributes, mantle_test_chain_spec, with_configured_mantle_node_rpc_opts,
+    with_mantle_node,
+};
 use alloy_network::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use jsonrpsee::{core::client::ClientT, http_client::HttpClient, rpc_params};
+use jsonrpsee::{
+    core::client::{ClientT, Error as ClientError},
+    http_client::HttpClient,
+    rpc_params,
+};
+use mantle_reth_cli::node::MantleNode;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 use reth_node_api::TreeConfig;
+use reth_node_core::args::RpcServerArgs;
 use serde_json::{Value, json};
 
 /// The transfer whose trace the tracer below makes fail.
@@ -72,10 +81,18 @@ async fn trace_block_reports_a_failed_transaction_trace_per_transaction() {
     let chain_id = chain_spec.chain().id();
     let wallet = Wallet::default().with_chain_id(chain_id);
 
-    with_mantle_node(
+    // The block-tracing methods are only served where the debug namespace is enabled.
+    let rpc = RpcServerArgs::default()
+        .with_unused_ports()
+        .with_http()
+        .with_http_api("eth,net,web3,debug".parse().unwrap());
+    with_configured_mantle_node_rpc_opts(
+        MantleNode::default(),
         chain_spec,
         mantle_payload_attributes,
         TreeConfig::default(),
+        None,
+        rpc,
         move |node, client| async move {
             let mut node = node;
             let failing = node
@@ -122,6 +139,30 @@ async fn trace_block_reports_a_failed_transaction_trace_per_transaction() {
             for other in trace_block_other_ways(&client, block.block().hash(), rlp, throwing).await
             {
                 assert_eq!(other, traces);
+            }
+        },
+    )
+    .await;
+}
+
+/// Without the debug namespace on a transport, the block-tracing methods are not served there.
+#[tokio::test]
+async fn trace_block_needs_the_debug_namespace() {
+    with_mantle_node(
+        mantle_test_chain_spec(),
+        mantle_payload_attributes,
+        TreeConfig::default(),
+        |node, client| async move {
+            // Keep the node, and with it the RPC server, alive for the requests.
+            let _node = node;
+            for method in ["debug_traceBlockByNumber", "debug_traceBlockByHash", "debug_traceBlock"]
+            {
+                let error =
+                    client.request::<Value, _>(method, rpc_params![]).await.expect_err("must fail");
+                assert!(
+                    matches!(&error, ClientError::Call(error) if error.code() == -32601),
+                    "{method} must not be registered: {error:?}"
+                );
             }
         },
     )

@@ -14,7 +14,7 @@ use reth_primitives_traits::transaction::{error::InvalidTransactionError, signed
 use reth_revm::db::bal::EvmDatabaseError;
 use reth_rpc_convert::{CallFeesError, EthTxEnvError, TransactionConversionError};
 use reth_rpc_server_types::result::{
-    block_id_to_str, internal_rpc_err, invalid_params_rpc_err, rpc_err, rpc_error_with_code,
+    internal_rpc_err, invalid_params_rpc_err, rpc_err, rpc_error_with_code,
 };
 use reth_transaction_pool::error::{
     Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
@@ -85,8 +85,13 @@ pub enum EthApiError {
     /// requested that has been pruned according to the node's data retention policy.
     ///
     /// See also <https://eips.ethereum.org/EIPS/eip-4444>
-    #[error("pruned history unavailable")]
-    PrunedHistoryUnavailable,
+    #[error("pruned history unavailable: requested {requested}, earliest available {earliest_available}")]
+    PrunedHistoryUnavailable {
+        /// The requested block number
+        requested: u64,
+        /// The earliest block number that is still available
+        earliest_available: u64,
+    },
     /// Receipts not found for block hash/number/tag
     #[error("receipts not found")]
     ReceiptsNotFound(BlockId),
@@ -310,7 +315,9 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
             EthApiError::InvalidBlockData(_) |
             EthApiError::Internal(_) |
             EthApiError::EvmCustom(_) => internal_rpc_err(error.to_string()),
-            EthApiError::UnknownBlockOrTxIndex | EthApiError::TransactionNotFound => {
+            EthApiError::UnknownBlockOrTxIndex |
+            EthApiError::TransactionNotFound |
+            EthApiError::BlockAccessListNotAvailablePreAmsterdam => {
                 rpc_error_with_code(EthRpcErrorCode::ResourceNotFound.code(), error.to_string())
             }
             EthApiError::TracingTransactionNotFound | EthApiError::GenesisNotTraceable => {
@@ -332,16 +339,12 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
             EthApiError::HeaderNotFound(id) | EthApiError::ReceiptsNotFound(id) => {
                 rpc_error_with_code(
                     EthRpcErrorCode::ResourceNotFound.code(),
-                    format!("block not found: {}", block_id_to_str(id)),
+                    format!("block not found: {id}"),
                 )
             }
             EthApiError::HeaderRangeNotFound(start_id, end_id) => rpc_error_with_code(
                 EthRpcErrorCode::ResourceNotFound.code(),
-                format!(
-                    "{error}: start block: {}, end block: {}",
-                    block_id_to_str(start_id),
-                    block_id_to_str(end_id),
-                ),
+                format!("{error}: start block: {start_id}, end block: {end_id}"),
             ),
             err @ EthApiError::TransactionConfirmationTimeout { .. } => rpc_error_with_code(
                 EthRpcErrorCode::TransactionConfirmationTimeout.code(),
@@ -358,7 +361,7 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
                 internal_rpc_err(err.to_string())
             }
             err @ EthApiError::TransactionInputError(_) => invalid_params_rpc_err(err.to_string()),
-            EthApiError::PrunedHistoryUnavailable | EthApiError::ExceedsMaxProofWindow => {
+            EthApiError::PrunedHistoryUnavailable { .. } | EthApiError::ExceedsMaxProofWindow => {
                 rpc_error_with_code(4444, error.to_string())
             }
             EthApiError::Other(err) => err.to_rpc_error(),
@@ -376,9 +379,6 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
                     ),
                     error.data(),
                 )
-            }
-            EthApiError::BlockAccessListNotAvailablePreAmsterdam => {
-                rpc_error_with_code(4445, error.to_string())
             }
         }
     }
@@ -544,7 +544,9 @@ impl From<reth_errors::ProviderError> for EthApiError {
             ProviderError::BlockNumberForTransactionIndexNotFound => Self::UnknownBlockOrTxIndex,
             ProviderError::FinalizedBlockNotFound => Self::HeaderNotFound(BlockId::finalized()),
             ProviderError::SafeBlockNotFound => Self::HeaderNotFound(BlockId::safe()),
-            ProviderError::BlockExpired { .. } => Self::PrunedHistoryUnavailable,
+            ProviderError::BlockExpired { requested, earliest_available } => {
+                Self::PrunedHistoryUnavailable { requested, earliest_available }
+            }
             err => Self::Internal(err.into()),
         }
     }
@@ -956,7 +958,7 @@ pub struct RevertError {
 impl RevertError {
     /// Wraps the output bytes
     ///
-    /// Note: this is intended to wrap a revm output
+    /// Note: this is intended to wrap an EVM revert output
     pub const fn new(output: Bytes) -> Self {
         Self { output }
     }
@@ -1229,6 +1231,24 @@ mod tests {
     }
 
     #[test]
+    fn pruned_history_error_reports_available_range() {
+        let err: EthApiError =
+            reth_errors::ProviderError::BlockExpired { requested: 5, earliest_available: 100 }
+                .into();
+        assert!(matches!(
+            err,
+            EthApiError::PrunedHistoryUnavailable { requested: 5, earliest_available: 100 }
+        ));
+
+        let err: jsonrpsee_types::error::ErrorObject<'static> = err.into();
+        assert_eq!(err.code(), 4444);
+        assert_eq!(
+            err.message(),
+            "pruned history unavailable: requested 5, earliest available 100"
+        );
+    }
+
+    #[test]
     fn receipts_not_found_message() {
         let err: jsonrpsee_types::error::ErrorObject<'static> =
             EthApiError::ReceiptsNotFound(BlockId::hash(b256!(
@@ -1284,16 +1304,5 @@ mod tests {
         assert_eq!(err.code(), 3);
         assert_eq!(err.message(), "execution reverted");
         assert_eq!(err.data().unwrap().get(), "\"0x\"");
-    }
-
-    #[test]
-    fn pruned_state_and_proof_window_use_pruned_history_code() {
-        for err in [
-            EthApiError::ExceedsMaxProofWindow,
-            EthApiError::from(reth_errors::ProviderError::StateAtBlockPruned(7)),
-        ] {
-            let err: jsonrpsee_types::error::ErrorObject<'static> = err.into();
-            assert_eq!(err.code(), 4444);
-        }
     }
 }

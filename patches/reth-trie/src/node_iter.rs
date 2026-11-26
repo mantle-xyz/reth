@@ -305,20 +305,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{TrieElement, TrieNodeIter};
+    use super::*;
     use crate::{
+        StateRoot,
         hashed_cursor::{
-            HashedCursorFactory, HashedPostStateCursor, mock::MockHashedCursorFactory,
-            noop::NoopHashedCursor,
+            HashedCursorFactory, HashedPostStateCursor, HashedPostStateCursorFactory,
+            mock::MockHashedCursorFactory,
+            noop::{NoopHashedCursor, NoopHashedCursorFactory},
         },
         mock::{KeyVisit, KeyVisitType},
         trie_cursor::{
-            TrieCursorFactory, mock::MockTrieCursorFactory, noop::NoopAccountTrieCursor,
+            InMemoryTrieCursorFactory, TrieCursorFactory,
+            mock::MockTrieCursorFactory,
+            noop::{NoopAccountTrieCursor, NoopTrieCursorFactory},
         },
         walker::TrieWalker,
     };
     use alloy_primitives::{
-        b256,
+        B256, U256, b256,
         map::{B256Map, HashMap},
     };
     use alloy_trie::{
@@ -327,7 +331,7 @@ mod tests {
     use itertools::Itertools;
     use reth_primitives_traits::Account;
     use reth_trie_common::{
-        BranchNode, HashedPostState, LeafNode, RlpNode, prefix_set::PrefixSetMut,
+        BranchNode, HashedPostState, HashedStorage, LeafNode, RlpNode, prefix_set::PrefixSetMut,
         updates::TrieUpdates,
     };
     use std::collections::BTreeMap;
@@ -380,14 +384,6 @@ mod tests {
 
     #[test]
     fn inserted_leaf_before_deeper_stored_branch_is_included() {
-        use crate::{
-            StateRoot,
-            hashed_cursor::{HashedPostStateCursorFactory, noop::NoopHashedCursorFactory},
-            trie_cursor::{InMemoryTrieCursorFactory, noop::NoopTrieCursorFactory},
-        };
-        use alloy_primitives::{B256, U256};
-        use reth_trie_common::HashedStorage;
-
         fn slot(prefix: &[u8]) -> B256 {
             let mut bytes = [0; 32];
             bytes[..prefix.len()].copy_from_slice(prefix);
@@ -406,12 +402,10 @@ mod tests {
             slot(&[0x10, 0xa1]),
         ];
         let inserted = slot(&[0x10, 0x00]);
-        let old_state = HashedPostState::default()
-            .with_accounts([(address, Some(account()))])
-            .with_storages([(
-                address,
-                HashedStorage::from_iter(false, old_slots.map(|slot| (slot, U256::from(1)))),
-            )]);
+        let old_state =
+            HashedPostState::default().with_accounts([(address, Some(account()))]).with_storages([
+                (address, HashedStorage::from_iter(old_slots.map(|slot| (slot, U256::from(1))))),
+            ]);
         let old_sorted = old_state.clone().into_sorted();
         let (old_root, old_updates) = StateRoot::new(
             NoopTrieCursorFactory::default(),
@@ -426,14 +420,12 @@ mod tests {
             .with_storages([(
                 address,
                 HashedStorage::from_iter(
-                    false,
                     old_slots.into_iter().chain([inserted]).map(|slot| (slot, U256::from(1))),
                 ),
             )]);
-        let delta =
-            HashedPostState::default().with_accounts([(address, Some(account()))]).with_storages([
-                (address, HashedStorage::from_iter(false, [(inserted, U256::from(1))])),
-            ]);
+        let delta = HashedPostState::default()
+            .with_accounts([(address, Some(account()))])
+            .with_storages([(address, HashedStorage::from_iter([(inserted, U256::from(1))]))]);
         let new_sorted = new_state.clone().into_sorted();
         let rebuilt_root = StateRoot::new(
             NoopTrieCursorFactory::default(),

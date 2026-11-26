@@ -27,7 +27,7 @@ use reth_engine_primitives::InvalidBlockHook;
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::{Account, NodePrimitives, RecoveredBlock, SealedHeader};
 use reth_provider::{DBProvider, DatabaseProviderFactory};
-use reth_trie::HashedStorage;
+use reth_trie::{HashedPostState, HashedStorage, TrieInputSorted};
 use reth_trie_common::updates::TrieUpdates;
 use reth_trie_db::{
     DatabaseHashedCursorFactory, DatabaseStorageRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
@@ -233,7 +233,10 @@ pub fn export_full_state_with_bundle<Provider: DBProvider>(
         let storage_hash = if hashed_for_root.is_empty() {
             "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".into()
         } else if let Some(address) = resolved {
-            let hs = HashedStorage::from_iter(false, hashed_for_root.iter().map(|(&k, &v)| (k, v)));
+            let hs = HashedStorage::from_iter(hashed_for_root.iter().map(|(&k, &v)| (k, v)));
+            let input = TrieInputSorted::from_state(
+                HashedPostState::from_hashed_storage(keccak256(address), hs).into_sorted(),
+            );
             type SR<'a, TX> = reth_trie::StorageRoot<
                 DatabaseTrieCursorFactory<&'a TX, LegacyKeyAdapter>,
                 DatabaseHashedCursorFactory<&'a TX>,
@@ -241,7 +244,7 @@ pub fn export_full_state_with_bundle<Provider: DBProvider>(
             match <SR<'_, _> as DatabaseStorageRoot<'_, _>>::overlay_root(
                 provider.tx_ref(),
                 address,
-                hs,
+                input,
             ) {
                 Ok(r) => format!("0x{}", hex::encode(r)),
                 Err(_) => {

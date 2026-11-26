@@ -14,9 +14,6 @@ where
     Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError>,
     Self: LoadPendingBlock,
 {
-    fn max_proof_window(&self) -> u64 {
-        self.inner.eth_proof_window()
-    }
 }
 
 impl<N, Rpc> LoadState for EthApi<N, Rpc>
@@ -38,6 +35,7 @@ mod tests {
         Address, StorageKey, StorageValue, B256, U256,
     };
     use alloy_rpc_types_eth::TransactionRequest;
+    use alloy_serde::JsonStorageKey;
     use reth_chainspec::ChainSpec;
     use reth_ethereum_primitives::Block;
     use reth_evm_ethereum::EthEvmConfig;
@@ -51,7 +49,8 @@ mod tests {
         node::{RpcNodeCoreAdapter, RpcNodeCoreExt},
         EthApiTypes,
     };
-    use reth_rpc_eth_types::{builder::config::PendingBlockKind, EthStateCache, PendingBlock};
+    use reth_rpc_eth_types::{EthApiSettings, EthStateCache, PendingBlock};
+    use reth_rpc_server_types::constants::DEFAULT_MAX_PROOF_SLOTS;
     use reth_storage_api::{StateProviderBox, StateProviderFactory};
     use reth_tasks::{
         pool::{BlockingTaskGuard, BlockingTaskPool},
@@ -120,6 +119,56 @@ mod tests {
     }
 
     #[test]
+    fn test_get_proof_key_cap() {
+        let eth_api = noop_eth_api();
+        let address = Address::random();
+        let keys = |len| vec![JsonStorageKey::from(B256::ZERO); len];
+
+        assert!(eth_api.get_proof(address, keys(DEFAULT_MAX_PROOF_SLOTS), None).is_ok());
+
+        let Err(err) = eth_api.get_proof(address, keys(DEFAULT_MAX_PROOF_SLOTS + 1), None) else {
+            panic!("expected over-limit request to be rejected");
+        };
+        assert_eq!(err.to_string(), "storage key count 1025 exceeds limit 1024");
+    }
+
+    #[test]
+    fn test_get_multi_proof_cap() {
+        let eth_api = noop_eth_api();
+        let address = Address::random();
+
+        // Exactly at the limit, on both axes.
+        let targets = vec![(address, vec![B256::ZERO; DEFAULT_MAX_PROOF_SLOTS])];
+        assert!(eth_api.get_multi_proof(targets, None).is_ok());
+        let targets = vec![(address, Vec::new()); DEFAULT_MAX_PROOF_SLOTS];
+        assert!(eth_api.get_multi_proof(targets, None).is_ok());
+
+        // Too many slots in a single target.
+        let targets = vec![(address, vec![B256::ZERO; DEFAULT_MAX_PROOF_SLOTS + 1])];
+        let Err(err) = eth_api.get_multi_proof(targets, None) else {
+            panic!("expected over-limit request to be rejected");
+        };
+        assert_eq!(err.to_string(), "total slot count 1025 exceeds limit 1024");
+
+        // Too many slots in total, spread across targets.
+        let targets = vec![
+            (address, vec![B256::ZERO; DEFAULT_MAX_PROOF_SLOTS]),
+            (Address::random(), vec![B256::ZERO]),
+        ];
+        let Err(err) = eth_api.get_multi_proof(targets, None) else {
+            panic!("expected over-limit request to be rejected");
+        };
+        assert_eq!(err.to_string(), "total slot count 1025 exceeds limit 1024");
+
+        // Too many targets without any slots.
+        let targets = vec![(address, Vec::new()); DEFAULT_MAX_PROOF_SLOTS + 1];
+        let Err(err) = eth_api.get_multi_proof(targets, None) else {
+            panic!("expected over-limit request to be rejected");
+        };
+        assert_eq!(err.to_string(), "target count 1025 exceeds limit 1024");
+    }
+
+    #[test]
     fn pending_state_and_access_list_do_not_deadlock() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -176,6 +225,10 @@ mod tests {
         type Error = EthApiError;
         type NetworkTypes = <MockEthApi as EthApiTypes>::NetworkTypes;
         type RpcConvert = <MockEthApi as EthApiTypes>::RpcConvert;
+
+        fn eth_api_settings(&self) -> &EthApiSettings {
+            self.inner.eth_api_settings()
+        }
 
         fn converter(&self) -> &Self::RpcConvert {
             self.inner.converter()
@@ -239,10 +292,6 @@ mod tests {
             self.inner.pending_env_builder()
         }
 
-        fn pending_block_kind(&self) -> PendingBlockKind {
-            self.inner.pending_block_kind()
-        }
-
         fn local_pending_state(
             &self,
         ) -> impl Future<Output = Result<Option<StateProviderBox>, Self::Error>> + Send {
@@ -253,11 +302,7 @@ mod tests {
 
     impl LoadState for CustomPendingState {}
 
-    impl EthState for CustomPendingState {
-        fn max_proof_window(&self) -> u64 {
-            self.inner.max_proof_window()
-        }
-    }
+    impl EthState for CustomPendingState {}
 
     #[tokio::test]
     async fn pending_state_reads_use_existing_override() {

@@ -7,8 +7,6 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// Vendored upstream code; upstream keeps the `unnameable-types` lint off.
-#![allow(unnameable_types)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -65,6 +63,9 @@ pub use trie::{BranchNodeMasks, BranchNodeMasksMap, ProofTrieNode};
 mod trie_node_v2;
 pub use trie_node_v2::*;
 
+/// Merkle Patricia trie range-proof verification.
+pub mod range_proof;
+
 /// The implementation of a container for storing intermediate changes to a trie.
 /// The container indicates when the trie has been modified.
 pub mod prefix_set;
@@ -81,8 +82,6 @@ pub mod ordered_root;
 
 /// Buffer for trie updates.
 pub mod updates;
-
-pub mod added_removed_keys;
 
 /// Utilities used by other modules in this crate.
 mod utils;

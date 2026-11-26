@@ -1,12 +1,12 @@
 [package]
 name = "reth-db"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Database primitives used in reth. [MANTLE PATCH: backport reth#28064 at aef8d3ef]"
+description = "Database primitives used in reth. [MANTLE PATCH: backport reth#28064, reth#28405 on ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
@@ -17,27 +17,27 @@ reth-db-api.workspace = true
 reth-fs-util.workspace = true
 reth-storage-errors.workspace = true
 reth-nippy-jar.workspace = true
-reth-tracing.workspace = true
-tracing.workspace = true
+reth-tracing = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 reth-static-file-types.workspace = true
+reth-primitives-traits = { workspace = true, optional = true, features = ["quanta"] }
 
 # ethereum
 alloy-primitives.workspace = true
 
 # mdbx
-reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", features = ["return-borrowed", "read-tx-timeouts"], optional = true }
+reth-libmdbx = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1", features = ["return-borrowed", "read-tx-timeouts"], optional = true }
 eyre = { workspace = true, optional = true }
 
 # metrics
 reth-metrics = { workspace = true, optional = true }
-metrics = { workspace = true, optional = true }
-quanta = { version = "0.12", optional = true }
+metrics = { version = "0.24.0", optional = true }
 
 # misc
 page_size = { version = "0.6.0", optional = true }
 thiserror.workspace = true
 tempfile = { workspace = true, optional = true }
-derive_more.workspace = true
+derive_more = { version = "2", default-features = false, features = ["full"] }
 rustc-hash = { workspace = true, optional = true, features = ["std"] }
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 parking_lot = { workspace = true, optional = true }
@@ -73,7 +73,7 @@ mdbx = [
     "dep:reth-libmdbx",
     "dep:eyre",
     "dep:page_size",
-    "dep:quanta",
+    "dep:reth-primitives-traits",
     "reth-metrics",
     "dep:metrics",
     "dep:strum",

@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.94.1"
 name = "alloy-evm"
-version = "0.37.1"
+version = "0.39.0"
 authors = ["Alloy Contributors"]
 build = false
 autolib = false
@@ -21,7 +21,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "EVM abstraction for Alloy [MANTLE PATCH: alloy-rs/evm#444 on 0.37.1]"
+description = "EVM abstraction for Alloy [MANTLE PATCH: alloy-rs/evm#444 on 0.39.0]"
 homepage = "https://github.com/alloy-rs/alloy-evm"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
@@ -98,7 +98,7 @@ features = ["full"]
 default-features = false
 
 [dependencies.revm]
-version = "41.0.0"
+version = "43.0.0"
 default-features = false
 
 [dependencies.thiserror]

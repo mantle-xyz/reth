@@ -26,9 +26,6 @@ type LoadedJarRef<'a> =
 
 /// Helper type to reuse an associated static file mmap handle on created cursors.
 #[derive(Debug)]
-// [MANTLE PATCH] allow(unnameable_types): re-exported through a private module;
-// upstream reth has the same shape. Newer clippy promotes this to deny under -D warnings.
-#[allow(unnameable_types)]
 pub struct LoadedJar {
     jar: NippyJar<SegmentHeader>,
     mmap_handle: Arc<reth_nippy_jar::DataReader>,
@@ -120,6 +117,17 @@ mod tests {
             eyre::bail!("{msg} | got: {got:?} expected: {expected:?}");
         }
         Ok(())
+    }
+
+    fn assert_cached_size_matches_disk(
+        sf_rw: &StaticFileProvider<EthPrimitives>,
+        segment: StaticFileSegment,
+        block: u64,
+    ) -> eyre::Result<()> {
+        let jar_provider = sf_rw.get_segment_provider_for_block(segment, block, None)?;
+        let disk_size = fs::metadata(jar_provider.data_path())?.len() +
+            fs::metadata(jar_provider.offsets_path())?.len();
+        assert_eyre(jar_provider.size() as u64, disk_size, "cached size mismatch")
     }
 
     #[test]
@@ -244,6 +252,7 @@ mod tests {
                     expected_tip,
                     "header mismatch",
                 )?;
+                assert_cached_size_matches_disk(sf_rw, StaticFileSegment::Headers, id)?;
             }
 
             // Validate the number of files remaining in the directory
@@ -497,6 +506,7 @@ mod tests {
                 "block mismatch",
             )?;
             assert_eyre(sf_rw.get_highest_static_file_tx(segment), expected_tx_tip, "tx mismatch")?;
+            assert_cached_size_matches_disk(sf_rw, segment, last_block)?;
 
             // Verify that transactions and receipts are returned correctly. Uses
             // cumulative_gas_used & nonce as ids.
@@ -758,7 +768,7 @@ mod tests {
                     })
                     .collect();
 
-                let changeset = generate_test_changesets(block_num, addresses.clone());
+                let changeset = generate_test_changesets(block_num, addresses);
 
                 writer.append_account_changeset(changeset, block_num).unwrap();
             }

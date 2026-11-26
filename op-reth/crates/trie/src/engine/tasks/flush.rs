@@ -1,12 +1,9 @@
 use super::super::state::EngineState;
-use crate::OpProofsStore;
+use crate::{OpProofsStore, engine::CanonicalInMemoryStateProvider};
 use crossbeam_channel::Sender;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::BlockTy;
-use reth_provider::{
-    BlockHashReader, BlockReader, DatabaseProviderFactory, StageCheckpointReader,
-    StateProviderFactory, StateReader,
-};
+use reth_provider::{BlockHashReader, BlockReader, DatabaseProviderFactory, StageCheckpointReader};
 
 pub(crate) struct FlushTask {
     pub(crate) reply: Sender<()>,
@@ -17,10 +14,9 @@ impl FlushTask {
     where
         Evm: ConfigureEvm,
         Provider: BlockHashReader
-            + StateReader
+            + CanonicalInMemoryStateProvider
             + StageCheckpointReader
             + DatabaseProviderFactory
-            + StateProviderFactory
             + BlockReader<Block = BlockTy<Evm::Primitives>>
             + Clone
             + 'static,

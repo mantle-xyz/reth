@@ -93,6 +93,15 @@ impl StorageSettings {
     }
 }
 
+/// Marker for an in-progress partial state trie unwind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialStateTrieUnwindMarker {
+    /// The Finish stage block number before the unwind started.
+    pub finish_block_number: u64,
+    /// The partial state trie frontier the pipeline is unwinding to.
+    pub partial_state_trie: u64,
+}
+
 /// A pipeline unwind that must finish before forward execution can resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineUnwind {

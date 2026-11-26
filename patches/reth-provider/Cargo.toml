@@ -1,12 +1,12 @@
 [package]
 name = "reth-provider"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth storage provider. [MANTLE PATCH: hashed-snapshot exec-read fallback; backport reth#27131, #27223, #27229, #27678, #28064, #28053, #28067 at aef8d3ef]"
+description = "Reth storage provider. [MANTLE PATCH: backport reth#27229, reth#27678, reth#28053, reth#28064, reth#28067, reth#28370, reth#28405, reth#28481 on ethereum-optimism/reth op-v2.6.0-1; Mantle: hashed-only snapshot exec-read fallback]"
 
 [lints]
 workspace = true
@@ -20,6 +20,7 @@ reth-primitives-traits = { workspace = true, features = ["reth-codec", "secp256k
 reth-errors.workspace = true
 reth-storage-errors.workspace = true
 reth-storage-api = { workspace = true, features = ["std", "db-api"] }
+reth-storage-overlay.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true
 reth-prune-types.workspace = true
@@ -35,7 +36,7 @@ reth-static-file-types = { workspace = true, features = ["std"] }
 reth-fs-util.workspace = true
 
 # ethereum
-alloy-eip7928.workspace = true
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
@@ -44,11 +45,11 @@ alloy-consensus.workspace = true
 revm.workspace = true
 
 # tracing
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 
 # metrics
 reth-metrics.workspace = true
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
 itertools.workspace = true
@@ -68,6 +69,9 @@ rayon.workspace = true
 
 rocksdb.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-primitives-traits = { workspace = true, features = ["arbitrary", "test-utils"] }
@@ -76,7 +80,7 @@ reth-trie = { workspace = true, features = ["test-utils"] }
 reth-testing-utils.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-primitives.workspace = true
-reth-tracing.workspace = true
+reth-tracing = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 
 tempfile.workspace = true
 assert_matches.workspace = true

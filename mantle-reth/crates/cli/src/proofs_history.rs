@@ -98,9 +98,14 @@ macro_rules! install_proofs_history {
                     ctx.node().evm_config().clone(),
                 );
                 // After the Mantle hook: the sidecar's getProof (window-aware) must win over the
-                // Mantle stock-path getProof, so these `replace_configured` calls run last.
+                // Mantle stock-path getProof, so these calls run last. The debug overrides only go
+                // where the debug namespace is enabled: `replace_configured` would add them to
+                // every transport.
                 ctx.modules.replace_configured(api_ext.into_rpc())?;
-                ctx.modules.replace_configured(debug_ext.into_rpc())?;
+                ctx.modules.add_or_replace_if_module_configured(
+                    reth_rpc_builder::RethRpcModule::Debug,
+                    debug_ext.into_rpc(),
+                )?;
                 info!(target: "reth::cli", "Proofs-history RPC overrides installed");
                 Ok(())
             })
@@ -124,6 +129,7 @@ where
     T: FullNodeTypes<
             Types: NodeTypes<Primitives = OpPrimitives, ChainSpec: reth_optimism_forks::OpHardforks>,
         >,
+    T::Provider: reth_optimism_trie::CanonicalInMemoryStateProvider,
     CB: NodeComponentsBuilder<T>,
     <CB::Components as reth_node_builder::components::NodeComponents<T>>::Evm:
         reth_optimism_evm::ConfigurePostExecEvm<Primitives = OpPrimitives>,
@@ -177,6 +183,7 @@ where
     T: FullNodeTypes<
             Types: NodeTypes<Primitives = OpPrimitives, ChainSpec: reth_optimism_forks::OpHardforks>,
         >,
+    T::Provider: reth_optimism_trie::CanonicalInMemoryStateProvider,
     CB: NodeComponentsBuilder<T>,
     <CB::Components as reth_node_builder::components::NodeComponents<T>>::Evm:
         reth_optimism_evm::ConfigurePostExecEvm<Primitives = OpPrimitives>,

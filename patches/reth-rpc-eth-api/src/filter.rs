@@ -1,14 +1,14 @@
 //! `eth_` RPC API for filtering.
 
 use alloy_json_rpc::RpcObject;
-use alloy_rpc_types_eth::{Filter, FilterChanges, FilterId, Log, PendingTransactionFilterKind};
+use alloy_rpc_types_eth::{Filter, FilterChanges, FilterId, PendingTransactionFilterKind};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use std::future::Future;
 
 /// Rpc Interface for poll-based ethereum filter API.
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "eth"))]
 #[cfg_attr(feature = "client", rpc(server, client, namespace = "eth"))]
-pub trait EthFilterApi<T: RpcObject> {
+pub trait EthFilterApi<T: RpcObject, L: RpcObject> {
     /// Creates a new filter and returns its id.
     #[method(name = "newFilter")]
     async fn new_filter(&self, filter: Filter) -> RpcResult<FilterId>;
@@ -26,11 +26,11 @@ pub trait EthFilterApi<T: RpcObject> {
 
     /// Returns all filter changes since last poll.
     #[method(name = "getFilterChanges")]
-    async fn filter_changes(&self, id: FilterId) -> RpcResult<FilterChanges<T>>;
+    async fn filter_changes(&self, id: FilterId) -> RpcResult<FilterChanges<T, L>>;
 
     /// Returns all logs matching given filter (in a range 'from' - 'to').
     #[method(name = "getFilterLogs")]
-    async fn filter_logs(&self, id: FilterId) -> RpcResult<Vec<Log>>;
+    async fn filter_logs(&self, id: FilterId) -> RpcResult<Vec<L>>;
 
     /// Uninstalls filter.
     #[method(name = "uninstallFilter")]
@@ -38,7 +38,7 @@ pub trait EthFilterApi<T: RpcObject> {
 
     /// Returns logs matching given filter object.
     #[method(name = "getLogs")]
-    async fn logs(&self, filter: Filter) -> RpcResult<Vec<Log>>;
+    async fn logs(&self, filter: Filter) -> RpcResult<Vec<L>>;
 }
 
 /// Limits for logs queries
@@ -48,6 +48,11 @@ pub struct QueryLimits {
     pub max_blocks_per_filter: Option<u64>,
     /// Maximum number of logs that can be returned in a response
     pub max_logs_per_response: Option<usize>,
+    /// Maximum JSON size in bytes of the logs a multi-block query collects, estimated from a lower
+    /// bound on each log's encoding.
+    ///
+    /// Like `max_logs_per_response`, this does not apply to single-block queries.
+    pub max_response_size: Option<usize>,
 }
 
 impl QueryLimits {
@@ -59,11 +64,11 @@ impl QueryLimits {
 
 /// Rpc Interface for poll-based ethereum filter API, implementing only the `eth_getLogs` method.
 /// Used for the engine API, with possibility to specify [`QueryLimits`].
-pub trait EngineEthFilter: Send + Sync + 'static {
+pub trait EngineEthFilter<L: RpcObject>: Send + Sync + 'static {
     /// Returns logs matching given filter object.
     fn logs(
         &self,
         filter: Filter,
         limits: QueryLimits,
-    ) -> impl Future<Output = RpcResult<Vec<Log>>> + Send;
+    ) -> impl Future<Output = RpcResult<Vec<L>>> + Send;
 }

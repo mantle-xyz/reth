@@ -1,0 +1,28 @@
+[package]
+name = "reth-rpc-server-types"
+version = "2.6.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "RPC server types and constants [MANTLE PATCH: backport reth#27716 on ethereum-optimism/reth op-v2.6.0-1]"
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-errors.workspace = true
+reth-network-api.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
+
+# rpc
+jsonrpsee-core.workspace = true
+jsonrpsee-types.workspace = true
+
+# misc
+strum = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }

@@ -1,12 +1,12 @@
 [package]
 name = "reth-tasks"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Task management [MANTLE PATCH: backport reth#27805, reth#27462, reth#27313 at aef8d3ef]"
+description = "Task management [MANTLE PATCH: backport reth#27313, reth#27462, reth#27466, reth#27805 on ethereum-optimism/reth op-v2.6.0-1; Mantle: worker-idle test fix]"
 
 [lints]
 workspace = true
@@ -14,23 +14,23 @@ workspace = true
 [dependencies]
 # async
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread"] }
-tracing-futures = "0.2"
+tracing-futures.workspace = true
 futures-util = { workspace = true, features = ["std"] }
 
 # metrics
 reth-metrics.workspace = true
-metrics.workspace = true
+metrics = { version = "0.24.0" }
 
 # misc
-dashmap = "6.2"
+dashmap.workspace = true
 parking_lot.workspace = true
 thread-priority.workspace = true
-tracing = { workspace = true, features = ["attributes"] }
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 thiserror.workspace = true
 
 # feature `rayon`
 rayon = { workspace = true, optional = true }
-crossbeam-utils = { version = "0.8", optional = true }
+crossbeam-utils = { workspace = true, optional = true }
 pin-project = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

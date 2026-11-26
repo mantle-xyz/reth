@@ -69,6 +69,8 @@ impl From<MerkleCheckpoint> for IntermediateStateRootState {
 }
 
 /// The intermediate state of a state root computation, whether account or storage root.
+// [MANTLE PATCH] allow(unnameable_types): the workspace enables this lint, upstream does not.
+#[allow(unnameable_types)]
 #[derive(Debug)]
 pub struct IntermediateRootState {
     /// Previously constructed hash builder.

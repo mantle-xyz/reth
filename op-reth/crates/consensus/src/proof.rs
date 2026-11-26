@@ -9,7 +9,7 @@ use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::DepositReceipt;
 
 /// Calculates the receipt root for a header.
-pub(crate) fn calculate_receipt_root_optimism<R: DepositReceipt>(
+pub fn calculate_receipt_root_optimism<R: DepositReceipt>(
     receipts: &[ReceiptWithBloom<&R>],
     chain_spec: impl OpHardforks,
     timestamp: u64,
@@ -54,47 +54,6 @@ pub(crate) fn calculate_receipt_root_optimism<R: DepositReceipt>(
     }
 
     ordered_trie_root_with_encoder(receipts, |r, buf| r.encode_2718(buf))
-}
-
-/// Calculates the receipt root for a header for the reference type of an OP receipt.
-///
-/// NOTE: Prefer calculate receipt root optimism if you have log blooms memoized.
-pub fn calculate_receipt_root_no_memo_optimism<R: DepositReceipt>(
-    receipts: &[R],
-    chain_spec: impl OpHardforks,
-    timestamp: u64,
-) -> B256 {
-    let is_mantle = chain_spec.is_mantle();
-    let should_strip = if is_mantle {
-        true
-    } else {
-        chain_spec.is_regolith_active_at_timestamp(timestamp) &&
-            !chain_spec.is_canyon_active_at_timestamp(timestamp)
-    };
-
-    if should_strip {
-        let receipts = receipts
-            .iter()
-            .map(|r| {
-                let mut r = (*r).clone();
-                if let Some(receipt) = r.as_deposit_receipt_mut() {
-                    receipt.deposit_nonce = None;
-                    if is_mantle {
-                        receipt.deposit_receipt_version = None;
-                    }
-                }
-                r
-            })
-            .collect::<Vec<_>>();
-
-        return ordered_trie_root_with_encoder(&receipts, |r, buf| {
-            r.with_bloom_ref().encode_2718(buf);
-        });
-    }
-
-    ordered_trie_root_with_encoder(receipts, |r, buf| {
-        r.with_bloom_ref().encode_2718(buf);
-    })
 }
 
 #[cfg(test)]

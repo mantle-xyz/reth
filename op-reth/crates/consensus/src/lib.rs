@@ -18,7 +18,8 @@ use alloy_consensus::{
 use alloy_primitives::{B64, B256};
 use core::fmt::Debug;
 use op_alloy_consensus::{
-    EIP1559ParamError, decode_eip_1559_params, decode_holocene_extra_data, decode_jovian_extra_data,
+    EIP1559ParamError, OpTransaction, decode_eip_1559_params, decode_holocene_extra_data,
+    decode_jovian_extra_data,
 };
 use reth_chainspec::EthChainSpec;
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
@@ -28,7 +29,7 @@ use reth_consensus_common::validation::{
     validate_header_base_fee, validate_header_extra_data, validate_header_gas,
 };
 use reth_execution_types::BlockExecutionResult;
-use reth_optimism_forks::OpHardforks;
+use reth_optimism_forks::{OpHardfork, OpHardforks};
 use reth_optimism_primitives::DepositReceipt;
 use reth_primitives_traits::{
     Block, BlockBody, BlockHeader, GotExpected, NodePrimitives, RecoveredBlock, SealedBlock,
@@ -36,7 +37,10 @@ use reth_primitives_traits::{
 };
 
 mod proof;
-pub use proof::calculate_receipt_root_no_memo_optimism;
+pub use proof::calculate_receipt_root_optimism;
+
+#[cfg(feature = "std")]
+mod sdm_metrics;
 
 pub mod validation;
 pub use validation::{canyon, isthmus, validate_block_post_execution};
@@ -44,13 +48,19 @@ pub use validation::{canyon, isthmus, validate_block_post_execution};
 pub mod error;
 pub use error::OpConsensusError;
 
+/// Validates that a header's `extraData` has the encoding required by the fork active at its
+/// timestamp: the Jovian or Holocene encoding, or empty before Holocene.
+///
+/// Before Holocene, the rollup genesis block may carry arbitrary `extraData`. That is the Bedrock
+/// transition block: block 0, or on chains migrated from a legacy chain (OP Mainnet) the first
+/// Bedrock block, whose chain-spec genesis is the legacy block 0.
 fn validate_op_header_extra_data<H, ChainSpec>(
-    header: &SealedHeader<H>,
+    header: &H,
     chain_spec: &ChainSpec,
 ) -> Result<(), ConsensusError>
 where
     H: BlockHeader,
-    ChainSpec: EthChainSpec<Header = H> + OpHardforks,
+    ChainSpec: OpHardforks,
 {
     let jovian = chain_spec.is_jovian_active_at_timestamp(header.timestamp());
     let (expected_len, version) = if jovian {
@@ -58,7 +68,11 @@ where
     } else if chain_spec.is_holocene_active_at_timestamp(header.timestamp()) {
         (9, 0)
     } else {
-        if header.hash() != chain_spec.genesis_hash() && !header.extra_data().is_empty() {
+        if !header.extra_data().is_empty() &&
+            !chain_spec
+                .op_fork_activation(OpHardfork::Bedrock)
+                .transitions_at_block(header.number())
+        {
             return Err(ConsensusError::msg("extraData must be empty before Holocene"));
         }
         return Ok(());
@@ -120,7 +134,7 @@ impl<ChainSpec> OpBeaconConsensus<ChainSpec> {
 
 impl<N, ChainSpec> FullConsensus<N> for OpBeaconConsensus<ChainSpec>
 where
-    N: NodePrimitives<Receipt: DepositReceipt>,
+    N: NodePrimitives<Receipt: DepositReceipt, SignedTx: OpTransaction>,
     ChainSpec: EthChainSpec<Header = N::BlockHeader> + OpHardforks + Debug + Send + Sync,
 {
     fn validate_block_post_execution(
@@ -136,7 +150,15 @@ where
         // the Mantle-specific strip logic.
         let receipt_root_bloom =
             if self.chain_spec.is_mantle() { None } else { receipt_root_bloom };
-        validate_block_post_execution(block.header(), &self.chain_spec, result, receipt_root_bloom)
+        validate_block_post_execution(
+            block.header(),
+            &self.chain_spec,
+            result,
+            receipt_root_bloom,
+        )?;
+        #[cfg(feature = "std")]
+        sdm_metrics::record_validated_block(block.header().gas_used(), block.body().transactions());
+        Ok(())
     }
 }
 
@@ -251,7 +273,7 @@ where
 
         // validate header extra data for all networks post merge
         validate_header_extra_data(header, self.max_extra_data_size)?;
-        validate_op_header_extra_data(sealed_header, &self.chain_spec)?;
+        validate_op_header_extra_data(header, &self.chain_spec)?;
         validate_header_gas(header)?;
         validate_header_base_fee(header, &self.chain_spec)
     }
@@ -323,9 +345,10 @@ mod tests {
     use op_alloy_consensus::{
         OpTypedTransaction, encode_holocene_extra_data, encode_jovian_extra_data,
     };
-    use reth_chainspec::{BaseFeeParams, EthChainSpec};
+    use reth_chainspec::{BaseFeeParams, EthChainSpec, ForkCondition};
     use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
     use reth_optimism_chainspec::{OP_MAINNET, OpChainSpec, OpChainSpecBuilder};
+    use reth_optimism_forks::OpHardfork;
     use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
     use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader, proofs};
     use reth_provider::BlockExecutionResult;
@@ -366,12 +389,77 @@ mod tests {
         chain_spec: &OpChainSpec,
         extra_data: Bytes,
     ) -> SealedHeader<Header> {
+        header_at(chain_spec, chain_spec.genesis_header().timestamp + 2, extra_data)
+    }
+
+    fn header_at(
+        chain_spec: &OpChainSpec,
+        timestamp: u64,
+        extra_data: Bytes,
+    ) -> SealedHeader<Header> {
         let mut header = chain_spec.genesis_header().clone();
         header.number += 1;
         header.parent_hash = chain_spec.genesis_hash();
-        header.timestamp += 2;
+        header.timestamp = timestamp;
         header.extra_data = extra_data;
         SealedHeader::seal_slow(header)
+    }
+
+    /// OP Mainnet's chain spec genesis is the legacy block 0, while its rollup genesis is the
+    /// Bedrock transition block, which carries `BEDROCK` as `extraData`.
+    #[test]
+    fn header_extra_data_op_mainnet_bedrock_block() {
+        let consensus = OpBeaconConsensus::new(OP_MAINNET.clone());
+        let bedrock_block = |number, extra_data| {
+            SealedHeader::seal_slow(Header {
+                number,
+                timestamp: 1_686_068_903,
+                gas_limit: 30_000_000,
+                base_fee_per_gas: Some(1_000_000_000),
+                extra_data,
+                ..Default::default()
+            })
+        };
+
+        let result =
+            consensus.validate_header(&bedrock_block(105_235_063, Bytes::from_static(b"BEDROCK")));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            consensus
+                .validate_header(&bedrock_block(105_235_064, Bytes::from_static(b"BEDROCK")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn header_extra_data_at_fork_boundaries() {
+        const HOLOCENE: u64 = 10;
+        const JOVIAN: u64 = 20;
+        let chain_spec = test_chain_spec(
+            OpChainSpecBuilder::default()
+                .granite_activated()
+                .with_fork(OpHardfork::Holocene, ForkCondition::Timestamp(HOLOCENE))
+                .with_fork(OpHardfork::Jovian, ForkCondition::Timestamp(JOVIAN)),
+            Bytes::new(),
+        );
+        let consensus = OpBeaconConsensus::new(chain_spec.clone());
+        let holocene = encode_holocene_extra_data(B64::ZERO, BaseFeeParams::optimism()).unwrap();
+        let jovian =
+            encode_jovian_extra_data(B64::ZERO, BaseFeeParams::optimism(), 1_000_000_000).unwrap();
+
+        for (timestamp, valid, invalid) in [
+            (HOLOCENE - 1, Bytes::new(), holocene.clone()),
+            (HOLOCENE, holocene.clone(), Bytes::new()),
+            (JOVIAN - 1, holocene.clone(), jovian.clone()),
+            (JOVIAN, jovian, holocene),
+        ] {
+            let result = consensus.validate_header(&header_at(&chain_spec, timestamp, valid));
+            assert!(result.is_ok(), "timestamp {timestamp}: {result:?}");
+            assert!(
+                consensus.validate_header(&header_at(&chain_spec, timestamp, invalid)).is_err(),
+                "timestamp {timestamp}"
+            );
+        }
     }
 
     #[test]
@@ -415,6 +503,7 @@ mod tests {
 
         for invalid in [
             Bytes::new(),
+            encode_jovian_extra_data(B64::ZERO, BaseFeeParams::optimism(), 1_000_000_000).unwrap(),
             Bytes::from(vec![0; 8]),
             Bytes::from(vec![1, 0, 0, 0, 1, 0, 0, 0, 1]),
             Bytes::from(vec![0, 0, 0, 0, 0, 0, 0, 0, 1]),
@@ -1048,7 +1137,7 @@ mod tests {
     /// re-computes the correct root via `verify_receipts_optimism`.
     #[test]
     fn mantle_ignores_precomputed_receipt_root() {
-        use crate::proof::calculate_receipt_root_no_memo_optimism;
+        use crate::proof::calculate_receipt_root_optimism;
         use mantle_reth_chainspec::MANTLE_MAINNET;
         use op_alloy_consensus::OpDepositReceipt;
 
@@ -1071,8 +1160,8 @@ mod tests {
         let bloom = deposit_receipt.bloom();
 
         // Root WITH Mantle strip (correct canonical root)
-        let mantle_root = calculate_receipt_root_no_memo_optimism(
-            std::slice::from_ref(&deposit_receipt),
+        let mantle_root = calculate_receipt_root_optimism(
+            std::slice::from_ref(&deposit_receipt.with_bloom_ref()),
             MANTLE_MAINNET.as_ref(),
             u64::MAX,
         );
@@ -1145,7 +1234,7 @@ mod tests {
 
     #[test]
     fn mantle_skadi_without_arsia_strips_deposit_fields() {
-        use crate::proof::calculate_receipt_root_no_memo_optimism;
+        use crate::proof::calculate_receipt_root_optimism;
         use alloy_hardforks::ForkCondition;
         use alloy_op_hardforks::{MantleHardfork, OpHardfork};
         use op_alloy_consensus::OpDepositReceipt;
@@ -1185,8 +1274,8 @@ mod tests {
         let unstripped_root =
             proofs::calculate_receipt_root(std::slice::from_ref(&deposit_receipt.with_bloom_ref()));
 
-        let mantle_root = calculate_receipt_root_no_memo_optimism(
-            std::slice::from_ref(&deposit_receipt),
+        let mantle_root = calculate_receipt_root_optimism(
+            std::slice::from_ref(&deposit_receipt.with_bloom_ref()),
             skadi_only_spec.as_ref(),
             1,
         );

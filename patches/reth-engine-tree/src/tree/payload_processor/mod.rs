@@ -4,7 +4,7 @@ use super::precompile_cache::PrecompileCacheMap;
 use crate::tree::{
     payload_processor::prewarm::{PrewarmCacheTask, PrewarmContext, PrewarmMode, PrewarmTaskEvent},
     CachedStateCacheMetrics, CachedStateMetrics, CachedStateMetricsSource, ExecutionCache,
-    ExecutionEnv, PayloadExecutionCache, SavedCache, StateProviderBuilder, TreeConfig,
+    ExecutionEnv, PayloadExecutionCache, SavedCache, TreeConfig,
 };
 use alloy_eips::eip1898::BlockWithParent;
 use alloy_primitives::B256;
@@ -17,8 +17,12 @@ use reth_evm::{
     ConfigureEvm, ConvertTx, ExecutableTxIterator, ExecutableTxTuple, SpecFor, TxEnvFor,
 };
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
-use reth_provider::{BlockExecutionOutput, BlockReader, StateProviderFactory, StateReader};
+use reth_provider::{
+    BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory, HistoryReader,
+    PruneCheckpointReader, StageCheckpointReader, StorageChangeSetReader, StorageSettingsCache,
+};
 use reth_revm::db::BundleState;
+use reth_storage_overlay::OverlayStateProviderFactory;
 use reth_tasks::Runtime;
 pub use reth_trie_parallel::{
     error::StateRootTaskError,
@@ -38,7 +42,7 @@ use std::{
 use tracing::{debug, instrument, trace, warn, Span};
 
 pub mod bal;
-pub(crate) mod bal_prewarm_pool;
+pub mod bal_prewarm_pool;
 pub mod prewarm;
 pub mod receipt_root_task;
 
@@ -166,25 +170,55 @@ where
         &self,
         env: ExecutionEnv<Evm>,
         transactions: I,
-        provider_builder: StateProviderBuilder<Evm::Primitives, P>,
+        state_provider_factory: OverlayStateProviderFactory<P, Evm::Primitives>,
         hint_stream: Option<StateRootHintStream>,
         hashed_update_stream: Option<StateRootUpdateStream>,
         parallel_bal_execution: bool,
     ) -> IteratorPayloadHandle<Evm, I>
     where
-        P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
+        P: DatabaseProviderFactory + Clone + 'static,
+        P::Provider: BlockNumReader
+            + PruneCheckpointReader
+            + StageCheckpointReader
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + StorageSettingsCache
+            + HistoryReader
+            + 'static,
     {
-        let (prewarm_rx, execution_rx) =
-            self.spawn_tx_iterator(transactions, env.transaction_count, parallel_bal_execution);
+        let prewarm_transactions =
+            self.prewarms_transactions(env.transaction_count, parallel_bal_execution);
+        let (prewarm_rx, execution_rx) = self.spawn_tx_iterator(
+            transactions,
+            env.transaction_count,
+            parallel_bal_execution,
+            prewarm_transactions,
+        );
         let prewarm_handle = self.spawn_caching_with(
             env,
             prewarm_rx,
-            provider_builder,
+            state_provider_factory,
             hint_stream,
             hashed_update_stream,
             parallel_bal_execution,
         );
         PayloadHandle { prewarm_handle, transactions: execution_rx, _span: Span::current() }
+    }
+
+    /// Whether the prewarm task will consume converted transactions, i.e. whether
+    /// [`Self::spawn_caching_with`] ends up in [`PrewarmMode::Transactions`].
+    ///
+    /// This is the only place the decision is made: the tx iterator uses it to skip creating the
+    /// prewarm channel and cloning every transaction into it, and the resulting `Option` receiver
+    /// then selects the mode, so the two cannot disagree.
+    const fn prewarms_transactions(
+        &self,
+        transaction_count: usize,
+        parallel_bal_execution: bool,
+    ) -> bool {
+        !parallel_bal_execution &&
+            !self.disable_transaction_prewarming &&
+            transaction_count >= SMALL_BLOCK_TX_THRESHOLD
     }
 
     /// Transaction count threshold below which sequential conversion is used.
@@ -215,14 +249,19 @@ where
     ///
     /// When `parallel_bal_execution` is disabled, preserves the original transaction order.
     /// Otherwise, streams results as they become available.
+    ///
+    /// The prewarm channel is only created when `prewarm_transactions` is set, see
+    /// [`Self::prewarms_transactions`]; otherwise no transaction is cloned into it.
     #[instrument(level = "debug", target = "engine::tree::payload_processor", skip_all)]
     fn spawn_tx_iterator<I: ExecutableTxIterator<Evm>>(
         &self,
         transactions: I,
         transaction_count: usize,
         parallel_bal_execution: bool,
-    ) -> (IteratorPrewarmTxReceiver<Evm, I>, IteratorExecuteTxReceiver<Evm, I>) {
-        let (prewarm_tx, prewarm_rx) = mpsc::sync_channel(transaction_count);
+        prewarm_transactions: bool,
+    ) -> (Option<IteratorPrewarmTxReceiver<Evm, I>>, IteratorExecuteTxReceiver<Evm, I>) {
+        let (prewarm_tx, prewarm_rx) =
+            prewarm_transactions.then(|| mpsc::sync_channel(transaction_count)).unzip();
         let (execute_tx, execute_rx) = crossbeam_channel::bounded(transaction_count);
 
         if transaction_count == 0 {
@@ -237,7 +276,12 @@ where
             );
             self.executor.spawn_blocking_named("tx-iterator", move || {
                 let (transactions, convert) = transactions.into_parts();
-                convert_serial(transactions.into_iter(), &convert, &prewarm_tx, &execute_tx);
+                convert_serial(
+                    transactions.into_iter(),
+                    &convert,
+                    prewarm_tx.as_ref(),
+                    &execute_tx,
+                );
             });
         } else {
             // Parallel path — recover signatures in parallel on rayon, stream results
@@ -254,13 +298,14 @@ where
                             .enumerate()
                             .try_for_each(|(idx, tx)| {
                                 let tx = convert.convert(tx).map(WithTxEnv::new);
-                                let failed = tx.is_err();
-                                if let Ok(tx) = &tx {
+                                if let (Some(prewarm_tx), Ok(tx)) = (&prewarm_tx, &tx) {
                                     let _ = prewarm_tx.send((idx, tx.clone()));
                                 }
                                 let disconnected = execute_tx.send((idx, tx)).is_err();
                                 trace!(target: "engine::tree::payload_processor", idx, "yielded transaction");
-                                if failed || disconnected {
+                                // Recovery failures are adjudicated in transaction order by
+                                // the BAL commit loop. Earlier slots may still be unconverted.
+                                if disconnected {
                                     Err(())
                                 } else {
                                     Ok(())
@@ -279,7 +324,7 @@ where
                     if !convert_serial(
                         iter.by_ref().take(prefetch),
                         &convert,
-                        &prewarm_tx,
+                        prewarm_tx.as_ref(),
                         &execute_tx,
                     ) {
                         return
@@ -314,7 +359,7 @@ where
 
                             for (idx, tx) in chunk {
                                 let failed = tx.is_err();
-                                if let Ok(tx) = &tx {
+                                if let (Some(prewarm_tx), Ok(tx)) = (&prewarm_tx, &tx) {
                                     let _ = prewarm_tx.send((idx, tx.clone()));
                                 }
                                 if execute_tx.send((idx, tx)).is_err() || failed {
@@ -340,14 +385,24 @@ where
     fn spawn_caching_with<P>(
         &self,
         env: ExecutionEnv<Evm>,
-        transactions: mpsc::Receiver<(usize, impl ExecutableTxFor<Evm> + Clone + Send + 'static)>,
-        provider_builder: StateProviderBuilder<Evm::Primitives, P>,
+        transactions: Option<
+            mpsc::Receiver<(usize, impl ExecutableTxFor<Evm> + Clone + Send + 'static)>,
+        >,
+        state_provider_factory: OverlayStateProviderFactory<P, Evm::Primitives>,
         hint_stream: Option<StateRootHintStream>,
         hashed_update_stream: Option<StateRootUpdateStream>,
         parallel_bal_execution: bool,
     ) -> CacheTaskHandle<<Evm::Primitives as NodePrimitives>::Receipt>
     where
-        P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
+        P: DatabaseProviderFactory + Clone + 'static,
+        P::Provider: BlockNumReader
+            + PruneCheckpointReader
+            + StageCheckpointReader
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + StorageSettingsCache
+            + HistoryReader
+            + 'static,
     {
         // Each mode carries the capability its producers use; the rest is dropped here, so
         // unused capabilities do not keep the state-root task's update channel open.
@@ -356,12 +411,10 @@ where
                 bal: env.decoded_bal.clone().expect("BAL dispatch implies decoded BAL"),
                 updates: hashed_update_stream,
             }
-        } else if self.disable_transaction_prewarming ||
-            env.transaction_count < SMALL_BLOCK_TX_THRESHOLD
-        {
-            PrewarmMode::Skipped
+        } else if let Some(pending) = transactions {
+            PrewarmMode::Transactions { pending, hints: hint_stream }
         } else {
-            PrewarmMode::Transactions { pending: transactions, hints: hint_stream }
+            PrewarmMode::Skipped
         };
         let saved_cache = self.disable_state_cache.not().then(|| self.cache_for(env.parent_hash));
 
@@ -371,7 +424,7 @@ where
             env,
             evm_config: self.evm_config.clone(),
             saved_cache: saved_cache.clone(),
-            provider: provider_builder,
+            provider: state_provider_factory,
             bal_prewarm_pool: parallel_bal_execution.then(|| self.bal_prewarm_pool()),
             metrics: PrewarmMetrics::default(),
             cache_metrics: self.cache_metrics.clone(),
@@ -476,12 +529,12 @@ where
     }
 }
 
-/// Converts transactions sequentially and sends them to the prewarm and execute channels. Returns
-/// false on conversion failure or disconnection.
+/// Converts transactions sequentially and sends them to the execute channel, and to the prewarm
+/// channel if there is one. Returns false on conversion failure or disconnection.
 fn convert_serial<RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
     iter: impl Iterator<Item = RawTx>,
     convert: &C,
-    prewarm_tx: &mpsc::SyncSender<(usize, WithTxEnv<TxEnv, Recovered>)>,
+    prewarm_tx: Option<&mpsc::SyncSender<(usize, WithTxEnv<TxEnv, Recovered>)>>,
     execute_tx: &ExecuteTxSender<TxEnv, Recovered, Err>,
 ) -> bool
 where
@@ -493,7 +546,7 @@ where
         let tx = convert.convert(raw_tx);
         let failed = tx.is_err();
         let tx = tx.map(WithTxEnv::new);
-        if let Ok(tx) = &tx {
+        if let (Some(prewarm_tx), Ok(tx)) = (prewarm_tx, &tx) {
             let _ = prewarm_tx.send((idx, tx.clone()));
         }
         if execute_tx.send((idx, tx)).is_err() || failed {
@@ -682,6 +735,7 @@ mod tests {
                 ((0..count).collect::<Vec<_>>(), |_| Ok::<_, std::io::Error>(converted_tx())),
                 count,
                 bal,
+                true,
             );
             let mut indices = Vec::new();
             for _ in 0..count {
@@ -693,14 +747,14 @@ mod tests {
                 indices.sort_unstable();
             }
             assert_eq!(indices, (0..count).collect::<Vec<_>>());
-            assert_eq!(prewarm.iter().count(), count);
+            assert_eq!(prewarm.unwrap().iter().count(), count);
         }
     }
 
     #[test]
     fn transaction_conversion_stops_on_error() {
         for (count, bal, fail_at) in
-            [(10, false, 0), (200, false, 0), (200, false, 4), (200, false, 20), (200, true, 0)]
+            [(10, false, 0), (10, true, 0), (200, false, 0), (200, false, 4), (200, false, 20)]
         {
             let processor = test_processor();
             let (_, receiver) = processor.spawn_tx_iterator(
@@ -713,6 +767,7 @@ mod tests {
                 }),
                 count,
                 bal,
+                false,
             );
             let mut results = Vec::new();
             loop {
@@ -729,6 +784,32 @@ mod tests {
                 assert!(results.last().unwrap().1.is_err());
             }
         }
+    }
+
+    #[test]
+    fn bal_transaction_conversion_preserves_all_error_slots() {
+        let count = 200;
+        let processor = test_processor();
+        let (_, receiver) = processor.spawn_tx_iterator(
+            ((0..count).collect::<Vec<_>>(), |idx| {
+                if idx % 3 == 0 {
+                    Err(std::io::Error::other("invalid transaction"))
+                } else {
+                    Ok(converted_tx())
+                }
+            }),
+            count,
+            true,
+            false,
+        );
+        let mut indices = Vec::new();
+        for _ in 0..count {
+            let (idx, tx) = receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            assert_eq!(tx.is_err(), idx % 3 == 0);
+            indices.push(idx);
+        }
+        indices.sort_unstable();
+        assert_eq!(indices, (0..count).collect::<Vec<_>>());
     }
 
     #[test]
@@ -752,6 +833,7 @@ mod tests {
                 }),
                 count,
                 bal,
+                false,
             );
             let handle = super::PayloadHandle {
                 prewarm_handle: super::CacheTaskHandle::<()> {

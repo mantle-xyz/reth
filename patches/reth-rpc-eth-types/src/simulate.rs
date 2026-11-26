@@ -23,8 +23,9 @@ use reth_primitives_traits::{
     BlockBody as _, BlockTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader,
 };
 use reth_rpc_convert::{RpcBlock, RpcConvert, RpcTxReq};
-use reth_rpc_server_types::result::{block_id_to_str, rpc_err};
+use reth_rpc_server_types::result::rpc_err;
 use reth_storage_api::{noop::NoopProvider, StateProvider};
+use reth_tasks::cancel::is_cancelled;
 use revm::{
     context::Block,
     context_interface::result::ExecutionResult,
@@ -61,7 +62,7 @@ pub enum EthSimulateError {
     #[error("Client adjustable limit reached")]
     GasLimitReached,
     /// Base block for the simulation was not found.
-    #[error("block not found: {}", block_id_to_str(*block))]
+    #[error("block not found: {block}")]
     BlockNotFound {
         /// The block id that was requested.
         block: BlockId,
@@ -329,6 +330,9 @@ where
     S: BlockBuilder<Executor: BlockExecutor<Evm: Evm<DB: Database<Error: Into<EthApiError>>>>>,
     T: RpcConvert<Primitives = S::Primitives>,
 {
+    if is_cancelled() {
+        return Err(EthApiError::InternalEthError)
+    }
     builder.apply_pre_execution_changes()?;
 
     let mut results = Vec::with_capacity(calls.len());
@@ -339,6 +343,9 @@ where
     let is_amsterdam = builder.evm().cfg_env().enable_amsterdam_eip8037;
     let tx_gas_limit_cap = builder.evm().cfg_env().tx_gas_limit_cap.unwrap_or(u64::MAX);
     for mut call in calls {
+        if is_cancelled() {
+            return Err(EthApiError::InternalEthError)
+        }
         let block_gas_remaining = if is_amsterdam {
             block_gas_limit
                 .saturating_sub(block_regular_gas_used)

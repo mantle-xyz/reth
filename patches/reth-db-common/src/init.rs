@@ -1027,6 +1027,7 @@ fn history_shard_with_block(
 /// collector sorts by address, so `AccountChangeSets` and `StorageChangeSets` receive data in
 /// sorted order within each account). State tables use `put`/`upsert` to replace existing
 /// genesis entries, with storage slots deleted before replacement.
+#[allow(clippy::clone_on_copy)]
 fn write_account_to_db<TX: DbTx + DbTxMut>(
     tx: &TX,
     address: &Address,

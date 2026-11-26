@@ -7,7 +7,7 @@ use alloy_rpc_types_eth::{
     pubsub::{
         Params, PubSubSyncStatus, SubscriptionKind, SyncStatusMetadata, TransactionReceiptsParams,
     },
-    Filter, Log,
+    Filter,
 };
 use futures::StreamExt;
 use jsonrpsee::{
@@ -17,7 +17,8 @@ use reth_chain_state::CanonStateSubscriptions;
 use reth_network_api::NetworkInfo;
 use reth_rpc_convert::RpcHeader;
 use reth_rpc_eth_api::{
-    helpers::EthSubscriptions, pubsub::EthPubSubApiServer, RpcConvert, RpcNodeCore, RpcTransaction,
+    helpers::EthSubscriptions, pubsub::EthPubSubApiServer, RpcConvert, RpcLog, RpcNodeCore,
+    RpcTransaction,
 };
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::BlockNumReader;
@@ -76,7 +77,7 @@ where
     }
 
     /// Returns a stream that yields matching logs.
-    pub fn log_stream(&self, filter: Filter) -> impl Stream<Item = Log> {
+    pub fn log_stream(&self, filter: Filter) -> impl Stream<Item = RpcLog<Eth::NetworkTypes>> {
         self.inner.eth_api.log_stream(filter)
     }
 
@@ -229,6 +230,15 @@ where
         kind: SubscriptionKind,
         params: Option<Params>,
     ) -> jsonrpsee::core::SubscriptionResult {
+        // Reject invalid params before accepting, so the caller gets -32602 instead of a
+        // subscription id that then fails in the background (reth#28616).
+        let (kind, params) = match Subscription::from_params(kind, params) {
+            Ok(subscription) => subscription.into_kind_and_params(),
+            Err(err) => {
+                pending.reject(err).await;
+                return Ok(())
+            }
+        };
         let sink = pending.accept().await?;
         let pubsub = self.clone();
         self.inner.subscription_task_spawner.spawn_task(async move {
@@ -236,6 +246,66 @@ where
         });
 
         Ok(())
+    }
+}
+
+/// An `eth_subscribe` request with its parameters resolved for the requested kind.
+///
+/// Backport of reth#28616's parameter validation; the accepted subscription goes back to
+/// [`EthPubSub::handle_accepted`] in its canonical `(kind, params)` form.
+#[derive(Debug)]
+enum Subscription {
+    NewHeads,
+    Logs(Box<Filter>),
+    FullPendingTransactions,
+    PendingTransactionHashes,
+    Syncing,
+    TransactionReceipts(TransactionReceiptsParams),
+}
+
+impl Subscription {
+    fn from_params(
+        kind: SubscriptionKind,
+        params: Option<Params>,
+    ) -> Result<Self, ErrorObject<'static>> {
+        match (kind, params.unwrap_or_default()) {
+            (SubscriptionKind::NewHeads, _) => Ok(Self::NewHeads),
+            // Alloy decodes an object with `transactionHashes` as receipt params and drops its
+            // `address` and `topics`, so it is rejected instead of being served as every log.
+            (SubscriptionKind::Logs, Params::Logs(filter)) => Ok(Self::Logs(filter)),
+            (SubscriptionKind::Logs, Params::None) => Ok(Self::Logs(Box::default())),
+            (SubscriptionKind::NewPendingTransactions, Params::Bool(true)) => {
+                Ok(Self::FullPendingTransactions)
+            }
+            (SubscriptionKind::NewPendingTransactions, Params::Bool(false) | Params::None) => {
+                Ok(Self::PendingTransactionHashes)
+            }
+            (SubscriptionKind::Syncing, _) => Ok(Self::Syncing),
+            (SubscriptionKind::TransactionReceipts, Params::TransactionReceipts(filter)) => {
+                Ok(Self::TransactionReceipts(filter))
+            }
+            // Alloy decodes objects without transactionHashes as log filters. Like geth, ignore
+            // log filter fields for receipt subscriptions.
+            (SubscriptionKind::TransactionReceipts, Params::None | Params::Logs(_)) => {
+                Ok(Self::TransactionReceipts(Default::default()))
+            }
+            (kind, _) => Err(invalid_params_rpc_err(format!("Invalid params for {kind:?}"))),
+        }
+    }
+
+    fn into_kind_and_params(self) -> (SubscriptionKind, Option<Params>) {
+        match self {
+            Self::NewHeads => (SubscriptionKind::NewHeads, None),
+            Self::Logs(filter) => (SubscriptionKind::Logs, Some(Params::Logs(filter))),
+            Self::FullPendingTransactions => {
+                (SubscriptionKind::NewPendingTransactions, Some(Params::Bool(true)))
+            }
+            Self::PendingTransactionHashes => (SubscriptionKind::NewPendingTransactions, None),
+            Self::Syncing => (SubscriptionKind::Syncing, None),
+            Self::TransactionReceipts(filter) => {
+                (SubscriptionKind::TransactionReceipts, Some(Params::TransactionReceipts(filter)))
+            }
+        }
     }
 }
 
@@ -349,5 +419,27 @@ where
         &self,
     ) -> impl Stream<Item = NewTransactionEvent<<Eth::Pool as TransactionPool>::Transaction>> {
         self.eth_api.pool().new_pending_pool_transactions_listener()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_params_are_validated_before_accepting() {
+        use SubscriptionKind::{Logs, NewPendingTransactions, TransactionReceipts};
+        assert!(Subscription::from_params(Logs, Some(Params::Bool(true))).is_err());
+        let logs = Some(Params::Logs(Box::default()));
+        assert!(Subscription::from_params(NewPendingTransactions, logs.clone()).is_err());
+        assert!(matches!(Subscription::from_params(Logs, None), Ok(Subscription::Logs(_))));
+        assert!(matches!(
+            Subscription::from_params(NewPendingTransactions, Some(Params::Bool(true))),
+            Ok(Subscription::FullPendingTransactions)
+        ));
+        assert!(matches!(
+            Subscription::from_params(TransactionReceipts, logs),
+            Ok(Subscription::TransactionReceipts(_))
+        ));
     }
 }

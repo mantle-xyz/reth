@@ -1,19 +1,19 @@
 [package]
 name = "reth-storage-api"
-version = "2.4.0"
+version = "2.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth storage provider traits and types [MANTLE PATCH: backport reth#28067 at aef8d3ef]"
+description = "Reth storage provider traits and types [MANTLE PATCH: backport reth#28067 on ethereum-optimism/reth op-v2.6.0-1]"
 
 [lints]
 workspace = true
 
 [dependencies]
 # reth
-reth-db-models = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false }
+reth-db-models = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1", default-features = false }
 reth-chainspec.workspace = true
 reth-db-api = { workspace = true, optional = true }
 reth-execution-types.workspace = true
@@ -27,7 +27,7 @@ reth-ethereum-primitives.workspace = true
 
 # ethereum
 alloy-eips.workspace = true
-alloy-eip7928.workspace = true
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true

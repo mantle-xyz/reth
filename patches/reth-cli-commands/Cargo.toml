@@ -1,12 +1,12 @@
 [package]
 name = "reth-cli-commands"
-version = "2.4.0"
+version = "2.6.0"
+description = "[MANTLE PATCH: backport reth#27981, reth#27984, reth#28067, reth#28269 on ethereum-optimism/reth op-v2.6.0-1]"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Commands for the reth CLI [MANTLE PATCH: backport reth#27981, #27984, #28067 at aef8d3ef]"
 
 [lints]
 
@@ -17,24 +17,24 @@ reth-cli.workspace = true
 reth-cli-runner.workspace = true
 reth-cli-util.workspace = true
 reth-codecs.workspace = true
-reth-config = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1", default-features = false, features = ["serde"] }
+reth-config = { workspace = true, features = ["serde"] }
 reth-consensus.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true
 reth-db-common.workspace = true
 reth-downloaders = { workspace = true, features = ["file-client"] }
-reth-ecies = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-ecies = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 reth-eth-wire.workspace = true
-reth-era = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
-reth-era-downloader = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
-reth-era-utils = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
-reth-etl = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-era = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
+reth-era-downloader = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
+reth-era-utils = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
+reth-etl = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 reth-evm.workspace = true
 reth-exex.workspace = true
 reth-fs-util.workspace = true
-reth-net-nat = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-net-nat = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 reth-network = { workspace = true, features = ["serde"] }
-reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-network-p2p.workspace = true
 reth-network-peers = { workspace = true, features = ["secp256k1"] }
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
@@ -56,49 +56,50 @@ reth-trie = { workspace = true, features = ["metrics"] }
 reth-trie-db = { workspace = true, features = ["metrics"] }
 reth-trie-common = { workspace = true, optional = true }
 reth-primitives-traits.workspace = true
-reth-discv4 = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
-reth-discv5 = { git = "https://github.com/paradigmxyz/reth", rev = "aef8d3ef92117f91455e16969f0adf5bf7c6e9e1" }
+reth-discv4 = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
+reth-discv5 = { git = "https://github.com/ethereum-optimism/reth", tag = "op-v2.6.0-1" }
 
 # ethereum
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-consensus.workspace = true
 alloy-chains.workspace = true
 
-itertools = { version = "0.14", default-features = false }
+itertools.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["net"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
 
 # misc
 humantime.workspace = true
-human_bytes = "0.4.1"
+human_bytes = { version = "0.4.1" }
 eyre.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
-lz4 = "1.28.1"
+lz4 = { version = "1.28.1" }
 zstd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
 tar.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 backon = { version = "1.2", default-features = false, features = ["std-blocking-sleep", "tokio-sleep"] }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "recovery", "std"] }
 tokio-stream.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "blocking"] }
 url.workspace = true
-metrics.workspace = true
-blake3 = "1.8"
+metrics = { version = "0.24.0" }
+blake3 = { version = "1.8" }
 rayon.workspace = true
 
 # io
-fdlimit = "0.3.0"
-toml = { workspace = true, features = ["display"] }
+fdlimit.workspace = true
+toml = { version = "0.9", features = ["display"] }
 
 # tui
-comfy-table = "7.0"
-crossterm = "0.29.0"
+comfy-table = { version = "7.0" }
+crossterm = { version = "0.29.0" }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 
 # reth test-vectors
@@ -123,6 +124,7 @@ arbitrary = [
     "reth-db/arbitrary",
     "reth-chainspec/arbitrary",
     "alloy-chains/arbitrary",
+    "alloy-eip7928/arbitrary",
     "alloy-eips/arbitrary",
     "alloy-primitives/arbitrary",
     "reth-codecs/test-utils",

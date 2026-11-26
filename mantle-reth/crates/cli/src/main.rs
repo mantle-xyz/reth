@@ -12,11 +12,8 @@ use reth_db::DatabaseEnv;
 use reth_db_api::database_metrics::DatabaseMetrics;
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_node::args::{ProofsStorageVersion, RollupArgs};
-use reth_optimism_trie::{
-    OpProofsStore,
-    db::{MdbxProofsStorage, MdbxProofsStorageV2},
-};
+use reth_optimism_node::args::RollupArgs;
+use reth_optimism_trie::{OpProofsStore, db::MdbxProofsStorage};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -184,26 +181,21 @@ async fn launch_node(
 
     let path = args.history.resolve_storage_path(builder.config().datadir().as_ref());
 
-    match args.history.storage_version {
-        ProofsStorageVersion::V1 => {
-            info!(target: "reth::cli", "Using on-disk storage for proofs history (v1)");
-            let mdbx = Arc::new(
-                MdbxProofsStorage::new(&path)
-                    .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
-            );
-            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled)
-                .await
-        }
-        ProofsStorageVersion::V2 => {
-            info!(target: "reth::cli", "Using on-disk storage for proofs history (v2)");
-            let mdbx = Arc::new(
-                MdbxProofsStorageV2::new(&path)
-                    .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorageV2: {e}"))?,
-            );
-            launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled)
-                .await
-        }
+    // v2 is the only proofs storage format since op-reth v2.8.0; same check as its `launch_node`.
+    info!(target: "reth::cli", "Using on-disk storage for proofs history");
+    let mdbx = Arc::new(
+        MdbxProofsStorage::new(&path)
+            .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
+    );
+    if mdbx.holds_only_legacy_v1_data()? {
+        eyre::bail!(
+            "Proofs storage at {} only holds legacy v1 data. Delete the proofs storage \
+             directory (or use a fresh --proofs-history.storage-path), then run \
+             'op-reth proofs init --proofs-history.storage-path <PATH>'.",
+            path.display()
+        );
     }
+    launch_with_proof_history(builder, node, args, mdbx, preconf_enabled, consumer_enabled).await
 }
 
 /// Installs the ExEx, RPC overrides, and metrics hook for proof history, then launches the node.

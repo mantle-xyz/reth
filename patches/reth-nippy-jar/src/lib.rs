@@ -14,6 +14,7 @@
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::{
     error::Error as StdError,
     fs::File,
@@ -64,7 +65,10 @@ pub const CHANGESET_OFFSETS_FILE_EXTENSION: &str = "csoff";
 
 /// A [`RefRow`] is a list of column value slices pointing to either an internal buffer or a
 /// memory-mapped file.
-type RefRow<'a> = Vec<&'a [u8]>;
+///
+/// The inline capacity covers every segment used by reth (at most three columns), so reading a row
+/// does not allocate.
+pub type RefRow<'a> = SmallVec<[&'a [u8]; 4]>;
 
 /// Alias type for a column value wrapped in `Result`.
 pub type ColumnResult<T> = Result<T, Box<dyn StdError + Send + Sync>>;
@@ -819,6 +823,28 @@ mod tests {
     }
 
     #[test]
+    fn test_pruner() {
+        let (col1, col2) = test_data(None);
+        let num_columns = 2;
+        let num_rows = 2;
+
+        // (missing_offsets, expected number of rows)
+        // If a row wasn't fully pruned, then it should clear it up as well
+        let missing_offsets_scenarios = [(1, 1), (2, 1), (3, 0)];
+
+        for (missing_offsets, expected_rows) in missing_offsets_scenarios {
+            let file_path = tempfile::NamedTempFile::new().unwrap();
+
+            append_two_rows(num_columns, file_path.path(), &col1, &col2);
+
+            simulate_interrupted_prune(num_columns, file_path.path(), num_rows, missing_offsets);
+
+            let nippy = NippyJar::load_without_header(file_path.path()).unwrap();
+            assert_eq!(nippy.rows, expected_rows);
+        }
+    }
+
+    #[test]
     fn test_read_last_row_while_appending() {
         let (col1, col2) = test_data(None);
         let num_columns = 2;
@@ -871,28 +897,6 @@ mod tests {
         assert_inconsistent(|_| 0);
         // Past the end of the data file.
         assert_inconsistent(|data_len| data_len + 1);
-    }
-
-    #[test]
-    fn test_pruner() {
-        let (col1, col2) = test_data(None);
-        let num_columns = 2;
-        let num_rows = 2;
-
-        // (missing_offsets, expected number of rows)
-        // If a row wasn't fully pruned, then it should clear it up as well
-        let missing_offsets_scenarios = [(1, 1), (2, 1), (3, 0)];
-
-        for (missing_offsets, expected_rows) in missing_offsets_scenarios {
-            let file_path = tempfile::NamedTempFile::new().unwrap();
-
-            append_two_rows(num_columns, file_path.path(), &col1, &col2);
-
-            simulate_interrupted_prune(num_columns, file_path.path(), num_rows, missing_offsets);
-
-            let nippy = NippyJar::load_without_header(file_path.path()).unwrap();
-            assert_eq!(nippy.rows, expected_rows);
-        }
     }
 
     #[test]
@@ -980,6 +984,52 @@ mod tests {
             1 + 2 * num_columns as u64 * 8 + 8
         );
         assert_jar_rows(file_path.path(), &col1, &col2, 2);
+    }
+
+    #[test]
+    fn test_create_over_leftover_offsets() {
+        let (col1, col2) = test_data(None);
+        let num_columns = 2;
+        let file_path = tempfile::NamedTempFile::new().unwrap();
+
+        // Two committed rows, of which only the offsets are left behind.
+        append_two_rows(num_columns, file_path.path(), &col1, &col2);
+        let nippy = NippyJar::new_without_header(num_columns, file_path.path());
+        reth_fs_util::remove_file(nippy.data_path()).unwrap();
+
+        let mut writer = NippyJarWriter::new(nippy).unwrap();
+        append_row(&mut writer, &col1, &col2, 2);
+        writer.commit().unwrap();
+
+        // All values have the same size, so stale offsets equal the fresh ones and only the length
+        // shows them.
+        assert_eq!(
+            File::open(writer.offsets_path()).unwrap().metadata().unwrap().len(),
+            1 + num_columns as u64 * 8 + 8
+        );
+        assert_jar_rows(file_path.path(), &col1[2..], &col2[2..], 1);
+    }
+
+    #[test]
+    fn test_create_over_leftover_data() {
+        let (col1, col2) = test_data(None);
+        let num_columns = 2;
+        let file_path = tempfile::NamedTempFile::new().unwrap();
+
+        // Two committed rows, of which only the data is left behind.
+        append_two_rows(num_columns, file_path.path(), &col1, &col2);
+        let nippy = NippyJar::new_without_header(num_columns, file_path.path());
+        reth_fs_util::remove_file(nippy.offsets_path()).unwrap();
+
+        let mut writer = NippyJarWriter::new(nippy).unwrap();
+        append_row(&mut writer, &col1, &col2, 2);
+        writer.commit().unwrap();
+
+        assert_eq!(
+            File::open(writer.data_path()).unwrap().metadata().unwrap().len() as usize,
+            col1[2].len() + col2[2].len()
+        );
+        assert_jar_rows(file_path.path(), &col1[2..], &col2[2..], 1);
     }
 
     fn test_append_consistency_partial_commit(
@@ -1259,5 +1309,26 @@ mod tests {
             assert_eq!((values[0], values[1]), (col1[row].as_slice(), col2[row].as_slice()));
         }
         assert!(cursor.row_by_number(rows).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_writer_resumes_interrupted_creation() {
+        let file_path = tempfile::NamedTempFile::new().unwrap();
+        let path = file_path.path();
+
+        // Crash after creating the data and offsets files, before writing the offsets header.
+        std::fs::write(path, b"junk").unwrap();
+        std::fs::write(path.with_extension(OFFSETS_FILE_EXTENSION), b"").unwrap();
+        assert!(!path.with_extension(CONFIG_FILE_EXTENSION).exists());
+
+        let mut writer = NippyJarWriter::new(NippyJar::new_without_header(1, path)).unwrap();
+        writer.append_column(Some(Ok(&b"row"[..]))).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let jar = NippyJar::load_without_header(path).unwrap();
+        assert_eq!(jar.rows(), 1);
+        NippyJarChecker::new(jar).check_consistency().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"row");
     }
 }

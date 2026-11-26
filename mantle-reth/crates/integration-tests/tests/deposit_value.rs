@@ -169,7 +169,9 @@ async fn oversized_deposits_fail_without_stalling_sequencer_or_verifier() {
     let chain_spec = Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis));
     // Keep these two blocks in the engine's canonical memory overlay; this harness does not
     // run staged sync or construct the historical-state indices.
-    let tree_config = TreeConfig::default().with_persistence_threshold(8);
+    // op-reth runs without state masking; reth's default (30) needs a threshold above 35.
+    let tree_config =
+        TreeConfig::default().with_num_state_masking_blocks(0).with_persistence_threshold(8);
     with_mantle_node(
         chain_spec.clone(),
         attributes,

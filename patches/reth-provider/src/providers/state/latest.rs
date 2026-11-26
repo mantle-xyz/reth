@@ -9,14 +9,14 @@ use reth_storage_api::{
 };
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_trie::{
-    hashed_cursor::HashedPostStateCursorFactory,
+    hashed_cursor::{zero_destroyed_account_storage, HashedPostStateCursorFactory},
     proof::{Proof, StorageProof},
     trie_cursor::InMemoryTrieCursorFactory,
     updates::TrieUpdates,
     witness::TrieWitness,
-    AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage, KeccakKeyHasher,
-    MultiProof, MultiProofTargets, StateRoot, StorageMultiProof, StorageRoot, TrieInput,
-    TrieInputSorted,
+    AccountProof, DecodedMultiProofV2, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    KeccakKeyHasher, MultiProof, MultiProofTargets, MultiProofTargetsV2, StateRoot,
+    StorageMultiProof, StorageRoot, TrieInput, TrieInputSorted,
 };
 use reth_trie_db::{DatabaseProof, DatabaseStateRoot, DatabaseStorageProof, DatabaseStorageRoot};
 
@@ -172,7 +172,14 @@ impl<Provider: DBProvider + StorageSettingsCache> StorageRootProvider
         hashed_storage: HashedStorage,
     ) -> ProviderResult<B256> {
         reth_trie_db::with_adapter!(self.0, |A| {
-            <DbStorageRoot<'_, _, A>>::overlay_root(self.tx(), address, hashed_storage)
+            let input = TrieInputSorted::from_state(
+                HashedPostState::from_hashed_storage(
+                    alloy_primitives::keccak256(address),
+                    hashed_storage,
+                )
+                .into_sorted(),
+            );
+            <DbStorageRoot<'_, _, A>>::overlay_root(self.tx(), address, input)
                 .map_err(|err| ProviderError::Database(err.into()))
         })
     }
@@ -201,13 +208,15 @@ impl<Provider: DBProvider + StorageSettingsCache> StorageRootProvider
         hashed_storage: HashedStorage,
     ) -> ProviderResult<StorageMultiProof> {
         reth_trie_db::with_adapter!(self.0, |A| {
-            <DbStorageProof<'_, _, A>>::overlay_storage_multiproof(
-                self.tx(),
-                address,
-                slots,
-                hashed_storage,
-            )
-            .map_err(ProviderError::from)
+            let input = TrieInputSorted::from_state(
+                HashedPostState::from_hashed_storage(
+                    alloy_primitives::keccak256(address),
+                    hashed_storage,
+                )
+                .into_sorted(),
+            );
+            <DbStorageProof<'_, _, A>>::overlay_storage_multiproof(self.tx(), address, slots, input)
+                .map_err(ProviderError::from)
         })
     }
 }
@@ -235,6 +244,17 @@ impl<Provider: DBProvider + StorageSettingsCache> StateProofProvider
         reth_trie_db::with_adapter!(self.0, |A| {
             let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(self.tx());
             proof.overlay_multiproof(input, targets).map_err(ProviderError::from)
+        })
+    }
+
+    fn multiproof_v2(
+        &self,
+        input: TrieInput,
+        targets: MultiProofTargetsV2,
+    ) -> ProviderResult<DecodedMultiProofV2> {
+        reth_trie_db::with_adapter!(self.0, |A| {
+            let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(self.tx());
+            proof.overlay_multiproof_v2(input, targets).map_err(ProviderError::from)
         })
     }
 
@@ -271,8 +291,18 @@ impl<Provider: DBProvider + StorageSettingsCache> StateProofProvider
 }
 
 impl<Provider: DBProvider> HashedPostStateProvider for LatestStateProviderRef<'_, Provider> {
-    fn hashed_post_state(&self, bundle_state: &revm::database::BundleState) -> HashedPostState {
-        HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
+    fn hashed_post_state(
+        &self,
+        bundle_state: &revm::database::BundleState,
+    ) -> ProviderResult<HashedPostState> {
+        let mut hashed_state =
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state());
+        zero_destroyed_account_storage(
+            &reth_trie_db::DatabaseHashedCursorFactory::new(self.tx()),
+            bundle_state.state(),
+            &mut hashed_state,
+        )?;
+        Ok(hashed_state)
     }
 }
 
