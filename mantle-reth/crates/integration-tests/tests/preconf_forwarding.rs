@@ -41,7 +41,7 @@
 
 use crate::helpers::{
     mantle_payload_attributes, mantle_test_chain_spec, with_configured_mantle_node,
-    with_configured_mantle_node_opts,
+    with_configured_mantle_node_rpc_opts,
 };
 use jsonrpsee::{
     core::client::ClientT,
@@ -50,6 +50,7 @@ use jsonrpsee::{
 };
 use mantle_reth_cli::node::MantleNode;
 use reth_node_api::TreeConfig;
+use reth_node_core::args::RpcServerArgs;
 use reth_optimism_node::args::{ProofsHistoryStorageArgs, ProofsStorageVersion, RollupArgs};
 use serde_json::{Value, json};
 
@@ -219,12 +220,18 @@ async fn preconf_forward_sends_configured_sequencer_headers() {
             )
         });
 
-        with_configured_mantle_node_opts(
+        // debug_proofsSyncStatus is only served where the debug namespace is enabled.
+        let rpc = RpcServerArgs::default()
+            .with_unused_ports()
+            .with_http()
+            .with_http_api("eth,net,web3,debug".parse().unwrap());
+        with_configured_mantle_node_rpc_opts(
             node,
             mantle_test_chain_spec(),
             mantle_payload_attributes,
             TreeConfig::default(),
             proofs,
+            rpc,
             move |node, client| async move {
                 let _node = node;
                 let _: Value = client

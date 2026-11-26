@@ -125,7 +125,9 @@ async fn hoodi_bvm_upgrade_writes_code_at_activation() {
         },
     );
     let chain_spec = Arc::new(mantle_reth_chainspec::from_mantle_genesis(genesis));
-    let tree_config = TreeConfig::default().with_persistence_threshold(8);
+    // op-reth runs without state masking; reth's default (30) needs a threshold above 35.
+    let tree_config =
+        TreeConfig::default().with_num_state_masking_blocks(0).with_persistence_threshold(8);
 
     with_mantle_node(
         chain_spec.clone(),

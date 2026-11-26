@@ -167,7 +167,9 @@ async fn estimate_total_fee_uses_target_block_token_ratio() {
     // head state (the stale-ratio flakiness). Keeping blocks in memory sidesteps that path.
     // Threshold 8 is > the 3 blocks we mine and < the default backpressure threshold of 16, so
     // the engine never persists/evicts within the test.
-    let tree_config = TreeConfig::default().with_persistence_threshold(8);
+    // op-reth runs without state masking; reth's default (30) needs a threshold above 35.
+    let tree_config =
+        TreeConfig::default().with_num_state_masking_blocks(0).with_persistence_threshold(8);
 
     with_mantle_node(chain_spec, attrs_with_l1_deposit, tree_config, move |node, client| {
         run_token_ratio_assertions(node, client, chain_id, wallet)
