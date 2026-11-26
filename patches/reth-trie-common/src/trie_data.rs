@@ -201,6 +201,8 @@ impl fmt::Debug for LazyTrieDataMode {
 }
 
 /// Producer consumed by a spawned task to compute sorted trie data for a [`LazyTrieData`] handle.
+// [MANTLE PATCH] allow(unnameable_types): the workspace enables this lint, upstream does not.
+#[allow(unnameable_types)]
 #[must_use = "LazyTrieDataProducer must be consumed with compute_and_publish to wake trie data waiters"]
 pub struct LazyTrieDataProducer {
     /// Shared result initialized exactly once by this producer.

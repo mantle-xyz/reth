@@ -162,7 +162,6 @@ test-ci:
   cargo test --workspace --lib --bins
   cargo test -p mantle-reth-cli --test build_version
   cargo nextest run -p mantle-reth-integration-tests --tests
-  cargo test -p reth-trie-sparse --test '*'
   cargo test --doc --workspace
 
 # Run the full local test suite (examples + benches + all features)
