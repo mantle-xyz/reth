@@ -33,6 +33,8 @@ reth-optimism-primitives.workspace = true
 reth-optimism-chainspec = { workspace = true, features = ["superchain-configs"] }
 reth-optimism-consensus.workspace = true
 reth-optimism-trie.workspace = true
+# [MANTLE] MantleHardfork for the hardfork activation metrics.
+alloy-op-hardforks.workspace = true
 
 reth-chainspec.workspace = true
 reth-cli-runner.workspace = true

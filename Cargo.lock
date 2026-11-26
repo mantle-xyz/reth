@@ -9427,6 +9427,7 @@ version = "2.0.0"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
+ "alloy-op-hardforks",
  "alloy-primitives",
  "clap",
  "dirs-next",

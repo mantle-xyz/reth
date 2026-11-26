@@ -1,5 +1,6 @@
 //! Metrics registered by the OP-Reth CLI.
 
+use alloy_op_hardforks::MantleHardfork;
 use metrics::{describe_gauge, gauge};
 use reth_chainspec::{ForkCondition, Hardforks};
 use reth_optimism_chainspec::{OpChainSpec, OpHardfork};
@@ -8,7 +9,8 @@ const HARDFORK_ACTIVATION: &str = "chain_hardfork_activation";
 
 /// Registers activation metrics for the configured chain's L2 (OP Stack) hardforks.
 ///
-/// Only [`OpHardfork`] variants are reported; the underlying L1 (Ethereum) hardforks are omitted.
+/// Only [`OpHardfork`] and [`MantleHardfork`] variants are reported; the underlying L1 (Ethereum)
+/// hardforks are omitted.
 pub fn register_hardfork_activation_metrics(chain_spec: &OpChainSpec) {
     describe_gauge!(
         HARDFORK_ACTIVATION,
@@ -21,6 +23,21 @@ pub fn register_hardfork_activation_metrics(chain_spec: &OpChainSpec) {
         };
 
         // Lowercase to match op-node's fork label values (e.g. "canyon").
+        gauge!(
+            HARDFORK_ACTIVATION,
+            "fork" => hardfork.name().to_lowercase(),
+            "activation_basis" => activation_basis
+        )
+        .set(value as f64);
+    }
+
+    // [MANTLE] Mantle's own forks, so Skadi, Limb and Arsia can be checked by name; Limb has no
+    // OP counterpart above (devops-issue#30).
+    for hardfork in MantleHardfork::VARIANTS {
+        let Some((activation_basis, value)) = activation(&chain_spec.fork(*hardfork)) else {
+            continue;
+        };
+
         gauge!(
             HARDFORK_ACTIVATION,
             "fork" => hardfork.name().to_lowercase(),
@@ -63,6 +80,8 @@ mod tests {
                 (OpHardfork::Bedrock.boxed(), ForkCondition::Block(10)),
                 (OpHardfork::Canyon.boxed(), ForkCondition::Timestamp(30)),
                 (OpHardfork::Regolith.boxed(), ForkCondition::Never),
+                (MantleHardfork::Skadi.boxed(), ForkCondition::Timestamp(40)),
+                (MantleHardfork::Limb.boxed(), ForkCondition::Never),
             ]))
             .build();
 
@@ -88,6 +107,16 @@ mod tests {
         assert!(
             !exposition.contains(r#"fork="shanghai""#),
             "L1 (Ethereum) forks must be omitted: {exposition}"
+        );
+        assert!(
+            exposition.contains(
+                r#"reth_chain_hardfork_activation{fork="skadi",activation_basis="timestamp"} 40"#
+            ),
+            "Mantle forks must be reported: {exposition}"
+        );
+        assert!(
+            !exposition.contains(r#"fork="limb""#),
+            "Never forks must be omitted: {exposition}"
         );
     }
 }
